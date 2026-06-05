@@ -2,6 +2,7 @@ mod backend;
 mod db;
 mod engine;
 mod mcp;
+mod pipeline;
 mod rc;
 mod repl;
 mod session;
