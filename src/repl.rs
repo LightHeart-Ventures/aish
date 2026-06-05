@@ -18,8 +18,9 @@ use rustyline::{
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Blocking y/N/a prompt on the controlling TTY. `a` ("always") allows this
 /// call and persists the tool/command so it never prompts again.
@@ -50,10 +51,15 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
 
     let rc = rc::load();
     session.env = rc.env;
-    let aliases = rc.aliases;
+    let aliases = Arc::new(rc.aliases);
 
     let mut rl: Editor<AishHelper, DefaultHistory> = Editor::new()?;
-    rl.set_helper(Some(AishHelper { cwd: session.cwd.clone() }));
+    rl.set_helper(Some(AishHelper {
+        cwd: session.cwd.clone(),
+        path: session_path(&session),
+        aliases: aliases.clone(),
+        cmd_cache: Arc::new(Mutex::new(None)),
+    }));
     let history_path = dirs_history_path();
     let _ = rl.load_history(&history_path);
 
@@ -194,14 +200,120 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
 
 struct AishHelper {
     cwd: PathBuf,
+    /// Session PATH (rc exports + process PATH) used for command-name completion.
+    path: String,
+    /// Aliases from ~/.aishrc — offered as command names alongside PATH + builtins.
+    aliases: Arc<HashMap<String, Vec<String>>>,
+    /// Lazily-populated, TTL-refreshed cache of executable names on PATH.
+    cmd_cache: Arc<Mutex<Option<CmdCache>>>,
+}
+
+/// Builtins aish handles itself — always offered as command-name completions.
+const BUILTINS: &[&str] = &["cd", "exit", "logout"];
+
+/// How long a PATH scan stays cached before it's re-scanned (picks up newly
+/// installed binaries without re-statting every PATH dir on each TAB).
+const CMD_CACHE_TTL: Duration = Duration::from_secs(10);
+
+/// A cached PATH scan, keyed on the PATH string it was taken from.
+struct CmdCache {
+    path: String,
+    scanned_at: Instant,
+    names: Vec<String>,
 }
 
 impl Completer for AishHelper {
     type Candidate = Pair;
     fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let start = line[..pos].rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+        // Word one (the command position): everything before the cursor's word is
+        // blank. Complete against PATH binaries + builtins + aliases. Later words
+        // fall back to filename completion.
+        if line[..start].trim().is_empty() {
+            return Ok(self.complete_command(line, pos, start));
+        }
         Ok(complete_path(line, pos, &self.cwd))
     }
 }
+
+impl AishHelper {
+    /// Command-name completion for the first word: union of cached PATH
+    /// executables, builtins, and alias names matching the typed prefix. A
+    /// prefix containing `/` is a path (`./script`, `/usr/bin/l`), so defer to
+    /// filename completion.
+    fn complete_command(&self, line: &str, pos: usize, start: usize) -> (usize, Vec<Pair>) {
+        let prefix = &line[start..pos];
+        if prefix.contains('/') {
+            return complete_path(line, pos, &self.cwd);
+        }
+        let mut names = self.cached_path_commands();
+        names.extend(BUILTINS.iter().map(|s| s.to_string()));
+        names.extend(self.aliases.keys().cloned());
+        names.sort();
+        names.dedup();
+        let pairs: Vec<Pair> = names
+            .into_iter()
+            .filter(|n| n.starts_with(prefix))
+            .map(|n| Pair { display: n.clone(), replacement: n })
+            .collect();
+        (start, pairs)
+    }
+
+    /// PATH executable names, re-scanning only when the PATH changed or the
+    /// cached scan aged past `CMD_CACHE_TTL`.
+    fn cached_path_commands(&self) -> Vec<String> {
+        let mut cache = self.cmd_cache.lock().unwrap();
+        let fresh = cache
+            .as_ref()
+            .is_some_and(|c| c.path == self.path && c.scanned_at.elapsed() < CMD_CACHE_TTL);
+        if !fresh {
+            *cache = Some(CmdCache {
+                path: self.path.clone(),
+                scanned_at: Instant::now(),
+                names: scan_path_commands(&self.path),
+            });
+        }
+        cache.as_ref().unwrap().names.clone()
+    }
+}
+
+/// Sorted, de-duplicated executable basenames found across every directory on
+/// `path_var`. Symlinks are followed (matching `resolve_program`); the exec bit
+/// must be set.
+fn scan_path_commands(path_var: &str) -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut names: Vec<String> = Vec::new();
+    for dir in path_var.split(':').filter(|d| !d.is_empty()) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let is_exec = std::fs::metadata(e.path())
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+            if is_exec {
+                names.push(e.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The PATH aish dispatches against: the rc-exported PATH if any, else the
+/// process PATH.
+fn session_path(session: &Session) -> String {
+    session
+        .env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default()
+}
+
 impl Hinter for AishHelper {
     type Hint = String;
 }
@@ -693,6 +805,103 @@ mod tests {
         let line = "ls subdir/";
         let (start, _) = complete_path(line, line.len(), &dir);
         assert_eq!(start, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn make_exec(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, "#!/bin/sh\n").unwrap();
+        let mut perm = std::fs::metadata(path).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(path, perm).unwrap();
+    }
+
+    fn helper_for(dir: &Path, aliases: HashMap<String, Vec<String>>) -> AishHelper {
+        AishHelper {
+            cwd: dir.to_path_buf(),
+            path: dir.to_string_lossy().into_owned(),
+            aliases: Arc::new(aliases),
+            cmd_cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn command_completion_word_one() {
+        let dir = std::env::temp_dir().join(format!("aish_cmd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        make_exec(&dir.join("cargo"));
+        make_exec(&dir.join("cat"));
+        std::fs::write(dir.join("README"), "").unwrap(); // non-exec: excluded
+
+        let mut aliases = HashMap::new();
+        aliases.insert("gs".to_string(), vec!["git".to_string(), "status".to_string()]);
+        let helper = helper_for(&dir, aliases);
+
+        // AC1: car<TAB> at the command position offers cargo
+        let (start, pairs) = helper.complete_command("car", 3, 0);
+        assert_eq!(start, 0);
+        let reps: Vec<&str> = pairs.iter().map(|p| p.replacement.as_str()).collect();
+        assert_eq!(reps, vec!["cargo"], "got: {reps:?}");
+
+        // builtins are offered as command names
+        let (_, pairs) = helper.complete_command("ex", 2, 0);
+        assert!(pairs.iter().any(|p| p.replacement == "exit"), "exit missing");
+
+        // aliases are offered as command names
+        let (_, pairs) = helper.complete_command("g", 1, 0);
+        assert!(pairs.iter().any(|p| p.replacement == "gs"), "alias gs missing");
+
+        // non-executable files are not offered
+        let (_, pairs) = helper.complete_command("READ", 4, 0);
+        assert!(pairs.is_empty(), "non-exec README offered: {pairs:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_completion_defers_to_path_for_later_words_and_slashes() {
+        let dir = std::env::temp_dir().join(format!("aish_cmd2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        make_exec(&dir.join("cargo"));
+        std::fs::write(dir.join("sub.txt"), "").unwrap();
+        let helper = helper_for(&dir, HashMap::new());
+
+        // word two routes to filename completion, not command names
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+        let (start, pairs) = helper.complete("cat su", 6, &ctx).unwrap();
+        assert_eq!(start, 4);
+        assert!(pairs.iter().any(|p| p.replacement == "sub.txt"));
+        assert!(!pairs.iter().any(|p| p.replacement == "cargo"));
+
+        // a slash in word one means it's a path (e.g. ./script) → filename
+        // completion (the dir part is kept verbatim in the replacement).
+        let (_, pairs) = helper.complete_command("./su", 4, 0);
+        assert!(pairs.iter().any(|p| p.display == "sub.txt"));
+        assert!(pairs.iter().any(|p| p.replacement == "./sub.txt"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_scan_is_cached() {
+        let dir = std::env::temp_dir().join(format!("aish_cmd3_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        make_exec(&dir.join("foo"));
+        let helper = helper_for(&dir, HashMap::new());
+
+        let first = helper.cached_path_commands();
+        assert!(first.contains(&"foo".to_string()));
+
+        // A binary added after the first scan must NOT appear within the TTL —
+        // proving the scan is served from cache (AC2: no re-scan on every TAB).
+        make_exec(&dir.join("bar"));
+        let second = helper.cached_path_commands();
+        assert!(!second.contains(&"bar".to_string()), "scan was not cached");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
