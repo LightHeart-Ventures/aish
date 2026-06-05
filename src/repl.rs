@@ -130,6 +130,10 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
                     }
                 }
 
+                // Model turn: set the activity/reply apart from the typed line
+                // (direct commands above stay shell-immediate on purpose).
+                println!();
+
                 // Agentic turn. Ctrl-C aborts it — unless a TTY hand-off is in
                 // progress, in which case the SIGINT belongs to the foreground
                 // child (the terminal already delivered it there).
@@ -558,7 +562,7 @@ async fn dispatch(
                 }
                 return Dispatch::NotACommand;
             };
-            match tools::run_on_tty(&path.to_string_lossy(), &words[1..], session).await {
+            match tools::run_on_tty(&path.to_string_lossy(), &words[1..], &[], session).await {
                 Ok(status) => {
                     session.set_last_status(&status);
                     if let Some(code) = status.code() {
@@ -657,12 +661,34 @@ fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -> bool
                  :backend <claude|local>             switch backend\n\
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
+                 :jobs                               list background jobs\n\
+                 :kill <id>                          kill a background job\n\
                  :allow                              list always-allowed tools/commands\n\
                  :allow remove <tool>                revoke an always-allowed tool/command\n\
                  Ctrl-O                              toggle raw tool output (show/squelch tool results)\n\
                  :quit                               exit (also Ctrl-D or `exit`)"
             );
         }
+        Some("jobs") => {
+            let jobs = session.jobs.lock().unwrap();
+            if jobs.is_empty() {
+                println!("no background jobs");
+            }
+            for j in jobs.iter() {
+                println!("[{}] {} — {}", j.id, j.status(), j.desc);
+            }
+        }
+        Some("kill") => match parts.next().and_then(|s| s.parse::<usize>().ok()) {
+            Some(id) => {
+                let jobs = session.jobs.lock().unwrap();
+                match jobs.iter().find(|j| j.id == id) {
+                    Some(j) if j.kill() => println!("job {id} killed"),
+                    Some(j) => println!("job {id} already finished ({})", j.status()),
+                    None => println!("no such job: {id}"),
+                }
+            }
+            None => println!("usage: :kill <job-id>"),
+        },
         Some("model") => match parts.next() {
             Some(m) => {
                 let id = match m {
