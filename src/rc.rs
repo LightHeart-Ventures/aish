@@ -58,11 +58,21 @@ fn parse(text: &str) -> Rc {
                 }
             }
         } else if let Some(rest) = line.strip_prefix("export ") {
-            if let Some((name, value)) = split_assignment(rest) {
-                // Unexpandable values ($VAR, `cmd`) are bash's business, not ours.
-                if !value.contains('$') && !value.contains('`') {
-                    rc.env.push((name, value));
+            match split_assignment(rest) {
+                // Command substitution genuinely needs a shell we don't have.
+                Some((_, value)) if value.contains('`') => eprintln!(
+                    "\x1b[2maish: ~/.aishrc: skipped `{line}` — command substitution (`) needs a shell\x1b[0m"
+                ),
+                // Resolve $NAME / ${NAME} against the exports parsed so far, then
+                // the process env — so `export PATH=\"$PATH:$HOME/.local/bin\"`
+                // extends the live PATH at startup.
+                Some((name, value)) => {
+                    let expanded = expand(&value, &rc.env);
+                    rc.env.push((name, expanded));
                 }
+                None => eprintln!(
+                    "\x1b[2maish: ~/.aishrc: skipped `{line}` — not a plain NAME=value export\x1b[0m"
+                ),
             }
         }
     }
@@ -99,6 +109,49 @@ fn split_assignment(s: &str) -> Option<(String, String)> {
         }
     };
     Some((name.to_string(), value))
+}
+
+/// Resolve `$NAME` and `${NAME}` references in an export value against the
+/// exports parsed so far (so chained `export PATH="$PATH:..."` lines stack),
+/// then the process environment. Unknown names expand to empty, as bash does.
+fn expand(value: &str, so_far: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        let braced = chars.peek() == Some(&'{');
+        if braced {
+            chars.next();
+        }
+        let mut name = String::new();
+        while let Some(&n) = chars.peek() {
+            if n.is_ascii_alphanumeric() || n == '_' {
+                name.push(n);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if braced && chars.peek() == Some(&'}') {
+            chars.next();
+        }
+        if name.is_empty() {
+            out.push('$'); // a lone `$` is just a dollar sign
+            continue;
+        }
+        let resolved = so_far
+            .iter()
+            .rev()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var(&name).ok())
+            .unwrap_or_default();
+        out.push_str(&resolved);
+    }
+    out
 }
 
 /// Split a command line into argv words, honoring single/double quotes.
@@ -161,6 +214,8 @@ mod tests {
 
     #[test]
     fn parses_aliases_and_exports() {
+        // Reference an export defined earlier in the same file, so the test
+        // doesn't have to mutate the process env to exercise expansion.
         let rc = parse(
             "# comment\n\
              alias ll='ls -alF'\n\
@@ -168,7 +223,8 @@ mod tests {
              alias bad='ls | wc -l'\n\
              export EDITOR=vim\n\
              export GREETING=\"hello world\"\n\
-             export PATH=$PATH:/opt/bin\n\
+             export AISH_BASE=/usr/bin\n\
+             export PATH=\"$AISH_BASE:/opt/bin\"\n\
              if [ -f /etc/bashrc ]; then\n\
              fi\n",
         );
@@ -177,7 +233,43 @@ mod tests {
         assert!(!rc.aliases.contains_key("bad"), "piped alias must be skipped");
         assert!(rc.env.contains(&("EDITOR".into(), "vim".into())));
         assert!(rc.env.contains(&("GREETING".into(), "hello world".into())));
-        assert!(!rc.env.iter().any(|(k, _)| k == "PATH"), "$-value must be skipped");
+        // $-references now expand at load time instead of being skipped.
+        assert!(rc.env.contains(&("PATH".into(), "/usr/bin:/opt/bin".into())));
+    }
+
+    #[test]
+    fn expands_dollar_references_in_exports() {
+        let rc = parse(
+            "export H=/home/dev\n\
+             export A=$H/bin\n\
+             export B=\"${H}/.local/bin\"\n\
+             export C=$AISH_NO_SUCH_VAR_42:/tail\n\
+             export D=plain\n",
+        );
+        assert!(rc.env.contains(&("A".into(), "/home/dev/bin".into())));
+        assert!(rc.env.contains(&("B".into(), "/home/dev/.local/bin".into())));
+        // An undefined name expands to empty, as bash does.
+        assert!(rc.env.contains(&("C".into(), ":/tail".into())));
+        assert!(rc.env.contains(&("D".into(), "plain".into())));
+    }
+
+    #[test]
+    fn chained_path_exports_stack() {
+        let rc = parse(
+            "export PATH=/base\n\
+             export PATH=\"$PATH:/a\"\n\
+             export PATH=\"$PATH:/b\"\n",
+        );
+        // Each export sees the previous one, so all three dirs survive and the
+        // last entry — the one `.envs()` keeps — holds the full PATH.
+        let last = rc.env.iter().rev().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone());
+        assert_eq!(last, Some("/base:/a:/b".to_string()));
+    }
+
+    #[test]
+    fn command_substitution_export_is_skipped() {
+        let rc = parse("export NOW=`date`\n");
+        assert!(!rc.env.iter().any(|(k, _)| k == "NOW"));
     }
 
     #[test]
