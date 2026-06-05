@@ -16,8 +16,50 @@ const MAX_TIMEOUT_SECS: u64 = 3600;
 // grandchild can hold the write end open forever.
 const PIPE_GRACE: Duration = Duration::from_secs(5);
 
+/// The user's answer to a confirmation prompt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Decision {
+    /// Decline this call.
+    Deny,
+    /// Allow this one call.
+    AllowOnce,
+    /// Allow this call and persist the tool/command so it never prompts again.
+    AlwaysAllow,
+}
+
 /// Frontend-provided confirmation hook. Engine stays TTY-free.
-pub type Confirm<'a> = dyn FnMut(&str) -> bool + 'a;
+pub type Confirm<'a> = dyn FnMut(&str) -> Decision + 'a;
+
+/// Consult the persistent always-allow list, prompting only when the key isn't
+/// already allowed. Returns true when the action may proceed; an 'always'
+/// answer is persisted under `key` so it skips the prompt next time.
+fn gate(session: &Session, key: &str, prompt: &str, confirm: &mut Confirm<'_>) -> bool {
+    if session.is_tool_allowed(key) {
+        return true;
+    }
+    match confirm(prompt) {
+        Decision::Deny => false,
+        Decision::AllowOnce => true,
+        Decision::AlwaysAllow => {
+            session.allow_tool(key);
+            true
+        }
+    }
+}
+
+/// Stable identity used by the always-allow list. Program execution keys on the
+/// binary name (allowing `git` must not also allow `rm`); everything else keys
+/// on the tool name.
+fn allow_key(call: &ToolCall) -> String {
+    match call.name.as_str() {
+        "run_program" | "run_interactive" => call.args["program"]
+            .as_str()
+            .map(bin_name)
+            .unwrap_or(call.name.as_str())
+            .to_string(),
+        _ => call.name.clone(),
+    }
+}
 
 pub fn tool_defs() -> Vec<ToolDef> {
     vec![
@@ -165,7 +207,7 @@ pub async fn execute(call: &ToolCall, session: &mut Session, confirm: &mut Confi
     // below then stand down (see exec_needs_confirm and friends).
     if session.mode == crate::session::Mode::Paranoid {
         let args = truncate_middle(serde_json::to_string(&call.args).unwrap_or_default(), 200);
-        if !confirm(&format!("{} {args}", call.name)) {
+        if !gate(session, &allow_key(call), &format!("{} {args}", call.name), confirm) {
             return ToolResult {
                 id: call.id.clone(),
                 content: "user declined this tool call".into(),
@@ -329,7 +371,7 @@ fn parse_argv(call: &ToolCall) -> Result<(String, Vec<String>)> {
     Ok((program, args))
 }
 
-async fn run_program(call: &ToolCall, session: &Session, confirm: &mut Confirm<'_>) -> Result<String> {
+async fn run_program(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
     let (program, args) = parse_argv(call)?;
     let env = resolve_env(call, session);
     let background = call.args["background"].as_bool() == Some(true);
@@ -345,7 +387,9 @@ async fn run_program(call: &ToolCall, session: &Session, confirm: &mut Confirm<'
         args.join(" "),
         if background { " (background)" } else { "" }
     );
-    if exec_needs_confirm(session.mode, &program, &args) && !confirm(display.trim()) {
+    if exec_needs_confirm(session.mode, &program, &args)
+        && !gate(session, bin_name(&program), display.trim(), confirm)
+    {
         return Ok("user declined to run this command".into());
     }
 
@@ -384,6 +428,9 @@ async fn run_program(call: &ToolCall, session: &Session, confirm: &mut Confirm<'
         }
     }
     .map_err(|e| anyhow::anyhow!("failed to wait on {program}: {e}"))?;
+
+    // A model-run command counts toward `$?` just like a directly-dispatched one.
+    session.set_last_status(&status);
 
     let stdout = await_capture(&mut out_task).await;
     let stderr = await_capture(&mut err_task).await;
@@ -669,16 +716,19 @@ async fn await_capture(task: &mut tokio::task::JoinHandle<(Vec<u8>, Vec<u8>, u64
     }
 }
 
-async fn run_interactive(call: &ToolCall, session: &Session, confirm: &mut Confirm<'_>) -> Result<String> {
+async fn run_interactive(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
     let (program, args) = parse_argv(call)?;
     let env = resolve_env(call, session);
 
     let display = format!("{} {}", program, args.join(" "));
-    if exec_needs_confirm(session.mode, &program, &args) && !confirm(display.trim()) {
+    if exec_needs_confirm(session.mode, &program, &args)
+        && !gate(session, bin_name(&program), display.trim(), confirm)
+    {
         return Ok("user declined to run this command".into());
     }
 
     let status = run_on_tty(&program, &args, &env, session).await?;
+    session.set_last_status(&status);
     Ok(match status.code() {
         Some(code) => format!("[interactive session ended: exit code {code}]"),
         None => {
@@ -758,7 +808,7 @@ async fn mcp_call(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<
     if gated {
         let args = serde_json::to_string(&call.args).unwrap_or_default();
         let args = truncate_middle(args, 200);
-        if !confirm(&format!("{} {args}", call.name)) {
+        if !gate(session, &call.name, &format!("{} {args}", call.name), confirm) {
             return Ok("user declined this tool call".into());
         }
     }
@@ -785,7 +835,7 @@ fn write_file(call: &ToolCall, session: &Session, confirm: &mut Confirm<'_>) -> 
         let suffix = if more > 0 { format!("\n  │ … +{more} lines") } else { String::new() };
         let action = if full.exists() { "overwrite" } else { "write" };
         let prompt = format!("{action} {} ({} bytes)\n  │ {preview}{suffix}\n ", full.display(), content.len());
-        if !confirm(&prompt) {
+        if !gate(session, "write_file", &prompt, confirm) {
             return Ok("user declined the write".into());
         }
     }
@@ -915,7 +965,7 @@ mod tests {
     async fn run(c: &ToolCall) -> String {
         let mut session = Session::new().unwrap();
         session.mode = crate::session::Mode::Yolo; // no confirm prompts in tests
-        let mut confirm = |_: &str| true;
+        let mut confirm = |_: &str| Decision::AllowOnce;
         let r = execute(c, &mut session, &mut confirm).await;
         assert!(!r.is_error, "unexpected error: {}", r.content);
         r.content
@@ -950,6 +1000,18 @@ mod tests {
         assert!(out.contains("[exit code: 1]"), "got: {out}");
     }
 
+    #[tokio::test]
+    async fn model_run_command_tracks_dollar_question() {
+        // A model-run command updates `$?` just like a directly-dispatched one.
+        let mut session = Session::new().unwrap();
+        session.mode = crate::session::Mode::Yolo;
+        let mut confirm = |_: &str| Decision::AllowOnce;
+        let _ = execute(&call("false", &[], None), &mut session, &mut confirm).await;
+        assert_eq!(session.last_status, 1);
+        let _ = execute(&call("true", &[], None), &mut session, &mut confirm).await;
+        assert_eq!(session.last_status, 0);
+    }
+
     #[test]
     fn destructive_classifier() {
         let d = |p: &str, a: &[&str]| {
@@ -975,5 +1037,56 @@ mod tests {
         // careful-mode allowlist still intact
         assert!(is_read_only("git", &["log".into()]));
         assert!(!is_read_only("git", &["push".into()]));
+    }
+
+    #[test]
+    fn allow_key_uses_binary_name() {
+        let c = |name: &str, args: serde_json::Value| ToolCall {
+            id: "t".into(),
+            name: name.into(),
+            args,
+        };
+        assert_eq!(
+            allow_key(&c("run_program", json!({"program": "/usr/bin/git", "args": ["push"]}))),
+            "git"
+        );
+        assert_eq!(allow_key(&c("run_interactive", json!({"program": "vim"}))), "vim");
+        assert_eq!(allow_key(&c("write_file", json!({"path": "/x"}))), "write_file");
+        assert_eq!(allow_key(&c("mcp__srv__do", json!({}))), "mcp__srv__do");
+    }
+
+    #[tokio::test]
+    async fn always_allow_persists_and_skips_confirm() {
+        use std::cell::Cell;
+        let mut session = Session::new().unwrap();
+        let path = std::env::temp_dir().join(format!("aish_allow_gate_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        session.db = Some(crate::db::Db::open(&path).unwrap());
+        session.mode = crate::session::Mode::Normal;
+
+        let calls = Cell::new(0);
+        // First destructive call: prompt fires, user answers 'always'.
+        {
+            let mut confirm = |_: &str| {
+                calls.set(calls.get() + 1);
+                Decision::AlwaysAllow
+            };
+            let r = execute(&call("rm", &["aish_no_such_file_a"], None), &mut session, &mut confirm).await;
+            assert!(!r.content.contains("declined"), "gate should have passed: {}", r.content);
+        }
+        assert_eq!(calls.get(), 1);
+        assert!(session.is_tool_allowed("rm"), "rm should be persisted on the allow-list");
+
+        // Second destructive call: confirm must NOT be consulted (would Deny).
+        {
+            let mut confirm = |_: &str| {
+                calls.set(calls.get() + 1);
+                Decision::Deny
+            };
+            let r = execute(&call("rm", &["aish_no_such_file_b"], None), &mut session, &mut confirm).await;
+            assert!(!r.content.contains("declined to run"), "should be auto-allowed: {}", r.content);
+        }
+        assert_eq!(calls.get(), 1, "second rm should have skipped the prompt");
+        let _ = std::fs::remove_file(&path);
     }
 }
