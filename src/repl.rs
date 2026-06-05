@@ -199,7 +199,7 @@ struct AishHelper {
 impl Completer for AishHelper {
     type Candidate = Pair;
     fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
-        Ok(complete_path(line, pos, &self.cwd))
+        Ok(complete_line(line, pos, &self.cwd))
     }
 }
 impl Hinter for AishHelper {
@@ -208,6 +208,130 @@ impl Hinter for AishHelper {
 impl Highlighter for AishHelper {}
 impl Validator for AishHelper {}
 impl Helper for AishHelper {}
+
+// ---------------------------------------------------------------------------
+// Command-aware completion (word 2+) — static tables
+// ---------------------------------------------------------------------------
+//
+// Scope decision (TASK-11): static tables, not a carapace-style spec source.
+// A spec-driven source would mean vendoring + parsing an external corpus of
+// hundreds of tool definitions and carrying a parser/dependency for it. The
+// task only asks for four high-traffic tools (git, cargo, docker, kubectl),
+// so a handful of `&'static [&str]` tables is the minimum that satisfies it,
+// stays dependency-free, and is trivially unit-testable. Any command without a
+// table — or any word past the subcommand slot — degrades to path completion.
+
+/// Static completion table for one command: its subcommands (offered in the
+/// first-argument slot) and its common flags (offered when the word starts
+/// with `-`).
+struct CmdSpec {
+    subcommands: &'static [&'static str],
+    flags: &'static [&'static str],
+}
+
+/// Look up the static spec for a command name. Returns `None` for any command
+/// we don't have a table for, which is the signal to fall back to path
+/// completion (graceful degradation).
+fn command_spec(cmd: &str) -> Option<CmdSpec> {
+    let spec = match cmd {
+        "git" => CmdSpec {
+            subcommands: &[
+                "add", "branch", "checkout", "cherry", "cherry-pick", "clone",
+                "commit", "config", "diff", "fetch", "init", "log", "merge",
+                "mv", "pull", "push", "rebase", "remote", "reset", "restore",
+                "revert", "rm", "show", "stash", "status", "switch", "tag",
+            ],
+            flags: &[
+                "--help", "--version", "--bare", "--git-dir", "--work-tree",
+                "--paginate", "--no-pager",
+            ],
+        },
+        "cargo" => CmdSpec {
+            subcommands: &[
+                "add", "bench", "build", "check", "clean", "clippy", "doc",
+                "fetch", "fix", "fmt", "init", "install", "new", "publish",
+                "remove", "run", "search", "test", "tree", "update", "vendor",
+            ],
+            flags: &[
+                "--help", "--version", "--release", "--verbose", "--quiet",
+                "--offline", "--locked", "--frozen", "--all-features",
+                "--no-default-features", "--features", "--target",
+                "--manifest-path",
+            ],
+        },
+        "docker" => CmdSpec {
+            subcommands: &[
+                "attach", "build", "commit", "container", "cp", "create",
+                "exec", "image", "images", "info", "inspect", "kill", "logs",
+                "network", "pause", "ps", "pull", "push", "rename", "restart",
+                "rm", "rmi", "run", "start", "stop", "system", "tag", "top",
+                "unpause", "version", "volume",
+            ],
+            flags: &["--help", "--version", "--config", "--log-level"],
+        },
+        "kubectl" => CmdSpec {
+            subcommands: &[
+                "apply", "attach", "config", "cordon", "cp", "create",
+                "delete", "describe", "drain", "edit", "exec", "explain",
+                "expose", "get", "logs", "patch", "port-forward", "proxy",
+                "rollout", "run", "scale", "set", "top", "uncordon", "version",
+                "wait",
+            ],
+            flags: &[
+                "--help", "--namespace", "--context", "--kubeconfig",
+                "--output", "--all-namespaces",
+            ],
+        },
+        _ => return None,
+    };
+    Some(spec)
+}
+
+/// Build completion `Pair`s for the candidates that start with `prefix`.
+fn matches(candidates: &[&str], prefix: &str) -> Vec<Pair> {
+    candidates
+        .iter()
+        .filter(|c| c.starts_with(prefix))
+        .map(|c| Pair { display: (*c).to_string(), replacement: (*c).to_string() })
+        .collect()
+}
+
+/// Top-level completion dispatcher. Completes flags and subcommands for known
+/// commands at word 2+, and falls back to path completion everywhere else
+/// (word 1, unknown commands, and any known-command slot with no table match).
+fn complete_line(line: &str, pos: usize, cwd: &Path) -> (usize, Vec<Pair>) {
+    let start = line[..pos].rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+    let word = &line[start..pos];
+
+    // First whitespace-delimited token on the line is the command name.
+    let cmd = line.split_whitespace().next().unwrap_or("");
+
+    // How many complete tokens precede the word under the cursor. 0 means we're
+    // still typing the command itself → path completion (command-name
+    // completion is out of scope; preserves existing behaviour).
+    let words_before = line[..start].split_whitespace().count();
+    if words_before == 0 {
+        return complete_path(line, pos, cwd);
+    }
+
+    if let Some(spec) = command_spec(cmd) {
+        if word.starts_with('-') {
+            let pairs = matches(spec.flags, word);
+            if !pairs.is_empty() {
+                return (start, pairs);
+            }
+        } else if words_before == 1 {
+            // First-argument slot → subcommand completion.
+            let pairs = matches(spec.subcommands, word);
+            if !pairs.is_empty() {
+                return (start, pairs);
+            }
+        }
+        // No table match → fall through to path completion (graceful).
+    }
+
+    complete_path(line, pos, cwd)
+}
 
 /// Complete the path under the cursor. Splits the current word into a
 /// directory part (kept verbatim in the replacement, `~` included) and a name
@@ -693,6 +817,60 @@ mod tests {
         let line = "ls subdir/";
         let (start, _) = complete_path(line, line.len(), &dir);
         assert_eq!(start, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_subcommand_and_flag_completion() {
+        let cwd = std::env::temp_dir();
+        let reps = |line: &str| -> Vec<String> {
+            let (_, pairs) = complete_line(line, line.len(), &cwd);
+            pairs.into_iter().map(|p| p.replacement).collect()
+        };
+
+        // AC1: `git che<TAB>` offers checkout and cherry-pick.
+        let r = reps("git che");
+        assert!(r.contains(&"checkout".to_string()), "got: {r:?}");
+        assert!(r.contains(&"cherry-pick".to_string()), "got: {r:?}");
+
+        // start index points at the word under the cursor, not the command.
+        let (start, _) = complete_line("git che", 7, &cwd);
+        assert_eq!(start, 4);
+
+        // Flags complete when the word begins with `-`.
+        let r = reps("cargo --no-d");
+        assert_eq!(r, vec!["--no-default-features".to_string()]);
+        let r = reps("docker --ver");
+        assert_eq!(r, vec!["--version".to_string()]);
+
+        // Subcommands for the other supported tools.
+        assert!(reps("kubectl get").contains(&"get".to_string()));
+        assert!(reps("cargo bu").contains(&"build".to_string()));
+    }
+
+    #[test]
+    fn unknown_command_degrades_to_path() {
+        // AC2: unknown commands must not error and must fall back to path
+        // completion (here: no matching paths → empty, but never a panic).
+        let dir = std::env::temp_dir().join(format!("aish_unknown_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("report.txt"), "").unwrap();
+
+        // A made-up command at the argument slot completes filenames, not a crash.
+        let (_, pairs) = complete_line("frobnicate rep", 14, &dir);
+        let reps: Vec<&str> = pairs.iter().map(|p| p.replacement.as_str()).collect();
+        assert_eq!(reps, vec!["report.txt"], "got: {reps:?}");
+
+        // A known command past the subcommand slot also falls to path completion.
+        let (_, pairs) = complete_line("git add rep", 11, &dir);
+        let reps: Vec<&str> = pairs.iter().map(|p| p.replacement.as_str()).collect();
+        assert_eq!(reps, vec!["report.txt"], "got: {reps:?}");
+
+        // An unrecognised git subcommand prefix degrades rather than erroring.
+        let (_, pairs) = complete_line("git zzz", 7, &dir);
+        assert!(pairs.is_empty(), "got: {pairs:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
