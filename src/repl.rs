@@ -290,7 +290,18 @@ async fn dispatch(
     // connect each stage's stdout to the next stage's stdin. Run it directly
     // only when every stage is a real program; otherwise route to the model.
     if let Some(stages) = pipeline::parse(line) {
-        if stages.iter().all(|s| s.first().is_some_and(|p| resolve_program(p, &session.cwd).is_some())) {
+        // Same session-aware PATH the single-command path uses below.
+        let path_var = session
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var("PATH").ok())
+            .unwrap_or_default();
+        if stages.iter().all(|s| {
+            s.first().is_some_and(|p| resolve_program(p, &session.cwd, &path_var).is_some())
+        }) {
             match pipeline::run(&stages, session).await {
                 Ok(status) => {
                     if let Some(code) = status.code() {
@@ -363,7 +374,18 @@ async fn dispatch(
             Dispatch::Handled
         }
         cmd => {
-            let Some(path) = resolve_program(cmd, &session.cwd) else {
+            // Resolve against the session's PATH — which includes any
+            // `export PATH="$PATH:…"` from ~/.aishrc — falling back to the
+            // process PATH when the rc file sets none.
+            let path_var = session
+                .env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == "PATH")
+                .map(|(_, v)| v.clone())
+                .or_else(|| std::env::var("PATH").ok())
+                .unwrap_or_default();
+            let Some(path) = resolve_program(cmd, &session.cwd, &path_var) else {
                 if force {
                     eprintln!("aish: {cmd}: command not found");
                     return Dispatch::Handled;
@@ -409,7 +431,7 @@ fn builtin_cd(arg: Option<&str>, session: &mut Session, prev: &mut Option<PathBu
 }
 
 /// PATH lookup with the executable bit checked — `which`, basically.
-fn resolve_program(cmd: &str, cwd: &Path) -> Option<PathBuf> {
+fn resolve_program(cmd: &str, cwd: &Path, path_var: &str) -> Option<PathBuf> {
     fn is_exec(p: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
         p.is_file() && p.metadata().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
@@ -418,7 +440,6 @@ fn resolve_program(cmd: &str, cwd: &Path) -> Option<PathBuf> {
         let p = if Path::new(cmd).is_absolute() { PathBuf::from(cmd) } else { cwd.join(cmd) };
         return is_exec(&p).then_some(p);
     }
-    let path_var = std::env::var("PATH").ok()?;
     for dir in path_var.split(':').filter(|d| !d.is_empty()) {
         let p = Path::new(dir).join(cmd);
         if is_exec(&p) {
