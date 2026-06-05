@@ -19,6 +19,11 @@ pub async fn run_turn(
     if backend.include_mcp_tools() {
         tool_defs.extend(session.mcp.tool_defs());
     }
+    // TASK-13: on a fresh conversation, seed the turn with the previous recorded
+    // output so a prompt like "summarize that" can reference it without
+    // re-running. Mid-conversation the output is already in `history`, so we
+    // don't duplicate it.
+    let input = seed_context(session.history.is_empty(), session.last_output(), input);
     session.history.push(Msg::user(input));
     session.last_turn_tools.clear();
 
@@ -61,6 +66,19 @@ pub async fn run_turn(
     }
 
     Ok("[stopped: turn exceeded the tool-call iteration limit]".into())
+}
+
+/// TASK-13: prepend the previous recorded output to a turn's input so the model
+/// can reference it ("summarize that") without re-running the command. Applied
+/// only when the conversation is empty — mid-conversation the output is already
+/// in `history`, and an empty/whitespace previous output is left untouched.
+fn seed_context(history_empty: bool, prev: Option<String>, input: String) -> String {
+    match prev {
+        Some(prev) if history_empty && !prev.trim().is_empty() => {
+            format!("[Previous command output, for reference:\n{prev}\n]\n\n{input}")
+        }
+        _ => input,
+    }
 }
 
 /// Transient "⠋ thinking…" line on stderr while the model is working.
@@ -165,5 +183,18 @@ mod tests {
         assert_eq!(raw_body(&mk("   \n ", false)), "(no output)");
         // error results keep their content — they are included, not skipped
         assert_eq!(raw_body(&mk("boom", true)), "boom");
+    }
+
+    #[test]
+    fn seed_context_injects_only_on_empty_history() {
+        // Fresh conversation with a prior output → input is seeded.
+        let seeded = seed_context(true, Some("df output".into()), "summarize that".into());
+        assert!(seeded.contains("df output"));
+        assert!(seeded.ends_with("summarize that"));
+        // Mid-conversation → untouched (the model already has prior output).
+        assert_eq!(seed_context(false, Some("df output".into()), "next".into()), "next");
+        // No prior output, or an empty one → untouched.
+        assert_eq!(seed_context(true, None, "hi".into()), "hi");
+        assert_eq!(seed_context(true, Some("   \n".into()), "hi".into()), "hi");
     }
 }

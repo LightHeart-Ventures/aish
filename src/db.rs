@@ -77,6 +77,21 @@ impl Db {
         );
     }
 
+    /// The content of the most recent `output` history row (a model/agent
+    /// reply). Backs TASK-13 last-output addressing — the `$LAST`/`$_` dispatch
+    /// binding and the automatic model-prompt context. `None` when no output has
+    /// been recorded yet.
+    pub fn last_output(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT content FROM history WHERE kind = 'output' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn remember(&self, content: &str, tags: Option<&str>) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO memories (content, tags) VALUES (?1, ?2)",
@@ -170,6 +185,20 @@ mod tests {
         assert!(hits[0].contains("terse replies"));
         let all = db.recall("", 10).unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn last_output_returns_most_recent_output_row() {
+        let db = temp_db("last_output");
+        // No output yet.
+        assert_eq!(db.last_output().unwrap(), None);
+        // Inputs don't count — only `output` rows.
+        db.record("input", "/tmp", "ls -la");
+        assert_eq!(db.last_output().unwrap(), None);
+        db.record("output", "/tmp", "first reply");
+        db.record("input", "/tmp", "next question");
+        db.record("output", "/tmp", "second reply");
+        assert_eq!(db.last_output().unwrap().as_deref(), Some("second reply"));
     }
 
     #[test]

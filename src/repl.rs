@@ -318,6 +318,26 @@ fn looks_like_prose(line: &str, words: &[String]) -> bool {
     })
 }
 
+/// Variable resolver for direct-dispatch `$VAR` expansion. Resolution order:
+/// session `export`s first (so a user override wins), then the TASK-13
+/// last-output bindings `$LAST` / `$_` (the most recent recorded output,
+/// truncated per the last-output policy), then the process environment. This
+/// lets the next line reference the previous output without re-running it —
+/// e.g. `echo $LAST`.
+fn var_lookup(session: &Session) -> impl Fn(&str) -> Option<String> + '_ {
+    move |name: &str| {
+        if let Some(v) = session.env.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.clone()) {
+            return Some(v);
+        }
+        if matches!(name, "LAST" | "_") {
+            if let Some(out) = session.last_output() {
+                return Some(out);
+            }
+        }
+        std::env::var(name).ok()
+    }
+}
+
 async fn dispatch(
     line: &str,
     force: bool,
@@ -364,16 +384,7 @@ async fn dispatch(
     // tokenize (apostrophes in English) go to the model. `$VAR` references are
     // expanded here against the session's exports first, then the process
     // environment — matching what the spawned program would see.
-    let lookup = |name: &str| {
-        session
-            .env
-            .iter()
-            .rev()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.clone())
-            .or_else(|| std::env::var(name).ok())
-    };
-    let Some(mut words) = rc::tokenize_with(line, lookup) else {
+    let Some(mut words) = rc::tokenize_with(line, var_lookup(session)) else {
         if force {
             eprintln!("aish: can't run that directly — it uses shell syntax aish doesn't implement");
             return Dispatch::Handled;
@@ -721,6 +732,24 @@ mod tests {
         // …but flags/paths still win even with a trailing comma elsewhere
         assert!(!prose("watch -n 5 free"));
         assert!(!prose("tail logs/app.log"));
+    }
+
+    #[test]
+    fn last_output_binding_expands_in_dispatch() {
+        let mut session = Session::new().unwrap();
+        let path = std::env::temp_dir().join(format!("aish_repl_last_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = crate::db::Db::open(&path).unwrap();
+        db.record("output", "/tmp", "hello from last");
+        session.db = Some(db);
+
+        // Both $LAST and $_ resolve to the most recent recorded output.
+        assert_eq!(rc::tokenize_with("echo $LAST", var_lookup(&session)).unwrap(), vec!["echo", "hello from last"]);
+        assert_eq!(rc::tokenize_with("echo $_", var_lookup(&session)).unwrap(), vec!["echo", "hello from last"]);
+        // An explicit session export shadows the binding.
+        session.env.push(("LAST".into(), "override".into()));
+        assert_eq!(rc::tokenize_with("echo $LAST", var_lookup(&session)).unwrap(), vec!["echo", "override"]);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -89,6 +89,15 @@ impl Session {
         })
     }
 
+    /// The most recent recorded output (a model/agent reply), truncated per the
+    /// last-output policy. Backs TASK-13 last-output addressing: the `$LAST`/`$_`
+    /// dispatch binding and the automatic model-prompt context. `None` when no
+    /// output has been recorded yet or the persistent store is unavailable.
+    pub fn last_output(&self) -> Option<String> {
+        let raw = self.db.as_ref()?.last_output().ok()??;
+        Some(truncate_last(raw))
+    }
+
     /// True when `key` is on the persistent always-allow list (a prior 'a'
     /// answer at a confirmation prompt). Best-effort: no store → not allowed.
     pub fn is_tool_allowed(&self, key: &str) -> bool {
@@ -142,6 +151,29 @@ the moment there are several items to compare. No markdown headers.{skills}",
     }
 }
 
+/// Hard cap (bytes) on last-output text exposed via `$LAST`/`$_` and the
+/// automatic model-prompt context (TASK-13 AC3). Outputs longer than this are
+/// truncated head-first with an ellipsis marker — the head is what a follow-up
+/// line most often references, and a bounded value keeps argv and prompt sizes
+/// sane.
+const LAST_OUTPUT_LIMIT: usize = 4000;
+
+/// Truncation policy for last-output addressing: keep the leading
+/// `LAST_OUTPUT_LIMIT` bytes (snapped to a char boundary) and append an ellipsis
+/// marker when anything was dropped. Short outputs pass through unchanged.
+fn truncate_last(mut s: String) -> String {
+    if s.len() <= LAST_OUTPUT_LIMIT {
+        return s;
+    }
+    let mut end = LAST_OUTPUT_LIMIT;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s.push_str("\n…[truncated]");
+    s
+}
+
 fn host_info() -> String {
     let os = std::fs::read_to_string("/etc/os-release")
         .ok()
@@ -154,4 +186,51 @@ fn host_info() -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
     let home = std::env::var("HOME").unwrap_or_default();
     format!("Host: {os}\nUser: {user} (home: {home})")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_last_passes_short_output_through() {
+        assert_eq!(truncate_last("short".into()), "short");
+        let exact = "x".repeat(LAST_OUTPUT_LIMIT);
+        assert_eq!(truncate_last(exact.clone()), exact);
+    }
+
+    #[test]
+    fn truncate_last_caps_large_output_with_marker() {
+        let big = "y".repeat(LAST_OUTPUT_LIMIT * 2);
+        let out = truncate_last(big);
+        assert!(out.ends_with("…[truncated]"), "missing marker: {}", &out[out.len() - 20..]);
+        // head kept up to the limit; marker is the only addition
+        assert!(out.starts_with(&"y".repeat(LAST_OUTPUT_LIMIT)));
+        assert_eq!(out.len(), LAST_OUTPUT_LIMIT + "\n…[truncated]".len());
+    }
+
+    #[test]
+    fn truncate_last_snaps_to_char_boundary() {
+        // A multibyte char straddling the limit must not panic or split a code point.
+        let mut s = "a".repeat(LAST_OUTPUT_LIMIT - 1);
+        s.push('é'); // 2 bytes, crosses the LAST_OUTPUT_LIMIT boundary
+        s.push_str(&"b".repeat(100));
+        let out = truncate_last(s);
+        assert!(out.ends_with("…[truncated]"));
+        assert!(out.is_char_boundary(out.len() - "\n…[truncated]".len()));
+    }
+
+    #[test]
+    fn session_last_output_reads_and_truncates() {
+        let mut session = Session::new().unwrap();
+        assert_eq!(session.last_output(), None); // no store
+        let path = std::env::temp_dir().join(format!("aish_sess_last_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = crate::db::Db::open(&path).unwrap();
+        db.record("output", "/tmp", &"z".repeat(LAST_OUTPUT_LIMIT * 2));
+        session.db = Some(db);
+        let out = session.last_output().unwrap();
+        assert!(out.ends_with("…[truncated]"));
+        let _ = std::fs::remove_file(&path);
+    }
 }
