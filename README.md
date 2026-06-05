@@ -47,6 +47,13 @@ Mostly ~/models (412G of GGUF weights) — 87% of your usage.
 - **Persistent memory.** SQLite (+ sqlite-vec) at `~/.aish/aish.db`: all
   input/output history, plus a memories table the model reads/writes through
   `remember`/`recall` tools across sessions.
+- **Last-output addressing.** The previous output is addressable on the next
+  line. In direct dispatch, `$LAST` (alias `$_`) expands to the most recent
+  recorded output — `grep ERROR $LAST`, `echo $LAST`. For the model it's
+  automatic: after a command, `summarize that` references the prior output
+  without re-running it. Large outputs are truncated head-first to 4000 bytes
+  with an `…[truncated]` marker. (Output is read from the SQLite `history`
+  table; streamed interactive programs — `vim`, `top` — aren't captured.)
 - **Extensible.** MCP servers from `~/.aish/.mcp.json` (stdio transport,
   Claude-Code-compatible schema) join the tool set as `mcp__server__tool`;
   skills (Claude-convention `SKILL.md` packs) in `~/.aish/skills/` are
