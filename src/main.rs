@@ -67,10 +67,15 @@ async fn main() -> Result<()> {
             "{\n  \"mcpServers\": {\n  }\n}\n",
         );
     }
-    session.skills_prompt = skills::render_prompt_section(&skills::load(&aish_dir.join("skills")));
     // Project-scope .mcp.json (cwd) outranks the user-scope one on name clashes.
     let project_mcp = session.cwd.join(".mcp.json");
     session.mcp = mcp::McpHost::start(&[project_mcp.as_path(), mcp_config.as_path()]).await;
+    // After MCP connect: the skills catalog merges the local directory with
+    // every server's published prompts.
+    session.skills_prompt = skills::render_prompt_section(
+        &skills::load(&aish_dir.join("skills")),
+        &session.mcp.skills(),
+    );
     session.db = match db::Db::open(&aish_dir.join("aish.db")) {
         Ok(d) => Some(d),
         Err(e) => {

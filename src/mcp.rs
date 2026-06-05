@@ -52,6 +52,23 @@ struct McpTool {
     read_only: bool,
 }
 
+/// An MCP prompt — servers publish reusable skills/playbooks this way
+/// (`prompts/list` is the catalog, `prompts/get` expands one).
+struct McpPrompt {
+    name: String,
+    description: String,
+    /// (argument name, required)
+    args: Vec<(String, bool)>,
+}
+
+/// One MCP-provided skill, flattened for the system-prompt catalog.
+pub struct McpSkill {
+    pub server: String,
+    pub name: String,
+    pub description: String,
+    pub args: Vec<(String, bool)>,
+}
+
 enum Transport {
     Stdio {
         _child: Child, // held for lifetime; killed on drop
@@ -72,6 +89,7 @@ struct McpServer {
     transport: Transport,
     next_id: u64,
     tools: Vec<McpTool>,
+    prompts: Vec<McpPrompt>,
 }
 
 impl McpHost {
@@ -101,8 +119,12 @@ impl McpHost {
                 }
                 match McpServer::start(name, spec).await {
                     Ok(s) => {
+                        let skills = match s.prompts.len() {
+                            0 => String::new(),
+                            n => format!(", {n} skill{}", if n == 1 { "" } else { "s" }),
+                        };
                         eprintln!(
-                            "\x1b[2mmcp: {} up ({} tool{})\x1b[0m",
+                            "\x1b[2mmcp: {} up ({} tool{}{skills})\x1b[0m",
                             name,
                             s.tools.len(),
                             if s.tools.len() == 1 { "" } else { "s" }
@@ -128,6 +150,54 @@ impl McpHost {
                 })
             })
             .collect()
+    }
+
+    /// Every MCP-provided skill (prompt) across connected servers.
+    pub fn skills(&self) -> Vec<McpSkill> {
+        self.servers
+            .iter()
+            .flat_map(|s| {
+                s.prompts.iter().map(|p| McpSkill {
+                    server: s.name.clone(),
+                    name: p.name.clone(),
+                    description: p.description.clone(),
+                    args: p.args.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Expand one skill via `prompts/get`, flattening its messages to text.
+    pub async fn get_skill(&mut self, server_name: &str, name: &str, args: &Value) -> Result<String> {
+        let server = self
+            .servers
+            .iter_mut()
+            .find(|s| s.name == server_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown mcp server: {server_name}"))?;
+        if !server.prompts.iter().any(|p| p.name == name) {
+            anyhow::bail!("server {server_name} has no skill named {name}");
+        }
+        let result = server
+            .request("prompts/get", json!({"name": name, "arguments": args}), CALL_TIMEOUT)
+            .await?;
+        let mut out = String::new();
+        for m in result["messages"].as_array().map(|a| a.as_slice()).unwrap_or_default() {
+            // `content` is one block or an array of blocks; text blocks only.
+            let one = std::slice::from_ref(&m["content"]);
+            let blocks = m["content"].as_array().map(|a| a.as_slice()).unwrap_or(one);
+            for b in blocks {
+                if b["type"].as_str() == Some("text") {
+                    if !out.is_empty() {
+                        out.push_str("\n\n");
+                    }
+                    out.push_str(b["text"].as_str().unwrap_or_default());
+                }
+            }
+        }
+        if out.is_empty() {
+            anyhow::bail!("skill {name} returned no text content");
+        }
+        Ok(out)
     }
 
     /// True when the server annotated this tool read-only (`readOnlyHint`).
@@ -258,9 +328,10 @@ impl McpServer {
             transport,
             next_id: 0,
             tools: Vec::new(),
+            prompts: Vec::new(),
         };
 
-        server
+        let init = server
             .request(
                 "initialize",
                 json!({
@@ -286,6 +357,35 @@ impl McpServer {
                     schema: t["inputSchema"].clone(),
                     read_only: t["annotations"]["readOnlyHint"].as_bool().unwrap_or(false),
                 });
+            }
+        }
+
+        // Prompts are how servers publish skills/playbooks. Fetch the catalog
+        // when the server advertises the capability; a failure here must not
+        // take the server down — its tools still work.
+        if init["capabilities"]["prompts"].is_object() {
+            if let Ok(listed) = server.request("prompts/list", json!({}), STARTUP_TIMEOUT).await {
+                for p in listed["prompts"].as_array().map(|a| a.as_slice()).unwrap_or_default() {
+                    if let Some(prompt_name) = p["name"].as_str() {
+                        let args = p["arguments"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|arg| {
+                                        arg["name"].as_str().map(|n| {
+                                            (n.to_string(), arg["required"].as_bool().unwrap_or(false))
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        server.prompts.push(McpPrompt {
+                            name: prompt_name.to_string(),
+                            description: p["description"].as_str().unwrap_or_default().to_string(),
+                            args,
+                        });
+                    }
+                }
             }
         }
         Ok(server)
@@ -470,19 +570,24 @@ mod tests {
     use super::*;
 
     /// A python one-file MCP server: initialize, tools/list with one `add`
-    /// tool, tools/call that adds two numbers.
+    /// tool, tools/call that adds two numbers, and one `greet` prompt.
     const MOCK_SERVER: &str = r#"
 import json, sys
 for line in sys.stdin:
     msg = json.loads(line)
     m, i = msg.get("method"), msg.get("id")
     if m == "initialize":
-        r = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "mock", "version": "0"}}
+        r = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}, "prompts": {}}, "serverInfo": {"name": "mock", "version": "0"}}
     elif m == "tools/list":
         r = {"tools": [{"name": "add", "description": "Add two numbers", "inputSchema": {"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}}}]}
     elif m == "tools/call":
         s = msg["params"]["arguments"]["a"] + msg["params"]["arguments"]["b"]
         r = {"content": [{"type": "text", "text": str(s)}], "isError": False}
+    elif m == "prompts/list":
+        r = {"prompts": [{"name": "greet", "description": "Say hello", "arguments": [{"name": "who", "required": True}, {"name": "tone"}]}]}
+    elif m == "prompts/get":
+        who = msg["params"].get("arguments", {}).get("who", "?")
+        r = {"messages": [{"role": "user", "content": {"type": "text", "text": "Hello " + who}}]}
     else:
         continue  # notification
     if i is not None:
@@ -510,6 +615,18 @@ for line in sys.stdin:
 
         let out = host.call("mcp__mock__add", &json!({"a": 2, "b": 3})).await.unwrap();
         assert_eq!(out, "5");
+
+        // prompts/list became the skills catalog…
+        let skills = host.skills();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].server, "mock");
+        assert_eq!(skills[0].name, "greet");
+        assert_eq!(skills[0].args, vec![("who".into(), true), ("tone".into(), false)]);
+
+        // …and prompts/get expands one to text
+        let body = host.get_skill("mock", "greet", &json!({"who": "world"})).await.unwrap();
+        assert_eq!(body, "Hello world");
+        assert!(host.get_skill("mock", "nope", &json!({})).await.is_err());
     }
 
     #[test]

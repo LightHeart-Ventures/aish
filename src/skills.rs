@@ -1,9 +1,14 @@
-//! Skills — reusable instruction packs in ~/.aish/skills/<name>/SKILL.md.
+//! Skills — reusable instruction packs from two sources, one catalog.
 //!
-//! The format is the Claude-skill convention: YAML frontmatter with `name:`
-//! and `description:`, then a markdown body. aish lists every skill's name,
-//! description, and path in the system prompt; the model reads the SKILL.md
-//! (and anything it references) with read_file when a task matches.
+//! Local: ~/.aish/skills/<name>/SKILL.md in the Claude-skill convention —
+//! YAML frontmatter with `name:` and `description:`, then a markdown body.
+//! The model reads the SKILL.md (and anything it references) with read_file
+//! when a task matches.
+//!
+//! MCP: servers publish skills as MCP prompts (`prompts/list`); mcp.rs
+//! fetches the catalog at connect time and the model expands one on demand
+//! with the get_skill tool. Both sources are advertised side by side in the
+//! system prompt.
 
 use std::path::{Path, PathBuf};
 
@@ -50,17 +55,37 @@ fn parse_frontmatter(text: &str) -> Option<(String, String)> {
     Some((name?, description?))
 }
 
-/// The system-prompt section advertising available skills.
-pub fn render_prompt_section(skills: &[Skill]) -> String {
-    if skills.is_empty() {
-        return String::new();
-    }
-    let mut s = String::from(
-        "\n\nSkills — expert playbooks on disk. When a task matches one, read its file \
+/// The system-prompt section advertising available skills from both sources.
+pub fn render_prompt_section(skills: &[Skill], mcp_skills: &[crate::mcp::McpSkill]) -> String {
+    let mut s = String::new();
+    if !skills.is_empty() {
+        s.push_str(
+            "\n\nSkills — expert playbooks on disk. When a task matches one, read its file \
 with read_file FIRST and follow it (it may reference further files next to it):\n",
-    );
-    for sk in skills {
-        s.push_str(&format!("- {} ({}): {}\n", sk.name, sk.path.display(), sk.description));
+        );
+        for sk in skills {
+            s.push_str(&format!("- {} ({}): {}\n", sk.name, sk.path.display(), sk.description));
+        }
+    }
+    if !mcp_skills.is_empty() {
+        s.push_str(
+            "\n\nMCP skills — the same idea, published by connected MCP servers. When a task \
+matches one, call get_skill {server, name, args} FIRST and follow what it returns:\n",
+        );
+        for sk in mcp_skills {
+            let args = if sk.args.is_empty() {
+                String::new()
+            } else {
+                // `name` required, `name?` optional — compact enough to scan
+                let list: Vec<String> = sk
+                    .args
+                    .iter()
+                    .map(|(n, req)| if *req { n.clone() } else { format!("{n}?") })
+                    .collect();
+                format!(" (args: {})", list.join(", "))
+            };
+            s.push_str(&format!("- {} (server: {}){}: {}\n", sk.name, sk.server, args, sk.description));
+        }
     }
     s
 }
@@ -78,5 +103,27 @@ mod tests {
         assert_eq!(d, "Does things.");
         assert!(parse_frontmatter("no frontmatter here").is_none());
         assert!(parse_frontmatter("---\nname: only-name\n---\n").is_none());
+    }
+
+    #[test]
+    fn prompt_section_merges_both_sources() {
+        let local = vec![Skill {
+            name: "deploy".into(),
+            description: "Ship it.".into(),
+            path: PathBuf::from("/s/deploy/SKILL.md"),
+        }];
+        let mcp = vec![crate::mcp::McpSkill {
+            server: "atum".into(),
+            name: "atum/sprint-status".into(),
+            description: "Summarize the sprint.".into(),
+            args: vec![("sprintId".into(), true), ("hours".into(), false)],
+        }];
+        let s = render_prompt_section(&local, &mcp);
+        assert!(s.contains("- deploy (/s/deploy/SKILL.md): Ship it."));
+        assert!(s.contains("- atum/sprint-status (server: atum) (args: sprintId, hours?): Summarize the sprint."));
+        // either source alone still renders; neither → empty
+        assert!(render_prompt_section(&local, &[]).contains("deploy"));
+        assert!(render_prompt_section(&[], &mcp).contains("get_skill"));
+        assert_eq!(render_prompt_section(&[], &[]), "");
     }
 }

@@ -125,6 +125,20 @@ this whenever the user says cd / go to / work in some directory.".into(),
                 "required": ["path"]
             }),
         },
+        ToolDef {
+            name: "get_skill".into(),
+            description: "Fetch an MCP-published skill playbook (the system prompt lists them \
+under 'MCP skills'). Returns the expanded instructions — read them, then follow them.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": {"type": "string", "description": "MCP server name, as listed"},
+                    "name": {"type": "string", "description": "Skill name, e.g. atum/sprint-status"},
+                    "args": {"type": "object", "description": "Skill arguments (string values), per the listed argument names"}
+                },
+                "required": ["server", "name"]
+            }),
+        },
     ]
 }
 
@@ -151,6 +165,7 @@ pub async fn execute(call: &ToolCall, session: &mut Session, confirm: &mut Confi
         "change_dir" => change_dir(call, session),
         "remember" => remember(call, session),
         "recall" => recall(call, session),
+        "get_skill" => get_skill(call, session).await,
         other if other.starts_with("mcp__") => mcp_call(call, session, confirm).await,
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
     };
@@ -580,6 +595,13 @@ fn recall(call: &ToolCall, session: &Session) -> Result<String> {
     let limit = call.args["limit"].as_u64().unwrap_or(8) as usize;
     let hits = db.recall(query, limit)?;
     Ok(if hits.is_empty() { "no memories match".into() } else { hits.join("\n") })
+}
+
+async fn get_skill(call: &ToolCall, session: &mut Session) -> Result<String> {
+    let server = call.args["server"].as_str().ok_or_else(|| anyhow::anyhow!("missing server"))?;
+    let name = call.args["name"].as_str().ok_or_else(|| anyhow::anyhow!("missing name"))?;
+    let args = if call.args["args"].is_object() { call.args["args"].clone() } else { json!({}) };
+    session.mcp.get_skill(server, name, &args).await
 }
 
 fn change_dir(call: &ToolCall, session: &mut Session) -> Result<String> {
