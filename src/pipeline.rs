@@ -145,7 +145,8 @@ mod tests {
         assert!(parse("a | | b").is_none());
         // a stage using other shell syntax routes the whole line to the model
         assert!(parse("a | b > c").is_none());
-        assert!(parse("cat x | grep $HOME").is_none());
+        // ($VAR in a stage is no longer machinery — the tokenizer expands it)
+        assert_eq!(parse("cat x | grep $HOME").unwrap().len(), 2);
     }
 
     #[test]

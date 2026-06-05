@@ -290,7 +290,18 @@ async fn dispatch(
     // connect each stage's stdout to the next stage's stdin. Run it directly
     // only when every stage is a real program; otherwise route to the model.
     if let Some(stages) = pipeline::parse(line) {
-        if stages.iter().all(|s| s.first().is_some_and(|p| resolve_program(p, &session.cwd).is_some())) {
+        // Same session-aware PATH the single-command path uses below.
+        let path_var = session
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var("PATH").ok())
+            .unwrap_or_default();
+        if stages.iter().all(|s| {
+            s.first().is_some_and(|p| resolve_program(p, &session.cwd, &path_var).is_some())
+        }) {
             match pipeline::run(&stages, session).await {
                 Ok(status) => {
                     if let Some(code) = status.code() {
@@ -310,9 +321,20 @@ async fn dispatch(
         return Dispatch::NotACommand;
     }
 
-    // Lines with shell machinery (pipes, $, globs, …) or that don't tokenize
-    // (apostrophes in English) go to the model.
-    let Some(mut words) = rc::tokenize(line) else {
+    // Lines with shell machinery (globs, redirection, …) or that don't
+    // tokenize (apostrophes in English) go to the model. `$VAR` references are
+    // expanded here against the session's exports first, then the process
+    // environment — matching what the spawned program would see.
+    let lookup = |name: &str| {
+        session
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var(name).ok())
+    };
+    let Some(mut words) = rc::tokenize_with(line, lookup) else {
         if force {
             eprintln!("aish: can't run that directly — it uses shell syntax aish doesn't implement");
             return Dispatch::Handled;
