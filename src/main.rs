@@ -1,7 +1,9 @@
 mod backend;
 mod db;
 mod engine;
+mod md;
 mod mcp;
+mod pipeline;
 mod rc;
 mod repl;
 mod session;
@@ -79,7 +81,7 @@ async fn main() -> Result<()> {
 
     if let Some(prompt) = args.command {
         let out = engine::run_turn(&backend, &mut session, prompt, &mut repl::confirm_tty).await?;
-        println!("{out}");
+        println!("{}", md::render_stdout(&out));
         return Ok(());
     }
 

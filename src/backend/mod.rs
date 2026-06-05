@@ -97,6 +97,18 @@ impl Backend {
         }
     }
 
+    /// MCP tool schemas can dwarf a small local context window (one server
+    /// with 144 tools is ~50k tokens of JSON Schema — past Qwen3-8B's 40960
+    /// limit before the conversation even starts), so only the Claude
+    /// backend gets them. Local runs with the built-in shell tools.
+    pub fn include_mcp_tools(&self) -> bool {
+        match self {
+            Backend::Claude(_) => true,
+            #[cfg(feature = "local")]
+            Backend::Local(_) => false,
+        }
+    }
+
     pub fn set_model(&mut self, model: String) {
         match self {
             Backend::Claude(b) => b.model = model,

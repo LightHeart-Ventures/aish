@@ -16,7 +16,9 @@ pub async fn run_turn(
 ) -> Result<String> {
     let system = session.system_prompt();
     let mut tool_defs = tools::tool_defs();
-    tool_defs.extend(session.mcp.tool_defs());
+    if backend.include_mcp_tools() {
+        tool_defs.extend(session.mcp.tool_defs());
+    }
     session.history.push(Msg::user(input));
 
     for _ in 0..MAX_ITERATIONS {
@@ -39,14 +41,15 @@ pub async fn run_turn(
 
         // Interim narration from the model, shown dim.
         if !turn.text.trim().is_empty() {
-            eprintln!("\x1b[2m{}\x1b[0m", turn.text.trim());
+            eprintln!("\x1b[2m{}\x1b[0m", crate::md::render(turn.text.trim(), "\x1b[2m"));
         }
 
         let mut results: Vec<ToolResult> = Vec::with_capacity(turn.tool_calls.len());
         for call in &turn.tool_calls {
-            eprintln!("\x1b[2m  ⚙ {}\x1b[0m", describe_call(call));
+            eprintln!("\x1b[2m  🔧 {}\x1b[0m", describe_call(call));
             results.push(tools::execute(call, session, confirm).await);
         }
+        eprintln!(); // breathing room between tool activity and what follows
         session.history.push(Msg::tool_results(results));
     }
 

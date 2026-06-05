@@ -238,6 +238,58 @@ fn expand_dollar(
     }
 }
 
+/// Split a command line into pipeline stages on unquoted `|`, tokenizing each
+/// stage with [`tokenize`]. `a | b | c` becomes three argv vectors.
+///
+/// Returns `None` — so the caller routes the line to the model — when the line
+/// uses shell machinery aish doesn't implement (any stage that [`tokenize`]
+/// rejects), a quote is unbalanced, or a pipeline stage is empty (`a |`,
+/// `| b`, `a || b`). A line with no pipe yields a single-stage pipeline.
+// Consumed by the pipeline executor (TASK-9); allow until that caller lands.
+#[allow(dead_code)]
+pub fn tokenize_pipeline(line: &str) -> Option<Vec<Vec<String>>> {
+    let segments = split_pipeline(line)?;
+    let piped = segments.len() > 1;
+    let mut stages = Vec::with_capacity(segments.len());
+    for seg in segments {
+        let words = tokenize(seg)?;
+        // An empty stage only makes sense around a pipe: `a |`, `|`, `a || b`.
+        if piped && words.is_empty() {
+            return None;
+        }
+        stages.push(words);
+    }
+    Some(stages)
+}
+
+/// Split on top-level (unquoted) `|`, returning the raw segments untouched.
+/// Pipes inside single/double quotes stay literal text. Returns `None` on an
+/// unbalanced quote so the pipeline routes to the model like other bad input.
+fn split_pipeline(line: &str) -> Option<Vec<&str>> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut chars = line.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            // Skip over a quoted span so an embedded `|` isn't a separator.
+            q @ ('\'' | '"') => loop {
+                match chars.next() {
+                    Some((_, ch)) if ch == q => break,
+                    Some(_) => {}
+                    None => return None, // unbalanced quote
+                }
+            },
+            '|' => {
+                segments.push(&line[start..i]);
+                start = i + 1; // '|' is one ASCII byte
+            }
+            _ => {}
+        }
+    }
+    segments.push(&line[start..]);
+    Some(segments)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +383,65 @@ mod tests {
         // malformed ${…} routes to the model
         assert!(tok("echo ${UNCLOSED").is_none());
         assert!(tok("echo ${}").is_none());
+    }
+
+    #[test]
+    fn pipeline_splits_stages() {
+        assert_eq!(
+            tokenize_pipeline("ls -la | grep rs | wc -l").unwrap(),
+            vec![
+                vec!["ls", "-la"],
+                vec!["grep", "rs"],
+                vec!["wc", "-l"],
+            ],
+        );
+        // single command is a one-stage pipeline
+        assert_eq!(tokenize_pipeline("ls -la").unwrap(), vec![vec!["ls", "-la"]]);
+        // pipes adjacent to arguments (no surrounding spaces)
+        assert_eq!(
+            tokenize_pipeline("a|b|c").unwrap(),
+            vec![vec!["a"], vec!["b"], vec!["c"]],
+        );
+    }
+
+    #[test]
+    fn pipeline_keeps_quoted_pipes_literal() {
+        // a quoted pipe is text, not a separator
+        assert_eq!(
+            tokenize_pipeline("grep 'a|b' x").unwrap(),
+            vec![vec!["grep", "a|b", "x"]],
+        );
+        // mix: real separator plus a quoted pipe inside a stage
+        assert_eq!(
+            tokenize_pipeline("echo 'x|y' | cat").unwrap(),
+            vec![vec!["echo", "x|y"], vec!["cat"]],
+        );
+    }
+
+    #[test]
+    fn pipeline_rejects_empty_stages() {
+        for line in ["a |", "| b", "a || b", "|", "a | | b"] {
+            assert!(tokenize_pipeline(line).is_none(), "should reject: {line}");
+        }
+    }
+
+    #[test]
+    fn pipeline_rejects_shell_machinery_in_a_stage() {
+        // a stage that itself uses unsupported syntax fails the whole pipeline
+        // (note: `$VAR` in a stage is no longer machinery — it expands now)
+        assert!(tokenize_pipeline("cat *.rs | wc").is_none());
+        // unbalanced quote routes to the model
+        assert!(tokenize_pipeline("echo 'oops | cat").is_none());
+    }
+
+    #[test]
+    fn pipeline_stages_expand_variables() {
+        // stages run through the same tokenizer, so `$VAR` expands per stage
+        // (process-env lookup; PATH is always set)
+        let stages = tokenize_pipeline("echo $PATH | cat").unwrap();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0][0], "echo");
+        assert!(!stages[0][1].contains('$'), "PATH must be expanded");
+        assert_eq!(stages[1], vec!["cat"]);
     }
 }

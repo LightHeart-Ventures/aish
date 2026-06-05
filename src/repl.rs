@@ -1,5 +1,6 @@
 use crate::backend::Backend;
 use crate::engine;
+use crate::pipeline;
 use crate::rc;
 use crate::session::Session;
 use crate::tools;
@@ -140,7 +141,7 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
                     println!("\x1b[33m^C\x1b[0m turn aborted");
                 } else if let Some(text) = reply {
                     if !text.trim().is_empty() {
-                        println!("{}", text.trim());
+                        println!("{}", crate::md::render_stdout(text.trim()));
                     }
                     if let Some(db) = &session.db {
                         db.record("output", &session.cwd.to_string_lossy(), &text);
@@ -285,7 +286,31 @@ async fn dispatch(
     aliases: &HashMap<String, Vec<String>>,
     prev_dir: &mut Option<PathBuf>,
 ) -> Dispatch {
-    // Lines with shell machinery (pipes, globs, redirection, …) or that don't
+    // A pipeline (a | b | c) is the one bit of shell syntax aish runs itself:
+    // connect each stage's stdout to the next stage's stdin. Run it directly
+    // only when every stage is a real program; otherwise route to the model.
+    if let Some(stages) = pipeline::parse(line) {
+        if stages.iter().all(|s| s.first().is_some_and(|p| resolve_program(p, &session.cwd).is_some())) {
+            match pipeline::run(&stages, session).await {
+                Ok(status) => {
+                    if let Some(code) = status.code() {
+                        if code != 0 {
+                            eprintln!("\x1b[2m[exit {code}]\x1b[0m");
+                        }
+                    }
+                }
+                Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e:#}"),
+            }
+            return Dispatch::Handled;
+        }
+        if force {
+            eprintln!("aish: a pipeline stage isn't an executable — can't run it directly");
+            return Dispatch::Handled;
+        }
+        return Dispatch::NotACommand;
+    }
+
+    // Lines with shell machinery (globs, redirection, …) or that don't
     // tokenize (apostrophes in English) go to the model. `$VAR` references are
     // expanded here against the session's exports first, then the process
     // environment — matching what the spawned program would see.
@@ -454,7 +479,10 @@ fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -> bool
                     println!("already on {}", backend.describe());
                 } else {
                     *backend = Backend::new_local();
-                    println!("backend → {} (loads on first use)", backend.describe());
+                    println!(
+                        "backend → {} (loads on first use; MCP tools off — they don't fit a small context window)",
+                        backend.describe()
+                    );
                 }
             }
             #[cfg(not(feature = "local"))]
