@@ -273,10 +273,23 @@ const AMBIGUOUS_COMMANDS: &[&str] = &[
 ];
 
 fn looks_like_prose(line: &str, words: &[String]) -> bool {
-    words.len() >= 3
-        && AMBIGUOUS_COMMANDS.contains(&words[0].as_str())
-        && !line.contains(['"', '\''])
-        && words.iter().all(|w| w.chars().all(|c| c.is_ascii_alphabetic()))
+    if words.len() < 3
+        || !AMBIGUOUS_COMMANDS.contains(&words[0].as_str())
+        || line.contains(['"', '\''])
+    {
+        return false;
+    }
+    // A comma reads as a sentence, not an argv — "watch for events from atum,
+    // let me know…" must go to the model even though `watch` is real.
+    if line.contains(", ") {
+        return true;
+    }
+    // Otherwise every word must be plain alphabetic, with trailing sentence
+    // punctuation forgiven; flags (-n), paths (a/b), and digits stay commands.
+    words.iter().all(|w| {
+        let w = w.trim_end_matches([',', '.', '!', '?', ';', ':']);
+        !w.is_empty() && w.chars().all(|c| c.is_ascii_alphabetic())
+    })
 }
 
 async fn dispatch(
@@ -614,6 +627,15 @@ mod tests {
         assert!(!prose("tail logfile"));
         assert!(!prose("echo hello there world")); // echo isn't ambiguous
         assert!(!prose("cat \"my file\" backup")); // quotes signal shell intent
+
+        // sentence punctuation is prose evidence, not command evidence
+        assert!(prose("watch for events from atum, let me know about activity in this sprint"));
+        assert!(prose("find big files, oldest first"));
+        // `?` is a glob metachar: tokenize already rejects it → model
+        assert!(rc::tokenize("who is on this machine right now?").is_none());
+        // …but flags/paths still win even with a trailing comma elsewhere
+        assert!(!prose("watch -n 5 free"));
+        assert!(!prose("tail logs/app.log"));
     }
 
     #[test]
