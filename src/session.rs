@@ -89,6 +89,20 @@ impl Session {
         })
     }
 
+    /// True when `key` is on the persistent always-allow list (a prior 'a'
+    /// answer at a confirmation prompt). Best-effort: no store → not allowed.
+    pub fn is_tool_allowed(&self, key: &str) -> bool {
+        self.db.as_ref().is_some_and(|db| db.is_allowed(key).unwrap_or(false))
+    }
+
+    /// Persist `key` on the always-allow list. Best-effort: a no-op (degrading
+    /// 'always' to 'once') when the store is unavailable.
+    pub fn allow_tool(&self, key: &str) {
+        if let Some(db) = &self.db {
+            let _ = db.allow(key);
+        }
+    }
+
     pub fn system_prompt(&self) -> String {
         // NOTE: deliberately static after session start (starting dir, not live cwd)
         // so the prompt-cache prefix never changes. The model learns cwd changes
