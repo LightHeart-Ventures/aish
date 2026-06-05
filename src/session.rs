@@ -106,7 +106,13 @@ only learn the exit status. Use run_program whenever you need the output yoursel
 - You have persistent memory across sessions: `remember` stores a durable fact, `recall` \
 searches by keyword. recall when prior preferences or decisions might matter; remember \
 preferences, project facts, and lessons worth keeping.\n\
-- Final replies are terse and shell-like. One line when one line will do. No markdown headers.{skills}",
+- When a reply lists more than one item (files, processes, packages, search hits, results), \
+prefer a markdown table over prose: a header row plus one row per item, with the columns that \
+matter — aish renders these as aligned terminal tables. Be verbose with columns rather than \
+terse, and order the rows deliberately: chronological for events or history, by stage for \
+pipelines or build/run phases, by category for mixed or grouped sets.\n\
+- Final replies are terse and shell-like. One line when one line will do, but reach for a table \
+the moment there are several items to compare. No markdown headers.{skills}",
             host = self.host_info,
             cwd = self.cwd.display(),
             skills = self.skills_prompt,
