@@ -1,5 +1,6 @@
 use crate::backend::Backend;
 use crate::engine;
+use crate::pipeline;
 use crate::rc;
 use crate::session::Session;
 use crate::tools;
@@ -285,6 +286,30 @@ async fn dispatch(
     aliases: &HashMap<String, Vec<String>>,
     prev_dir: &mut Option<PathBuf>,
 ) -> Dispatch {
+    // A pipeline (a | b | c) is the one bit of shell syntax aish runs itself:
+    // connect each stage's stdout to the next stage's stdin. Run it directly
+    // only when every stage is a real program; otherwise route to the model.
+    if let Some(stages) = pipeline::parse(line) {
+        if stages.iter().all(|s| s.first().is_some_and(|p| resolve_program(p, &session.cwd).is_some())) {
+            match pipeline::run(&stages, session).await {
+                Ok(status) => {
+                    if let Some(code) = status.code() {
+                        if code != 0 {
+                            eprintln!("\x1b[2m[exit {code}]\x1b[0m");
+                        }
+                    }
+                }
+                Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e:#}"),
+            }
+            return Dispatch::Handled;
+        }
+        if force {
+            eprintln!("aish: a pipeline stage isn't an executable — can't run it directly");
+            return Dispatch::Handled;
+        }
+        return Dispatch::NotACommand;
+    }
+
     // Lines with shell machinery (pipes, $, globs, …) or that don't tokenize
     // (apostrophes in English) go to the model.
     let Some(mut words) = rc::tokenize(line) else {

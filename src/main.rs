@@ -3,6 +3,7 @@ mod db;
 mod engine;
 mod md;
 mod mcp;
+mod pipeline;
 mod rc;
 mod repl;
 mod session;
