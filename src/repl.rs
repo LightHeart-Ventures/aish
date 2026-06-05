@@ -343,6 +343,7 @@ async fn dispatch(
         }) {
             match pipeline::run(&stages, session).await {
                 Ok(status) => {
+                    session.set_last_status(&status);
                     if let Some(code) = status.code() {
                         if code != 0 {
                             eprintln!("\x1b[2m[exit {code}]\x1b[0m");
@@ -365,6 +366,9 @@ async fn dispatch(
     // expanded here against the session's exports first, then the process
     // environment — matching what the spawned program would see.
     let lookup = |name: &str| {
+        if name == "?" {
+            return Some(session.last_status.to_string());
+        }
         session
             .env
             .iter()
@@ -433,6 +437,7 @@ async fn dispatch(
             };
             match tools::run_on_tty(&path.to_string_lossy(), &words[1..], session).await {
                 Ok(status) => {
+                    session.set_last_status(&status);
                     if let Some(code) = status.code() {
                         if code != 0 {
                             eprintln!("\x1b[2m[exit {code}]\x1b[0m");

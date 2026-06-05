@@ -353,7 +353,7 @@ fn parse_argv(call: &ToolCall) -> Result<(String, Vec<String>)> {
     Ok((program, args))
 }
 
-async fn run_program(call: &ToolCall, session: &Session, confirm: &mut Confirm<'_>) -> Result<String> {
+async fn run_program(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
     let (program, args) = parse_argv(call)?;
 
     let timeout_secs = call.args["timeout_secs"]
@@ -398,6 +398,9 @@ async fn run_program(call: &ToolCall, session: &Session, confirm: &mut Confirm<'
         }
     }
     .map_err(|e| anyhow::anyhow!("failed to wait on {program}: {e}"))?;
+
+    // A model-run command counts toward `$?` just like a directly-dispatched one.
+    session.set_last_status(&status);
 
     let stdout = await_capture(&mut out_task).await;
     let stderr = await_capture(&mut err_task).await;
@@ -483,7 +486,7 @@ async fn await_capture(task: &mut tokio::task::JoinHandle<(Vec<u8>, Vec<u8>, u64
     }
 }
 
-async fn run_interactive(call: &ToolCall, session: &Session, confirm: &mut Confirm<'_>) -> Result<String> {
+async fn run_interactive(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
     let (program, args) = parse_argv(call)?;
 
     let display = format!("{} {}", program, args.join(" "));
@@ -494,6 +497,7 @@ async fn run_interactive(call: &ToolCall, session: &Session, confirm: &mut Confi
     }
 
     let status = run_on_tty(&program, &args, session).await?;
+    session.set_last_status(&status);
     Ok(match status.code() {
         Some(code) => format!("[interactive session ended: exit code {code}]"),
         None => {
@@ -740,6 +744,18 @@ mod tests {
     async fn nonzero_exit_reported() {
         let out = run(&call("false", &[], None)).await;
         assert!(out.contains("[exit code: 1]"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn model_run_command_tracks_dollar_question() {
+        // A model-run command updates `$?` just like a directly-dispatched one.
+        let mut session = Session::new().unwrap();
+        session.mode = crate::session::Mode::Yolo;
+        let mut confirm = |_: &str| Decision::AllowOnce;
+        let _ = execute(&call("false", &[], None), &mut session, &mut confirm).await;
+        assert_eq!(session.last_status, 1);
+        let _ = execute(&call("true", &[], None), &mut session, &mut confirm).await;
+        assert_eq!(session.last_status, 0);
     }
 
     #[test]
