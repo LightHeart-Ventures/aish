@@ -20,6 +20,7 @@ pub async fn run_turn(
         tool_defs.extend(session.mcp.tool_defs());
     }
     session.history.push(Msg::user(input));
+    session.last_turn_tools.clear();
 
     for _ in 0..MAX_ITERATIONS {
         let spinner = Spinner::start();
@@ -46,8 +47,14 @@ pub async fn run_turn(
 
         let mut results: Vec<ToolResult> = Vec::with_capacity(turn.tool_calls.len());
         for call in &turn.tool_calls {
-            eprintln!("\x1b[2m  🔧 {}\x1b[0m", describe_call(call));
-            results.push(tools::execute(call, session, confirm).await);
+            let desc = describe_call(call);
+            eprintln!("\x1b[2m  🔧 {desc}\x1b[0m");
+            let result = tools::execute(call, session, confirm).await;
+            if session.raw_tool_output {
+                print_raw_result(&result);
+            }
+            session.last_turn_tools.push((desc, result.clone()));
+            results.push(result);
         }
         eprintln!(); // breathing room between tool activity and what follows
         session.history.push(Msg::tool_results(results));
@@ -112,5 +119,51 @@ fn describe_call(call: &crate::backend::ToolCall) -> String {
         "remember" => format!("remember: {}", a["content"].as_str().unwrap_or("?")),
         "recall" => format!("recall: {}", a["query"].as_str().unwrap_or("(recent)")),
         other => other.to_string(),
+    }
+}
+
+/// The text echoed (dim) for a tool result's raw body. Empty results get a
+/// placeholder so an error with no output still shows *something*.
+fn raw_body(result: &ToolResult) -> &str {
+    if result.content.trim().is_empty() {
+        "(no output)"
+    } else {
+        result.content.as_str()
+    }
+}
+
+/// Echo one tool result's raw content dim, nested under its 🔧 line. Printed
+/// verbatim and never truncated — squelching (Ctrl-O) is the size control.
+fn print_raw_result(result: &ToolResult) {
+    for line in raw_body(result).lines() {
+        eprintln!("\x1b[2m     {line}\x1b[0m");
+    }
+}
+
+/// Re-print the most recent turn's tool calls and their raw results. Drives the
+/// retroactive reveal when raw output is toggled on after an answer.
+pub fn reveal_last_turn(session: &Session) {
+    for (desc, result) in &session.last_turn_tools {
+        eprintln!("\x1b[2m  🔧 {desc}\x1b[0m");
+        print_raw_result(result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_body_placeholder() {
+        let mk = |content: &str, is_error| ToolResult {
+            id: "t".into(),
+            content: content.into(),
+            is_error,
+        };
+        assert_eq!(raw_body(&mk("hello", false)), "hello");
+        assert_eq!(raw_body(&mk("", true)), "(no output)");
+        assert_eq!(raw_body(&mk("   \n ", false)), "(no output)");
+        // error results keep their content — they are included, not skipped
+        assert_eq!(raw_body(&mk("boom", true)), "boom");
     }
 }

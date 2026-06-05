@@ -11,11 +11,15 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
-use rustyline::{Context, Editor, Helper};
+use rustyline::{
+    Cmd, ConditionalEventHandler, Context, Editor, Event, EventContext, EventHandler, Helper,
+    KeyEvent, RepeatCount,
+};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Blocking y/N prompt on the controlling TTY.
 pub fn confirm_tty(prompt: &str) -> bool {
@@ -46,6 +50,15 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
     rl.set_helper(Some(AishHelper { cwd: session.cwd.clone() }));
     let history_path = dirs_history_path();
     let _ = rl.load_history(&history_path);
+
+    // Ctrl-O toggles raw tool output. The handler can't reach the Session, so
+    // it just flags the request and bails out of the line editor (Interrupt);
+    // the loop below performs the toggle, status line, and retroactive reveal.
+    let raw_toggle = Arc::new(AtomicBool::new(false));
+    rl.bind_sequence(
+        KeyEvent::ctrl('O'),
+        EventHandler::Conditional(Box::new(CtrlOToggle { pending: raw_toggle.clone() })),
+    );
 
     // Start on a clean screen (interactive terminals only — keep piped output clean).
     // SAFETY: plain isatty query.
@@ -148,7 +161,14 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
                     }
                 }
             }
-            Err(ReadlineError::Interrupted) => continue, // Ctrl-C at prompt: clear line
+            Err(ReadlineError::Interrupted) => {
+                // Ctrl-O routes here too (handler returns Interrupt); distinguish
+                // it from a plain Ctrl-C clear-line via the toggle flag.
+                if raw_toggle.swap(false, Ordering::SeqCst) {
+                    toggle_raw_output(&mut session);
+                }
+                continue;
+            }
             Err(ReadlineError::Eof) => break,            // Ctrl-D: exit
             Err(e) => {
                 eprintln!("aish: readline error: {e}");
@@ -449,6 +469,32 @@ fn resolve_program(cmd: &str, cwd: &Path, path_var: &str) -> Option<PathBuf> {
     None
 }
 
+/// Ctrl-O key handler: signal a raw-output toggle and leave the line editor so
+/// the run loop can act on it. Returns `Cmd::Interrupt` to discard the typed
+/// line without submitting it.
+struct CtrlOToggle {
+    pending: Arc<AtomicBool>,
+}
+
+impl ConditionalEventHandler for CtrlOToggle {
+    fn handle(&self, _: &Event, _: RepeatCount, _: bool, _: &EventContext) -> Option<Cmd> {
+        self.pending.store(true, Ordering::SeqCst);
+        Some(Cmd::Interrupt)
+    }
+}
+
+/// Flip raw tool output, print one-line status, and — when switching on —
+/// reveal the most recent turn's raw results.
+fn toggle_raw_output(session: &mut Session) {
+    session.raw_tool_output = !session.raw_tool_output;
+    if session.raw_tool_output {
+        println!("\x1b[2mraw tool output on\x1b[0m");
+        engine::reveal_last_turn(session);
+    } else {
+        println!("\x1b[2mraw tool output off\x1b[0m");
+    }
+}
+
 /// Returns true when the REPL should exit.
 fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -> bool {
     let mut parts = cmd.split_whitespace();
@@ -464,6 +510,7 @@ fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -> bool
                  :backend <claude|local>             switch backend\n\
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
+                 Ctrl-O                              toggle raw tool output (show/squelch tool results)\n\
                  :quit                               exit (also Ctrl-D or `exit`)"
             );
         }
