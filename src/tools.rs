@@ -4,8 +4,9 @@ use anyhow::Result;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 const MAX_OUTPUT: usize = 50_000; // bytes of program output fed back to the model
 const MAX_FILE_READ: usize = 100_000;
@@ -35,7 +36,9 @@ cut off, they can't hang the session."
                 "properties": {
                     "program": {"type": "string", "description": "Binary name (resolved via PATH) or absolute path"},
                     "args": {"type": "array", "items": {"type": "string"}, "description": "Argument vector (no quoting/escaping — pass each arg as-is)"},
-                    "timeout_secs": {"type": "integer", "description": "Kill the program after this many seconds (default 120, max 3600). Raise for slow builds; lower to sample a continuous monitor."}
+                    "timeout_secs": {"type": "integer", "description": "Kill the program after this many seconds (default 120, max 3600). Raise for slow builds; lower to sample a continuous monitor. Ignored for background jobs."},
+                    "env": {"type": "object", "description": "Extra environment variables (string values). A value may reference \"${NAME}\" (session exports, then process env) or \"${profile:KEY}\" (resolved from ~/.atum/credentials section [profile] at spawn time) — use the reference for secrets so their values never enter the conversation."},
+                    "background": {"type": "boolean", "description": "Run detached as a background job: returns a job id immediately, the program runs until it exits or :kill, its output streams live to the user's terminal, and you can read the accumulated output anytime with job_output. Use for watchers, listeners, tails, and servers."}
                 },
                 "required": ["program"]
             }),
@@ -52,7 +55,8 @@ whenever you need the output."
                 "type": "object",
                 "properties": {
                     "program": {"type": "string", "description": "Binary name (resolved via PATH) or absolute path"},
-                    "args": {"type": "array", "items": {"type": "string"}, "description": "Argument vector (no quoting/escaping — pass each arg as-is)"}
+                    "args": {"type": "array", "items": {"type": "string"}, "description": "Argument vector (no quoting/escaping — pass each arg as-is)"},
+                    "env": {"type": "object", "description": "Extra environment variables (string values). Supports \"${NAME}\" and \"${profile:KEY}\" references like run_program's env."}
                 },
                 "required": ["program"]
             }),
@@ -126,6 +130,19 @@ this whenever the user says cd / go to / work in some directory.".into(),
             }),
         },
         ToolDef {
+            name: "job_output".into(),
+            description: "Read a background job's accumulated output and status (started via \
+run_program with background:true). Use this to check on watchers/listeners you started earlier — \
+their output does NOT reach you by push, only the user's terminal sees it live.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "job": {"type": "integer", "description": "Job id, as returned when the job started (also shown by :jobs)"}
+                },
+                "required": ["job"]
+            }),
+        },
+        ToolDef {
             name: "get_skill".into(),
             description: "Fetch an MCP-published skill playbook (the system prompt lists them \
 under 'MCP skills'). Returns the expanded instructions — read them, then follow them.".into(),
@@ -165,6 +182,7 @@ pub async fn execute(call: &ToolCall, session: &mut Session, confirm: &mut Confi
         "change_dir" => change_dir(call, session),
         "remember" => remember(call, session),
         "recall" => recall(call, session),
+        "job_output" => job_output(call, session),
         "get_skill" => get_skill(call, session).await,
         other if other.starts_with("mcp__") => mcp_call(call, session, confirm).await,
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
@@ -313,21 +331,33 @@ fn parse_argv(call: &ToolCall) -> Result<(String, Vec<String>)> {
 
 async fn run_program(call: &ToolCall, session: &Session, confirm: &mut Confirm<'_>) -> Result<String> {
     let (program, args) = parse_argv(call)?;
+    let env = resolve_env(call, session);
+    let background = call.args["background"].as_bool() == Some(true);
 
     let timeout_secs = call.args["timeout_secs"]
         .as_u64()
         .unwrap_or(DEFAULT_TIMEOUT_SECS)
         .clamp(1, MAX_TIMEOUT_SECS);
 
-    let display = format!("{} {}", program, args.join(" "));
+    let display = format!(
+        "{} {}{}",
+        program,
+        args.join(" "),
+        if background { " (background)" } else { "" }
+    );
     if exec_needs_confirm(session.mode, &program, &args) && !confirm(display.trim()) {
         return Ok("user declined to run this command".into());
+    }
+
+    if background {
+        return spawn_background(&program, &args, &env, session, display);
     }
 
     let mut child = tokio::process::Command::new(&program)
         .args(&args)
         .current_dir(&session.cwd)
         .envs(session.env.iter().map(|(k, v)| (k, v)))
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -388,6 +418,206 @@ async fn run_program(call: &ToolCall, session: &Session, confirm: &mut Confirm<'
     Ok(truncate_middle(out, MAX_OUTPUT))
 }
 
+// ---------------------------------------------------------------------------
+// Background jobs — detached children whose output streams to the user live
+// and accumulates (capped) for the model to read with job_output.
+// ---------------------------------------------------------------------------
+
+const JOB_BUFFER_CAP: usize = 64_000; // bytes of retained output per job
+
+pub struct Job {
+    pub id: usize,
+    pub desc: String,
+    buffer: Arc<Mutex<String>>,
+    /// Exit summary once finished; None while running.
+    pub done: Arc<Mutex<Option<String>>>,
+    kill: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+pub type Jobs = Arc<Mutex<Vec<Arc<Job>>>>;
+
+impl Job {
+    /// "running" or the exit summary.
+    pub fn status(&self) -> String {
+        self.done.lock().unwrap().clone().unwrap_or_else(|| "running".into())
+    }
+
+    /// Ask the waiter task to kill the child. False when already finished.
+    pub fn kill(&self) -> bool {
+        self.kill.lock().unwrap().take().is_some_and(|tx| tx.send(()).is_ok())
+    }
+}
+
+/// Print one line from a background source (job output, MCP notification)
+/// over the top of whatever is on the current terminal line — rustyline
+/// redraws its prompt on the next keypress.
+pub fn announce(prefix: &str, line: &str) {
+    eprint!("\r\x1b[2K\x1b[2m{prefix} {line}\x1b[0m\n");
+}
+
+fn spawn_background(
+    program: &str,
+    args: &[String],
+    env: &[(String, String)],
+    session: &Session,
+    display: String,
+) -> Result<String> {
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .current_dir(&session.cwd)
+        .envs(session.env.iter().map(|(k, v)| (k, v)))
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // The Child moves into the waiter task below, so this only fires if
+        // aish itself shuts down — background jobs die with the shell.
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to exec {program}: {e}"))?;
+    let pid = child.id().unwrap_or_default();
+
+    let mut jobs = session.jobs.lock().unwrap();
+    let id = jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
+    let (kill_tx, kill_rx) = tokio::sync::oneshot::channel();
+    let job = Arc::new(Job {
+        id,
+        desc: display,
+        buffer: Arc::new(Mutex::new(String::new())),
+        done: Arc::new(Mutex::new(None)),
+        kill: Mutex::new(Some(kill_tx)),
+    });
+
+    stream_job_pipe(child.stdout.take().expect("piped"), job.clone());
+    stream_job_pipe(child.stderr.take().expect("piped"), job.clone());
+
+    // Waiter owns the child for its whole life.
+    let waiter_job = job.clone();
+    tokio::spawn(async move {
+        let status = tokio::select! {
+            s = child.wait() => s,
+            _ = kill_rx => {
+                child.start_kill().ok();
+                child.wait().await
+            }
+        };
+        let summary = match status {
+            Ok(s) => match s.code() {
+                Some(code) => format!("exited {code}"),
+                None => "killed".into(),
+            },
+            Err(e) => format!("wait failed: {e}"),
+        };
+        *waiter_job.done.lock().unwrap() = Some(summary.clone());
+        announce(&format!("[job {}]", waiter_job.id), &format!("{summary} — {}", waiter_job.desc));
+    });
+
+    jobs.push(job);
+    Ok(format!(
+        "started background job {id} (pid {pid}). It runs until it exits or the user kills it \
+(:kill {id}); its output streams live to the user's terminal. You do NOT receive that output — \
+read it with job_output {{\"job\": {id}}} when you need it."
+    ))
+}
+
+/// Stream one job pipe line by line: echo to the terminal, append to the
+/// job's capped buffer.
+fn stream_job_pipe<R>(pipe: R, job: Arc<Job>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(pipe).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            {
+                let mut buf = job.buffer.lock().unwrap();
+                buf.push_str(&line);
+                buf.push('\n');
+                if buf.len() > JOB_BUFFER_CAP {
+                    let mut cut = buf.len() - JOB_BUFFER_CAP;
+                    while !buf.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    buf.drain(..cut);
+                }
+            }
+            announce(&format!("[job {}]", job.id), &line);
+        }
+    });
+}
+
+fn job_output(call: &ToolCall, session: &Session) -> Result<String> {
+    let id = call.args["job"].as_u64().ok_or_else(|| anyhow::anyhow!("missing job id"))? as usize;
+    let jobs = session.jobs.lock().unwrap();
+    let job = jobs
+        .iter()
+        .find(|j| j.id == id)
+        .ok_or_else(|| anyhow::anyhow!("no such job: {id} (see :jobs)"))?;
+    let buf = job.buffer.lock().unwrap();
+    Ok(format!(
+        "[job {id}: {}] {}\n{}",
+        job.status(),
+        job.desc,
+        if buf.is_empty() { "(no output yet)" } else { buf.as_str() }
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Spawn environment — the call's `env` object, with secret-safe references
+// ---------------------------------------------------------------------------
+
+/// Extra env for a spawn. Values may reference `${NAME}` (session exports,
+/// then process env) or `${profile:KEY}` (~/.atum/credentials) — resolved
+/// here at spawn time so secret values never enter the conversation.
+fn resolve_env(call: &ToolCall, session: &Session) -> Vec<(String, String)> {
+    let Some(map) = call.args["env"].as_object() else {
+        return Vec::new();
+    };
+    let creds = format!("{}/.atum/credentials", std::env::var("HOME").unwrap_or_default());
+    map.iter()
+        .filter_map(|(k, v)| {
+            v.as_str().map(|v| (k.clone(), resolve_env_value(v, &session.env, &creds)))
+        })
+        .collect()
+}
+
+fn resolve_env_value(raw: &str, session_env: &[(String, String)], creds_file: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let name = &after[..end];
+        let resolved = if let Some((profile, key)) = name.split_once(':') {
+            crate::mcp::load_profile(creds_file, profile).get(key).cloned()
+        } else {
+            session_env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .or_else(|| std::env::var(name).ok())
+        };
+        match resolved {
+            Some(v) => out.push_str(&v),
+            // Unresolvable: keep the reference verbatim so the failure
+            // surfaces in the program, not silently as an empty string.
+            None => {
+                out.push_str("${");
+                out.push_str(name);
+                out.push('}');
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Read a pipe to EOF, keeping at most `cap` bytes: a head prefix plus a tail
 /// ring, mirroring truncate_middle's head+tail split. Excess is drained and
 /// discarded so the child never stalls on a full pipe.
@@ -441,13 +671,14 @@ async fn await_capture(task: &mut tokio::task::JoinHandle<(Vec<u8>, Vec<u8>, u64
 
 async fn run_interactive(call: &ToolCall, session: &Session, confirm: &mut Confirm<'_>) -> Result<String> {
     let (program, args) = parse_argv(call)?;
+    let env = resolve_env(call, session);
 
     let display = format!("{} {}", program, args.join(" "));
     if exec_needs_confirm(session.mode, &program, &args) && !confirm(display.trim()) {
         return Ok("user declined to run this command".into());
     }
 
-    let status = run_on_tty(&program, &args, session).await?;
+    let status = run_on_tty(&program, &args, &env, session).await?;
     Ok(match status.code() {
         Some(code) => format!("[interactive session ended: exit code {code}]"),
         None => {
@@ -468,6 +699,7 @@ async fn run_interactive(call: &ToolCall, session: &Session, confirm: &mut Confi
 pub async fn run_on_tty(
     program: &str,
     args: &[String],
+    extra_env: &[(String, String)],
     session: &Session,
 ) -> Result<std::process::ExitStatus> {
     let _guard = TtyGuard::engage(session.tty_handoff.clone());
@@ -475,6 +707,7 @@ pub async fn run_on_tty(
         .args(args)
         .current_dir(&session.cwd)
         .envs(session.env.iter().map(|(k, v)| (k, v)))
+        .envs(extra_env.iter().map(|(k, v)| (k, v)))
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to exec {program}: {e}"))?
@@ -649,6 +882,27 @@ fn char_ceil(s: &str, mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_value_resolution() {
+        let creds = std::env::temp_dir().join(format!("aish_env_creds_{}", std::process::id()));
+        std::fs::write(&creds, "[aish]\nATUM_API_KEY = sk_secret\n[other]\nATUM_API_KEY = nope\n").unwrap();
+        let creds = creds.to_str().unwrap().to_string();
+        let session_env = vec![("FOO".to_string(), "from_session".to_string())];
+
+        // session exports win; ${profile:KEY} reads the right INI section
+        assert_eq!(resolve_env_value("${FOO}", &session_env, &creds), "from_session");
+        assert_eq!(resolve_env_value("${aish:ATUM_API_KEY}", &session_env, &creds), "sk_secret");
+        // composition with literal text
+        assert_eq!(resolve_env_value("Bearer ${aish:ATUM_API_KEY}!", &session_env, &creds), "Bearer sk_secret!");
+        // process env fallback (PATH is always set), unresolved kept verbatim
+        assert_ne!(resolve_env_value("${PATH}", &[], &creds), "${PATH}");
+        assert_eq!(resolve_env_value("${NO_SUCH_VAR_XYZ}", &[], &creds), "${NO_SUCH_VAR_XYZ}");
+        assert_eq!(resolve_env_value("${missing:KEY}", &[], &creds), "${missing:KEY}");
+        // no references: passthrough
+        assert_eq!(resolve_env_value("plain", &[], &creds), "plain");
+        let _ = std::fs::remove_file(&creds);
+    }
 
     fn call(program: &str, args: &[&str], timeout_secs: Option<u64>) -> ToolCall {
         let mut a = json!({"program": program, "args": args});

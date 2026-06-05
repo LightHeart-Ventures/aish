@@ -289,8 +289,9 @@ fn interpolate(s: &str, vars: &HashMap<String, String>) -> String {
 }
 
 /// Read one `[profile]` section of an INI-style credentials file
-/// (`KEY = value` lines, AWS-credentials shaped).
-fn load_profile(file: &str, profile: &str) -> HashMap<String, String> {
+/// (`KEY = value` lines, AWS-credentials shaped). Shared with tools.rs for
+/// `${profile:KEY}` references in spawn env values.
+pub(crate) fn load_profile(file: &str, profile: &str) -> HashMap<String, String> {
     let path = if let Some(rest) = file.strip_prefix("~/") {
         Path::new(&std::env::var("HOME").unwrap_or_default()).join(rest)
     } else {
@@ -358,6 +359,20 @@ impl McpServer {
                     read_only: t["annotations"]["readOnlyHint"].as_bool().unwrap_or(false),
                 });
             }
+        }
+
+        // Server→client notifications ride a separate GET SSE stream on the
+        // same URL (MCP streamable HTTP). Hold one open per HTTP server so
+        // pushes (e.g. atum_subscribe_events deliveries) surface on the
+        // user's terminal instead of vanishing. Servers without GET support
+        // are detected on the first attempt and left alone.
+        if let Transport::Http { url, headers, session, .. } = &server.transport {
+            tokio::spawn(notification_stream(
+                server.name.clone(),
+                url.clone(),
+                headers.clone(),
+                session.clone(),
+            ));
         }
 
         // Prompts are how servers publish skills/playbooks. Fetch the catalog
@@ -547,10 +562,110 @@ impl McpServer {
             if msg["method"].as_str() == Some("ping") && !msg["id"].is_null() {
                 let pong = json!({"jsonrpc": "2.0", "id": msg["id"].clone(), "result": {}});
                 self.send(&pong).await?;
+                continue;
             }
-            // anything else: notification or unrelated traffic — keep reading
+            // Surface pushes that arrive while we're mid-request. (Between
+            // requests nothing reads a stdio pipe — push-heavy servers
+            // should use the HTTP transport, which has a dedicated stream.)
+            announce_notification(&self.name, &msg);
         }
     }
+}
+
+/// Hold a GET SSE stream open against an HTTP MCP server and announce every
+/// `notifications/*` it pushes. Quiet connections get idle-timed out by load
+/// balancers, so the reconnect loop is load-bearing; a server that rejects
+/// the first GET (405/406, wrong content type) simply doesn't push — give up
+/// silently in that case only.
+async fn notification_stream(
+    server: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    session: Option<String>,
+) {
+    const RECONNECT: Duration = Duration::from_secs(5);
+    // The shared client carries a global request timeout that would kill a
+    // long-lived stream; build a timeout-free one for this task.
+    let Ok(client) = reqwest::Client::builder().build() else {
+        return;
+    };
+    let mut connected_once = false;
+    loop {
+        let mut req = client.get(&url).header("accept", "text/event-stream");
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+        if let Some(s) = &session {
+            req = req.header("mcp-session-id", s);
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(_) if !connected_once => return,
+            Err(_) => {
+                tokio::time::sleep(RECONNECT).await;
+                continue;
+            }
+        };
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !resp.status().is_success() || !ct.contains("text/event-stream") {
+            if !connected_once {
+                return; // server doesn't serve a push stream
+            }
+            tokio::time::sleep(RECONNECT).await;
+            continue;
+        }
+        connected_once = true;
+
+        let mut resp = resp;
+        let mut buf = String::new();
+        let mut data = String::new();
+        while let Ok(Some(chunk)) = resp.chunk().await {
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(nl) = buf.find('\n') {
+                let line = buf[..nl].trim_end_matches('\r').to_string();
+                buf.drain(..=nl);
+                if let Some(d) = line.strip_prefix("data:") {
+                    data.push_str(d.trim_start());
+                } else if line.is_empty() && !data.is_empty() {
+                    if let Ok(msg) = serde_json::from_str::<Value>(&data) {
+                        announce_notification(&server, &msg);
+                    }
+                    data.clear();
+                }
+            }
+        }
+        // A silently dead stream must not look like "no events".
+        crate::tools::announce(
+            &format!("[mcp:{server}]"),
+            "notification stream dropped — reconnecting",
+        );
+        tokio::time::sleep(RECONNECT).await;
+    }
+}
+
+/// One dim line per pushed notification: method tail + compact params.
+fn announce_notification(server: &str, msg: &Value) {
+    let Some(method) = msg["method"].as_str() else {
+        return; // responses to our own POSTs can echo here — not pushes
+    };
+    let Some(kind) = method.strip_prefix("notifications/") else {
+        return;
+    };
+    let params = serde_json::to_string(&msg["params"]).unwrap_or_default();
+    let mut summary = format!("{kind} {params}");
+    if summary.len() > 220 {
+        let mut cut = 220;
+        while !summary.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        summary.truncate(cut);
+        summary.push('…');
+    }
+    crate::tools::announce(&format!("[mcp:{server}]"), &summary);
 }
 
 /// An HTTP MCP response body is either one JSON object or an SSE stream

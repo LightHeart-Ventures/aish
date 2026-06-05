@@ -69,6 +69,9 @@ pub struct Session {
     /// Tool calls + results of the most recent turn, kept for the retroactive
     /// reveal when raw output is switched on after a surprising answer.
     pub last_turn_tools: Vec<(String, ToolResult)>,
+    /// Background jobs (run_program background:true). Output streams to the
+    /// terminal live; the model reads it via job_output. Die with the shell.
+    pub jobs: crate::tools::Jobs,
 }
 
 impl Session {
@@ -86,6 +89,7 @@ impl Session {
             db: None,
             raw_tool_output: false,
             last_turn_tools: Vec::new(),
+            jobs: Default::default(),
         })
     }
 
@@ -108,7 +112,20 @@ and filter or aggregate output yourself.\n\
 - Use change_dir to move around; it changes the shell's working directory for all later calls.\n\
 - For screen-oriented or interactive programs (top, htop, vim, less, ssh, REPLs) use \
 run_interactive: it attaches the program to the user's terminal and the user drives it — you \
-only learn the exit status. Use run_program whenever you need the output yourself.\n\
+only learn the exit status. Use run_program whenever you need the output yourself. NEVER use \
+run_interactive for watchers or monitors — that freezes the user's prompt.\n\
+- Your turn ENDS when you reply. Nothing of yours keeps running between turns except background \
+jobs, and you never receive pushed events, MCP notifications, or job output — aish prints those \
+on the user's terminal as they arrive, and you read them on a LATER turn via job_output. Never \
+claim to be 'listening' or 'waiting' for anything after your reply.\n\
+- Long-running programs (watchers, event listeners, tails, servers): run_program with \
+background:true. It returns a job id immediately; output streams live to the user and \
+accumulates for job_output {{job}}. The user manages jobs with :jobs and :kill. Foreground \
+run_program is killed at timeout_secs.\n\
+- run_program and run_interactive accept env (extra environment variables). For secrets, pass a \
+reference — \"${{profile:KEY}}\" resolves from ~/.atum/credentials [profile] at spawn time, \
+\"${{NAME}}\" from session exports/environment — so the value never enters the conversation. \
+NEVER read credential files with read_file; reference them.\n\
 - Prefer read_file/write_file/list_dir over cat/echo tricks.\n\
 - When a command fails, read the error and try one sensible fix before reporting back.\n\
 - You have persistent memory across sessions: `remember` stores a durable fact, `recall` \
