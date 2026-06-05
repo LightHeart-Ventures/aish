@@ -285,9 +285,20 @@ async fn dispatch(
     aliases: &HashMap<String, Vec<String>>,
     prev_dir: &mut Option<PathBuf>,
 ) -> Dispatch {
-    // Lines with shell machinery (pipes, $, globs, …) or that don't tokenize
-    // (apostrophes in English) go to the model.
-    let Some(mut words) = rc::tokenize(line) else {
+    // Lines with shell machinery (pipes, globs, redirection, …) or that don't
+    // tokenize (apostrophes in English) go to the model. `$VAR` references are
+    // expanded here against the session's exports first, then the process
+    // environment — matching what the spawned program would see.
+    let lookup = |name: &str| {
+        session
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var(name).ok())
+    };
+    let Some(mut words) = rc::tokenize_with(line, lookup) else {
         if force {
             eprintln!("aish: can't run that directly — it uses shell syntax aish doesn't implement");
             return Dispatch::Handled;

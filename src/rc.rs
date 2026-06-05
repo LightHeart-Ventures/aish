@@ -101,18 +101,29 @@ fn split_assignment(s: &str) -> Option<(String, String)> {
     Some((name.to_string(), value))
 }
 
-/// Split a command line into argv words, honoring single/double quotes.
+/// Split a command line into argv words, honoring single/double quotes and
+/// expanding `$VAR` / `${VAR}` references against the process environment.
 /// Returns None when the line uses shell machinery aish doesn't implement —
-/// pipes, redirection, expansion, globs, control operators — so the caller
-/// can route it to the model instead.
+/// pipes, redirection, command substitution, globs, control operators — so the
+/// caller can route it to the model instead.
 pub fn tokenize(line: &str) -> Option<Vec<String>> {
+    tokenize_with(line, |name| std::env::var(name).ok())
+}
+
+/// Like [`tokenize`], but resolves `$VAR` references through `lookup` so the
+/// dispatch path can consult per-session `export`s before falling back to the
+/// process environment. An unset variable expands to the empty string, matching
+/// POSIX shells. Expanded values are inserted verbatim — never re-split on
+/// whitespace nor re-scanned for metacharacters — so a variable can't smuggle
+/// shell syntax (pipes, `;`, …) into the argv.
+pub fn tokenize_with(line: &str, lookup: impl Fn(&str) -> Option<String>) -> Option<Vec<String>> {
     const META: &[char] = &[
-        '|', '&', ';', '<', '>', '$', '`', '*', '?', '(', ')', '{', '}', '\\',
+        '|', '&', ';', '<', '>', '`', '*', '?', '(', ')', '{', '}', '\\',
     ];
     let mut words: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut in_word = false;
-    let mut chars = line.chars();
+    let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '\'' => {
@@ -130,12 +141,33 @@ pub fn tokenize(line: &str) -> Option<Vec<String>> {
                 loop {
                     match chars.next() {
                         Some('"') => break,
-                        Some('$' | '`') => return None, // would need expansion
+                        Some('`') => return None, // command substitution
+                        // Inside double quotes the word already exists, so even
+                        // an empty expansion is part of it.
+                        Some('$') => match expand_dollar(&mut chars, &lookup)? {
+                            Dollar::Expanded(val) => cur.push_str(&val),
+                            Dollar::Literal => cur.push('$'),
+                        },
                         Some(ch) => cur.push(ch),
                         None => return None,
                     }
                 }
             }
+            '$' => match expand_dollar(&mut chars, &lookup)? {
+                // Unquoted: an empty expansion that isn't adjacent to other text
+                // produces no word at all (POSIX word-splitting), so only join
+                // the word when there's something to add.
+                Dollar::Expanded(val) => {
+                    if !val.is_empty() {
+                        cur.push_str(&val);
+                        in_word = true;
+                    }
+                }
+                Dollar::Literal => {
+                    cur.push('$');
+                    in_word = true;
+                }
+            },
             c if c.is_whitespace() => {
                 if in_word {
                     words.push(std::mem::take(&mut cur));
@@ -153,6 +185,57 @@ pub fn tokenize(line: &str) -> Option<Vec<String>> {
         words.push(cur);
     }
     Some(words)
+}
+
+/// Result of reading a `$…` reference after the `$` has been consumed.
+enum Dollar {
+    /// A `$NAME` / `${NAME}` reference; carries the looked-up value (empty when
+    /// the variable is unset).
+    Expanded(String),
+    /// A bare `$` that doesn't start a name (e.g. `$`, `$5`, `$ `) — keep it as
+    /// a literal dollar sign.
+    Literal,
+}
+
+/// Read a variable reference from `chars` (the `$` is already consumed) and
+/// resolve it via `lookup`. Supports `$NAME` and `${NAME}` where NAME is
+/// `[A-Za-z_][A-Za-z0-9_]*`. Returns None for a malformed `${…}` (unterminated
+/// or containing an invalid character) so the caller rejects the line and routes
+/// it to the model.
+fn expand_dollar(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Option<Dollar> {
+    match chars.peek() {
+        Some('{') => {
+            chars.next(); // consume '{'
+            let mut name = String::new();
+            loop {
+                match chars.next() {
+                    Some('}') => break,
+                    Some(c) if c.is_ascii_alphanumeric() || c == '_' => name.push(c),
+                    _ => return None, // invalid char or unterminated ${…}
+                }
+            }
+            if name.is_empty() {
+                return None; // ${} is not a valid reference
+            }
+            Some(Dollar::Expanded(lookup(&name).unwrap_or_default()))
+        }
+        Some(&c) if c.is_ascii_alphabetic() || c == '_' => {
+            let mut name = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    name.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            Some(Dollar::Expanded(lookup(&name).unwrap_or_default()))
+        }
+        _ => Some(Dollar::Literal),
+    }
 }
 
 #[cfg(test)]
@@ -193,12 +276,60 @@ mod tests {
 
     #[test]
     fn tokenizer_rejects_shell_machinery() {
-        for line in ["ls | wc -l", "echo $HOME", "ls > out", "a && b", "rm *.rs", "what?"] {
+        for line in ["ls | wc -l", "ls > out", "a && b", "rm *.rs", "what?"] {
             assert!(tokenize(line).is_none(), "should reject: {line}");
         }
         // ...but quoted metachars are just text
         assert_eq!(tokenize("grep 'a|b' x").unwrap(), vec!["grep", "a|b", "x"]);
         // unbalanced quote (apostrophe in English) routes to the model
         assert!(tokenize("what's eating my disk").is_none());
+    }
+
+    #[test]
+    fn tokenizer_expands_variables() {
+        // Deterministic lookup so the test doesn't depend on the real environment.
+        let env = |name: &str| match name {
+            "HOME" => Some("/home/ada".to_string()),
+            "PATH" => Some("/usr/bin:/bin".to_string()),
+            "GREETING" => Some("hi there".to_string()),
+            _ => None,
+        };
+        let tok = |line: &str| tokenize_with(line, env);
+
+        // bare and braced forms
+        assert_eq!(tok("echo $HOME").unwrap(), vec!["echo", "/home/ada"]);
+        assert_eq!(tok("echo ${HOME}").unwrap(), vec!["echo", "/home/ada"]);
+        // adjacent to text, on either side
+        assert_eq!(tok("ls $HOME/bin").unwrap(), vec!["ls", "/home/ada/bin"]);
+        assert_eq!(tok("cat pre${HOME}post").unwrap(), vec!["cat", "pre/home/adapost"]);
+        // PATH-extension scenario
+        assert_eq!(
+            tok("env PATH=$PATH:/opt/bin").unwrap(),
+            vec!["env", "PATH=/usr/bin:/bin:/opt/bin"]
+        );
+        // a value with spaces is NOT re-split — it stays one argv word
+        assert_eq!(tok("echo $GREETING").unwrap(), vec!["echo", "hi there"]);
+        // an expanded value is not re-scanned for metacharacters
+        let pipey = |_: &str| Some("a|b".to_string());
+        assert_eq!(tokenize_with("echo $X", pipey).unwrap(), vec!["echo", "a|b"]);
+
+        // unset → empty; a standalone unquoted empty expansion drops the word
+        assert_eq!(tok("grep $MISSING file").unwrap(), vec!["grep", "file"]);
+        // ...but adjacent literal text is preserved
+        assert_eq!(tok("echo a$MISSING").unwrap(), vec!["echo", "a"]);
+        // a quoted empty expansion IS a real (empty) argument
+        assert_eq!(tok("echo \"$MISSING\"").unwrap(), vec!["echo", ""]);
+
+        // expansion happens inside double quotes; single quotes stay literal
+        assert_eq!(tok("echo \"$HOME/x\"").unwrap(), vec!["echo", "/home/ada/x"]);
+        assert_eq!(tok("echo '$HOME'").unwrap(), vec!["echo", "$HOME"]);
+
+        // a lone `$`, or one before a non-name char, is a literal dollar sign
+        assert_eq!(tok("echo $").unwrap(), vec!["echo", "$"]);
+        assert_eq!(tok("echo 5$").unwrap(), vec!["echo", "5$"]);
+
+        // malformed ${…} routes to the model
+        assert!(tok("echo ${UNCLOSED").is_none());
+        assert!(tok("echo ${}").is_none());
     }
 }
