@@ -155,6 +155,59 @@ pub fn tokenize(line: &str) -> Option<Vec<String>> {
     Some(words)
 }
 
+/// Split a command line into pipeline stages on unquoted `|`, tokenizing each
+/// stage with [`tokenize`]. `a | b | c` becomes three argv vectors.
+///
+/// Returns `None` — so the caller routes the line to the model — when any stage
+/// uses shell machinery [`tokenize`] rejects, a quote is unbalanced, or a
+/// pipeline stage is empty (`a |`, `| b`, `a || b`). A line with no pipe yields
+/// a single-stage pipeline; the pipeline executor (TASK-9) treats `< 2` stages
+/// as a plain command and delegates here for the split + per-stage argv.
+// Consumed by the pipeline executor (TASK-9); allow until that caller lands.
+#[allow(dead_code)]
+pub fn tokenize_pipeline(line: &str) -> Option<Vec<Vec<String>>> {
+    let segments = split_pipeline(line)?;
+    let piped = segments.len() > 1;
+    let mut stages = Vec::with_capacity(segments.len());
+    for seg in segments {
+        let words = tokenize(seg)?;
+        // An empty stage only makes sense around a pipe: `a |`, `|`, `a || b`.
+        if piped && words.is_empty() {
+            return None;
+        }
+        stages.push(words);
+    }
+    Some(stages)
+}
+
+/// Split on top-level (unquoted) `|`, returning the raw segments untouched.
+/// Pipes inside single/double quotes stay literal text. Returns `None` on an
+/// unbalanced quote so the pipeline routes to the model like other bad input.
+fn split_pipeline(line: &str) -> Option<Vec<&str>> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut chars = line.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            // Skip over a quoted span so an embedded `|` isn't a separator.
+            q @ ('\'' | '"') => loop {
+                match chars.next() {
+                    Some((_, ch)) if ch == q => break,
+                    Some(_) => {}
+                    None => return None, // unbalanced quote
+                }
+            },
+            '|' => {
+                segments.push(&line[start..i]);
+                start = i + 1; // '|' is one ASCII byte
+            }
+            _ => {}
+        }
+    }
+    segments.push(&line[start..]);
+    Some(segments)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +253,59 @@ mod tests {
         assert_eq!(tokenize("grep 'a|b' x").unwrap(), vec!["grep", "a|b", "x"]);
         // unbalanced quote (apostrophe in English) routes to the model
         assert!(tokenize("what's eating my disk").is_none());
+    }
+
+    #[test]
+    fn pipeline_splits_stages() {
+        // AC-1: `ls | wc -l` tokenizes into two stages (stays in dispatch).
+        assert_eq!(
+            tokenize_pipeline("ls | wc -l").unwrap(),
+            vec![vec!["ls"], vec!["wc", "-l"]],
+        );
+        assert_eq!(
+            tokenize_pipeline("ls -la | grep rs | wc -l").unwrap(),
+            vec![vec!["ls", "-la"], vec!["grep", "rs"], vec!["wc", "-l"]],
+        );
+        // single command is a one-stage pipeline
+        assert_eq!(tokenize_pipeline("ls -la").unwrap(), vec![vec!["ls", "-la"]]);
+        // pipes adjacent to arguments (no surrounding spaces)
+        assert_eq!(
+            tokenize_pipeline("a|b|c").unwrap(),
+            vec![vec!["a"], vec!["b"], vec!["c"]],
+        );
+    }
+
+    #[test]
+    fn pipeline_keeps_quoted_pipes_literal() {
+        // AC-2: a quoted pipe is text, not a separator.
+        assert_eq!(
+            tokenize_pipeline("grep 'a|b' x").unwrap(),
+            vec![vec!["grep", "a|b", "x"]],
+        );
+        assert_eq!(
+            tokenize_pipeline("grep \"a|b\" x").unwrap(),
+            vec![vec!["grep", "a|b", "x"]],
+        );
+        // mix: real separator plus a quoted pipe inside a stage
+        assert_eq!(
+            tokenize_pipeline("echo 'x|y' | cat").unwrap(),
+            vec![vec!["echo", "x|y"], vec!["cat"]],
+        );
+    }
+
+    #[test]
+    fn pipeline_rejects_empty_stages() {
+        for line in ["a |", "| b", "a || b", "|", "a | | b"] {
+            assert!(tokenize_pipeline(line).is_none(), "should reject: {line}");
+        }
+    }
+
+    #[test]
+    fn pipeline_rejects_shell_machinery_in_a_stage() {
+        // a stage that itself uses unsupported syntax fails the whole pipeline
+        assert!(tokenize_pipeline("ls | grep $HOME").is_none());
+        assert!(tokenize_pipeline("cat *.rs | wc").is_none());
+        // unbalanced quote routes to the model
+        assert!(tokenize_pipeline("echo 'oops | cat").is_none());
     }
 }
