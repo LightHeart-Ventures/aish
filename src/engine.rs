@@ -71,7 +71,7 @@ impl Spinner {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(80));
             for i in 0.. {
                 tick.tick().await;
-                eprint!("\r\x1b[2m{} thinking…\x1b[0m", FRAMES[i % FRAMES.len()]);
+                eprint!("\r\x1b[36m{} thinking…\x1b[0m", FRAMES[i % FRAMES.len()]);
             }
         })))
     }
