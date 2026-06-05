@@ -21,15 +21,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Blocking y/N prompt on the controlling TTY.
-pub fn confirm_tty(prompt: &str) -> bool {
-    print!("\x1b[33mrun?\x1b[0m {prompt} \x1b[33m[y/N]\x1b[0m ");
+/// Blocking y/N/a prompt on the controlling TTY. `a` ("always") allows this
+/// call and persists the tool/command so it never prompts again.
+pub fn confirm_tty(prompt: &str) -> tools::Decision {
+    use tools::Decision;
+    print!("\x1b[33mrun?\x1b[0m {prompt} \x1b[33m[y/N/a]\x1b[0m ");
     std::io::stdout().flush().ok();
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
+        return Decision::Deny;
     }
-    matches!(line.trim(), "y" | "Y" | "yes")
+    match line.trim() {
+        "y" | "Y" | "yes" => Decision::AllowOnce,
+        "a" | "A" | "always" => Decision::AlwaysAllow,
+        _ => Decision::Deny,
+    }
 }
 
 pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
@@ -523,6 +529,8 @@ fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -> bool
                  :backend <claude|local>             switch backend\n\
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
+                 :allow                              list always-allowed tools/commands\n\
+                 :allow remove <tool>                revoke an always-allowed tool/command\n\
                  Ctrl-O                              toggle raw tool output (show/squelch tool results)\n\
                  :quit                               exit (also Ctrl-D or `exit`)"
             );
@@ -593,10 +601,40 @@ fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -> bool
             session.history.clear();
             println!("history cleared");
         }
+        Some("allow") => handle_allow(parts.next(), parts.next(), session),
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
     }
     false
+}
+
+/// `:allow` lists the always-allowed tools; `:allow remove <tool>` revokes one.
+fn handle_allow(sub: Option<&str>, arg: Option<&str>, session: &Session) {
+    let Some(db) = session.db.as_ref() else {
+        println!("allow: persistent store unavailable");
+        return;
+    };
+    match sub {
+        None => match db.allowed_tools() {
+            Ok(tools) if tools.is_empty() => println!("no always-allowed tools"),
+            Ok(tools) => {
+                println!("always-allowed tools:");
+                for t in tools {
+                    println!("  {t}");
+                }
+            }
+            Err(e) => println!("allow: {e:#}"),
+        },
+        Some("remove") => match arg {
+            Some(tool) => match db.revoke(tool) {
+                Ok(true) => println!("removed {tool} from the always-allow list"),
+                Ok(false) => println!("{tool} wasn't on the always-allow list"),
+                Err(e) => println!("allow: {e:#}"),
+            },
+            None => println!("usage: :allow remove <tool>"),
+        },
+        Some(other) => println!("unknown :allow subcommand '{other}' — usage: :allow [remove <tool>]"),
+    }
 }
 
 fn describe_mode(m: crate::session::Mode) -> String {

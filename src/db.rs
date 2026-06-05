@@ -9,7 +9,7 @@
 //!   keyword-based until then.
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 
 pub struct Db {
@@ -53,6 +53,10 @@ impl Db {
              CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(
                  memory_id INTEGER PRIMARY KEY,
                  embedding float[384]
+             );
+             CREATE TABLE IF NOT EXISTS allowed_tools (
+                 tool TEXT PRIMARY KEY,
+                 ts   TEXT NOT NULL DEFAULT current_timestamp
              );",
         )
         .context("schema init failed")?;
@@ -99,6 +103,39 @@ impl Db {
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect())
     }
+
+    /// Add a tool/command to the persistent always-allow list (idempotent).
+    pub fn allow(&self, tool: &str) -> Result<()> {
+        self.conn
+            .execute("INSERT OR IGNORE INTO allowed_tools (tool) VALUES (?1)", [tool])?;
+        Ok(())
+    }
+
+    /// Is this tool/command on the always-allow list?
+    pub fn is_allowed(&self, tool: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT 1 FROM allowed_tools WHERE tool = ?1", [tool], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// Every always-allowed tool, alphabetical.
+    pub fn allowed_tools(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tool FROM allowed_tools ORDER BY tool")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Drop a tool from the always-allow list. Returns true if a row was removed.
+    pub fn revoke(&self, tool: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM allowed_tools WHERE tool = ?1", [tool])?;
+        Ok(n > 0)
+    }
 }
 
 #[cfg(test)]
@@ -133,5 +170,20 @@ mod tests {
         assert!(hits[0].contains("terse replies"));
         let all = db.recall("", 10).unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn allowlist_roundtrip() {
+        let db = temp_db("allow");
+        assert!(!db.is_allowed("git").unwrap());
+        db.allow("git").unwrap();
+        db.allow("git").unwrap(); // idempotent
+        db.allow("npm").unwrap();
+        assert!(db.is_allowed("git").unwrap());
+        assert_eq!(db.allowed_tools().unwrap(), vec!["git", "npm"]);
+        assert!(db.revoke("git").unwrap());
+        assert!(!db.revoke("git").unwrap()); // already gone
+        assert!(!db.is_allowed("git").unwrap());
+        assert_eq!(db.allowed_tools().unwrap(), vec!["npm"]);
     }
 }
