@@ -69,6 +69,10 @@ pub struct Session {
     /// Tool calls + results of the most recent turn, kept for the retroactive
     /// reveal when raw output is switched on after a surprising answer.
     pub last_turn_tools: Vec<(String, ToolResult)>,
+    /// Exit status of the most recently dispatched command (direct, pipeline, or
+    /// model-run), expanded as `$?` on the next dispatch line. Starts at 0, as in
+    /// any POSIX shell.
+    pub last_status: i32,
 }
 
 impl Session {
@@ -86,7 +90,16 @@ impl Session {
             db: None,
             raw_tool_output: false,
             last_turn_tools: Vec::new(),
+            last_status: 0,
         })
+    }
+
+    /// Record the exit status of the command just dispatched, so the next line
+    /// can expand `$?`. Signal termination maps to 128 + signal, as POSIX shells
+    /// report it.
+    pub fn set_last_status(&mut self, status: &std::process::ExitStatus) {
+        use std::os::unix::process::ExitStatusExt;
+        self.last_status = status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     }
 
     /// The most recent recorded output (a model/agent reply), truncated per the

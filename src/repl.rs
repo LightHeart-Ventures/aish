@@ -438,6 +438,9 @@ fn looks_like_prose(line: &str, words: &[String]) -> bool {
 /// e.g. `echo $LAST`.
 fn var_lookup(session: &Session) -> impl Fn(&str) -> Option<String> + '_ {
     move |name: &str| {
+        if name == "?" {
+            return Some(session.last_status.to_string());
+        }
         if let Some(v) = session.env.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.clone()) {
             return Some(v);
         }
@@ -475,6 +478,7 @@ async fn dispatch(
         }) {
             match pipeline::run(&stages, session).await {
                 Ok(status) => {
+                    session.set_last_status(&status);
                     if let Some(code) = status.code() {
                         if code != 0 {
                             eprintln!("\x1b[2m[exit {code}]\x1b[0m");
@@ -556,6 +560,7 @@ async fn dispatch(
             };
             match tools::run_on_tty(&path.to_string_lossy(), &words[1..], session).await {
                 Ok(status) => {
+                    session.set_last_status(&status);
                     if let Some(code) = status.code() {
                         if code != 0 {
                             eprintln!("\x1b[2m[exit {code}]\x1b[0m");
@@ -864,9 +869,11 @@ mod tests {
         let (_, pairs) = helper.complete_command("g", 1, 0);
         assert!(pairs.iter().any(|p| p.replacement == "gs"), "alias gs missing");
 
-        // non-executable files are not offered
+        // non-executable files are not offered. (rustyline's Pair has no Debug;
+        // report the replacement strings — `{pairs:?}` broke main's test build.)
         let (_, pairs) = helper.complete_command("READ", 4, 0);
-        assert!(pairs.is_empty(), "non-exec README offered: {pairs:?}");
+        let names: Vec<&str> = pairs.iter().map(|p| p.replacement.as_str()).collect();
+        assert!(names.is_empty(), "non-exec README offered: {names:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
