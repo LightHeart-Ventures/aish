@@ -140,7 +140,7 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
                     println!("\x1b[33m^C\x1b[0m turn aborted");
                 } else if let Some(text) = reply {
                     if !text.trim().is_empty() {
-                        println!("{}", text.trim());
+                        println!("{}", crate::md::render_stdout(text.trim()));
                     }
                     if let Some(db) = &session.db {
                         db.record("output", &session.cwd.to_string_lossy(), &text);
@@ -443,7 +443,10 @@ fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -> bool
                     println!("already on {}", backend.describe());
                 } else {
                     *backend = Backend::new_local();
-                    println!("backend → {} (loads on first use)", backend.describe());
+                    println!(
+                        "backend → {} (loads on first use; MCP tools off — they don't fit a small context window)",
+                        backend.describe()
+                    );
                 }
             }
             #[cfg(not(feature = "local"))]
