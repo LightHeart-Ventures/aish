@@ -252,7 +252,8 @@ enum Dollar {
 
 /// Read a variable reference from `chars` (the `$` is already consumed) and
 /// resolve it via `lookup`. Supports `$NAME` and `${NAME}` where NAME is
-/// `[A-Za-z_][A-Za-z0-9_]*`. Returns None for a malformed `${…}` (unterminated
+/// `[A-Za-z_][A-Za-z0-9_]*`, plus the special parameter `$?` (last exit status).
+/// Returns None for a malformed `${…}` (unterminated
 /// or containing an invalid character) so the caller rejects the line and routes
 /// it to the model.
 fn expand_dollar(
@@ -274,6 +275,13 @@ fn expand_dollar(
                 return None; // ${} is not a valid reference
             }
             Some(Dollar::Expanded(lookup(&name).unwrap_or_default()))
+        }
+        // `$?` — the last command's exit status. A single-char special parameter
+        // resolved through the same lookup, so the dispatch path can feed it the
+        // session's tracked status.
+        Some('?') => {
+            chars.next();
+            Some(Dollar::Expanded(lookup("?").unwrap_or_default()))
         }
         Some(&c) if c.is_ascii_alphabetic() || c == '_' => {
             let mut name = String::new();
@@ -475,6 +483,23 @@ mod tests {
         // malformed ${…} routes to the model
         assert!(tok("echo ${UNCLOSED").is_none());
         assert!(tok("echo ${}").is_none());
+    }
+
+    #[test]
+    fn tokenizer_expands_last_status() {
+        // `$?` resolves through the same lookup the dispatch path uses to feed in
+        // the session's tracked exit status.
+        let status = |name: &str| (name == "?").then(|| "1".to_string());
+        let tok = |line: &str| tokenize_with(line, status);
+
+        assert_eq!(tok("echo $?").unwrap(), vec!["echo", "1"]);
+        // adjacent to literal text, bare and double-quoted
+        assert_eq!(tok("echo code=$?").unwrap(), vec!["echo", "code=1"]);
+        assert_eq!(tok("echo \"exit $?\"").unwrap(), vec!["echo", "exit 1"]);
+        // an unset status expands to empty and drops the standalone word, like
+        // any other unknown variable
+        let none = |_: &str| -> Option<String> { None };
+        assert_eq!(tokenize_with("echo $?", none).unwrap(), vec!["echo"]);
     }
 
     #[test]
