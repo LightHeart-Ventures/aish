@@ -47,6 +47,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hf-hub",
  "libc",
  "mistralrs",
  "reqwest 0.13.4",

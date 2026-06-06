@@ -27,6 +27,10 @@ pub async fn run_turn(
     session.history.push(Msg::user(input));
     session.last_turn_tools.clear();
 
+    // First local use lazy-loads (and maybe downloads) weights — do it before
+    // any spinner exists so the download progress line owns stderr.
+    backend.prepare().await?;
+
     for _ in 0..MAX_ITERATIONS {
         let spinner = Spinner::start();
         let turn = backend.complete(&system, &session.history, &tool_defs).await;

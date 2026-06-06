@@ -33,7 +33,8 @@ Mostly ~/models (412G of GGUF weights) — 87% of your usage.
   filters output itself. (`aish` refuses to exec `sh`/`bash`/etc.)
 - **Hybrid brain.** Claude API (`claude-opus-4-8` default) or fully-offline
   in-process inference via [mistral.rs](https://github.com/EricLBuehler/mistral.rs)
-  (Qwen3-8B GGUF, lazy-loaded from the HF cache on first use).
+  (Qwen3-1.7B GGUF default, lazy-loaded from the HF cache on first use with a
+  download progress bar; swap via `AISH_LOCAL_MODEL_ID` — no rebuild).
 - **Graded safety gate.** `:mode <paranoid|careful|normal|yolo>`: paranoid
   confirms every tool call, careful confirms anything not provably read-only,
   normal (default) confirms only write/create/delete — `aws s3 ls` runs free,
@@ -73,9 +74,19 @@ Mostly ~/models (412G of GGUF weights) — 87% of your usage.
 export ANTHROPIC_API_KEY=sk-ant-…
 cargo run --release                 # interactive shell
 cargo run --release -- -c "prompt"  # one-shot (login-shell -c style)
-cargo run --release -- --backend local   # offline, in-process Qwen3-8B
+cargo run --release -- --backend local   # offline, in-process Qwen3-1.7B
 cargo run --release -- --mode careful    # stricter confirmation gate
 cargo build --no-default-features   # fast Claude-only build (skips mistral.rs)
+```
+
+Local model selection (no rebuild): `AISH_LOCAL_MODEL_ID` picks the GGUF repo
+(default `Qwen/Qwen3-1.7B-GGUF`, which ships a single `Q8_0` quant); for other
+repos the tokenizer and `*-Q4_K_M.gguf` filename are derived from the Qwen
+naming convention, or set explicitly with `AISH_LOCAL_TOK_ID` /
+`AISH_LOCAL_MODEL_FILE`:
+
+```sh
+AISH_LOCAL_MODEL_ID=Qwen/Qwen3-4B-GGUF cargo run --release -- --backend local
 ```
 
 REPL commands: `:mode <paranoid|careful|normal|yolo>` · `:model <opus|sonnet|haiku|id>` ·
