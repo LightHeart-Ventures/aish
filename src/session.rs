@@ -1,5 +1,6 @@
 use crate::backend::{Msg, ToolResult};
 use anyhow::Result;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -76,6 +77,10 @@ pub struct Session {
     /// model-run), expanded as `$?` on the next dispatch line. Starts at 0, as in
     /// any POSIX shell.
     pub last_status: i32,
+    /// Tools always-allowed for THIS session only — the in-memory fallback that
+    /// keeps `a` working even when the persistent store is unavailable (AC3).
+    /// Populated on every 'a' answer and consulted before the DB.
+    pub session_allows: HashSet<String>,
 }
 
 impl Session {
@@ -95,6 +100,7 @@ impl Session {
             last_turn_tools: Vec::new(),
             jobs: Default::default(),
             last_status: 0,
+            session_allows: HashSet::new(),
         })
     }
 
@@ -115,17 +121,24 @@ impl Session {
         Some(truncate_last(raw))
     }
 
-    /// True when `key` is on the persistent always-allow list (a prior 'a'
-    /// answer at a confirmation prompt). Best-effort: no store → not allowed.
+    /// True when `key` is always-allowed (a prior 'a' answer). Checks the
+    /// in-memory session set first, then the persistent store. Best-effort: no
+    /// store → only the session set applies.
     pub fn is_tool_allowed(&self, key: &str) -> bool {
-        self.db.as_ref().is_some_and(|db| db.is_allowed(key).unwrap_or(false))
+        self.session_allows.contains(key)
+            || self.db.as_ref().is_some_and(|db| db.is_allowed(key).unwrap_or(false))
     }
 
-    /// Persist `key` on the always-allow list. Best-effort: a no-op (degrading
-    /// 'always' to 'once') when the store is unavailable.
-    pub fn allow_tool(&self, key: &str) {
-        if let Some(db) = &self.db {
-            let _ = db.allow(key);
+    /// Always-allow `key`. Always recorded in the session set so it holds for
+    /// the rest of this session; also persisted when a store is available. When
+    /// none is, the allow degrades to session-only and the user is warned.
+    pub fn allow_tool(&mut self, key: &str) {
+        self.session_allows.insert(key.to_string());
+        match &self.db {
+            Some(db) => {
+                let _ = db.allow(key);
+            }
+            None => eprintln!("note: allow-list won't persist — database unavailable"),
         }
     }
 
