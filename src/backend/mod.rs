@@ -81,6 +81,17 @@ impl Backend {
         Backend::Local(local::LocalBackend::new())
     }
 
+    /// Pre-turn hook: the local backend lazy-loads weights here — drawing a
+    /// download progress line if needed — before the engine's "thinking"
+    /// spinner starts overwriting stderr. No-op for Claude.
+    pub async fn prepare(&self) -> Result<()> {
+        match self {
+            Backend::Claude(_) => Ok(()),
+            #[cfg(feature = "local")]
+            Backend::Local(b) => b.prepare().await,
+        }
+    }
+
     pub async fn complete(&self, system: &str, history: &[Msg], tools: &[ToolDef]) -> Result<Turn> {
         match self {
             Backend::Claude(b) => b.complete(system, history, tools).await,
@@ -98,9 +109,9 @@ impl Backend {
     }
 
     /// MCP tool schemas can dwarf a small local context window (one server
-    /// with 144 tools is ~50k tokens of JSON Schema — past Qwen3-8B's 40960
-    /// limit before the conversation even starts), so only the Claude
-    /// backend gets them. Local runs with the built-in shell tools.
+    /// with 144 tools is ~50k tokens of JSON Schema — bigger than the local
+    /// model's entire context before the conversation even starts), so only
+    /// the Claude backend gets them. Local runs with the built-in shell tools.
     pub fn include_mcp_tools(&self) -> bool {
         match self {
             Backend::Claude(_) => true,
@@ -114,7 +125,7 @@ impl Backend {
             Backend::Claude(b) => b.model = model,
             #[cfg(feature = "local")]
             Backend::Local(_) => {
-                eprintln!("(:model on the local backend isn't wired yet — use :backend claude first)")
+                eprintln!("(:model on the local backend isn't wired — set AISH_LOCAL_MODEL_ID and restart, or use :backend claude)")
             }
         }
     }
