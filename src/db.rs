@@ -135,12 +135,15 @@ impl Db {
             .is_some())
     }
 
-    /// Every always-allowed tool, alphabetical.
-    pub fn allowed_tools(&self) -> Result<Vec<String>> {
+    /// Every always-allowed tool with its created-at timestamp, alphabetical.
+    pub fn allowed_tools(&self) -> Result<Vec<(String, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT tool FROM allowed_tools ORDER BY tool")?;
-        let rows = stmt.query_map([], |r| r.get(0))?;
+            .prepare("SELECT tool, ts FROM allowed_tools ORDER BY tool")?;
+        let rows = stmt.query_map([], |r| {
+            let row: (String, String) = (r.get(0)?, r.get(1)?);
+            Ok(row)
+        })?;
         Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
@@ -209,10 +212,13 @@ mod tests {
         db.allow("git").unwrap(); // idempotent
         db.allow("npm").unwrap();
         assert!(db.is_allowed("git").unwrap());
-        assert_eq!(db.allowed_tools().unwrap(), vec!["git", "npm"]);
+        let names = |db: &Db| {
+            db.allowed_tools().unwrap().into_iter().map(|(t, _)| t).collect::<Vec<_>>()
+        };
+        assert_eq!(names(&db), vec!["git", "npm"]);
         assert!(db.revoke("git").unwrap());
         assert!(!db.revoke("git").unwrap()); // already gone
         assert!(!db.is_allowed("git").unwrap());
-        assert_eq!(db.allowed_tools().unwrap(), vec!["npm"]);
+        assert_eq!(names(&db), vec!["npm"]);
     }
 }

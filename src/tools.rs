@@ -33,7 +33,7 @@ pub type Confirm<'a> = dyn FnMut(&str) -> Decision + 'a;
 /// Consult the persistent always-allow list, prompting only when the key isn't
 /// already allowed. Returns true when the action may proceed; an 'always'
 /// answer is persisted under `key` so it skips the prompt next time.
-fn gate(session: &Session, key: &str, prompt: &str, confirm: &mut Confirm<'_>) -> bool {
+fn gate(session: &mut Session, key: &str, prompt: &str, confirm: &mut Confirm<'_>) -> bool {
     if session.is_tool_allowed(key) {
         return true;
     }
@@ -823,7 +823,7 @@ fn read_file(call: &ToolCall, session: &Session) -> Result<String> {
     Ok(truncate_middle(content, MAX_FILE_READ))
 }
 
-fn write_file(call: &ToolCall, session: &Session, confirm: &mut Confirm<'_>) -> Result<String> {
+fn write_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
     let path = call.args["path"].as_str().ok_or_else(|| anyhow::anyhow!("missing path"))?;
     let content = call.args["content"].as_str().ok_or_else(|| anyhow::anyhow!("missing content"))?;
     let full = resolve(session, path);

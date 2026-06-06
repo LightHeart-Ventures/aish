@@ -790,6 +790,7 @@ fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -> bool
                  :kill <id>                          kill a background job\n\
                  :allow                              list always-allowed tools/commands\n\
                  :allow remove <tool>                revoke an always-allowed tool/command\n\
+                 a at a prompt                       always-allow this tool (see :allow)\n\
                  Ctrl-O                              toggle raw tool output (show/squelch tool results)\n\
                  :quit                               exit (also Ctrl-D or `exit`)"
             );
@@ -895,11 +896,13 @@ fn handle_allow(sub: Option<&str>, arg: Option<&str>, session: &Session) {
     };
     match sub {
         None => match db.allowed_tools() {
-            Ok(tools) if tools.is_empty() => println!("no always-allowed tools"),
+            Ok(tools) if tools.is_empty() => {
+                println!("no always-allowed tools — press 'a' at a confirmation prompt to add one")
+            }
             Ok(tools) => {
                 println!("always-allowed tools:");
-                for t in tools {
-                    println!("  {t}");
+                for (t, ts) in tools {
+                    println!("  {t}  ({ts})");
                 }
             }
             Err(e) => println!("allow: {e:#}"),
