@@ -68,6 +68,31 @@ fn split_top_level(line: &str) -> Option<Vec<&str>> {
 /// shell). Stages run concurrently; aish keeps no pipe ends of its own, so
 /// reaping them in order cannot deadlock.
 pub async fn run(stages: &[Vec<String>], session: &Session) -> Result<ExitStatus> {
+    Ok(exec(stages, session, false).await?.0)
+}
+
+/// Like [`run`], but capture the final stage's stdout instead of inheriting the
+/// terminal, returning it alongside the exit status. The oracle test harness
+/// (TASK-109) uses this to diff aish's real pipeline execution against bash —
+/// sharing [`exec`] with [`run`] so the harness exercises the production wiring
+/// and exit-status logic, not a reimplementation.
+#[cfg(test)]
+pub(crate) async fn run_captured(
+    stages: &[Vec<String>],
+    session: &Session,
+) -> Result<(ExitStatus, String)> {
+    let (status, captured) = exec(stages, session, true).await?;
+    Ok((status, captured.unwrap_or_default()))
+}
+
+/// Shared pipeline executor. When `capture` is false the final stage's stdout
+/// stays inherited (the terminal), as an interactive shell needs; when true it
+/// is piped and collected and returned in the second tuple slot.
+async fn exec(
+    stages: &[Vec<String>],
+    session: &Session,
+    capture: bool,
+) -> Result<(ExitStatus, Option<String>)> {
     let n = stages.len();
     let mut children: Vec<tokio::process::Child> = Vec::with_capacity(n);
     let mut prev_stdout: Option<tokio::process::ChildStdout> = None;
@@ -80,13 +105,13 @@ pub async fn run(stages: &[Vec<String>], session: &Session) -> Result<ExitStatus
             .envs(session.env.iter().map(|(k, v)| (k, v)))
             .kill_on_drop(true);
         // First stage inherits the terminal's stdin; every later stage reads the
-        // previous stage's stdout. The last stage's stdout stays inherited (the
-        // terminal); earlier stages pipe theirs onward. stderr is always the
-        // terminal, so each stage's diagnostics stay visible.
+        // previous stage's stdout. Earlier stages pipe theirs onward; the last
+        // stage's stdout stays inherited (the terminal) unless we're capturing.
+        // stderr is always the terminal, so each stage's diagnostics stay visible.
         if let Some(out) = prev_stdout.take() {
             cmd.stdin(TryInto::<Stdio>::try_into(out)?);
         }
-        if i < n - 1 {
+        if i < n - 1 || capture {
             cmd.stdout(Stdio::piped());
         }
         let mut child = cmd
@@ -97,6 +122,24 @@ pub async fn run(stages: &[Vec<String>], session: &Session) -> Result<ExitStatus
         }
         children.push(child);
     }
+
+    // When capturing, drain the final stage's stdout concurrently with the reap
+    // loop so a large output can't fill the pipe and deadlock the waits.
+    let capture_task = capture.then(|| {
+        let out = children
+            .last_mut()
+            .expect("pipeline has at least two stages")
+            .stdout
+            .take()
+            .expect("piped stdout");
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut out = out;
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf).await;
+            buf
+        })
+    });
 
     // Reap every stage; the last one's status is the pipeline's status.
     let mut last = None;
@@ -109,7 +152,11 @@ pub async fn run(stages: &[Vec<String>], session: &Session) -> Result<ExitStatus
             last = Some(status);
         }
     }
-    Ok(last.expect("pipeline has at least two stages"))
+    let captured = match capture_task {
+        Some(task) => Some(String::from_utf8_lossy(&task.await.unwrap_or_default()).into_owned()),
+        None => None,
+    };
+    Ok((last.expect("pipeline has at least two stages"), captured))
 }
 
 #[cfg(test)]

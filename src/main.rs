@@ -3,6 +3,8 @@ mod db;
 mod engine;
 mod md;
 mod mcp;
+#[cfg(test)]
+mod oracle;
 mod pipeline;
 mod rc;
 mod repl;

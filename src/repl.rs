@@ -727,7 +727,7 @@ fn builtin_cd(arg: Option<&str>, session: &mut Session, prev: &mut Option<PathBu
 }
 
 /// PATH lookup with the executable bit checked — `which`, basically.
-fn resolve_program(cmd: &str, cwd: &Path, path_var: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_program(cmd: &str, cwd: &Path, path_var: &str) -> Option<PathBuf> {
     fn is_exec(p: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
         p.is_file() && p.metadata().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
