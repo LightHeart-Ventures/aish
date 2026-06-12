@@ -1317,4 +1317,144 @@ mod tests {
             );
         }
     }
+
+    // ---- TASK-109: oracle harness — direct-dispatch path ------------------
+    //
+    // Sibling to pipeline.rs's pipeline-path oracle. A line with no `|` takes
+    // the *direct-dispatch* path: `dispatch` resolves one program via
+    // `resolve_program` and runs it through `tools::run_on_tty`. bash is the
+    // ground truth aish's single-command path must reproduce on stdout bytes
+    // and exit status.
+    //
+    // `run_on_tty` inherits the terminal's stdout, so — exactly as the pipeline
+    // oracle appends a `dd` sink rather than read the terminal — the stdout
+    // cases mirror `run_on_tty`'s spawn configuration (same cwd, same session
+    // env, kill_on_drop) but pipe stdout into a capture buffer. The exit-status
+    // cases call the genuine `run_on_tty`, so the production path is exercised
+    // directly. The corpus is integer/ASCII coreutils with no stdin reads, so a
+    // mismatch is an aish regression, not a locale or echo-builtin quirk.
+
+    /// Resolve `cmd`'s program the way `dispatch` does (real `resolve_program`
+    /// against the process PATH), returning the resolved path and argv tail.
+    fn resolve_for_oracle(cmd: &str, session: &Session) -> (PathBuf, Vec<String>) {
+        let words = rc::tokenize(cmd).expect("oracle command must tokenize");
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        let program = resolve_program(&words[0], &session.cwd, &path_var)
+            .expect("oracle command's program must resolve on PATH");
+        (program, words[1..].to_vec())
+    }
+
+    /// Run `cmd` through aish's direct-dispatch resolution and a faithful mirror
+    /// of `run_on_tty`'s spawn (stdout piped for capture). Returns stdout bytes.
+    async fn aish_direct_stdout(cmd: &str, session: &Session) -> Vec<u8> {
+        let (program, args) = resolve_for_oracle(cmd, session);
+        tokio::process::Command::new(&program)
+            .args(&args)
+            .current_dir(&session.cwd)
+            .envs(session.env.iter().map(|(k, v)| (k, v)))
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .output()
+            .await
+            .expect("spawn direct-dispatch program")
+            .stdout
+    }
+
+    /// Exit code of `cmd` through the genuine `tools::run_on_tty`.
+    async fn aish_direct_code(cmd: &str, session: &Session) -> Option<i32> {
+        let (program, args) = resolve_for_oracle(cmd, session);
+        tools::run_on_tty(&program.to_string_lossy(), &args, &[], session)
+            .await
+            .expect("run_on_tty")
+            .code()
+    }
+
+    /// Run `cmd` through the oracle (`bash -c`) in `cwd`, returning its stdout.
+    fn bash_stdout(cmd: &str, cwd: &Path) -> Vec<u8> {
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("spawn bash oracle (is bash on PATH?)")
+            .stdout
+    }
+
+    /// Exit code of `cmd` under the oracle (`bash -c`) in `cwd`.
+    fn bash_code(cmd: &str, cwd: &Path) -> Option<i32> {
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(cwd)
+            .status()
+            .expect("spawn bash oracle")
+            .code()
+    }
+
+    #[tokio::test]
+    async fn oracle_direct_stdout_matches_bash() {
+        let session = Session::new().unwrap();
+        // Each entry is a single command aish runs natively (no pipe), reading
+        // no stdin; bash is the ground truth.
+        let corpus = [
+            "echo hello world",
+            "seq 1 20",
+            "seq 5 1",        // descending with the default step → empty output
+            "seq 1 2 9",      // strided: 1 3 5 7 9
+            "printf %s+%s 3 4",
+            "expr 6 + 7",
+            "basename /usr/local/bin/aish",
+            "dirname /usr/local/bin/aish",
+            "head -c 8 /dev/zero",
+            "wc -c /dev/null",
+        ];
+        for cmd in corpus {
+            let got = aish_direct_stdout(cmd, &session).await;
+            let want = bash_stdout(cmd, &session.cwd);
+            assert_eq!(
+                got,
+                want,
+                "aish direct-dispatch stdout diverged from bash for `{cmd}`\n  \
+                 aish: {:?}\n  bash: {:?}",
+                String::from_utf8_lossy(&got),
+                String::from_utf8_lossy(&want),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oracle_direct_exit_status_matches_bash() {
+        let session = Session::new().unwrap();
+        // A single command's status is the program's status in both shells.
+        let corpus = [
+            "true",
+            "false",
+            "test -d /",
+            "test -f /no/such/path/aish-oracle",
+            "grep -q anything /dev/null", // empty file → no match → exit 1
+            "expr 1 = 1",                 // result 1 (true) → exit 0
+            "expr 1 = 2",                 // result 0 (false) → exit 1
+        ];
+        for cmd in corpus {
+            let got = aish_direct_code(cmd, &session).await;
+            let want = bash_code(cmd, &session.cwd);
+            assert_eq!(got, want, "aish direct-dispatch exit status diverged from bash for `{cmd}`");
+        }
+    }
+
+    #[tokio::test]
+    async fn oracle_direct_detects_deliberate_divergence() {
+        // Teeth: feed aish and the oracle *different* commands and confirm the
+        // comparator sees them as unequal. If this ever matches, the direct
+        // oracle is blind and the agreement tests above are worthless.
+        let session = Session::new().unwrap();
+        let aish = aish_direct_stdout("echo same", &session).await;
+        let bash = bash_stdout("echo different", &session.cwd);
+        assert_ne!(
+            aish, bash,
+            "direct oracle failed to detect an intentional divergence — the harness is blind"
+        );
+    }
 }
