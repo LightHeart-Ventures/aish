@@ -559,6 +559,15 @@ fn looks_like_prose(line: &str, words: &[String]) -> bool {
     })
 }
 
+/// A lone confirmation token typed at the prompt (`y`, `yes`, `n`, `no`) is
+/// almost certainly a stray answer to a prompt that is no longer there — not a
+/// request to run the `yes` flood. Route it to the model rather than dispatch
+/// `yes`/`y` as a command. Case-insensitive; only a single bare word qualifies,
+/// so `yes hello` and a forced `!yes` still run directly.
+fn is_stray_confirmation(words: &[String]) -> bool {
+    matches!(words, [w] if matches!(w.to_ascii_lowercase().as_str(), "y" | "yes" | "n" | "no"))
+}
+
 /// Variable resolver for direct-dispatch `$VAR` expansion. Resolution order:
 /// session `export`s first (so a user override wins), then the TASK-13
 /// last-output bindings `$LAST` / `$_` (the most recent recorded output,
@@ -640,9 +649,13 @@ async fn dispatch(
         return Dispatch::NotACommand;
     };
 
-    // English that happens to start with a command word ("who is …") goes to
-    // the model — unless the user forced it with `!` or aliased the word.
-    if !force && !aliases.contains_key(first) && looks_like_prose(line, &words) {
+    // English that happens to start with a command word ("who is …"), or a bare
+    // stray confirmation ("yes"), goes to the model — unless the user forced it
+    // with `!` or aliased the word.
+    if !force
+        && !aliases.contains_key(first)
+        && (looks_like_prose(line, &words) || is_stray_confirmation(&words))
+    {
         return Dispatch::NotACommand;
     }
 
@@ -1182,5 +1195,126 @@ mod tests {
         assert!(matches!(split_route("!who is x".into()), (l, Route::Direct) if l == "who is x"));
         assert!(matches!(split_route("?ls".into()), (l, Route::Model) if l == "ls"));
         assert!(matches!(split_route("ls".into()), (l, Route::Auto) if l == "ls"));
+    }
+
+    // Snapshot of the three pure routing heuristics — `!`/`?` force routing,
+    // looks_like_prose, and the tokenizer gate — so a tweak to any of them
+    // surfaces as a golden diff instead of silently reshaping UX. The
+    // executable-resolution step in `dispatch` is intentionally excluded to
+    // keep the snapshot hermetic (no PATH/filesystem dependence); "direct"
+    // here means "the heuristics did not divert the line to the model".
+    fn heuristic_route(input: &str) -> &'static str {
+        let (rest, route) = split_route(input.to_string());
+        match route {
+            Route::Direct => "direct  [! force]",
+            Route::Model => "model   [? force]",
+            Route::Auto => match rc::tokenize(&rest) {
+                None => "model   [shell-syntax / non-tokenizable]",
+                Some(words) if words.is_empty() => "model   [empty]",
+                Some(words) => {
+                    if is_stray_confirmation(&words) {
+                        "model   [bare-yes guard]"
+                    } else if looks_like_prose(&rest, &words) {
+                        "model   [looks_like_prose]"
+                    } else {
+                        "direct  [auto]"
+                    }
+                }
+            },
+        }
+    }
+
+    #[test]
+    fn routing_decision_snapshot() {
+        // Golden corpus grouped by the heuristic each case exercises. Keep the
+        // inputs and their order stable: a heuristic change should show up as a
+        // value diff, not a reshuffle.
+        let groups: &[(&str, &[&str])] = &[
+            (
+                "looks_like_prose — English starting with a real command word routes to the model, real invocations stay direct",
+                &[
+                    "who is zachary hohertz",
+                    "find me big files",
+                    "make this file executable",
+                    "watch for events from atum, let me know about activity",
+                    "find big files, oldest first",
+                    "who",
+                    "who -a",
+                    "which ls",
+                    "find . -name foo",
+                    "tail logfile",
+                    "echo hello there world",
+                    "cat \"my file\" backup",
+                    "watch -n 5 free",
+                    "tail logs/app.log",
+                ],
+            ),
+            (
+                "bare-yes guard — a lone confirmation token (y/yes/n/no) routes to the model; multi-word invocations stay direct",
+                &[
+                    "yes",
+                    "yes please",
+                    "yes please thanks",
+                    "test -f file",
+                    "test the connection right now",
+                ],
+            ),
+            (
+                "!/? force routing — explicit escape hatches override every other heuristic",
+                &[
+                    "!who is zachary hohertz",
+                    "!ls -la",
+                    "?ls",
+                    "?make this file executable",
+                    "?who",
+                ],
+            ),
+            (
+                "tokenizer gate — shell syntax and prose punctuation the tokenizer rejects route to the model",
+                &[
+                    "who is on this machine right now?",
+                    "echo *.rs",
+                    "cat a > b",
+                ],
+            ),
+        ];
+
+        let mut snap = String::new();
+        snap.push_str("# routing decision snapshot (TASK-110)\n");
+        snap.push_str("# direct = run on the terminal · model = hand the line to the model\n");
+        snap.push_str("# regenerate after an intended heuristic change: UPDATE_GOLDEN=1 cargo test routing_decision_snapshot\n");
+        for (heading, cases) in groups {
+            snap.push('\n');
+            snap.push_str(&format!("## {heading}\n"));
+            for &input in *cases {
+                snap.push_str(&format!("{:<52} -> {}\n", input, heuristic_route(input)));
+            }
+        }
+
+        let golden_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/routing_decisions.snap");
+        if std::env::var("UPDATE_GOLDEN").is_ok() {
+            std::fs::write(golden_path, &snap).expect("write golden snapshot");
+            return;
+        }
+
+        let golden = std::fs::read_to_string(golden_path)
+            .expect("missing tests/golden/routing_decisions.snap — run UPDATE_GOLDEN=1 cargo test to create it");
+        if golden != snap {
+            let mut diff = String::new();
+            for (i, (g, a)) in golden.lines().zip(snap.lines()).enumerate() {
+                if g != a {
+                    diff.push_str(&format!("  L{}\n    golden: {g}\n    actual: {a}\n", i + 1));
+                }
+            }
+            let (gn, an) = (golden.lines().count(), snap.lines().count());
+            if gn != an {
+                diff.push_str(&format!("  line count differs: golden={gn} actual={an}\n"));
+            }
+            panic!(
+                "routing decision snapshot drift — a routing heuristic changed.\n\
+                 Review the diff below; if the change is intended, regenerate the \n\
+                 golden file with `UPDATE_GOLDEN=1 cargo test routing_decision_snapshot`.\n\n{diff}"
+            );
+        }
     }
 }
