@@ -204,4 +204,113 @@ mod tests {
         assert_eq!(got, expected);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---- TASK-109: oracle harness -----------------------------------------
+    //
+    // A differential test: run a corpus of pipelines through aish's *native*
+    // executor (`pipeline::run`) and through a real `bash -c`, then assert the
+    // two agree on stdout bytes and on exit status. bash is the oracle — the
+    // ground truth aish's no-shell pipeline must reproduce byte-for-byte. The
+    // corpus is deliberately env- and locale-stable (integer/ASCII coreutils,
+    // numeric sorts) so a mismatch means an aish regression, not a flaky locale.
+    //
+    // aish's last stage writes to the inherited terminal, so to capture its
+    // stdout we append a `dd of=<file>` sink (aish has no `>`) exactly as the
+    // AC-1 test does. bash's stdout is captured directly via a pipe.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static ORACLE_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    /// Run `cmd` through aish's pipeline executor, capturing the final stdout
+    /// into a temp file via an appended `dd` sink. Returns the captured bytes.
+    async fn aish_stdout(cmd: &str, session: &Session) -> Vec<u8> {
+        let n = ORACLE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let sink = std::env::temp_dir().join(format!("aish_oracle_{}_{n}.out", std::process::id()));
+        let piped = format!("{cmd} | dd of={}", sink.display());
+        let stages = parse(&piped).expect("oracle command must be a pipeline aish runs directly");
+        let status = run(&stages, session).await.expect("aish pipeline run");
+        assert!(status.success(), "dd capture sink failed for `{cmd}`");
+        let bytes = std::fs::read(&sink).unwrap_or_default();
+        let _ = std::fs::remove_file(&sink);
+        bytes
+    }
+
+    /// Run `cmd` through the oracle (`bash -c`) in `cwd`, returning its stdout.
+    fn bash_stdout(cmd: &str, cwd: &std::path::Path) -> Vec<u8> {
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(cwd)
+            .output()
+            .expect("spawn bash oracle (is bash on PATH?)")
+            .stdout
+    }
+
+    /// Exit code of `cmd` under the oracle (`bash -c`) in `cwd`.
+    fn bash_code(cmd: &str, cwd: &std::path::Path) -> Option<i32> {
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(cwd)
+            .status()
+            .expect("spawn bash oracle")
+            .code()
+    }
+
+    #[tokio::test]
+    async fn oracle_stdout_matches_bash() {
+        let session = Session::new().unwrap();
+        // Each entry is a pipeline aish runs natively; bash is the ground truth.
+        let corpus = [
+            "seq 1 20 | sort -rn | head -n 3",
+            "seq 1 100 | grep 7 | wc -l",
+            "seq 1 9 | tr 0-9 a-j",
+            "yes hello | head -n 4 | wc -l",
+            "echo one two three four | wc -w",
+            "seq 1 3 | sort -r",
+            "seq 1 50 | grep -c 2",
+        ];
+        for cmd in corpus {
+            let got = aish_stdout(cmd, &session).await;
+            let want = bash_stdout(cmd, &session.cwd);
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                String::from_utf8_lossy(&want),
+                "aish stdout diverged from bash for `{cmd}`"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oracle_exit_status_matches_bash() {
+        let session = Session::new().unwrap();
+        // Default (no pipefail) pipeline status == last stage status in both.
+        let corpus = [
+            "true | true | false",
+            "false | false | true",
+            "seq 1 3 | grep 2",
+            "seq 1 3 | grep 9",
+        ];
+        for cmd in corpus {
+            let got = run(&parse(cmd).unwrap(), &session).await.unwrap().code();
+            let want = bash_code(cmd, &session.cwd);
+            assert_eq!(got, want, "aish exit status diverged from bash for `{cmd}`");
+        }
+    }
+
+    #[tokio::test]
+    async fn oracle_detects_deliberate_divergence() {
+        // The harness must have teeth: feed aish and the oracle *different*
+        // commands and confirm the comparator sees them as unequal. If this
+        // ever passes as equal, the oracle is blind and the matching tests
+        // above are worthless.
+        let session = Session::new().unwrap();
+        let aish = aish_stdout("seq 1 5 | sort -r", &session).await;
+        let bash = bash_stdout("seq 1 5 | sort", &session.cwd); // ascending, not reversed
+        assert_ne!(
+            String::from_utf8_lossy(&aish),
+            String::from_utf8_lossy(&bash),
+            "oracle failed to detect an intentional divergence — the harness is blind"
+        );
+    }
 }
