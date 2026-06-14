@@ -49,6 +49,9 @@ struct JobInner {
     result: Option<String>,
     /// Error message if the batch failed (auth, network, timeout, …).
     error: Option<String>,
+    /// Whether this job's result has already been surfaced to the user, so the
+    /// "all complete" flush doesn't print it twice.
+    displayed: bool,
 }
 
 pub type BatchJobs = Arc<Mutex<Vec<Arc<BatchJob>>>>;
@@ -88,6 +91,19 @@ impl BatchJob {
 
     pub fn status(&self) -> String {
         self.inner.lock().unwrap().status.clone()
+    }
+
+    /// Done or failed — no longer running.
+    fn is_terminal(&self) -> bool {
+        matches!(self.inner.lock().unwrap().status.as_str(), "done" | "failed")
+    }
+
+    fn is_displayed(&self) -> bool {
+        self.inner.lock().unwrap().displayed
+    }
+
+    fn mark_displayed(&self) {
+        self.inner.lock().unwrap().displayed = true;
     }
 
     /// One line for `:batch status`.
@@ -139,13 +155,13 @@ pub fn spawn(
     let job = Arc::new(BatchJob {
         id: id.clone(),
         task: task.clone(),
-        inner: Mutex::new(JobInner { status: "running".into(), result: None, error: None }),
+        inner: Mutex::new(JobInner { status: "running".into(), result: None, error: None, displayed: false }),
         store,
     });
     guard.push(job.clone());
     drop(guard);
 
-    tokio::spawn(run_batch(job, task, model, api_key));
+    tokio::spawn(run_batch(jobs.clone(), job, task, model, api_key));
     id
 }
 
@@ -168,6 +184,7 @@ pub fn rehydrate(session: &mut crate::session::Session) {
         return;
     }
     let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+    let jobs = session.batch_jobs.clone();
     let mut resumed = 0usize;
     for row in rows {
         let terminal = matches!(row.status.as_str(), "done" | "failed");
@@ -178,16 +195,19 @@ pub fn rehydrate(session: &mut crate::session::Session) {
                 status: row.status.clone(),
                 result: row.result.clone(),
                 error: row.error.clone(),
+                // Jobs that finished in a previous session were already surfaced
+                // there — don't re-print them when a reattached job completes.
+                displayed: terminal,
             }),
             store: Some(store.clone()),
         });
-        session.batch_jobs.lock().unwrap().push(job.clone());
+        jobs.lock().unwrap().push(job.clone());
         if terminal {
             continue;
         }
         match (row.anthropic_id, api_key.clone()) {
             (Some(aid), Some(key)) => {
-                tokio::spawn(resume_batch(job, aid, key));
+                tokio::spawn(resume_batch(jobs.clone(), job, aid, key));
                 resumed += 1;
             }
             // Crashed between registering and submitting — unrecoverable.
@@ -202,19 +222,19 @@ pub fn rehydrate(session: &mut crate::session::Session) {
 }
 
 /// The poll task: submit one batch request, poll to completion, retrieve and
-/// render the result, then announce on the user's terminal.
-async fn run_batch(job: Arc<BatchJob>, task: String, model: String, api_key: String) {
+/// render the result, then surface it.
+async fn run_batch(jobs: BatchJobs, job: Arc<BatchJob>, task: String, model: String, api_key: String) {
     let client = BatchClient::new(api_key);
     match client.run(&task, &model, &job).await {
         Ok(summary) => job.set_done(summary),
         Err(e) => job.set_failed(format!("{e:#}")),
     }
-    announce_completion(&job);
+    on_complete(&jobs, &job);
 }
 
 /// Reattach to an already-submitted batch (no `create`): poll the existing
-/// Anthropic id to completion, retrieve, render, announce.
-async fn resume_batch(job: Arc<BatchJob>, anthropic_id: String, api_key: String) {
+/// Anthropic id to completion, retrieve, render, surface.
+async fn resume_batch(jobs: BatchJobs, job: Arc<BatchJob>, anthropic_id: String, api_key: String) {
     let client = BatchClient::new(api_key);
     let outcome = async {
         let ended = client.poll(&anthropic_id, &job).await?;
@@ -229,16 +249,48 @@ async fn resume_batch(job: Arc<BatchJob>, anthropic_id: String, api_key: String)
         Ok(summary) => job.set_done(summary),
         Err(e) => job.set_failed(format!("{e:#}")),
     }
-    announce_completion(&job);
+    on_complete(&jobs, &job);
 }
 
-/// Print a job's terminal state over the prompt (rustyline redraws on keypress).
-fn announce_completion(job: &Arc<BatchJob>) {
-    let line = match job.status().as_str() {
-        "done" => format!("done — {} (batch_result \"{}\" to read it)", job.task, job.id),
-        _ => format!("failed — {}", job.fetch()),
+/// Called when one batch finishes. While other batches are still running, print a
+/// brief progress line; once every batch has finished, deliver all not-yet-shown
+/// results to the user's terminal at once — no need to ask the model to fetch them.
+fn on_complete(jobs: &BatchJobs, finished: &Arc<BatchJob>) {
+    let (all_terminal, remaining) = {
+        let g = jobs.lock().unwrap();
+        let remaining = g.iter().filter(|j| !j.is_terminal()).count();
+        (remaining == 0, remaining)
     };
-    crate::tools::announce(&format!("[{}]", job.id), &line);
+    if !all_terminal {
+        crate::tools::announce(
+            &format!("[{}]", finished.id),
+            &format!("{} — {remaining} batch job(s) still running", finished.status()),
+        );
+        return;
+    }
+    flush_results(jobs);
+}
+
+/// Print every finished-but-not-yet-shown batch result over the prompt, then mark
+/// them shown. Rendered through the markdown formatter so tables/lists look right;
+/// rustyline redraws the prompt on the next keypress.
+fn flush_results(jobs: &BatchJobs) {
+    let pending: Vec<Arc<BatchJob>> = {
+        let g = jobs.lock().unwrap();
+        g.iter().filter(|j| j.is_terminal() && !j.is_displayed()).cloned().collect()
+    };
+    if pending.is_empty() {
+        return;
+    }
+    print!("\r\x1b[2K"); // wipe the prompt line the result is landing over
+    for job in &pending {
+        let label = if job.status() == "failed" { "failed" } else { "complete" };
+        println!("\x1b[2m── batch {} {label} ──\x1b[0m", job.id);
+        println!("{}", crate::md::render_stdout(job.fetch().trim()));
+        job.mark_displayed();
+    }
+    use std::io::Write;
+    std::io::stdout().flush().ok();
 }
 
 /// One flattened per-request result from a batch's `.jsonl` results.
@@ -500,7 +552,7 @@ mod tests {
             jobs.lock().unwrap().push(Arc::new(BatchJob {
                 id: format!("batch_{id}"),
                 task: "t".into(),
-                inner: Mutex::new(JobInner { status: "running".into(), result: None, error: None }),
+                inner: Mutex::new(JobInner { status: "running".into(), result: None, error: None, displayed: false }),
                 store: None,
             }));
         };
@@ -523,7 +575,7 @@ mod tests {
         let job = Arc::new(BatchJob {
             id: "batch_1".into(),
             task: "summarize".into(),
-            inner: Mutex::new(JobInner { status: "running".into(), result: None, error: None }),
+            inner: Mutex::new(JobInner { status: "running".into(), result: None, error: None, displayed: false }),
             store: None,
         });
         assert!(job.fetch().contains("still running"));

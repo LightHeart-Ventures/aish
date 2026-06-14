@@ -671,8 +671,8 @@ fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
     );
     Ok(format!(
         "Queued background batch {id} on {model}. It runs asynchronously (~50% cheaper, may take up \
-to ~1h). Continue with other work and call batch_result {{\"job\": \"{id}\"}} on a later turn to \
-retrieve the result.",
+to ~1h) and its result is printed to the user's terminal automatically once it finishes — you don't \
+need to poll. Continue with other work; you may also fetch it with batch_result {{\"job\": \"{id}\"}}.",
         model = session.batch_model
     ))
 }

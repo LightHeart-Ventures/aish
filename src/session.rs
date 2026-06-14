@@ -221,7 +221,8 @@ self-contained, deferrable task to an asynchronous Anthropic Message Batches job
 non-blocking) and returns a job id immediately; batch_result(job) fetches it once it ends. PREFER \
 run_in_background for deferrable, parallelizable, or non-urgent work — it is slower but keeps the \
 conversation moving. Only answer inline when the user needs the result right now. After offloading, \
-tell the user the job id and check batch_result on a later turn (or when they ask).";
+tell the user the job id; the result is delivered to their terminal automatically once the batch \
+finishes (no need to promise to check back — you can also fetch it yourself with batch_result).";
 
 /// Hard cap (bytes) on last-output text exposed via `$LAST`/`$_` and the
 /// automatic model-prompt context (TASK-13 AC3). Outputs longer than this are
