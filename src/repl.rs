@@ -102,7 +102,7 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
                 needs_gap = true;
 
                 if let Some(cmd) = line.strip_prefix(':') {
-                    if handle_colon(cmd, &mut backend, &mut session) {
+                    if handle_colon(cmd, &mut backend, &mut session).await {
                         break;
                     }
                     continue;
@@ -772,7 +772,7 @@ fn toggle_raw_output(session: &mut Session) {
 }
 
 /// Returns true when the REPL should exit.
-fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -> bool {
+async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -> bool {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
         Some("q" | "quit" | "exit") => return true,
@@ -784,6 +784,11 @@ fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -> bool
                                                      normal only for write/create/delete, yolo never)\n\
                  :model <opus|sonnet|haiku|full-id>  switch model\n\
                  :backend <claude|local>             switch backend\n\
+                 :mcp [list|status]                  list connected MCP servers\n\
+                 :mcp reconnect [name|all]           restart MCP server(s)\n\
+                 :mcp add <name> <command|url> [args] connect + save an MCP server (~/.aish/.mcp.json)\n\
+                 :mcp remove <name>                  disconnect + unsave an MCP server\n\
+                 :mcp tools [name]                   list MCP tools\n\
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
                  :batch <on|off|status|clear>        interactive batch mode: agent offloads deferrable\n\
@@ -887,10 +892,116 @@ fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -> bool
         }
         Some("allow") => handle_allow(parts.next(), parts.next(), session),
         Some("batch") => handle_batch(parts.next(), parts.next(), session),
+        Some("mcp") => handle_mcp(parts.collect(), session).await,
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
     }
     false
+}
+
+/// `:mcp` manages MCP servers (like Claude Code's `/mcp`): list, reconnect, add,
+/// remove, and inspect tools. Adds/removes persist to ~/.aish/.mcp.json.
+async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
+    match args.split_first() {
+        None | Some((&"list", _)) | Some((&"status", _)) => {
+            let servers = session.mcp.status();
+            if servers.is_empty() {
+                println!("no MCP servers connected");
+                return;
+            }
+            for s in servers {
+                println!(
+                    "  {} [{}] {} — {} tool{}, {} skill{}",
+                    s.name,
+                    s.kind,
+                    s.detail,
+                    s.tools,
+                    if s.tools == 1 { "" } else { "s" },
+                    s.prompts,
+                    if s.prompts == 1 { "" } else { "s" },
+                );
+            }
+        }
+        Some((&"reconnect", rest)) => {
+            if rest.is_empty() || (rest.len() == 1 && rest[0] == "all") {
+                let results = session.mcp.reconnect_all().await;
+                if results.is_empty() {
+                    println!("no MCP servers to reconnect");
+                }
+                for (name, res) in results {
+                    match res {
+                        Ok(()) => println!("reconnected {name}"),
+                        Err(e) => println!("reconnect {name}: {e:#}"),
+                    }
+                }
+            } else {
+                for name in rest {
+                    match session.mcp.reconnect(name).await {
+                        Ok(()) => println!("reconnected {name}"),
+                        Err(e) => println!("reconnect {name}: {e:#}"),
+                    }
+                }
+            }
+        }
+        Some((&"add", rest)) => {
+            let Some((&name, tail)) = rest.split_first() else {
+                println!("usage: :mcp add <name> <command|url> [args…]");
+                return;
+            };
+            let Some((&first, extra)) = tail.split_first() else {
+                println!("usage: :mcp add <name> <command|url> [args…]");
+                return;
+            };
+            let spec = if first.starts_with("http://") || first.starts_with("https://") {
+                serde_json::json!({"type": "http", "url": first})
+            } else {
+                serde_json::json!({"command": first, "args": extra})
+            };
+            match session.mcp.add(name, spec, true).await {
+                Ok(()) => println!("connected and saved {name}"),
+                Err(e) => println!("mcp add {name}: {e:#}"),
+            }
+        }
+        Some((&"remove" | &"rm", rest)) => {
+            let Some(&name) = rest.first() else {
+                println!("usage: :mcp remove <name>");
+                return;
+            };
+            match session.mcp.remove(name) {
+                Ok((false, _)) => println!("no connected server {name}"),
+                Ok((true, true)) => println!("disconnected and unsaved {name}"),
+                Ok((true, false)) => {
+                    println!("disconnected {name} (defined in project .mcp.json — it returns on restart)")
+                }
+                Err(e) => println!("mcp remove {name}: {e:#}"),
+            }
+        }
+        Some((&"tools", rest)) => {
+            let names: Vec<String> = if rest.is_empty() {
+                session.mcp.server_names()
+            } else {
+                rest.iter().map(|s| s.to_string()).collect()
+            };
+            if names.is_empty() {
+                println!("no MCP servers connected");
+            }
+            for n in names {
+                match session.mcp.tools_of(&n) {
+                    Some(tools) if tools.is_empty() => println!("{n}: (no tools)"),
+                    Some(tools) => {
+                        println!("{n}:");
+                        for (t, ro) in tools {
+                            println!("  mcp__{n}__{t}{}", if ro { "  (read-only)" } else { "" });
+                        }
+                    }
+                    None => println!("no such server {n}"),
+                }
+            }
+        }
+        Some((other, _)) => {
+            println!("unknown :mcp subcommand '{other}' — usage: :mcp [list|reconnect|add|remove|tools]")
+        }
+    }
 }
 
 /// `:allow` lists the always-allowed tools; `:allow remove <tool>` revokes one.
