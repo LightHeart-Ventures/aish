@@ -11,6 +11,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 pub struct Db {
     conn: Connection,
@@ -57,6 +58,10 @@ impl Db {
              CREATE TABLE IF NOT EXISTS allowed_tools (
                  tool TEXT PRIMARY KEY,
                  ts   TEXT NOT NULL DEFAULT current_timestamp
+             );
+             CREATE TABLE IF NOT EXISTS settings (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
              );",
         )
         .context("schema init failed")?;
@@ -154,6 +159,140 @@ impl Db {
             .execute("DELETE FROM allowed_tools WHERE tool = ?1", [tool])?;
         Ok(n > 0)
     }
+
+    /// Persist a key/value setting (e.g. the batch-mode flag). Upserts.
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )?;
+        Ok(())
+    }
+
+    /// Read a persisted setting. `None` when unset.
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+}
+
+/// One persisted background batch job (the `model` column is recorded but not
+/// needed for reattach — the model is already stamped on the submitted batch).
+pub struct BatchRow {
+    pub local_id: String,
+    pub anthropic_id: Option<String>,
+    pub task: String,
+    pub status: String,
+    pub result: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Durable store for background batch jobs, kept in its OWN connection so the
+/// async poll tasks (which run off the main thread) can persist status updates
+/// without sharing the main `Db` connection. Points at the same `aish.db` file;
+/// WAL mode (set by `Db::open`) makes the concurrent connections safe. Cloneable
+/// — every spawned batch task holds a handle.
+#[derive(Clone)]
+pub struct BatchStore {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl BatchStore {
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)
+            .with_context(|| format!("can't open batch store at {}", path.display()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE IF NOT EXISTS batch_jobs (
+                 local_id     TEXT PRIMARY KEY,
+                 anthropic_id TEXT,
+                 task         TEXT NOT NULL,
+                 model        TEXT NOT NULL,
+                 status       TEXT NOT NULL,
+                 result       TEXT,
+                 error        TEXT,
+                 created_at   TEXT NOT NULL DEFAULT current_timestamp
+             );",
+        )
+        .context("batch_jobs schema init failed")?;
+        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+    }
+
+    /// Register a freshly-queued job (no Anthropic id yet, status "running").
+    pub fn insert(&self, local_id: &str, task: &str, model: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO batch_jobs (local_id, task, model, status) VALUES (?1, ?2, ?3, 'running')",
+            (local_id, task, model),
+        )?;
+        Ok(())
+    }
+
+    /// Record the Anthropic batch id once `create` returns — this is what lets a
+    /// later run reattach to a batch in flight.
+    pub fn set_anthropic_id(&self, local_id: &str, anthropic_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE batch_jobs SET anthropic_id = ?2 WHERE local_id = ?1",
+            (local_id, anthropic_id),
+        )?;
+        Ok(())
+    }
+
+    pub fn set_status(&self, local_id: &str, status: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE batch_jobs SET status = ?2 WHERE local_id = ?1", (local_id, status))?;
+        Ok(())
+    }
+
+    pub fn set_done(&self, local_id: &str, result: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE batch_jobs SET status = 'done', result = ?2 WHERE local_id = ?1",
+            (local_id, result),
+        )?;
+        Ok(())
+    }
+
+    pub fn set_failed(&self, local_id: &str, error: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE batch_jobs SET status = 'failed', error = ?2 WHERE local_id = ?1",
+            (local_id, error),
+        )?;
+        Ok(())
+    }
+
+    /// Every persisted job, oldest first — used at startup to rehydrate handles
+    /// and reattach poll loops to still-running batches.
+    pub fn load_all(&self) -> Result<Vec<BatchRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT local_id, anthropic_id, task, status, result, error
+             FROM batch_jobs ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(BatchRow {
+                local_id: r.get(0)?,
+                anthropic_id: r.get(1)?,
+                task: r.get(2)?,
+                status: r.get(3)?,
+                result: r.get(4)?,
+                error: r.get(5)?,
+            })
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Drop terminal (done/failed) jobs. Returns how many rows were removed.
+    pub fn clear_finished(&self) -> Result<usize> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM batch_jobs WHERE status IN ('done', 'failed')", [])?)
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +341,45 @@ mod tests {
         db.record("input", "/tmp", "next question");
         db.record("output", "/tmp", "second reply");
         assert_eq!(db.last_output().unwrap().as_deref(), Some("second reply"));
+    }
+
+    #[test]
+    fn settings_roundtrip() {
+        let db = temp_db("settings");
+        assert_eq!(db.get_setting("batch_mode").unwrap(), None);
+        db.set_setting("batch_mode", "true").unwrap();
+        assert_eq!(db.get_setting("batch_mode").unwrap().as_deref(), Some("true"));
+        db.set_setting("batch_mode", "false").unwrap(); // upsert
+        assert_eq!(db.get_setting("batch_mode").unwrap().as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn batch_store_roundtrip_and_reattach() {
+        let path = std::env::temp_dir().join(format!("aish_batch_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = BatchStore::open(&path).unwrap();
+
+        store.insert("batch_1", "summarize logs", "claude-opus-4-8").unwrap();
+        store.set_anthropic_id("batch_1", "msgbatch_abc").unwrap();
+        store.set_status("batch_1", "in_progress").unwrap();
+        store.insert("batch_2", "translate", "claude-opus-4-8").unwrap();
+        store.set_done("batch_2", "the result").unwrap();
+
+        // A fresh store over the same file sees both — this is the restart path.
+        let reopened = BatchStore::open(&path).unwrap();
+        let rows = reopened.load_all().unwrap();
+        assert_eq!(rows.len(), 2);
+        let one = rows.iter().find(|r| r.local_id == "batch_1").unwrap();
+        assert_eq!(one.anthropic_id.as_deref(), Some("msgbatch_abc"));
+        assert_eq!(one.status, "in_progress"); // resumable
+        let two = rows.iter().find(|r| r.local_id == "batch_2").unwrap();
+        assert_eq!(two.status, "done");
+        assert_eq!(two.result.as_deref(), Some("the result"));
+
+        store.set_failed("batch_1", "timeout").unwrap();
+        assert_eq!(reopened.clear_finished().unwrap(), 2); // both terminal now
+        assert!(reopened.load_all().unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

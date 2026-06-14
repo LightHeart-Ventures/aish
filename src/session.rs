@@ -81,6 +81,21 @@ pub struct Session {
     /// keeps `a` working even when the persistent store is unavailable (AC3).
     /// Populated on every 'a' answer and consulted before the DB.
     pub session_allows: HashSet<String>,
+    /// Interactive batch mode (on by default, persisted; toggle with `:batch`).
+    /// When on, the agent gets the run_in_background/batch_result tools and a
+    /// system-prompt nudge to offload deferrable work to background Anthropic
+    /// Message Batches jobs. A persisted `:batch off` survives restarts.
+    pub batch_mode: bool,
+    /// Model every background batch runs on (batches are Anthropic-only). Always
+    /// Opus by default — deferred work gets the strongest model regardless of the
+    /// interactive backend. Settable via `:batch model`.
+    pub batch_model: String,
+    /// Live background batch jobs (in memory for the session, mirrored to
+    /// `batch_store` for durability).
+    pub batch_jobs: crate::batch::BatchJobs,
+    /// Durable batch-job store (own SQLite connection). None if it failed to
+    /// open — batches then fall back to session-only, lost on exit.
+    pub batch_store: Option<crate::db::BatchStore>,
 }
 
 impl Session {
@@ -101,6 +116,10 @@ impl Session {
             jobs: Default::default(),
             last_status: 0,
             session_allows: HashSet::new(),
+            batch_mode: true,
+            batch_model: crate::batch::DEFAULT_BATCH_MODEL.to_string(),
+            batch_jobs: Default::default(),
+            batch_store: None,
         })
     }
 
@@ -186,13 +205,23 @@ matter — aish renders these as aligned terminal tables. Be verbose with column
 terse, and order the rows deliberately: chronological for events or history, by stage for \
 pipelines or build/run phases, by category for mixed or grouped sets.\n\
 - Final replies are terse and shell-like. One line when one line will do, but reach for a table \
-the moment there are several items to compare. No markdown headers.{skills}",
+the moment there are several items to compare. No markdown headers.{skills}{batch}",
             host = self.host_info,
             cwd = self.cwd.display(),
             skills = self.skills_prompt,
+            batch = if self.batch_mode { BATCH_NUDGE } else { "" },
         )
     }
 }
+
+/// Appended to the system prompt when batch mode is on (ported from atum's
+/// BATCH_MODE_NUDGE): biases the agent toward offloading deferrable work.
+const BATCH_NUDGE: &str = "\n\nBatch mode is ON. You have run_in_background(task) — it offloads a \
+self-contained, deferrable task to an asynchronous Anthropic Message Batches job (~50% cheaper, \
+non-blocking) and returns a job id immediately; batch_result(job) fetches it once it ends. PREFER \
+run_in_background for deferrable, parallelizable, or non-urgent work — it is slower but keeps the \
+conversation moving. Only answer inline when the user needs the result right now. After offloading, \
+tell the user the job id and check batch_result on a later turn (or when they ask).";
 
 /// Hard cap (bytes) on last-output text exposed via `$LAST`/`$_` and the
 /// automatic model-prompt context (TASK-13 AC3). Outputs longer than this are
