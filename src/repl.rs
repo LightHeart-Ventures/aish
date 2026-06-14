@@ -535,7 +535,7 @@ fn split_route(line: String) -> (String, Route) {
 /// flip it back to a command.
 const AMBIGUOUS_COMMANDS: &[&str] = &[
     "who", "w", "find", "time", "test", "yes", "look", "last", "watch", "date",
-    "which", "whatis", "finger", "write", "wall", "users", "top", "more",
+    "which", "what", "whatis", "finger", "write", "wall", "users", "top", "more",
     "head", "tail", "make", "cat", "kill",
 ];
 
@@ -1218,10 +1218,12 @@ mod tests {
         assert!(prose("who is zachary hohertz"));
         assert!(prose("find me big files"));
         assert!(prose("make this file executable"));
+        assert!(prose("what is the capital of texas")); // `what` is a real binary on macOS
         // real invocations stay direct
         assert!(!prose("who"));
         assert!(!prose("who -a"));
         assert!(!prose("which ls"));
+        assert!(!prose("what /usr/bin/ls")); // real `what` use takes a path
         assert!(!prose("find . -name foo"));
         assert!(!prose("tail logfile"));
         assert!(!prose("echo hello there world")); // echo isn't ambiguous
