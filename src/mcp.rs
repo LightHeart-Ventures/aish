@@ -28,7 +28,7 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -41,6 +41,18 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Default)]
 pub struct McpHost {
     servers: Vec<McpServer>,
+    /// User-scope `.mcp.json` (last config path) — where `:mcp add`/`remove`
+    /// persist changes. None until `start` records it.
+    user_config: Option<PathBuf>,
+}
+
+/// One server's state for the `:mcp` listing.
+pub struct McpStatus {
+    pub name: String,
+    pub kind: &'static str, // "stdio" | "http"
+    pub detail: String,     // command (+args) or url
+    pub tools: usize,
+    pub prompts: usize,
 }
 
 struct McpTool {
@@ -86,6 +98,8 @@ enum Transport {
 
 struct McpServer {
     name: String,
+    /// Raw config spec — kept so `:mcp reconnect` can restart the server.
+    spec: Value,
     transport: Transport,
     next_id: u64,
     tools: Vec<McpTool>,
@@ -99,6 +113,8 @@ impl McpHost {
     /// entry must not take the shell down.
     pub async fn start(config_paths: &[&Path]) -> Self {
         let mut host = Self::default();
+        // Last path is user scope (project precedes user) — adds/removes land there.
+        host.user_config = config_paths.last().map(|p| p.to_path_buf());
         for path in config_paths {
             let Ok(text) = std::fs::read_to_string(path) else {
                 continue;
@@ -150,6 +166,128 @@ impl McpHost {
                 })
             })
             .collect()
+    }
+
+    // ---- `:mcp` management -------------------------------------------------
+
+    /// Per-server state for the `:mcp` listing.
+    pub fn status(&self) -> Vec<McpStatus> {
+        self.servers
+            .iter()
+            .map(|s| {
+                let (kind, detail) = if s.spec["command"].is_string() {
+                    let args = s.spec["args"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+                        .unwrap_or_default();
+                    ("stdio", format!("{} {args}", s.spec["command"].as_str().unwrap_or("")).trim().to_string())
+                } else {
+                    ("http", s.spec["url"].as_str().unwrap_or("").to_string())
+                };
+                McpStatus { name: s.name.clone(), kind, detail, tools: s.tools.len(), prompts: s.prompts.len() }
+            })
+            .collect()
+    }
+
+    /// Connected server names.
+    pub fn server_names(&self) -> Vec<String> {
+        self.servers.iter().map(|s| s.name.clone()).collect()
+    }
+
+    /// `(tool name, read_only)` for one server, or None if it isn't connected.
+    pub fn tools_of(&self, name: &str) -> Option<Vec<(String, bool)>> {
+        self.servers
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.tools.iter().map(|t| (t.name.clone(), t.read_only)).collect())
+    }
+
+    /// Restart one server from its stored spec (drops the old one — its child is
+    /// killed on drop). Fresh tool/prompt lists replace the old.
+    pub async fn reconnect(&mut self, name: &str) -> Result<()> {
+        let idx = self
+            .servers
+            .iter()
+            .position(|s| s.name == name)
+            .ok_or_else(|| anyhow::anyhow!("unknown mcp server: {name}"))?;
+        let spec = self.servers[idx].spec.clone();
+        let fresh = McpServer::start(name, &spec).await?;
+        self.servers[idx] = fresh;
+        Ok(())
+    }
+
+    /// Reconnect every server; returns each result so the caller can report.
+    pub async fn reconnect_all(&mut self) -> Vec<(String, Result<()>)> {
+        let names = self.server_names();
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let res = self.reconnect(&name).await;
+            out.push((name, res));
+        }
+        out
+    }
+
+    /// Connect a new server from a spec and (optionally) persist it to the
+    /// user-scope `.mcp.json`.
+    pub async fn add(&mut self, name: &str, spec: Value, persist: bool) -> Result<()> {
+        if self.servers.iter().any(|s| s.name == name) {
+            anyhow::bail!("server {name} is already connected — use :mcp reconnect {name}");
+        }
+        let server = McpServer::start(name, &spec).await?;
+        self.servers.push(server);
+        if persist {
+            self.persist_server(name, &spec)?;
+        }
+        Ok(())
+    }
+
+    /// Disconnect a server. Returns `(was_connected, removed_from_user_config)`.
+    /// A server defined only in project-scope config is dropped live but returns
+    /// on restart — the bools let the caller say so.
+    pub fn remove(&mut self, name: &str) -> Result<(bool, bool)> {
+        let before = self.servers.len();
+        self.servers.retain(|s| s.name != name); // drop kills the child
+        let was = self.servers.len() < before;
+        let unpersisted = self.unpersist_server(name)?;
+        Ok((was, unpersisted))
+    }
+
+    fn persist_server(&self, name: &str, spec: &Value) -> Result<()> {
+        let path = self
+            .user_config
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no user mcp config path to write"))?;
+        let mut root: Value = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_else(|| json!({"mcpServers": {}}));
+        if !root["mcpServers"].is_object() {
+            root["mcpServers"] = json!({});
+        }
+        root["mcpServers"][name] = spec.clone();
+        std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&root)?))
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Remove a server from the user config. Returns true if it was present there.
+    fn unpersist_server(&self, name: &str) -> Result<bool> {
+        let Some(path) = self.user_config.as_ref() else {
+            return Ok(false);
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Ok(false);
+        };
+        let mut root: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+        let present = root["mcpServers"].get(name).is_some();
+        if present {
+            if let Some(map) = root["mcpServers"].as_object_mut() {
+                map.remove(name);
+            }
+            std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&root)?))
+                .with_context(|| format!("writing {}", path.display()))?;
+        }
+        Ok(present)
     }
 
     /// Every MCP-provided skill (prompt) across connected servers.
@@ -326,6 +464,7 @@ impl McpServer {
         };
         let mut server = Self {
             name: name.to_string(),
+            spec: spec.clone(),
             transport,
             next_id: 0,
             tools: Vec::new(),
@@ -721,7 +860,7 @@ for line in sys.stdin:
             Err(e) if format!("{e:#}").contains("failed to spawn") => return, // no python3 on host
             Err(e) => panic!("handshake failed: {e:#}"),
         };
-        let mut host = McpHost { servers: vec![server] };
+        let mut host = McpHost { servers: vec![server], ..Default::default() };
 
         let defs = host.tool_defs();
         assert_eq!(defs.len(), 1);
