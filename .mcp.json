@@ -1,15 +1,13 @@
 {
   "mcpServers": {
     "atum": {
-      "command": "node",
-      "args": [
-        "./node_modules/.bin/mcp-remote",
-        "https://events.api.getatum.com/v1/tenants/t_5d2e99ddf596/projects/b_9e8fb2e16501/mcp",
-        "--header",
-        "X-Atum-Api-Key:${ATUM_API_KEY}",
-        "--header",
-        "X-Atum-Api-Key-Id:${ATUM_API_KEY_ID}"
-      ]
+      "type": "http",
+      "url": "https://events.api.getatum.com/v1/tenants/${ATUM_TENANT}/projects/${ATUM_PROJECT}/mcp",
+      "headers": {
+        "X-Atum-Api-Key": "${ATUM_API_KEY}",
+        "X-Atum-Api-Key-Id": "${ATUM_API_KEY_ID}"
+      },
+      "credentials": { "file": "~/.atum/credentials", "profile": "aish" }
     }
   }
 }
