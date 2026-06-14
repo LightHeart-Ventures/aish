@@ -61,8 +61,8 @@ fn allow_key(call: &ToolCall) -> String {
     }
 }
 
-pub fn tool_defs() -> Vec<ToolDef> {
-    vec![
+pub fn tool_defs(batch_mode: bool) -> Vec<ToolDef> {
+    let mut defs = vec![
         ToolDef {
             name: "run_program".into(),
             description: "Execute one program directly (fork/exec — NO shell). Call this for any \
@@ -198,7 +198,41 @@ under 'MCP skills'). Returns the expanded instructions — read them, then follo
                 "required": ["server", "name"]
             }),
         },
-    ]
+    ];
+    // Interactive batch mode: only offered when on, so the model never sees these
+    // tools (or the system-prompt nudge) unless the user opted in with :batch on.
+    if batch_mode {
+        defs.push(ToolDef {
+            name: "run_in_background".into(),
+            description: "Offload a self-contained, deferrable task to a BACKGROUND batch job \
+(Anthropic Message Batches API). Returns a job id immediately; the work runs asynchronously — \
+~50% cheaper and non-blocking, but slower (it may take up to ~1 hour). Prefer this for \
+parallelizable, long-running, or non-urgent work. Retrieve the result later with \
+batch_result(job). Do NOT use it for work the user needs answered right now."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "The self-contained task to run in the background. It runs with no access to this conversation or the local machine — include everything it needs."}
+                },
+                "required": ["task"]
+            }),
+        });
+        defs.push(ToolDef {
+            name: "batch_result".into(),
+            description: "Fetch the result of a background batch job started with run_in_background. \
+Returns the result if the job has ended, or its current status if still running."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "job": {"type": "string", "description": "The job id returned by run_in_background, e.g. \"batch_1\""}
+                },
+                "required": ["job"]
+            }),
+        });
+    }
+    defs
 }
 
 /// Execute one tool call, routing mutating actions through the safety gate.
@@ -225,6 +259,8 @@ pub async fn execute(call: &ToolCall, session: &mut Session, confirm: &mut Confi
         "remember" => remember(call, session),
         "recall" => recall(call, session),
         "job_output" => job_output(call, session),
+        "run_in_background" => run_in_background(call, session),
+        "batch_result" => batch_result(call, session),
         "get_skill" => get_skill(call, session).await,
         other if other.starts_with("mcp__") => mcp_call(call, session, confirm).await,
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
@@ -607,6 +643,54 @@ fn job_output(call: &ToolCall, session: &Session) -> Result<String> {
         job.desc,
         if buf.is_empty() { "(no output yet)" } else { buf.as_str() }
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Interactive batch mode — offload deferrable work to background Anthropic
+// Message Batches jobs. Only reachable when :batch is on (the tools aren't in
+// the tool set otherwise).
+// ---------------------------------------------------------------------------
+
+fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
+    let task = call.args["task"].as_str().map(str::trim).unwrap_or("");
+    if task.is_empty() {
+        anyhow::bail!("`task` is required");
+    }
+    let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
+        anyhow::anyhow!(
+            "ANTHROPIC_API_KEY is not set — the Message Batches API needs a metered API key \
+(a Claude subscription token won't reach it)"
+        )
+    })?;
+    let id = crate::batch::spawn(
+        &session.batch_jobs,
+        task.to_string(),
+        session.batch_model.clone(),
+        api_key,
+        session.batch_store.clone(),
+    );
+    Ok(format!(
+        "Queued background batch {id} on {model}. It runs asynchronously (~50% cheaper, may take up \
+to ~1h). Continue with other work and call batch_result {{\"job\": \"{id}\"}} on a later turn to \
+retrieve the result.",
+        model = session.batch_model
+    ))
+}
+
+fn batch_result(call: &ToolCall, session: &Session) -> Result<String> {
+    // Accept "batch_1", "1", or the integer 1 — normalize to the canonical id.
+    let raw = call.args["job"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| call.args["job"].as_u64().map(|n| n.to_string()))
+        .ok_or_else(|| anyhow::anyhow!("missing job id"))?;
+    let id = format!("batch_{}", raw.trim().trim_start_matches("batch_"));
+    let jobs = session.batch_jobs.lock().unwrap();
+    let job = jobs
+        .iter()
+        .find(|j| j.id == id)
+        .ok_or_else(|| anyhow::anyhow!("no batch job {id} (batch jobs live for this session only; see :batch status)"))?;
+    Ok(job.fetch())
 }
 
 // ---------------------------------------------------------------------------

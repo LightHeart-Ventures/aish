@@ -1,4 +1,5 @@
 mod backend;
+mod batch;
 mod db;
 mod engine;
 mod md;
@@ -83,6 +84,25 @@ async fn main() -> Result<()> {
             None
         }
     };
+
+    // Restore the persisted interactive-batch-mode flag. On by default; a prior
+    // `:batch off` is honored across restarts (unset → stays on).
+    if let Some(db) = &session.db {
+        if let Ok(Some(v)) = db.get_setting("batch_mode") {
+            session.batch_mode = v == "true";
+        }
+    }
+
+    // Durable batch jobs: open the store and reattach any in-flight batches from
+    // a previous session (the batch keeps running platform-side while aish is
+    // down; this picks the handle back up so results land here when they finish).
+    match db::BatchStore::open(&aish_dir.join("aish.db")) {
+        Ok(store) => {
+            session.batch_store = Some(store);
+            batch::rehydrate(&mut session);
+        }
+        Err(e) => eprintln!("\x1b[33maish:\x1b[0m batch store unavailable: {e:#}"),
+    }
 
     if let Some(prompt) = args.command {
         let out = engine::run_turn(&backend, &mut session, prompt, &mut repl::confirm_tty).await?;

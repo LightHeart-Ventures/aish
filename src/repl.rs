@@ -786,6 +786,10 @@ fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -> bool
                  :backend <claude|local>             switch backend\n\
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
+                 :batch <on|off|status|clear>        interactive batch mode: agent offloads deferrable\n\
+                                                     work to background Anthropic batches (Opus, ~50%\n\
+                                                     cheaper); jobs persist + reattach across restarts\n\
+                 :batch model <opus|sonnet|haiku|id> model background batches run on (default opus)\n\
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
                  :allow                              list always-allowed tools/commands\n\
@@ -882,6 +886,7 @@ fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -> bool
             println!("history cleared");
         }
         Some("allow") => handle_allow(parts.next(), parts.next(), session),
+        Some("batch") => handle_batch(parts.next(), parts.next(), session),
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
     }
@@ -916,6 +921,79 @@ fn handle_allow(sub: Option<&str>, arg: Option<&str>, session: &Session) {
             None => println!("usage: :allow remove <tool>"),
         },
         Some(other) => println!("unknown :allow subcommand '{other}' — usage: :allow [remove <tool>]"),
+    }
+}
+
+/// `:batch` toggles/inspects interactive batch mode. `:batch` or `:batch status`
+/// reports the mode and lists this session's batch jobs; `:batch on|off` flips
+/// the (persisted) flag; `:batch model <id>` sets the model batches run on.
+fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
+    let persist = |session: &Session| {
+        if let Some(db) = session.db.as_ref() {
+            let _ = db.set_setting("batch_mode", if session.batch_mode { "true" } else { "false" });
+        }
+    };
+    match sub {
+        Some("on") => {
+            session.batch_mode = true;
+            persist(session);
+            println!(
+                "batch mode on — the agent can offload deferrable work to background batches on {} (takes effect next turn)",
+                session.batch_model
+            );
+        }
+        Some("off") => {
+            session.batch_mode = false;
+            persist(session);
+            println!("batch mode off");
+        }
+        Some("model") => match arg {
+            Some(m) => {
+                let id = match m {
+                    "opus" => "claude-opus-4-8",
+                    "sonnet" => "claude-sonnet-4-6",
+                    "haiku" => "claude-haiku-4-5",
+                    other => other,
+                };
+                session.batch_model = id.to_string();
+                println!("batch model → {}", session.batch_model);
+            }
+            None => println!("batch model: {}\nusage: :batch model <opus|sonnet|haiku|full-id>", session.batch_model),
+        },
+        Some("clear") => {
+            // Drop finished (done/failed) jobs from both the store and memory.
+            if let Some(store) = session.batch_store.as_ref() {
+                match store.clear_finished() {
+                    Ok(n) => println!("cleared {n} finished batch job(s)"),
+                    Err(e) => println!("batch clear: {e:#}"),
+                }
+            } else {
+                println!("cleared (session-only — no persistent store)");
+            }
+            session
+                .batch_jobs
+                .lock()
+                .unwrap()
+                .retain(|j| !matches!(j.status().as_str(), "done" | "failed"));
+        }
+        None | Some("status") => {
+            println!(
+                "batch mode: {} · model: {}",
+                if session.batch_mode { "on" } else { "off" },
+                session.batch_model
+            );
+            let jobs = session.batch_jobs.lock().unwrap();
+            if jobs.is_empty() {
+                println!("no batch jobs");
+            } else {
+                for j in jobs.iter() {
+                    println!("  {}", j.summary_line());
+                }
+            }
+        }
+        Some(other) => {
+            println!("unknown :batch subcommand '{other}' — usage: :batch [on|off|status|clear|model <id>]")
+        }
     }
 }
 

@@ -15,7 +15,7 @@ pub async fn run_turn(
     confirm: &mut Confirm<'_>,
 ) -> Result<String> {
     let system = session.system_prompt();
-    let mut tool_defs = tools::tool_defs();
+    let mut tool_defs = tools::tool_defs(session.batch_mode);
     if backend.include_mcp_tools() {
         tool_defs.extend(session.mcp.tool_defs());
     }
