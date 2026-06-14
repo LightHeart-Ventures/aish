@@ -669,12 +669,13 @@ fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
         api_key,
         session.batch_store.clone(),
     );
-    Ok(format!(
-        "Queued background batch {id} on {model}. It runs asynchronously (~50% cheaper, may take up \
-to ~1h) and its result is printed to the user's terminal automatically once it finishes — you don't \
-need to poll. Continue with other work; you may also fetch it with batch_result {{\"job\": \"{id}\"}}.",
-        model = session.batch_model
-    ))
+    // Steers the model's reply rather than being echoed verbatim — the id stays
+    // internal (results auto-deliver, so the user doesn't need it).
+    let _ = id;
+    Ok("Queued in the background. Now reply to the user with one short, natural sentence that \
+you're working on it and the answer will appear here when it's ready — don't mention a job id or \
+restate the task."
+        .to_string())
 }
 
 fn batch_result(call: &ToolCall, session: &Session) -> Result<String> {
