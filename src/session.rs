@@ -50,6 +50,9 @@ pub struct Session {
     pub history: Vec<Msg>,
     /// How much the safety gate asks before acting (paranoid → yolo).
     pub mode: Mode,
+    /// Optional session name, shown as a `[NAME] |` prefix on the prompt. Set
+    /// with `:name <name>`, cleared with bare `:name`. Session-local.
+    pub name: Option<String>,
     /// Static host info baked into the system prompt once.
     pub host_info: String,
     /// True while a child owns the terminal (run_interactive / direct dispatch).
@@ -96,6 +99,14 @@ pub struct Session {
     /// Durable batch-job store (own SQLite connection). None if it failed to
     /// open — batches then fall back to session-only, lost on exit.
     pub batch_store: Option<crate::db::BatchStore>,
+    /// Live full-tool background workers — aish subprocesses run in
+    /// `--coordinator` mode. In memory for the session, like `batch_jobs`.
+    pub worker_jobs: crate::worker::WorkerJobs,
+    /// True when THIS aish is itself a background coordinator (env
+    /// `AISH_COORDINATOR=1`). The nested guard: a coordinator must never spawn
+    /// its own workers (no infinite re-exec recursion), so `run_in_background`
+    /// downgrades a tool-needing offload to a tool-less batch when this is set.
+    pub nested: bool,
 }
 
 impl Session {
@@ -105,6 +116,7 @@ impl Session {
             cwd,
             history: Vec::new(),
             mode: Mode::default(),
+            name: None,
             host_info: host_info(),
             tty_handoff: Arc::new(AtomicBool::new(false)),
             env: Vec::new(),
@@ -120,6 +132,8 @@ impl Session {
             batch_model: crate::batch::DEFAULT_BATCH_MODEL.to_string(),
             batch_jobs: Default::default(),
             batch_store: None,
+            worker_jobs: Default::default(),
+            nested: std::env::var("AISH_COORDINATOR").is_ok(),
         })
     }
 

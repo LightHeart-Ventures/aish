@@ -130,6 +130,26 @@ impl BatchJob {
     }
 }
 
+/// Block until every background batch job has reached a terminal state. The
+/// headless coordinator (`engine::run_coordinator`) uses this so it doesn't exit
+/// while offloaded sub-work is still running — the poll tasks drive completion,
+/// we just watch their status. (The interactive REPL never needs this: it stays
+/// alive and `on_complete` flushes results as they land.)
+pub async fn await_all(jobs: &BatchJobs) {
+    loop {
+        let running = jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|j| !matches!(j.status().as_str(), "done" | "failed"))
+            .count();
+        if running == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// Register a new background batch and start its poll task. Returns the
 /// session-local job id. `api_key` and `model` are captured up front so the
 /// spawned task is self-contained. `store`, when present, persists the job so it
@@ -256,6 +276,12 @@ async fn resume_batch(jobs: BatchJobs, job: Arc<BatchJob>, anthropic_id: String,
 /// brief progress line; once every batch has finished, deliver all not-yet-shown
 /// results to the user's terminal at once — no need to ask the model to fetch them.
 fn on_complete(jobs: &BatchJobs, finished: &Arc<BatchJob>) {
+    // Interactive REPL: the presenter drains results at a pause in work; staying
+    // quiet here is what stops the "blurt". Headless (-c/--coordinator) has no
+    // prompt to protect, so it falls through and prints inline.
+    if crate::present::deferred() {
+        return;
+    }
     let (all_terminal, remaining) = {
         let g = jobs.lock().unwrap();
         let remaining = g.iter().filter(|j| !j.is_terminal()).count();
@@ -271,23 +297,42 @@ fn on_complete(jobs: &BatchJobs, finished: &Arc<BatchJob>) {
     flush_results(jobs);
 }
 
-/// Print every finished-but-not-yet-shown batch result over the prompt, then mark
-/// them shown. Rendered through the markdown formatter so tables/lists look right;
-/// rustyline redraws the prompt on the next keypress.
-fn flush_results(jobs: &BatchJobs) {
+/// Format every finished-but-not-yet-shown batch result into a display block,
+/// marking each shown. Shared by the headless inline flush and the interactive
+/// presenter (which prints the blocks above the prompt via ExternalPrinter).
+pub fn drain_pending(jobs: &BatchJobs) -> Vec<String> {
     let pending: Vec<Arc<BatchJob>> = {
         let g = jobs.lock().unwrap();
         g.iter().filter(|j| j.is_terminal() && !j.is_displayed()).cloned().collect()
     };
-    if pending.is_empty() {
+    pending
+        .iter()
+        .map(|job| {
+            let label = if job.status() == "failed" { "failed" } else { "complete" };
+            job.mark_displayed();
+            format!(
+                "\x1b[2m── batch {} {label} ──\x1b[0m\n{}",
+                job.id,
+                crate::md::render_stdout(job.fetch().trim())
+            )
+        })
+        .collect()
+}
+
+/// Count of batch jobs still running — for the prompt's `⟳N` indicator.
+pub fn running_count(jobs: &BatchJobs) -> usize {
+    jobs.lock().unwrap().iter().filter(|j| !j.is_terminal()).count()
+}
+
+/// Headless inline flush (no presenter): print every drained block to stdout.
+fn flush_results(jobs: &BatchJobs) {
+    let blocks = drain_pending(jobs);
+    if blocks.is_empty() {
         return;
     }
     print!("\r\x1b[2K"); // wipe the prompt line the result is landing over
-    for job in &pending {
-        let label = if job.status() == "failed" { "failed" } else { "complete" };
-        println!("\x1b[2m── batch {} {label} ──\x1b[0m", job.id);
-        println!("{}", crate::md::render_stdout(job.fetch().trim()));
-        job.mark_displayed();
+    for b in &blocks {
+        println!("{b}");
     }
     use std::io::Write;
     std::io::stdout().flush().ok();

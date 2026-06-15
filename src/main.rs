@@ -7,11 +7,13 @@ mod mcp;
 #[cfg(test)]
 mod oracle;
 mod pipeline;
+mod present;
 mod rc;
 mod repl;
 mod session;
 mod skills;
 mod tools;
+mod worker;
 
 use anyhow::Result;
 use clap::Parser;
@@ -39,6 +41,18 @@ struct Args {
     /// Skip all confirmation prompts (alias for --mode yolo)
     #[arg(long)]
     yolo: bool,
+
+    /// Run headless as a background coordinator: like -c, but AWAIT all
+    /// background batch jobs before exiting (plain -c would orphan them). Runs
+    /// unattended in yolo mode. Requires --run-id. This is how aish re-execs
+    /// itself as a full-tool background worker.
+    #[arg(long)]
+    coordinator: bool,
+
+    /// Durable id for a --coordinator run (used in logs and, later, the
+    /// coordinator store for result read-back).
+    #[arg(long = "run-id")]
+    run_id: Option<String>,
 }
 
 #[tokio::main]
@@ -46,7 +60,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let backend = match args.backend.as_str() {
         "claude" => backend::Backend::new_claude(
-            args.model.unwrap_or_else(|| "claude-opus-4-8".into()),
+            args.model.unwrap_or_else(|| "claude-haiku-4-5".into()),
         )?,
         #[cfg(feature = "local")]
         "local" => backend::Backend::new_local(),
@@ -107,6 +121,14 @@ async fn main() -> Result<()> {
     }
 
     if let Some(prompt) = args.command {
+        if args.coordinator {
+            let run_id = args
+                .run_id
+                .ok_or_else(|| anyhow::anyhow!("--coordinator requires --run-id"))?;
+            // Unattended: no TTY to answer confirm prompts, so run without gates.
+            session.mode = session::Mode::Yolo;
+            return engine::run_coordinator(&backend, &mut session, prompt, &run_id).await;
+        }
         let out = engine::run_turn(&backend, &mut session, prompt, &mut repl::confirm_tty).await?;
         println!("{}", md::render_stdout(&out));
         return Ok(());
