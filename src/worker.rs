@@ -25,6 +25,142 @@ use tokio::process::Command;
 /// possibly-long jobs — but bounded so a wedged child can't live forever.
 const WORKER_TIMEOUT: Duration = Duration::from_secs(60 * 60); // 1h
 
+/// Default address-space / data cap for a worker child, in MB. Generous enough
+/// for a real agentic task but bounded so a runaway can't exhaust host memory.
+/// Override with `AISH_WORKER_MEM_MB`.
+const DEFAULT_WORKER_MEM_MB: u64 = 4096;
+
+/// Default CPU-time cap for a worker child, in seconds. A backstop against a
+/// runaway busy-loop that the wall-clock timeout might not catch promptly.
+/// Override with `AISH_WORKER_CPU_SECS`.
+const DEFAULT_WORKER_CPU_SECS: u64 = 3600;
+
+/// Parse a `u64` from `var`, falling back to `default` if unset, empty, or
+/// unparseable. A value of `0` is treated as "unset / no limit" by the caller.
+fn env_u64(var: &str, default: u64) -> u64 {
+    parse_u64_or(std::env::var(var).ok().as_deref(), default)
+}
+
+/// Pure parsing core of `env_u64`, split out so it's testable without mutating
+/// process-wide env (which is `unsafe` and racy under the test harness's
+/// threads). `None`/empty/unparseable → `default`; otherwise the parsed value
+/// (including a legitimate `0`, which callers read as "no limit").
+fn parse_u64_or(raw: Option<&str>, default: u64) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
+}
+
+/// Build the `tokio::process::Command` that re-execs aish in `--coordinator`
+/// mode for a single task. Centralises the args, env, pipes, AND the resource
+/// limits applied to the child, so `run_worker` and `run_once` stay in sync.
+///
+/// Resource limits are applied via a `pre_exec` hook (see `apply_rlimits`):
+/// they run in the forked child between fork and exec.
+fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str) -> Command {
+    let mut cmd = Command::new(&spec.exe);
+    cmd.arg("-c")
+        .arg(task)
+        .arg("--coordinator")
+        .arg("--run-id")
+        .arg(run_id)
+        .arg("--backend")
+        .arg("claude")
+        .arg("--model")
+        .arg(&spec.model)
+        .current_dir(&spec.cwd)
+        // Nested-coordinator guard: an in-container/in-worker aish must never
+        // spawn its own workers (no infinite recursion). The child reads this.
+        .env("AISH_COORDINATOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in &spec.env {
+        cmd.env(k, v);
+    }
+
+    // Read the knobs in the PARENT (env::var allocates — not allowed in the
+    // post-fork child), then move plain integers into the pre_exec closure.
+    let mem_mb = env_u64("AISH_WORKER_MEM_MB", DEFAULT_WORKER_MEM_MB);
+    let cpu_secs = env_u64("AISH_WORKER_CPU_SECS", DEFAULT_WORKER_CPU_SECS);
+
+    // SAFETY: `pre_exec` runs in the forked child before `exec`, where only
+    // async-signal-safe calls are permitted. `apply_rlimits` performs only
+    // `setrlimit` syscalls and integer arithmetic — no allocation, no locks,
+    // no panics — so it is safe here. Failures are swallowed (best-effort): a
+    // worker that couldn't be capped still runs rather than failing to spawn.
+    // `tokio::process::Command::pre_exec` is an inherent method (it mirrors
+    // `std::os::unix::process::CommandExt::pre_exec`); no extra trait import.
+    unsafe {
+        cmd.pre_exec(move || {
+            apply_rlimits(mem_mb, cpu_secs);
+            Ok(())
+        });
+    }
+    cmd
+}
+
+/// Apply memory and CPU resource limits to the CURRENT process via
+/// `setrlimit`. Intended to run inside a `pre_exec` hook (post-fork, pre-exec),
+/// so it must stay async-signal-safe: only `setrlimit` syscalls and integer
+/// math, no allocation, no logging, no panics. Every call is best-effort —
+/// a failed `setrlimit` is silently ignored so the child still execs.
+///
+/// macOS caveat: on Linux `RLIMIT_AS` is a hard ceiling on the process's
+/// virtual address space, so a memory runaway hits `ENOMEM`/abort well before
+/// the kernel OOM-killer or macOS Jetsam steps in. On macOS the relationship
+/// between `RLIMIT_AS`/`RLIMIT_DATA` and Jetsam's memory-pressure killer is
+/// looser — a process can still be SIGKILLed by Jetsam under system pressure
+/// regardless of these limits, and these caps don't perfectly track physical
+/// footprint. This is harm-reduction (it bounds the worst single-process
+/// runaways and is a real cap), NOT a guarantee against signal-9 on macOS.
+fn apply_rlimits(mem_mb: u64, cpu_secs: u64) {
+    // 0 == "no limit" for either knob.
+    if mem_mb > 0 {
+        // Saturate the byte count so a huge MB value can't wrap around.
+        let bytes = mem_mb.saturating_mul(1024 * 1024);
+        let lim = libc::rlimit {
+            rlim_cur: bytes as libc::rlim_t,
+            rlim_max: bytes as libc::rlim_t,
+        };
+        // Cap address space (virtual memory). Best-effort.
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_AS, &lim);
+        }
+        // Also cap the data segment as a second line of defence; on some
+        // platforms RLIMIT_DATA bites where RLIMIT_AS doesn't.
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_DATA, &lim);
+        }
+    }
+    if cpu_secs > 0 {
+        let lim = libc::rlimit {
+            rlim_cur: cpu_secs as libc::rlim_t,
+            rlim_max: cpu_secs as libc::rlim_t,
+        };
+        // Cap CPU seconds — a runaway loop gets SIGXCPU then SIGKILL.
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_CPU, &lim);
+        }
+    }
+}
+
+/// Turn a finished child's `ExitStatus` into a human failure note. SIGKILL
+/// (signal 9) on these workers is overwhelmingly the OS memory-pressure killer
+/// (macOS Jetsam / Linux OOM), so we name that explicitly rather than emit the
+/// useless "signal: 9 (SIGKILL)".
+fn describe_failure(status: std::process::ExitStatus, role: &str, stderr: &str) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    if status.signal() == Some(libc::SIGKILL) {
+        return format!(
+            "{role} was killed by the OS (signal 9) — most likely out of memory; \
+             the task may have been too large, or raise AISH_WORKER_MEM_MB. {}",
+            stderr.trim()
+        )
+        .trim_end()
+        .to_string();
+    }
+    format!("{role} exited unsuccessfully ({status}): {}", stderr.trim())
+}
+
 /// A background worker subprocess, tracked for the life of the session. Shared
 /// between the REPL (which lists/surfaces it) and the run task (which mutates it).
 pub struct WorkerJob {
@@ -136,26 +272,7 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
 /// The run task: re-exec aish in `--coordinator` mode, capture stdout as the
 /// result, enforce a timeout, then surface it.
 async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: WorkerSpec) {
-    let mut cmd = Command::new(&spec.exe);
-    cmd.arg("-c")
-        .arg(&task)
-        .arg("--coordinator")
-        .arg("--run-id")
-        .arg(&job.id)
-        .arg("--backend")
-        .arg("claude")
-        .arg("--model")
-        .arg(&spec.model)
-        .current_dir(&spec.cwd)
-        // Nested-coordinator guard: an in-container/in-worker aish must never
-        // spawn its own workers (no infinite recursion). The child reads this.
-        .env("AISH_COORDINATOR", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (k, v) in &spec.env {
-        cmd.env(k, v);
-    }
+    let mut cmd = worker_command(&spec, &task, &job.id);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -204,10 +321,7 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
             let t = out.trim();
             job.set_done(if t.is_empty() { "(no output)".into() } else { t.to_string() });
         }
-        Some(s) => job.set_failed(format!(
-            "worker exited unsuccessfully ({s}): {}",
-            err.trim()
-        )),
+        Some(s) => job.set_failed(describe_failure(s, "worker", &err)),
         None => job.set_failed(format!(
             "worker timed out after {}s",
             WORKER_TIMEOUT.as_secs()
@@ -221,24 +335,7 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
 /// auto-deliver — the caller consumes the output. Used by the goal loop for each
 /// work step.
 pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<String, String> {
-    let mut cmd = Command::new(&spec.exe);
-    cmd.arg("-c")
-        .arg(task)
-        .arg("--coordinator")
-        .arg("--run-id")
-        .arg(run_id)
-        .arg("--backend")
-        .arg("claude")
-        .arg("--model")
-        .arg(&spec.model)
-        .current_dir(&spec.cwd)
-        .env("AISH_COORDINATOR", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (k, v) in &spec.env {
-        cmd.env(k, v);
-    }
+    let mut cmd = worker_command(spec, task, run_id);
     let mut child = cmd.spawn().map_err(|e| format!("couldn't launch goal worker: {e}"))?;
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
@@ -264,7 +361,7 @@ pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<Str
     if status.success() {
         Ok(out.trim().to_string())
     } else {
-        Err(format!("goal worker exited unsuccessfully ({status}): {}", err.trim()))
+        Err(describe_failure(status, "goal worker", &err))
     }
 }
 
@@ -396,5 +493,35 @@ mod tests {
         });
         job.set_failed("boom".into());
         assert!(job.fetch().contains("worker_2 failed: boom"));
+    }
+
+    #[test]
+    fn mem_limit_env_parsing() {
+        // Unset → default.
+        assert_eq!(parse_u64_or(None, DEFAULT_WORKER_MEM_MB), DEFAULT_WORKER_MEM_MB);
+        // Valid override (with surrounding whitespace) parses.
+        assert_eq!(parse_u64_or(Some(" 1024 "), DEFAULT_WORKER_MEM_MB), 1024);
+        // Garbage → default.
+        assert_eq!(parse_u64_or(Some("not-a-number"), DEFAULT_WORKER_MEM_MB), DEFAULT_WORKER_MEM_MB);
+        // Empty → default.
+        assert_eq!(parse_u64_or(Some(""), DEFAULT_WORKER_MEM_MB), DEFAULT_WORKER_MEM_MB);
+        // 0 is a legal "no limit" value and must round-trip, not fall back.
+        assert_eq!(parse_u64_or(Some("0"), DEFAULT_WORKER_CPU_SECS), 0);
+    }
+
+    #[test]
+    fn describe_failure_names_sigkill_as_oom() {
+        use std::os::unix::process::ExitStatusExt;
+        // A status synthesised from signal 9 (SIGKILL).
+        let killed = std::process::ExitStatus::from_raw(libc::SIGKILL);
+        let msg = describe_failure(killed, "worker", "some stderr noise");
+        assert!(msg.contains("killed by the OS"), "got: {msg}");
+        assert!(msg.contains("AISH_WORKER_MEM_MB"), "got: {msg}");
+
+        // A non-signal failure keeps the plain message and doesn't mention OOM.
+        let exited = std::process::ExitStatus::from_raw(1 << 8); // exit code 1
+        let msg = describe_failure(exited, "goal worker", "boom");
+        assert!(msg.contains("exited unsuccessfully"), "got: {msg}");
+        assert!(!msg.contains("killed by the OS"), "got: {msg}");
     }
 }
