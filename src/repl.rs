@@ -8,7 +8,7 @@ use anyhow::Result;
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::ExternalPrinter;
-use rustyline::highlight::Highlighter;
+use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
@@ -362,7 +362,90 @@ fn session_path(session: &Session) -> String {
 impl Hinter for AishHelper {
     type Hint = String;
 }
-impl Highlighter for AishHelper {}
+/// What the dispatch routing WOULD do with the current line — surfaced live as
+/// the user types (TASK-132) so a mis-route is visible and correctable BEFORE
+/// Enter, instead of silently running the wrong thing. Reuses the exact dispatch
+/// predicates so the preview can't disagree with the real decision.
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Preview {
+    /// Runs directly as a shell command (green).
+    Direct,
+    /// Goes to the model (cyan).
+    Model,
+    /// Would dispatch directly, but the lead word is a real binary that's also an
+    /// everyday English word (`clear`, `watch`, `pr`, …) — a judgment call worth
+    /// a glance (dim). Add `?` to force the model or `!` to force direct.
+    Ambiguous,
+    /// A `:` REPL command, or nothing to classify — left uncolored.
+    Plain,
+}
+
+/// Classify a line the way `dispatch` will route it, using only what the
+/// completer already holds (cwd, PATH, aliases). `$VAR` isn't expanded here — a
+/// preview approximation — but every other decision mirrors `dispatch`.
+fn route_preview(line: &str, cwd: &Path, path: &str, aliases: &HashMap<String, Vec<String>>) -> Preview {
+    let l = line.trim();
+    if l.is_empty() || l.starts_with(':') {
+        return Preview::Plain;
+    }
+    if l.starts_with('!') {
+        return Preview::Direct; // forced direct
+    }
+    if l.starts_with('?') {
+        return Preview::Model; // forced model
+    }
+    // A pipeline runs directly only when every stage resolves to a program.
+    if let Some(stages) = pipeline::parse(l) {
+        let all = stages
+            .iter()
+            .all(|s| s.first().is_some_and(|p| resolve_program(p, cwd, path).is_some()));
+        return if all { Preview::Direct } else { Preview::Model };
+    }
+    // Shell machinery / apostrophes don't tokenize → model.
+    let Some(words) = rc::tokenize(l) else {
+        return Preview::Model;
+    };
+    let Some(first) = words.first() else {
+        return Preview::Plain;
+    };
+    let aliased = aliases.contains_key(first);
+    if !aliased
+        && (looks_like_prose(l, &words)
+            || is_stray_confirmation(&words)
+            || looks_like_command_arg_intent(&words, cwd, path))
+    {
+        return Preview::Model;
+    }
+    let resolves = aliased
+        || BUILTINS.contains(&first.as_str())
+        || resolve_program(first, cwd, path).is_some();
+    if !resolves {
+        return Preview::Model;
+    }
+    let lead = first.to_ascii_lowercase();
+    if AMBIGUOUS_COMMANDS.contains(&lead.as_str()) || COMMAND_ARG_COMMANDS.contains(&lead.as_str()) {
+        Preview::Ambiguous
+    } else {
+        Preview::Direct
+    }
+}
+
+impl Highlighter for AishHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
+        let color = match route_preview(line, &self.cwd, &self.path, &self.aliases) {
+            Preview::Direct => "\x1b[32m",    // green — shell command
+            Preview::Model => "\x1b[36m",     // cyan — goes to the model
+            Preview::Ambiguous => "\x1b[2m",  // dim — real binary that's also English
+            Preview::Plain => return std::borrow::Cow::Borrowed(line),
+        };
+        std::borrow::Cow::Owned(format!("{color}{line}\x1b[0m"))
+    }
+
+    fn highlight_char(&self, _line: &str, _pos: usize, kind: CmdKind) -> bool {
+        // Re-color on edits (not on bare cursor moves — the route can't change).
+        kind != CmdKind::MoveCursor
+    }
+}
 impl Validator for AishHelper {}
 impl Helper for AishHelper {}
 
@@ -1579,6 +1662,35 @@ mod tests {
         // Only the exact two-word shape qualifies.
         assert!(!intent("watch")); // 1 word
         assert!(!intent("watch tool extra")); // 3 words
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn route_preview_classifies() {
+        use std::os::unix::fs::PermissionsExt;
+        let cwd = std::env::temp_dir();
+        let dir = std::env::temp_dir().join(format!("aish_preview_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        for name in ["tool", "clear"] {
+            let p = dir.join(name);
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = dir.to_string_lossy().to_string();
+        let aliases: HashMap<String, Vec<String>> = HashMap::new();
+        let pv = |s: &str| route_preview(s, &cwd, &path, &aliases);
+
+        assert_eq!(pv(""), Preview::Plain);
+        assert_eq!(pv(":help"), Preview::Plain);
+        assert_eq!(pv("!anything goes here"), Preview::Direct); // forced direct
+        assert_eq!(pv("?run this for me"), Preview::Model); // forced model
+        assert_eq!(pv("tool --flag"), Preview::Direct); // resolves, not ambiguous
+        assert_eq!(pv("clear"), Preview::Ambiguous); // resolves but real-binary-also-English
+        assert_eq!(pv("clear the screen for me"), Preview::Model); // prose
+        assert_eq!(pv("watch orch_c1b45797b841"), Preview::Model); // command-arg intent
+        assert_eq!(pv("what is the capital of texas"), Preview::Model); // prose
+        assert_eq!(pv("definitelynotacommand"), Preview::Model); // unresolvable lead word
 
         let _ = std::fs::remove_dir_all(&dir);
     }
