@@ -831,24 +831,159 @@ async fn run_interactive(call: &ToolCall, session: &mut Session, confirm: &mut C
 /// While the child runs, `session.tty_handoff` is set so the REPL knows a
 /// Ctrl-C belongs to the child; terminal modes are restored afterwards in
 /// case the program crashed without cleaning up its raw-mode state.
+///
+/// Per the S1.4 spike (docs/spikes/S1.4-reaper-vs-waitpid.md) this single
+/// foreground path is spawned with `std::process` rather than `tokio::process`
+/// so its pid is disjoint from tokio's reaper set: the child leads its own
+/// process group (`setpgid`), owns the terminal (`tcsetpgrp`, with SIGTTOU
+/// ignored across the hand-off), and is reaped by a contained SIGCHLD task that
+/// `waitpid`s *only this pid* with `WUNTRACED|WCONTINUED|WNOHANG`. The signal is
+/// observed through `tokio::signal` (which multiplexes the handler) so tokio
+/// keeps reaping its own captured/background/pipeline children and never
+/// `waitpid(-1)`s — disjoint PID sets, no double-reap.
 pub async fn run_on_tty(
     program: &str,
     args: &[String],
     extra_env: &[(String, String)],
     session: &Session,
 ) -> Result<std::process::ExitStatus> {
+    use std::os::unix::process::CommandExt;
+
     let _guard = TtyGuard::engage(session.tty_handoff.clone());
-    tokio::process::Command::new(program)
-        .args(args)
+
+    // Subscribe to SIGCHLD *before* spawning so an instant-exit child can't fire
+    // before we are listening. tokio::signal multiplexes the handler, so tokio's
+    // own child reaper keeps working (no raw `sigaction` clobber).
+    let mut sigchld = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+        .map_err(|e| anyhow::anyhow!("failed to watch SIGCHLD: {e}"))?;
+
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
         .current_dir(&session.cwd)
         .envs(session.env.iter().map(|(k, v)| (k, v)))
-        .envs(extra_env.iter().map(|(k, v)| (k, v)))
-        .kill_on_drop(true)
+        .envs(extra_env.iter().map(|(k, v)| (k, v)));
+    // The child leads its own process group so terminal signals (Ctrl-C/-Z) hit
+    // it, not the shell. setpgid(0, 0): the new pgid is the child's pid.
+    unsafe {
+        cmd.pre_exec(|| match libc::setpgid(0, 0) {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        });
+    }
+    let proc = cmd
         .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to exec {program}: {e}"))?
-        .wait()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to wait on {program}: {e}"))
+        .map_err(|e| anyhow::anyhow!("failed to exec {program}: {e}"))?;
+    let pid = proc.id() as libc::pid_t;
+    // std::process::Child::drop neither reaps nor kills, so the pid stays
+    // waitpid-able — our SIGCHLD task owns the wait.
+    drop(proc);
+    let mut child = ForegroundChild { pid, reaped: false };
+
+    // Mirror the child's setpgid from the parent too (closes the spawn race;
+    // EACCES once the child has exec'd is expected — ignore it), then hand it
+    // the terminal. tcsetpgrp from our now-background pgrp would raise SIGTTOU,
+    // so ignore that signal across the call.
+    let on_tty = unsafe { libc::isatty(0) == 1 };
+    unsafe { libc::setpgid(pid, pid) };
+    if on_tty {
+        with_sigttou_ignored(|| unsafe { libc::tcsetpgrp(0, pid) });
+    }
+    // Reclaim the terminal for the shell on every exit path, including a Ctrl-C
+    // that drops this future mid-await.
+    let _reclaim = ForegroundReclaim { on_tty };
+
+    // Reap loop: poll first (covers an exit between spawn and the first await),
+    // then wait for the next SIGCHLD. waitpid is scoped to `pid` only.
+    loop {
+        if let Some(status) = reap_foreground(pid)? {
+            child.reaped = true;
+            return Ok(status);
+        }
+        sigchld.recv().await;
+    }
+}
+
+/// One non-blocking pass of the foreground reaper: `waitpid(pid, …)` with
+/// `WNOHANG|WUNTRACED|WCONTINUED`, tracking job state. Returns `Some(status)`
+/// once the child terminates, `None` while it is still running (or merely
+/// stopped/continued). A Ctrl-Z stop is resumed in place — real
+/// suspend-to-background (the fg/bg/jobs UX) is deferred to S2.
+fn reap_foreground(pid: libc::pid_t) -> Result<Option<std::process::ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+    loop {
+        let mut status: libc::c_int = 0;
+        let r = unsafe {
+            libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED)
+        };
+        if r == 0 {
+            return Ok(None); // no state change for our child yet
+        }
+        if r < 0 {
+            return Err(anyhow::anyhow!(
+                "failed to wait on pid {pid}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+            return Ok(Some(std::process::ExitStatus::from_raw(status)));
+        }
+        if libc::WIFSTOPPED(status) {
+            // Job state: stopped. S2 owns suspend-to-background; for now resume
+            // so the foreground child keeps running and the terminal stays live.
+            unsafe { libc::kill(-pid, libc::SIGCONT) };
+        }
+        // WIFCONTINUED (or the resume above): loop and poll again.
+    }
+}
+
+/// Run `f` with SIGTTOU ignored. `tcsetpgrp()` from a process that isn't the
+/// terminal's foreground group raises SIGTTOU (default action: stop us); ignore
+/// it for the duration so the hand-off itself never suspends the shell.
+fn with_sigttou_ignored<T>(f: impl FnOnce() -> T) -> T {
+    // SAFETY: swapping the SIGTTOU disposition to SIG_IGN and back to its prior
+    // handler around a single synchronous call.
+    let prev = unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
+    let out = f();
+    unsafe { libc::signal(libc::SIGTTOU, prev) };
+    out
+}
+
+/// Owns the foreground child's pid for the lifetime of `run_on_tty`. On the
+/// normal exit path the SIGCHLD task has already reaped it (`reaped = true`); if
+/// the future is dropped first (Ctrl-C aborts the turn), SIGKILL the child's
+/// group and reap it so no orphan lingers — replacing the `kill_on_drop` we gave
+/// up by spawning raw.
+struct ForegroundChild {
+    pid: libc::pid_t,
+    reaped: bool,
+}
+
+impl Drop for ForegroundChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            // SAFETY: signalling/reaping our own child's process group (pgid == pid).
+            unsafe {
+                libc::kill(-self.pid, libc::SIGKILL);
+                let mut s: libc::c_int = 0;
+                libc::waitpid(self.pid, &mut s, 0);
+            }
+        }
+    }
+}
+
+/// Restore the shell's process group as the terminal's foreground group on the
+/// way out, even if the future is dropped. No-op when stdin isn't a tty.
+struct ForegroundReclaim {
+    on_tty: bool,
+}
+
+impl Drop for ForegroundReclaim {
+    fn drop(&mut self) {
+        if self.on_tty {
+            // SAFETY: tcsetpgrp on fd 0 back to our own process group.
+            with_sigttou_ignored(|| unsafe { libc::tcsetpgrp(0, libc::getpgrp()) });
+        }
+    }
 }
 
 /// RAII for a TTY hand-off: flags the hand-off for the REPL's signal handling
@@ -1083,6 +1218,45 @@ mod tests {
     async fn nonzero_exit_reported() {
         let out = run(&call("false", &[], None)).await;
         assert!(out.contains("[exit code: 1]"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn run_on_tty_reaps_foreground_child() {
+        // AC1: foreground exec works through the new std::process + contained
+        // SIGCHLD reaper path. Runs in CI without a controlling tty (on_tty is
+        // false), exercising setpgid + the reaper without the tcsetpgrp dance.
+        let session = Session::new().unwrap();
+        let ok = run_on_tty("true", &[], &[], &session).await.unwrap();
+        assert!(ok.success());
+        let bad = run_on_tty("false", &[], &[], &session).await.unwrap();
+        assert_eq!(bad.code(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn tokio_reaper_never_steals_foreground_pid() {
+        // The disjoint-PID-set invariant: tokio reaps only its own children and
+        // never waitpid(-1)s, so a foreground-style child spawned with
+        // std::process stays ours to reap.
+        use std::os::unix::process::ExitStatusExt;
+
+        // A foreground child spawned the same way run_on_tty does — std::process,
+        // deliberately not awaited here.
+        let fg = std::process::Command::new("sleep").arg("0.3").spawn().unwrap();
+        let fg_pid = fg.id() as libc::pid_t;
+        std::mem::forget(fg); // we own the wait; don't let std reap it
+
+        // Drive tokio's child reaper by spawning + awaiting a tokio child. If it
+        // waitpid(-1)'d it would also harvest fg_pid out from under us.
+        let status = tokio::process::Command::new("true").status().await.unwrap();
+        assert!(status.success());
+
+        // Let the foreground child exit, then prove WE can still reap it —
+        // tokio stealing it via waitpid(-1) would have left ECHILD here.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let mut wstatus: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(fg_pid, &mut wstatus, 0) };
+        assert_eq!(r, fg_pid, "tokio's reaper stole the foreground pid via waitpid(-1)");
+        assert!(std::process::ExitStatus::from_raw(wstatus).success());
     }
 
     #[tokio::test]
