@@ -216,6 +216,58 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
     on_complete(&jobs, &job);
 }
 
+/// Run a single coordinator subprocess to completion and return its stdout (the
+/// final answer). Unlike `spawn`, it doesn't register a tracked job or
+/// auto-deliver — the caller consumes the output. Used by the goal loop for each
+/// work step.
+pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<String, String> {
+    let mut cmd = Command::new(&spec.exe);
+    cmd.arg("-c")
+        .arg(task)
+        .arg("--coordinator")
+        .arg("--run-id")
+        .arg(run_id)
+        .arg("--backend")
+        .arg("claude")
+        .arg("--model")
+        .arg(&spec.model)
+        .current_dir(&spec.cwd)
+        .env("AISH_COORDINATOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in &spec.env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("couldn't launch goal worker: {e}"))?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let collect = tokio::spawn(async move {
+        let mut o = String::new();
+        let mut e = String::new();
+        let _ = tokio::join!(stdout.read_to_string(&mut o), stderr.read_to_string(&mut e));
+        (o, e)
+    });
+    let status = match tokio::time::timeout(WORKER_TIMEOUT, child.wait()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            collect.abort();
+            return Err(format!("goal worker process error: {e}"));
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(format!("goal worker timed out after {}s", WORKER_TIMEOUT.as_secs()));
+        }
+    };
+    let (out, err) = collect.await.unwrap_or_default();
+    if status.success() {
+        Ok(out.trim().to_string())
+    } else {
+        Err(format!("goal worker exited unsuccessfully ({status}): {}", err.trim()))
+    }
+}
+
 /// Called when one worker finishes. While others run, print a brief progress
 /// line; once all have finished, flush every not-yet-shown result at once.
 /// Mirrors `batch::on_complete`.

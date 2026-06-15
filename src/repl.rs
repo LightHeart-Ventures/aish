@@ -1048,6 +1048,8 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                  :kill <id>                          kill a background job\n\
                  :workers                            list full-tool background workers (needs_tools offloads)\n\
                  :name <name>                        name the session (prefixes the prompt); bare :name clears\n\
+                 :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
+                                                     a verifier judges each turn. :goal status, :goal clear\n\
                  :allow                              list always-allowed tools/commands\n\
                  :allow remove <tool>                revoke an always-allowed tool/command\n\
                  a at a prompt                       always-allow this tool (see :allow)\n\
@@ -1096,6 +1098,55 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
             } else {
                 session.name = Some(rest.to_string());
                 println!("session named \x1b[1;35m[{rest}]\x1b[0m");
+            }
+        }
+        Some("goal") => {
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            let rest = rest.trim();
+            match rest {
+                "" => match &session.goal {
+                    Some(g) => println!("{}", g.status_line()),
+                    None => println!("no goal set — `:goal <condition>` to set one (requires :batch on)"),
+                },
+                "clear" | "stop" | "off" | "reset" | "none" | "cancel" => match session.goal.take() {
+                    Some(g) => {
+                        g.clear();
+                        println!("goal cleared");
+                    }
+                    None => println!("no goal set"),
+                },
+                cond => {
+                    if !session.batch_mode {
+                        println!("`:goal` runs as background batch work — enable it first with `:batch on`");
+                    } else if session.goal.as_ref().is_some_and(|g| g.is_active()) {
+                        println!("a goal is already active (one per session) — `:goal clear` it first");
+                    } else {
+                        match (std::env::var("ANTHROPIC_API_KEY"), std::env::current_exe()) {
+                            (Ok(key), Ok(exe)) => {
+                                let spec = crate::worker::WorkerSpec {
+                                    exe,
+                                    cwd: session.cwd.clone(),
+                                    model: session.batch_model.clone(),
+                                    env: session.env.clone(),
+                                };
+                                let g = crate::goal::spawn(
+                                    cond.to_string(),
+                                    spec,
+                                    session.batch_model.clone(),
+                                    key,
+                                );
+                                session.goal = Some(g);
+                                println!("\x1b[2mgoal set — pursuing it in the background; progress and the result appear here. `:goal` for status, `:goal clear` to stop.\x1b[0m");
+                            }
+                            (Err(_), _) => {
+                                println!("ANTHROPIC_API_KEY not set — the goal loop needs a metered key")
+                            }
+                            (_, Err(e)) => {
+                                println!("can't locate the aish binary to run goal workers: {e}")
+                            }
+                        }
+                    }
+                }
             }
         }
         Some("model") => match parts.next() {
