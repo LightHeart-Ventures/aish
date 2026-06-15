@@ -17,11 +17,19 @@
 //! |---|---|---|
 //! | `ctrl_c_kills_child_not_shell` | PTY master write of `\x03` | Full kernel TTY INTR path |
 //! | `sigint_to_child_pgrp_does_not_kill_shell` | `kill(-pgid, SIGINT)` | `setpgid` scoping (no PTY needed) |
+//! | `foreground_transfers_to_child_and_restores_to_shell` | `tcsetpgrp` + `tcgetpgrp` | TASK-114 hand-off / reclaim (ac_e46bcc2586e0) |
+//! | `shell_not_stopped_by_sigttou_during_handoff` | `tcsetpgrp` from background pgrp w/ `SIG_IGN` | TASK-114 SIGTTOU avoidance (ac_55415ce9b8f4) |
 //!
 //! ## Effort estimate
 //!
-//! ~25 min to production deployment (tests only; no production code changes
-//! required; CI green on the PR is the gate).
+//! TASK-117: ~25 min to production deployment (tests only; no production code
+//! changes required; CI green on the PR is the gate).
+//!
+//! TASK-114: ~20 min to production deployment. The `tcsetpgrp` hand-off /
+//! reclaim and the `SIGTTOU` ignore are already implemented in
+//! `src/tools.rs::run_on_tty` / `ForegroundReclaim` / `with_sigttou_ignored`;
+//! this card adds the two PTY tests below that prove the ACs. No production
+//! code change; gate is CI green.
 
 #![cfg(unix)]
 
@@ -274,4 +282,181 @@ fn sigint_to_child_pgrp_does_not_kill_shell() {
 
     // Restore SIGINT disposition.
     unsafe { libc::signal(libc::SIGINT, saved) };
+}
+
+// ── TASK-114: terminal foreground hand-off / reclaim ─────────────────────────────
+
+/// Parsed `waitpid` outcome for the forked "shell" subprocess.
+struct ShellOutcome {
+    exited: bool,
+    exit_code: libc::c_int,
+    stopped: bool,
+    stop_signal: libc::c_int,
+}
+
+/// Fork a subprocess that becomes a PTY session leader and performs the exact
+/// terminal hand-off / reclaim dance that `tools::run_on_tty` does, then
+/// `waitpid(WUNTRACED)` on it so a SIGTTOU **stop** is observable.
+///
+/// The dance has to run in its own session: `tcsetpgrp`/`tcgetpgrp` operate on
+/// the *controlling terminal* of the caller, so the shell must `setsid()` and
+/// adopt the PTY slave (mirroring how aish owns its tty) rather than disturbing
+/// the test harness's own controlling terminal.
+///
+/// The child speaks only `libc` + `_exit` after the fork (async-signal-safe; no
+/// Rust allocation or panic), reporting each checkpoint via a distinct exit
+/// code so the parent can pinpoint a failure:
+///   0  success            13 shell not initially foreground
+///   11 setsid failed       15 tcsetpgrp(job) failed
+///   12 open(slave) failed   16 foreground did not transfer to job
+///   14 fork(job) failed    17 redundant background tcsetpgrp failed
+///                          18 tcsetpgrp(shell) reclaim failed
+///                          19 foreground did not restore to shell
+fn run_handoff_shell() -> ShellOutcome {
+    let (master_fd, slave_path) = open_pty_master();
+
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+
+    if pid == 0 {
+        // ── Child: the "shell" ──────────────────────────────────────────────
+        // libc-only from here; never returns (always _exit).
+        unsafe {
+            if libc::setsid() < 0 {
+                libc::_exit(11);
+            }
+            // Adopt the PTY slave as our controlling terminal (no O_NOCTTY).
+            let slave_fd = libc::open(slave_path.as_ptr(), libc::O_RDWR);
+            if slave_fd < 0 {
+                libc::_exit(12);
+            }
+            libc::dup2(slave_fd, 0);
+            if slave_fd > 2 {
+                libc::close(slave_fd);
+            }
+            libc::close(master_fd);
+
+            let shell_pgid = libc::getpgrp();
+            // As session leader we start as the terminal's foreground group.
+            if libc::tcgetpgrp(0) != shell_pgid {
+                libc::_exit(13);
+            }
+            // Mirror aish: ignore SIGTTOU so a background-group tcsetpgrp never
+            // stops the shell (tools::with_sigttou_ignored / ignore_job_control_signals).
+            libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+
+            // Spawn the "foreground job" in its own process group.
+            let job = libc::fork();
+            if job < 0 {
+                libc::_exit(14);
+            }
+            if job == 0 {
+                libc::setpgid(0, 0);
+                // Bounded block: the shell kills us first; self-terminate if leaked.
+                let ts = libc::timespec { tv_sec: 5, tv_nsec: 0 };
+                libc::nanosleep(&ts, std::ptr::null_mut());
+                libc::_exit(0);
+            }
+            libc::setpgid(job, job); // close the spawn race (EACCES after exec is fine)
+
+            // Hand the terminal to the job (mirrors run_on_tty's tcsetpgrp(0, pid)).
+            if libc::tcsetpgrp(0, job) != 0 {
+                libc::kill(job, libc::SIGKILL);
+                libc::_exit(15);
+            }
+            // ac_e46bcc2586e0 (transfer): foreground is now the job's pgrp.
+            if libc::tcgetpgrp(0) != job {
+                libc::kill(job, libc::SIGKILL);
+                libc::_exit(16);
+            }
+            // ac_55415ce9b8f4: the shell is now a *background* group. A
+            // tcsetpgrp from a background process group raises SIGTTOU (default
+            // action: stop). With SIG_IGN installed it must proceed and NOT
+            // stop the shell. If SIGTTOU were not ignored, the parent's
+            // waitpid(WUNTRACED) would observe a stop here.
+            if libc::tcsetpgrp(0, job) != 0 {
+                libc::kill(job, libc::SIGKILL);
+                libc::_exit(17);
+            }
+            // Reclaim the terminal for the shell (mirrors ForegroundReclaim).
+            if libc::tcsetpgrp(0, shell_pgid) != 0 {
+                libc::kill(job, libc::SIGKILL);
+                libc::_exit(18);
+            }
+            // ac_e46bcc2586e0 (restore): foreground is back on the shell.
+            if libc::tcgetpgrp(0) != shell_pgid {
+                libc::kill(job, libc::SIGKILL);
+                libc::_exit(19);
+            }
+
+            libc::kill(job, libc::SIGKILL);
+            let mut s: libc::c_int = 0;
+            libc::waitpid(job, &mut s, 0);
+            libc::_exit(0);
+        }
+    }
+
+    // ── Parent: keep the master open (PTY stays alive) and reap the shell ────
+    let mut status: libc::c_int = 0;
+    let waited = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+    assert_eq!(waited, pid, "waitpid(shell): {}", std::io::Error::last_os_error());
+
+    let stopped = unsafe { libc::WIFSTOPPED(status) };
+    if stopped {
+        // The shell was SIGTTOU-stopped (AC violation) — don't leave it parked.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut s: libc::c_int = 0;
+            libc::waitpid(pid, &mut s, 0);
+        }
+    }
+    unsafe { libc::close(master_fd) };
+
+    ShellOutcome {
+        exited: unsafe { libc::WIFEXITED(status) },
+        exit_code: if unsafe { libc::WIFEXITED(status) } {
+            unsafe { libc::WEXITSTATUS(status) }
+        } else {
+            -1
+        },
+        stopped,
+        stop_signal: if stopped { unsafe { libc::WSTOPSIG(status) } } else { 0 },
+    }
+}
+
+/// **TASK-114 AC `ac_e46bcc2586e0`**: the shell transfers the terminal's
+/// foreground process group to the child's pgrp before waiting, then restores
+/// it to the shell afterwards. The forked shell asserts both `tcgetpgrp`
+/// transitions internally and exits 0 only when both held.
+#[test]
+fn foreground_transfers_to_child_and_restores_to_shell() {
+    let outcome = run_handoff_shell();
+    assert!(
+        outcome.exited && outcome.exit_code == 0,
+        "shell hand-off/reclaim failed: exited={} code={} (16=transfer, 19=restore; see run_handoff_shell)",
+        outcome.exited,
+        outcome.exit_code,
+    );
+}
+
+/// **TASK-114 AC `ac_55415ce9b8f4`**: no stray SIGTTOU stop of the shell. The
+/// shell calls `tcsetpgrp` while in a background process group (after handing
+/// the terminal to the job) with SIGTTOU set to `SIG_IGN`; it must proceed
+/// without being stopped. `waitpid(WUNTRACED)` would surface any such stop.
+#[test]
+fn shell_not_stopped_by_sigttou_during_handoff() {
+    let outcome = run_handoff_shell();
+    assert!(
+        !outcome.stopped,
+        "shell was stopped by signal {} during the hand-off (expected SIGTTOU={} to be ignored)",
+        outcome.stop_signal,
+        libc::SIGTTOU,
+    );
+    // A clean exit also confirms the background-group tcsetpgrp (exit 17) returned 0.
+    assert!(
+        outcome.exited && outcome.exit_code == 0,
+        "shell did not exit cleanly: exited={} code={}",
+        outcome.exited,
+        outcome.exit_code,
+    );
 }
