@@ -188,6 +188,11 @@ pub struct BatchRow {
     pub status: String,
     pub result: Option<String>,
     pub error: Option<String>,
+    /// Owning session (uuid) + its friendly name. Null for rows written before
+    /// ownership tracking existed.
+    pub session_id: Option<String>,
+    pub session_name: Option<String>,
+    pub created_at: Option<String>,
 }
 
 /// Durable store for background batch jobs, kept in its OWN connection so the
@@ -214,18 +219,35 @@ impl BatchStore {
                  status       TEXT NOT NULL,
                  result       TEXT,
                  error        TEXT,
-                 created_at   TEXT NOT NULL DEFAULT current_timestamp
+                 created_at   TEXT NOT NULL DEFAULT current_timestamp,
+                 session_id   TEXT,
+                 session_name TEXT
              );",
         )
         .context("batch_jobs schema init failed")?;
+        // Back-compat: add the ownership columns to a table created before they
+        // existed. ALTER errors with "duplicate column name" once present —
+        // ignore that so it's idempotent.
+        for col in ["session_id", "session_name"] {
+            let _ = conn.execute(&format!("ALTER TABLE batch_jobs ADD COLUMN {col} TEXT"), []);
+        }
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
-    /// Register a freshly-queued job (no Anthropic id yet, status "running").
-    pub fn insert(&self, local_id: &str, task: &str, model: &str) -> Result<()> {
+    /// Register a freshly-queued job (no Anthropic id yet, status "running"),
+    /// tagged with the spawning session so results auto-deliver only there.
+    pub fn insert(
+        &self,
+        local_id: &str,
+        task: &str,
+        model: &str,
+        session_id: &str,
+        session_name: Option<&str>,
+    ) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO batch_jobs (local_id, task, model, status) VALUES (?1, ?2, ?3, 'running')",
-            (local_id, task, model),
+            "INSERT INTO batch_jobs (local_id, task, model, status, session_id, session_name) \
+             VALUES (?1, ?2, ?3, 'running', ?4, ?5)",
+            (local_id, task, model, session_id, session_name),
         )?;
         Ok(())
     }
@@ -269,7 +291,7 @@ impl BatchStore {
     pub fn load_all(&self) -> Result<Vec<BatchRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT local_id, anthropic_id, task, status, result, error
+            "SELECT local_id, anthropic_id, task, status, result, error, session_id, session_name, created_at
              FROM batch_jobs ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -280,6 +302,9 @@ impl BatchStore {
                 status: r.get(3)?,
                 result: r.get(4)?,
                 error: r.get(5)?,
+                session_id: r.get(6)?,
+                session_name: r.get(7)?,
+                created_at: r.get(8)?,
             })
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect())
@@ -359,10 +384,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = BatchStore::open(&path).unwrap();
 
-        store.insert("batch_1", "summarize logs", "claude-opus-4-8").unwrap();
+        store.insert("batch_1", "summarize logs", "claude-opus-4-8", "sess-a", Some("alpha")).unwrap();
         store.set_anthropic_id("batch_1", "msgbatch_abc").unwrap();
         store.set_status("batch_1", "in_progress").unwrap();
-        store.insert("batch_2", "translate", "claude-opus-4-8").unwrap();
+        store.insert("batch_2", "translate", "claude-opus-4-8", "sess-b", None).unwrap();
         store.set_done("batch_2", "the result").unwrap();
 
         // A fresh store over the same file sees both — this is the restart path.
@@ -372,9 +397,12 @@ mod tests {
         let one = rows.iter().find(|r| r.local_id == "batch_1").unwrap();
         assert_eq!(one.anthropic_id.as_deref(), Some("msgbatch_abc"));
         assert_eq!(one.status, "in_progress"); // resumable
+        assert_eq!(one.session_id.as_deref(), Some("sess-a"));
+        assert_eq!(one.session_name.as_deref(), Some("alpha"));
         let two = rows.iter().find(|r| r.local_id == "batch_2").unwrap();
         assert_eq!(two.status, "done");
         assert_eq!(two.result.as_deref(), Some("the result"));
+        assert_eq!(two.session_name, None);
 
         store.set_failed("batch_1", "timeout").unwrap();
         assert_eq!(reopened.clear_finished().unwrap(), 2); // both terminal now
