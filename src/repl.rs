@@ -536,14 +536,28 @@ fn split_route(line: String) -> (String, Route) {
 const AMBIGUOUS_COMMANDS: &[&str] = &[
     "who", "w", "find", "time", "test", "yes", "look", "last", "watch", "date",
     "which", "what", "whatis", "finger", "write", "wall", "users", "top", "more",
-    "head", "tail", "make", "cat", "kill",
+    "head", "tail", "make", "cat", "kill", "pr",
 ];
 
+/// Subset of `AMBIGUOUS_COMMANDS` whose *idiomatic* first argument is a number:
+/// `kill 1234`, `head 50`, `tail 100`, `top 1`, `w 1`, `nice 10`. For these, a
+/// digit right after the command is a real operand, so a numeric token must NOT
+/// be read as part of an English sentence (see the digit relaxation below).
+/// `pr` is deliberately absent: `pr` takes filenames, never a bare PID/line
+/// count, so "PR 22 merged" has no command reading.
+const NUMERIC_ARG_COMMANDS: &[&str] =
+    &["kill", "head", "tail", "top", "w", "nice", "renice", "fold", "split"];
+
 fn looks_like_prose(line: &str, words: &[String]) -> bool {
-    if words.len() < 3
-        || !AMBIGUOUS_COMMANDS.contains(&words[0].as_str())
-        || line.contains(['"', '\''])
-    {
+    // The membership check is case-insensitive: on a case-insensitive
+    // filesystem (macOS) `PR`/`What`/`FIND` resolve to the lowercase binary, so
+    // they're just as ambiguous. We only lowercase for the *lookup* — the argv
+    // handed to exec is never mutated.
+    if words.len() < 3 {
+        return false;
+    }
+    let lead = words[0].to_ascii_lowercase();
+    if !AMBIGUOUS_COMMANDS.contains(&lead.as_str()) || line.contains(['"', '\'']) {
         return false;
     }
     // A comma reads as a sentence, not an argv — "watch for events from atum,
@@ -551,12 +565,55 @@ fn looks_like_prose(line: &str, words: &[String]) -> bool {
     if line.contains(", ") {
         return true;
     }
-    // Otherwise every word must be plain alphabetic, with trailing sentence
-    // punctuation forgiven; flags (-n), paths (a/b), and digits stay commands.
-    words.iter().all(|w| {
-        let w = w.trim_end_matches([',', '.', '!', '?', ';', ':']);
-        !w.is_empty() && w.chars().all(|c| c.is_ascii_alphabetic())
-    })
+
+    // Classify each token (trailing sentence punctuation forgiven): is it a
+    // plain alphabetic English word, a bare run of digits, or "other" (a flag
+    // `-n`, a path `a/b`, a filename `file.txt`, a version `1.2`, …)?
+    let trim = |w: &str| w.trim_end_matches([',', '.', '!', '?', ';', ':']).to_string();
+    let is_alpha = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphabetic());
+    let is_digits = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit());
+
+    let trimmed: Vec<String> = words.iter().map(|w| trim(w)).collect();
+
+    // Fast path / strict rule: a line of nothing but plain words is prose.
+    // (Keeps "what is the capital of texas" routing to the model.)
+    if trimmed.iter().all(|w| is_alpha(w)) {
+        return true;
+    }
+
+    // Targeted digit relaxation for "PR 22 merged" / "PR 22 was merged":
+    // a developer narrating an event ("PR 22 merged", "issue 7 closed",
+    // "find 3 failed") embeds exactly one number in an otherwise-English line.
+    // We accept that as prose ONLY when every guard holds, so real invocations
+    // can't slip through:
+    //   * the lead word does NOT take a numeric operand (so `kill 1234 now`,
+    //     `head 50 lines`, `tail 100 fast`, `top 1 now` stay commands — for
+    //     those the digit is a genuine argument, not a sentence number);
+    //   * the LAST token is a plain alphabetic predicate ("merged"/"closed"/
+    //     "is") — a sentence ends in a word, an invocation often ends in a
+    //     value/path;
+    //   * exactly one token is purely numeric (two numbers reads like argv:
+    //     `head 50 100`); and
+    //   * every remaining token is plain alphabetic — no flag/path/filename/
+    //     version token (those are unambiguous command syntax). This is why
+    //     `pr file.txt` (a real pr invocation) is NOT prose: "file.txt" is an
+    //     "other" token, and it's only two words anyway.
+    if NUMERIC_ARG_COMMANDS.contains(&lead.as_str()) {
+        return false;
+    }
+    let numeric = trimmed.iter().filter(|w| is_digits(w)).count();
+    let last_is_word = trimmed.last().is_some_and(|w| is_alpha(w));
+    let rest_alpha = trimmed.iter().all(|w| is_alpha(w) || is_digits(w));
+    numeric == 1 && last_is_word && rest_alpha
+}
+
+/// A lone confirmation token typed at the prompt (`y`, `yes`, `n`, `no`) is
+/// almost certainly a stray answer to a prompt that is no longer there — not a
+/// request to run the `yes` flood. Route it to the model rather than dispatch
+/// `yes`/`y` as a command. Case-insensitive; only a single bare word qualifies,
+/// so `yes hello` and a forced `!yes` still run directly.
+fn is_stray_confirmation(words: &[String]) -> bool {
+    matches!(words, [w] if matches!(w.to_ascii_lowercase().as_str(), "y" | "yes" | "n" | "no"))
 }
 
 /// Variable resolver for direct-dispatch `$VAR` expansion. Resolution order:
@@ -640,9 +697,13 @@ async fn dispatch(
         return Dispatch::NotACommand;
     };
 
-    // English that happens to start with a command word ("who is …") goes to
-    // the model — unless the user forced it with `!` or aliased the word.
-    if !force && !aliases.contains_key(first) && looks_like_prose(line, &words) {
+    // English that happens to start with a command word ("who is …"), or a bare
+    // stray confirmation ("yes"), goes to the model — unless the user forced it
+    // with `!` or aliased the word.
+    if !force
+        && !aliases.contains_key(first)
+        && (looks_like_prose(line, &words) || is_stray_confirmation(&words))
+    {
         return Dispatch::NotACommand;
     }
 
@@ -727,7 +788,7 @@ fn builtin_cd(arg: Option<&str>, session: &mut Session, prev: &mut Option<PathBu
 }
 
 /// PATH lookup with the executable bit checked — `which`, basically.
-fn resolve_program(cmd: &str, cwd: &Path, path_var: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_program(cmd: &str, cwd: &Path, path_var: &str) -> Option<PathBuf> {
     fn is_exec(p: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
         p.is_file() && p.metadata().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
@@ -1348,6 +1409,24 @@ mod tests {
         // …but flags/paths still win even with a trailing comma elsewhere
         assert!(!prose("watch -n 5 free"));
         assert!(!prose("tail logs/app.log"));
+
+        // ISS-1480: "PR 22 merged" (dev shorthand) must route to the model, not
+        // dispatch to /usr/bin/pr. Covers all three former failure modes:
+        // `pr` is now ambiguous, the lookup is case-insensitive, and a single
+        // embedded number no longer flips an English sentence to a command.
+        assert!(prose("pr 22 merged"));
+        assert!(prose("PR 22 merged")); // case-insensitive lead word
+        assert!(prose("PR is merged")); // no digit at all
+        assert!(prose("pr 22 was merged"));
+        // …without breaking real invocations. `pr` with a filename, and the
+        // numeric-operand commands, stay direct even though a number is present.
+        assert!(!prose("pr file.txt")); // genuine pr usage takes a filename
+        assert!(!prose("kill 1234")); // PID operand
+        assert!(!prose("kill 1234 now")); // number after kill is still a PID
+        assert!(!prose("head 50")); // line count
+        assert!(!prose("tail 100")); // line count
+        assert!(!prose("w 1")); // w's numeric arg
+        assert!(!prose("top 1")); // top's numeric arg
     }
 
     #[test]
@@ -1373,5 +1452,266 @@ mod tests {
         assert!(matches!(split_route("!who is x".into()), (l, Route::Direct) if l == "who is x"));
         assert!(matches!(split_route("?ls".into()), (l, Route::Model) if l == "ls"));
         assert!(matches!(split_route("ls".into()), (l, Route::Auto) if l == "ls"));
+    }
+
+    // Snapshot of the three pure routing heuristics — `!`/`?` force routing,
+    // looks_like_prose, and the tokenizer gate — so a tweak to any of them
+    // surfaces as a golden diff instead of silently reshaping UX. The
+    // executable-resolution step in `dispatch` is intentionally excluded to
+    // keep the snapshot hermetic (no PATH/filesystem dependence); "direct"
+    // here means "the heuristics did not divert the line to the model".
+    fn heuristic_route(input: &str) -> &'static str {
+        let (rest, route) = split_route(input.to_string());
+        match route {
+            Route::Direct => "direct  [! force]",
+            Route::Model => "model   [? force]",
+            Route::Auto => match rc::tokenize(&rest) {
+                None => "model   [shell-syntax / non-tokenizable]",
+                Some(words) if words.is_empty() => "model   [empty]",
+                Some(words) => {
+                    if is_stray_confirmation(&words) {
+                        "model   [bare-yes guard]"
+                    } else if looks_like_prose(&rest, &words) {
+                        "model   [looks_like_prose]"
+                    } else {
+                        "direct  [auto]"
+                    }
+                }
+            },
+        }
+    }
+
+    #[test]
+    fn routing_decision_snapshot() {
+        // Golden corpus grouped by the heuristic each case exercises. Keep the
+        // inputs and their order stable: a heuristic change should show up as a
+        // value diff, not a reshuffle.
+        let groups: &[(&str, &[&str])] = &[
+            (
+                "looks_like_prose — English starting with a real command word routes to the model, real invocations stay direct",
+                &[
+                    "who is zachary hohertz",
+                    "find me big files",
+                    "make this file executable",
+                    "watch for events from atum, let me know about activity",
+                    "find big files, oldest first",
+                    "who",
+                    "who -a",
+                    "which ls",
+                    "find . -name foo",
+                    "tail logfile",
+                    "echo hello there world",
+                    "cat \"my file\" backup",
+                    "watch -n 5 free",
+                    "tail logs/app.log",
+                ],
+            ),
+            (
+                "bare-yes guard — a lone confirmation token (y/yes/n/no) routes to the model; multi-word invocations stay direct",
+                &[
+                    "yes",
+                    "yes please",
+                    "yes please thanks",
+                    "test -f file",
+                    "test the connection right now",
+                ],
+            ),
+            (
+                "!/? force routing — explicit escape hatches override every other heuristic",
+                &[
+                    "!who is zachary hohertz",
+                    "!ls -la",
+                    "?ls",
+                    "?make this file executable",
+                    "?who",
+                ],
+            ),
+            (
+                "tokenizer gate — shell syntax and prose punctuation the tokenizer rejects route to the model",
+                &[
+                    "who is on this machine right now?",
+                    "echo *.rs",
+                    "cat a > b",
+                ],
+            ),
+        ];
+
+        let mut snap = String::new();
+        snap.push_str("# routing decision snapshot (TASK-110)\n");
+        snap.push_str("# direct = run on the terminal · model = hand the line to the model\n");
+        snap.push_str("# regenerate after an intended heuristic change: UPDATE_GOLDEN=1 cargo test routing_decision_snapshot\n");
+        for (heading, cases) in groups {
+            snap.push('\n');
+            snap.push_str(&format!("## {heading}\n"));
+            for &input in *cases {
+                snap.push_str(&format!("{:<52} -> {}\n", input, heuristic_route(input)));
+            }
+        }
+
+        let golden_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/routing_decisions.snap");
+        if std::env::var("UPDATE_GOLDEN").is_ok() {
+            std::fs::write(golden_path, &snap).expect("write golden snapshot");
+            return;
+        }
+
+        let golden = std::fs::read_to_string(golden_path)
+            .expect("missing tests/golden/routing_decisions.snap — run UPDATE_GOLDEN=1 cargo test to create it");
+        if golden != snap {
+            let mut diff = String::new();
+            for (i, (g, a)) in golden.lines().zip(snap.lines()).enumerate() {
+                if g != a {
+                    diff.push_str(&format!("  L{}\n    golden: {g}\n    actual: {a}\n", i + 1));
+                }
+            }
+            let (gn, an) = (golden.lines().count(), snap.lines().count());
+            if gn != an {
+                diff.push_str(&format!("  line count differs: golden={gn} actual={an}\n"));
+            }
+            panic!(
+                "routing decision snapshot drift — a routing heuristic changed.\n\
+                 Review the diff below; if the change is intended, regenerate the \n\
+                 golden file with `UPDATE_GOLDEN=1 cargo test routing_decision_snapshot`.\n\n{diff}"
+            );
+        }
+    }
+
+    // ---- TASK-109: oracle harness — direct-dispatch path ------------------
+    //
+    // Sibling to pipeline.rs's pipeline-path oracle. A line with no `|` takes
+    // the *direct-dispatch* path: `dispatch` resolves one program via
+    // `resolve_program` and runs it through `tools::run_on_tty`. bash is the
+    // ground truth aish's single-command path must reproduce on stdout bytes
+    // and exit status.
+    //
+    // `run_on_tty` inherits the terminal's stdout, so — exactly as the pipeline
+    // oracle appends a `dd` sink rather than read the terminal — the stdout
+    // cases mirror `run_on_tty`'s spawn configuration (same cwd, same session
+    // env, kill_on_drop) but pipe stdout into a capture buffer. The exit-status
+    // cases call the genuine `run_on_tty`, so the production path is exercised
+    // directly. The corpus is integer/ASCII coreutils with no stdin reads, so a
+    // mismatch is an aish regression, not a locale or echo-builtin quirk.
+
+    /// Resolve `cmd`'s program the way `dispatch` does (real `resolve_program`
+    /// against the process PATH), returning the resolved path and argv tail.
+    fn resolve_for_oracle(cmd: &str, session: &Session) -> (PathBuf, Vec<String>) {
+        let words = rc::tokenize(cmd).expect("oracle command must tokenize");
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        let program = resolve_program(&words[0], &session.cwd, &path_var)
+            .expect("oracle command's program must resolve on PATH");
+        (program, words[1..].to_vec())
+    }
+
+    /// Run `cmd` through aish's direct-dispatch resolution and a faithful mirror
+    /// of `run_on_tty`'s spawn (stdout piped for capture). Returns stdout bytes.
+    async fn aish_direct_stdout(cmd: &str, session: &Session) -> Vec<u8> {
+        let (program, args) = resolve_for_oracle(cmd, session);
+        tokio::process::Command::new(&program)
+            .args(&args)
+            .current_dir(&session.cwd)
+            .envs(session.env.iter().map(|(k, v)| (k, v)))
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .output()
+            .await
+            .expect("spawn direct-dispatch program")
+            .stdout
+    }
+
+    /// Exit code of `cmd` through the genuine `tools::run_on_tty`.
+    async fn aish_direct_code(cmd: &str, session: &Session) -> Option<i32> {
+        let (program, args) = resolve_for_oracle(cmd, session);
+        tools::run_on_tty(&program.to_string_lossy(), &args, &[], session)
+            .await
+            .expect("run_on_tty")
+            .code()
+    }
+
+    /// Run `cmd` through the oracle (`bash -c`) in `cwd`, returning its stdout.
+    fn bash_stdout(cmd: &str, cwd: &Path) -> Vec<u8> {
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("spawn bash oracle (is bash on PATH?)")
+            .stdout
+    }
+
+    /// Exit code of `cmd` under the oracle (`bash -c`) in `cwd`.
+    fn bash_code(cmd: &str, cwd: &Path) -> Option<i32> {
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(cwd)
+            .status()
+            .expect("spawn bash oracle")
+            .code()
+    }
+
+    #[tokio::test]
+    async fn oracle_direct_stdout_matches_bash() {
+        let session = Session::new().unwrap();
+        // Each entry is a single command aish runs natively (no pipe), reading
+        // no stdin; bash is the ground truth.
+        let corpus = [
+            "echo hello world",
+            "seq 1 20",
+            "seq 5 1",        // descending with the default step → empty output
+            "seq 1 2 9",      // strided: 1 3 5 7 9
+            "printf %s+%s 3 4",
+            "expr 6 + 7",
+            "basename /usr/local/bin/aish",
+            "dirname /usr/local/bin/aish",
+            "head -c 8 /dev/zero",
+            "wc -c /dev/null",
+        ];
+        for cmd in corpus {
+            let got = aish_direct_stdout(cmd, &session).await;
+            let want = bash_stdout(cmd, &session.cwd);
+            assert_eq!(
+                got,
+                want,
+                "aish direct-dispatch stdout diverged from bash for `{cmd}`\n  \
+                 aish: {:?}\n  bash: {:?}",
+                String::from_utf8_lossy(&got),
+                String::from_utf8_lossy(&want),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oracle_direct_exit_status_matches_bash() {
+        let session = Session::new().unwrap();
+        // A single command's status is the program's status in both shells.
+        let corpus = [
+            "true",
+            "false",
+            "test -d /",
+            "test -f /no/such/path/aish-oracle",
+            "grep -q anything /dev/null", // empty file → no match → exit 1
+            "expr 1 = 1",                 // result 1 (true) → exit 0
+            "expr 1 = 2",                 // result 0 (false) → exit 1
+        ];
+        for cmd in corpus {
+            let got = aish_direct_code(cmd, &session).await;
+            let want = bash_code(cmd, &session.cwd);
+            assert_eq!(got, want, "aish direct-dispatch exit status diverged from bash for `{cmd}`");
+        }
+    }
+
+    #[tokio::test]
+    async fn oracle_direct_detects_deliberate_divergence() {
+        // Teeth: feed aish and the oracle *different* commands and confirm the
+        // comparator sees them as unequal. If this ever matches, the direct
+        // oracle is blind and the agreement tests above are worthless.
+        let session = Session::new().unwrap();
+        let aish = aish_direct_stdout("echo same", &session).await;
+        let bash = bash_stdout("echo different", &session.cwd);
+        assert_ne!(
+            aish, bash,
+            "direct oracle failed to detect an intentional divergence — the harness is blind"
+        );
     }
 }

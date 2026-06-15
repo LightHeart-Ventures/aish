@@ -1,0 +1,38 @@
+# routing decision snapshot (TASK-110)
+# direct = run on the terminal · model = hand the line to the model
+# regenerate after an intended heuristic change: UPDATE_GOLDEN=1 cargo test routing_decision_snapshot
+
+## looks_like_prose — English starting with a real command word routes to the model, real invocations stay direct
+who is zachary hohertz                               -> model   [looks_like_prose]
+find me big files                                    -> model   [looks_like_prose]
+make this file executable                            -> model   [looks_like_prose]
+watch for events from atum, let me know about activity -> model   [looks_like_prose]
+find big files, oldest first                         -> model   [looks_like_prose]
+who                                                  -> direct  [auto]
+who -a                                               -> direct  [auto]
+which ls                                             -> direct  [auto]
+find . -name foo                                     -> direct  [auto]
+tail logfile                                         -> direct  [auto]
+echo hello there world                               -> direct  [auto]
+cat "my file" backup                                 -> direct  [auto]
+watch -n 5 free                                      -> direct  [auto]
+tail logs/app.log                                    -> direct  [auto]
+
+## bare-yes guard — a lone confirmation token (y/yes/n/no) routes to the model; multi-word invocations stay direct
+yes                                                  -> model   [bare-yes guard]
+yes please                                           -> direct  [auto]
+yes please thanks                                    -> model   [looks_like_prose]
+test -f file                                         -> direct  [auto]
+test the connection right now                        -> model   [looks_like_prose]
+
+## !/? force routing — explicit escape hatches override every other heuristic
+!who is zachary hohertz                              -> direct  [! force]
+!ls -la                                              -> direct  [! force]
+?ls                                                  -> model   [? force]
+?make this file executable                           -> model   [? force]
+?who                                                 -> model   [? force]
+
+## tokenizer gate — shell syntax and prose punctuation the tokenizer rejects route to the model
+who is on this machine right now?                    -> model   [shell-syntax / non-tokenizable]
+echo *.rs                                            -> model   [shell-syntax / non-tokenizable]
+cat a > b                                            -> model   [shell-syntax / non-tokenizable]
