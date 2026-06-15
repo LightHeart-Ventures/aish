@@ -109,13 +109,17 @@ pub async fn run_turn(
     Ok("[stopped: turn exceeded the tool-call iteration limit]".into())
 }
 
-/// Headless background coordinator: run one full agentic turn with the full
-/// toolset (filesystem, run_program, MCP — the same tools an interactive turn
-/// has), then — unlike `aish -c` — AWAIT every background batch this turn
-/// offloaded before returning, so deferred sub-work isn't dropped when the
-/// process exits. Confirmation is auto-allowed: the caller runs us unattended
-/// (yolo, no TTY), so there is no one to answer a prompt. `run_id` identifies
-/// this run in logs (and, later, the durable coordinator store).
+/// Headless background coordinator: the durable, resumable multi-round loop
+/// (see `crate::coordinator`). Runs full-tool agentic rounds and, when a round
+/// fans heavy sub-work out to the Anthropic Batches API, awaits it (phase
+/// `awaiting_batch`, heartbeating) and folds the results into the next round —
+/// persisting each phase transition to the `coordinator_runs` store so a crash
+/// resumes. Confirmation is auto-allowed: the caller runs us unattended (yolo,
+/// no TTY). `run_id` keys the durable row.
+///
+/// This is the body of `aish --coordinator`, which is now the DEFAULT background
+/// path (`run_in_background` spawns one of these); the tool-less Batches offload
+/// is an internal optimization a round can reach for, not a user-facing mode.
 pub async fn run_coordinator(
     backend: &Backend,
     session: &mut Session,
@@ -123,14 +127,23 @@ pub async fn run_coordinator(
     run_id: &str,
 ) -> Result<()> {
     eprintln!("\x1b[2maish: coordinator run {run_id} starting\x1b[0m");
-    let mut allow = |_: &str| tools::Decision::AllowOnce;
-    let out = run_turn(backend, session, input, &mut allow).await?;
-    println!("{}", crate::md::render_stdout(&out));
-    // Await deferred sub-work: each batch's result auto-prints as it completes
-    // (batch::on_complete), so we just block until none remain running. This is
-    // the behavioral difference from `-c`, which would exit here and orphan them.
-    crate::batch::await_all(&session.batch_jobs).await;
-    Ok(())
+    let store = session.coordinator_store.clone();
+    let outcome = crate::coordinator::drive(backend, session, input, run_id, store.as_ref()).await;
+    match outcome.phase {
+        crate::coordinator::Phase::Done => {
+            if let Some(result) = &outcome.result {
+                println!("{}", crate::md::render_stdout(result));
+            }
+            Ok(())
+        }
+        // A failed run prints its error to stdout (the worker captures stdout as
+        // the result) and propagates a non-zero exit so the parent marks it
+        // failed. The durable row already records the failure for rehydrate.
+        _ => {
+            let err = outcome.error.unwrap_or_else(|| "coordinator failed".into());
+            anyhow::bail!("{err}")
+        }
+    }
 }
 
 /// TASK-13: prepend the previous recorded output to a turn's input so the model

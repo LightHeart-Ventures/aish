@@ -204,46 +204,27 @@ under 'MCP skills'). Returns the expanded instructions — read them, then follo
     if batch_mode {
         defs.push(ToolDef {
             name: "run_in_background".into(),
-            description: "Offload a self-contained, deferrable task to a BACKGROUND job; it runs \
-asynchronously and its result auto-delivers here when done. Do NOT use it for work the user needs \
-answered right now. Two backends, picked by `needs_tools`:\n\
-- needs_tools=false (default): a tool-LESS reasoning job on the Anthropic Message Batches API \
-(~50% cheaper, may take up to ~1 hour). Use for summarizing, drafting, analyzing, or answering \
-from text you PROVIDE in the task — it has no filesystem, no commands, no MCP.\n\
-- needs_tools=true: a full headless aish running in the SAME directory with your COMPLETE toolset \
-and MCP servers (read/write files, run programs, atum/github, …). Use when the task must touch \
-files, run commands, or query MCP."
+            description: "Run a self-contained, deferrable task in the BACKGROUND. Do NOT use it \
+for work the user needs answered right now. The task runs as a full background coordinator: a \
+headless aish in the SAME directory with your COMPLETE toolset and MCP servers (read/write files, \
+run programs, atum/github, …) that can also fan heavy parallel sub-work out on its own. It runs \
+asynchronously, survives a restart, and its result auto-delivers here when done. You don't choose \
+a backend or worry about batches — just describe the task and offload it."
                 .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "task": {"type": "string", "description": "The self-contained task to run in the background. It has no access to THIS conversation — include everything it needs. (With needs_tools=true it CAN read the project files and use tools/MCP in the current directory.)"},
-                    "needs_tools": {"type": "boolean", "description": "True if the task must use tools — read/write files, run programs, or query MCP servers (atum, github). False (default) for pure reasoning over text you provide, which runs on the cheaper Batches API."}
+                    "task": {"type": "string", "description": "The self-contained task to run in the background. It has no access to THIS conversation — include everything it needs. It CAN read the project files and use tools/MCP in the current directory."}
                 },
                 "required": ["task"]
             }),
         });
         defs.push(ToolDef {
-            name: "batch_result".into(),
-            description: "Fetch the result of a tool-LESS background batch (needs_tools=false). \
-Returns the result if it has ended, or its status if still running. NOTE: full-tool workers \
-(needs_tools=true) auto-deliver their result to the terminal — do NOT call this for them; just \
-wait."
-                .into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "job": {"type": "string", "description": "The job id (or an unambiguous prefix) from run_in_background"}
-                },
-                "required": ["job"]
-            }),
-        });
-        defs.push(ToolDef {
             name: "background_status".into(),
-            description: "List ALL background jobs and their LIVE status — full-tool workers \
-(needs_tools=true, running in this session) and Anthropic batch jobs (needs_tools=false, shared \
-across sessions). Call this to answer \"what's running?\" / \"status\" instead of guessing or \
-inventing your own tracking. Returns a table: id, kind (worker|batch), owner, status, task."
+            description: "List ALL background jobs and their LIVE status — background coordinators \
+(running in this session) and durable coordinator runs / Anthropic batch jobs (shared across \
+sessions). Call this to answer \"what's running?\" / \"status\" instead of guessing or inventing \
+your own tracking. Returns a table: id, kind, owner, status, task."
                 .into(),
             schema: json!({ "type": "object", "properties": {} }),
         });
@@ -673,74 +654,56 @@ fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
     if task.is_empty() {
         anyhow::bail!("`task` is required");
     }
-    // Both backends need a metered key: the Batches API rejects subscription
-    // tokens, and a worker subprocess's Claude backend reads ANTHROPIC_API_KEY.
+    // A background coordinator's Claude backend reads ANTHROPIC_API_KEY, and the
+    // tool-less batch fan-out it may reach for needs a metered key too.
     if std::env::var("ANTHROPIC_API_KEY").is_err() {
         anyhow::bail!(
             "ANTHROPIC_API_KEY is not set — background jobs need a metered API key \
-(a Claude subscription token won't reach the Batches API, and a worker subprocess needs it too)"
+(a Claude subscription token won't reach the Batches API, and a coordinator subprocess needs it too)"
         );
     }
 
-    // Routing: the model's needs_tools, OR a heuristic backstop that catches a
-    // clearly tool-needing task the model mislabeled (the common failure — a
-    // "scan this repo" task sent to the tool-less Batches API returns garbage).
-    // The heuristic only ever upgrades batch→worker, never the reverse: a worker
-    // is a full aish, so it can also do pure reasoning — a false positive just
-    // costs a bit more, while a false negative produces wrong results. The
-    // nested guard still caps it (a coordinator never spawns its own workers).
-    let asked_tools = call.args["needs_tools"].as_bool().unwrap_or(false);
-    let needs_tools = (asked_tools || task_needs_tools(task)) && !session.nested;
-
-    if needs_tools {
-        let exe = std::env::current_exe()
-            .map_err(|e| anyhow::anyhow!("can't locate the aish binary to re-exec: {e}"))?;
-        let spec = crate::worker::WorkerSpec {
-            exe,
-            cwd: session.cwd.clone(),
-            model: session.batch_model.clone(),
-            env: session.env.clone(),
-        };
-        let _id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
-        return Ok("Queued a full-tool background worker (it can read files, run commands, and use \
-MCP in this directory). The result auto-delivers here when it's done — do NOT call batch_result \
-for it. Now reply to the user with one short, natural sentence that you're on it and the answer \
-will appear when ready — no job id, no restating the task."
+    // The DEFAULT (and only model-facing) background path is now the coordinator:
+    // a full-tool, durable, resumable headless aish that can ALSO fan heavy
+    // sub-work out to the Batches API on its own. The model no longer picks
+    // batch-vs-worker — it just offloads. The tool-less batch is kept purely as
+    // an INTERNAL optimization (used by a coordinator round / `:batch`), not a
+    // user-facing mode.
+    //
+    // Nested guard: a coordinator must never spawn its own coordinator (no
+    // infinite re-exec recursion). When we ARE a coordinator (`session.nested`),
+    // a deferred offload degrades to the in-process tool-less batch — the one
+    // internal use of the batch path on this model-facing route.
+    if session.nested {
+        let api_key = std::env::var("ANTHROPIC_API_KEY").expect("checked above");
+        let _id = crate::batch::spawn(
+            &session.batch_jobs,
+            task.to_string(),
+            session.batch_model.clone(),
+            api_key,
+            session.batch_store.clone(),
+            session.session_id.clone(),
+            session.name.clone(),
+        );
+        return Ok("Queued in the background. Now reply with one short, natural sentence that \
+you're working on it and the answer will appear here when ready — no job id, no restating the task."
             .to_string());
     }
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY").expect("checked above");
-    let _id = crate::batch::spawn(
-        &session.batch_jobs,
-        task.to_string(),
-        session.batch_model.clone(),
-        api_key,
-        session.batch_store.clone(),
-        session.session_id.clone(),
-        session.name.clone(),
-    );
-    // Steers the model's reply rather than being echoed verbatim — the id stays
-    // internal (results auto-deliver, so the user doesn't need it).
-    Ok("Queued in the background. Now reply to the user with one short, natural sentence that \
-you're working on it and the answer will appear here when it's ready — don't mention a job id or \
-restate the task."
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("can't locate the aish binary to re-exec: {e}"))?;
+    let spec = crate::worker::WorkerSpec {
+        exe,
+        cwd: session.cwd.clone(),
+        model: session.batch_model.clone(),
+        env: session.env.clone(),
+    };
+    let _id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
+    Ok("Queued a background coordinator (full toolset + MCP in this directory; it can fan parallel \
+sub-work out on its own). The result auto-delivers here when it's done — do NOT try to fetch it. \
+Now reply to the user with one short, natural sentence that you're on it and the answer will appear \
+when ready — no job id, no restating the task."
         .to_string())
-}
-
-/// Strong signals that a task needs the filesystem, a command, the repo, or an
-/// MCP server — so it must run as a full-tool worker, not a tool-less batch.
-/// Conservative toward false POSITIVES (upgrading to a worker is always safe);
-/// the cost is only losing the cheaper batch path for these.
-fn task_needs_tools(task: &str) -> bool {
-    let t = task.to_ascii_lowercase();
-    const SIGNALS: &[&str] = &[
-        "repo", "repositor", "codebase", "this project", "the project",
-        "this directory", "the directory", "this folder", "the code", "the file",
-        "these files", "the files", "scan ", "grep", "search the", "src/",
-        ".rs", "./", "git ", "github", "atum", "mcp", "run the", "run a",
-        "build the", "build and", "compile", "the tests", "list the files",
-    ];
-    SIGNALS.iter().any(|s| t.contains(s))
 }
 
 /// Live status of every background job the session can see — its own full-tool
@@ -760,15 +723,38 @@ fn background_status(session: &Session) -> Result<String> {
         String::from("| ID | Kind | Owner | Status | Since | Task |\n|---|---|---|---|---|---|\n");
     let mut any = false;
 
-    // This session's full-tool workers (in memory; not shared across sessions).
+    // This session's full-tool background coordinators (in memory; the live
+    // subprocess handle is session-local even though its durable row is shared).
     for w in session.worker_jobs.lock().unwrap().iter() {
         any = true;
         out.push_str(&format!(
-            "| `{}` | worker | you | {} | — | {} |\n",
+            "| `{}` | coordinator | you | {} | — | {} |\n",
             crate::batch::short_id(&w.id),
             w.status(),
             trunc(&w.task)
         ));
+    }
+    // Durable coordinator runs from the shared store — every session's, so this
+    // surfaces runs that outlive (or were started by) another aish process.
+    if let Some(store) = &session.coordinator_store {
+        if let Ok(rows) = store.load_all() {
+            for r in rows {
+                any = true;
+                let owner = match r.session_id.as_deref() {
+                    Some(sid) if sid == session.session_id.as_str() => "you".into(),
+                    Some(sid) => crate::batch::short_id(sid).to_string(),
+                    None => "—".into(),
+                };
+                out.push_str(&format!(
+                    "| `{}` | coordinator | {} | {} | {} | {} |\n",
+                    crate::batch::short_id(&r.run_id),
+                    owner,
+                    r.phase,
+                    r.created_at.as_deref().unwrap_or("—"),
+                    trunc(&r.task)
+                ));
+            }
+        }
     }
     // Anthropic batches from the shared store — every session's, so this answers
     // cross-session "what's running" too.
@@ -1328,21 +1314,6 @@ fn char_ceil(s: &str, mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn task_needs_tools_backstop() {
-        // Clearly tool-needing tasks the model might mislabel → upgrade to worker.
-        assert!(task_needs_tools("scan this repo and list the modules"));
-        assert!(task_needs_tools("read the files in src/ and summarize"));
-        assert!(task_needs_tools("run the tests and report failures"));
-        assert!(task_needs_tools("check atum for open issues"));
-        assert!(task_needs_tools("grep for TODO across the codebase"));
-        assert!(task_needs_tools("build the project and report warnings"));
-        // Pure reasoning over provided text → stays on the cheap batch path.
-        assert!(!task_needs_tools("write a haiku about the ocean"));
-        assert!(!task_needs_tools("summarize the following paragraph: ..."));
-        assert!(!task_needs_tools("translate this sentence to french"));
-    }
 
     #[test]
     fn env_value_resolution() {

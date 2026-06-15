@@ -1,5 +1,6 @@
 mod backend;
 mod batch;
+mod coordinator;
 mod db;
 mod engine;
 mod goal;
@@ -119,6 +120,16 @@ async fn main() -> Result<()> {
             batch::rehydrate(&mut session);
         }
         Err(e) => eprintln!("\x1b[33maish:\x1b[0m batch store unavailable: {e:#}"),
+    }
+
+    // Durable coordinator runs: open the store and reattach prior runs — surface
+    // any that finished while we were down, reap orphaned (stale-heartbeat) ones.
+    match db::CoordinatorStore::open(&aish_dir.join("aish.db")) {
+        Ok(store) => {
+            session.coordinator_store = Some(store);
+            coordinator::rehydrate(&mut session);
+        }
+        Err(e) => eprintln!("\x1b[33maish:\x1b[0m coordinator store unavailable: {e:#}"),
     }
 
     if let Some(prompt) = args.command {

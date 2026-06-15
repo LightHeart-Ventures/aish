@@ -132,10 +132,11 @@ impl BatchJob {
 }
 
 /// Block until every background batch job has reached a terminal state. The
-/// headless coordinator (`engine::run_coordinator`) uses this so it doesn't exit
-/// while offloaded sub-work is still running — the poll tasks drive completion,
-/// we just watch their status. (The interactive REPL never needs this: it stays
-/// alive and `on_complete` flushes results as they land.)
+/// headless coordinator used to call this directly; it now awaits batches via
+/// `coordinator::await_batches_with_heartbeat` (which also beats the durable
+/// run heartbeat). Kept as a public helper for any caller that just wants to
+/// drain the batch queue without a coordinator row.
+#[allow(dead_code)]
 pub async fn await_all(jobs: &BatchJobs) {
     loop {
         let running = jobs
