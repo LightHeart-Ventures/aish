@@ -626,6 +626,38 @@ fn looks_like_prose(line: &str, words: &[String]) -> bool {
     numeric == 1 && last_is_word && rest_alpha
 }
 
+/// Ambiguous commands whose argument must itself be a runnable program
+/// (`watch ls`, `time make`, `nice cargo`). These never trip `looks_like_prose`
+/// — they're typically used as two-word lines, below its `>= 3 words` bar — yet
+/// `watch orch_c1b45797b841` (an atum id the user wants the model to look up via
+/// MCP) is intent, not an invocation: `orch_…` isn't a command, so a real
+/// `watch` can't run it.
+///
+/// So for these verbs, a bare `<verb> <word>` line routes to the model when the
+/// argument doesn't resolve to a program. Deliberately narrow — exactly two
+/// words, no leading-dash flag — so genuine usage keeps dispatching directly:
+/// `watch df`, `time ls`, `watch -n 5 free`, `time ls -l`. Surface-form
+/// heuristic; the durable fix is model-based route preview (S5/S6:
+/// TASK-132/137), which understands the line instead of matching its lead word.
+const COMMAND_ARG_COMMANDS: &[&str] = &["watch", "time", "nice"];
+
+/// See [`COMMAND_ARG_COMMANDS`]. `cwd`/`path_var` are the same PATH dispatch uses.
+fn looks_like_command_arg_intent(words: &[String], cwd: &Path, path_var: &str) -> bool {
+    let [verb, arg] = words else {
+        return false;
+    };
+    if !COMMAND_ARG_COMMANDS.contains(&verb.to_ascii_lowercase().as_str()) {
+        return false;
+    }
+    // A flag is unambiguous invocation syntax; only a bare word qualifies.
+    if arg.starts_with('-') {
+        return false;
+    }
+    // A resolvable argument means a genuine `watch <cmd>` call; an unresolvable
+    // one (an id, a typo, an English word) reads as intent → model.
+    resolve_program(arg, cwd, path_var).is_none()
+}
+
 /// A lone confirmation token typed at the prompt (`y`, `yes`, `n`, `no`) is
 /// almost certainly a stray answer to a prompt that is no longer there — not a
 /// request to run the `yes` flood. Route it to the model rather than dispatch
@@ -716,12 +748,15 @@ async fn dispatch(
         return Dispatch::NotACommand;
     };
 
-    // English that happens to start with a command word ("who is …"), or a bare
-    // stray confirmation ("yes"), goes to the model — unless the user forced it
-    // with `!` or aliased the word.
+    // English that happens to start with a command word ("who is …"), a bare
+    // stray confirmation ("yes"), or a command-taking verb whose argument isn't
+    // a real program ("watch orch_…") goes to the model — unless the user forced
+    // it with `!` or aliased the word.
     if !force
         && !aliases.contains_key(first)
-        && (looks_like_prose(line, &words) || is_stray_confirmation(&words))
+        && (looks_like_prose(line, &words)
+            || is_stray_confirmation(&words)
+            || looks_like_command_arg_intent(&words, &session.cwd, &session_path(session)))
     {
         return Dispatch::NotACommand;
     }
@@ -1472,6 +1507,40 @@ mod tests {
         assert!(!prose("tail 100")); // line count
         assert!(!prose("w 1")); // w's numeric arg
         assert!(!prose("top 1")); // top's numeric arg
+    }
+
+    #[test]
+    fn command_arg_intent_detection() {
+        use std::os::unix::fs::PermissionsExt;
+        let tok = |s: &str| rc::tokenize(s).unwrap();
+        let cwd = std::env::temp_dir();
+
+        // A PATH dir holding one real executable, `tool`, so resolution is
+        // deterministic without depending on what's installed.
+        let dir = std::env::temp_dir().join(format!("aish_cmdarg_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let exe = dir.join("tool");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.to_string_lossy().to_string();
+        let intent = |s: &str| looks_like_command_arg_intent(&tok(s), &cwd, &path);
+
+        // The reported bug: `watch <atum-id>` (and peers) → model — the argument
+        // isn't a runnable command, so it can't be a real invocation.
+        assert!(intent("watch orch_c1b45797b841"));
+        assert!(intent("time some_made_up_target"));
+        assert!(intent("nice frobnicate"));
+        // Genuine command-taking invocations stay direct.
+        assert!(!intent("watch tool")); // `tool` resolves on our PATH
+        assert!(!intent("watch -n")); // a flag is real invocation syntax
+        // Not a command-taking verb → not intercepted here (handled, or not, elsewhere).
+        assert!(!intent("git status"));
+        assert!(!intent("make build")); // make targets aren't programs — deliberately excluded
+        // Only the exact two-word shape qualifies.
+        assert!(!intent("watch")); // 1 word
+        assert!(!intent("watch tool extra")); // 3 words
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
