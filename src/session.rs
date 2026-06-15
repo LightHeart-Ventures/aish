@@ -50,6 +50,9 @@ pub struct Session {
     pub history: Vec<Msg>,
     /// How much the safety gate asks before acting (paranoid → yolo).
     pub mode: Mode,
+    /// Optional session name, shown as a `[NAME] |` prefix on the prompt. Set
+    /// with `:name <name>`, cleared with bare `:name`. Session-local.
+    pub name: Option<String>,
     /// Static host info baked into the system prompt once.
     pub host_info: String,
     /// True while a child owns the terminal (run_interactive / direct dispatch).
@@ -113,6 +116,7 @@ impl Session {
             cwd,
             history: Vec::new(),
             mode: Mode::default(),
+            name: None,
             host_info: host_info(),
             tty_handoff: Arc::new(AtomicBool::new(false)),
             env: Vec::new(),

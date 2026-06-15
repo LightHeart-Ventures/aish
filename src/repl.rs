@@ -136,7 +136,11 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
         } else {
             String::new()
         };
-        let prompt = format!("{badge}\x1b[36m{}\x1b[0m ❯ ", short_cwd(&session));
+        let name = match &session.name {
+            Some(n) => format!("\x1b[1;35m[{n}]\x1b[0m | "), // bold magenta, set apart from the cyan path
+            None => String::new(),
+        };
+        let prompt = format!("{name}{badge}\x1b[36m{}\x1b[0m ❯ ", short_cwd(&session));
         match rl.readline(&prompt) {
             Ok(line) => {
                 let line = line.trim().to_string();
@@ -1043,6 +1047,7 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
                  :workers                            list full-tool background workers (needs_tools offloads)\n\
+                 :name <name>                        name the session (prefixes the prompt); bare :name clears\n\
                  :allow                              list always-allowed tools/commands\n\
                  :allow remove <tool>                revoke an always-allowed tool/command\n\
                  a at a prompt                       always-allow this tool (see :allow)\n\
@@ -1077,6 +1082,20 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
             }
             for w in workers.iter() {
                 println!("{}", w.summary_line());
+            }
+        }
+        Some("name") => {
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            let rest = rest.trim();
+            if rest.is_empty() {
+                if session.name.take().is_some() {
+                    println!("session name cleared");
+                } else {
+                    println!("usage: :name <name>   (bare :name clears it)");
+                }
+            } else {
+                session.name = Some(rest.to_string());
+                println!("session named \x1b[1;35m[{rest}]\x1b[0m");
             }
         }
         Some("model") => match parts.next() {
