@@ -2,6 +2,12 @@ use crate::backend::{Backend, Msg, Role, ToolResult};
 use crate::session::Session;
 use crate::tools::{self, Confirm};
 use anyhow::Result;
+use std::sync::{Arc, Mutex};
+
+/// A tool animation's background task, shared between the `ToolSpinner` and the
+/// confirm wrapper so a permission prompt can stop the animation before it
+/// overwrites the prompt line.
+type SpinTask = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
 
 const MAX_ITERATIONS: usize = 40; // runaway-loop backstop
 
@@ -68,7 +74,15 @@ pub async fn run_turn(
             // terminal to a child, so it opts out of the animation (which would
             // fight the child for stderr) and shows a plain static line.
             let tool_spin = ToolSpinner::start(&desc, animates(&call.name));
-            let result = tools::execute(call, session, confirm).await;
+            // Stop the animation before any permission prompt — otherwise the next
+            // spinner frame overwrites the prompt and the hidden cursor leaves the
+            // user nothing to answer.
+            let stopper = tool_spin.stopper();
+            let mut gated = |p: &str| {
+                stop_spinner(&stopper);
+                confirm(p)
+            };
+            let result = tools::execute(call, session, &mut gated).await;
             tool_spin.finish(&desc, result.is_error);
             if session.raw_tool_output {
                 print_raw_result(&result);
@@ -166,7 +180,14 @@ impl Drop for Spinner {
 /// keeps the same dim, two-space-indented style as the static 🔧 line it
 /// replaces. TTY-gated; on `finish` the animation is erased and a static
 /// result line (✓/✗ + desc) is printed in its place.
-struct ToolSpinner(Option<tokio::task::JoinHandle<()>>);
+struct ToolSpinner {
+    /// `Some` while a TTY animation is running; taken by `finish`, `stop_spinner`
+    /// (before a confirm prompt), or `Drop`. Empty for the static piped line.
+    task: SpinTask,
+    /// True when we actually animated (so `finish` knows to print the result
+    /// line even if a confirm already consumed the task).
+    animated: bool,
+}
 
 /// Frames for the running-tool animation. Gear ↔ hourglass: "a tool is turning
 /// / time is passing". Small and tasteful — two glyphs, no emoji soup.
@@ -185,37 +206,57 @@ impl ToolSpinner {
             // Piped/headless or non-animating tool: emit the plain static line
             // once, no animation.
             eprintln!("\x1b[2m  🔧 {desc}\x1b[0m");
-            return Self(None);
+            return Self { task: Default::default(), animated: false };
         }
         eprint!("\x1b[?25l"); // hide the cursor so it doesn't blink at the spinner's tail
         let desc = desc.to_string();
-        Self(Some(tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
             for i in 0.. {
                 tick.tick().await;
                 eprint!("\r\x1b[2K\x1b[2m  {} {desc}\x1b[0m", TOOL_FRAMES[i % TOOL_FRAMES.len()]);
             }
-        })))
+        });
+        Self { task: Arc::new(Mutex::new(Some(task))), animated: true }
+    }
+
+    /// A shared handle to the animation task — the REPL stops it with
+    /// `stop_spinner` right before an interactive confirm prompt.
+    fn stopper(&self) -> SpinTask {
+        self.task.clone()
     }
 
     /// Stop the animation and leave a static result line behind. On a TTY the
-    /// spinning line is erased and replaced in place; piped, the static line
-    /// was already printed at `start`, so we do nothing.
-    fn finish(mut self, desc: &str, is_error: bool) {
-        if let Some(h) = self.0.take() {
+    /// spinning line is erased and replaced in place; piped, the static line was
+    /// already printed at `start`, so we only print the result for animated runs.
+    fn finish(self, desc: &str, is_error: bool) {
+        if let Some(h) = self.task.lock().unwrap().take() {
             h.abort();
-            // Erase the spinner, print the result line, then restore the cursor.
+        }
+        if self.animated {
+            // Erase the spinner / cleared line, print the result, restore cursor.
             eprintln!("\r\x1b[2K\x1b[2m  {}\x1b[0m\x1b[?25h", tool_result_line(desc, is_error));
         }
     }
 }
 
+/// Stop a running tool animation, clear its line, and restore the cursor — called
+/// right before an interactive confirm prompt so the prompt isn't immediately
+/// overwritten by the next spinner frame and the user can see the cursor to
+/// answer. Idempotent: a no-op once the task has been taken.
+fn stop_spinner(task: &SpinTask) {
+    if let Some(h) = task.lock().unwrap().take() {
+        h.abort();
+        eprint!("\r\x1b[2K\x1b[?25h");
+    }
+}
+
 impl Drop for ToolSpinner {
     fn drop(&mut self) {
-        // Only fires when `finish` wasn't called (e.g. the turn was aborted
-        // mid-tool) — stop the animation and restore the cursor so it's never
-        // left hidden.
-        if let Some(h) = self.0.take() {
+        // Only fires when nothing else consumed the task (e.g. the turn was
+        // aborted mid-tool) — stop the animation and restore the cursor so it's
+        // never left hidden.
+        if let Some(h) = self.task.lock().unwrap().take() {
             h.abort();
             eprint!("\r\x1b[2K\x1b[?25h");
         }
