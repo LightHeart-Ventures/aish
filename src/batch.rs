@@ -130,6 +130,26 @@ impl BatchJob {
     }
 }
 
+/// Block until every background batch job has reached a terminal state. The
+/// headless coordinator (`engine::run_coordinator`) uses this so it doesn't exit
+/// while offloaded sub-work is still running — the poll tasks drive completion,
+/// we just watch their status. (The interactive REPL never needs this: it stays
+/// alive and `on_complete` flushes results as they land.)
+pub async fn await_all(jobs: &BatchJobs) {
+    loop {
+        let running = jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|j| !matches!(j.status().as_str(), "done" | "failed"))
+            .count();
+        if running == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// Register a new background batch and start its poll task. Returns the
 /// session-local job id. `api_key` and `model` are captured up front so the
 /// spawned task is self-contained. `store`, when present, persists the job so it

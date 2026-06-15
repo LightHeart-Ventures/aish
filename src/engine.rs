@@ -83,6 +83,30 @@ pub async fn run_turn(
     Ok("[stopped: turn exceeded the tool-call iteration limit]".into())
 }
 
+/// Headless background coordinator: run one full agentic turn with the full
+/// toolset (filesystem, run_program, MCP — the same tools an interactive turn
+/// has), then — unlike `aish -c` — AWAIT every background batch this turn
+/// offloaded before returning, so deferred sub-work isn't dropped when the
+/// process exits. Confirmation is auto-allowed: the caller runs us unattended
+/// (yolo, no TTY), so there is no one to answer a prompt. `run_id` identifies
+/// this run in logs (and, later, the durable coordinator store).
+pub async fn run_coordinator(
+    backend: &Backend,
+    session: &mut Session,
+    input: String,
+    run_id: &str,
+) -> Result<()> {
+    eprintln!("\x1b[2maish: coordinator run {run_id} starting\x1b[0m");
+    let mut allow = |_: &str| tools::Decision::AllowOnce;
+    let out = run_turn(backend, session, input, &mut allow).await?;
+    println!("{}", crate::md::render_stdout(&out));
+    // Await deferred sub-work: each batch's result auto-prints as it completes
+    // (batch::on_complete), so we just block until none remain running. This is
+    // the behavioral difference from `-c`, which would exit here and orphan them.
+    crate::batch::await_all(&session.batch_jobs).await;
+    Ok(())
+}
+
 /// TASK-13: prepend the previous recorded output to a turn's input so the model
 /// can reference it ("summarize that") without re-running the command. Applied
 /// only when the conversation is empty — mid-conversation the output is already
