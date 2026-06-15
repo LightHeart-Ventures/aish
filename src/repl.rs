@@ -536,14 +536,28 @@ fn split_route(line: String) -> (String, Route) {
 const AMBIGUOUS_COMMANDS: &[&str] = &[
     "who", "w", "find", "time", "test", "yes", "look", "last", "watch", "date",
     "which", "what", "whatis", "finger", "write", "wall", "users", "top", "more",
-    "head", "tail", "make", "cat", "kill",
+    "head", "tail", "make", "cat", "kill", "pr",
 ];
 
+/// Subset of `AMBIGUOUS_COMMANDS` whose *idiomatic* first argument is a number:
+/// `kill 1234`, `head 50`, `tail 100`, `top 1`, `w 1`, `nice 10`. For these, a
+/// digit right after the command is a real operand, so a numeric token must NOT
+/// be read as part of an English sentence (see the digit relaxation below).
+/// `pr` is deliberately absent: `pr` takes filenames, never a bare PID/line
+/// count, so "PR 22 merged" has no command reading.
+const NUMERIC_ARG_COMMANDS: &[&str] =
+    &["kill", "head", "tail", "top", "w", "nice", "renice", "fold", "split"];
+
 fn looks_like_prose(line: &str, words: &[String]) -> bool {
-    if words.len() < 3
-        || !AMBIGUOUS_COMMANDS.contains(&words[0].as_str())
-        || line.contains(['"', '\''])
-    {
+    // The membership check is case-insensitive: on a case-insensitive
+    // filesystem (macOS) `PR`/`What`/`FIND` resolve to the lowercase binary, so
+    // they're just as ambiguous. We only lowercase for the *lookup* — the argv
+    // handed to exec is never mutated.
+    if words.len() < 3 {
+        return false;
+    }
+    let lead = words[0].to_ascii_lowercase();
+    if !AMBIGUOUS_COMMANDS.contains(&lead.as_str()) || line.contains(['"', '\'']) {
         return false;
     }
     // A comma reads as a sentence, not an argv — "watch for events from atum,
@@ -551,12 +565,46 @@ fn looks_like_prose(line: &str, words: &[String]) -> bool {
     if line.contains(", ") {
         return true;
     }
-    // Otherwise every word must be plain alphabetic, with trailing sentence
-    // punctuation forgiven; flags (-n), paths (a/b), and digits stay commands.
-    words.iter().all(|w| {
-        let w = w.trim_end_matches([',', '.', '!', '?', ';', ':']);
-        !w.is_empty() && w.chars().all(|c| c.is_ascii_alphabetic())
-    })
+
+    // Classify each token (trailing sentence punctuation forgiven): is it a
+    // plain alphabetic English word, a bare run of digits, or "other" (a flag
+    // `-n`, a path `a/b`, a filename `file.txt`, a version `1.2`, …)?
+    let trim = |w: &str| w.trim_end_matches([',', '.', '!', '?', ';', ':']).to_string();
+    let is_alpha = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphabetic());
+    let is_digits = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit());
+
+    let trimmed: Vec<String> = words.iter().map(|w| trim(w)).collect();
+
+    // Fast path / strict rule: a line of nothing but plain words is prose.
+    // (Keeps "what is the capital of texas" routing to the model.)
+    if trimmed.iter().all(|w| is_alpha(w)) {
+        return true;
+    }
+
+    // Targeted digit relaxation for "PR 22 merged" / "PR 22 was merged":
+    // a developer narrating an event ("PR 22 merged", "issue 7 closed",
+    // "find 3 failed") embeds exactly one number in an otherwise-English line.
+    // We accept that as prose ONLY when every guard holds, so real invocations
+    // can't slip through:
+    //   * the lead word does NOT take a numeric operand (so `kill 1234 now`,
+    //     `head 50 lines`, `tail 100 fast`, `top 1 now` stay commands — for
+    //     those the digit is a genuine argument, not a sentence number);
+    //   * the LAST token is a plain alphabetic predicate ("merged"/"closed"/
+    //     "is") — a sentence ends in a word, an invocation often ends in a
+    //     value/path;
+    //   * exactly one token is purely numeric (two numbers reads like argv:
+    //     `head 50 100`); and
+    //   * every remaining token is plain alphabetic — no flag/path/filename/
+    //     version token (those are unambiguous command syntax). This is why
+    //     `pr file.txt` (a real pr invocation) is NOT prose: "file.txt" is an
+    //     "other" token, and it's only two words anyway.
+    if NUMERIC_ARG_COMMANDS.contains(&lead.as_str()) {
+        return false;
+    }
+    let numeric = trimmed.iter().filter(|w| is_digits(w)).count();
+    let last_is_word = trimmed.last().is_some_and(|w| is_alpha(w));
+    let rest_alpha = trimmed.iter().all(|w| is_alpha(w) || is_digits(w));
+    numeric == 1 && last_is_word && rest_alpha
 }
 
 /// A lone confirmation token typed at the prompt (`y`, `yes`, `n`, `no`) is
@@ -1361,6 +1409,24 @@ mod tests {
         // …but flags/paths still win even with a trailing comma elsewhere
         assert!(!prose("watch -n 5 free"));
         assert!(!prose("tail logs/app.log"));
+
+        // ISS-1480: "PR 22 merged" (dev shorthand) must route to the model, not
+        // dispatch to /usr/bin/pr. Covers all three former failure modes:
+        // `pr` is now ambiguous, the lookup is case-insensitive, and a single
+        // embedded number no longer flips an English sentence to a command.
+        assert!(prose("pr 22 merged"));
+        assert!(prose("PR 22 merged")); // case-insensitive lead word
+        assert!(prose("PR is merged")); // no digit at all
+        assert!(prose("pr 22 was merged"));
+        // …without breaking real invocations. `pr` with a filename, and the
+        // numeric-operand commands, stay direct even though a number is present.
+        assert!(!prose("pr file.txt")); // genuine pr usage takes a filename
+        assert!(!prose("kill 1234")); // PID operand
+        assert!(!prose("kill 1234 now")); // number after kill is still a PID
+        assert!(!prose("head 50")); // line count
+        assert!(!prose("tail 100")); // line count
+        assert!(!prose("w 1")); // w's numeric arg
+        assert!(!prose("top 1")); // top's numeric arg
     }
 
     #[test]
