@@ -57,6 +57,7 @@ dependencies = [
  "serde_json",
  "sqlite-vec",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]

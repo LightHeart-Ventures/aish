@@ -150,10 +150,13 @@ fn split_row(line: &str) -> Vec<String> {
     cells
 }
 
-/// Display width of a cell after markdown markers are consumed and ANSI
-/// stripped. Chars ≈ columns — close enough for shell-answer tables.
+/// Terminal display width of a cell after markdown markers are consumed and
+/// ANSI stripped. Uses `unicode-width` so wide glyphs count as two columns:
+/// a single-codepoint emoji (🚀) and a VS16 emoji-presentation sequence
+/// (⚙️ = U+2699 U+FE0F) both measure 2, which `chars().count()` got wrong.
 fn visible_width(s: &str) -> usize {
-    strip_ansi(&inline(s, "")).chars().count()
+    use unicode_width::UnicodeWidthStr;
+    strip_ansi(&inline(s, "")).width()
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -282,6 +285,42 @@ mod tests {
         assert!(super::strip_ansi(lines[3]).ends_with("  5"));
         // bold cell padded by its stripped width (2), not its raw width (6)
         assert!(super::strip_ansi(lines[3]).starts_with("S2      "));
+    }
+
+    #[test]
+    fn table_aligns_emoji_column() {
+        // Mixes a single-codepoint emoji (🚀, 1 char / 2 cols) with a VS16
+        // emoji-presentation sequence (⚙️ = U+2699 U+FE0F, 2 chars / 2 cols):
+        // counting chars would under-pad 🚀 by one and the column would ragged.
+        let out = render(
+            "| Emoji | Module |\n|---|---|\n| 🚀 | main.rs |\n| ⚙️ | engine.rs |",
+            "",
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 4);
+        // Display width via the same unicode-width measure render uses.
+        let w = |l: &str| super::visible_width(&super::strip_ansi(l));
+        let header = w(lines[0]);
+        for l in &lines {
+            assert_eq!(w(l), header, "row {l:?} display width != header");
+        }
+        // The `│` / `┼` separators must land at the same display column on
+        // every row — the actual symptom of the bug. Measure each separator's
+        // column as the display width of the text preceding it (measuring
+        // char-by-char would mis-split the ⚙️ VS16 sequence).
+        let sep_cols = |l: &str| -> Vec<usize> {
+            let stripped = super::strip_ansi(l);
+            stripped
+                .char_indices()
+                .filter(|&(_, ch)| ch == '│' || ch == '┼')
+                .map(|(i, _)| super::visible_width(&stripped[..i]))
+                .collect::<Vec<_>>()
+        };
+        let expected = sep_cols(lines[0]);
+        assert_eq!(expected.len(), 1, "one separator per row");
+        for l in &lines {
+            assert_eq!(sep_cols(l), expected, "separator misaligned in {l:?}");
+        }
     }
 
     #[test]
