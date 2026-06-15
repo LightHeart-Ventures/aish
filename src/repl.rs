@@ -14,7 +14,7 @@ use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{
     Cmd, ConditionalEventHandler, Context, Editor, Event, EventContext, EventHandler, Helper,
-    KeyEvent, RepeatCount,
+    KeyCode, KeyEvent, Modifiers, Movement, RepeatCount,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -71,6 +71,13 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
     rl.bind_sequence(
         KeyEvent::ctrl('O'),
         EventHandler::Conditional(Box::new(CtrlOToggle { pending: raw_toggle.clone() })),
+    );
+
+    // Esc clears the current input line (a harmless no-op when it's already
+    // empty, so it only clears when there's text to clear).
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Esc, Modifiers::NONE),
+        EventHandler::Simple(Cmd::Kill(Movement::WholeBuffer)),
     );
 
     // Start on a clean screen (interactive terminals only — keep piped output clean).
