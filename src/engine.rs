@@ -186,6 +186,7 @@ impl ToolSpinner {
             eprintln!("\x1b[2m  🔧 {desc}\x1b[0m");
             return Self(None);
         }
+        eprint!("\x1b[?25l"); // hide the cursor so it doesn't blink at the spinner's tail
         let desc = desc.to_string();
         Self(Some(tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
@@ -199,10 +200,23 @@ impl ToolSpinner {
     /// Stop the animation and leave a static result line behind. On a TTY the
     /// spinning line is erased and replaced in place; piped, the static line
     /// was already printed at `start`, so we do nothing.
-    fn finish(self, desc: &str, is_error: bool) {
-        if let Some(h) = self.0 {
+    fn finish(mut self, desc: &str, is_error: bool) {
+        if let Some(h) = self.0.take() {
             h.abort();
-            eprintln!("\r\x1b[2K\x1b[2m  {}\x1b[0m", tool_result_line(desc, is_error));
+            // Erase the spinner, print the result line, then restore the cursor.
+            eprintln!("\r\x1b[2K\x1b[2m  {}\x1b[0m\x1b[?25h", tool_result_line(desc, is_error));
+        }
+    }
+}
+
+impl Drop for ToolSpinner {
+    fn drop(&mut self) {
+        // Only fires when `finish` wasn't called (e.g. the turn was aborted
+        // mid-tool) — stop the animation and restore the cursor so it's never
+        // left hidden.
+        if let Some(h) = self.0.take() {
+            h.abort();
+            eprint!("\r\x1b[2K\x1b[?25h");
         }
     }
 }
