@@ -200,7 +200,7 @@ fn ctrl_c_kills_child_not_shell() {
     // Ctrl-C delivery.  The SIGINT went to the child's process group (the PTY
     // session's foreground group) exclusively; the shell's pgid was never in
     // that session.
-    assert!(std::process::id() > 0, "shell process must still be running");
+    // Reaching this line proves the test process survived — code cannot run in a dead process.
 
     // ── Cleanup ──────────────────────────────────────────────────────────────
     unsafe {
@@ -270,7 +270,7 @@ fn sigint_to_child_pgrp_does_not_kill_shell() {
     );
 
     // Shell is still here — SIGINT was scoped to the child's pgid only.
-    assert!(std::process::id() > 0, "shell process must still be running");
+    // Reaching this line proves the test process survived — code cannot run in a dead process.
 
     // Restore SIGINT disposition.
     unsafe { libc::signal(libc::SIGINT, saved) };
