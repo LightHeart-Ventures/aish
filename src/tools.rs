@@ -204,16 +204,21 @@ under 'MCP skills'). Returns the expanded instructions — read them, then follo
     if batch_mode {
         defs.push(ToolDef {
             name: "run_in_background".into(),
-            description: "Offload a self-contained, deferrable task to a BACKGROUND batch job \
-(Anthropic Message Batches API). Returns a job id immediately; the work runs asynchronously — \
-~50% cheaper and non-blocking, but slower (it may take up to ~1 hour). Prefer this for \
-parallelizable, long-running, or non-urgent work. Retrieve the result later with \
-batch_result(job). Do NOT use it for work the user needs answered right now."
+            description: "Offload a self-contained, deferrable task to a BACKGROUND job; it runs \
+asynchronously and its result auto-delivers here when done. Do NOT use it for work the user needs \
+answered right now. Two backends, picked by `needs_tools`:\n\
+- needs_tools=false (default): a tool-LESS reasoning job on the Anthropic Message Batches API \
+(~50% cheaper, may take up to ~1 hour). Use for summarizing, drafting, analyzing, or answering \
+from text you PROVIDE in the task — it has no filesystem, no commands, no MCP.\n\
+- needs_tools=true: a full headless aish running in the SAME directory with your COMPLETE toolset \
+and MCP servers (read/write files, run programs, atum/github, …). Use when the task must touch \
+files, run commands, or query MCP."
                 .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "task": {"type": "string", "description": "The self-contained task to run in the background. It runs with no access to this conversation or the local machine — include everything it needs."}
+                    "task": {"type": "string", "description": "The self-contained task to run in the background. It has no access to THIS conversation — include everything it needs. (With needs_tools=true it CAN read the project files and use tools/MCP in the current directory.)"},
+                    "needs_tools": {"type": "boolean", "description": "True if the task must use tools — read/write files, run programs, or query MCP servers (atum, github). False (default) for pure reasoning over text you provide, which runs on the cheaper Batches API."}
                 },
                 "required": ["task"]
             }),
@@ -656,13 +661,37 @@ fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
     if task.is_empty() {
         anyhow::bail!("`task` is required");
     }
-    let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
-        anyhow::anyhow!(
-            "ANTHROPIC_API_KEY is not set — the Message Batches API needs a metered API key \
-(a Claude subscription token won't reach it)"
-        )
-    })?;
-    let id = crate::batch::spawn(
+    // Both backends need a metered key: the Batches API rejects subscription
+    // tokens, and a worker subprocess's Claude backend reads ANTHROPIC_API_KEY.
+    if std::env::var("ANTHROPIC_API_KEY").is_err() {
+        anyhow::bail!(
+            "ANTHROPIC_API_KEY is not set — background jobs need a metered API key \
+(a Claude subscription token won't reach the Batches API, and a worker subprocess needs it too)"
+        );
+    }
+
+    // Nested guard: a coordinator subprocess must not spawn its own workers, so
+    // a tool-needing offload from inside one downgrades to a tool-less batch.
+    let needs_tools = call.args["needs_tools"].as_bool().unwrap_or(false) && !session.nested;
+
+    if needs_tools {
+        let exe = std::env::current_exe()
+            .map_err(|e| anyhow::anyhow!("can't locate the aish binary to re-exec: {e}"))?;
+        let spec = crate::worker::WorkerSpec {
+            exe,
+            cwd: session.cwd.clone(),
+            model: session.batch_model.clone(),
+            env: session.env.clone(),
+        };
+        let _id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
+        return Ok("Queued a full-tool background worker. Now reply with one short, natural \
+sentence that you're on it and the answer will appear here when it's ready — don't mention a job \
+id or restate the task."
+            .to_string());
+    }
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY").expect("checked above");
+    let _id = crate::batch::spawn(
         &session.batch_jobs,
         task.to_string(),
         session.batch_model.clone(),
@@ -671,7 +700,6 @@ fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
     );
     // Steers the model's reply rather than being echoed verbatim — the id stays
     // internal (results auto-deliver, so the user doesn't need it).
-    let _ = id;
     Ok("Queued in the background. Now reply to the user with one short, natural sentence that \
 you're working on it and the answer will appear here when it's ready — don't mention a job id or \
 restate the task."

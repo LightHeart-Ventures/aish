@@ -858,6 +858,7 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                  :batch model <opus|sonnet|haiku|id> model background batches run on (default opus)\n\
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
+                 :workers                            list full-tool background workers (needs_tools offloads)\n\
                  :allow                              list always-allowed tools/commands\n\
                  :allow remove <tool>                revoke an always-allowed tool/command\n\
                  a at a prompt                       always-allow this tool (see :allow)\n\
@@ -885,6 +886,15 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
             }
             None => println!("usage: :kill <job-id>"),
         },
+        Some("workers") => {
+            let workers = session.worker_jobs.lock().unwrap();
+            if workers.is_empty() {
+                println!("no background workers");
+            }
+            for w in workers.iter() {
+                println!("{}", w.summary_line());
+            }
+        }
         Some("model") => match parts.next() {
             Some(m) => {
                 let id = match m {

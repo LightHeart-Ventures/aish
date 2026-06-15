@@ -12,6 +12,7 @@ mod repl;
 mod session;
 mod skills;
 mod tools;
+mod worker;
 
 use anyhow::Result;
 use clap::Parser;
