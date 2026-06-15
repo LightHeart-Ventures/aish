@@ -2,6 +2,7 @@ mod backend;
 mod batch;
 mod db;
 mod engine;
+mod goal;
 mod md;
 mod mcp;
 #[cfg(test)]

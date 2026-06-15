@@ -111,6 +111,9 @@ pub struct Session {
     /// its own workers (no infinite re-exec recursion), so `run_in_background`
     /// downgrades a tool-needing offload to a tool-less batch when this is set.
     pub nested: bool,
+    /// The active background `:goal` loop, if any (one per session). Set by
+    /// `:goal <condition>`, inspected by bare `:goal`, stopped by `:goal clear`.
+    pub goal: Option<crate::goal::Handle>,
 }
 
 impl Session {
@@ -139,6 +142,7 @@ impl Session {
             batch_store: None,
             worker_jobs: Default::default(),
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
+            goal: None,
         })
     }
 
