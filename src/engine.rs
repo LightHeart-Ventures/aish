@@ -4,10 +4,20 @@ use crate::tools::{self, Confirm};
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 
-/// A tool animation's background task, shared between the `ToolSpinner` and the
-/// confirm wrapper so a permission prompt can stop the animation before it
-/// overwrites the prompt line.
-type SpinTask = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
+/// Animation state for a running tool, shared between the spinner task and the
+/// confirm wrapper. The task reads it (under the lock) right before each frame;
+/// `pause_spinner`/`resume_spinner`/`stop_spinner` write it (under the SAME
+/// lock), so the lock serializes draw-vs-control and no frame can land after the
+/// prompt (the race that made permission prompts look "off-screen"). Pausing for
+/// the prompt also means the emoji only animates while the tool is *executing*,
+/// never while waiting for the permission answer.
+#[derive(PartialEq, Clone, Copy)]
+enum Spin {
+    Running,
+    Paused,
+    Stopped,
+}
+type SpinState = Arc<Mutex<Spin>>;
 
 const MAX_ITERATIONS: usize = 40; // runaway-loop backstop
 
@@ -74,13 +84,15 @@ pub async fn run_turn(
             // terminal to a child, so it opts out of the animation (which would
             // fight the child for stderr) and shows a plain static line.
             let tool_spin = ToolSpinner::start(&desc, animates(&call.name));
-            // Stop the animation before any permission prompt — otherwise the next
-            // spinner frame overwrites the prompt and the hidden cursor leaves the
-            // user nothing to answer.
+            // Pause the animation around any permission prompt: the emoji must
+            // not animate (or overwrite the prompt) while we wait for the answer,
+            // then it resumes for the tool's actual execution.
             let stopper = tool_spin.stopper();
             let mut gated = |p: &str| {
-                stop_spinner(&stopper);
-                confirm(p)
+                pause_spinner(&stopper);
+                let decision = confirm(p);
+                resume_spinner(&stopper);
+                decision
             };
             let result = tools::execute(call, session, &mut gated).await;
             tool_spin.finish(&desc, result.is_error);
@@ -181,11 +193,12 @@ impl Drop for Spinner {
 /// replaces. TTY-gated; on `finish` the animation is erased and a static
 /// result line (✓/✗ + desc) is printed in its place.
 struct ToolSpinner {
-    /// `Some` while a TTY animation is running; taken by `finish`, `stop_spinner`
-    /// (before a confirm prompt), or `Drop`. Empty for the static piped line.
-    task: SpinTask,
-    /// True when we actually animated (so `finish` knows to print the result
-    /// line even if a confirm already consumed the task).
+    /// Shared animation state (Running/Paused/Stopped). `stopper()` hands a clone
+    /// to the confirm wrapper so it can pause/resume around the prompt.
+    state: SpinState,
+    /// The animation task — aborted by `finish`/`Drop` once stopped.
+    task: Option<tokio::task::JoinHandle<()>>,
+    /// True when we actually animated (vs the static piped/non-animating line).
     animated: bool,
 }
 
@@ -206,59 +219,97 @@ impl ToolSpinner {
             // Piped/headless or non-animating tool: emit the plain static line
             // once, no animation.
             eprintln!("\x1b[2m  🔧 {desc}\x1b[0m");
-            return Self { task: Default::default(), animated: false };
+            return Self {
+                state: Arc::new(Mutex::new(Spin::Stopped)),
+                task: None,
+                animated: false,
+            };
         }
         eprint!("\x1b[?25l"); // hide the cursor so it doesn't blink at the spinner's tail
+        let state = Arc::new(Mutex::new(Spin::Running));
+        let s = state.clone();
         let desc = desc.to_string();
         let task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
+            // Consume the immediate first tick so no frame draws for the first
+            // ~120ms — long enough for a permission gate to pause us before the
+            // emoji ever appears, so it never animates over the prompt.
+            tick.tick().await;
             for i in 0.. {
                 tick.tick().await;
-                eprint!("\r\x1b[2K\x1b[2m  {} {desc}\x1b[0m", TOOL_FRAMES[i % TOOL_FRAMES.len()]);
+                let g = s.lock().unwrap();
+                match *g {
+                    Spin::Stopped => break,
+                    Spin::Paused => {} // waiting on a confirm — draw nothing
+                    Spin::Running => {
+                        eprint!("\r\x1b[2K\x1b[2m  {} {desc}\x1b[0m", TOOL_FRAMES[i % TOOL_FRAMES.len()])
+                    }
+                }
             }
         });
-        Self { task: Arc::new(Mutex::new(Some(task))), animated: true }
+        Self { state, task: Some(task), animated: true }
     }
 
-    /// A shared handle to the animation task — the REPL stops it with
-    /// `stop_spinner` right before an interactive confirm prompt.
-    fn stopper(&self) -> SpinTask {
-        self.task.clone()
+    /// A clone of the animation state — the confirm wrapper pauses/resumes it
+    /// around a permission prompt.
+    fn stopper(&self) -> SpinState {
+        self.state.clone()
     }
 
     /// Stop the animation and leave a static result line behind. On a TTY the
     /// spinning line is erased and replaced in place; piped, the static line was
     /// already printed at `start`, so we only print the result for animated runs.
-    fn finish(self, desc: &str, is_error: bool) {
-        if let Some(h) = self.task.lock().unwrap().take() {
-            h.abort();
+    fn finish(mut self, desc: &str, is_error: bool) {
+        stop_spinner(&self.state);
+        if let Some(t) = self.task.take() {
+            t.abort();
         }
         if self.animated {
-            // Erase the spinner / cleared line, print the result, restore cursor.
-            eprintln!("\r\x1b[2K\x1b[2m  {}\x1b[0m\x1b[?25h", tool_result_line(desc, is_error));
+            eprintln!("\r\x1b[2K\x1b[2m  {}\x1b[0m", tool_result_line(desc, is_error));
         }
     }
 }
 
-/// Stop a running tool animation, clear its line, and restore the cursor — called
-/// right before an interactive confirm prompt so the prompt isn't immediately
-/// overwritten by the next spinner frame and the user can see the cursor to
-/// answer. Idempotent: a no-op once the task has been taken.
-fn stop_spinner(task: &SpinTask) {
-    if let Some(h) = task.lock().unwrap().take() {
-        h.abort();
+/// Pause the animation for a confirm prompt: stop drawing, clear the line, and
+/// restore the cursor — so the emoji isn't animating while we wait for the
+/// user's answer and the prompt is clean. Under the lock, so it can't race a
+/// frame. Idempotent.
+fn pause_spinner(state: &SpinState) {
+    let mut g = state.lock().unwrap();
+    if *g == Spin::Running {
+        *g = Spin::Paused;
+        eprint!("\r\x1b[2K\x1b[?25h");
+    }
+}
+
+/// Resume the animation after the prompt — the emoji animates again during the
+/// tool's actual execution. Idempotent.
+fn resume_spinner(state: &SpinState) {
+    let mut g = state.lock().unwrap();
+    if *g == Spin::Paused {
+        *g = Spin::Running;
+        eprint!("\x1b[?25l"); // re-hide the cursor; the next tick draws a frame
+    }
+}
+
+/// Stop the animation for good, clearing the line and restoring the cursor.
+/// Idempotent.
+fn stop_spinner(state: &SpinState) {
+    let mut g = state.lock().unwrap();
+    if *g != Spin::Stopped {
+        *g = Spin::Stopped;
         eprint!("\r\x1b[2K\x1b[?25h");
     }
 }
 
 impl Drop for ToolSpinner {
     fn drop(&mut self) {
-        // Only fires when nothing else consumed the task (e.g. the turn was
-        // aborted mid-tool) — stop the animation and restore the cursor so it's
-        // never left hidden.
-        if let Some(h) = self.task.lock().unwrap().take() {
-            h.abort();
-            eprint!("\r\x1b[2K\x1b[?25h");
+        // Only does work when nothing else stopped it (e.g. the turn was aborted
+        // mid-tool) — stop the animation and restore the cursor so it's never
+        // left hidden.
+        stop_spinner(&self.state);
+        if let Some(t) = self.task.take() {
+            t.abort();
         }
     }
 }
