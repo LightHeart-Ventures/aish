@@ -40,6 +40,14 @@ pub fn confirm_tty(prompt: &str) -> tools::Decision {
 }
 
 pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
+    // Job-control signal disposition (TASK-115): aish ignores SIGINT/QUIT/TSTP/
+    // TTOU/TTIN so a Ctrl-C/Ctrl-\/Ctrl-Z reaches the foreground child's process
+    // group (run_on_tty hands it the terminal) instead of killing or suspending
+    // the shell; foreground children restore the default disposition in pre_exec.
+    // SIGINT is also still observed by the ctrl_c task below for model-turn aborts
+    // — reconciling that overlap (and removing tty_handoff) is TASK-116.
+    tools::ignore_job_control_signals();
+
     // Install the process-wide SIGINT handler up front. A Ctrl-C during a
     // direct-dispatch child must interrupt the child (the terminal delivers
     // it to the shared foreground group) — never kill aish itself.

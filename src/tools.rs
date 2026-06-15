@@ -869,6 +869,14 @@ pub async fn run_on_tty(
             0 => Ok(()),
             _ => Err(std::io::Error::last_os_error()),
         });
+        // aish ignores the job-control signals (see ignore_job_control_signals);
+        // SIG_IGN is inherited across exec, so restore the default disposition in
+        // the child or it would be deaf to Ctrl-C/Ctrl-\/Ctrl-Z. Async-signal-safe:
+        // signal(2) only.
+        cmd.pre_exec(|| {
+            reset_job_control_signals();
+            Ok(())
+        });
     }
     let proc = cmd
         .spawn()
@@ -946,6 +954,39 @@ fn with_sigttou_ignored<T>(f: impl FnOnce() -> T) -> T {
     let out = f();
     unsafe { libc::signal(libc::SIGTTOU, prev) };
     out
+}
+
+/// The job-control signals an interactive shell ignores so that a Ctrl-C,
+/// Ctrl-\\ or Ctrl-Z reaches the foreground child's process group (which owns
+/// the terminal — see `run_on_tty`) rather than killing or stopping aish itself.
+const JOB_CONTROL_SIGNALS: [libc::c_int; 5] = [
+    libc::SIGINT,
+    libc::SIGQUIT,
+    libc::SIGTSTP,
+    libc::SIGTTOU,
+    libc::SIGTTIN,
+];
+
+/// Set aish's disposition for the job-control signals to SIG_IGN. Called once at
+/// interactive REPL startup so the shell survives the terminal-generated signals
+/// it would otherwise be killed or suspended by; the signal is delivered to the
+/// foreground child's process group instead.
+pub fn ignore_job_control_signals() {
+    for sig in JOB_CONTROL_SIGNALS {
+        // SAFETY: installing SIG_IGN for a fixed set of signals at startup.
+        unsafe { libc::signal(sig, libc::SIG_IGN) };
+    }
+}
+
+/// Restore the job-control signals to their default disposition. Runs in a
+/// foreground child's `pre_exec` because SIG_IGN is inherited across exec —
+/// without this reset the child would inherit the shell's ignore and never see
+/// Ctrl-C/Ctrl-\\/Ctrl-Z. Async-signal-safe: `signal(2)` only.
+fn reset_job_control_signals() {
+    for sig in JOB_CONTROL_SIGNALS {
+        // SAFETY: restoring SIG_DFL for a fixed set of signals in the child.
+        unsafe { libc::signal(sig, libc::SIG_DFL) };
+    }
 }
 
 /// Owns the foreground child's pid for the lifetime of `run_on_tty`. On the
@@ -1230,6 +1271,44 @@ mod tests {
         assert!(ok.success());
         let bad = run_on_tty("false", &[], &[], &session).await.unwrap();
         assert_eq!(bad.code(), Some(1));
+    }
+
+    #[test]
+    fn job_control_signals_ignored_then_reset() {
+        // TASK-115: the shell ignores the job-control signals; the child path
+        // resets them to default so the foreground program stays interruptible.
+        use std::mem::MaybeUninit;
+
+        // Current disposition of `sig` per sigaction(2).
+        fn disposition(sig: libc::c_int) -> libc::sighandler_t {
+            // SAFETY: reading the installed sigaction into zeroed POD storage.
+            unsafe {
+                let mut old = MaybeUninit::<libc::sigaction>::zeroed();
+                libc::sigaction(sig, std::ptr::null(), old.as_mut_ptr());
+                old.assume_init().sa_sigaction
+            }
+        }
+
+        // Snapshot so the test leaves the process's signal state untouched.
+        let saved: Vec<_> = JOB_CONTROL_SIGNALS
+            .iter()
+            .map(|&s| (s, disposition(s)))
+            .collect();
+
+        ignore_job_control_signals();
+        for &sig in &JOB_CONTROL_SIGNALS {
+            assert_eq!(disposition(sig), libc::SIG_IGN, "signal {sig} not ignored");
+        }
+
+        reset_job_control_signals();
+        for &sig in &JOB_CONTROL_SIGNALS {
+            assert_eq!(disposition(sig), libc::SIG_DFL, "signal {sig} not reset to default");
+        }
+
+        // SAFETY: restoring each signal's captured prior disposition.
+        for (sig, h) in saved {
+            unsafe { libc::signal(sig, h) };
+        }
     }
 
     #[tokio::test]
