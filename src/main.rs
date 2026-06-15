@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let backend = match args.backend.as_str() {
         "claude" => backend::Backend::new_claude(
-            args.model.unwrap_or_else(|| "claude-opus-4-8".into()),
+            args.model.unwrap_or_else(|| "claude-haiku-4-5".into()),
         )?,
         #[cfg(feature = "local")]
         "local" => backend::Backend::new_local(),
