@@ -139,6 +139,7 @@ impl Spinner {
         if !stderr_is_tty() {
             return Self(None);
         }
+        eprint!("\x1b[?25l"); // hide the cursor while thinking; restored on drop
         Self(Some(tokio::spawn(async {
             const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(80));
@@ -154,7 +155,7 @@ impl Drop for Spinner {
     fn drop(&mut self) {
         if let Some(h) = self.0.take() {
             h.abort();
-            eprint!("\r\x1b[2K"); // erase the spinner line
+            eprint!("\r\x1b[2K\x1b[?25h"); // erase the spinner line + restore the cursor
         }
     }
 }
