@@ -204,24 +204,31 @@ under 'MCP skills'). Returns the expanded instructions — read them, then follo
     if batch_mode {
         defs.push(ToolDef {
             name: "run_in_background".into(),
-            description: "Offload a self-contained, deferrable task to a BACKGROUND batch job \
-(Anthropic Message Batches API). Returns a job id immediately; the work runs asynchronously — \
-~50% cheaper and non-blocking, but slower (it may take up to ~1 hour). Prefer this for \
-parallelizable, long-running, or non-urgent work. Retrieve the result later with \
-batch_result(job). Do NOT use it for work the user needs answered right now."
+            description: "Offload a self-contained, deferrable task to a BACKGROUND job; it runs \
+asynchronously and its result auto-delivers here when done. Do NOT use it for work the user needs \
+answered right now. Two backends, picked by `needs_tools`:\n\
+- needs_tools=false (default): a tool-LESS reasoning job on the Anthropic Message Batches API \
+(~50% cheaper, may take up to ~1 hour). Use for summarizing, drafting, analyzing, or answering \
+from text you PROVIDE in the task — it has no filesystem, no commands, no MCP.\n\
+- needs_tools=true: a full headless aish running in the SAME directory with your COMPLETE toolset \
+and MCP servers (read/write files, run programs, atum/github, …). Use when the task must touch \
+files, run commands, or query MCP."
                 .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "task": {"type": "string", "description": "The self-contained task to run in the background. It runs with no access to this conversation or the local machine — include everything it needs."}
+                    "task": {"type": "string", "description": "The self-contained task to run in the background. It has no access to THIS conversation — include everything it needs. (With needs_tools=true it CAN read the project files and use tools/MCP in the current directory.)"},
+                    "needs_tools": {"type": "boolean", "description": "True if the task must use tools — read/write files, run programs, or query MCP servers (atum, github). False (default) for pure reasoning over text you provide, which runs on the cheaper Batches API."}
                 },
                 "required": ["task"]
             }),
         });
         defs.push(ToolDef {
             name: "batch_result".into(),
-            description: "Fetch the result of a background batch job started with run_in_background. \
-Returns the result if the job has ended, or its current status if still running."
+            description: "Fetch the result of a tool-LESS background batch (needs_tools=false). \
+Returns the result if it has ended, or its status if still running. NOTE: full-tool workers \
+(needs_tools=true) auto-deliver their result to the terminal — do NOT call this for them; just \
+wait."
                 .into(),
             schema: json!({
                 "type": "object",
@@ -656,13 +663,44 @@ fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
     if task.is_empty() {
         anyhow::bail!("`task` is required");
     }
-    let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
-        anyhow::anyhow!(
-            "ANTHROPIC_API_KEY is not set — the Message Batches API needs a metered API key \
-(a Claude subscription token won't reach it)"
-        )
-    })?;
-    let id = crate::batch::spawn(
+    // Both backends need a metered key: the Batches API rejects subscription
+    // tokens, and a worker subprocess's Claude backend reads ANTHROPIC_API_KEY.
+    if std::env::var("ANTHROPIC_API_KEY").is_err() {
+        anyhow::bail!(
+            "ANTHROPIC_API_KEY is not set — background jobs need a metered API key \
+(a Claude subscription token won't reach the Batches API, and a worker subprocess needs it too)"
+        );
+    }
+
+    // Routing: the model's needs_tools, OR a heuristic backstop that catches a
+    // clearly tool-needing task the model mislabeled (the common failure — a
+    // "scan this repo" task sent to the tool-less Batches API returns garbage).
+    // The heuristic only ever upgrades batch→worker, never the reverse: a worker
+    // is a full aish, so it can also do pure reasoning — a false positive just
+    // costs a bit more, while a false negative produces wrong results. The
+    // nested guard still caps it (a coordinator never spawns its own workers).
+    let asked_tools = call.args["needs_tools"].as_bool().unwrap_or(false);
+    let needs_tools = (asked_tools || task_needs_tools(task)) && !session.nested;
+
+    if needs_tools {
+        let exe = std::env::current_exe()
+            .map_err(|e| anyhow::anyhow!("can't locate the aish binary to re-exec: {e}"))?;
+        let spec = crate::worker::WorkerSpec {
+            exe,
+            cwd: session.cwd.clone(),
+            model: session.batch_model.clone(),
+            env: session.env.clone(),
+        };
+        let _id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
+        return Ok("Queued a full-tool background worker (it can read files, run commands, and use \
+MCP in this directory). The result auto-delivers here when it's done — do NOT call batch_result \
+for it. Now reply to the user with one short, natural sentence that you're on it and the answer \
+will appear when ready — no job id, no restating the task."
+            .to_string());
+    }
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY").expect("checked above");
+    let _id = crate::batch::spawn(
         &session.batch_jobs,
         task.to_string(),
         session.batch_model.clone(),
@@ -671,26 +709,53 @@ fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
     );
     // Steers the model's reply rather than being echoed verbatim — the id stays
     // internal (results auto-deliver, so the user doesn't need it).
-    let _ = id;
     Ok("Queued in the background. Now reply to the user with one short, natural sentence that \
 you're working on it and the answer will appear here when it's ready — don't mention a job id or \
 restate the task."
         .to_string())
 }
 
+/// Strong signals that a task needs the filesystem, a command, the repo, or an
+/// MCP server — so it must run as a full-tool worker, not a tool-less batch.
+/// Conservative toward false POSITIVES (upgrading to a worker is always safe);
+/// the cost is only losing the cheaper batch path for these.
+fn task_needs_tools(task: &str) -> bool {
+    let t = task.to_ascii_lowercase();
+    const SIGNALS: &[&str] = &[
+        "repo", "repositor", "codebase", "this project", "the project",
+        "this directory", "the directory", "this folder", "the code", "the file",
+        "these files", "the files", "scan ", "grep", "search the", "src/",
+        ".rs", "./", "git ", "github", "atum", "mcp", "run the", "run a",
+        "build the", "build and", "compile", "the tests", "list the files",
+    ];
+    SIGNALS.iter().any(|s| t.contains(s))
+}
+
 fn batch_result(call: &ToolCall, session: &Session) -> Result<String> {
-    // Accept "batch_1", "1", or the integer 1 — normalize to the canonical id.
+    // Accept "batch_1"/"worker_1"/"1"/the integer 1 — normalize the trailing n.
     let raw = call.args["job"]
         .as_str()
         .map(str::to_string)
         .or_else(|| call.args["job"].as_u64().map(|n| n.to_string()))
         .ok_or_else(|| anyhow::anyhow!("missing job id"))?;
-    let id = format!("batch_{}", raw.trim().trim_start_matches("batch_"));
+    let n = raw.trim().trim_start_matches("batch_").trim_start_matches("worker_");
+
+    // Full-tool workers auto-deliver, but the model sometimes reflexively fetches
+    // one here — so look in worker_jobs too rather than reporting "no such job".
+    {
+        let workers = session.worker_jobs.lock().unwrap();
+        let wid = format!("worker_{n}");
+        if let Some(w) = workers.iter().find(|j| j.id == wid) {
+            return Ok(w.fetch());
+        }
+    }
+
+    let id = format!("batch_{n}");
     let jobs = session.batch_jobs.lock().unwrap();
     let job = jobs
         .iter()
         .find(|j| j.id == id)
-        .ok_or_else(|| anyhow::anyhow!("no batch job {id} (batch jobs live for this session only; see :batch status)"))?;
+        .ok_or_else(|| anyhow::anyhow!("no background job {id} (jobs live for this session only; workers auto-deliver — you usually don't need to fetch)"))?;
     Ok(job.fetch())
 }
 
@@ -869,6 +934,14 @@ pub async fn run_on_tty(
             0 => Ok(()),
             _ => Err(std::io::Error::last_os_error()),
         });
+        // aish ignores the job-control signals (see ignore_job_control_signals);
+        // SIG_IGN is inherited across exec, so restore the default disposition in
+        // the child or it would be deaf to Ctrl-C/Ctrl-\/Ctrl-Z. Async-signal-safe:
+        // signal(2) only.
+        cmd.pre_exec(|| {
+            reset_job_control_signals();
+            Ok(())
+        });
     }
     let proc = cmd
         .spawn()
@@ -946,6 +1019,39 @@ fn with_sigttou_ignored<T>(f: impl FnOnce() -> T) -> T {
     let out = f();
     unsafe { libc::signal(libc::SIGTTOU, prev) };
     out
+}
+
+/// The job-control signals an interactive shell ignores so that a Ctrl-C,
+/// Ctrl-\\ or Ctrl-Z reaches the foreground child's process group (which owns
+/// the terminal — see `run_on_tty`) rather than killing or stopping aish itself.
+const JOB_CONTROL_SIGNALS: [libc::c_int; 5] = [
+    libc::SIGINT,
+    libc::SIGQUIT,
+    libc::SIGTSTP,
+    libc::SIGTTOU,
+    libc::SIGTTIN,
+];
+
+/// Set aish's disposition for the job-control signals to SIG_IGN. Called once at
+/// interactive REPL startup so the shell survives the terminal-generated signals
+/// it would otherwise be killed or suspended by; the signal is delivered to the
+/// foreground child's process group instead.
+pub fn ignore_job_control_signals() {
+    for sig in JOB_CONTROL_SIGNALS {
+        // SAFETY: installing SIG_IGN for a fixed set of signals at startup.
+        unsafe { libc::signal(sig, libc::SIG_IGN) };
+    }
+}
+
+/// Restore the job-control signals to their default disposition. Runs in a
+/// foreground child's `pre_exec` because SIG_IGN is inherited across exec —
+/// without this reset the child would inherit the shell's ignore and never see
+/// Ctrl-C/Ctrl-\\/Ctrl-Z. Async-signal-safe: `signal(2)` only.
+fn reset_job_control_signals() {
+    for sig in JOB_CONTROL_SIGNALS {
+        // SAFETY: restoring SIG_DFL for a fixed set of signals in the child.
+        unsafe { libc::signal(sig, libc::SIG_DFL) };
+    }
 }
 
 /// Owns the foreground child's pid for the lifetime of `run_on_tty`. On the
@@ -1154,6 +1260,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn task_needs_tools_backstop() {
+        // Clearly tool-needing tasks the model might mislabel → upgrade to worker.
+        assert!(task_needs_tools("scan this repo and list the modules"));
+        assert!(task_needs_tools("read the files in src/ and summarize"));
+        assert!(task_needs_tools("run the tests and report failures"));
+        assert!(task_needs_tools("check atum for open issues"));
+        assert!(task_needs_tools("grep for TODO across the codebase"));
+        assert!(task_needs_tools("build the project and report warnings"));
+        // Pure reasoning over provided text → stays on the cheap batch path.
+        assert!(!task_needs_tools("write a haiku about the ocean"));
+        assert!(!task_needs_tools("summarize the following paragraph: ..."));
+        assert!(!task_needs_tools("translate this sentence to french"));
+    }
+
+    #[test]
     fn env_value_resolution() {
         let creds = std::env::temp_dir().join(format!("aish_env_creds_{}", std::process::id()));
         std::fs::write(&creds, "[aish]\nATUM_API_KEY = sk_secret\n[other]\nATUM_API_KEY = nope\n").unwrap();
@@ -1278,6 +1399,44 @@ mod tests {
                 status.success(),
                 "setpgid race on launch {i}: child not its own group leader"
             );
+        }
+    }
+
+    #[test]
+    fn job_control_signals_ignored_then_reset() {
+        // TASK-115: the shell ignores the job-control signals; the child path
+        // resets them to default so the foreground program stays interruptible.
+        use std::mem::MaybeUninit;
+
+        // Current disposition of `sig` per sigaction(2).
+        fn disposition(sig: libc::c_int) -> libc::sighandler_t {
+            // SAFETY: reading the installed sigaction into zeroed POD storage.
+            unsafe {
+                let mut old = MaybeUninit::<libc::sigaction>::zeroed();
+                libc::sigaction(sig, std::ptr::null(), old.as_mut_ptr());
+                old.assume_init().sa_sigaction
+            }
+        }
+
+        // Snapshot so the test leaves the process's signal state untouched.
+        let saved: Vec<_> = JOB_CONTROL_SIGNALS
+            .iter()
+            .map(|&s| (s, disposition(s)))
+            .collect();
+
+        ignore_job_control_signals();
+        for &sig in &JOB_CONTROL_SIGNALS {
+            assert_eq!(disposition(sig), libc::SIG_IGN, "signal {sig} not ignored");
+        }
+
+        reset_job_control_signals();
+        for &sig in &JOB_CONTROL_SIGNALS {
+            assert_eq!(disposition(sig), libc::SIG_DFL, "signal {sig} not reset to default");
+        }
+
+        // SAFETY: restoring each signal's captured prior disposition.
+        for (sig, h) in saved {
+            unsafe { libc::signal(sig, h) };
         }
     }
 

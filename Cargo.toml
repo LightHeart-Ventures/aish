@@ -18,6 +18,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sqlite-vec = "0.1.6"
 tokio = { version = "1.52.3", features = ["full"] }
+unicode-width = "^0.2"
 
 [features]
 default = ["local"]
@@ -29,3 +30,10 @@ cuda = ["mistralrs/cuda"]
 [profile.dev.package."*"]
 # candle/mistralrs are unusably slow unoptimized — always optimize deps.
 opt-level = 3
+
+[profile.release]
+# A small, stripped release binary (the same binary a background coordinator job
+# re-execs) without paying for a full opt-level=3 / fat-LTO compile.
+opt-level = 2
+lto = "thin"
+strip = true

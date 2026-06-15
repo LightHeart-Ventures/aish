@@ -7,13 +7,14 @@ use crate::tools;
 use anyhow::Result;
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
-use rustyline::highlight::Highlighter;
+use rustyline::ExternalPrinter;
+use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{
     Cmd, ConditionalEventHandler, Context, Editor, Event, EventContext, EventHandler, Helper,
-    KeyEvent, RepeatCount,
+    KeyCode, KeyEvent, Modifiers, Movement, RepeatCount,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -40,6 +41,14 @@ pub fn confirm_tty(prompt: &str) -> tools::Decision {
 }
 
 pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
+    // Job-control signal disposition (TASK-115): aish ignores SIGINT/QUIT/TSTP/
+    // TTOU/TTIN so a Ctrl-C/Ctrl-\/Ctrl-Z reaches the foreground child's process
+    // group (run_on_tty hands it the terminal) instead of killing or suspending
+    // the shell; foreground children restore the default disposition in pre_exec.
+    // SIGINT is also still observed by the ctrl_c task below for model-turn aborts
+    // — reconciling that overlap (and removing tty_handoff) is TASK-116.
+    tools::ignore_job_control_signals();
+
     // Install the process-wide SIGINT handler up front. A Ctrl-C during a
     // direct-dispatch child must interrupt the child (the terminal delivers
     // it to the shared foreground group) — never kill aish itself.
@@ -72,6 +81,13 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
         EventHandler::Conditional(Box::new(CtrlOToggle { pending: raw_toggle.clone() })),
     );
 
+    // Esc clears the current input line (a harmless no-op when it's already
+    // empty, so it only clears when there's text to clear).
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Esc, Modifiers::NONE),
+        EventHandler::Simple(Cmd::Kill(Movement::WholeBuffer)),
+    );
+
     // Start on a clean screen (interactive terminals only — keep piped output clean).
     // SAFETY: plain isatty query.
     if unsafe { libc::isatty(1) } == 1 {
@@ -82,6 +98,34 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
     let mut prev_dir: Option<PathBuf> = None;
     let mut needs_gap = false; // blank line between previous output and the prompt
 
+    // Background-result presenter. When interactive, finished batch/worker jobs
+    // queue their results (present::enable_deferred) and this task prints them
+    // ABOVE the prompt via rustyline's ExternalPrinter — but only at a pause in
+    // work (`busy == false`), so a result never blurts over a command in flight
+    // or the user's typing. ExternalPrinter redraws the prompt after printing.
+    // If the terminal can't provide a printer, we leave inline printing on.
+    let busy = Arc::new(AtomicBool::new(false));
+    if let Ok(mut printer) = rl.create_external_printer() {
+        crate::present::enable_deferred();
+        let busy = busy.clone();
+        let batch_jobs = session.batch_jobs.clone();
+        let worker_jobs = session.worker_jobs.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(400));
+            loop {
+                tick.tick().await;
+                if busy.load(Ordering::SeqCst) {
+                    continue; // mid-command/turn — hold results until a pause
+                }
+                let mut blocks = crate::batch::drain_pending(&batch_jobs);
+                blocks.extend(crate::worker::drain_pending(&worker_jobs));
+                for b in blocks {
+                    let _ = printer.print(format!("{b}\n"));
+                }
+            }
+        });
+    }
+
     loop {
         if needs_gap {
             println!();
@@ -91,7 +135,20 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
         if let Some(h) = rl.helper_mut() {
             h.cwd.clone_from(&session.cwd);
         }
-        let prompt = format!("\x1b[36m{}\x1b[0m ❯ ", short_cwd(&session));
+        // We're about to idle at the prompt — let the presenter flush results.
+        busy.store(false, Ordering::SeqCst);
+        let running = crate::batch::running_count(&session.batch_jobs)
+            + crate::worker::running_count(&session.worker_jobs);
+        let badge = if running > 0 {
+            format!("\x1b[2m⟳{running}\x1b[0m ")
+        } else {
+            String::new()
+        };
+        let name = match &session.name {
+            Some(n) => format!("\x1b[1;35m[{n}]\x1b[0m | "), // bold magenta, set apart from the cyan path
+            None => String::new(),
+        };
+        let prompt = format!("{name}{badge}\x1b[36m{}\x1b[0m ❯ ", short_cwd(&session));
         match rl.readline(&prompt) {
             Ok(line) => {
                 let line = line.trim().to_string();
@@ -100,6 +157,8 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
                 }
                 let _ = rl.add_history_entry(&line);
                 needs_gap = true;
+                // Now working — hold background results until the next pause.
+                busy.store(true, Ordering::SeqCst);
 
                 if let Some(cmd) = line.strip_prefix(':') {
                     if handle_colon(cmd, &mut backend, &mut session).await {
@@ -322,7 +381,90 @@ fn session_path(session: &Session) -> String {
 impl Hinter for AishHelper {
     type Hint = String;
 }
-impl Highlighter for AishHelper {}
+/// What the dispatch routing WOULD do with the current line — surfaced live as
+/// the user types (TASK-132) so a mis-route is visible and correctable BEFORE
+/// Enter, instead of silently running the wrong thing. Reuses the exact dispatch
+/// predicates so the preview can't disagree with the real decision.
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Preview {
+    /// Runs directly as a shell command (green).
+    Direct,
+    /// Goes to the model (cyan).
+    Model,
+    /// Would dispatch directly, but the lead word is a real binary that's also an
+    /// everyday English word (`clear`, `watch`, `pr`, …) — a judgment call worth
+    /// a glance (dim). Add `?` to force the model or `!` to force direct.
+    Ambiguous,
+    /// A `:` REPL command, or nothing to classify — left uncolored.
+    Plain,
+}
+
+/// Classify a line the way `dispatch` will route it, using only what the
+/// completer already holds (cwd, PATH, aliases). `$VAR` isn't expanded here — a
+/// preview approximation — but every other decision mirrors `dispatch`.
+fn route_preview(line: &str, cwd: &Path, path: &str, aliases: &HashMap<String, Vec<String>>) -> Preview {
+    let l = line.trim();
+    if l.is_empty() || l.starts_with(':') {
+        return Preview::Plain;
+    }
+    if l.starts_with('!') {
+        return Preview::Direct; // forced direct
+    }
+    if l.starts_with('?') {
+        return Preview::Model; // forced model
+    }
+    // A pipeline runs directly only when every stage resolves to a program.
+    if let Some(stages) = pipeline::parse(l) {
+        let all = stages
+            .iter()
+            .all(|s| s.first().is_some_and(|p| resolve_program(p, cwd, path).is_some()));
+        return if all { Preview::Direct } else { Preview::Model };
+    }
+    // Shell machinery / apostrophes don't tokenize → model.
+    let Some(words) = rc::tokenize(l) else {
+        return Preview::Model;
+    };
+    let Some(first) = words.first() else {
+        return Preview::Plain;
+    };
+    let aliased = aliases.contains_key(first);
+    if !aliased
+        && (looks_like_prose(l, &words)
+            || is_stray_confirmation(&words)
+            || looks_like_command_arg_intent(&words, cwd, path))
+    {
+        return Preview::Model;
+    }
+    let resolves = aliased
+        || BUILTINS.contains(&first.as_str())
+        || resolve_program(first, cwd, path).is_some();
+    if !resolves {
+        return Preview::Model;
+    }
+    let lead = first.to_ascii_lowercase();
+    if AMBIGUOUS_COMMANDS.contains(&lead.as_str()) || COMMAND_ARG_COMMANDS.contains(&lead.as_str()) {
+        Preview::Ambiguous
+    } else {
+        Preview::Direct
+    }
+}
+
+impl Highlighter for AishHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
+        let color = match route_preview(line, &self.cwd, &self.path, &self.aliases) {
+            Preview::Direct => "\x1b[32m",    // green — shell command
+            Preview::Model => "\x1b[36m",     // cyan — goes to the model
+            Preview::Ambiguous => "\x1b[2m",  // dim — real binary that's also English
+            Preview::Plain => return std::borrow::Cow::Borrowed(line),
+        };
+        std::borrow::Cow::Owned(format!("{color}{line}\x1b[0m"))
+    }
+
+    fn highlight_char(&self, _line: &str, _pos: usize, kind: CmdKind) -> bool {
+        // Re-color on edits (not on bare cursor moves — the route can't change).
+        kind != CmdKind::MoveCursor
+    }
+}
 impl Validator for AishHelper {}
 impl Helper for AishHelper {}
 
@@ -533,17 +675,50 @@ fn split_route(line: String) -> (String, Route) {
 /// nothing but bare words is almost certainly a question ("who is …",
 /// "find me big files"), not an invocation — flags, paths, digits, or quotes
 /// flip it back to a command.
+///
+/// HEURISTIC STOPGAP: this hand-curated word list is a blunt instrument — it
+/// can only ever catch commands we thought to enumerate (cf. ISS-1480, the
+/// `clear`/`open` class below). The durable fix is model-based route preview
+/// (S5/S6: TASK-132/137), which decides routing by understanding the line
+/// rather than matching its lead word; this list goes away once that lands.
+///
+/// Additions in the `clear … green` class are deliberately conservative: a word
+/// only belongs here if a 3+word all-alphabetic line starting with it is far
+/// more likely prose than a real invocation. Real invocations of these carry a
+/// flag, path, dot, or digit (handled by the guards in `looks_like_prose`) — so
+/// commands whose plain `cmd a b c` form is a legitimate multi-arg call
+/// (`say`, `touch`, `file`, `link`, `paste`, `join`, `mail`, `banner`, …) are
+/// intentionally excluded to avoid swallowing real usage.
 const AMBIGUOUS_COMMANDS: &[&str] = &[
     "who", "w", "find", "time", "test", "yes", "look", "last", "watch", "date",
     "which", "what", "whatis", "finger", "write", "wall", "users", "top", "more",
-    "head", "tail", "make", "cat", "kill",
+    "head", "tail", "make", "cat", "kill", "pr",
+    // clear/open: real use is bare (`clear`) or carries a path/dot/flag
+    // (`open file.txt`, `open .`, `open -a App`); a bare-word sentence
+    // starting with either ("clear the pointer so it reflects green",
+    // "open the door slowly") is prose, not an invocation.
+    "clear", "open",
 ];
 
+/// Subset of `AMBIGUOUS_COMMANDS` whose *idiomatic* first argument is a number:
+/// `kill 1234`, `head 50`, `tail 100`, `top 1`, `w 1`, `nice 10`. For these, a
+/// digit right after the command is a real operand, so a numeric token must NOT
+/// be read as part of an English sentence (see the digit relaxation below).
+/// `pr` is deliberately absent: `pr` takes filenames, never a bare PID/line
+/// count, so "PR 22 merged" has no command reading.
+const NUMERIC_ARG_COMMANDS: &[&str] =
+    &["kill", "head", "tail", "top", "w", "nice", "renice", "fold", "split"];
+
 fn looks_like_prose(line: &str, words: &[String]) -> bool {
-    if words.len() < 3
-        || !AMBIGUOUS_COMMANDS.contains(&words[0].as_str())
-        || line.contains(['"', '\''])
-    {
+    // The membership check is case-insensitive: on a case-insensitive
+    // filesystem (macOS) `PR`/`What`/`FIND` resolve to the lowercase binary, so
+    // they're just as ambiguous. We only lowercase for the *lookup* — the argv
+    // handed to exec is never mutated.
+    if words.len() < 3 {
+        return false;
+    }
+    let lead = words[0].to_ascii_lowercase();
+    if !AMBIGUOUS_COMMANDS.contains(&lead.as_str()) || line.contains(['"', '\'']) {
         return false;
     }
     // A comma reads as a sentence, not an argv — "watch for events from atum,
@@ -551,12 +726,78 @@ fn looks_like_prose(line: &str, words: &[String]) -> bool {
     if line.contains(", ") {
         return true;
     }
-    // Otherwise every word must be plain alphabetic, with trailing sentence
-    // punctuation forgiven; flags (-n), paths (a/b), and digits stay commands.
-    words.iter().all(|w| {
-        let w = w.trim_end_matches([',', '.', '!', '?', ';', ':']);
-        !w.is_empty() && w.chars().all(|c| c.is_ascii_alphabetic())
-    })
+
+    // Classify each token (trailing sentence punctuation forgiven): is it a
+    // plain alphabetic English word, a bare run of digits, or "other" (a flag
+    // `-n`, a path `a/b`, a filename `file.txt`, a version `1.2`, …)?
+    let trim = |w: &str| w.trim_end_matches([',', '.', '!', '?', ';', ':']).to_string();
+    let is_alpha = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphabetic());
+    let is_digits = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit());
+
+    let trimmed: Vec<String> = words.iter().map(|w| trim(w)).collect();
+
+    // Fast path / strict rule: a line of nothing but plain words is prose.
+    // (Keeps "what is the capital of texas" routing to the model.)
+    if trimmed.iter().all(|w| is_alpha(w)) {
+        return true;
+    }
+
+    // Targeted digit relaxation for "PR 22 merged" / "PR 22 was merged":
+    // a developer narrating an event ("PR 22 merged", "issue 7 closed",
+    // "find 3 failed") embeds exactly one number in an otherwise-English line.
+    // We accept that as prose ONLY when every guard holds, so real invocations
+    // can't slip through:
+    //   * the lead word does NOT take a numeric operand (so `kill 1234 now`,
+    //     `head 50 lines`, `tail 100 fast`, `top 1 now` stay commands — for
+    //     those the digit is a genuine argument, not a sentence number);
+    //   * the LAST token is a plain alphabetic predicate ("merged"/"closed"/
+    //     "is") — a sentence ends in a word, an invocation often ends in a
+    //     value/path;
+    //   * exactly one token is purely numeric (two numbers reads like argv:
+    //     `head 50 100`); and
+    //   * every remaining token is plain alphabetic — no flag/path/filename/
+    //     version token (those are unambiguous command syntax). This is why
+    //     `pr file.txt` (a real pr invocation) is NOT prose: "file.txt" is an
+    //     "other" token, and it's only two words anyway.
+    if NUMERIC_ARG_COMMANDS.contains(&lead.as_str()) {
+        return false;
+    }
+    let numeric = trimmed.iter().filter(|w| is_digits(w)).count();
+    let last_is_word = trimmed.last().is_some_and(|w| is_alpha(w));
+    let rest_alpha = trimmed.iter().all(|w| is_alpha(w) || is_digits(w));
+    numeric == 1 && last_is_word && rest_alpha
+}
+
+/// Ambiguous commands whose argument must itself be a runnable program
+/// (`watch ls`, `time make`, `nice cargo`). These never trip `looks_like_prose`
+/// — they're typically used as two-word lines, below its `>= 3 words` bar — yet
+/// `watch orch_c1b45797b841` (an atum id the user wants the model to look up via
+/// MCP) is intent, not an invocation: `orch_…` isn't a command, so a real
+/// `watch` can't run it.
+///
+/// So for these verbs, a bare `<verb> <word>` line routes to the model when the
+/// argument doesn't resolve to a program. Deliberately narrow — exactly two
+/// words, no leading-dash flag — so genuine usage keeps dispatching directly:
+/// `watch df`, `time ls`, `watch -n 5 free`, `time ls -l`. Surface-form
+/// heuristic; the durable fix is model-based route preview (S5/S6:
+/// TASK-132/137), which understands the line instead of matching its lead word.
+const COMMAND_ARG_COMMANDS: &[&str] = &["watch", "time", "nice"];
+
+/// See [`COMMAND_ARG_COMMANDS`]. `cwd`/`path_var` are the same PATH dispatch uses.
+fn looks_like_command_arg_intent(words: &[String], cwd: &Path, path_var: &str) -> bool {
+    let [verb, arg] = words else {
+        return false;
+    };
+    if !COMMAND_ARG_COMMANDS.contains(&verb.to_ascii_lowercase().as_str()) {
+        return false;
+    }
+    // A flag is unambiguous invocation syntax; only a bare word qualifies.
+    if arg.starts_with('-') {
+        return false;
+    }
+    // A resolvable argument means a genuine `watch <cmd>` call; an unresolvable
+    // one (an id, a typo, an English word) reads as intent → model.
+    resolve_program(arg, cwd, path_var).is_none()
 }
 
 /// A lone confirmation token typed at the prompt (`y`, `yes`, `n`, `no`) is
@@ -649,12 +890,15 @@ async fn dispatch(
         return Dispatch::NotACommand;
     };
 
-    // English that happens to start with a command word ("who is …"), or a bare
-    // stray confirmation ("yes"), goes to the model — unless the user forced it
-    // with `!` or aliased the word.
+    // English that happens to start with a command word ("who is …"), a bare
+    // stray confirmation ("yes"), or a command-taking verb whose argument isn't
+    // a real program ("watch orch_…") goes to the model — unless the user forced
+    // it with `!` or aliased the word.
     if !force
         && !aliases.contains_key(first)
-        && (looks_like_prose(line, &words) || is_stray_confirmation(&words))
+        && (looks_like_prose(line, &words)
+            || is_stray_confirmation(&words)
+            || looks_like_command_arg_intent(&words, &session.cwd, &session_path(session)))
     {
         return Dispatch::NotACommand;
     }
@@ -810,6 +1054,8 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                  :batch model <opus|sonnet|haiku|id> model background batches run on (default opus)\n\
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
+                 :workers                            list full-tool background workers (needs_tools offloads)\n\
+                 :name <name>                        name the session (prefixes the prompt); bare :name clears\n\
                  :allow                              list always-allowed tools/commands\n\
                  :allow remove <tool>                revoke an always-allowed tool/command\n\
                  a at a prompt                       always-allow this tool (see :allow)\n\
@@ -837,6 +1083,29 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
             }
             None => println!("usage: :kill <job-id>"),
         },
+        Some("workers") => {
+            let workers = session.worker_jobs.lock().unwrap();
+            if workers.is_empty() {
+                println!("no background workers");
+            }
+            for w in workers.iter() {
+                println!("{}", w.summary_line());
+            }
+        }
+        Some("name") => {
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            let rest = rest.trim();
+            if rest.is_empty() {
+                if session.name.take().is_some() {
+                    println!("session name cleared");
+                } else {
+                    println!("usage: :name <name>   (bare :name clears it)");
+                }
+            } else {
+                session.name = Some(rest.to_string());
+                println!("session named \x1b[1;35m[{rest}]\x1b[0m");
+            }
+        }
         Some("model") => match parts.next() {
             Some(m) => {
                 let id = match m {
@@ -1343,6 +1612,14 @@ mod tests {
         assert!(prose("find me big files"));
         assert!(prose("make this file executable"));
         assert!(prose("what is the capital of texas")); // `what` is a real binary on macOS
+
+        // `clear`/`open` class (same class as ISS-1480): `clear`/`open` are real
+        // commands that also begin everyday sentences. A bare-word sentence is
+        // prose; bare `clear` and path/flag-bearing `open` invocations stay direct.
+        assert!(prose("clear the pointer so it reflects green"));
+        assert!(prose("clear the screen for me"));
+        assert!(prose("open the door slowly"));
+
         // real invocations stay direct
         assert!(!prose("who"));
         assert!(!prose("who -a"));
@@ -1350,6 +1627,14 @@ mod tests {
         assert!(!prose("what /usr/bin/ls")); // real `what` use takes a path
         assert!(!prose("find . -name foo"));
         assert!(!prose("tail logfile"));
+        assert!(!prose("clear")); // bare clear-screen stays direct (only 1 word)
+        assert!(!prose("open file.txt")); // dot in the path → command
+        assert!(!prose("sort -n data")); // flag → command (sort not ambiguous either)
+        assert!(!prose("touch newfile.txt")); // dot in the path → command
+        // ISS-1480 negatives must keep routing direct
+        assert!(!prose("kill 1234 now")); // digits → command
+        assert!(!prose("head 50")); // 2 words → not prose
+        assert!(!prose("pr file.txt")); // dot in the path → command
         assert!(!prose("echo hello there world")); // echo isn't ambiguous
         assert!(!prose("cat \"my file\" backup")); // quotes signal shell intent
 
@@ -1361,6 +1646,87 @@ mod tests {
         // …but flags/paths still win even with a trailing comma elsewhere
         assert!(!prose("watch -n 5 free"));
         assert!(!prose("tail logs/app.log"));
+
+        // ISS-1480: "PR 22 merged" (dev shorthand) must route to the model, not
+        // dispatch to /usr/bin/pr. Covers all three former failure modes:
+        // `pr` is now ambiguous, the lookup is case-insensitive, and a single
+        // embedded number no longer flips an English sentence to a command.
+        assert!(prose("pr 22 merged"));
+        assert!(prose("PR 22 merged")); // case-insensitive lead word
+        assert!(prose("PR is merged")); // no digit at all
+        assert!(prose("pr 22 was merged"));
+        // …without breaking real invocations. `pr` with a filename, and the
+        // numeric-operand commands, stay direct even though a number is present.
+        assert!(!prose("pr file.txt")); // genuine pr usage takes a filename
+        assert!(!prose("kill 1234")); // PID operand
+        assert!(!prose("kill 1234 now")); // number after kill is still a PID
+        assert!(!prose("head 50")); // line count
+        assert!(!prose("tail 100")); // line count
+        assert!(!prose("w 1")); // w's numeric arg
+        assert!(!prose("top 1")); // top's numeric arg
+    }
+
+    #[test]
+    fn command_arg_intent_detection() {
+        use std::os::unix::fs::PermissionsExt;
+        let tok = |s: &str| rc::tokenize(s).unwrap();
+        let cwd = std::env::temp_dir();
+
+        // A PATH dir holding one real executable, `tool`, so resolution is
+        // deterministic without depending on what's installed.
+        let dir = std::env::temp_dir().join(format!("aish_cmdarg_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let exe = dir.join("tool");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.to_string_lossy().to_string();
+        let intent = |s: &str| looks_like_command_arg_intent(&tok(s), &cwd, &path);
+
+        // The reported bug: `watch <atum-id>` (and peers) → model — the argument
+        // isn't a runnable command, so it can't be a real invocation.
+        assert!(intent("watch orch_c1b45797b841"));
+        assert!(intent("time some_made_up_target"));
+        assert!(intent("nice frobnicate"));
+        // Genuine command-taking invocations stay direct.
+        assert!(!intent("watch tool")); // `tool` resolves on our PATH
+        assert!(!intent("watch -n")); // a flag is real invocation syntax
+        // Not a command-taking verb → not intercepted here (handled, or not, elsewhere).
+        assert!(!intent("git status"));
+        assert!(!intent("make build")); // make targets aren't programs — deliberately excluded
+        // Only the exact two-word shape qualifies.
+        assert!(!intent("watch")); // 1 word
+        assert!(!intent("watch tool extra")); // 3 words
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn route_preview_classifies() {
+        use std::os::unix::fs::PermissionsExt;
+        let cwd = std::env::temp_dir();
+        let dir = std::env::temp_dir().join(format!("aish_preview_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        for name in ["tool", "clear"] {
+            let p = dir.join(name);
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = dir.to_string_lossy().to_string();
+        let aliases: HashMap<String, Vec<String>> = HashMap::new();
+        let pv = |s: &str| route_preview(s, &cwd, &path, &aliases);
+
+        assert_eq!(pv(""), Preview::Plain);
+        assert_eq!(pv(":help"), Preview::Plain);
+        assert_eq!(pv("!anything goes here"), Preview::Direct); // forced direct
+        assert_eq!(pv("?run this for me"), Preview::Model); // forced model
+        assert_eq!(pv("tool --flag"), Preview::Direct); // resolves, not ambiguous
+        assert_eq!(pv("clear"), Preview::Ambiguous); // resolves but real-binary-also-English
+        assert_eq!(pv("clear the screen for me"), Preview::Model); // prose
+        assert_eq!(pv("watch orch_c1b45797b841"), Preview::Model); // command-arg intent
+        assert_eq!(pv("what is the capital of texas"), Preview::Model); // prose
+        assert_eq!(pv("definitelynotacommand"), Preview::Model); // unresolvable lead word
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
