@@ -1232,6 +1232,55 @@ mod tests {
         assert_eq!(bad.code(), Some(1));
     }
 
+    // A `sh` snippet that exits 0 iff the running shell leads its own process
+    // group. Field 1 of /proc/self/stat is the pid and field 5 is the pgrp; a
+    // foreground child that `run_on_tty` setpgid'd into its own group has
+    // pgrp == pid. `$$` stays the shell's pid inside the command substitution
+    // (POSIX), and `comm` (field 2) is `(sh)`/`(dash)` — no embedded spaces — so
+    // positional splitting keeps the fields aligned.
+    const OWN_PGRP_PROBE: &str = r#"set -- $(cat /proc/$$/stat); [ "$5" = "$1" ]"#;
+
+    #[tokio::test]
+    async fn foreground_child_leads_its_own_process_group() {
+        // AC1: child runs in its own pgrp (verified via /proc). Exercises the
+        // real run_on_tty spawn path; the probe shell reports its own pgrp.
+        let session = Session::new().unwrap();
+        let status = run_on_tty(
+            "sh",
+            &["-c".to_string(), OWN_PGRP_PROBE.to_string()],
+            &[],
+            &session,
+        )
+        .await
+        .unwrap();
+        assert!(
+            status.success(),
+            "foreground child was not its own process-group leader"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_foreground_launches_have_no_setpgid_race() {
+        // AC2: no setpgid race under repeated launches. The parent+child double
+        // setpgid must leave every back-to-back child as its own group leader; a
+        // race would intermittently flip the probe's exit code.
+        let session = Session::new().unwrap();
+        for i in 0..20 {
+            let status = run_on_tty(
+                "sh",
+                &["-c".to_string(), OWN_PGRP_PROBE.to_string()],
+                &[],
+                &session,
+            )
+            .await
+            .unwrap();
+            assert!(
+                status.success(),
+                "setpgid race on launch {i}: child not its own group leader"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn tokio_reaper_never_steals_foreground_pid() {
         // The disjoint-PID-set invariant: tokio reaps only its own children and
