@@ -233,10 +233,19 @@ wait."
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "job": {"type": "string", "description": "The job id returned by run_in_background, e.g. \"batch_1\""}
+                    "job": {"type": "string", "description": "The job id (or an unambiguous prefix) from run_in_background"}
                 },
                 "required": ["job"]
             }),
+        });
+        defs.push(ToolDef {
+            name: "background_status".into(),
+            description: "List ALL background jobs and their LIVE status — full-tool workers \
+(needs_tools=true, running in this session) and Anthropic batch jobs (needs_tools=false, shared \
+across sessions). Call this to answer \"what's running?\" / \"status\" instead of guessing or \
+inventing your own tracking. Returns a table: id, kind (worker|batch), owner, status, task."
+                .into(),
+            schema: json!({ "type": "object", "properties": {} }),
         });
     }
     defs
@@ -268,6 +277,7 @@ pub async fn execute(call: &ToolCall, session: &mut Session, confirm: &mut Confi
         "job_output" => job_output(call, session),
         "run_in_background" => run_in_background(call, session),
         "batch_result" => batch_result(call, session),
+        "background_status" => background_status(session),
         "get_skill" => get_skill(call, session).await,
         other if other.starts_with("mcp__") => mcp_call(call, session, confirm).await,
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
@@ -706,6 +716,8 @@ will appear when ready — no job id, no restating the task."
         session.batch_model.clone(),
         api_key,
         session.batch_store.clone(),
+        session.session_id.clone(),
+        session.name.clone(),
     );
     // Steers the model's reply rather than being echoed verbatim — the id stays
     // internal (results auto-deliver, so the user doesn't need it).
@@ -731,32 +743,90 @@ fn task_needs_tools(task: &str) -> bool {
     SIGNALS.iter().any(|s| t.contains(s))
 }
 
+/// Live status of every background job the session can see — its own full-tool
+/// workers (in memory) and all sessions' Anthropic batches (from the shared
+/// store). This is what lets the model answer "what's running?" with facts
+/// instead of fabricating its own tracking (see the Haiku failure transcript).
+fn background_status(session: &Session) -> Result<String> {
+    let trunc = |t: &str| -> String {
+        let t = t.replace('|', "\\|");
+        if t.chars().count() > 56 {
+            format!("{}…", t.chars().take(56).collect::<String>())
+        } else {
+            t
+        }
+    };
+    let mut out =
+        String::from("| ID | Kind | Owner | Status | Since | Task |\n|---|---|---|---|---|---|\n");
+    let mut any = false;
+
+    // This session's full-tool workers (in memory; not shared across sessions).
+    for w in session.worker_jobs.lock().unwrap().iter() {
+        any = true;
+        out.push_str(&format!(
+            "| `{}` | worker | you | {} | — | {} |\n",
+            crate::batch::short_id(&w.id),
+            w.status(),
+            trunc(&w.task)
+        ));
+    }
+    // Anthropic batches from the shared store — every session's, so this answers
+    // cross-session "what's running" too.
+    if let Some(store) = &session.batch_store {
+        if let Ok(rows) = store.load_all() {
+            for r in rows {
+                any = true;
+                let owner = r
+                    .session_name
+                    .clone()
+                    .or_else(|| r.session_id.as_deref().map(|s| crate::batch::short_id(s).to_string()))
+                    .unwrap_or_else(|| "—".into());
+                let owner = if r.session_id.as_deref() == Some(session.session_id.as_str()) {
+                    format!("{owner} (you)")
+                } else {
+                    owner
+                };
+                out.push_str(&format!(
+                    "| `{}` | batch | {} | {} | {} | {} |\n",
+                    crate::batch::short_id(&r.local_id),
+                    owner,
+                    r.status,
+                    r.created_at.as_deref().unwrap_or("—"),
+                    trunc(&r.task)
+                ));
+            }
+        }
+    }
+
+    if !any {
+        return Ok("No background jobs running.".into());
+    }
+    Ok(out)
+}
+
 fn batch_result(call: &ToolCall, session: &Session) -> Result<String> {
-    // Accept "batch_1"/"worker_1"/"1"/the integer 1 — normalize the trailing n.
+    // Ids are now uuids; match the full id or any unambiguous prefix (e.g. the
+    // short 8-char form shown by background_status).
     let raw = call.args["job"]
         .as_str()
         .map(str::to_string)
         .or_else(|| call.args["job"].as_u64().map(|n| n.to_string()))
         .ok_or_else(|| anyhow::anyhow!("missing job id"))?;
-    let n = raw.trim().trim_start_matches("batch_").trim_start_matches("worker_");
+    let q = raw.trim();
+    let hit = |id: &str| id == q || id.starts_with(q);
 
     // Full-tool workers auto-deliver, but the model sometimes reflexively fetches
-    // one here — so look in worker_jobs too rather than reporting "no such job".
-    {
-        let workers = session.worker_jobs.lock().unwrap();
-        let wid = format!("worker_{n}");
-        if let Some(w) = workers.iter().find(|j| j.id == wid) {
-            return Ok(w.fetch());
-        }
+    // one — so check worker_jobs too rather than reporting "no such job".
+    if let Some(w) = session.worker_jobs.lock().unwrap().iter().find(|j| hit(&j.id)) {
+        return Ok(w.fetch());
     }
-
-    let id = format!("batch_{n}");
-    let jobs = session.batch_jobs.lock().unwrap();
-    let job = jobs
-        .iter()
-        .find(|j| j.id == id)
-        .ok_or_else(|| anyhow::anyhow!("no background job {id} (jobs live for this session only; workers auto-deliver — you usually don't need to fetch)"))?;
-    Ok(job.fetch())
+    if let Some(j) = session.batch_jobs.lock().unwrap().iter().find(|j| hit(&j.id)) {
+        return Ok(j.fetch());
+    }
+    anyhow::bail!(
+        "no background job matching '{q}' in this session — call background_status to list \
+running jobs (workers auto-deliver, so you usually don't need to fetch at all)"
+    )
 }
 
 // ---------------------------------------------------------------------------
