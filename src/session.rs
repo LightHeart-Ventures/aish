@@ -106,6 +106,11 @@ pub struct Session {
     /// Live full-tool background workers — aish subprocesses run in
     /// `--coordinator` mode. In memory for the session, like `batch_jobs`.
     pub worker_jobs: crate::worker::WorkerJobs,
+    /// Durable coordinator-run store (own SQLite connection). Records the phase
+    /// of each background coordinator run so a crash/exit resumes, and so
+    /// `background_status` / startup rehydrate can see runs across restarts.
+    /// None if it failed to open — coordinator runs then aren't persisted.
+    pub coordinator_store: Option<crate::db::CoordinatorStore>,
     /// True when THIS aish is itself a background coordinator (env
     /// `AISH_COORDINATOR=1`). The nested guard: a coordinator must never spawn
     /// its own workers (no infinite re-exec recursion), so `run_in_background`
@@ -141,6 +146,7 @@ impl Session {
             batch_jobs: Default::default(),
             batch_store: None,
             worker_jobs: Default::default(),
+            coordinator_store: None,
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
             goal: None,
         })

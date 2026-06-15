@@ -320,6 +320,145 @@ impl BatchStore {
     }
 }
 
+/// One persisted coordinator run. Mirrors `BatchRow`, but for a durable,
+/// resumable multi-round background coordinator (the default background path)
+/// rather than a single Anthropic batch.
+pub struct CoordinatorRow {
+    pub run_id: String,
+    pub task: String,
+    /// 'coordinating' | 'awaiting_batch' | 'done' | 'failed'.
+    pub phase: String,
+    pub result: Option<String>,
+    /// Failure reason when phase='failed'. Persisted for rehydrate/diagnostics;
+    /// `background_status` shows the phase, not the message, so it's read only by
+    /// the store round-trip test today.
+    #[allow(dead_code)]
+    pub error: Option<String>,
+    /// Owning session (uuid) — used to detect orphaned runs at startup.
+    pub session_id: Option<String>,
+    pub created_at: Option<String>,
+    /// Last liveness beat (SQLite `current_timestamp` string). A run whose owner
+    /// is gone and whose heartbeat is stale is treated as orphaned on reattach.
+    pub heartbeat_at: Option<String>,
+}
+
+/// Durable store for background coordinator runs — the resumable equivalent of
+/// `BatchStore`, ported from atum_cli's batch-controller store. Kept in its own
+/// connection (the coordinator drives turns + batch waits off the main thread)
+/// against the same `aish.db`; WAL makes the concurrent connections safe.
+/// Cloneable so the running coordinator and the REPL both hold a handle.
+#[derive(Clone)]
+pub struct CoordinatorStore {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl CoordinatorStore {
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)
+            .with_context(|| format!("can't open coordinator store at {}", path.display()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE IF NOT EXISTS coordinator_runs (
+                 run_id       TEXT PRIMARY KEY,
+                 task         TEXT NOT NULL,
+                 phase        TEXT NOT NULL CHECK (phase IN
+                              ('coordinating', 'awaiting_batch', 'done', 'failed')),
+                 result       TEXT,
+                 error        TEXT,
+                 session_id   TEXT,
+                 created_at   TEXT NOT NULL DEFAULT current_timestamp,
+                 heartbeat_at TEXT NOT NULL DEFAULT current_timestamp
+             );",
+        )
+        .context("coordinator_runs schema init failed")?;
+        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+    }
+
+    /// Register a freshly-started run in the `coordinating` phase. Idempotent —
+    /// re-inserting the same `run_id` (e.g. a resumed run) leaves the existing
+    /// row untouched so its persisted phase/result survives.
+    pub fn insert(&self, run_id: &str, task: &str, session_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO coordinator_runs (run_id, task, phase, session_id)
+             VALUES (?1, ?2, 'coordinating', ?3)
+             ON CONFLICT(run_id) DO NOTHING",
+            (run_id, task, session_id),
+        )?;
+        Ok(())
+    }
+
+    /// Advance the run's phase marker (and bump the heartbeat, since a phase
+    /// transition is itself proof of liveness).
+    pub fn set_phase(&self, run_id: &str, phase: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE coordinator_runs SET phase = ?2, heartbeat_at = current_timestamp \
+             WHERE run_id = ?1",
+            (run_id, phase),
+        )?;
+        Ok(())
+    }
+
+    /// Stamp a liveness beat — written periodically while awaiting a batch so a
+    /// restart can tell a live run from an orphaned one.
+    pub fn heartbeat(&self, run_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE coordinator_runs SET heartbeat_at = current_timestamp WHERE run_id = ?1",
+            [run_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_done(&self, run_id: &str, result: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE coordinator_runs \
+             SET phase = 'done', result = ?2, heartbeat_at = current_timestamp WHERE run_id = ?1",
+            (run_id, result),
+        )?;
+        Ok(())
+    }
+
+    pub fn set_failed(&self, run_id: &str, error: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE coordinator_runs \
+             SET phase = 'failed', error = ?2, heartbeat_at = current_timestamp WHERE run_id = ?1",
+            (run_id, error),
+        )?;
+        Ok(())
+    }
+
+    /// Every persisted run, oldest first — used at startup to surface completed
+    /// runs and reap orphaned ones.
+    pub fn load_all(&self) -> Result<Vec<CoordinatorRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT run_id, task, phase, result, error, session_id, created_at, heartbeat_at
+             FROM coordinator_runs ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CoordinatorRow {
+                run_id: r.get(0)?,
+                task: r.get(1)?,
+                phase: r.get(2)?,
+                result: r.get(3)?,
+                error: r.get(4)?,
+                session_id: r.get(5)?,
+                created_at: r.get(6)?,
+                heartbeat_at: r.get(7)?,
+            })
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Drop terminal (done/failed) runs. Returns how many rows were removed.
+    pub fn clear_finished(&self) -> Result<usize> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM coordinator_runs WHERE phase IN ('done', 'failed')", [])?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +544,44 @@ mod tests {
         assert_eq!(two.session_name, None);
 
         store.set_failed("batch_1", "timeout").unwrap();
+        assert_eq!(reopened.clear_finished().unwrap(), 2); // both terminal now
+        assert!(reopened.load_all().unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn coordinator_store_roundtrip_and_resume() {
+        let path = std::env::temp_dir().join(format!("aish_coord_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+
+        store.insert("run_1", "audit the repo", "sess-a").unwrap();
+        // Idempotent insert (resume path) must not clobber the existing row.
+        store.set_phase("run_1", "awaiting_batch").unwrap();
+        store.insert("run_1", "audit the repo", "sess-a").unwrap();
+        store.heartbeat("run_1").unwrap();
+
+        store.insert("run_2", "draft release notes", "sess-b").unwrap();
+        store.set_done("run_2", "the notes").unwrap();
+
+        // A fresh store over the same file sees both — the restart path.
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        let rows = reopened.load_all().unwrap();
+        assert_eq!(rows.len(), 2);
+        let one = rows.iter().find(|r| r.run_id == "run_1").unwrap();
+        assert_eq!(one.phase, "awaiting_batch"); // resumable, insert didn't reset it
+        assert_eq!(one.session_id.as_deref(), Some("sess-a"));
+        assert!(one.heartbeat_at.is_some());
+        let two = rows.iter().find(|r| r.run_id == "run_2").unwrap();
+        assert_eq!(two.phase, "done");
+        assert_eq!(two.result.as_deref(), Some("the notes"));
+
+        store.set_failed("run_1", "exceeded round cap").unwrap();
+        let rows = reopened.load_all().unwrap();
+        let one = rows.iter().find(|r| r.run_id == "run_1").unwrap();
+        assert_eq!(one.phase, "failed");
+        assert_eq!(one.error.as_deref(), Some("exceeded round cap"));
+
         assert_eq!(reopened.clear_finished().unwrap(), 2); // both terminal now
         assert!(reopened.load_all().unwrap().is_empty());
         let _ = std::fs::remove_file(&path);
