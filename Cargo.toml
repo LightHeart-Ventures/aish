@@ -29,3 +29,10 @@ cuda = ["mistralrs/cuda"]
 [profile.dev.package."*"]
 # candle/mistralrs are unusably slow unoptimized — always optimize deps.
 opt-level = 3
+
+[profile.release]
+# A small, stripped release binary (the same binary a background coordinator job
+# re-execs) without paying for a full opt-level=3 / fat-LTO compile.
+opt-level = 2
+lto = "thin"
+strip = true
