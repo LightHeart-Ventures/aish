@@ -225,8 +225,10 @@ files, run commands, or query MCP."
         });
         defs.push(ToolDef {
             name: "batch_result".into(),
-            description: "Fetch the result of a background batch job started with run_in_background. \
-Returns the result if the job has ended, or its current status if still running."
+            description: "Fetch the result of a tool-LESS background batch (needs_tools=false). \
+Returns the result if it has ended, or its status if still running. NOTE: full-tool workers \
+(needs_tools=true) auto-deliver their result to the terminal — do NOT call this for them; just \
+wait."
                 .into(),
             schema: json!({
                 "type": "object",
@@ -670,9 +672,15 @@ fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
         );
     }
 
-    // Nested guard: a coordinator subprocess must not spawn its own workers, so
-    // a tool-needing offload from inside one downgrades to a tool-less batch.
-    let needs_tools = call.args["needs_tools"].as_bool().unwrap_or(false) && !session.nested;
+    // Routing: the model's needs_tools, OR a heuristic backstop that catches a
+    // clearly tool-needing task the model mislabeled (the common failure — a
+    // "scan this repo" task sent to the tool-less Batches API returns garbage).
+    // The heuristic only ever upgrades batch→worker, never the reverse: a worker
+    // is a full aish, so it can also do pure reasoning — a false positive just
+    // costs a bit more, while a false negative produces wrong results. The
+    // nested guard still caps it (a coordinator never spawns its own workers).
+    let asked_tools = call.args["needs_tools"].as_bool().unwrap_or(false);
+    let needs_tools = (asked_tools || task_needs_tools(task)) && !session.nested;
 
     if needs_tools {
         let exe = std::env::current_exe()
@@ -684,9 +692,10 @@ fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
             env: session.env.clone(),
         };
         let _id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
-        return Ok("Queued a full-tool background worker. Now reply with one short, natural \
-sentence that you're on it and the answer will appear here when it's ready — don't mention a job \
-id or restate the task."
+        return Ok("Queued a full-tool background worker (it can read files, run commands, and use \
+MCP in this directory). The result auto-delivers here when it's done — do NOT call batch_result \
+for it. Now reply to the user with one short, natural sentence that you're on it and the answer \
+will appear when ready — no job id, no restating the task."
             .to_string());
     }
 
@@ -706,19 +715,47 @@ restate the task."
         .to_string())
 }
 
+/// Strong signals that a task needs the filesystem, a command, the repo, or an
+/// MCP server — so it must run as a full-tool worker, not a tool-less batch.
+/// Conservative toward false POSITIVES (upgrading to a worker is always safe);
+/// the cost is only losing the cheaper batch path for these.
+fn task_needs_tools(task: &str) -> bool {
+    let t = task.to_ascii_lowercase();
+    const SIGNALS: &[&str] = &[
+        "repo", "repositor", "codebase", "this project", "the project",
+        "this directory", "the directory", "this folder", "the code", "the file",
+        "these files", "the files", "scan ", "grep", "search the", "src/",
+        ".rs", "./", "git ", "github", "atum", "mcp", "run the", "run a",
+        "build the", "build and", "compile", "the tests", "list the files",
+    ];
+    SIGNALS.iter().any(|s| t.contains(s))
+}
+
 fn batch_result(call: &ToolCall, session: &Session) -> Result<String> {
-    // Accept "batch_1", "1", or the integer 1 — normalize to the canonical id.
+    // Accept "batch_1"/"worker_1"/"1"/the integer 1 — normalize the trailing n.
     let raw = call.args["job"]
         .as_str()
         .map(str::to_string)
         .or_else(|| call.args["job"].as_u64().map(|n| n.to_string()))
         .ok_or_else(|| anyhow::anyhow!("missing job id"))?;
-    let id = format!("batch_{}", raw.trim().trim_start_matches("batch_"));
+    let n = raw.trim().trim_start_matches("batch_").trim_start_matches("worker_");
+
+    // Full-tool workers auto-deliver, but the model sometimes reflexively fetches
+    // one here — so look in worker_jobs too rather than reporting "no such job".
+    {
+        let workers = session.worker_jobs.lock().unwrap();
+        let wid = format!("worker_{n}");
+        if let Some(w) = workers.iter().find(|j| j.id == wid) {
+            return Ok(w.fetch());
+        }
+    }
+
+    let id = format!("batch_{n}");
     let jobs = session.batch_jobs.lock().unwrap();
     let job = jobs
         .iter()
         .find(|j| j.id == id)
-        .ok_or_else(|| anyhow::anyhow!("no batch job {id} (batch jobs live for this session only; see :batch status)"))?;
+        .ok_or_else(|| anyhow::anyhow!("no background job {id} (jobs live for this session only; workers auto-deliver — you usually don't need to fetch)"))?;
     Ok(job.fetch())
 }
 
@@ -1180,6 +1217,21 @@ fn char_ceil(s: &str, mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_needs_tools_backstop() {
+        // Clearly tool-needing tasks the model might mislabel → upgrade to worker.
+        assert!(task_needs_tools("scan this repo and list the modules"));
+        assert!(task_needs_tools("read the files in src/ and summarize"));
+        assert!(task_needs_tools("run the tests and report failures"));
+        assert!(task_needs_tools("check atum for open issues"));
+        assert!(task_needs_tools("grep for TODO across the codebase"));
+        assert!(task_needs_tools("build the project and report warnings"));
+        // Pure reasoning over provided text → stays on the cheap batch path.
+        assert!(!task_needs_tools("write a haiku about the ocean"));
+        assert!(!task_needs_tools("summarize the following paragraph: ..."));
+        assert!(!task_needs_tools("translate this sentence to french"));
+    }
 
     #[test]
     fn env_value_resolution() {
