@@ -220,6 +220,10 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
 /// line; once all have finished, flush every not-yet-shown result at once.
 /// Mirrors `batch::on_complete`.
 fn on_complete(jobs: &WorkerJobs, finished: &Arc<WorkerJob>) {
+    // Interactive REPL: the presenter drains at a pause (see batch::on_complete).
+    if crate::present::deferred() {
+        return;
+    }
     let (all_terminal, remaining) = {
         let g = jobs.lock().unwrap();
         let remaining = g.iter().filter(|j| !j.is_terminal()).count();
@@ -235,22 +239,41 @@ fn on_complete(jobs: &WorkerJobs, finished: &Arc<WorkerJob>) {
     flush_results(jobs);
 }
 
-/// Print every finished-but-not-yet-shown worker result over the prompt, then
-/// mark them shown. Mirrors `batch::flush_results`.
-fn flush_results(jobs: &WorkerJobs) {
+/// Format every finished-but-not-yet-shown worker result into a display block,
+/// marking each shown. Shared by the headless flush and the REPL presenter.
+pub fn drain_pending(jobs: &WorkerJobs) -> Vec<String> {
     let pending: Vec<Arc<WorkerJob>> = {
         let g = jobs.lock().unwrap();
         g.iter().filter(|j| j.is_terminal() && !j.is_displayed()).cloned().collect()
     };
-    if pending.is_empty() {
+    pending
+        .iter()
+        .map(|job| {
+            let label = if job.status() == "failed" { "failed" } else { "complete" };
+            job.mark_displayed();
+            format!(
+                "\x1b[2m── worker {} {label} ──\x1b[0m\n{}",
+                job.id,
+                crate::md::render_stdout(job.fetch().trim())
+            )
+        })
+        .collect()
+}
+
+/// Count of workers still running — for the prompt's `⟳N` indicator.
+pub fn running_count(jobs: &WorkerJobs) -> usize {
+    jobs.lock().unwrap().iter().filter(|j| !j.is_terminal()).count()
+}
+
+/// Headless inline flush (no presenter): print every drained block to stdout.
+fn flush_results(jobs: &WorkerJobs) {
+    let blocks = drain_pending(jobs);
+    if blocks.is_empty() {
         return;
     }
-    print!("\r\x1b[2K"); // wipe the prompt line the result is landing over
-    for job in &pending {
-        let label = if job.status() == "failed" { "failed" } else { "complete" };
-        println!("\x1b[2m── worker {} {label} ──\x1b[0m", job.id);
-        println!("{}", crate::md::render_stdout(job.fetch().trim()));
-        job.mark_displayed();
+    print!("\r\x1b[2K");
+    for b in &blocks {
+        println!("{b}");
     }
     use std::io::Write;
     std::io::stdout().flush().ok();

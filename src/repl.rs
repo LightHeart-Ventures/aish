@@ -7,6 +7,7 @@ use crate::tools;
 use anyhow::Result;
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
+use rustyline::ExternalPrinter;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
@@ -82,6 +83,34 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
     let mut prev_dir: Option<PathBuf> = None;
     let mut needs_gap = false; // blank line between previous output and the prompt
 
+    // Background-result presenter. When interactive, finished batch/worker jobs
+    // queue their results (present::enable_deferred) and this task prints them
+    // ABOVE the prompt via rustyline's ExternalPrinter — but only at a pause in
+    // work (`busy == false`), so a result never blurts over a command in flight
+    // or the user's typing. ExternalPrinter redraws the prompt after printing.
+    // If the terminal can't provide a printer, we leave inline printing on.
+    let busy = Arc::new(AtomicBool::new(false));
+    if let Ok(mut printer) = rl.create_external_printer() {
+        crate::present::enable_deferred();
+        let busy = busy.clone();
+        let batch_jobs = session.batch_jobs.clone();
+        let worker_jobs = session.worker_jobs.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(400));
+            loop {
+                tick.tick().await;
+                if busy.load(Ordering::SeqCst) {
+                    continue; // mid-command/turn — hold results until a pause
+                }
+                let mut blocks = crate::batch::drain_pending(&batch_jobs);
+                blocks.extend(crate::worker::drain_pending(&worker_jobs));
+                for b in blocks {
+                    let _ = printer.print(format!("{b}\n"));
+                }
+            }
+        });
+    }
+
     loop {
         if needs_gap {
             println!();
@@ -91,7 +120,16 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
         if let Some(h) = rl.helper_mut() {
             h.cwd.clone_from(&session.cwd);
         }
-        let prompt = format!("\x1b[36m{}\x1b[0m ❯ ", short_cwd(&session));
+        // We're about to idle at the prompt — let the presenter flush results.
+        busy.store(false, Ordering::SeqCst);
+        let running = crate::batch::running_count(&session.batch_jobs)
+            + crate::worker::running_count(&session.worker_jobs);
+        let badge = if running > 0 {
+            format!("\x1b[2m⟳{running}\x1b[0m ")
+        } else {
+            String::new()
+        };
+        let prompt = format!("{badge}\x1b[36m{}\x1b[0m ❯ ", short_cwd(&session));
         match rl.readline(&prompt) {
             Ok(line) => {
                 let line = line.trim().to_string();
@@ -100,6 +138,8 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
                 }
                 let _ = rl.add_history_entry(&line);
                 needs_gap = true;
+                // Now working — hold background results until the next pause.
+                busy.store(true, Ordering::SeqCst);
 
                 if let Some(cmd) = line.strip_prefix(':') {
                     if handle_colon(cmd, &mut backend, &mut session).await {

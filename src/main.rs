@@ -7,6 +7,7 @@ mod mcp;
 #[cfg(test)]
 mod oracle;
 mod pipeline;
+mod present;
 mod rc;
 mod repl;
 mod session;
