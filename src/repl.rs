@@ -533,10 +533,29 @@ fn split_route(line: String) -> (String, Route) {
 /// nothing but bare words is almost certainly a question ("who is …",
 /// "find me big files"), not an invocation — flags, paths, digits, or quotes
 /// flip it back to a command.
+///
+/// HEURISTIC STOPGAP: this hand-curated word list is a blunt instrument — it
+/// can only ever catch commands we thought to enumerate (cf. ISS-1480, the
+/// `clear`/`open` class below). The durable fix is model-based route preview
+/// (S5/S6: TASK-132/137), which decides routing by understanding the line
+/// rather than matching its lead word; this list goes away once that lands.
+///
+/// Additions in the `clear … green` class are deliberately conservative: a word
+/// only belongs here if a 3+word all-alphabetic line starting with it is far
+/// more likely prose than a real invocation. Real invocations of these carry a
+/// flag, path, dot, or digit (handled by the guards in `looks_like_prose`) — so
+/// commands whose plain `cmd a b c` form is a legitimate multi-arg call
+/// (`say`, `touch`, `file`, `link`, `paste`, `join`, `mail`, `banner`, …) are
+/// intentionally excluded to avoid swallowing real usage.
 const AMBIGUOUS_COMMANDS: &[&str] = &[
     "who", "w", "find", "time", "test", "yes", "look", "last", "watch", "date",
     "which", "what", "whatis", "finger", "write", "wall", "users", "top", "more",
     "head", "tail", "make", "cat", "kill", "pr",
+    // clear/open: real use is bare (`clear`) or carries a path/dot/flag
+    // (`open file.txt`, `open .`, `open -a App`); a bare-word sentence
+    // starting with either ("clear the pointer so it reflects green",
+    // "open the door slowly") is prose, not an invocation.
+    "clear", "open",
 ];
 
 /// Subset of `AMBIGUOUS_COMMANDS` whose *idiomatic* first argument is a number:
@@ -1401,6 +1420,14 @@ mod tests {
         assert!(prose("find me big files"));
         assert!(prose("make this file executable"));
         assert!(prose("what is the capital of texas")); // `what` is a real binary on macOS
+
+        // `clear`/`open` class (same class as ISS-1480): `clear`/`open` are real
+        // commands that also begin everyday sentences. A bare-word sentence is
+        // prose; bare `clear` and path/flag-bearing `open` invocations stay direct.
+        assert!(prose("clear the pointer so it reflects green"));
+        assert!(prose("clear the screen for me"));
+        assert!(prose("open the door slowly"));
+
         // real invocations stay direct
         assert!(!prose("who"));
         assert!(!prose("who -a"));
@@ -1408,6 +1435,14 @@ mod tests {
         assert!(!prose("what /usr/bin/ls")); // real `what` use takes a path
         assert!(!prose("find . -name foo"));
         assert!(!prose("tail logfile"));
+        assert!(!prose("clear")); // bare clear-screen stays direct (only 1 word)
+        assert!(!prose("open file.txt")); // dot in the path → command
+        assert!(!prose("sort -n data")); // flag → command (sort not ambiguous either)
+        assert!(!prose("touch newfile.txt")); // dot in the path → command
+        // ISS-1480 negatives must keep routing direct
+        assert!(!prose("kill 1234 now")); // digits → command
+        assert!(!prose("head 50")); // 2 words → not prose
+        assert!(!prose("pr file.txt")); // dot in the path → command
         assert!(!prose("echo hello there world")); // echo isn't ambiguous
         assert!(!prose("cat \"my file\" backup")); // quotes signal shell intent
 
