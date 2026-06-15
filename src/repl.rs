@@ -1054,7 +1054,7 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                  :batch model <opus|sonnet|haiku|id> model background batches run on (default opus)\n\
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
-                 :workers                            list full-tool background workers (needs_tools offloads)\n\
+                 :workers                            list in-flight background coordinator subprocesses\n\
                  :name <name>                        name the session (prefixes the prompt); bare :name clears\n\
                  :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
                                                      a verifier judges each turn. :goal status, :goal clear\n\
