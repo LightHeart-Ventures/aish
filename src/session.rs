@@ -53,6 +53,10 @@ pub struct Session {
     /// Optional session name, shown as a `[NAME] |` prefix on the prompt. Set
     /// with `:name <name>`, cleared with bare `:name`. Session-local.
     pub name: Option<String>,
+    /// Stable per-process id (a uuid). Batch jobs are tagged with it so results
+    /// auto-deliver only to the session that spawned them; other sessions can
+    /// still query any job. The friendly `name` (if set) is the display label.
+    pub session_id: String,
     /// Static host info baked into the system prompt once.
     pub host_info: String,
     /// True while a child owns the terminal (run_interactive / direct dispatch).
@@ -107,6 +111,9 @@ pub struct Session {
     /// its own workers (no infinite re-exec recursion), so `run_in_background`
     /// downgrades a tool-needing offload to a tool-less batch when this is set.
     pub nested: bool,
+    /// The active background `:goal` loop, if any (one per session). Set by
+    /// `:goal <condition>`, inspected by bare `:goal`, stopped by `:goal clear`.
+    pub goal: Option<crate::goal::Handle>,
 }
 
 impl Session {
@@ -117,6 +124,7 @@ impl Session {
             history: Vec::new(),
             mode: Mode::default(),
             name: None,
+            session_id: uuid::Uuid::new_v4().to_string(),
             host_info: host_info(),
             tty_handoff: Arc::new(AtomicBool::new(false)),
             env: Vec::new(),
@@ -134,6 +142,7 @@ impl Session {
             batch_store: None,
             worker_jobs: Default::default(),
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
+            goal: None,
         })
     }
 

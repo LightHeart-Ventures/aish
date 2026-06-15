@@ -32,7 +32,8 @@ pub const DEFAULT_BATCH_MODEL: &str = "claude-opus-4-8";
 /// A background batch job, tracked for the life of the session. Shared between
 /// the REPL (which lists/fetches it) and the poll task (which mutates it).
 pub struct BatchJob {
-    /// Session-local handle, e.g. "batch_1" — how the model and `:batch` refer to it.
+    /// Globally-unique job id (a uuid) — unique across the sessions that share
+    /// the batch store. The model/`:batch` may refer to it by any unambiguous prefix.
     pub id: String,
     pub task: String,
     inner: Mutex<JobInner>,
@@ -160,17 +161,12 @@ pub fn spawn(
     model: String,
     api_key: String,
     store: Option<crate::db::BatchStore>,
+    session_id: String,
+    session_name: Option<String>,
 ) -> String {
-    let mut guard = jobs.lock().unwrap();
-    let n = guard
-        .iter()
-        .filter_map(|j| j.id.strip_prefix("batch_").and_then(|s| s.parse::<usize>().ok()))
-        .max()
-        .unwrap_or(0)
-        + 1;
-    let id = format!("batch_{n}");
+    let id = uuid::Uuid::new_v4().to_string();
     if let Some(store) = &store {
-        let _ = store.insert(&id, &task, &model);
+        let _ = store.insert(&id, &task, &model, &session_id, session_name.as_deref());
     }
     let job = Arc::new(BatchJob {
         id: id.clone(),
@@ -178,11 +174,15 @@ pub fn spawn(
         inner: Mutex::new(JobInner { status: "running".into(), result: None, error: None, displayed: false }),
         store,
     });
-    guard.push(job.clone());
-    drop(guard);
+    jobs.lock().unwrap().push(job.clone());
 
     tokio::spawn(run_batch(jobs.clone(), job, task, model, api_key));
     id
+}
+
+/// Short, table-friendly form of a uuid job id (first 8 hex chars).
+pub fn short_id(id: &str) -> &str {
+    id.split('-').next().unwrap_or(id)
 }
 
 /// Rehydrate persisted batch jobs at startup: every stored job is restored into
@@ -200,13 +200,23 @@ pub fn rehydrate(session: &mut crate::session::Session) {
             return;
         }
     };
-    if rows.is_empty() {
+    // Only this session's own jobs come back into memory (so the prompt badge and
+    // auto-delivery stay scoped to us); other sessions' jobs are query-only, read
+    // live from the store by `:batch status` / the batch_status tool. Job ids are
+    // per-process, so a fresh start matches nothing — this is a no-op until/unless
+    // ownership is made stable.
+    let own = session.session_id.clone();
+    let mine: Vec<_> = rows
+        .into_iter()
+        .filter(|r| r.session_id.as_deref() == Some(own.as_str()))
+        .collect();
+    if mine.is_empty() {
         return;
     }
     let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
     let jobs = session.batch_jobs.clone();
     let mut resumed = 0usize;
-    for row in rows {
+    for row in mine {
         let terminal = matches!(row.status.as_str(), "done" | "failed");
         let job = Arc::new(BatchJob {
             id: row.local_id.clone(),
@@ -589,36 +599,15 @@ mod tests {
     }
 
     #[test]
-    fn spawn_assigns_incrementing_ids() {
-        let jobs: BatchJobs = Default::default();
-        // No tokio runtime here, so the spawned poll task never runs — we only
-        // assert the synchronous registration + id assignment.
-        let mk = |jobs: &BatchJobs, id: usize| {
-            jobs.lock().unwrap().push(Arc::new(BatchJob {
-                id: format!("batch_{id}"),
-                task: "t".into(),
-                inner: Mutex::new(JobInner { status: "running".into(), result: None, error: None, displayed: false }),
-                store: None,
-            }));
-        };
-        mk(&jobs, 1);
-        mk(&jobs, 2);
-        // Next id computed the way spawn() does.
-        let next = jobs
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|j| j.id.strip_prefix("batch_").and_then(|s| s.parse::<usize>().ok()))
-            .max()
-            .unwrap_or(0)
-            + 1;
-        assert_eq!(next, 3);
+    fn short_id_is_first_uuid_segment() {
+        assert_eq!(short_id("a1b2c3d4-e5f6-7890-abcd-ef1234567890"), "a1b2c3d4");
+        assert_eq!(short_id("nodashes"), "nodashes");
     }
 
     #[test]
     fn fetch_reports_running_then_done() {
         let job = Arc::new(BatchJob {
-            id: "batch_1".into(),
+            id: "a1b2c3d4-0000".into(),
             task: "summarize".into(),
             inner: Mutex::new(JobInner { status: "running".into(), result: None, error: None, displayed: false }),
             store: None,
@@ -626,7 +615,7 @@ mod tests {
         assert!(job.fetch().contains("still running"));
         job.set_done("the summary".into());
         assert_eq!(job.fetch(), "the summary");
-        assert!(job.summary_line().contains("batch_1"));
+        assert!(job.summary_line().contains("a1b2c3d4"));
         assert!(job.summary_line().contains("done"));
     }
 }
