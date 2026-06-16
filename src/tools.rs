@@ -655,12 +655,17 @@ fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
     if task.is_empty() {
         anyhow::bail!("`task` is required");
     }
-    // A background coordinator's Claude backend reads ANTHROPIC_API_KEY, and the
-    // tool-less batch fan-out it may reach for needs a metered key too.
-    if std::env::var("ANTHROPIC_API_KEY").is_err() {
+    // A background coordinator (a re-exec'd headless aish) runs Messages turns,
+    // which work with EITHER a metered ANTHROPIC_API_KEY or a Claude subscription
+    // CLAUDE_CODE_OAUTH_TOKEN (inherited via the child's env, incl. ~/.aishrc
+    // exports). Require at least one. The nested tool-less batch path below
+    // additionally needs a metered key (subscription tokens can't reach the
+    // Batches API) — checked there.
+    if crate::backend::claude::Credential::resolve(&session.env).is_err() {
         anyhow::bail!(
-            "ANTHROPIC_API_KEY is not set — background jobs need a metered API key \
-(a Claude subscription token won't reach the Batches API, and a coordinator subprocess needs it too)"
+            "no Claude credential — set CLAUDE_CODE_OAUTH_TOKEN (a Claude Max/Pro subscription \
+token) or ANTHROPIC_API_KEY (a metered key), in your environment or ~/.aishrc, so background \
+jobs can authenticate"
         );
     }
 
@@ -676,7 +681,24 @@ fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
     // a deferred offload degrades to the in-process tool-less batch — the one
     // internal use of the batch path on this model-facing route.
     if session.nested {
-        let api_key = std::env::var("ANTHROPIC_API_KEY").expect("checked above");
+        // The tool-less Batches API needs a metered key; a subscription OAuth
+        // token can't reach it. Look in ~/.aishrc exports first, then the process
+        // env. If that's all we have, this nested fan-out can't run — say so
+        // plainly rather than failing opaquely later.
+        let api_key = session
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "ANTHROPIC_API_KEY")
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "nested background fan-out uses the Anthropic Batches API, which needs a metered \
+ANTHROPIC_API_KEY — a Claude subscription token (CLAUDE_CODE_OAUTH_TOKEN) can't reach it"
+                )
+            })?;
         let _id = crate::batch::spawn(
             &session.batch_jobs,
             task.to_string(),

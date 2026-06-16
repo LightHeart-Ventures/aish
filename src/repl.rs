@@ -40,7 +40,11 @@ pub fn confirm_tty(prompt: &str) -> tools::Decision {
     }
 }
 
-pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
+pub async fn run(
+    mut backend: Backend,
+    mut session: Session,
+    aliases: HashMap<String, Vec<String>>,
+) -> Result<()> {
     // Job-control signal disposition (TASK-115): aish ignores SIGINT/QUIT/TSTP/
     // TTOU/TTIN so a Ctrl-C/Ctrl-\/Ctrl-Z reaches the foreground child's process
     // group (run_on_tty hands it the terminal) instead of killing or suspending
@@ -58,9 +62,10 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
         }
     });
 
-    let rc = rc::load();
-    session.env = rc.env;
-    let aliases = Arc::new(rc.aliases);
+    // ~/.aishrc is already loaded in main (its exports are in session.env, used
+    // for credential resolution before the backend is built); we just take the
+    // aliases it parsed.
+    let aliases = Arc::new(aliases);
 
     let mut rl: Editor<AishHelper, DefaultHistory> = Editor::new()?;
     rl.set_helper(Some(AishHelper {
@@ -1182,8 +1187,8 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                 println!("usage: :dispatch <task>   — launch a background coordinator for <task>");
             } else if session.nested {
                 println!("can't :dispatch from inside a coordinator (no nested coordinators)");
-            } else if std::env::var("ANTHROPIC_API_KEY").is_err() {
-                println!("ANTHROPIC_API_KEY not set — the coordinator needs a metered key");
+            } else if crate::backend::claude::Credential::resolve(&session.env).is_err() {
+                println!("no Claude credential — set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY");
             } else {
                 match std::env::current_exe() {
                     Ok(exe) => {
@@ -1240,8 +1245,11 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
                     } else if session.goal.as_ref().is_some_and(|g| g.is_active()) {
                         println!("a goal is already active (one per session) — `:goal clear` it first");
                     } else {
-                        match (std::env::var("ANTHROPIC_API_KEY"), std::env::current_exe()) {
-                            (Ok(key), Ok(exe)) => {
+                        match (
+                            crate::backend::claude::Credential::resolve(&session.env),
+                            std::env::current_exe(),
+                        ) {
+                            (Ok(cred), Ok(exe)) => {
                                 let spec = crate::worker::WorkerSpec {
                                     exe,
                                     cwd: session.cwd.clone(),
@@ -1254,13 +1262,13 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
                                     cond.to_string(),
                                     spec,
                                     session.batch_model.clone(),
-                                    key,
+                                    cred,
                                 );
                                 session.goal = Some(g);
                                 println!("\x1b[2mgoal set — pursuing it in the background; progress and the result appear here. `:goal` for status, `:goal clear` to stop.\x1b[0m");
                             }
                             (Err(_), _) => {
-                                println!("ANTHROPIC_API_KEY not set — the goal loop needs a metered key")
+                                println!("no Claude credential — set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY")
                             }
                             (_, Err(e)) => {
                                 println!("can't locate the aish binary to run goal workers: {e}")
@@ -1288,7 +1296,9 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
                 if matches!(backend, Backend::Claude(_)) {
                     println!("already on {}", backend.describe());
                 } else {
-                    match Backend::new_claude("claude-opus-4-8".into()) {
+                    match crate::backend::claude::Credential::resolve(&session.env)
+                        .and_then(|cred| Backend::new_claude("claude-opus-4-8".into(), cred))
+                    {
                         Ok(b) => {
                             *backend = b;
                             println!("backend → {}", backend.describe());

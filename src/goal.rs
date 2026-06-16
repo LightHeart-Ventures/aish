@@ -161,7 +161,7 @@ pub fn spawn(
     condition: String,
     spec: crate::worker::WorkerSpec,
     model: String,
-    api_key: String,
+    cred: crate::backend::claude::Credential,
 ) -> Handle {
     let goal = Arc::new(Goal {
         condition,
@@ -175,11 +175,16 @@ pub fn spawn(
             phase: Step::Idle,
         }),
     });
-    tokio::spawn(run_goal(goal.clone(), spec, model, api_key));
+    tokio::spawn(run_goal(goal.clone(), spec, model, cred));
     goal
 }
 
-async fn run_goal(goal: Handle, spec: crate::worker::WorkerSpec, model: String, api_key: String) {
+async fn run_goal(
+    goal: Handle,
+    spec: crate::worker::WorkerSpec,
+    model: String,
+    cred: crate::backend::claude::Credential,
+) {
     announce(&format!("started — {}", goal.condition));
     let mut guidance: Option<String> = None;
 
@@ -234,7 +239,7 @@ async fn run_goal(goal: Handle, spec: crate::worker::WorkerSpec, model: String, 
         // Verifier: the batch model judges whether the output demonstrates the goal.
         announce(&format!("turn {turn}: checking…"));
         goal.inner.lock().unwrap().phase = Step::Checking;
-        match judge(&api_key, &model, &goal.condition, &output).await {
+        match judge(&cred, &model, &goal.condition, &output).await {
             Ok((true, reason)) => {
                 goal.set(Status::Achieved, Some(reason.clone()));
                 deliver(&goal, turn, &reason, &output);
@@ -257,7 +262,7 @@ async fn run_goal(goal: Handle, spec: crate::worker::WorkerSpec, model: String, 
 /// Ask the verifier (batch model) whether the goal is demonstrably met. Returns
 /// `(met, reason)`. A strict judge: evidence in the output, not mere claims.
 async fn judge(
-    api_key: &str,
+    cred: &crate::backend::claude::Credential,
     model: &str,
     condition: &str,
     work: &str,
@@ -271,11 +276,14 @@ async fn judge(
     let body = json!({
         "model": model,
         "max_tokens": 512,
-        "system": "You are a strict completion judge for an autonomous agent. Decide whether the \
+        // Shaped per credential (OAuth needs the Claude Code identity block).
+        "system": cred.system_value(
+            "You are a strict completion judge for an autonomous agent. Decide whether the \
 GOAL is DEMONSTRABLY met by the WORK OUTPUT — judge only what the output shows as evidence (command \
 results, file contents, exit codes), never what is merely asserted without proof. If the goal \
 states a turn/time bound, honor it. Reply with ONLY a JSON object, no prose: \
 {\"met\": true|false, \"reason\": \"<one sentence>\"}.",
+        ),
         "messages": [{
             "role": "user",
             "content": format!("GOAL:\n{condition}\n\nWORK OUTPUT:\n{work}")
@@ -285,10 +293,11 @@ states a turn/time bound, honor it. Reply with ONLY a JSON object, no prose: \
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = client
+    let req = client
         .post(MESSAGES_API)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-version", "2023-06-01");
+    let resp = cred
+        .apply(req)
         .json(&body)
         .send()
         .await

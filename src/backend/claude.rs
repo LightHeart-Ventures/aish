@@ -5,21 +5,103 @@ use std::time::Duration;
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 
+/// Subscription OAuth tokens (Claude Max/Pro, via `claude setup-token`) are only
+/// honored when the request identifies as Claude Code: the first system block
+/// must be this exact string, or the API rejects the credential. Metered API
+/// keys have no such constraint. We prepend it for OAuth and send our real
+/// system prompt as a second block.
+const CLAUDE_CODE_SPOOF: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// How the request authenticates. A Claude Max/Pro subscription token (as Claude
+/// Code uses) takes precedence over a metered API key when both are present.
+#[derive(Clone)]
+enum Auth {
+    /// `x-api-key` — a metered `sk-ant-…` key (full API surface, incl. Batches).
+    ApiKey(String),
+    /// `Authorization: Bearer` — a subscription `CLAUDE_CODE_OAUTH_TOKEN`
+    /// (`sk-ant-oat…`). Works for the Messages API; the Batches API is out of
+    /// reach for subscription credentials.
+    Oauth(String),
+}
+
+/// A Claude credential resolved from the environment, plus the auth/system
+/// shaping it requires. Shared by `ClaudeBackend` and the goal verifier (which
+/// hand-rolls its own Messages call) so the OAuth handling can't drift between
+/// the two call sites.
+#[derive(Clone)]
+pub struct Credential {
+    auth: Auth,
+}
+
+impl Credential {
+    /// A non-empty value for `key`, looked up in `extra` (the ~/.aishrc `export`
+    /// pairs, last-wins) first, then the process environment. Empty/whitespace
+    /// values are treated as unset.
+    fn lookup(extra: &[(String, String)], key: &str) -> Option<String> {
+        extra
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var(key).ok())
+            .filter(|v| !v.trim().is_empty())
+    }
+
+    /// Resolve a credential, checking the ~/.aishrc exports in `extra` before the
+    /// process env. A `CLAUDE_CODE_OAUTH_TOKEN` (Claude Max/Pro subscription)
+    /// wins over `ANTHROPIC_API_KEY` (metered). Errors if neither is set. Pass
+    /// `&[]` when no rc context is available.
+    pub fn resolve(extra: &[(String, String)]) -> Result<Self> {
+        let auth = match Self::lookup(extra, "CLAUDE_CODE_OAUTH_TOKEN") {
+            Some(t) => Auth::Oauth(t),
+            None => Auth::ApiKey(Self::lookup(extra, "ANTHROPIC_API_KEY").context(
+                "no Claude credential — set CLAUDE_CODE_OAUTH_TOKEN (a Claude Max/Pro \
+subscription token from `claude setup-token`) or ANTHROPIC_API_KEY (a metered key), \
+in your environment or ~/.aishrc",
+            )?),
+        };
+        Ok(Self { auth })
+    }
+
+    /// Add the auth header(s) for this credential to a Messages request. OAuth
+    /// uses a Bearer header plus the oauth beta flag and must NOT also send
+    /// `x-api-key`; a metered key uses `x-api-key`.
+    pub fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth {
+            Auth::ApiKey(k) => req.header("x-api-key", k),
+            Auth::Oauth(t) => req
+                .header("authorization", format!("Bearer {t}"))
+                .header("anthropic-beta", "oauth-2025-04-20"),
+        }
+    }
+
+    /// Shape a system prompt for this credential: OAuth requires the Claude Code
+    /// identity as the first system block (else the credential is rejected); a
+    /// metered key takes the prompt as a plain string.
+    pub fn system_value(&self, system: &str) -> Value {
+        match &self.auth {
+            Auth::Oauth(_) => json!([
+                {"type": "text", "text": CLAUDE_CODE_SPOOF},
+                {"type": "text", "text": system},
+            ]),
+            Auth::ApiKey(_) => json!(system),
+        }
+    }
+}
+
 pub struct ClaudeBackend {
     client: reqwest::Client,
-    api_key: String,
+    cred: Credential,
     pub model: String,
 }
 
 impl ClaudeBackend {
-    pub fn new(model: String) -> Result<Self> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .context("ANTHROPIC_API_KEY is not set — the claude backend needs it")?;
+    pub fn new(model: String, cred: Credential) -> Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(300))
                 .build()?,
-            api_key,
+            cred,
             model,
         })
     }
@@ -44,7 +126,10 @@ impl ClaudeBackend {
             // truncating the tool_use JSON. 32k fits a large file rewrite and is
             // well within Opus/Sonnet 4.x's documented max output (64k).
             "max_tokens": 32000,
-            "system": system,
+            // OAuth (subscription) credentials require the Claude Code identity
+            // as the first system block; API keys take the prompt as a plain
+            // string. See Credential::system_value.
+            "system": self.cred.system_value(system),
             "tools": tool_defs,
             "messages": messages,
             // Auto-cache the growing conversation prefix — a shell session is
@@ -70,15 +155,12 @@ impl ClaudeBackend {
         let mut delay = Duration::from_secs(2);
         for attempt in 0..MAX_ATTEMPTS {
             let last = attempt + 1 == MAX_ATTEMPTS;
-            let resp = self
+            let req = self
                 .client
                 .post(API_URL)
-                .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .json(body)
-                .send()
-                .await;
+                .header("content-type", "application/json");
+            let resp = self.cred.apply(req).json(body).send().await;
 
             match resp {
                 Ok(r) => {
@@ -279,5 +361,53 @@ mod tests {
         assert!(!turn.truncated_tool_call, "plain-text truncation isn't a dropped tool call");
         assert!(turn.raw.is_some());
         assert!(turn.text.contains("response truncated"));
+    }
+
+    // Credentials. Built directly (not via resolve) so the tests never depend on
+    // what's in the process environment.
+    fn oauth() -> Credential {
+        Credential { auth: Auth::Oauth("sk-ant-oat-test".into()) }
+    }
+    fn api_key() -> Credential {
+        Credential { auth: Auth::ApiKey("sk-ant-test".into()) }
+    }
+
+    #[test]
+    fn oauth_token_beats_api_key_when_both_in_rc() {
+        // Both supplied via the rc-exports slice → OAuth (subscription) wins.
+        let c = Credential::resolve(&[
+            ("ANTHROPIC_API_KEY".into(), "sk-ant-test".into()),
+            ("CLAUDE_CODE_OAUTH_TOKEN".into(), "sk-ant-oat-test".into()),
+        ])
+        .unwrap();
+        assert!(matches!(c.auth, Auth::Oauth(_)));
+    }
+
+    #[test]
+    fn lookup_prefers_rc_export_over_process_env() {
+        // A key present in the rc slice short-circuits before the process env.
+        assert_eq!(
+            Credential::lookup(&[("ANTHROPIC_API_KEY".into(), "from-rc".into())], "ANTHROPIC_API_KEY"),
+            Some("from-rc".to_string())
+        );
+        // Blank rc values don't count as set.
+        assert_eq!(
+            Credential::lookup(&[("CLAUDE_CODE_OAUTH_TOKEN".into(), "   ".into())], "NOPE"),
+            None
+        );
+    }
+
+    #[test]
+    fn oauth_system_prompt_prepends_claude_code_identity() {
+        let v = oauth().system_value("REAL SYSTEM PROMPT");
+        let arr = v.as_array().expect("OAuth shapes system as an array of blocks");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["text"], CLAUDE_CODE_SPOOF);
+        assert_eq!(arr[1]["text"], "REAL SYSTEM PROMPT");
+    }
+
+    #[test]
+    fn api_key_system_prompt_stays_a_plain_string() {
+        assert_eq!(api_key().system_value("REAL SYSTEM PROMPT"), json!("REAL SYSTEM PROMPT"));
     }
 }

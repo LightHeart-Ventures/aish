@@ -78,8 +78,8 @@ pub enum Backend {
 }
 
 impl Backend {
-    pub fn new_claude(model: String) -> Result<Self> {
-        Ok(Backend::Claude(claude::ClaudeBackend::new(model)?))
+    pub fn new_claude(model: String, cred: claude::Credential) -> Result<Self> {
+        Ok(Backend::Claude(claude::ClaudeBackend::new(model, cred)?))
     }
 
     #[cfg(feature = "local")]
