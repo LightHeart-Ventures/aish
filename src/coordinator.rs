@@ -151,7 +151,9 @@ pub async fn drive(
     store: Option<&CoordinatorStore>,
 ) -> Outcome {
     if let Some(s) = store {
-        let _ = s.insert(run_id, &input, &session.session_id);
+        // session.session_id/name were adopted from the LAUNCHING session at
+        // startup (see main.rs), so the row attributes to who asked for the work.
+        let _ = s.insert(run_id, &input, &session.session_id, session.name.as_deref());
     }
 
     let mut rounds = 0usize;
@@ -207,6 +209,10 @@ codes, diffs).\n\nTASK:\n{input}",
             if let Some(s) = store {
                 let _ = s.set_phase(run_id, Phase::AwaitingBatch.as_str());
             }
+            // Forwarded to the watcher (via the `📦` sentinel) as the batch-vs-
+            // standard indicator: this round fanned work out to the Batches API.
+            let n = crate::batch::running_count(&session.batch_jobs);
+            eprintln!("📦 fanned {n} sub-task(s) out to the Batches API; awaiting results");
             await_batches_with_heartbeat(session, run_id, store).await;
 
             // Fold the batch results back: feed the just-completed sub-work into
