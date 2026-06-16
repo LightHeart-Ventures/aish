@@ -59,6 +59,10 @@ pub struct Job {
     /// Channel that asks the background waiter task to kill the child. `None`
     /// for foreground jobs (the shell waits on them directly).
     kill: Mutex<Option<oneshot::Sender<()>>>,
+    /// Process-group id the job leads (`pgid == leader pid`), recorded once the
+    /// child is spawned. `None` until set. Used to signal the whole job on shell
+    /// exit (SIGHUP/SIGCONT — TASK-123); the libc signalling lives in `tools`.
+    pgid: Mutex<Option<libc::pid_t>>,
 }
 
 /// The unified job table: the single source of truth for every foreground and
@@ -77,6 +81,7 @@ impl Job {
             state: Mutex::new(JobState::Running),
             buffer: Mutex::new(String::new()),
             kill: Mutex::new(Some(kill_tx)),
+            pgid: Mutex::new(None),
         });
         (job, kill_rx)
     }
@@ -90,6 +95,7 @@ impl Job {
             state: Mutex::new(JobState::Running),
             buffer: Mutex::new(String::new()),
             kill: Mutex::new(None),
+            pgid: Mutex::new(None),
         })
     }
 
@@ -101,6 +107,27 @@ impl Job {
     /// Mark the job finished with the given exit summary.
     pub fn finish(&self, summary: impl Into<String>) {
         *self.state.lock().unwrap() = JobState::Done(summary.into());
+    }
+
+    /// True once the job has reached its terminal `Done` state.
+    pub fn is_done(&self) -> bool {
+        self.state.lock().unwrap().is_done()
+    }
+
+    /// True while the job is suspended (SIGTSTP / Ctrl-Z).
+    pub fn is_stopped(&self) -> bool {
+        matches!(*self.state.lock().unwrap(), JobState::Stopped)
+    }
+
+    /// Record the process group this job leads (`pgid == leader pid`). Set once,
+    /// right after the child is spawned.
+    pub fn set_pgid(&self, pgid: libc::pid_t) {
+        *self.pgid.lock().unwrap() = Some(pgid);
+    }
+
+    /// The process group this job leads, if recorded.
+    pub fn pgid(&self) -> Option<libc::pid_t> {
+        *self.pgid.lock().unwrap()
     }
 
     /// Suspend a running job (SIGTSTP / Ctrl-Z). No-op once finished.

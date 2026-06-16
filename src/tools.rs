@@ -635,6 +635,29 @@ pub fn announce(prefix: &str, line: &str) {
     eprint!("\r\x1b[2K\x1b[2m{prefix} {line}\x1b[0m\n");
 }
 
+/// Hang up every still-live managed job when the shell exits, so none is
+/// orphaned (TASK-123 / S3.6). For each non-terminal job with a known process
+/// group: if it is stopped, continue it first (SIGCONT) — a stopped process
+/// can't act on a pending SIGHUP — then send SIGHUP to the whole group. Jobs
+/// that have already finished, or that never recorded a pgid, are skipped.
+pub fn hangup_jobs_on_exit(jobs: &Jobs) {
+    let jobs = jobs.lock().unwrap();
+    for job in jobs.iter() {
+        if job.is_done() {
+            continue;
+        }
+        let Some(pgid) = job.pgid() else { continue };
+        // SAFETY: signalling a managed job's own process group (pgid == its
+        // leader pid), which the shell put in its own group at spawn.
+        unsafe {
+            if job.is_stopped() {
+                libc::kill(-pgid, libc::SIGCONT);
+            }
+            libc::kill(-pgid, libc::SIGHUP);
+        }
+    }
+}
+
 fn spawn_background(
     program: &str,
     args: &[String],
@@ -642,8 +665,8 @@ fn spawn_background(
     session: &Session,
     display: String,
 ) -> Result<String> {
-    let mut child = tokio::process::Command::new(program)
-        .args(args)
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
         .current_dir(&session.cwd)
         .envs(session.env.iter().map(|(k, v)| (k, v)))
         .envs(env.iter().map(|(k, v)| (k, v)))
@@ -652,14 +675,28 @@ fn spawn_background(
         .stderr(Stdio::piped())
         // The Child moves into the waiter task below, so this only fires if
         // aish itself shuts down — background jobs die with the shell.
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    // Lead its own process group (pgid == pid) so the shell can hang the job up
+    // by group on exit without signalling itself (TASK-123). setpgid(0, 0) in
+    // the post-fork child; `pre_exec` is an inherent method on tokio's Command.
+    unsafe {
+        cmd.pre_exec(|| match libc::setpgid(0, 0) {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        });
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to exec {program}: {e}"))?;
     let pid = child.id().unwrap_or_default();
+    // Mirror the setpgid from the parent to close the spawn race (EACCES once
+    // the child has exec'd is expected — ignore it).
+    unsafe { libc::setpgid(pid as libc::pid_t, pid as libc::pid_t) };
 
     let mut jobs = session.jobs.lock().unwrap();
     let id = jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
     let (job, kill_rx) = Job::background(id, display);
+    job.set_pgid(pid as libc::pid_t);
 
     stream_job_pipe(child.stdout.take().expect("piped"), job.clone());
     stream_job_pipe(child.stderr.take().expect("piped"), job.clone());
@@ -1695,6 +1732,62 @@ mod tests {
         for (sig, h) in saved {
             unsafe { libc::signal(sig, h) };
         }
+    }
+
+    // AC ac_3411acecc301 — exiting aish must not orphan stopped jobs. A stopped
+    // child can't act on a pending SIGHUP, so hangup_jobs_on_exit must SIGCONT it
+    // first and then SIGHUP its group; the child must terminate (by SIGHUP), not
+    // linger as an orphan.
+    #[test]
+    fn hangup_on_exit_continues_and_kills_stopped_job() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        // Leads its own process group (so we can signal it by group without
+        // touching the test runner), stops itself, then would sleep — surviving
+        // the shell unless it is continued and hung up.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "kill -STOP $$; sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: setpgid(0, 0) in the post-fork child — new pgid == child pid.
+        unsafe {
+            cmd.pre_exec(|| match libc::setpgid(0, 0) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            });
+        }
+        let proc = cmd.spawn().expect("spawn stopped-job probe");
+        let pid = proc.id() as libc::pid_t;
+        // std::process::Child::drop neither reaps nor kills — we waitpid the pid.
+        drop(proc);
+
+        // Wait until the child has actually stopped itself before hanging it up.
+        let mut st: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(pid, &mut st, libc::WUNTRACED) };
+        assert!(r == pid && libc::WIFSTOPPED(st), "probe did not stop");
+
+        // Register it as a stopped background job carrying its process group.
+        let jobs: Jobs = Default::default();
+        let (job, _kill_rx) = Job::background(1, "stopped probe".into());
+        job.set_pgid(pid);
+        job.stop();
+        jobs.lock().unwrap().push(job);
+
+        // Shell exit.
+        hangup_jobs_on_exit(&jobs);
+
+        // The child must be continued and terminated by SIGHUP — not orphaned.
+        let mut st2: libc::c_int = 0;
+        let r2 = unsafe { libc::waitpid(pid, &mut st2, 0) };
+        assert_eq!(r2, pid, "failed to reap probe");
+        assert!(libc::WIFSIGNALED(st2), "probe was not terminated by a signal");
+        assert_eq!(
+            libc::WTERMSIG(st2),
+            libc::SIGHUP,
+            "probe was not hung up (SIGHUP) on shell exit"
+        );
     }
 
     #[tokio::test]
