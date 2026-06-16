@@ -1043,6 +1043,7 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                  :backend <claude|local>             switch backend\n\
                  :mcp [list|status]                  list connected MCP servers\n\
                  :mcp reconnect [name|all]           restart MCP server(s)\n\
+                 :mcp reload                          connect servers newly added to .mcp.json (no restart)\n\
                  :mcp add <name> <command|url> [args] connect + save an MCP server (~/.aish/.mcp.json)\n\
                  :mcp remove <name>                  disconnect + unsave an MCP server\n\
                  :mcp tools [name]                   list MCP tools\n\
@@ -1274,6 +1275,23 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
                         Err(e) => println!("reconnect {name}: {e:#}"),
                     }
                 }
+            }
+        }
+        Some((&"reload", _)) => {
+            // Re-scan .mcp.json and connect anything newly added there, without a
+            // restart. New servers' tools join the model's tool set on the next
+            // turn; their MCP-published skills appear in the system prompt only
+            // after a restart.
+            let added = session.mcp.reload().await;
+            if added.is_empty() {
+                println!("no new MCP servers in .mcp.json (all already connected)");
+            } else {
+                println!(
+                    "connected {} new server{}: {}",
+                    added.len(),
+                    if added.len() == 1 { "" } else { "s" },
+                    added.join(", ")
+                );
             }
         }
         Some((&"add", rest)) => {
