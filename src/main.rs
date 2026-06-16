@@ -76,17 +76,10 @@ async fn main() -> Result<()> {
                 cred,
             )?
         }
-        "grok" => {
-            let key = rc::env_value(&session.env, "XAI_API_KEY").ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no Grok credential — set XAI_API_KEY in your environment or ~/.aishrc"
-                )
-            })?;
-            backend::Backend::new_grok(
-                args.model.unwrap_or_else(|| backend::grok::DEFAULT_MODEL.into()),
-                key,
-            )?
-        }
+        "grok" => backend::Backend::new_grok(
+            args.model.unwrap_or_else(|| backend::grok::DEFAULT_MODEL.into()),
+            &session.env,
+        )?,
         #[cfg(feature = "local")]
         "local" => backend::Backend::new_local(),
         other => anyhow::bail!("unknown backend: {other} (available: claude, grok, local)"),

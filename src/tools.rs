@@ -655,17 +655,20 @@ fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
     if task.is_empty() {
         anyhow::bail!("`task` is required");
     }
-    // A background coordinator (a re-exec'd headless aish) runs Messages turns,
-    // which work with EITHER a metered ANTHROPIC_API_KEY or a Claude subscription
-    // CLAUDE_CODE_OAUTH_TOKEN (inherited via the child's env, incl. ~/.aishrc
-    // exports). Require at least one. The nested tool-less batch path below
-    // additionally needs a metered key (subscription tokens can't reach the
-    // Batches API) — checked there.
-    if crate::backend::claude::Credential::resolve(&session.env).is_err() {
+    // A background coordinator (a re-exec'd headless aish) runs on the SAME
+    // backend as this session (full parity), so it needs a credential for THAT
+    // backend — both inherited by the child (env + ~/.aishrc exports, and for
+    // Grok the ~/.grok/auth.json token file). Claude works with either
+    // ANTHROPIC_API_KEY or a CLAUDE_CODE_OAUTH_TOKEN subscription; the nested
+    // tool-less batch path below additionally needs a metered key (checked there).
+    let cred_ok = match session.backend_kind.as_str() {
+        "grok" => crate::backend::grok::credential_available(&session.env),
+        _ => crate::backend::claude::Credential::resolve(&session.env).is_ok(),
+    };
+    if !cred_ok {
         anyhow::bail!(
-            "no Claude credential — set CLAUDE_CODE_OAUTH_TOKEN (a Claude Max/Pro subscription \
-token) or ANTHROPIC_API_KEY (a metered key), in your environment or ~/.aishrc, so background \
-jobs can authenticate"
+            "no credential for the active backend — Claude needs CLAUDE_CODE_OAUTH_TOKEN or \
+ANTHROPIC_API_KEY; Grok needs a Grok CLI login (~/.grok/auth.json) or XAI_API_KEY (env or ~/.aishrc)"
         );
     }
 

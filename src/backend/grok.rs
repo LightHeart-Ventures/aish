@@ -1,6 +1,7 @@
 use super::{Msg, Role, ToolCall, ToolDef, Turn};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::time::Duration;
 
 const API_URL: &str = "https://api.x.ai/v1/chat/completions";
@@ -17,21 +18,111 @@ pub const DEFAULT_MODEL: &str = "grok-code-fast-1";
 /// OpenAI-current field; `max_tokens` is deprecated).
 const MAX_COMPLETION_TOKENS: u64 = 32000;
 
+/// Where the Grok backend gets its bearer token. A SuperGrok/X Premium
+/// subscription (via the Grok CLI's `~/.grok/auth.json`) is preferred over a
+/// metered API key — mirroring the Claude Max precedence (subscription first).
+enum GrokAuth {
+    /// A metered `XAI_API_KEY` (env or ~/.aishrc) — sent verbatim as the bearer.
+    ApiKey(String),
+    /// The Grok CLI's OAuth token store (`~/.grok/auth.json`), holding a
+    /// subscription token. Read FRESH on each request so a token the Grok CLI has
+    /// refreshed is picked up without restarting aish (the CLI owns login +
+    /// refresh; aish only reads).
+    OAuthFile(PathBuf),
+}
+
+impl GrokAuth {
+    /// Prefer the subscription OAuth token (`~/.grok/auth.json`) when present,
+    /// else a metered `XAI_API_KEY` from the rc exports or process env.
+    fn resolve(extra: &[(String, String)]) -> Result<Self> {
+        if let Some(p) = grok_auth_path() {
+            if p.exists() {
+                return Ok(GrokAuth::OAuthFile(p));
+            }
+        }
+        if let Some(key) = crate::rc::env_value(extra, "XAI_API_KEY") {
+            return Ok(GrokAuth::ApiKey(key));
+        }
+        bail!(
+            "no Grok credential — log in with the Grok CLI (creates ~/.grok/auth.json) \
+or set XAI_API_KEY in your environment or ~/.aishrc"
+        )
+    }
+
+    /// The current bearer token. For the OAuth file this reads + parses on every
+    /// request, so a token the Grok CLI refreshed is used without a restart.
+    fn bearer(&self) -> Result<String> {
+        match self {
+            GrokAuth::ApiKey(k) => Ok(k.clone()),
+            GrokAuth::OAuthFile(p) => {
+                let contents = std::fs::read_to_string(p)
+                    .with_context(|| format!("reading Grok token store {}", p.display()))?;
+                token_from_auth_json(&contents)
+            }
+        }
+    }
+
+    /// A non-secret label for `describe()` — never the token itself.
+    fn label(&self) -> &'static str {
+        match self {
+            GrokAuth::ApiKey(_) => "api key",
+            GrokAuth::OAuthFile(_) => "subscription",
+        }
+    }
+}
+
+/// `~/.grok/auth.json` — the Grok CLI's token store.
+fn grok_auth_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".grok").join("auth.json"))
+}
+
+/// Extract the access token from the Grok CLI's `auth.json`. The file maps one
+/// or more `"<issuer>::<client_id>"` keys to a login entry; the JWT bearer lives
+/// in that entry's `key` field. We take the first entry (the CLI keeps one active
+/// login). Pure (string in, token out) so it's unit-testable without the file.
+fn token_from_auth_json(contents: &str) -> Result<String> {
+    let v: Value = serde_json::from_str(contents).context("~/.grok/auth.json is not valid JSON")?;
+    let obj = v.as_object().context("~/.grok/auth.json: expected a JSON object of logins")?;
+    let entry = obj
+        .values()
+        .next()
+        .context("~/.grok/auth.json has no login — run the Grok CLI login")?;
+    let key = entry["key"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .context("~/.grok/auth.json login has no `key` token — re-run the Grok CLI login")?;
+    Ok(key.to_string())
+}
+
+/// True when SOME Grok credential is resolvable (OAuth file or `XAI_API_KEY`).
+/// Used by the background-dispatch guards when the active backend is Grok.
+pub fn credential_available(extra: &[(String, String)]) -> bool {
+    GrokAuth::resolve(extra).is_ok()
+}
+
 pub struct GrokBackend {
     client: reqwest::Client,
-    api_key: String,
+    auth: GrokAuth,
     pub model: String,
 }
 
 impl GrokBackend {
-    pub fn new(model: String, api_key: String) -> Result<Self> {
+    /// Resolve a credential (subscription OAuth file, else `XAI_API_KEY` from
+    /// `extra_env`/process env) and build the backend.
+    pub fn new(model: String, extra_env: &[(String, String)]) -> Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(300))
                 .build()?,
-            api_key,
+            auth: GrokAuth::resolve(extra_env)?,
             model,
         })
+    }
+
+    /// Non-secret credential label for `describe()` ("subscription" / "api key").
+    pub fn auth_label(&self) -> &'static str {
+        self.auth.label()
     }
 
     pub async fn complete(&self, system: &str, history: &[Msg], tools: &[ToolDef]) -> Result<Turn> {
@@ -76,13 +167,17 @@ impl GrokBackend {
         // wait stays bounded. Mirrors claude.rs's resilience.
         const MAX_ATTEMPTS: u32 = 6;
         const MAX_DELAY: Duration = Duration::from_secs(30);
+        // Resolve the bearer once per request (fresh-reads the OAuth file, so a
+        // CLI-refreshed token is picked up); it won't change across the ~seconds
+        // of retry backoff.
+        let bearer = self.auth.bearer()?;
         let mut delay = Duration::from_secs(2);
         for attempt in 0..MAX_ATTEMPTS {
             let last = attempt + 1 == MAX_ATTEMPTS;
             let resp = self
                 .client
                 .post(API_URL)
-                .header("authorization", format!("Bearer {}", self.api_key))
+                .header("authorization", format!("Bearer {bearer}"))
                 .header("content-type", "application/json")
                 .json(body)
                 .send()
@@ -104,6 +199,15 @@ impl GrokBackend {
                         tokio::time::sleep(delay).await;
                         delay = (delay * 2).min(MAX_DELAY);
                         continue;
+                    }
+                    // A rejected subscription token is usually an expired login;
+                    // the Grok CLI owns the refresh, so point the user there. (403
+                    // is also where xAI's SuperGrok-Heavy allowlist would bite.)
+                    if matches!(status, 401 | 403) && matches!(self.auth, GrokAuth::OAuthFile(_)) {
+                        bail!(
+                            "grok api {kind} ({status}): {msg} — your SuperGrok login may have \
+expired or lack API access; re-run the Grok CLI to refresh ~/.grok/auth.json"
+                        );
                     }
                     bail!("grok api {kind} ({status}): {msg}");
                 }
@@ -440,6 +544,30 @@ mod tests {
 
         let s2 = sanitize_schema(&json!({"type": "object"}));
         assert_eq!(s2["properties"], json!({}));
+    }
+
+    #[test]
+    fn token_extracted_from_grok_auth_json() {
+        // Shape mirrors the real ~/.grok/auth.json: one "<issuer>::<client_id>"
+        // login entry whose `key` is the JWT bearer.
+        let contents = r#"{
+            "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {
+                "key": "eyJ0eXAiOiJKV1Qif.payload.sig",
+                "auth_mode": "oidc",
+                "refresh_token": "rt_abc",
+                "expires_at": "2026-06-16T11:26:09.947367Z"
+            }
+        }"#;
+        assert_eq!(token_from_auth_json(contents).unwrap(), "eyJ0eXAiOiJKV1Qif.payload.sig");
+    }
+
+    #[test]
+    fn token_extraction_errors_are_clear() {
+        assert!(token_from_auth_json("not json").is_err());
+        assert!(token_from_auth_json("{}").is_err(), "no login entry");
+        // entry present but no/blank key
+        assert!(token_from_auth_json(r#"{"x::y": {"key": ""}}"#).is_err());
+        assert!(token_from_auth_json(r#"{"x::y": {"auth_mode": "oidc"}}"#).is_err());
     }
 
     #[test]
