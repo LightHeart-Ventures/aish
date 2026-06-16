@@ -69,9 +69,12 @@ pub async fn run_turn(
             return Ok(turn.text);
         }
 
-        // Interim narration from the model, shown dim.
+        // Interim narration from the model (its reasoning between tool calls) —
+        // rendered at normal brightness like the final answer, because it's
+        // substantive content the user reads. Only the transient 🔧 tool-activity
+        // lines stay dim, so the rounds still read as structured.
         if !turn.text.trim().is_empty() {
-            eprintln!("\x1b[2m{}\x1b[0m", crate::md::render(turn.text.trim(), "\x1b[2m"));
+            eprintln!("{}", crate::md::render(turn.text.trim(), ""));
         }
 
         let mut results: Vec<ToolResult> = Vec::with_capacity(turn.tool_calls.len());
