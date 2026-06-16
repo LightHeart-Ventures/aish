@@ -1,4 +1,5 @@
 pub mod claude;
+pub mod grok;
 #[cfg(feature = "local")]
 pub mod local;
 
@@ -73,6 +74,7 @@ pub struct ToolDef {
 /// Enum dispatch — two backends don't justify a trait object.
 pub enum Backend {
     Claude(claude::ClaudeBackend),
+    Grok(grok::GrokBackend),
     #[cfg(feature = "local")]
     Local(local::LocalBackend),
 }
@@ -80,6 +82,22 @@ pub enum Backend {
 impl Backend {
     pub fn new_claude(model: String, cred: claude::Credential) -> Result<Self> {
         Ok(Backend::Claude(claude::ClaudeBackend::new(model, cred)?))
+    }
+
+    pub fn new_grok(model: String, api_key: String) -> Result<Self> {
+        Ok(Backend::Grok(grok::GrokBackend::new(model, api_key)?))
+    }
+
+    /// A stable short name for the active backend (`"claude"`/`"grok"`/`"local"`).
+    /// Used to thread the active backend through to background coordinators so
+    /// they run on the same provider the interactive session does.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Backend::Claude(_) => "claude",
+            Backend::Grok(_) => "grok",
+            #[cfg(feature = "local")]
+            Backend::Local(_) => "local",
+        }
     }
 
     #[cfg(feature = "local")]
@@ -93,6 +111,7 @@ impl Backend {
     pub async fn prepare(&self) -> Result<()> {
         match self {
             Backend::Claude(_) => Ok(()),
+            Backend::Grok(_) => Ok(()),
             #[cfg(feature = "local")]
             Backend::Local(b) => b.prepare().await,
         }
@@ -101,6 +120,7 @@ impl Backend {
     pub async fn complete(&self, system: &str, history: &[Msg], tools: &[ToolDef]) -> Result<Turn> {
         match self {
             Backend::Claude(b) => b.complete(system, history, tools).await,
+            Backend::Grok(b) => b.complete(system, history, tools).await,
             #[cfg(feature = "local")]
             Backend::Local(b) => b.complete(system, history, tools).await,
         }
@@ -109,6 +129,7 @@ impl Backend {
     pub fn describe(&self) -> String {
         match self {
             Backend::Claude(b) => format!("claude ({})", b.model),
+            Backend::Grok(b) => format!("grok ({})", b.model),
             #[cfg(feature = "local")]
             Backend::Local(b) => format!("local ({} · in-process)", b.file),
         }
@@ -121,6 +142,8 @@ impl Backend {
     pub fn include_mcp_tools(&self) -> bool {
         match self {
             Backend::Claude(_) => true,
+            // Grok is a capable, large-context model — give it the full MCP tool set.
+            Backend::Grok(_) => true,
             #[cfg(feature = "local")]
             Backend::Local(_) => false,
         }
@@ -129,6 +152,7 @@ impl Backend {
     pub fn set_model(&mut self, model: String) {
         match self {
             Backend::Claude(b) => b.model = model,
+            Backend::Grok(b) => b.model = model,
             #[cfg(feature = "local")]
             Backend::Local(_) => {
                 eprintln!("(:model on the local backend isn't wired — set AISH_LOCAL_MODEL_ID and restart, or use :backend claude)")

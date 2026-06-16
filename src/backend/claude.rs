@@ -36,15 +36,10 @@ pub struct Credential {
 impl Credential {
     /// A non-empty value for `key`, looked up in `extra` (the ~/.aishrc `export`
     /// pairs, last-wins) first, then the process environment. Empty/whitespace
-    /// values are treated as unset.
+    /// values are treated as unset. Delegates to the shared `rc::env_value` so the
+    /// precedence stays identical to the Grok key resolution in `main.rs`.
     fn lookup(extra: &[(String, String)], key: &str) -> Option<String> {
-        extra
-            .iter()
-            .rev()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.clone())
-            .or_else(|| std::env::var(key).ok())
-            .filter(|v| !v.trim().is_empty())
+        crate::rc::env_value(extra, key)
     }
 
     /// Resolve a credential, checking the ~/.aishrc exports in `extra` before the

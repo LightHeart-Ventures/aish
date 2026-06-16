@@ -726,7 +726,8 @@ you're working on it and the answer will appear here when ready — no job id, n
     let spec = crate::worker::WorkerSpec {
         exe,
         cwd: session.cwd.clone(),
-        model: session.batch_model.clone(),
+        backend: session.backend_kind.clone(),
+        model: crate::worker::coordinator_model(&session.backend_kind, &session.batch_model),
         env: session.env.clone(),
         isolate,
     };
