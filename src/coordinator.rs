@@ -49,10 +49,11 @@ use std::time::Duration;
 
 /// Upper bound on agentic rounds (a misbehaving model can't spin forever).
 /// Mirrors atum's `DEFAULT_MAX_STEPS` backstop, scaled for a shell session.
-/// Kept modest because each round accumulates conversation history in the
-/// coordinator process — too many rounds is the OOM path. Most real work
-/// completes in 1–3 rounds.
-const MAX_ROUNDS: usize = 12;
+/// Bounded but generous: real multi-file work (rewrite a crate, iterate to a
+/// green build) needs many rounds, and the parent-side stdout capture is already
+/// capped at 1MB (`worker::read_capped`), so rounds aren't the OOM lever — a
+/// runaway still terminates here. Most work completes well under this.
+const MAX_ROUNDS: usize = 36;
 
 /// How often to beat the run's durable heartbeat while awaiting batches — proof
 /// of liveness so a restart can tell a live run from an orphaned one. Matches
@@ -266,6 +267,13 @@ async fn await_batches_with_heartbeat(
 /// a fresh heartbeat are left untouched. Idempotent: already-surfaced/terminal
 /// rows are cleared, so a second start is a no-op.
 pub fn rehydrate(session: &mut Session) {
+    // Best-effort: prune git's record of worktrees whose directories are gone
+    // (e.g. a crashed isolated worker left a dangling registration). Cheap and
+    // safe — `git worktree prune` only drops already-missing entries.
+    // TODO(worktree): also `git worktree remove` empty leftover worktree dirs from
+    // crashed runs (those with a live dir but no commits) — needs a per-dir scan.
+    crate::worker::prune_worktrees(&session.cwd);
+
     let Some(store) = session.coordinator_store.clone() else {
         return;
     };

@@ -19,7 +19,10 @@ enum Spin {
 }
 type SpinState = Arc<Mutex<Spin>>;
 
-const MAX_ITERATIONS: usize = 40; // runaway-loop backstop
+// Per-turn tool-call iteration backstop. Generous enough that a legitimate
+// multi-file task (read several files, edit them, build, test, fix) completes
+// within one turn, but still a hard stop so a runaway tool loop terminates.
+const MAX_ITERATIONS: usize = 50;
 
 /// One full agentic turn: user input → (model ⇄ tools)* → final text.
 /// Frontend-agnostic: confirmation is a callback, output goes through eprintln
@@ -64,6 +67,17 @@ pub async fn run_turn(
             tool_results: vec![],
             raw: turn.raw,
         });
+
+        // A response cut off mid-tool-call had its partial tool call dropped (see
+        // claude.rs) — `tool_calls` is empty but this is NOT a final answer. The
+        // corrective note is already in `turn.text` (now in history as the
+        // assistant message); loop so the model retries with a smaller edit.
+        if turn.truncated_tool_call {
+            if !turn.text.trim().is_empty() {
+                eprintln!("{}", crate::md::render(turn.text.trim(), ""));
+            }
+            continue;
+        }
 
         if turn.tool_calls.is_empty() {
             return Ok(turn.text);
