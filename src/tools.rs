@@ -410,6 +410,74 @@ fn exec_needs_confirm(mode: crate::session::Mode, program: &str, args: &[String]
     }
 }
 
+/// The currently checked-out branch in `cwd`, or `None` if it can't be told
+/// (not a repo, detached HEAD, git missing). Cheap `git rev-parse` probe.
+fn current_git_branch(cwd: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!b.is_empty() && b != "HEAD").then_some(b)
+}
+
+/// Guard entry point: returns a human reason when this `git` invocation would
+/// mutate the default branch (push to or commit on main/master). Only `push`
+/// and `commit` are inspected — and only those pay for the branch lookup.
+fn git_default_branch_guard(args: &[String], cwd: &Path) -> Option<String> {
+    match args.first().map(String::as_str) {
+        Some("push") | Some("commit") => {
+            protected_git_mutation(args, current_git_branch(cwd).as_deref())
+        }
+        _ => None,
+    }
+}
+
+/// Pure default-branch detection (split out for testing — no IO). `args` is the
+/// git argv *after* the program; `current_branch` is the checked-out branch.
+fn protected_git_mutation(args: &[String], current_branch: Option<&str>) -> Option<String> {
+    let is_default = |b: &str| matches!(b, "main" | "master");
+    let on_default = current_branch.map(is_default).unwrap_or(false);
+    match args.first().map(String::as_str)? {
+        "push" => {
+            // An explicit main/master target — `git push origin main`,
+            // `… HEAD:main`, `… :main` — is unambiguous.
+            let names_default = args
+                .iter()
+                .any(|a| is_default(a) || a.rsplit(':').next().map(is_default).unwrap_or(false));
+            if names_default {
+                return Some("push to the default branch (main/master)".into());
+            }
+            // An implicit push (no explicit refspec beyond a remote) while ON the
+            // default branch pushes it. An explicit other-branch refspec is fine.
+            if on_default && !push_has_explicit_refspec(args) {
+                return Some("push the current branch, which is the default (main/master)".into());
+            }
+            None
+        }
+        "commit" if on_default => {
+            Some("commit directly on the default branch (main/master)".into())
+        }
+        _ => None,
+    }
+}
+
+/// True when a `git push` argv carries an explicit refspec (a second non-flag
+/// token after the remote), i.e. it targets a named branch rather than pushing
+/// the current one. Flags (`-u`, `--force`, …) and the lone remote don't count.
+fn push_has_explicit_refspec(args: &[String]) -> bool {
+    args.iter()
+        .skip(1) // drop the "push" subcommand
+        .filter(|a| !a.starts_with('-'))
+        .count()
+        >= 2 // remote + at least one refspec
+}
+
 // ---------------------------------------------------------------------------
 // Executors
 // ---------------------------------------------------------------------------
@@ -435,6 +503,32 @@ fn parse_argv(call: &ToolCall) -> Result<(String, Vec<String>)> {
 
 async fn run_program(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
     let (program, args) = parse_argv(call)?;
+
+    // Default-branch guard: never let an agent commit on / push the default
+    // branch directly (the footgun that pushed unreviewed work straight to a
+    // shared main). Unattended (yolo or a background coordinator) → hard refuse;
+    // interactive → require an explicit y/N (not the always-allow gate, so this
+    // can't be permanently waved through). Branch + PR is the only sanctioned path.
+    if bin_name(&program) == "git" {
+        if let Some(reason) = git_default_branch_guard(&args, &session.cwd) {
+            if session.mode == crate::session::Mode::Yolo || session.nested {
+                anyhow::bail!(
+                    "refused: this command would {reason}. aish does not let an agent touch the \
+default branch directly — create a feature branch (git checkout -b …), commit there, push the \
+branch, and open a pull request (gh pr create) instead."
+                );
+            }
+            if confirm(&format!(
+                "⚠ this git command would {reason}, bypassing review — proceed anyway?"
+            )) == Decision::Deny
+            {
+                return Ok(
+                    "declined — use a feature branch + pull request instead of touching the default branch".into(),
+                );
+            }
+        }
+    }
+
     let env = resolve_env(call, session);
     let background = call.args["background"].as_bool() == Some(true);
 
@@ -1451,6 +1545,29 @@ mod tests {
         // Independent of batch mode: escalate tracks its own flag.
         assert!(has(&tool_defs(false, true), "escalate"));
         assert!(!has(&tool_defs(false, false), "escalate"));
+    }
+
+    #[test]
+    fn default_branch_guard_detects_protected_mutations() {
+        let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        // Explicit push to main/master — blocked regardless of current branch.
+        assert!(protected_git_mutation(&a("push origin main"), Some("feature")).is_some());
+        assert!(protected_git_mutation(&a("push -u origin master"), None).is_some());
+        assert!(protected_git_mutation(&a("push origin HEAD:main"), Some("feature")).is_some());
+        // Implicit push while ON the default branch — blocked.
+        assert!(protected_git_mutation(&a("push"), Some("main")).is_some());
+        assert!(protected_git_mutation(&a("push origin"), Some("main")).is_some());
+        // Commit on the default branch — blocked.
+        assert!(protected_git_mutation(&a("commit -m wip"), Some("main")).is_some());
+
+        // Pushing/committing a feature branch — allowed.
+        assert!(protected_git_mutation(&a("push origin feature"), Some("feature")).is_none());
+        assert!(protected_git_mutation(&a("push -u origin feat/x"), Some("feat/x")).is_none());
+        assert!(protected_git_mutation(&a("push"), Some("feature")).is_none());
+        assert!(protected_git_mutation(&a("commit -m wip"), Some("feature")).is_none());
+        // Non-mutating git verbs — never flagged.
+        assert!(protected_git_mutation(&a("status"), Some("main")).is_none());
+        assert!(protected_git_mutation(&a("log -5"), Some("main")).is_none());
     }
 
     #[test]
