@@ -330,6 +330,40 @@ pub fn drain_pending(jobs: &BatchJobs) -> Vec<String> {
         .collect()
 }
 
+/// Collapse a (possibly multi-line) task to a single clipped line, for notices
+/// and listings. Shared with `worker.rs`.
+pub fn one_line(task: &str) -> String {
+    let s = task.split_whitespace().collect::<Vec<_>>().join(" ");
+    if s.chars().count() > 60 {
+        format!("{}…", s.chars().take(60).collect::<String>())
+    } else {
+        s
+    }
+}
+
+/// One-line completion NOTICES for finished-but-unshown batch jobs, marking them
+/// shown. The interactive presenter NOTIFIES instead of dumping the full result
+/// over the prompt — the user views it on demand with `:result <id>`. The result
+/// stays available via `fetch`.
+pub fn notify_pending(jobs: &BatchJobs) -> Vec<String> {
+    let pending: Vec<Arc<BatchJob>> = {
+        let g = jobs.lock().unwrap();
+        g.iter().filter(|j| j.is_terminal() && !j.is_displayed()).cloned().collect()
+    };
+    pending
+        .iter()
+        .map(|job| {
+            let (icon, what) = if job.status() == "failed" { ("✗", "failed") } else { ("✓", "done") };
+            job.mark_displayed();
+            let sid = short_id(&job.id);
+            format!(
+                "\x1b[2m{icon} batch {sid} {what} — `:result {sid}` to view · {}\x1b[0m",
+                one_line(&job.task)
+            )
+        })
+        .collect()
+}
+
 /// Count of batch jobs still running — for the prompt's `⟳N` indicator.
 pub fn running_count(jobs: &BatchJobs) -> usize {
     jobs.lock().unwrap().iter().filter(|j| !j.is_terminal()).count()

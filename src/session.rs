@@ -88,10 +88,11 @@ pub struct Session {
     /// keeps `a` working even when the persistent store is unavailable (AC3).
     /// Populated on every 'a' answer and consulted before the DB.
     pub session_allows: HashSet<String>,
-    /// Interactive batch mode (on by default, persisted; toggle with `:batch`).
-    /// When on, the agent gets the run_in_background/batch_result tools and a
-    /// system-prompt nudge to offload deferrable work to background Anthropic
-    /// Message Batches jobs. A persisted `:batch off` survives restarts.
+    /// Interactive background mode (on by default, persisted; toggle with `:batch`).
+    /// When on, the agent gets the run_in_background/background_status tools and a
+    /// system-prompt nudge to offload deferrable work to a full background
+    /// coordinator (which may itself fan sub-work out to the Anthropic Batches
+    /// API). A persisted `:batch off` survives restarts.
     pub batch_mode: bool,
     /// Model every background batch runs on (batches are Anthropic-only). Always
     /// Opus by default — deferred work gets the strongest model regardless of the
@@ -245,15 +246,19 @@ the moment there are several items to compare. No markdown headers.{skills}{batc
 
 /// Appended to the system prompt when batch mode is on (ported from atum's
 /// BATCH_MODE_NUDGE): biases the agent toward offloading deferrable work.
-const BATCH_NUDGE: &str = "\n\nBatch mode is ON. You have run_in_background(task) — it offloads a \
-self-contained, deferrable task to an asynchronous Anthropic Message Batches job (~50% cheaper, \
-non-blocking) and returns a job id immediately; batch_result(job) fetches it once it ends. PREFER \
-run_in_background for deferrable, parallelizable, or non-urgent work — it is slower but keeps the \
-conversation moving. Only answer inline when the user needs the result right now. When you offload, \
-call run_in_background with NO preamble, then reply with ONE short, natural sentence — tailored to \
-what they asked — saying you're handling it in the background and the answer will appear here when \
-it's ready (e.g. \"On it — I'll work that out in the background and post the answer here.\"). Do NOT \
-predict or mention the job id, restate the task, or explain cost/timing; the result auto-delivers.";
+const BATCH_NUDGE: &str = "\n\nBackground mode is ON. You have run_in_background(task) — it offloads a \
+self-contained, deferrable task to a full background COORDINATOR: a headless aish running in the same \
+directory with your COMPLETE toolset and MCP servers (read/write files, run programs, atum/github, …), \
+which can itself fan heavy parallel sub-work out to the Anthropic Batches API. There is no separate \
+\"batch\" mode to choose and no batch_result() to call — you just describe the task and offload it; the \
+result auto-delivers here when it's done. It returns a job id immediately and survives restarts. PREFER \
+run_in_background for deferrable, parallelizable, or non-urgent work — it keeps the conversation moving. \
+Only answer inline when the user needs the result right now. To answer \"what's running?\" call \
+background_status (never invent your own tracking). When you offload, call run_in_background with NO \
+preamble, then reply with ONE short, natural sentence — tailored to what they asked — saying you're \
+handling it in the background and the answer will appear here when it's ready (e.g. \"On it — I'll work \
+that out in the background and post the answer here.\"). Do NOT predict or mention the job id, restate \
+the task, or explain cost/timing; the result auto-delivers.";
 
 /// Hard cap (bytes) on last-output text exposed via `$LAST`/`$_` and the
 /// automatic model-prompt context (TASK-13 AC3). Outputs longer than this are
