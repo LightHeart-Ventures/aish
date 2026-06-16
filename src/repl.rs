@@ -210,8 +210,27 @@ pub async fn run(
         }
         // We're about to idle at the prompt — let the presenter flush results.
         busy.store(false, Ordering::SeqCst);
-        let running = crate::batch::running_count(&session.batch_jobs)
+        // In-memory background jobs owned by THIS session: Anthropic batches
+        // plus re-exec'd worker subprocesses (run_in_background / :dispatch).
+        let mut running = crate::batch::running_count(&session.batch_jobs)
             + crate::worker::running_count(&session.worker_jobs);
+        // Plus durable coordinator runs the in-memory tallies miss — goal-loop
+        // generator turns, runs launched from another session, and runs
+        // reattached after a restart live ONLY in the coordinator store. Counting
+        // their non-terminal rows (deduped against this session's in-memory
+        // worker ids) keeps the prompt badge in agreement with `:workers`, which
+        // already lists them. This is the fix for "`:workers` shows coordinating
+        // tasks but the prompt has no activity indicator".
+        if let Some(store) = &session.coordinator_store {
+            let in_memory: std::collections::HashSet<String> = session
+                .worker_jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|w| w.id.clone())
+                .collect();
+            running += crate::coordinator::active_store_count(store, &in_memory);
+        }
         // Colour the ⟳N badge by the most recent background-worker event
         // (green ✓ tool success, red ✗ tool failure, magenta ⟳ turn
         // completion), fading back to dim ⟳N after worker::PULSE_FADE.
