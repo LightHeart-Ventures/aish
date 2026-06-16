@@ -1187,8 +1187,11 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                 println!("usage: :dispatch <task>   — launch a background coordinator for <task>");
             } else if session.nested {
                 println!("can't :dispatch from inside a coordinator (no nested coordinators)");
-            } else if crate::backend::claude::Credential::resolve(&session.env).is_err() {
-                println!("no Claude credential — set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY");
+            } else if match session.backend_kind.as_str() {
+                "grok" => !crate::backend::grok::credential_available(&session.env),
+                _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
+            } {
+                println!("no credential for the active backend — Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY");
             } else {
                 match std::env::current_exe() {
                     Ok(exe) => {
@@ -1326,13 +1329,10 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
                 if matches!(backend, Backend::Grok(_)) {
                     println!("already on {}", backend.describe());
                 } else {
-                    match crate::rc::env_value(&session.env, "XAI_API_KEY")
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "no Grok credential — set XAI_API_KEY in your environment or ~/.aishrc"
-                        ))
-                        .and_then(|key| {
-                            Backend::new_grok(crate::backend::grok::DEFAULT_MODEL.into(), key)
-                        }) {
+                    match Backend::new_grok(
+                        crate::backend::grok::DEFAULT_MODEL.into(),
+                        &session.env,
+                    ) {
                         Ok(b) => {
                             *backend = b;
                             session.backend_kind = backend.kind().to_string();

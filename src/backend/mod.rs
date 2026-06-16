@@ -84,8 +84,8 @@ impl Backend {
         Ok(Backend::Claude(claude::ClaudeBackend::new(model, cred)?))
     }
 
-    pub fn new_grok(model: String, api_key: String) -> Result<Self> {
-        Ok(Backend::Grok(grok::GrokBackend::new(model, api_key)?))
+    pub fn new_grok(model: String, extra_env: &[(String, String)]) -> Result<Self> {
+        Ok(Backend::Grok(grok::GrokBackend::new(model, extra_env)?))
     }
 
     /// A stable short name for the active backend (`"claude"`/`"grok"`/`"local"`).
@@ -129,7 +129,7 @@ impl Backend {
     pub fn describe(&self) -> String {
         match self {
             Backend::Claude(b) => format!("claude ({})", b.model),
-            Backend::Grok(b) => format!("grok ({})", b.model),
+            Backend::Grok(b) => format!("grok ({} · {})", b.model, b.auth_label()),
             #[cfg(feature = "local")]
             Backend::Local(b) => format!("local ({} · in-process)", b.file),
         }
