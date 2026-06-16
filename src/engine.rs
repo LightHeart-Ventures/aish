@@ -100,9 +100,13 @@ pub async fn run_turn(
 
         let mut results: Vec<ToolResult> = Vec::with_capacity(turn.tool_calls.len());
         for call in &turn.tool_calls {
-            let desc = describe_call(call);
+            // Prefix the per-tool glyph (🔧 for most tools, ⚙️ for an `escalate`
+            // hand-off to the stronger model) so it travels with the desc through
+            // the running spinner, the finished ✓/✗ line, and the retroactive
+            // reveal — every place that renders the activity line.
+            let desc = format!("{} {}", tool_glyph(&call.name), describe_call(call));
             // Tool-execution phase: this call gets its own animated line while it
-            // runs — a braille spinner turning to the LEFT of a steady 🔧 emoji.
+            // runs — a braille spinner turning to the LEFT of a steady tool glyph.
             // Calls execute sequentially, so only the current one animates; the
             // spinner is replaced by a final static line (✓/✗ + desc) when the
             // tool returns. `run_interactive` hands the terminal to a child, so it
@@ -241,13 +245,14 @@ impl Drop for Spinner {
     }
 }
 
-/// Running-tool indicator: a braille spinner turning to the LEFT of a steady 🔧
-/// emoji while the tool executes — the tool-execution phase, distinct from the
-/// model's "thinking" spinner. The wrench stays put (it's *our* tool glyph) and
-/// only the spinner to its left animates, mirroring the look of the thinking
-/// icon (same braille frames, cyan glyph). Keeps the dim, two-space-indented
-/// style of the static 🔧 line it replaces. TTY-gated; on `finish` the animation
-/// is erased and a static result line (✓/✗ + desc) is printed in its place.
+/// Running-tool indicator: a braille spinner turning to the LEFT of a steady
+/// tool glyph while the tool executes — the tool-execution phase, distinct from
+/// the model's "thinking" spinner. The glyph stays put (it's *our* tool marker:
+/// 🔧 for most tools, ⚙️ for an `escalate` hand-off) and only the spinner to its
+/// left animates, mirroring the look of the thinking icon (same braille frames,
+/// cyan glyph). Keeps the dim, two-space-indented style of the static line it
+/// replaces. TTY-gated; on `finish` the animation is erased and a static result
+/// line (✓/✗ + desc) is printed in its place.
 struct ToolSpinner {
     /// Shared animation state (Running/Paused/Stopped). `stopper()` hands a clone
     /// to the confirm wrapper so it can pause/resume around the prompt.
@@ -259,9 +264,22 @@ struct ToolSpinner {
 }
 
 /// Frames for the running-tool spinner — the same braille cycle as the
-/// "thinking" indicator, drawn to the LEFT of a steady 🔧 so the wrench stays
-/// put while the spinner turns.
+/// "thinking" indicator, drawn to the LEFT of a steady tool glyph so the glyph
+/// stays put while the spinner turns.
 const TOOL_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// The steady glyph shown to the RIGHT of the animated braille spinner on a
+/// tool-activity line. Most tools use the 🔧 wrench; `escalate` uses a ⚙️ gear so
+/// a hand-off to the stronger model reads as its own distinct event — a static
+/// escalation marker with the live "thinking" spinner to its left — rather than
+/// looking like just another tool call. Baked into the desc at the call site so
+/// it travels through the running spinner, the ✓/✗ finish line, and the reveal.
+fn tool_glyph(tool_name: &str) -> &'static str {
+    match tool_name {
+        "escalate" => "⚙\u{fe0f}", // gear + VS16 emoji-presentation selector
+        _ => "🔧",
+    }
+}
 
 /// Whether a tool's execution should be animated. Tools that hand the terminal
 /// to a child (interactive sessions) must not animate — the spinner's cursor
@@ -274,8 +292,8 @@ impl ToolSpinner {
     fn start(desc: &str, animate: bool) -> Self {
         if !animate || !stderr_is_tty() {
             // Piped/headless or non-animating tool: emit the plain static line
-            // once, no animation.
-            eprintln!("\x1b[2m  🔧 {desc}\x1b[0m");
+            // once, no animation. The glyph is already part of `desc`.
+            eprintln!("\x1b[2m  {desc}\x1b[0m");
             return Self {
                 state: Arc::new(Mutex::new(Spin::Stopped)),
                 task: None,
@@ -300,9 +318,10 @@ impl ToolSpinner {
                     Spin::Paused => {} // waiting on a confirm — draw nothing
                     Spin::Running => {
                         // Animated braille spinner (cyan, like "thinking…") to the
-                        // left of a steady, dim 🔧 + desc.
+                        // left of the steady, dim tool glyph + desc (the glyph is
+                        // already baked into `desc`).
                         eprint!(
-                            "\r\x1b[2K  \x1b[36m{}\x1b[0m \x1b[2m🔧 {desc}\x1b[0m",
+                            "\r\x1b[2K  \x1b[36m{}\x1b[0m \x1b[2m{desc}\x1b[0m",
                             TOOL_FRAMES[i % TOOL_FRAMES.len()]
                         )
                     }
@@ -383,14 +402,15 @@ impl Drop for ToolSpinner {
     }
 }
 
-/// The static post-execution tool line: a ✓/✗ status glyph plus the 🔧 desc,
-/// kept dim like the rest of the activity stream. Shared by `ToolSpinner::finish`
-/// and the retroactive `reveal_last_turn`.
+/// The static post-execution tool line: a ✓/✗ status glyph plus the (already
+/// glyph-prefixed) desc, kept dim like the rest of the activity stream. Shared
+/// by `ToolSpinner::finish` and the retroactive `reveal_last_turn`. The tool
+/// glyph (🔧/⚙️) is part of `desc`, so only the colorized status mark is added.
 fn tool_result_line(desc: &str, is_error: bool) -> String {
     if is_error {
-        format!("\x1b[31m✗\x1b[0m 🔧 {desc}")  // red for error
+        format!("\x1b[31m✗\x1b[0m {desc}")  // red for error
     } else {
-        format!("\x1b[32m✓\x1b[0m 🔧 {desc}")  // green for success
+        format!("\x1b[32m✓\x1b[0m {desc}")  // green for success
     }
 }
 
@@ -483,6 +503,33 @@ mod tests {
         assert!(ok.contains("\x1b[32m✓\x1b[0m"), "success checkmark should be green: {ok}");
         let err = tool_result_line("write x", true);
         assert!(err.contains("\x1b[31m✗\x1b[0m"), "error X should be red: {err}");
+    }
+
+    #[test]
+    fn tool_glyph_escalate_is_gear_others_wrench() {
+        // The escalate hand-off gets the static gear (with VS16), distinct from
+        // the wrench every other tool shows — so it reads as its own event.
+        assert_eq!(tool_glyph("escalate"), "⚙\u{fe0f}");
+        assert_eq!(tool_glyph("run_program"), "🔧");
+        assert_eq!(tool_glyph("read_file"), "🔧");
+        assert_eq!(tool_glyph("mcp__atum__list_tools"), "🔧");
+    }
+
+    #[test]
+    fn escalate_activity_line_uses_gear_glyph() {
+        // The desc the spinner/finish/reveal all render carries the gear, and the
+        // finished line keeps the colorized status mark in front of it.
+        let call = crate::backend::ToolCall {
+            id: "t".into(),
+            name: "escalate".into(),
+            args: serde_json::json!({ "task": "estimate the LOE" }),
+        };
+        let desc = format!("{} {}", tool_glyph(&call.name), describe_call(&call));
+        assert!(desc.starts_with("⚙\u{fe0f} escalate → stronger model:"), "got: {desc}");
+        assert!(!desc.contains('🔧'), "escalate must not show the wrench: {desc}");
+        let done = tool_result_line(&desc, false);
+        assert!(done.contains("\x1b[32m✓\x1b[0m"), "done line should be green-checked: {done}");
+        assert!(done.contains("⚙\u{fe0f}"), "done line keeps the gear: {done}");
     }
 
     #[test]
