@@ -372,8 +372,11 @@ impl Drop for ToolSpinner {
 /// kept dim like the rest of the activity stream. Shared by `ToolSpinner::finish`
 /// and the retroactive `reveal_last_turn`.
 fn tool_result_line(desc: &str, is_error: bool) -> String {
-    let mark = if is_error { "✗" } else { "✓" };
-    format!("{mark} 🔧 {desc}")
+    if is_error {
+        format!("\x1b[31m✗\x1b[0m 🔧 {desc}")  // red for error
+    } else {
+        format!("\x1b[32m✓\x1b[0m 🔧 {desc}")  // green for success
+    }
 }
 
 fn describe_call(call: &crate::backend::ToolCall) -> String {
@@ -461,8 +464,10 @@ mod tests {
 
     #[test]
     fn tool_result_line_marks_status() {
-        assert_eq!(tool_result_line("read /etc/hosts", false), "✓ 🔧 read /etc/hosts");
-        assert_eq!(tool_result_line("write x", true), "✗ 🔧 write x");
+        let ok = tool_result_line("read /etc/hosts", false);
+        assert!(ok.contains("\x1b[32m✓\x1b[0m"), "success checkmark should be green: {ok}");
+        let err = tool_result_line("write x", true);
+        assert!(err.contains("\x1b[31m✗\x1b[0m"), "error X should be red: {err}");
     }
 
     #[test]
