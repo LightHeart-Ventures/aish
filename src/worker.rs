@@ -17,6 +17,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -89,20 +90,45 @@ fn clean_activity_line(raw: &str) -> Option<String> {
     Some(cleaned.to_string())
 }
 
-/// Stream a child's stderr line by line: forward tool-activity lines to the
-/// user's terminal live via `announce(prefix, …)`, and retain only the last
+/// A coordinator stderr line carrying turn text (the `🗨` sentinel emitted by
+/// `engine::emit_narration`) or a batch-phase notice (`📦` from the coordinator
+/// loop). Returns the cleaned text after the sentinel, or `None`.
+fn strip_sentinel(raw: &str, mark: &str) -> Option<String> {
+    let rest = raw.trim_start().strip_prefix(mark)?.trim_start();
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
+/// Stream a child's stderr line by line, forwarding the interesting lines to the
+/// user's terminal live via `announce`, and retaining only the last
 /// `STDERR_TAIL_LINES` raw lines as a bounded ring for the failure message.
 /// Returns the retained tail joined with newlines (oldest-first).
 ///
-/// This both keeps the child's stderr pipe drained (so it never blocks) and
-/// gives the user live `[goal] 🔧 …` activity, without accumulating all of
-/// stderr in memory.
-async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(r: R, prefix: &str) -> String {
+/// Three line kinds are recognized by sentinel:
+/// - `🔧` tool activity → always forwarded as `[label] …`.
+/// - `🗨` turn text (a standard model call) → forwarded as `[label·standard] …`
+///   only while `:worker-output` is on (`show_output`).
+/// - `📦` batch fan-out notice → forwarded as `[label·batch] …`, also gated on
+///   `show_output` (so "off" stays exactly today's tool-only stream).
+///
+/// This keeps the child's stderr pipe drained (so it never blocks) and gives the
+/// user live activity without accumulating all of stderr in memory.
+async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
+    r: R,
+    label: &str,
+    show_output: Arc<AtomicBool>,
+) -> String {
     let mut lines = BufReader::new(r).lines();
     let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_LINES);
+    let base = format!("[{label}]");
     while let Ok(Some(line)) = lines.next_line().await {
         if let Some(activity) = clean_activity_line(&line) {
-            crate::tools::announce(prefix, &activity);
+            crate::tools::announce(&base, &activity);
+        } else if show_output.load(Ordering::Relaxed) {
+            if let Some(text) = strip_sentinel(&line, "🗨") {
+                crate::tools::announce(&format!("[{label}·standard]"), &text);
+            } else if let Some(text) = strip_sentinel(&line, "📦") {
+                crate::tools::announce(&format!("[{label}·batch]"), &text);
+            }
         }
         if tail.len() == STDERR_TAIL_LINES {
             tail.pop_front();
@@ -582,6 +608,10 @@ pub struct WorkerSpec {
     /// The launching session's friendly name (`:name`), if it has one — carried
     /// alongside the id purely for display.
     pub launch_session_name: Option<String>,
+    /// Shared `:worker-output` toggle from the launching session. The live stderr
+    /// stream reads it per line, so flipping it mid-run starts/stops forwarding
+    /// this worker's *turn* output (the always-on `🔧` tool lines are unaffected).
+    pub show_output: Arc<AtomicBool>,
 }
 
 impl WorkerJob {
@@ -697,9 +727,10 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
     // for the failure message.
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let prefix = format!("[{}]", job.id);
+    let label = job.id.clone();
+    let show_output = spec.show_output.clone();
     let collect = tokio::spawn(async move {
-        tokio::join!(read_capped(stdout, CAPTURE_CAP), stream_stderr(stderr, &prefix))
+        tokio::join!(read_capped(stdout, CAPTURE_CAP), stream_stderr(stderr, &label, show_output))
     });
 
     let status = match tokio::time::timeout(WORKER_TIMEOUT, child.wait()).await {
@@ -778,8 +809,9 @@ pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<Str
     // stdout is the result (capped capture, unchanged). stderr is streamed live
     // to the user's terminal as `[goal] 🔧 …` tool-activity, retaining only a
     // bounded tail for the failure message — no unbounded accumulation.
+    let show_output = spec.show_output.clone();
     let collect = tokio::spawn(async move {
-        tokio::join!(read_capped(stdout, CAPTURE_CAP), stream_stderr(stderr, "[goal]"))
+        tokio::join!(read_capped(stdout, CAPTURE_CAP), stream_stderr(stderr, "goal", show_output))
     });
     let status = match tokio::time::timeout(WORKER_TIMEOUT, child.wait()).await {
         Ok(Ok(s)) => s,
@@ -997,6 +1029,26 @@ mod tests {
         assert_eq!(clean_activity_line("coordinator run abc starting"), None);
         assert_eq!(clean_activity_line(""), None);
         assert_eq!(clean_activity_line("   \x1b[2m\x1b[0m  "), None);
+    }
+
+    #[test]
+    fn strip_sentinel_extracts_turn_and_batch_lines() {
+        // 🗨 turn text (emitted by the coordinator's engine narration).
+        assert_eq!(
+            strip_sentinel("🗨 planning the migration", "🗨"),
+            Some("planning the migration".to_string())
+        );
+        // 📦 batch fan-out notice.
+        assert_eq!(
+            strip_sentinel("📦 fanned 3 sub-task(s) out", "📦"),
+            Some("fanned 3 sub-task(s) out".to_string())
+        );
+        // Wrong sentinel / plain lines / empty payload → None.
+        assert_eq!(strip_sentinel("🗨 hi", "📦"), None);
+        assert_eq!(strip_sentinel("just prose", "🗨"), None);
+        assert_eq!(strip_sentinel("🗨   ", "🗨"), None);
+        // A 🔧 tool line is NOT a turn line (it routes through clean_activity_line).
+        assert_eq!(strip_sentinel("🔧 git status", "🗨"), None);
     }
 
     #[test]

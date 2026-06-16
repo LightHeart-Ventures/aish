@@ -125,6 +125,12 @@ pub struct Session {
     /// Background coordinators are spawned on this same backend (full parity), so
     /// `:dispatch`/`run_in_background`/`:goal` thread it through to `WorkerSpec`.
     pub backend_kind: String,
+    /// When true, the live worker stream forwards each background coordinator's
+    /// *turn* output (its model narration, tagged standard vs batch) in addition
+    /// to the always-shown `🔧` tool-activity lines. Toggled by `:worker-output`;
+    /// session-local, never persisted. Shared into the detached stderr-streaming
+    /// task (via `WorkerSpec`) so toggling mid-run takes effect on later lines.
+    pub show_worker_output: Arc<AtomicBool>,
     /// `(provider, model)` of the stronger model a weak frontend should escalate
     /// hard, in-turn reasoning to — recomputed each turn by the engine from
     /// `Backend::escalation_target`. `None` when the frontend is already frontier
@@ -163,6 +169,7 @@ impl Session {
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
             goal: None,
             backend_kind: "claude".to_string(),
+            show_worker_output: Arc::new(AtomicBool::new(false)),
             escalation: None,
         })
     }

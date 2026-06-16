@@ -1062,7 +1062,8 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                  :batch model <opus|sonnet|haiku|id> model background batches run on (default opus)\n\
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
-                 :workers                            list in-flight background coordinator subprocesses\n\
+                 :workers                            list background coordinators (all sessions; * = this session)\n\
+                 :worker-output [on|off]             stream coordinators' turn output (·standard/·batch), not just 🔧 tool lines\n\
                  :results                            list finished background jobs (workers + batches)\n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
@@ -1096,6 +1097,25 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
             }
             None => println!("usage: :kill <job-id>"),
         },
+        Some("worker-output" | "wo") => {
+            let target = match parts.next() {
+                Some("on") => Some(true),
+                Some("off") => Some(false),
+                None => Some(!session.show_worker_output.load(Ordering::SeqCst)),
+                Some(_) => None,
+            };
+            match target {
+                Some(true) => {
+                    session.show_worker_output.store(true, Ordering::SeqCst);
+                    println!("worker output ON — coordinators' turn output now streams (tagged ·standard/·batch) alongside 🔧 tool lines");
+                }
+                Some(false) => {
+                    session.show_worker_output.store(false, Ordering::SeqCst);
+                    println!("worker output OFF — only 🔧 tool lines stream");
+                }
+                None => println!("usage: :worker-output [on|off]"),
+            }
+        }
         Some("workers") => {
             // Collapse a (possibly multi-line) task to one clipped line.
             let one_line = |t: &str| {
@@ -1250,6 +1270,7 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                             base: "main".to_string(),
                             launch_session_id: session.session_id.clone(),
                             launch_session_name: session.name.clone(),
+                            show_output: session.show_worker_output.clone(),
                         };
                         let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
                         println!(
@@ -1316,6 +1337,7 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
                                     base: "main".to_string(),
                                     launch_session_id: session.session_id.clone(),
                                     launch_session_name: session.name.clone(),
+                                    show_output: session.show_worker_output.clone(),
                                 };
                                 // KNOWN LIMITATION: the verifier still judges on
                                 // Claude (batch_model + the Claude credential

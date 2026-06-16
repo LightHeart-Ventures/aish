@@ -81,7 +81,7 @@ pub async fn run_turn(
         // assistant message); loop so the model retries with a smaller edit.
         if turn.truncated_tool_call {
             if !turn.text.trim().is_empty() {
-                eprintln!("{}", crate::md::render(turn.text.trim(), ""));
+                emit_narration(session, &turn.text);
             }
             continue;
         }
@@ -95,7 +95,7 @@ pub async fn run_turn(
         // substantive content the user reads. Only the transient 🔧 tool-activity
         // lines stay dim, so the rounds still read as structured.
         if !turn.text.trim().is_empty() {
-            eprintln!("{}", crate::md::render(turn.text.trim(), ""));
+            emit_narration(session, &turn.text);
         }
 
         let mut results: Vec<ToolResult> = Vec::with_capacity(turn.tool_calls.len());
@@ -167,6 +167,23 @@ pub async fn run_coordinator(
             let err = outcome.error.unwrap_or_else(|| "coordinator failed".into());
             anyhow::bail!("{err}")
         }
+    }
+}
+
+/// Print the model's interim narration. In an interactive session it goes out
+/// plainly. In a background coordinator (`session.nested`) each line is tagged
+/// with a `🗨` sentinel so the parent's worker stream can recognize it as *turn*
+/// output (vs `🔧` tool lines) and forward it only when `:worker-output` is on.
+/// A coordinator turn is always a standard (Messages API) model call, hence the
+/// `[standard]` label the parent attaches; batch fan-out is announced separately.
+fn emit_narration(session: &Session, text: &str) {
+    let rendered = crate::md::render(text.trim(), "");
+    if session.nested {
+        for line in rendered.lines() {
+            eprintln!("🗨 {line}");
+        }
+    } else {
+        eprintln!("{rendered}");
     }
 }
 

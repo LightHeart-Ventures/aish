@@ -209,6 +209,10 @@ codes, diffs).\n\nTASK:\n{input}",
             if let Some(s) = store {
                 let _ = s.set_phase(run_id, Phase::AwaitingBatch.as_str());
             }
+            // Forwarded to the watcher (via the `📦` sentinel) as the batch-vs-
+            // standard indicator: this round fanned work out to the Batches API.
+            let n = crate::batch::running_count(&session.batch_jobs);
+            eprintln!("📦 fanned {n} sub-task(s) out to the Batches API; awaiting results");
             await_batches_with_heartbeat(session, run_id, store).await;
 
             // Fold the batch results back: feed the just-completed sub-work into
