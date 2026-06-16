@@ -1091,9 +1091,25 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
             let workers = session.worker_jobs.lock().unwrap();
             if workers.is_empty() {
                 println!("no background workers");
-            }
-            for w in workers.iter() {
-                println!("{}", w.summary_line());
+            } else {
+                // One row per worker: id, status, a one-line summary of its task.
+                let mut table = String::from("| Worker | Status | Doing |\n|---|---|---|\n");
+                for w in workers.iter() {
+                    // Collapse the (possibly multi-line) task to one line + clip.
+                    let doing = w.task.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let doing = if doing.chars().count() > 70 {
+                        format!("{}…", doing.chars().take(70).collect::<String>())
+                    } else {
+                        doing
+                    };
+                    table.push_str(&format!(
+                        "| {} | {} | {} |\n",
+                        w.id,
+                        w.status(),
+                        doing.replace('|', "\\|")
+                    ));
+                }
+                println!("{}", crate::md::render_stdout(table.trim()));
             }
         }
         Some("dispatch") => {
