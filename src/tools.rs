@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
@@ -626,30 +626,7 @@ branch, and open a pull request (gh pr create) instead."
 // and accumulates (capped) for the model to read with job_output.
 // ---------------------------------------------------------------------------
 
-const JOB_BUFFER_CAP: usize = 64_000; // bytes of retained output per job
-
-pub struct Job {
-    pub id: usize,
-    pub desc: String,
-    buffer: Arc<Mutex<String>>,
-    /// Exit summary once finished; None while running.
-    pub done: Arc<Mutex<Option<String>>>,
-    kill: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-}
-
-pub type Jobs = Arc<Mutex<Vec<Arc<Job>>>>;
-
-impl Job {
-    /// "running" or the exit summary.
-    pub fn status(&self) -> String {
-        self.done.lock().unwrap().clone().unwrap_or_else(|| "running".into())
-    }
-
-    /// Ask the waiter task to kill the child. False when already finished.
-    pub fn kill(&self) -> bool {
-        self.kill.lock().unwrap().take().is_some_and(|tx| tx.send(()).is_ok())
-    }
-}
+pub use crate::jobs::{Job, Jobs};
 
 /// Print one line from a background source (job output, MCP notification)
 /// over the top of whatever is on the current terminal line — rustyline
@@ -682,14 +659,7 @@ fn spawn_background(
 
     let mut jobs = session.jobs.lock().unwrap();
     let id = jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
-    let (kill_tx, kill_rx) = tokio::sync::oneshot::channel();
-    let job = Arc::new(Job {
-        id,
-        desc: display,
-        buffer: Arc::new(Mutex::new(String::new())),
-        done: Arc::new(Mutex::new(None)),
-        kill: Mutex::new(Some(kill_tx)),
-    });
+    let (job, kill_rx) = Job::background(id, display);
 
     stream_job_pipe(child.stdout.take().expect("piped"), job.clone());
     stream_job_pipe(child.stderr.take().expect("piped"), job.clone());
@@ -711,7 +681,7 @@ fn spawn_background(
             },
             Err(e) => format!("wait failed: {e}"),
         };
-        *waiter_job.done.lock().unwrap() = Some(summary.clone());
+        waiter_job.finish(summary.clone());
         announce(&format!("[job {}]", waiter_job.id), &format!("{summary} — {}", waiter_job.desc));
     });
 
@@ -732,18 +702,7 @@ where
     tokio::spawn(async move {
         let mut lines = BufReader::new(pipe).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            {
-                let mut buf = job.buffer.lock().unwrap();
-                buf.push_str(&line);
-                buf.push('\n');
-                if buf.len() > JOB_BUFFER_CAP {
-                    let mut cut = buf.len() - JOB_BUFFER_CAP;
-                    while !buf.is_char_boundary(cut) {
-                        cut += 1;
-                    }
-                    buf.drain(..cut);
-                }
-            }
+            job.push_line(&line);
             announce(&format!("[job {}]", job.id), &line);
         }
     });
@@ -756,7 +715,7 @@ fn job_output(call: &ToolCall, session: &Session) -> Result<String> {
         .iter()
         .find(|j| j.id == id)
         .ok_or_else(|| anyhow::anyhow!("no such job: {id} (see :jobs)"))?;
-    let buf = job.buffer.lock().unwrap();
+    let buf = job.output();
     Ok(format!(
         "[job {id}: {}] {}\n{}",
         job.status(),
