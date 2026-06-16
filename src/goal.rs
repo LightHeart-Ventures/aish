@@ -14,7 +14,7 @@
 
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Unattended runaway backstop. `/goal` itself has none (the user can Ctrl-C);
 /// a background loop can't be watched, so we cap it.
@@ -33,8 +33,18 @@ enum Status {
     Cleared,
 }
 
+/// What the loop is doing right now within a turn (work → check), or between turns.
+#[derive(Clone, Copy, PartialEq)]
+enum Step {
+    Idle,
+    Working,
+    Checking,
+}
+
 pub struct Goal {
     pub condition: String,
+    /// When the goal was first spawned — basis for total elapsed time.
+    started: Instant,
     inner: Mutex<Inner>,
 }
 
@@ -43,6 +53,10 @@ struct Inner {
     turns: usize,
     last_reason: Option<String>,
     cancel: bool,
+    /// When the current turn began — basis for per-turn elapsed time.
+    turn_started: Option<Instant>,
+    /// Current phase within the loop.
+    phase: Step,
 }
 
 pub type Handle = Arc<Goal>;
@@ -64,21 +78,46 @@ impl Goal {
         }
     }
 
-    /// One-line `:goal` status report.
+    /// One-line `:goal` status report — includes overall + current-turn elapsed
+    /// and the current phase while active; a finished goal shows just the final
+    /// state and total elapsed.
     pub fn status_line(&self) -> String {
         let i = self.inner.lock().unwrap();
-        let state = match i.status {
-            Status::Active => "active",
-            Status::Achieved => "achieved",
-            Status::Failed => "failed",
-            Status::Cleared => "cleared",
-        };
+        let total = fmt_duration(self.started.elapsed());
         let reason = i
             .last_reason
             .as_deref()
             .map(|r| format!(" · last check: {r}"))
             .unwrap_or_default();
-        format!("goal [{state}] · {} turn(s) · {}{reason}", i.turns, self.condition)
+        let condition = truncate_condition(&self.condition);
+
+        if i.status == Status::Active {
+            let phase = match i.phase {
+                Step::Working => "working",
+                Step::Checking => "checking",
+                Step::Idle => "starting",
+            };
+            // Per-turn elapsed only makes sense once a turn is under way.
+            let this_turn = match i.turn_started {
+                Some(t) => format!("{} this turn / {} total", fmt_duration(t.elapsed()), total),
+                None => format!("{total} total"),
+            };
+            format!(
+                "goal [active · {phase}] · turn {} · {this_turn} · {condition}{reason}",
+                i.turns
+            )
+        } else {
+            let state = match i.status {
+                Status::Achieved => "achieved",
+                Status::Failed => "failed",
+                Status::Cleared => "cleared",
+                Status::Active => unreachable!(),
+            };
+            format!(
+                "goal [{state}] · {} turn(s) · {total} total · {condition}{reason}",
+                i.turns
+            )
+        }
     }
 
     fn set(&self, status: Status, reason: Option<String>) {
@@ -87,6 +126,31 @@ impl Goal {
         if reason.is_some() {
             i.last_reason = reason;
         }
+    }
+}
+
+/// Human-readable elapsed time: `45s`, `4m12s`, `1h03m`. Coarse on purpose —
+/// seconds drop off once we're past an hour.
+fn fmt_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Keep the condition snippet on one line — long goals get an ellipsis.
+fn truncate_condition(condition: &str) -> String {
+    const MAX: usize = 60;
+    if condition.chars().count() > MAX {
+        let head: String = condition.chars().take(MAX).collect();
+        format!("{}…", head.trim_end())
+    } else {
+        condition.to_string()
     }
 }
 
@@ -101,11 +165,14 @@ pub fn spawn(
 ) -> Handle {
     let goal = Arc::new(Goal {
         condition,
+        started: Instant::now(),
         inner: Mutex::new(Inner {
             status: Status::Active,
             turns: 0,
             last_reason: None,
             cancel: false,
+            turn_started: None,
+            phase: Step::Idle,
         }),
     });
     tokio::spawn(run_goal(goal.clone(), spec, model, api_key));
@@ -146,6 +213,11 @@ async fn run_goal(goal: Handle, spec: crate::worker::WorkerSpec, model: String, 
             ),
         };
         announce(&format!("turn {turn}: working…"));
+        {
+            let mut i = goal.inner.lock().unwrap();
+            i.turn_started = Some(Instant::now());
+            i.phase = Step::Working;
+        }
         let run_id = format!("goal-{}", uuid::Uuid::new_v4());
         let output = match crate::worker::run_once(&spec, &directive, &run_id).await {
             Ok(o) => o,
@@ -161,6 +233,7 @@ async fn run_goal(goal: Handle, spec: crate::worker::WorkerSpec, model: String, 
 
         // Verifier: the batch model judges whether the output demonstrates the goal.
         announce(&format!("turn {turn}: checking…"));
+        goal.inner.lock().unwrap().phase = Step::Checking;
         match judge(&api_key, &model, &goal.condition, &output).await {
             Ok((true, reason)) => {
                 goal.set(Status::Achieved, Some(reason.clone()));
@@ -261,4 +334,73 @@ fn deliver(goal: &Handle, turns: usize, reason: &str, output: &str) {
     println!("{}", crate::md::render_stdout(output.trim()));
     let _ = goal; // handle kept for symmetry / future status integration
     std::io::stdout().flush().ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_duration_buckets() {
+        assert_eq!(fmt_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(fmt_duration(Duration::from_secs(45)), "45s");
+        assert_eq!(fmt_duration(Duration::from_secs(59)), "59s");
+        // 4m12s
+        assert_eq!(fmt_duration(Duration::from_secs(4 * 60 + 12)), "4m12s");
+        // seconds zero-padded within a minute
+        assert_eq!(fmt_duration(Duration::from_secs(60 + 5)), "1m05s");
+        // 1h03m — past an hour, seconds drop off, minutes zero-padded
+        assert_eq!(fmt_duration(Duration::from_secs(3600 + 3 * 60 + 9)), "1h03m");
+        assert_eq!(fmt_duration(Duration::from_secs(3600)), "1h00m");
+    }
+
+    #[test]
+    fn truncate_condition_ellipsizes() {
+        assert_eq!(truncate_condition("short goal"), "short goal");
+        let long = "a".repeat(80);
+        let out = truncate_condition(&long);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 61); // 60 + ellipsis
+    }
+
+    /// Build a Goal directly (bypassing spawn's background loop) to assert wording.
+    fn goal_with(status: Status, phase: Step, turn_started: bool) -> Goal {
+        Goal {
+            condition: "Complete the work".to_string(),
+            started: Instant::now(),
+            inner: Mutex::new(Inner {
+                status,
+                turns: 3,
+                last_reason: Some("not yet".to_string()),
+                cancel: false,
+                turn_started: turn_started.then(Instant::now),
+                phase,
+            }),
+        }
+    }
+
+    #[test]
+    fn status_line_active_shows_phase_and_turn() {
+        let g = goal_with(Status::Active, Step::Checking, true);
+        let line = g.status_line();
+        assert!(line.contains("goal [active · checking]"), "got: {line}");
+        assert!(line.contains("turn 3"), "got: {line}");
+        assert!(line.contains("this turn /"), "got: {line}");
+        assert!(line.contains("total"), "got: {line}");
+        assert!(line.contains("Complete the work"), "got: {line}");
+        assert!(line.contains("last check: not yet"), "got: {line}");
+        assert!(!line.contains('\n'), "must be one line: {line}");
+    }
+
+    #[test]
+    fn status_line_finished_omits_phase_and_perturn() {
+        let g = goal_with(Status::Achieved, Step::Idle, false);
+        let line = g.status_line();
+        assert!(line.contains("goal [achieved]"), "got: {line}");
+        assert!(line.contains("3 turn(s)"), "got: {line}");
+        assert!(line.contains("total"), "got: {line}");
+        assert!(!line.contains("this turn"), "got: {line}");
+        assert!(!line.contains("checking"), "got: {line}");
+        assert!(!line.contains("working"), "got: {line}");
+    }
 }
