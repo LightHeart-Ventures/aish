@@ -1167,9 +1167,11 @@ async fn run_interactive(call: &ToolCall, session: &mut Session, confirm: &mut C
 
 /// Hand the terminal to a child program: inherited stdin/stdout/stderr, wait
 /// until it exits. Used by run_interactive and the REPL's direct dispatch.
-/// While the child runs, `session.tty_handoff` is set so the REPL knows a
-/// Ctrl-C belongs to the child; terminal modes are restored afterwards in
-/// case the program crashed without cleaning up its raw-mode state.
+/// The child leads its own process group and owns the terminal (tcsetpgrp), so
+/// the terminal delivers a Ctrl-C straight to it — aish needs no hand-off flag
+/// to know the signal isn't its to handle (TASK-116). Terminal modes are
+/// restored afterwards in case the program crashed without cleaning up its
+/// raw-mode state.
 ///
 /// Per the S1.4 spike (docs/spikes/S1.4-reaper-vs-waitpid.md) this single
 /// foreground path is spawned with `std::process` rather than `tokio::process`
@@ -1188,7 +1190,7 @@ pub async fn run_on_tty(
 ) -> Result<std::process::ExitStatus> {
     use std::os::unix::process::CommandExt;
 
-    let _guard = TtyGuard::engage(session.tty_handoff.clone());
+    let _guard = TtyGuard::engage();
 
     // Subscribe to SIGCHLD *before* spawning so an instant-exit child can't fire
     // before we are listening. tokio::signal multiplexes the handler, so tokio's
@@ -1366,16 +1368,17 @@ impl Drop for ForegroundReclaim {
     }
 }
 
-/// RAII for a TTY hand-off: flags the hand-off for the REPL's signal handling
-/// and snapshots/restores terminal attributes around the child's lifetime.
+/// RAII guard around a foreground child's terminal hand-off: snapshots the
+/// terminal attributes on entry and restores them when the child exits, in case
+/// the program crashed without cleaning up its raw-mode state. (The REPL no
+/// longer needs a hand-off flag — with real process-group ownership the terminal
+/// delivers job-control signals to the child's own pgrp directly; TASK-116.)
 struct TtyGuard {
-    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     saved: Option<libc::termios>,
 }
 
 impl TtyGuard {
-    fn engage(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
-        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    fn engage() -> Self {
         // SAFETY: plain libc terminal queries on fd 0; termios is POD.
         let saved = unsafe {
             if libc::isatty(0) == 1 {
@@ -1385,7 +1388,7 @@ impl TtyGuard {
                 None
             }
         };
-        Self { flag, saved }
+        Self { saved }
     }
 }
 
@@ -1395,7 +1398,6 @@ impl Drop for TtyGuard {
             // SAFETY: restoring the exact attributes captured in engage().
             unsafe { libc::tcsetattr(0, libc::TCSADRAIN, &t) };
         }
-        self.flag.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

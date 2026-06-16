@@ -49,13 +49,17 @@ pub async fn run(
     // TTOU/TTIN so a Ctrl-C/Ctrl-\/Ctrl-Z reaches the foreground child's process
     // group (run_on_tty hands it the terminal) instead of killing or suspending
     // the shell; foreground children restore the default disposition in pre_exec.
-    // SIGINT is also still observed by the ctrl_c task below for model-turn aborts
-    // — reconciling that overlap (and removing tty_handoff) is TASK-116.
+    // SIGINT is also observed by the ctrl_c task below for model-turn aborts.
+    // With real process-group ownership (TASK-113/114) the terminal delivers a
+    // Ctrl-C straight to the foreground child's process group, so aish only ever
+    // receives SIGINT when IT owns the terminal — i.e. during a model turn. That
+    // makes the old tty_handoff disambiguation flag unnecessary; TASK-116 removed it.
     tools::ignore_job_control_signals();
 
     // Install the process-wide SIGINT handler up front. A Ctrl-C during a
-    // direct-dispatch child must interrupt the child (the terminal delivers
-    // it to the shared foreground group) — never kill aish itself.
+    // direct-dispatch child is delivered by the terminal straight to that child's
+    // own process group (it leads its own pgrp and owns the tty via tcsetpgrp), so
+    // this task just keeps a tokio SIGINT handler installed — aish is never killed.
     tokio::spawn(async {
         loop {
             let _ = tokio::signal::ctrl_c().await;
@@ -200,32 +204,25 @@ pub async fn run(
                 // (direct commands above stay shell-immediate on purpose).
                 println!();
 
-                // Agentic turn. Ctrl-C aborts it — unless a TTY hand-off is in
-                // progress, in which case the SIGINT belongs to the foreground
-                // child (the terminal already delivered it there).
+                // Agentic turn. A Ctrl-C aborts it. Real process-group ownership
+                // means a foreground child (run_interactive) receives terminal
+                // signals directly via its own pgrp, so aish only gets SIGINT here
+                // when it owns the terminal — i.e. the turn itself is what to abort.
+                // No tty_handoff flag needed (TASK-116).
                 let pre_len = session.history.len();
                 let mut aborted = false;
                 let mut reply: Option<String> = None;
                 {
-                    let handoff = session.tty_handoff.clone();
                     let mut confirm = confirm_tty;
                     let turn = engine::run_turn(&backend, &mut session, line, &mut confirm);
                     tokio::pin!(turn);
-                    loop {
-                        tokio::select! {
-                            res = &mut turn => {
-                                match res {
-                                    Ok(text) => reply = Some(text),
-                                    Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e:#}"),
-                                }
-                                break;
-                            }
-                            _ = tokio::signal::ctrl_c() => {
-                                if !handoff.load(Ordering::SeqCst) {
-                                    aborted = true;
-                                    break;
-                                }
-                            }
+                    tokio::select! {
+                        res = &mut turn => match res {
+                            Ok(text) => reply = Some(text),
+                            Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e:#}"),
+                        },
+                        _ = tokio::signal::ctrl_c() => {
+                            aborted = true;
                         }
                     }
                 }
