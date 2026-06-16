@@ -44,6 +44,10 @@ pub struct McpHost {
     /// User-scope `.mcp.json` (last config path) — where `:mcp add`/`remove`
     /// persist changes. None until `start` records it.
     user_config: Option<PathBuf>,
+    /// All `.mcp.json` paths `start` was given (project then user). Kept so
+    /// `:mcp reload` can re-scan them and connect servers added to the file
+    /// since startup.
+    config_paths: Vec<PathBuf>,
 }
 
 /// One server's state for the `:mcp` listing.
@@ -115,7 +119,20 @@ impl McpHost {
         let mut host = Self::default();
         // Last path is user scope (project precedes user) — adds/removes land there.
         host.user_config = config_paths.last().map(|p| p.to_path_buf());
-        for path in config_paths {
+        host.config_paths = config_paths.iter().map(|p| p.to_path_buf()).collect();
+        host.connect_missing().await;
+        host
+    }
+
+    /// Scan the configured `.mcp.json` paths and connect every server NOT already
+    /// connected (earlier paths win on a name clash). Returns the names connected
+    /// this pass. Shared by startup and `:mcp reload`, so a server added to the
+    /// file is picked up live. Already-connected servers are left untouched; one
+    /// bad entry never aborts the scan.
+    async fn connect_missing(&mut self) -> Vec<String> {
+        let mut added: Vec<String> = Vec::new();
+        let paths = self.config_paths.clone();
+        for path in &paths {
             let Ok(text) = std::fs::read_to_string(path) else {
                 continue;
             };
@@ -130,8 +147,8 @@ impl McpHost {
                 continue;
             };
             for (name, spec) in servers {
-                if host.servers.iter().any(|s| s.name == *name) {
-                    continue; // earlier (project-scope) definition wins
+                if self.servers.iter().any(|s| s.name == *name) || added.contains(name) {
+                    continue; // already connected (earlier path / a prior pass) wins
                 }
                 match McpServer::start(name, spec).await {
                     Ok(s) => {
@@ -145,13 +162,21 @@ impl McpHost {
                             s.tools.len(),
                             if s.tools.len() == 1 { "" } else { "s" }
                         );
-                        host.servers.push(s);
+                        self.servers.push(s);
+                        added.push(name.clone());
                     }
                     Err(e) => eprintln!("\x1b[33maish:\x1b[0m mcp server {name} skipped: {e:#}"),
                 }
             }
         }
-        host
+        added
+    }
+
+    /// Re-read the `.mcp.json` config paths and connect any servers added to them
+    /// since startup (or the last reload). Existing servers are left as-is — use
+    /// `:mcp reconnect` to restart a changed one. Returns the names connected.
+    pub async fn reload(&mut self) -> Vec<String> {
+        self.connect_missing().await
     }
 
     /// Tool definitions for every connected server, namespaced.
