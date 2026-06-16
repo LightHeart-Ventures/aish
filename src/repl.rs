@@ -694,7 +694,7 @@ fn split_route(line: String) -> (String, Route) {
 const AMBIGUOUS_COMMANDS: &[&str] = &[
     "who", "w", "find", "time", "test", "yes", "look", "last", "watch", "date",
     "which", "what", "whatis", "finger", "write", "wall", "users", "top", "more",
-    "head", "tail", "make", "cat", "kill", "pr",
+    "head", "tail", "make", "cat", "kill", "pr", "wait",
     // clear/open: real use is bare (`clear`) or carries a path/dot/flag
     // (`open file.txt`, `open .`, `open -a App`); a bare-word sentence
     // starting with either ("clear the pointer so it reflects green",

@@ -377,6 +377,11 @@ fn describe_call(call: &crate::backend::ToolCall) -> String {
         "change_dir" => format!("cd {}", a["path"].as_str().unwrap_or("?")),
         "remember" => format!("remember: {}", a["content"].as_str().unwrap_or("?")),
         "recall" => format!("recall: {}", a["query"].as_str().unwrap_or("(recent)")),
+        "run_in_background" => format!(
+            "background: {}",
+            crate::batch::one_line(a["task"].as_str().unwrap_or("?"))
+        ),
+        "background_status" => "background status".to_string(),
         other => other.to_string(),
     }
 }
