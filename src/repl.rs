@@ -150,11 +150,11 @@ pub async fn run(
         busy.store(false, Ordering::SeqCst);
         let running = crate::batch::running_count(&session.batch_jobs)
             + crate::worker::running_count(&session.worker_jobs);
-        let badge = if running > 0 {
-            format!("\x1b[2m⟳{running}\x1b[0m ")
-        } else {
-            String::new()
-        };
+        // Colour the ⟳N badge by the most recent background-worker event
+        // (green ✓ tool success, red ✗ tool failure, magenta ⟳ turn
+        // completion), fading back to dim ⟳N after worker::PULSE_FADE.
+        let pulse = crate::worker::fresh_pulse(&session.worker_jobs);
+        let badge = crate::worker::pulse_badge(running, pulse);
         let name = match &session.name {
             Some(n) => format!("\x1b[1;35m[{n}]\x1b[0m | "), // bold magenta, set apart from the cyan path
             None => String::new(),
@@ -1060,7 +1060,7 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
                  :workers                            list background coordinators (all sessions; * = this session)\n\
-                 :worker-output [on|off]             stream coordinators' turn output (·standard/·batch), not just 🔧 tool lines\n\
+                 :worker-output [on|off]             stream background coordinators' activity (🔧 tool + ·standard/·batch lines); off (default) keeps them quiet\n\
                  :results                            list finished background jobs (workers + batches)\n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
@@ -1104,11 +1104,11 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
             match target {
                 Some(true) => {
                     session.show_worker_output.store(true, Ordering::SeqCst);
-                    println!("worker output ON — coordinators' turn output now streams (tagged ·standard/·batch) alongside 🔧 tool lines");
+                    println!("worker output ON — background coordinators now stream their 🔧 tool activity and ·standard/·batch turn output");
                 }
                 Some(false) => {
                     session.show_worker_output.store(false, Ordering::SeqCst);
-                    println!("worker output OFF — only 🔧 tool lines stream");
+                    println!("worker output OFF — background coordinators run quietly (only the ⟳N pulse + completion notice show)");
                 }
                 None => println!("usage: :worker-output [on|off]"),
             }

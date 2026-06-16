@@ -121,11 +121,15 @@ pub struct Session {
     /// Background coordinators are spawned on this same backend (full parity), so
     /// `:dispatch`/`run_in_background`/`:goal` thread it through to `WorkerSpec`.
     pub backend_kind: String,
-    /// When true, the live worker stream forwards each background coordinator's
-    /// *turn* output (its model narration, tagged standard vs batch) in addition
-    /// to the always-shown `🔧` tool-activity lines. Toggled by `:worker-output`;
-    /// session-local, never persisted. Shared into the detached stderr-streaming
-    /// task (via `WorkerSpec`) so toggling mid-run takes effect on later lines.
+    /// Gates whether a background coordinator's live activity is forwarded to
+    /// the terminal. When false (the DEFAULT) a background worker is QUIET: none
+    /// of its stderr is echoed — not its `🔧` tool-activity, not its turn/batch
+    /// narration — only the prompt's `⟳N` pulse and the completion notice show it's
+    /// alive. When true the full live stream is forwarded: `🔧` tool lines plus the
+    /// coordinator's turn output (tagged standard vs batch). Toggled by
+    /// `:worker-output`; session-local, never persisted. Shared into the detached
+    /// stderr-streaming task (via `WorkerSpec`) and read per line, so toggling
+    /// mid-run takes effect on later lines.
     pub show_worker_output: Arc<AtomicBool>,
     /// `(provider, model)` of the stronger model a weak frontend should escalate
     /// hard, in-turn reasoning to — recomputed each turn by the engine from
