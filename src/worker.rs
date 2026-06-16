@@ -25,6 +25,39 @@ use tokio::process::Command;
 /// possibly-long jobs — but bounded so a wedged child can't live forever.
 const WORKER_TIMEOUT: Duration = Duration::from_secs(60 * 60); // 1h
 
+/// Max bytes of a child's stdout/stderr we keep. A runaway coordinator that
+/// dumps gigabytes must never OOM the PARENT (the interactive aish / goal loop)
+/// via an unbounded read — so we cap the capture and drain the rest.
+const CAPTURE_CAP: usize = 1024 * 1024; // 1 MB
+
+/// Read up to `cap` bytes of `r` into a String, then keep draining (so the
+/// child never blocks on a full pipe) but discard the overflow. A truncation
+/// marker is appended if it overflowed.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, cap: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    let mut overflowed = false;
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if buf.len() < cap {
+                    let take = n.min(cap - buf.len());
+                    buf.extend_from_slice(&chunk[..take]);
+                    overflowed |= take < n;
+                } else {
+                    overflowed = true; // past the cap — keep draining, drop the bytes
+                }
+            }
+        }
+    }
+    let mut s = String::from_utf8_lossy(&buf).into_owned();
+    if overflowed {
+        s.push_str("\n…[output truncated — exceeded the capture cap]");
+    }
+    s
+}
+
 /// Default address-space / data cap for a worker child, in MB. Generous enough
 /// for a real agentic task but bounded so a runaway can't exhaust host memory.
 /// Override with `AISH_WORKER_MEM_MB`.
@@ -287,16 +320,11 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
     // child fills the other pipe's buffer). The child's stderr — spinners, tool
     // activity — is captured, not shown; only its stdout (the final answer) and,
     // on failure, its stderr matter to us.
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
     let collect = tokio::spawn(async move {
-        let mut out = String::new();
-        let mut err = String::new();
-        let _ = tokio::join!(
-            stdout.read_to_string(&mut out),
-            stderr.read_to_string(&mut err),
-        );
-        (out, err)
+        // Capped so a runaway coordinator can't OOM this parent via its stdout.
+        tokio::join!(read_capped(stdout, CAPTURE_CAP), read_capped(stderr, CAPTURE_CAP))
     });
 
     let status = match tokio::time::timeout(WORKER_TIMEOUT, child.wait()).await {
@@ -337,13 +365,10 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
 pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<String, String> {
     let mut cmd = worker_command(spec, task, run_id);
     let mut child = cmd.spawn().map_err(|e| format!("couldn't launch goal worker: {e}"))?;
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
     let collect = tokio::spawn(async move {
-        let mut o = String::new();
-        let mut e = String::new();
-        let _ = tokio::join!(stdout.read_to_string(&mut o), stderr.read_to_string(&mut e));
-        (o, e)
+        tokio::join!(read_capped(stdout, CAPTURE_CAP), read_capped(stderr, CAPTURE_CAP))
     });
     let status = match tokio::time::timeout(WORKER_TIMEOUT, child.wait()).await {
         Ok(Ok(s)) => s,

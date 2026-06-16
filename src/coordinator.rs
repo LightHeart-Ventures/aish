@@ -49,7 +49,10 @@ use std::time::Duration;
 
 /// Upper bound on agentic rounds (a misbehaving model can't spin forever).
 /// Mirrors atum's `DEFAULT_MAX_STEPS` backstop, scaled for a shell session.
-const MAX_ROUNDS: usize = 40;
+/// Kept modest because each round accumulates conversation history in the
+/// coordinator process — too many rounds is the OOM path. Most real work
+/// completes in 1–3 rounds.
+const MAX_ROUNDS: usize = 12;
 
 /// How often to beat the run's durable heartbeat while awaiting batches — proof
 /// of liveness so a restart can tell a live run from an orphaned one. Matches
