@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 /// `pause_spinner`/`resume_spinner`/`stop_spinner` write it (under the SAME
 /// lock), so the lock serializes draw-vs-control and no frame can land after the
 /// prompt (the race that made permission prompts look "off-screen"). Pausing for
-/// the prompt also means the emoji only animates while the tool is *executing*,
+/// the prompt also means the spinner only animates while the tool is *executing*,
 /// never while waiting for the permission answer.
 #[derive(PartialEq, Clone, Copy)]
 enum Spin {
@@ -101,14 +101,15 @@ pub async fn run_turn(
         let mut results: Vec<ToolResult> = Vec::with_capacity(turn.tool_calls.len());
         for call in &turn.tool_calls {
             let desc = describe_call(call);
-            // Tool-execution phase: this call gets its own animated emoji line
-            // while it runs. Calls execute sequentially, so only the current
-            // one animates; the spinner is replaced by a final static line
-            // (✓/✗ + desc) when the tool returns. `run_interactive` hands the
-            // terminal to a child, so it opts out of the animation (which would
-            // fight the child for stderr) and shows a plain static line.
+            // Tool-execution phase: this call gets its own animated line while it
+            // runs — a braille spinner turning to the LEFT of a steady 🔧 emoji.
+            // Calls execute sequentially, so only the current one animates; the
+            // spinner is replaced by a final static line (✓/✗ + desc) when the
+            // tool returns. `run_interactive` hands the terminal to a child, so it
+            // opts out of the animation (which would fight the child for stderr)
+            // and shows a plain static line.
             let tool_spin = ToolSpinner::start(&desc, animates(&call.name));
-            // Pause the animation around any permission prompt: the emoji must
+            // Pause the animation around any permission prompt: the spinner must
             // not animate (or overwrite the prompt) while we wait for the answer,
             // then it resumes for the tool's actual execution.
             let stopper = tool_spin.stopper();
@@ -240,12 +241,13 @@ impl Drop for Spinner {
     }
 }
 
-/// Cycling-emoji animation on the tool-call line while that tool executes —
-/// the tool-execution phase indicator, distinct from the model's "thinking"
-/// spinner. A gear/hourglass cycle reads as "work in progress" at a glance and
-/// keeps the same dim, two-space-indented style as the static 🔧 line it
-/// replaces. TTY-gated; on `finish` the animation is erased and a static
-/// result line (✓/✗ + desc) is printed in its place.
+/// Running-tool indicator: a braille spinner turning to the LEFT of a steady 🔧
+/// emoji while the tool executes — the tool-execution phase, distinct from the
+/// model's "thinking" spinner. The wrench stays put (it's *our* tool glyph) and
+/// only the spinner to its left animates, mirroring the look of the thinking
+/// icon (same braille frames, cyan glyph). Keeps the dim, two-space-indented
+/// style of the static 🔧 line it replaces. TTY-gated; on `finish` the animation
+/// is erased and a static result line (✓/✗ + desc) is printed in its place.
 struct ToolSpinner {
     /// Shared animation state (Running/Paused/Stopped). `stopper()` hands a clone
     /// to the confirm wrapper so it can pause/resume around the prompt.
@@ -256,9 +258,10 @@ struct ToolSpinner {
     animated: bool,
 }
 
-/// Frames for the running-tool animation. Gear ↔ hourglass: "a tool is turning
-/// / time is passing". Small and tasteful — two glyphs, no emoji soup.
-const TOOL_FRAMES: [&str; 4] = ["⚙️ ", "⏳", "⚙️ ", "⌛"];
+/// Frames for the running-tool spinner — the same braille cycle as the
+/// "thinking" indicator, drawn to the LEFT of a steady 🔧 so the wrench stays
+/// put while the spinner turns.
+const TOOL_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Whether a tool's execution should be animated. Tools that hand the terminal
 /// to a child (interactive sessions) must not animate — the spinner's cursor
@@ -284,10 +287,10 @@ impl ToolSpinner {
         let s = state.clone();
         let desc = desc.to_string();
         let task = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(80));
             // Consume the immediate first tick so no frame draws for the first
-            // ~120ms — long enough for a permission gate to pause us before the
-            // emoji ever appears, so it never animates over the prompt.
+            // ~80ms — long enough for a permission gate to pause us before the
+            // spinner ever appears, so it never animates over the prompt.
             tick.tick().await;
             for i in 0.. {
                 tick.tick().await;
@@ -296,7 +299,12 @@ impl ToolSpinner {
                     Spin::Stopped => break,
                     Spin::Paused => {} // waiting on a confirm — draw nothing
                     Spin::Running => {
-                        eprint!("\r\x1b[2K\x1b[2m  {} {desc}\x1b[0m", TOOL_FRAMES[i % TOOL_FRAMES.len()])
+                        // Animated braille spinner (cyan, like "thinking…") to the
+                        // left of a steady, dim 🔧 + desc.
+                        eprint!(
+                            "\r\x1b[2K  \x1b[36m{}\x1b[0m \x1b[2m🔧 {desc}\x1b[0m",
+                            TOOL_FRAMES[i % TOOL_FRAMES.len()]
+                        )
                     }
                 }
             }
@@ -332,7 +340,7 @@ impl ToolSpinner {
 }
 
 /// Pause the animation for a confirm prompt: stop drawing, clear the line, and
-/// restore the cursor — so the emoji isn't animating while we wait for the
+/// restore the cursor — so the spinner isn't animating while we wait for the
 /// user's answer and the prompt is clean. Under the lock, so it can't race a
 /// frame. Idempotent.
 fn pause_spinner(state: &SpinState) {
@@ -343,7 +351,7 @@ fn pause_spinner(state: &SpinState) {
     }
 }
 
-/// Resume the animation after the prompt — the emoji animates again during the
+/// Resume the animation after the prompt — the spinner animates again during the
 /// tool's actual execution. Idempotent.
 fn resume_spinner(state: &SpinState) {
     let mut g = state.lock().unwrap();
