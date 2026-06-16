@@ -1,8 +1,8 @@
 use super::{Msg, Role, ToolCall, ToolDef, Turn};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const API_URL: &str = "https://api.x.ai/v1/chat/completions";
 
@@ -51,14 +51,21 @@ or set XAI_API_KEY in your environment or ~/.aishrc"
 
     /// The current bearer token. For the OAuth file this reads + parses on every
     /// request, so a token the Grok CLI refreshed is used without a restart.
-    fn bearer(&self) -> Result<String> {
+    fn access_token(&self) -> Result<String> {
         match self {
             GrokAuth::ApiKey(k) => Ok(k.clone()),
-            GrokAuth::OAuthFile(p) => {
-                let contents = std::fs::read_to_string(p)
-                    .with_context(|| format!("reading Grok token store {}", p.display()))?;
-                token_from_auth_json(&contents)
-            }
+            GrokAuth::OAuthFile(p) => Ok(GrokOAuthStore::load(p)?.access_token),
+        }
+    }
+
+    /// Exchange the stored refresh token for a fresh access token and persist the
+    /// result (the refresh token ROTATES on each use, so this writeback is
+    /// mandatory). Returns the new access token. Only the OAuth-file credential
+    /// can refresh — an API key is used verbatim.
+    async fn refresh(&self, client: &reqwest::Client) -> Result<String> {
+        match self {
+            GrokAuth::ApiKey(_) => bail!("an XAI_API_KEY can't be refreshed"),
+            GrokAuth::OAuthFile(p) => GrokOAuthStore::load(p)?.refresh(client).await,
         }
     }
 
@@ -71,28 +78,203 @@ or set XAI_API_KEY in your environment or ~/.aishrc"
     }
 }
 
+/// The Grok CLI's `~/.grok/auth.json` parsed into the fields aish needs: the
+/// current access token plus everything required to refresh it. The file maps
+/// one `"<issuer>::<client_id>"` key to a login entry; we use the first.
+struct GrokOAuthStore {
+    path: PathBuf,
+    /// The top-level `"<issuer>::<client_id>"` key of the active login entry.
+    entry_key: String,
+    access_token: String,
+    refresh_token: String,
+    client_id: String,
+    /// `<issuer>/oauth2/token` — the OIDC token endpoint (public PKCE client, so
+    /// refresh needs only refresh_token + client_id, no secret).
+    token_endpoint: String,
+}
+
+impl GrokOAuthStore {
+    fn load(path: &Path) -> Result<Self> {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("reading Grok token store {}", path.display()))?;
+        Self::parse(path, &contents)
+    }
+
+    /// Pure parse (no IO) for unit-testability.
+    fn parse(path: &Path, contents: &str) -> Result<Self> {
+        let v: Value = serde_json::from_str(contents).context("~/.grok/auth.json is not valid JSON")?;
+        let obj = v.as_object().context("~/.grok/auth.json: expected a JSON object of logins")?;
+        let (entry_key, entry) = obj
+            .iter()
+            .next()
+            .context("~/.grok/auth.json has no login — run the Grok CLI login")?;
+        let access_token = entry["key"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .context("~/.grok/auth.json login has no `key` token — re-run the Grok CLI login")?
+            .to_string();
+        let refresh_token = entry["refresh_token"].as_str().unwrap_or("").to_string();
+        let client_id = entry["oidc_client_id"].as_str().unwrap_or("").to_string();
+        let issuer = entry["oidc_issuer"].as_str().unwrap_or("https://auth.x.ai");
+        let token_endpoint = format!("{}/oauth2/token", issuer.trim_end_matches('/'));
+        Ok(Self {
+            path: path.to_path_buf(),
+            entry_key: entry_key.clone(),
+            access_token,
+            refresh_token,
+            client_id,
+            token_endpoint,
+        })
+    }
+
+    async fn refresh(&self, client: &reqwest::Client) -> Result<String> {
+        if self.refresh_token.is_empty() || self.client_id.is_empty() {
+            bail!(
+                "~/.grok/auth.json has no refresh_token/client_id to refresh with — \
+re-run the Grok CLI login"
+            );
+        }
+        let form = format!(
+            "grant_type=refresh_token&refresh_token={}&client_id={}",
+            form_encode(&self.refresh_token),
+            form_encode(&self.client_id),
+        );
+        let resp = client
+            .post(&self.token_endpoint)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(form)
+            .send()
+            .await
+            .context("grok token refresh request failed")?;
+        let status = resp.status().as_u16();
+        let v: Value = resp.json().await.context("grok token endpoint returned non-JSON")?;
+        if status != 200 {
+            let msg = v["error_description"]
+                .as_str()
+                .or_else(|| v["error"].as_str())
+                .unwrap_or("unknown error");
+            bail!("grok token refresh failed ({status}): {msg} — re-run the Grok CLI login");
+        }
+        let access = v["access_token"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .context("grok token refresh response had no access_token")?
+            .to_string();
+        // Refresh tokens rotate: if a new one came back we MUST persist it, or the
+        // old one (now invalidated server-side) breaks the next refresh.
+        let new_refresh = v["refresh_token"].as_str().filter(|s| !s.is_empty());
+        let expires_at = v["expires_in"]
+            .as_u64()
+            .map(|secs| unix_to_rfc3339(now_unix().saturating_add(secs)));
+        self.write_back(&access, new_refresh, expires_at.as_deref())?;
+        Ok(access)
+    }
+
+    /// Persist refreshed credentials back into auth.json, preserving every other
+    /// field, atomically (temp + rename) and 0600 so a partial/loose write can't
+    /// corrupt or expose the token store.
+    fn write_back(&self, access: &str, refresh: Option<&str>, expires_at: Option<&str>) -> Result<()> {
+        let contents = std::fs::read_to_string(&self.path)
+            .with_context(|| format!("re-reading {} for write-back", self.path.display()))?;
+        let mut v: Value = serde_json::from_str(&contents).context("auth.json became invalid JSON")?;
+        apply_refresh_to_entry(&mut v, &self.entry_key, access, refresh, expires_at)?;
+        let pretty = serde_json::to_string_pretty(&v).context("serializing refreshed auth.json")?;
+        atomic_write_0600(&self.path, &pretty)
+    }
+}
+
+/// Merge refreshed credentials into the parsed auth.json `Value` in place,
+/// touching only the active entry's `key`/`refresh_token`/`expires_at`. Pure so
+/// the merge (and its field-preservation) is unit-testable.
+fn apply_refresh_to_entry(
+    v: &mut Value,
+    entry_key: &str,
+    access: &str,
+    refresh: Option<&str>,
+    expires_at: Option<&str>,
+) -> Result<()> {
+    let entry = v
+        .get_mut(entry_key)
+        .and_then(|e| e.as_object_mut())
+        .context("auth.json login entry vanished before write-back")?;
+    entry.insert("key".into(), json!(access));
+    if let Some(rt) = refresh {
+        entry.insert("refresh_token".into(), json!(rt));
+    }
+    if let Some(ea) = expires_at {
+        entry.insert("expires_at".into(), json!(ea));
+    }
+    Ok(())
+}
+
+/// Percent-encode a value for an `application/x-www-form-urlencoded` body,
+/// leaving the RFC 3986 unreserved set untouched. Used to build the token-refresh
+/// request without depending on reqwest's optional form support.
+fn form_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Seconds since the Unix epoch (0 if the clock is before it — never panics).
+fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Format Unix seconds as a UTC RFC 3339 timestamp (`YYYY-MM-DDTHH:MM:SSZ`), so
+/// we can rewrite `expires_at` without pulling in a date crate. Uses Hinnant's
+/// days-from-civil algorithm.
+fn unix_to_rfc3339(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let tod = secs % 86_400;
+    let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// Write `contents` to `path` atomically: a temp file in the same directory,
+/// chmod 0600, then rename over the target (rename is atomic on the same fs).
+fn atomic_write_0600(path: &Path, contents: &str) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("auth.json");
+    let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, contents)
+        .with_context(|| format!("writing temp token file {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, path).with_context(|| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("replacing {}", path.display())
+    })
+}
+
 /// `~/.grok/auth.json` — the Grok CLI's token store.
 fn grok_auth_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".grok").join("auth.json"))
 }
 
-/// Extract the access token from the Grok CLI's `auth.json`. The file maps one
-/// or more `"<issuer>::<client_id>"` keys to a login entry; the JWT bearer lives
-/// in that entry's `key` field. We take the first entry (the CLI keeps one active
-/// login). Pure (string in, token out) so it's unit-testable without the file.
+/// Extract just the access token from the Grok CLI's `auth.json` (the first
+/// login entry's `key`). Thin wrapper over the full store parser.
+#[cfg(test)]
 fn token_from_auth_json(contents: &str) -> Result<String> {
-    let v: Value = serde_json::from_str(contents).context("~/.grok/auth.json is not valid JSON")?;
-    let obj = v.as_object().context("~/.grok/auth.json: expected a JSON object of logins")?;
-    let entry = obj
-        .values()
-        .next()
-        .context("~/.grok/auth.json has no login — run the Grok CLI login")?;
-    let key = entry["key"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .context("~/.grok/auth.json login has no `key` token — re-run the Grok CLI login")?;
-    Ok(key.to_string())
+    GrokOAuthStore::parse(Path::new("(memory)"), contents).map(|s| s.access_token)
 }
 
 /// True when SOME Grok credential is resolvable (OAuth file or `XAI_API_KEY`).
@@ -169,8 +351,9 @@ impl GrokBackend {
         const MAX_DELAY: Duration = Duration::from_secs(30);
         // Resolve the bearer once per request (fresh-reads the OAuth file, so a
         // CLI-refreshed token is picked up); it won't change across the ~seconds
-        // of retry backoff.
-        let bearer = self.auth.bearer()?;
+        // of retry backoff unless WE refresh it on a 401 below.
+        let mut bearer = self.auth.access_token()?;
+        let mut refreshed = false;
         let mut delay = Duration::from_secs(2);
         for attempt in 0..MAX_ATTEMPTS {
             let last = attempt + 1 == MAX_ATTEMPTS;
@@ -190,9 +373,43 @@ impl GrokBackend {
                     if status == 200 {
                         return Ok(v);
                     }
-                    // OpenAI error shape: {"error": {"message": ..., "type": ...}}.
-                    let msg = v["error"]["message"].as_str().unwrap_or("unknown error");
-                    let kind = v["error"]["type"].as_str().unwrap_or("error");
+                    // xAI reports errors in two shapes: the OpenAI
+                    // {"error":{"message","type"}} and a flatter {"code","error":
+                    // "<string>"} (used for auth failures). Read whichever is present.
+                    let msg = v["error"]["message"]
+                        .as_str()
+                        .or_else(|| v["error"].as_str())
+                        .or_else(|| v["code"].as_str())
+                        .unwrap_or("unknown error");
+                    let kind = v["error"]["type"]
+                        .as_str()
+                        .or_else(|| v["code"].as_str())
+                        .unwrap_or("error");
+                    // A bad/expired bearer comes back as 401/403 OR — for xAI — a
+                    // 400 "Incorrect API key provided". For a subscription token
+                    // that means the access token lapsed: refresh it ONCE (rotating
+                    // + persisting the new token) and retry, rather than making the
+                    // user re-run the Grok CLI.
+                    let auth_failed = matches!(status, 401 | 403)
+                        || (status == 400 && {
+                            let m = msg.to_ascii_lowercase();
+                            m.contains("api key") || m.contains("expired") || m.contains("unauthor")
+                        });
+                    if auth_failed
+                        && !refreshed
+                        && !last
+                        && matches!(self.auth, GrokAuth::OAuthFile(_))
+                    {
+                        eprintln!("\x1b[2m  grok token expired — refreshing…\x1b[0m");
+                        match self.auth.refresh(&self.client).await {
+                            Ok(t) => {
+                                bearer = t;
+                                refreshed = true;
+                                continue; // retry immediately with the fresh token
+                            }
+                            Err(e) => bail!("{e:#}"),
+                        }
+                    }
                     // Retry only what's retryable: rate limits (429) and 5xx.
                     if (status == 429 || status >= 500) && !last {
                         eprintln!("\x1b[2m  api {kind} ({status}), retrying…\x1b[0m");
@@ -200,13 +417,12 @@ impl GrokBackend {
                         delay = (delay * 2).min(MAX_DELAY);
                         continue;
                     }
-                    // A rejected subscription token is usually an expired login;
-                    // the Grok CLI owns the refresh, so point the user there. (403
-                    // is also where xAI's SuperGrok-Heavy allowlist would bite.)
-                    if matches!(status, 401 | 403) && matches!(self.auth, GrokAuth::OAuthFile(_)) {
+                    // An auth failure a refresh didn't (or couldn't) fix — or 403,
+                    // xAI's SuperGrok-Heavy allowlist. Point the user to the CLI.
+                    if auth_failed && matches!(self.auth, GrokAuth::OAuthFile(_)) {
                         bail!(
-                            "grok api {kind} ({status}): {msg} — your SuperGrok login may have \
-expired or lack API access; re-run the Grok CLI to refresh ~/.grok/auth.json"
+                            "grok api ({status}): {msg} — your SuperGrok login may have expired or \
+lack API access; re-run the Grok CLI to refresh ~/.grok/auth.json"
                         );
                     }
                     bail!("grok api {kind} ({status}): {msg}");
@@ -220,7 +436,7 @@ expired or lack API access; re-run the Grok CLI to refresh ~/.grok/auth.json"
                 Err(e) => return Err(e).context("request to grok api failed"),
             }
         }
-        unreachable!()
+        bail!("grok api: exhausted retries")
     }
 }
 
@@ -568,6 +784,63 @@ mod tests {
         // entry present but no/blank key
         assert!(token_from_auth_json(r#"{"x::y": {"key": ""}}"#).is_err());
         assert!(token_from_auth_json(r#"{"x::y": {"auth_mode": "oidc"}}"#).is_err());
+    }
+
+    #[test]
+    fn store_parse_derives_token_endpoint_and_refresh_fields() {
+        let contents = r#"{
+            "https://auth.x.ai::cid-123": {
+                "key": "access.jwt",
+                "refresh_token": "rt_xyz",
+                "oidc_client_id": "cid-123",
+                "oidc_issuer": "https://auth.x.ai"
+            }
+        }"#;
+        let s = GrokOAuthStore::parse(Path::new("(memory)"), contents).unwrap();
+        assert_eq!(s.access_token, "access.jwt");
+        assert_eq!(s.refresh_token, "rt_xyz");
+        assert_eq!(s.client_id, "cid-123");
+        assert_eq!(s.token_endpoint, "https://auth.x.ai/oauth2/token");
+        assert_eq!(s.entry_key, "https://auth.x.ai::cid-123");
+    }
+
+    #[test]
+    fn unix_to_rfc3339_matches_known_instants() {
+        assert_eq!(unix_to_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(unix_to_rfc3339(1_700_000_000), "2023-11-14T22:13:20Z");
+        // a leap day
+        assert_eq!(unix_to_rfc3339(1_582_934_400), "2020-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn apply_refresh_updates_entry_and_preserves_other_fields() {
+        let mut v: Value = serde_json::from_str(
+            r#"{"iss::cid": {"key": "old", "refresh_token": "old_rt", "expires_at": "old_exp", "email": "x@y.z", "user_id": "u1"}}"#,
+        )
+        .unwrap();
+        apply_refresh_to_entry(&mut v, "iss::cid", "new_access", Some("new_rt"), Some("new_exp")).unwrap();
+        let e = &v["iss::cid"];
+        assert_eq!(e["key"], "new_access");
+        assert_eq!(e["refresh_token"], "new_rt");
+        assert_eq!(e["expires_at"], "new_exp");
+        // untouched fields survive
+        assert_eq!(e["email"], "x@y.z");
+        assert_eq!(e["user_id"], "u1");
+    }
+
+    #[test]
+    fn apply_refresh_keeps_old_refresh_token_when_none_returned() {
+        let mut v: Value =
+            serde_json::from_str(r#"{"iss::cid": {"key": "old", "refresh_token": "old_rt"}}"#).unwrap();
+        apply_refresh_to_entry(&mut v, "iss::cid", "new_access", None, None).unwrap();
+        assert_eq!(v["iss::cid"]["key"], "new_access");
+        assert_eq!(v["iss::cid"]["refresh_token"], "old_rt", "no rotation → keep the old token");
+    }
+
+    #[test]
+    fn apply_refresh_errors_on_missing_entry() {
+        let mut v: Value = serde_json::from_str(r#"{"iss::cid": {"key": "old"}}"#).unwrap();
+        assert!(apply_refresh_to_entry(&mut v, "nope::nope", "a", None, None).is_err());
     }
 
     #[test]
