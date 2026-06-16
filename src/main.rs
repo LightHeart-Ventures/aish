@@ -16,6 +16,7 @@ mod repl;
 mod session;
 mod skills;
 mod tools;
+mod update;
 mod worker;
 
 use anyhow::Result;
@@ -44,6 +45,10 @@ struct Args {
     /// Skip all confirmation prompts (alias for --mode yolo)
     #[arg(long)]
     yolo: bool,
+
+    /// Check for a newer published release, upgrade if one exists, and exit.
+    #[arg(long)]
+    update: bool,
 
     /// Run headless as a background coordinator: like -c, but AWAIT all
     /// background batch jobs before exiting (plain -c would orphan them). Runs
@@ -96,6 +101,27 @@ async fn main() -> Result<()> {
     let mut timer = StartupTimer::new();
     let args = Args::parse();
     timer.mark("args parsed");
+
+    // `aish --update`: non-interactive self-upgrade. Check the latest release and,
+    // if it's newer for this platform, download + swap the binary, then exit.
+    if args.update {
+        match update::check().await {
+            Ok(Some(info)) => {
+                println!(
+                    "aish {} is available (you have {}).",
+                    info.version,
+                    update::current_version()
+                );
+                update::perform(&info).await?;
+            }
+            Ok(None) => println!("aish is up to date ({}).", update::current_version()),
+            Err(e) => {
+                eprintln!("\x1b[31maish:\x1b[0m update check failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     // Load ~/.aishrc up front, BEFORE building the backend: its `export` lines
     // (credentials included) populate session.env, and the Claude backend
     // resolves its credential from those rc exports as well as the process env —
