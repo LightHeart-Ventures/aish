@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
@@ -58,6 +58,51 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, cap: usize) -> S
         s.push_str("\n…[output truncated — exceeded the capture cap]");
     }
     s
+}
+
+// ---------------------------------------------------------------------------
+// Prompt-badge pulse — colour the ⟳N indicator by recent background activity
+// ---------------------------------------------------------------------------
+
+/// How long a background-worker event keeps the prompt's `⟳N` badge pulsing
+/// (coloured glyph) before it fades back to the idle dim `⟳N`. Short enough to
+/// read as a transient "pulse", long enough to be seen at the next prompt draw.
+pub const PULSE_FADE: Duration = Duration::from_millis(900);
+
+/// A single prompt-badge pulse event, derived from a coordinator's stderr.
+/// Most-recent-wins across all live workers (see [`fresh_pulse`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pulse {
+    /// A tool call finished successfully — pulse green ✓.
+    ToolOk,
+    /// A tool call failed — pulse red ✗.
+    ToolErr,
+    /// The model emitted a turn/narration line — pulse magenta ⟳.
+    Turn,
+}
+
+/// Classify ONE raw coordinator-stderr line into a prompt-badge pulse event, or
+/// `None` when it carries no event. Pure, so it's unit-testable without a pipe.
+///
+/// The coordinator runs non-TTY, so its post-execution tool line is the static
+/// `✓/✗ 🔧 <desc>` shape (see `engine::tool_result_line`): a `✓` glyph alongside
+/// the wrench is a success, a `✗` a failure. A bare `🔧 <desc>` START line (no
+/// status glyph) is the tool *beginning*, not an outcome → `None`. A `🗨` line is
+/// turn narration (`engine::emit_narration`) → a turn-completion pulse.
+fn classify_event(line: &str) -> Option<Pulse> {
+    if line.contains('🔧') {
+        if line.contains('✓') {
+            return Some(Pulse::ToolOk);
+        }
+        if line.contains('✗') {
+            return Some(Pulse::ToolErr);
+        }
+        return None; // a bare start line — no outcome yet
+    }
+    if line.trim_start().starts_with('🗨') {
+        return Some(Pulse::Turn);
+    }
+    None
 }
 
 /// How many of the child's most-recent stderr lines we retain for the failure
@@ -150,10 +195,22 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
     r: R,
     label: &str,
     show_output: Arc<AtomicBool>,
+    pulse: Option<Arc<WorkerJob>>,
 ) -> String {
     let mut lines = BufReader::new(r).lines();
     let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_LINES);
     while let Ok(Some(line)) = lines.next_line().await {
+        // Drive the prompt-badge pulse from EVERY line (independent of the
+        // `:worker-output` forwarding gate) so the badge colour-pulses even when
+        // the verbose stream is suppressed — the badge is the quiet liveness cue.
+        if let Some(job) = &pulse {
+            match classify_event(&line) {
+                Some(Pulse::ToolOk) => job.record_tool_outcome(true),
+                Some(Pulse::ToolErr) => job.record_tool_outcome(false),
+                Some(Pulse::Turn) => job.record_turn_completion(),
+                None => {}
+            }
+        }
         if let Some((suffix, text)) = forward_decision(&line, show_output.load(Ordering::Relaxed)) {
             crate::tools::announce(&format!("[{label}{suffix}]"), &text);
         }
@@ -585,6 +642,13 @@ struct JobInner {
     /// worktree (it made changes). Surfaced in the completion notice so the
     /// parent knows where to review/merge. `None` for shared-cwd or no-change runs.
     branch: Option<String>,
+    /// Most recent tool-call outcome parsed from this worker's stderr, for the
+    /// prompt-badge pulse: `(is_success, when)`. `None` until the first tool
+    /// finishes. Read by [`WorkerJob::latest_pulse`] and faded after [`PULSE_FADE`].
+    last_tool_outcome: Option<(bool, Instant)>,
+    /// When the worker most recently emitted turn/narration text, for the
+    /// magenta turn pulse. `None` until the first narration line.
+    last_turn_completion: Option<Instant>,
 }
 
 pub type WorkerJobs = Arc<Mutex<Vec<Arc<WorkerJob>>>>;
@@ -658,6 +722,33 @@ impl WorkerJob {
     fn branch(&self) -> Option<String> {
         self.inner.lock().unwrap().branch.clone()
     }
+    /// Record a tool-call outcome for the prompt-badge pulse (green on success,
+    /// red on failure). Called from the stderr stream as the coordinator reports
+    /// each tool finishing.
+    fn record_tool_outcome(&self, success: bool) {
+        self.inner.lock().unwrap().last_tool_outcome = Some((success, Instant::now()));
+    }
+    /// Record a turn/narration completion for the magenta turn pulse.
+    fn record_turn_completion(&self) {
+        self.inner.lock().unwrap().last_turn_completion = Some(Instant::now());
+    }
+    /// The most recent badge-pulse event on this worker (tool outcome vs turn
+    /// completion — whichever happened later), paired with when it happened.
+    /// `None` when neither has occurred. Recency is judged by the caller against
+    /// [`PULSE_FADE`].
+    fn latest_pulse(&self) -> Option<(Pulse, Instant)> {
+        let i = self.inner.lock().unwrap();
+        let tool = i
+            .last_tool_outcome
+            .map(|(ok, t)| (if ok { Pulse::ToolOk } else { Pulse::ToolErr }, t));
+        let turn = i.last_turn_completion.map(|t| (Pulse::Turn, t));
+        match (tool, turn) {
+            (Some(a), Some(b)) => Some(if a.1 >= b.1 { a } else { b }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
     fn set_failed(&self, err: String) {
         let mut i = self.inner.lock().unwrap();
         i.status = "failed".into();
@@ -715,6 +806,8 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
             error: None,
             displayed: false,
             branch: None,
+            last_tool_outcome: None,
+            last_turn_completion: None,
         }),
     });
     guard.push(job.clone());
@@ -760,8 +853,12 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
     let stderr = child.stderr.take().expect("piped stderr");
     let label = job.id.clone();
     let show_output = spec.show_output.clone();
+    let pulse_job = job.clone();
     let collect = tokio::spawn(async move {
-        tokio::join!(read_capped(stdout, CAPTURE_CAP), stream_stderr(stderr, &label, show_output))
+        tokio::join!(
+            read_capped(stdout, CAPTURE_CAP),
+            stream_stderr(stderr, &label, show_output, Some(pulse_job))
+        )
     });
 
     let status = match tokio::time::timeout(WORKER_TIMEOUT, child.wait()).await {
@@ -842,7 +939,10 @@ pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<Str
     // worker path — retaining only a bounded tail for the failure message.
     let show_output = spec.show_output.clone();
     let collect = tokio::spawn(async move {
-        tokio::join!(read_capped(stdout, CAPTURE_CAP), stream_stderr(stderr, "goal", show_output))
+        tokio::join!(
+            read_capped(stdout, CAPTURE_CAP),
+            stream_stderr(stderr, "goal", show_output, None)
+        )
     });
     let status = match tokio::time::timeout(WORKER_TIMEOUT, child.wait()).await {
         Ok(Ok(s)) => s,
@@ -939,6 +1039,41 @@ pub fn running_count(jobs: &WorkerJobs) -> usize {
     jobs.lock().unwrap().iter().filter(|j| !j.is_terminal()).count()
 }
 
+/// The most recent still-fresh badge pulse across ALL workers (most-recent
+/// wins), or `None` when no worker has had an event within [`PULSE_FADE`]. Drives
+/// the colour of the prompt's `⟳N` badge.
+pub fn fresh_pulse(jobs: &WorkerJobs) -> Option<Pulse> {
+    let now = Instant::now();
+    jobs.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|j| j.latest_pulse())
+        .filter(|(_, when)| now.saturating_duration_since(*when) < PULSE_FADE)
+        .max_by_key(|&(_, when)| when)
+        .map(|(p, _)| p)
+}
+
+/// Build the prompt's `⟳N` background-jobs badge, coloured by the most recent
+/// background-worker event:
+///   * green `✓N`   — a tool call just succeeded,
+///   * red `✗N`     — a tool call just failed,
+///   * magenta `⟳N` — the model just emitted a turn/narration line,
+///   * dim `⟳N`     — idle (no recent event, or the pulse has faded).
+/// `running` is the TOTAL live background-job count (workers + batches); the
+/// badge is empty when nothing is running. `pulse` is [`fresh_pulse`]'s verdict.
+/// Pure, so the colour/glyph mapping is unit-testable.
+pub fn pulse_badge(running: usize, pulse: Option<Pulse>) -> String {
+    if running == 0 {
+        return String::new();
+    }
+    match pulse {
+        Some(Pulse::ToolOk) => format!("\x1b[32m✓{running}\x1b[0m "), // green tick
+        Some(Pulse::ToolErr) => format!("\x1b[31m✗{running}\x1b[0m "), // red cross
+        Some(Pulse::Turn) => format!("\x1b[1;35m⟳{running}\x1b[0m "), // bright magenta
+        None => format!("\x1b[2m⟳{running}\x1b[0m "),                 // idle dim
+    }
+}
+
 /// Headless inline flush (no presenter): print every drained block to stdout.
 fn flush_results(jobs: &WorkerJobs) {
     let blocks = drain_pending(jobs);
@@ -970,6 +1105,8 @@ mod tests {
                     error: None,
                     displayed: false,
                     branch: None,
+                    last_tool_outcome: None,
+                    last_turn_completion: None,
                 }),
             }));
         };
@@ -997,6 +1134,8 @@ mod tests {
                 error: None,
                 displayed: false,
                 branch: None,
+                last_tool_outcome: None,
+                last_turn_completion: None,
             }),
         });
         assert!(job.fetch().contains("still running"));
@@ -1017,6 +1156,8 @@ mod tests {
                 error: None,
                 displayed: false,
                 branch: None,
+                last_tool_outcome: None,
+                last_turn_completion: None,
             }),
         });
         job.set_failed("boom".into());
@@ -1133,6 +1274,140 @@ mod tests {
         // Distinct repos get distinct keyed dirs even with the same id.
         let (_, other_repo) = worktree_layout(std::path::Path::new("/other"), "worker_3");
         assert_ne!(path, other_repo);
+    }
+
+    #[tokio::test]
+    async fn stream_stderr_records_pulse_from_coordinator_lines() {
+        // A realistic slice of a coordinator's piped stderr: a tool start line,
+        // its success result line, a narration line, then a tool failure. The
+        // pulse must end on the most recent event (the failure).
+        let job = Arc::new(WorkerJob {
+            id: "worker_1".into(),
+            task: "t".into(),
+            inner: Mutex::new(JobInner {
+                status: "running".into(),
+                result: None,
+                error: None,
+                displayed: false,
+                branch: None,
+                last_tool_outcome: None,
+                last_turn_completion: None,
+            }),
+        });
+        let lines = concat!(
+            "\x1b[2m  \u{1f527} read /etc/hosts\x1b[0m\n",
+            "\x1b[2m  \x1b[32m\u{2713}\x1b[0m \u{1f527} read /etc/hosts\x1b[0m\n",
+            "\u{1f5e8} planning the next step\n",
+            "\x1b[2m  \u{1f527} write x\x1b[0m\n",
+            "\x1b[2m  \x1b[31m\u{2717}\x1b[0m \u{1f527} write x\x1b[0m\n",
+        );
+        let show = Arc::new(AtomicBool::new(false));
+        let reader = lines.as_bytes();
+        let _tail = stream_stderr(reader, "worker_1", show, Some(job.clone())).await;
+        // Most recent event was the tool FAILURE -> red cross pulse.
+        assert_eq!(job.latest_pulse().map(|(p, _)| p), Some(Pulse::ToolErr));
+        // And it is fresh, so the aggregate badge is the red-cross variant.
+        let jobs: WorkerJobs = Arc::new(Mutex::new(vec![job]));
+        assert_eq!(pulse_badge(1, fresh_pulse(&jobs)), "\x1b[31m\u{2717}1\x1b[0m ");
+    }
+
+    #[test]
+    fn classify_event_maps_tool_and_turn_lines() {
+        // Coordinator non-TTY result lines carry a status glyph beside the wrench.
+        assert_eq!(classify_event("\x1b[2m  ✓ 🔧 read /etc/hosts\x1b[0m"), Some(Pulse::ToolOk));
+        assert_eq!(classify_event("\x1b[2m  ✗ 🔧 write x\x1b[0m"), Some(Pulse::ToolErr));
+        // A bare start line (no ✓/✗) is the tool beginning, not an outcome.
+        assert_eq!(classify_event("\x1b[2m  🔧 git status\x1b[0m"), None);
+        // Turn narration carries the speech sentinel.
+        assert_eq!(classify_event("🗨 planning the migration"), Some(Pulse::Turn));
+        // Noise lines carry nothing.
+        assert_eq!(classify_event("coordinator run abc starting"), None);
+        assert_eq!(classify_event(""), None);
+        // A batch sentinel is not a pulse event.
+        assert_eq!(classify_event("📦 fanned 3 sub-task(s) out"), None);
+    }
+
+    #[test]
+    fn latest_pulse_picks_the_most_recent_event() {
+        let job = Arc::new(WorkerJob {
+            id: "worker_1".into(),
+            task: "t".into(),
+            inner: Mutex::new(JobInner {
+                status: "running".into(),
+                result: None,
+                error: None,
+                displayed: false,
+                branch: None,
+                last_tool_outcome: None,
+                last_turn_completion: None,
+            }),
+        });
+        // No events yet.
+        assert!(job.latest_pulse().is_none());
+        // A tool success, then (later) a turn completion: turn wins (most recent).
+        job.record_tool_outcome(true);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        job.record_turn_completion();
+        assert_eq!(job.latest_pulse().map(|(p, _)| p), Some(Pulse::Turn));
+        // A still-later tool failure overtakes the turn.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        job.record_tool_outcome(false);
+        assert_eq!(job.latest_pulse().map(|(p, _)| p), Some(Pulse::ToolErr));
+    }
+
+    #[test]
+    fn fresh_pulse_aggregates_and_fades() {
+        let jobs: WorkerJobs = Default::default();
+        // Empty → nothing to pulse.
+        assert_eq!(fresh_pulse(&jobs), None);
+        let mk = |id: &str| {
+            let j = Arc::new(WorkerJob {
+                id: id.into(),
+                task: "t".into(),
+                inner: Mutex::new(JobInner {
+                    status: "running".into(),
+                    result: None,
+                    error: None,
+                    displayed: false,
+                    branch: None,
+                    last_tool_outcome: None,
+                    last_turn_completion: None,
+                }),
+            });
+            jobs.lock().unwrap().push(j.clone());
+            j
+        };
+        let a = mk("worker_1");
+        let b = mk("worker_2");
+        a.record_tool_outcome(true);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        b.record_tool_outcome(false);
+        // Most-recent across workers wins: b's failure.
+        assert_eq!(fresh_pulse(&jobs), Some(Pulse::ToolErr));
+        // A stale event (older than PULSE_FADE) fades out of the aggregate.
+        {
+            let mut i = b.inner.lock().unwrap();
+            i.last_tool_outcome = Some((false, Instant::now() - PULSE_FADE - Duration::from_millis(50)));
+        }
+        {
+            let mut i = a.inner.lock().unwrap();
+            i.last_tool_outcome = Some((true, Instant::now() - PULSE_FADE - Duration::from_millis(50)));
+        }
+        assert_eq!(fresh_pulse(&jobs), None);
+    }
+
+    #[test]
+    fn pulse_badge_colours_by_event_and_count() {
+        // Nothing running → empty badge regardless of pulse.
+        assert_eq!(pulse_badge(0, Some(Pulse::ToolOk)), "");
+        // Idle (no recent event) → dim ⟳N.
+        assert_eq!(pulse_badge(2, None), "\x1b[2m⟳2\x1b[0m ");
+        // Tool success → green ✓N.
+        assert_eq!(pulse_badge(1, Some(Pulse::ToolOk)), "\x1b[32m✓1\x1b[0m ");
+        // Tool failure → red ✗N.
+        assert_eq!(pulse_badge(1, Some(Pulse::ToolErr)), "\x1b[31m✗1\x1b[0m ");
+        // Turn completion → bright magenta ⟳N.
+        assert_eq!(pulse_badge(3, Some(Pulse::Turn)), "\x1b[1;35m⟳3\x1b[0m ");
     }
 
     #[test]

@@ -320,6 +320,13 @@ impl ToolSpinner {
         }
         if self.animated {
             eprintln!("\r\x1b[2K\x1b[2m  {}\x1b[0m", tool_result_line(desc, is_error));
+        } else {
+            // Non-animated (piped / background coordinator): the dim start line
+            // was already printed at `start`; emit the static ✓/✗ result line too
+            // so the parent worker stream can pulse the prompt badge on the
+            // tool outcome (green success / red failure). On a TTY the animated
+            // branch already does the in-place replace.
+            eprintln!("\x1b[2m  {}\x1b[0m", tool_result_line(desc, is_error));
         }
     }
 }

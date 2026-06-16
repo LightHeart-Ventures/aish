@@ -150,11 +150,11 @@ pub async fn run(
         busy.store(false, Ordering::SeqCst);
         let running = crate::batch::running_count(&session.batch_jobs)
             + crate::worker::running_count(&session.worker_jobs);
-        let badge = if running > 0 {
-            format!("\x1b[2m⟳{running}\x1b[0m ")
-        } else {
-            String::new()
-        };
+        // Colour the ⟳N badge by the most recent background-worker event
+        // (green ✓ tool success, red ✗ tool failure, magenta ⟳ turn
+        // completion), fading back to dim ⟳N after worker::PULSE_FADE.
+        let pulse = crate::worker::fresh_pulse(&session.worker_jobs);
+        let badge = crate::worker::pulse_badge(running, pulse);
         let name = match &session.name {
             Some(n) => format!("\x1b[1;35m[{n}]\x1b[0m | "), // bold magenta, set apart from the cyan path
             None => String::new(),
