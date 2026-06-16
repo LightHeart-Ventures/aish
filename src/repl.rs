@@ -1056,6 +1056,7 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
                  :workers                            list in-flight background coordinator subprocesses\n\
+                 :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
                  :name <name>                        name the session (prefixes the prompt); bare :name clears\n\
                  :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
                                                      a verifier judges each turn. :goal status, :goal clear\n\
@@ -1093,6 +1094,36 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
             }
             for w in workers.iter() {
                 println!("{}", w.summary_line());
+            }
+        }
+        Some("dispatch") => {
+            // Launch a background coordinator directly, without a model turn —
+            // the deterministic equivalent of the model calling run_in_background.
+            let task = parts.collect::<Vec<_>>().join(" ");
+            let task = task.trim();
+            if task.is_empty() {
+                println!("usage: :dispatch <task>   — launch a background coordinator for <task>");
+            } else if session.nested {
+                println!("can't :dispatch from inside a coordinator (no nested coordinators)");
+            } else if std::env::var("ANTHROPIC_API_KEY").is_err() {
+                println!("ANTHROPIC_API_KEY not set — the coordinator needs a metered key");
+            } else {
+                match std::env::current_exe() {
+                    Ok(exe) => {
+                        let spec = crate::worker::WorkerSpec {
+                            exe,
+                            cwd: session.cwd.clone(),
+                            model: session.batch_model.clone(),
+                            env: session.env.clone(),
+                        };
+                        let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
+                        println!(
+                            "\x1b[2mdispatched background coordinator {id} — runs here with the full \
+toolset; result auto-delivers. :workers to check.\x1b[0m"
+                        );
+                    }
+                    Err(e) => println!("can't locate the aish binary to launch the coordinator: {e}"),
+                }
             }
         }
         Some("name") => {
