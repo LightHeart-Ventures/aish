@@ -33,8 +33,13 @@ pub fn load() -> Rc {
                 let _ = std::fs::write(
                     &path,
                     "# ~/.aishrc — read by aish at startup.\n\
-                     # Only `alias name='value'` and `export NAME=value` lines are honored;\n\
-                     # there is no shell underneath, so functions/conditionals are ignored.\n",
+                     # Only `alias name='value'` and `export NAME=value` lines are honored\n\
+                     # (the `export` keyword is required; a bare NAME=value is ignored).\n\
+                     # There is no shell underneath, so functions/conditionals are ignored.\n\
+                     #\n\
+                     # Credentials work here too, e.g.:\n\
+                     #   export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat...   # a Claude Max/Pro subscription\n\
+                     #   export ANTHROPIC_API_KEY=sk-ant-...           # or a metered API key\n",
                 );
                 eprintln!("\x1b[2mcreated ~/.aishrc\x1b[0m");
             }

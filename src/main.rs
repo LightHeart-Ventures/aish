@@ -60,15 +60,26 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    // Load ~/.aishrc up front, BEFORE building the backend: its `export` lines
+    // (credentials included) populate session.env, and the Claude backend
+    // resolves its credential from those rc exports as well as the process env —
+    // so `export CLAUDE_CODE_OAUTH_TOKEN=…` / `export ANTHROPIC_API_KEY=…` in
+    // ~/.aishrc works for aish itself, not just the programs it spawns.
+    let rc = rc::load();
+    let mut session = session::Session::new()?;
+    session.env = rc.env;
     let backend = match args.backend.as_str() {
-        "claude" => backend::Backend::new_claude(
-            args.model.unwrap_or_else(|| "claude-haiku-4-5".into()),
-        )?,
+        "claude" => {
+            let cred = backend::claude::Credential::resolve(&session.env)?;
+            backend::Backend::new_claude(
+                args.model.unwrap_or_else(|| "claude-haiku-4-5".into()),
+                cred,
+            )?
+        }
         #[cfg(feature = "local")]
         "local" => backend::Backend::new_local(),
         other => anyhow::bail!("unknown backend: {other} (available: claude, local)"),
     };
-    let mut session = session::Session::new()?;
     session.mode = if args.yolo {
         session::Mode::Yolo
     } else {
@@ -146,7 +157,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    repl::run(backend, session).await
+    repl::run(backend, session, rc.aliases).await
 }
 
 fn aish_dir() -> PathBuf {
