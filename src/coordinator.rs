@@ -154,7 +154,20 @@ pub async fn drive(
     }
 
     let mut rounds = 0usize;
-    let mut next_input = input;
+    // The coordinator's model HAS the full toolset (run_turn passes tool_defs),
+    // but a model handed a big task headless sometimes rationalizes "I'm a
+    // text-only assistant without file access" and refuses on turn 1 instead of
+    // calling read_file. Lead the first turn with an explicit assertion of its
+    // capabilities to head that off; later rounds use the fold-results message.
+    let mut next_input = format!(
+        "You are running headless as an autonomous aish coordinator in {cwd}. You have your FULL \
+toolset RIGHT NOW — read_file, write_file, list_dir, change_dir, run_program (build, test, git, \
+gh, anything), and the connected MCP servers. You CAN read and edit files and run commands on \
+this machine. Do NOT claim to be a text-only assistant or that you lack access — call the tools \
+and actually do the work, then report what you did with concrete evidence (command output, exit \
+codes, diffs).\n\nTASK:\n{input}",
+        cwd = session.cwd.display(),
+    );
 
     loop {
         if rounds >= MAX_ROUNDS {
