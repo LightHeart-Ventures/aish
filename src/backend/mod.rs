@@ -50,11 +50,17 @@ impl Msg {
 }
 
 /// One assistant turn, normalized.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Turn {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
     pub raw: Option<Value>,
+    /// Set when the response hit the output limit (`stop_reason:"max_tokens"`)
+    /// WHILE emitting a tool call, so the partial tool call was dropped rather
+    /// than executed (see `claude.rs`). The agentic loop must keep going — feed
+    /// the model the corrective note in `text` instead of treating the empty
+    /// `tool_calls` as a final answer — so it can retry with a smaller edit.
+    pub truncated_tool_call: bool,
 }
 
 /// A tool definition in neutral form (JSON Schema input).

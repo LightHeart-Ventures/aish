@@ -214,7 +214,8 @@ a backend or worry about batches — just describe the task and offload it."
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "task": {"type": "string", "description": "The self-contained task to run in the background. It has no access to THIS conversation — include everything it needs. It CAN read the project files and use tools/MCP in the current directory."}
+                    "task": {"type": "string", "description": "The self-contained task to run in the background. It has no access to THIS conversation — include everything it needs. It CAN read the project files and use tools/MCP in the current directory."},
+                    "isolate": {"type": "boolean", "description": "Set TRUE for any task that WRITES or EDITS files or runs builds/tests — it then runs in its own dedicated git worktree (a fresh branch off HEAD) so it can't clobber the working tree of other parallel background jobs or your live session. Set FALSE for read-only / analysis tasks (search, summarize, inspect) that change nothing. If omitted, it defaults to TRUE when the current directory is a git repo (isolation is free when no changes are made — the worktree is auto-removed), FALSE otherwise. When an isolated job makes changes, its branch is left intact and reported back for you to review/merge; nothing is auto-merged."}
                 },
                 "required": ["task"]
             }),
@@ -692,11 +693,20 @@ you're working on it and the answer will appear here when ready — no job id, n
 
     let exe = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("can't locate the aish binary to re-exec: {e}"))?;
+    // Worktree isolation (the headline fix for parallel coordinators clobbering
+    // one tree). The model sets `isolate` explicitly (true for write/build work);
+    // when omitted, default to isolated WHEN we're in a git repo — isolation is
+    // free for a no-change job (the worktree auto-removes) so it's the safe default.
+    let isolate = match call.args["isolate"].as_bool() {
+        Some(b) => b,
+        None => crate::worker::is_git_repo(&session.cwd),
+    };
     let spec = crate::worker::WorkerSpec {
         exe,
         cwd: session.cwd.clone(),
         model: session.batch_model.clone(),
         env: session.env.clone(),
+        isolate,
     };
     let _id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
     Ok("Queued a background coordinator (full toolset + MCP in this directory; it can fan parallel \

@@ -1192,6 +1192,8 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                             cwd: session.cwd.clone(),
                             model: session.batch_model.clone(),
                             env: session.env.clone(),
+                            // `:dispatch` keeps the shared-cwd behavior (no worktree).
+                            isolate: false,
                         };
                         let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
                         println!(
@@ -1245,6 +1247,8 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
                                     cwd: session.cwd.clone(),
                                     model: session.batch_model.clone(),
                                     env: session.env.clone(),
+                                    // The goal loop iterates in the live cwd (no worktree).
+                                    isolate: false,
                                 };
                                 let g = crate::goal::spawn(
                                     cond.to_string(),

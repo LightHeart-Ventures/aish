@@ -142,7 +142,7 @@ fn parse_u64_or(raw: Option<&str>, default: u64) -> u64 {
 ///
 /// Resource limits are applied via a `pre_exec` hook (see `apply_rlimits`):
 /// they run in the forked child between fork and exec.
-fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str) -> Command {
+fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str, cwd: &std::path::Path) -> Command {
     let mut cmd = Command::new(&spec.exe);
     cmd.arg("-c")
         .arg(task)
@@ -153,7 +153,9 @@ fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str) -> Command {
         .arg("claude")
         .arg("--model")
         .arg(&spec.model)
-        .current_dir(&spec.cwd)
+        // The effective run directory: `spec.cwd` normally, or the isolated
+        // worktree path when isolation is on.
+        .current_dir(cwd)
         // Nested-coordinator guard: an in-container/in-worker aish must never
         // spawn its own workers (no infinite recursion). The child reads this.
         .env("AISH_COORDINATOR", "1")
@@ -230,6 +232,171 @@ fn apply_rlimits(mem_mb: u64, cpu_secs: u64) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Worktree isolation — give a writing/building coordinator its own git worktree
+// so parallel coordinators can't clobber each other's tree (the headline bug).
+// ---------------------------------------------------------------------------
+
+/// A dedicated git worktree carved off `src` for one worker, on a fresh branch.
+/// `path` is where the coordinator runs; `branch` is reported on completion so
+/// the parent can review/merge changes (we never auto-merge).
+struct Worktree {
+    path: PathBuf,
+    branch: String,
+    /// The source repo the worktree was carved from — used to remove it cleanly.
+    src: PathBuf,
+}
+
+/// True when `dir` is inside a git working tree. Cheap `git rev-parse` probe;
+/// false on any error (not a repo, git missing, …).
+pub fn is_git_repo(dir: &std::path::Path) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Build the branch name + worktree path for a worker. Pure (no IO) so it's
+/// unit-testable. The worktree lives OUTSIDE the repo — under the system temp
+/// dir, in a subdir keyed by a hash of the source path so two repos with the
+/// same basename don't collide — so it never pollutes the source repo's
+/// `git status` with an untracked dir. The branch is `aish/<id>`.
+fn worktree_layout(src: &std::path::Path, id: &str) -> (String, PathBuf) {
+    let branch = format!("aish/{id}");
+    // Stable per-repo key (FNV-1a of the absolute source path) so worktrees for
+    // the same repo cluster together and distinct repos never share a dir.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in src.to_string_lossy().as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let path = std::env::temp_dir()
+        .join("aish-worktrees")
+        .join(format!("{hash:016x}"))
+        .join(id);
+    (branch, path)
+}
+
+/// Create a fresh worktree off the current HEAD for worker `id`. Best-effort:
+/// returns `None` (caller falls back to the shared `src` cwd) if `src` isn't a
+/// repo or the `git worktree add` fails, so isolation never blocks a job.
+fn create_worktree(src: &std::path::Path, id: &str) -> Option<Worktree> {
+    if !is_git_repo(src) {
+        return None;
+    }
+    let (branch, path) = worktree_layout(src, id);
+    // A stale dir from a crashed prior run would make `git worktree add` fail;
+    // best-effort clear it first (only an empty/leftover one is expected here).
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(src)
+        .args(["worktree", "remove", "--force"])
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let ok = std::process::Command::new("git")
+        .arg("-C")
+        .arg(src)
+        .args(["worktree", "add", "-b", &branch])
+        .arg(&path)
+        .arg("HEAD")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        Some(Worktree { path, branch, src: src.to_path_buf() })
+    } else {
+        None
+    }
+}
+
+/// True when the worktree has neither uncommitted changes nor commits ahead of
+/// where it branched (HEAD of `src` at create time). Such a worktree is "no
+/// work was done" and can be torn down. Any git error is treated as "has
+/// changes" (conservative — never delete work we can't account for).
+fn worktree_is_clean(wt: &Worktree) -> bool {
+    // Uncommitted/untracked changes?
+    let porcelain = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&wt.path)
+        .args(["status", "--porcelain"])
+        .output();
+    let dirty = match porcelain {
+        Ok(o) if o.status.success() => !o.stdout.is_empty(),
+        _ => return false, // can't tell → assume dirty, keep it
+    };
+    if dirty {
+        return false;
+    }
+    // Any commits added? The worktree branched off the source's HEAD; if its tip
+    // still equals the source's current HEAD, no commits were made → clean.
+    // (Comparing tips is robust without tracking an upstream.)
+    match (git_head(&wt.src), git_head(&wt.path)) {
+        (Some(src), Some(tip)) => src == tip,
+        _ => false, // can't compare → assume work was done, keep it
+    }
+}
+
+/// The current HEAD commit sha of a repo/worktree, or `None` on error.
+fn git_head(dir: &std::path::Path) -> Option<String> {
+    let o = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if o.status.success() {
+        Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Best-effort startup cleanup: drop git's record of worktrees whose dirs are
+/// already gone (a crashed isolated worker can leave a dangling registration).
+/// A no-op outside a repo. `git worktree prune` only removes missing entries —
+/// it never touches a live worktree, so this is always safe to call.
+pub fn prune_worktrees(dir: &std::path::Path) {
+    if !is_git_repo(dir) {
+        return;
+    }
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["worktree", "prune"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Remove a worktree and delete its branch — used when the worker made no
+/// changes, so nothing is left behind. Best-effort.
+fn remove_worktree(wt: &Worktree) {
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&wt.src)
+        .args(["worktree", "remove", "--force"])
+        .arg(&wt.path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&wt.src)
+        .args(["branch", "-D", &wt.branch])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// Turn a finished child's `ExitStatus` into a human failure note. SIGKILL
 /// (signal 9) on these workers is overwhelmingly the OS memory-pressure killer
 /// (macOS Jetsam / Linux OOM), so we name that explicitly rather than emit the
@@ -265,6 +432,10 @@ struct JobInner {
     /// Whether this job's result was already surfaced, so the flush doesn't
     /// print it twice.
     displayed: bool,
+    /// The git branch this isolated worker left its changes on, if it kept a
+    /// worktree (it made changes). Surfaced in the completion notice so the
+    /// parent knows where to review/merge. `None` for shared-cwd or no-change runs.
+    branch: Option<String>,
 }
 
 pub type WorkerJobs = Arc<Mutex<Vec<Arc<WorkerJob>>>>;
@@ -275,7 +446,9 @@ pub struct WorkerSpec {
     /// The aish binary to re-exec (this process's own executable).
     pub exe: PathBuf,
     /// Working directory for the child — the session's cwd, so it sees the same
-    /// project files and the same project `.mcp.json`.
+    /// project files and the same project `.mcp.json`. When `isolate` is set this
+    /// is the SOURCE repo; the child actually runs in a dedicated worktree carved
+    /// off it (see `run_worker`), not in `cwd` itself.
     pub cwd: PathBuf,
     /// Model the child's coordinator turn runs on (Opus by default, like batches).
     pub model: String,
@@ -283,6 +456,14 @@ pub struct WorkerSpec {
     /// `${VAR}` interpolation resolves the same as it does here. The child also
     /// inherits the parent's process env (ANTHROPIC_API_KEY, ATUM_*, …).
     pub env: Vec<(String, String)>,
+    /// When true and `cwd` is a git repo, run the coordinator in a dedicated
+    /// `git worktree` (fresh branch off HEAD) instead of sharing `cwd`, so
+    /// parallel coordinators that write/build can't clobber each other's tree.
+    /// A no-change worktree is removed on completion; one with changes is left
+    /// intact and its branch is surfaced in the result. Set by the model via the
+    /// `run_in_background` tool's `isolate` flag (smart-defaulted to true inside a
+    /// repo). The goal loop and `:dispatch` leave this false (shared cwd).
+    pub isolate: bool,
 }
 
 impl WorkerJob {
@@ -290,6 +471,13 @@ impl WorkerJob {
         let mut i = self.inner.lock().unwrap();
         i.status = "done".into();
         i.result = Some(result);
+    }
+    /// Record the branch an isolated worker left its changes on (kept worktree).
+    fn set_branch(&self, branch: String) {
+        self.inner.lock().unwrap().branch = Some(branch);
+    }
+    fn branch(&self) -> Option<String> {
+        self.inner.lock().unwrap().branch.clone()
     }
     fn set_failed(&self, err: String) {
         let mut i = self.inner.lock().unwrap();
@@ -347,6 +535,7 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
             result: None,
             error: None,
             displayed: false,
+            branch: None,
         }),
     });
     guard.push(job.clone());
@@ -359,11 +548,21 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
 /// The run task: re-exec aish in `--coordinator` mode, capture stdout as the
 /// result, enforce a timeout, then surface it.
 async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: WorkerSpec) {
-    let mut cmd = worker_command(&spec, &task, &job.id);
+    // Isolation: a writing/building coordinator gets its own git worktree off
+    // HEAD so parallel coordinators can't clobber the shared tree. Best-effort —
+    // if `cwd` isn't a repo or `git worktree add` fails, we fall back to the
+    // shared cwd (today's behavior). The worktree is torn down on completion if
+    // the job made no changes; otherwise it's left intact and its branch reported.
+    let worktree = if spec.isolate { create_worktree(&spec.cwd, &job.id) } else { None };
+    let run_cwd = worktree.as_ref().map(|w| w.path.clone()).unwrap_or_else(|| spec.cwd.clone());
+    let mut cmd = worker_command(&spec, &task, &job.id, &run_cwd);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
+            if let Some(wt) = &worktree {
+                remove_worktree(wt);
+            }
             job.set_failed(format!("couldn't launch worker subprocess: {e}"));
             on_complete(&jobs, &job);
             return;
@@ -400,10 +599,27 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
     };
 
     let (out, err) = collect.await.unwrap_or_default();
+    // Finalize the worktree (if any): a clean one (no changes, no new commits) is
+    // removed so nothing is left behind; one with work is kept and its branch
+    // surfaced so the parent can review/merge it. Returns the kept branch, if any.
+    let kept_branch = finalize_worktree(worktree.as_ref());
+    if let Some(branch) = &kept_branch {
+        job.set_branch(branch.clone());
+    }
     match status {
         Some(s) if s.success() => {
             let t = out.trim();
-            job.set_done(if t.is_empty() { "(no output)".into() } else { t.to_string() });
+            let mut result = if t.is_empty() { "(no output)".to_string() } else { t.to_string() };
+            if let Some(wt) = worktree.as_ref() {
+                if let Some(branch) = &kept_branch {
+                    result.push_str(&format!(
+                        "\n\n(changes left on branch `{branch}` in worktree `{}` — review/merge \
+from the parent repo; not auto-merged.)",
+                        wt.path.display(),
+                    ));
+                }
+            }
+            job.set_done(result);
         }
         Some(s) => job.set_failed(describe_failure(s, "worker", &err)),
         None => job.set_failed(format!(
@@ -414,12 +630,28 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
     on_complete(&jobs, &job);
 }
 
+/// Tear down or keep a finished worker's worktree. If it has no changes and no
+/// commits ahead, remove it + its branch (nothing left behind) and return
+/// `None`. If it has work, leave it intact and return the branch name so the
+/// parent can review/merge it (never auto-merged).
+fn finalize_worktree(worktree: Option<&Worktree>) -> Option<String> {
+    let wt = worktree?;
+    if worktree_is_clean(wt) {
+        remove_worktree(wt);
+        None
+    } else {
+        Some(wt.branch.clone())
+    }
+}
+
 /// Run a single coordinator subprocess to completion and return its stdout (the
 /// final answer). Unlike `spawn`, it doesn't register a tracked job or
 /// auto-deliver — the caller consumes the output. Used by the goal loop for each
 /// work step.
 pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<String, String> {
-    let mut cmd = worker_command(spec, task, run_id);
+    // The goal loop never isolates (it iterates in the user's live cwd), so we
+    // run in `spec.cwd` directly.
+    let mut cmd = worker_command(spec, task, run_id, &spec.cwd);
     let mut child = cmd.spawn().map_err(|e| format!("couldn't launch goal worker: {e}"))?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
@@ -506,8 +738,11 @@ pub fn notify_pending(jobs: &WorkerJobs) -> Vec<String> {
         .map(|job| {
             let (icon, what) = if job.status() == "failed" { ("✗", "failed") } else { ("✓", "done") };
             job.mark_displayed();
+            // Surface the branch an isolated worker left changes on, so the parent
+            // knows where to review/merge without opening the full result.
+            let branch = job.branch().map(|b| format!(" · branch `{b}`")).unwrap_or_default();
             format!(
-                "\x1b[2m{icon} {} {what} — `:result {}` to view · {}\x1b[0m",
+                "\x1b[2m{icon} {} {what} — `:result {}` to view · {}{branch}\x1b[0m",
                 job.id,
                 job.id,
                 crate::batch::one_line(&job.task)
@@ -551,6 +786,7 @@ mod tests {
                     result: None,
                     error: None,
                     displayed: false,
+                    branch: None,
                 }),
             }));
         };
@@ -577,6 +813,7 @@ mod tests {
                 result: None,
                 error: None,
                 displayed: false,
+                branch: None,
             }),
         });
         assert!(job.fetch().contains("still running"));
@@ -596,6 +833,7 @@ mod tests {
                 result: None,
                 error: None,
                 displayed: false,
+                branch: None,
             }),
         });
         job.set_failed("boom".into());
@@ -639,6 +877,25 @@ mod tests {
         assert_eq!(clean_activity_line("coordinator run abc starting"), None);
         assert_eq!(clean_activity_line(""), None);
         assert_eq!(clean_activity_line("   \x1b[2m\x1b[0m  "), None);
+    }
+
+    #[test]
+    fn worktree_layout_builds_branch_and_path() {
+        let src = std::path::Path::new("/repo");
+        let (branch, path) = worktree_layout(src, "worker_3");
+        assert_eq!(branch, "aish/worker_3");
+        // Lives OUTSIDE the repo (in temp), keyed by repo, ending in the id — so
+        // it never pollutes the source `git status`.
+        assert!(path.starts_with(std::env::temp_dir()), "got: {}", path.display());
+        assert!(path.ends_with("worker_3"), "got: {}", path.display());
+        assert!(!path.starts_with(src));
+        // Distinct ids never collide on path or branch.
+        let (b2, p2) = worktree_layout(src, "worker_4");
+        assert_ne!(branch, b2);
+        assert_ne!(path, p2);
+        // Distinct repos get distinct keyed dirs even with the same id.
+        let (_, other_repo) = worktree_layout(std::path::Path::new("/other"), "worker_3");
+        assert_ne!(path, other_repo);
     }
 
     #[test]
