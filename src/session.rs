@@ -120,6 +120,11 @@ pub struct Session {
     /// The active background `:goal` loop, if any (one per session). Set by
     /// `:goal <condition>`, inspected by bare `:goal`, stopped by `:goal clear`.
     pub goal: Option<crate::goal::Handle>,
+    /// Which provider the interactive backend runs on (`"claude"`/`"grok"`/
+    /// `"local"`). Set right after the backend is built and updated by `:backend`.
+    /// Background coordinators are spawned on this same backend (full parity), so
+    /// `:dispatch`/`run_in_background`/`:goal` thread it through to `WorkerSpec`.
+    pub backend_kind: String,
 }
 
 impl Session {
@@ -150,6 +155,7 @@ impl Session {
             coordinator_store: None,
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
             goal: None,
+            backend_kind: "claude".to_string(),
         })
     }
 

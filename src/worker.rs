@@ -149,8 +149,12 @@ fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str, cwd: &std::path::
         .arg("--coordinator")
         .arg("--run-id")
         .arg(run_id)
+        // Full parity: the coordinator runs on the SAME backend the interactive
+        // session uses (claude/grok), not a hardcoded one. The child inherits the
+        // relevant credential (XAI_API_KEY / ANTHROPIC_API_KEY) via the env it's
+        // spawned with — see the note on WorkerSpec.env.
         .arg("--backend")
-        .arg("claude")
+        .arg(&spec.backend)
         .arg("--model")
         .arg(&spec.model)
         // The effective run directory: `spec.cwd` normally, or the isolated
@@ -415,6 +419,18 @@ fn describe_failure(status: std::process::ExitStatus, role: &str, stderr: &str) 
     format!("{role} exited unsuccessfully ({status}): {}", stderr.trim())
 }
 
+/// Pick the coordinator model for a given backend kind. Claude coordinators keep
+/// the session's batch model (`batch_model`, Opus by default — deferred work gets
+/// the strongest model). Grok has no Batches API and no model tiers worth
+/// distinguishing here, so its coordinators run on the Grok default. Anything
+/// else falls back to `batch_model`.
+pub fn coordinator_model(backend_kind: &str, batch_model: &str) -> String {
+    match backend_kind {
+        "grok" => crate::backend::grok::DEFAULT_MODEL.to_string(),
+        _ => batch_model.to_string(),
+    }
+}
+
 /// A background worker subprocess, tracked for the life of the session. Shared
 /// between the REPL (which lists/surfaces it) and the run task (which mutates it).
 pub struct WorkerJob {
@@ -445,6 +461,11 @@ pub type WorkerJobs = Arc<Mutex<Vec<Arc<WorkerJob>>>>;
 pub struct WorkerSpec {
     /// The aish binary to re-exec (this process's own executable).
     pub exe: PathBuf,
+    /// Which backend the coordinator child runs on (`"claude"`/`"grok"`). Set
+    /// from the active session's `backend_kind` so background work runs on the
+    /// same provider as the interactive session (full parity). Threaded into the
+    /// child's `--backend` arg by `worker_command`.
+    pub backend: String,
     /// Working directory for the child — the session's cwd, so it sees the same
     /// project files and the same project `.mcp.json`. When `isolate` is set this
     /// is the SOURCE repo; the child actually runs in a dedicated worktree carved

@@ -28,7 +28,7 @@ struct Args {
     #[arg(short = 'c', long = "command")]
     command: Option<String>,
 
-    /// Backend to use: claude | local
+    /// Backend to use: claude | grok | local
     #[arg(long, default_value = "claude")]
     backend: String,
 
@@ -76,10 +76,24 @@ async fn main() -> Result<()> {
                 cred,
             )?
         }
+        "grok" => {
+            let key = rc::env_value(&session.env, "XAI_API_KEY").ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no Grok credential — set XAI_API_KEY in your environment or ~/.aishrc"
+                )
+            })?;
+            backend::Backend::new_grok(
+                args.model.unwrap_or_else(|| backend::grok::DEFAULT_MODEL.into()),
+                key,
+            )?
+        }
         #[cfg(feature = "local")]
         "local" => backend::Backend::new_local(),
-        other => anyhow::bail!("unknown backend: {other} (available: claude, local)"),
+        other => anyhow::bail!("unknown backend: {other} (available: claude, grok, local)"),
     };
+    // Record which provider the interactive session runs on, so background
+    // coordinators are spawned on the SAME backend (full parity).
+    session.backend_kind = backend.kind().to_string();
     session.mode = if args.yolo {
         session::Mode::Yolo
     } else {

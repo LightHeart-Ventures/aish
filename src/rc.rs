@@ -17,6 +17,22 @@ pub struct Rc {
     pub env: Vec<(String, String)>,
 }
 
+/// Resolve a config/credential value for `key` the way aish resolves env: the
+/// `~/.aishrc` `export` pairs in `extra` (last-wins) win over the process
+/// environment, and a blank/whitespace value counts as unset (→ `None`). This is
+/// the single lookup the Claude credential resolver and the Grok key resolution
+/// both share, so the precedence can't drift between them. Pass `&[]` when no rc
+/// context is available.
+pub fn env_value(extra: &[(String, String)], key: &str) -> Option<String> {
+    extra
+        .iter()
+        .rev()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var(key).ok())
+        .filter(|v| !v.trim().is_empty())
+}
+
 pub fn load() -> Rc {
     let home = std::env::var("HOME").unwrap_or_default();
     if home.is_empty() {

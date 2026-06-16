@@ -1047,7 +1047,7 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                  :mode <paranoid|careful|normal|yolo> confirmation level (paranoid asks for everything,\n\
                                                      normal only for write/create/delete, yolo never)\n\
                  :model <opus|sonnet|haiku|full-id>  switch model\n\
-                 :backend <claude|local>             switch backend\n\
+                 :backend <claude|grok|local>        switch backend\n\
                  :mcp [list|status]                  list connected MCP servers\n\
                  :mcp reconnect [name|all]           restart MCP server(s)\n\
                  :mcp reload                          connect servers newly added to .mcp.json (no restart)\n\
@@ -1195,7 +1195,11 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                         let spec = crate::worker::WorkerSpec {
                             exe,
                             cwd: session.cwd.clone(),
-                            model: session.batch_model.clone(),
+                            backend: session.backend_kind.clone(),
+                            model: crate::worker::coordinator_model(
+                                &session.backend_kind,
+                                &session.batch_model,
+                            ),
                             env: session.env.clone(),
                             // `:dispatch` keeps the shared-cwd behavior (no worktree).
                             isolate: false,
@@ -1253,11 +1257,21 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
                                 let spec = crate::worker::WorkerSpec {
                                     exe,
                                     cwd: session.cwd.clone(),
-                                    model: session.batch_model.clone(),
+                                    // The generator runs on the active backend (parity).
+                                    backend: session.backend_kind.clone(),
+                                    model: crate::worker::coordinator_model(
+                                        &session.backend_kind,
+                                        &session.batch_model,
+                                    ),
                                     env: session.env.clone(),
                                     // The goal loop iterates in the live cwd (no worktree).
                                     isolate: false,
                                 };
+                                // KNOWN LIMITATION: the verifier still judges on
+                                // Claude (batch_model + the Claude credential
+                                // resolved above) — xAI has no judge here, so a
+                                // Grok `:goal` runs its GENERATOR on Grok but
+                                // requires a Claude credential to judge each turn.
                                 let g = crate::goal::spawn(
                                     cond.to_string(),
                                     spec,
@@ -1301,6 +1315,27 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
                     {
                         Ok(b) => {
                             *backend = b;
+                            session.backend_kind = backend.kind().to_string();
+                            println!("backend → {}", backend.describe());
+                        }
+                        Err(e) => println!("can't switch: {e:#}"),
+                    }
+                }
+            }
+            Some("grok") => {
+                if matches!(backend, Backend::Grok(_)) {
+                    println!("already on {}", backend.describe());
+                } else {
+                    match crate::rc::env_value(&session.env, "XAI_API_KEY")
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "no Grok credential — set XAI_API_KEY in your environment or ~/.aishrc"
+                        ))
+                        .and_then(|key| {
+                            Backend::new_grok(crate::backend::grok::DEFAULT_MODEL.into(), key)
+                        }) {
+                        Ok(b) => {
+                            *backend = b;
+                            session.backend_kind = backend.kind().to_string();
                             println!("backend → {}", backend.describe());
                         }
                         Err(e) => println!("can't switch: {e:#}"),
@@ -1313,6 +1348,7 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
                     println!("already on {}", backend.describe());
                 } else {
                     *backend = Backend::new_local();
+                    session.backend_kind = backend.kind().to_string();
                     println!(
                         "backend → {} (loads on first use; MCP tools off — they don't fit a small context window)",
                         backend.describe()
@@ -1321,7 +1357,7 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
             }
             #[cfg(not(feature = "local"))]
             Some("local") => println!("built without the local feature (cargo build --features local)"),
-            _ => println!("usage: :backend <claude|local>"),
+            _ => println!("usage: :backend <claude|grok|local>"),
         },
         Some("mode") => match parts.next().and_then(crate::session::Mode::parse) {
             Some(m) => {
