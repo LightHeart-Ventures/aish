@@ -493,6 +493,29 @@ pub fn drain_pending(jobs: &WorkerJobs) -> Vec<String> {
         .collect()
 }
 
+/// One-line completion NOTICES for finished-but-unshown workers, marking them
+/// shown. The presenter notifies (rather than dumping the full result over the
+/// prompt); the user views it with `:result <id>`. Result stays in `fetch`.
+pub fn notify_pending(jobs: &WorkerJobs) -> Vec<String> {
+    let pending: Vec<Arc<WorkerJob>> = {
+        let g = jobs.lock().unwrap();
+        g.iter().filter(|j| j.is_terminal() && !j.is_displayed()).cloned().collect()
+    };
+    pending
+        .iter()
+        .map(|job| {
+            let (icon, what) = if job.status() == "failed" { ("✗", "failed") } else { ("✓", "done") };
+            job.mark_displayed();
+            format!(
+                "\x1b[2m{icon} {} {what} — `:result {}` to view · {}\x1b[0m",
+                job.id,
+                job.id,
+                crate::batch::one_line(&job.task)
+            )
+        })
+        .collect()
+}
+
 /// Count of workers still running — for the prompt's `⟳N` indicator.
 pub fn running_count(jobs: &WorkerJobs) -> usize {
     jobs.lock().unwrap().iter().filter(|j| !j.is_terminal()).count()

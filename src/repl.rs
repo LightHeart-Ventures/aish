@@ -117,10 +117,12 @@ pub async fn run(mut backend: Backend, mut session: Session) -> Result<()> {
                 if busy.load(Ordering::SeqCst) {
                     continue; // mid-command/turn — hold results until a pause
                 }
-                let mut blocks = crate::batch::drain_pending(&batch_jobs);
-                blocks.extend(crate::worker::drain_pending(&worker_jobs));
-                for b in blocks {
-                    let _ = printer.print(format!("{b}\n"));
+                // Notify (one line per finished job), don't dump the full result
+                // over the prompt — the user views it on demand with `:result`.
+                let mut notices = crate::batch::notify_pending(&batch_jobs);
+                notices.extend(crate::worker::notify_pending(&worker_jobs));
+                for n in notices {
+                    let _ = printer.print(format!("{n}\n"));
                 }
             }
         });
@@ -1056,6 +1058,8 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
                  :workers                            list in-flight background coordinator subprocesses\n\
+                 :results                            list finished background jobs (workers + batches)\n\
+                 :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
                  :name <name>                        name the session (prefixes the prompt); bare :name clears\n\
                  :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
@@ -1110,6 +1114,63 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                     ));
                 }
                 println!("{}", crate::md::render_stdout(table.trim()));
+            }
+        }
+        Some("result") => {
+            // View a finished background job's full result on demand.
+            let Some(&id) = parts.next().as_ref() else {
+                println!("usage: :result <job>   (id or prefix from a completion notice / :results)");
+                return false;
+            };
+            let hit = |jid: &str| jid == id || jid.starts_with(id);
+            let found = session
+                .worker_jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|j| hit(&j.id))
+                .map(|j| j.fetch())
+                .or_else(|| {
+                    session
+                        .batch_jobs
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|j| hit(&j.id))
+                        .map(|j| j.fetch())
+                });
+            match found {
+                Some(r) => println!("{}", crate::md::render_stdout(r.trim())),
+                None => println!("no background job matching '{id}' (see :results)"),
+            }
+        }
+        Some("results") => {
+            // List background jobs (workers + batches) so the user can :result one.
+            let mut table = String::from("| Job | Status | Task |\n|---|---|---|\n");
+            let mut any = false;
+            for j in session.worker_jobs.lock().unwrap().iter() {
+                any = true;
+                table.push_str(&format!(
+                    "| {} | {} | {} |\n",
+                    j.id,
+                    j.status(),
+                    crate::batch::one_line(&j.task).replace('|', "\\|")
+                ));
+            }
+            for j in session.batch_jobs.lock().unwrap().iter() {
+                any = true;
+                table.push_str(&format!(
+                    "| {} | {} | {} |\n",
+                    crate::batch::short_id(&j.id),
+                    j.status(),
+                    crate::batch::one_line(&j.task).replace('|', "\\|")
+                ));
+            }
+            if any {
+                println!("{}", crate::md::render_stdout(table.trim()));
+                println!("\x1b[2m:result <job> to view a result\x1b[0m");
+            } else {
+                println!("no background jobs");
             }
         }
         Some("dispatch") => {
