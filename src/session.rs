@@ -59,10 +59,6 @@ pub struct Session {
     pub session_id: String,
     /// Static host info baked into the system prompt once.
     pub host_info: String,
-    /// True while a child owns the terminal (run_interactive / direct dispatch).
-    /// The REPL's Ctrl-C handling consults this: a SIGINT then belongs to that
-    /// foreground child, not to aish's turn-abort.
-    pub tty_handoff: Arc<AtomicBool>,
     /// `export` lines from ~/.aishrc, applied to every program aish spawns.
     pub env: Vec<(String, String)>,
     /// Pre-rendered system-prompt section listing ~/.aish/skills (may be empty).
@@ -150,7 +146,6 @@ impl Session {
             name: None,
             session_id: uuid::Uuid::new_v4().to_string(),
             host_info: host_info(),
-            tty_handoff: Arc::new(AtomicBool::new(false)),
             env: Vec::new(),
             skills_prompt: String::new(),
             mcp: crate::mcp::McpHost::default(),
