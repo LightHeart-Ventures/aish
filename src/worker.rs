@@ -371,14 +371,16 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
     };
 
     // Drain stdout and stderr concurrently (sequential reads can deadlock if the
-    // child fills the other pipe's buffer). The child's stderr — spinners, tool
-    // activity — is captured, not shown; only its stdout (the final answer) and,
-    // on failure, its stderr matter to us.
+    // child fills the other pipe's buffer). stdout is the final answer (capped);
+    // stderr is STREAMED live — its `🔧` tool-activity lines forward to the
+    // user's terminal as the coordinator works (prefixed with the worker id), so
+    // a background job isn't a silent black box. A bounded stderr tail is kept
+    // for the failure message.
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
+    let prefix = format!("[{}]", job.id);
     let collect = tokio::spawn(async move {
-        // Capped so a runaway coordinator can't OOM this parent via its stdout.
-        tokio::join!(read_capped(stdout, CAPTURE_CAP), read_capped(stderr, CAPTURE_CAP))
+        tokio::join!(read_capped(stdout, CAPTURE_CAP), stream_stderr(stderr, &prefix))
     });
 
     let status = match tokio::time::timeout(WORKER_TIMEOUT, child.wait()).await {
