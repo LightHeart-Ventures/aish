@@ -1185,7 +1185,23 @@ pub async fn run_on_tty(
     // std::process::Child::drop neither reaps nor kills, so the pid stays
     // waitpid-able — our SIGCHLD task owns the wait.
     drop(proc);
-    let mut child = ForegroundChild { pid, reaped: false };
+
+    // Register the foreground child in the unified job table (TASK-118) so the
+    // SIGCHLD reaper below can record its stop/continue/exit transitions there
+    // (TASK-120). Foreground and background jobs now share one table.
+    let desc = if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{program} {}", args.join(" "))
+    };
+    let job = {
+        let mut jobs = session.jobs.lock().unwrap();
+        let id = jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
+        let job = Job::foreground(id, desc);
+        jobs.push(job.clone());
+        job
+    };
+    let mut child = ForegroundChild { pid, reaped: false, job: job.clone() };
 
     // Mirror the child's setpgid from the parent too (closes the spawn race;
     // EACCES once the child has exec'd is expected — ignore it), then hand it
@@ -1203,28 +1219,36 @@ pub async fn run_on_tty(
     // Reap loop: poll first (covers an exit between spawn and the first await),
     // then wait for the next SIGCHLD. waitpid is scoped to `pid` only.
     loop {
-        if let Some(status) = reap_foreground(pid)? {
+        if let Some(status) = reap_foreground(pid, &job)? {
             child.reaped = true;
             return Ok(status);
+        }
+        // The reaper just recorded any Ctrl-Z stop in the job table; real
+        // suspend-to-background (the fg/bg UX) is TASK-121. Until then, resume a
+        // stopped foreground child in place so it keeps running and the terminal
+        // stays live.
+        if job.status() == "stopped" {
+            // SAFETY: continuing our own child's process group (pgid == pid).
+            unsafe { libc::kill(-pid, libc::SIGCONT) };
         }
         sigchld.recv().await;
     }
 }
 
-/// One non-blocking pass of the foreground reaper: `waitpid(pid, …)` with
-/// `WNOHANG|WUNTRACED|WCONTINUED`, tracking job state. Returns `Some(status)`
+/// One non-blocking pass of the foreground reaper: drain every pending
+/// `waitpid(pid, …)` event with `WNOHANG|WUNTRACED|WCONTINUED` and fold each
+/// into the unified job table via [`apply_wait_status`]. Returns `Some(status)`
 /// once the child terminates, `None` while it is still running (or merely
-/// stopped/continued). A Ctrl-Z stop is resumed in place — real
-/// suspend-to-background (the fg/bg/jobs UX) is deferred to S2.
-fn reap_foreground(pid: libc::pid_t) -> Result<Option<std::process::ExitStatus>> {
-    use std::os::unix::process::ExitStatusExt;
+/// stopped/continued). The wait is scoped to `pid`, disjoint from tokio's
+/// owned-pid reaper (S1.4 spike) — no `waitpid(-1)`, no double-reap.
+fn reap_foreground(pid: libc::pid_t, job: &Job) -> Result<Option<std::process::ExitStatus>> {
     loop {
         let mut status: libc::c_int = 0;
         let r = unsafe {
             libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED)
         };
         if r == 0 {
-            return Ok(None); // no state change for our child yet
+            return Ok(None); // no further state change for our child yet
         }
         if r < 0 {
             return Err(anyhow::anyhow!(
@@ -1232,16 +1256,35 @@ fn reap_foreground(pid: libc::pid_t) -> Result<Option<std::process::ExitStatus>>
                 std::io::Error::last_os_error()
             ));
         }
-        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
-            return Ok(Some(std::process::ExitStatus::from_raw(status)));
+        if let Some(exit) = apply_wait_status(job, status) {
+            return Ok(Some(exit));
         }
-        if libc::WIFSTOPPED(status) {
-            // Job state: stopped. S2 owns suspend-to-background; for now resume
-            // so the foreground child keeps running and the terminal stays live.
-            unsafe { libc::kill(-pid, libc::SIGCONT) };
-        }
-        // WIFCONTINUED (or the resume above): loop and poll again.
+        // Stopped or continued: the transition is recorded — keep draining.
     }
+}
+
+/// Map one raw `waitpid` status to a unified-job-table state transition
+/// (TASK-120 / S3.3): `WIFSTOPPED` → `Stopped`, `WIFCONTINUED` → `Running`,
+/// `WIFEXITED`/`WIFSIGNALED` → `Done`. Returns `Some(ExitStatus)` once the child
+/// has terminated, `None` for a stop/continue (the job lives on). Pure — no
+/// syscalls — so every SIGCHLD-driven reaper shares it and it is directly
+/// unit-testable with `waitpid`-produced statuses.
+fn apply_wait_status(job: &Job, status: libc::c_int) -> Option<std::process::ExitStatus> {
+    use std::os::unix::process::ExitStatusExt;
+    if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+        let exit = std::process::ExitStatus::from_raw(status);
+        job.finish(match exit.code() {
+            Some(code) => format!("exited {code}"),
+            None => "killed".into(),
+        });
+        return Some(exit);
+    }
+    if libc::WIFSTOPPED(status) {
+        job.stop();
+    } else if libc::WIFCONTINUED(status) {
+        job.resume();
+    }
+    None
 }
 
 /// Run `f` with SIGTTOU ignored. `tcsetpgrp()` from a process that isn't the
@@ -1297,6 +1340,7 @@ fn reset_job_control_signals() {
 struct ForegroundChild {
     pid: libc::pid_t,
     reaped: bool,
+    job: Arc<Job>,
 }
 
 impl Drop for ForegroundChild {
@@ -1308,6 +1352,9 @@ impl Drop for ForegroundChild {
                 let mut s: libc::c_int = 0;
                 libc::waitpid(self.pid, &mut s, 0);
             }
+            // Ctrl-C aborted the turn before a normal exit; record the kill in
+            // the job table so the entry doesn't linger as a phantom "running".
+            self.job.finish("killed");
         }
     }
 }
@@ -1722,6 +1769,68 @@ mod tests {
         let r = unsafe { libc::waitpid(fg_pid, &mut wstatus, 0) };
         assert_eq!(r, fg_pid, "tokio's reaper stole the foreground pid via waitpid(-1)");
         assert!(std::process::ExitStatus::from_raw(wstatus).success());
+    }
+
+    #[tokio::test]
+    async fn sigchld_reaper_records_stop_continue_and_exit_in_job_table() {
+        // AC ac_9652f9e32655 (TASK-120): the SIGCHLD-driven reaper updates the
+        // unified job table for BOTH stopped and exited children — no polling.
+        // We drive a real child through stop -> continue -> exit and assert the
+        // table after each transition. The reaper only runs on a SIGCHLD wakeup
+        // (the drive loop blocks on the signal; it never busy-polls waitpid).
+        use std::os::unix::process::CommandExt;
+
+        let mut sigchld =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).unwrap();
+
+        // A long-lived child in its own process group, spawned exactly like
+        // run_on_tty (std::process + setpgid). std::process::Child::drop neither
+        // reaps nor kills, so the pid stays ours to waitpid.
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        unsafe {
+            cmd.pre_exec(|| match libc::setpgid(0, 0) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            });
+        }
+        let proc = cmd.spawn().unwrap();
+        let pid = proc.id() as libc::pid_t;
+        drop(proc);
+        let job = Job::foreground(1, "sleep 30".into());
+
+        // Mirror run_on_tty's loop: reap on each SIGCHLD wakeup until `done`
+        // holds. Bounded so a missed wakeup fails loudly instead of hanging.
+        async fn drive(
+            sigchld: &mut tokio::signal::unix::Signal,
+            pid: libc::pid_t,
+            job: &Job,
+            done: impl Fn(Option<&std::process::ExitStatus>, &Job) -> bool,
+        ) {
+            for _ in 0..20 {
+                let exit = reap_foreground(pid, job).unwrap();
+                if done(exit.as_ref(), job) {
+                    return;
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(2), sigchld.recv()).await;
+            }
+            panic!("reaper never reached the expected state (job: {})", job.status());
+        }
+
+        // Stop: SIGSTOP must mark the job Stopped in the table (not just exits).
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        drive(&mut sigchld, pid, &job, |_e, j| j.status() == "stopped").await;
+        assert_eq!(job.status(), "stopped", "a stopped child must update the job table");
+
+        // Continue: SIGCONT must mark it Running again.
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+        drive(&mut sigchld, pid, &job, |_e, j| j.status() == "running").await;
+        assert_eq!(job.status(), "running", "a continued child must update the job table");
+
+        // Exit: SIGKILL must mark it Done with the exit summary.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        drive(&mut sigchld, pid, &job, |e, _j| e.is_some()).await;
+        assert_eq!(job.status(), "killed", "an exited child must update the job table");
     }
 
     #[tokio::test]
