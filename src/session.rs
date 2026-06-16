@@ -247,6 +247,13 @@ reference — \"${{profile:KEY}}\" resolves from ~/.atum/credentials [profile] a
 NEVER read credential files with read_file; reference them.\n\
 - Prefer read_file/write_file/list_dir over cat/echo tricks.\n\
 - When a command fails, read the error and try one sensible fix before reporting back.\n\
+- Git hygiene — NEVER commit or push directly to the default branch (main/master). To make a \
+change: create a feature branch (git checkout -b …), commit THERE, push that branch, then open a \
+pull request (gh pr create). Do NOT `git push` the default branch yourself, and do NOT merge into \
+it locally. A PR is the only way work reaches the default branch — and once work is on the default \
+branch it is DONE: never open a PR for commits that already exist there (no pushing main AND \
+PR-ing the same commits). If you discover local commits sitting on main (or any unexpected state), \
+STOP and report it to the user instead of pushing — surfacing it is the fix, not force-syncing.\n\
 - You have persistent memory across sessions: `remember` stores a durable fact, `recall` \
 searches by keyword. recall when prior preferences or decisions might matter; remember \
 preferences, project facts, and lessons worth keeping.\n\
