@@ -151,7 +151,9 @@ pub async fn drive(
     store: Option<&CoordinatorStore>,
 ) -> Outcome {
     if let Some(s) = store {
-        let _ = s.insert(run_id, &input, &session.session_id);
+        // session.session_id/name were adopted from the LAUNCHING session at
+        // startup (see main.rs), so the row attributes to who asked for the work.
+        let _ = s.insert(run_id, &input, &session.session_id, session.name.as_deref());
     }
 
     let mut rounds = 0usize;

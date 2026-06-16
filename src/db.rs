@@ -334,8 +334,11 @@ pub struct CoordinatorRow {
     /// the store round-trip test today.
     #[allow(dead_code)]
     pub error: Option<String>,
-    /// Owning session (uuid) — used to detect orphaned runs at startup.
+    /// Owning session (uuid) — the LAUNCHING interactive session, used both to
+    /// detect orphaned runs at startup and to mark "your" rows in `:workers`.
     pub session_id: Option<String>,
+    /// The launching session's friendly name (`:name`), for display.
+    pub session_name: Option<String>,
     pub created_at: Option<String>,
     /// Last liveness beat (SQLite `current_timestamp` string). A run whose owner
     /// is gone and whose heartbeat is stale is treated as orphaned on reattach.
@@ -366,23 +369,33 @@ impl CoordinatorStore {
                  result       TEXT,
                  error        TEXT,
                  session_id   TEXT,
+                 session_name TEXT,
                  created_at   TEXT NOT NULL DEFAULT current_timestamp,
                  heartbeat_at TEXT NOT NULL DEFAULT current_timestamp
              );",
         )
         .context("coordinator_runs schema init failed")?;
+        // Back-compat: add session_name to a table created before it existed.
+        // (session_id predates this; ignore the error when the column is present.)
+        let _ = conn.execute("ALTER TABLE coordinator_runs ADD COLUMN session_name TEXT", []);
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
     /// Register a freshly-started run in the `coordinating` phase. Idempotent —
     /// re-inserting the same `run_id` (e.g. a resumed run) leaves the existing
     /// row untouched so its persisted phase/result survives.
-    pub fn insert(&self, run_id: &str, task: &str, session_id: &str) -> Result<()> {
+    pub fn insert(
+        &self,
+        run_id: &str,
+        task: &str,
+        session_id: &str,
+        session_name: Option<&str>,
+    ) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO coordinator_runs (run_id, task, phase, session_id)
-             VALUES (?1, ?2, 'coordinating', ?3)
+            "INSERT INTO coordinator_runs (run_id, task, phase, session_id, session_name)
+             VALUES (?1, ?2, 'coordinating', ?3, ?4)
              ON CONFLICT(run_id) DO NOTHING",
-            (run_id, task, session_id),
+            (run_id, task, session_id, session_name),
         )?;
         Ok(())
     }
@@ -431,7 +444,7 @@ impl CoordinatorStore {
     pub fn load_all(&self) -> Result<Vec<CoordinatorRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT run_id, task, phase, result, error, session_id, created_at, heartbeat_at
+            "SELECT run_id, task, phase, result, error, session_id, session_name, created_at, heartbeat_at
              FROM coordinator_runs ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -442,8 +455,9 @@ impl CoordinatorStore {
                 result: r.get(3)?,
                 error: r.get(4)?,
                 session_id: r.get(5)?,
-                created_at: r.get(6)?,
-                heartbeat_at: r.get(7)?,
+                session_name: r.get(6)?,
+                created_at: r.get(7)?,
+                heartbeat_at: r.get(8)?,
             })
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect())
@@ -555,13 +569,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = CoordinatorStore::open(&path).unwrap();
 
-        store.insert("run_1", "audit the repo", "sess-a").unwrap();
+        store.insert("run_1", "audit the repo", "sess-a", Some("alpha")).unwrap();
         // Idempotent insert (resume path) must not clobber the existing row.
         store.set_phase("run_1", "awaiting_batch").unwrap();
-        store.insert("run_1", "audit the repo", "sess-a").unwrap();
+        store.insert("run_1", "audit the repo", "sess-a", Some("alpha")).unwrap();
         store.heartbeat("run_1").unwrap();
 
-        store.insert("run_2", "draft release notes", "sess-b").unwrap();
+        store.insert("run_2", "draft release notes", "sess-b", None).unwrap();
         store.set_done("run_2", "the notes").unwrap();
 
         // A fresh store over the same file sees both — the restart path.
@@ -571,10 +585,12 @@ mod tests {
         let one = rows.iter().find(|r| r.run_id == "run_1").unwrap();
         assert_eq!(one.phase, "awaiting_batch"); // resumable, insert didn't reset it
         assert_eq!(one.session_id.as_deref(), Some("sess-a"));
+        assert_eq!(one.session_name.as_deref(), Some("alpha"));
         assert!(one.heartbeat_at.is_some());
         let two = rows.iter().find(|r| r.run_id == "run_2").unwrap();
         assert_eq!(two.phase, "done");
         assert_eq!(two.result.as_deref(), Some("the notes"));
+        assert_eq!(two.session_name, None);
 
         store.set_failed("run_1", "exceeded round cap").unwrap();
         let rows = reopened.load_all().unwrap();

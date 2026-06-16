@@ -163,9 +163,15 @@ fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str, cwd: &std::path::
         // Nested-coordinator guard: an in-container/in-worker aish must never
         // spawn its own workers (no infinite recursion). The child reads this.
         .env("AISH_COORDINATOR", "1")
+        // Tie the work to the LAUNCHING session: the child adopts this id so its
+        // durable records attribute to the session that asked for the work.
+        .env("AISH_LAUNCH_SESSION_ID", &spec.launch_session_id)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(name) = &spec.launch_session_name {
+        cmd.env("AISH_LAUNCH_SESSION_NAME", name);
+    }
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
@@ -566,6 +572,16 @@ pub struct WorkerSpec {
     /// session's current `HEAD` for "continue what I'm working on" tasks. Only
     /// consulted when `isolate` is true.
     pub base: String,
+    /// The LAUNCHING session's id — the interactive session that spawned this
+    /// coordinator. The child adopts it as its own `session.session_id` so every
+    /// durable record it writes (its `coordinator_runs` row, any batches it fans
+    /// out) is attributed to the session that asked for the work, not to the
+    /// child's throwaway uuid. This is what makes `:workers`/`background_status`
+    /// recognize a background job as belonging to "you".
+    pub launch_session_id: String,
+    /// The launching session's friendly name (`:name`), if it has one — carried
+    /// alongside the id purely for display.
+    pub launch_session_name: Option<String>,
 }
 
 impl WorkerJob {

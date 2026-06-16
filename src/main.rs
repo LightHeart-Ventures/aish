@@ -157,6 +157,19 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("--coordinator requires --run-id"))?;
             // Unattended: no TTY to answer confirm prompts, so run without gates.
             session.mode = session::Mode::Yolo;
+            // Adopt the LAUNCHING session's identity so every durable record this
+            // coordinator writes is attributed to the session that asked for the
+            // work, not to this child's throwaway uuid (set in Session::new).
+            if let Ok(sid) = std::env::var("AISH_LAUNCH_SESSION_ID") {
+                if !sid.is_empty() {
+                    session.session_id = sid;
+                }
+            }
+            if let Ok(name) = std::env::var("AISH_LAUNCH_SESSION_NAME") {
+                if !name.is_empty() {
+                    session.name = Some(name);
+                }
+            }
             return engine::run_coordinator(&backend, &mut session, prompt, &run_id).await;
         }
         let out = engine::run_turn(&backend, &mut session, prompt, &mut repl::confirm_tty).await?;

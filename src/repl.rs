@@ -1097,28 +1097,69 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
             None => println!("usage: :kill <job-id>"),
         },
         Some("workers") => {
-            let workers = session.worker_jobs.lock().unwrap();
-            if workers.is_empty() {
-                println!("no background workers");
-            } else {
-                // One row per worker: id, status, a one-line summary of its task.
-                let mut table = String::from("| Worker | Status | Doing |\n|---|---|---|\n");
-                for w in workers.iter() {
-                    // Collapse the (possibly multi-line) task to one line + clip.
-                    let doing = w.task.split_whitespace().collect::<Vec<_>>().join(" ");
-                    let doing = if doing.chars().count() > 70 {
-                        format!("{}…", doing.chars().take(70).collect::<String>())
-                    } else {
-                        doing
-                    };
-                    table.push_str(&format!(
-                        "| {} | {} | {} |\n",
-                        w.id,
-                        w.status(),
-                        doing.replace('|', "\\|")
-                    ));
+            // Collapse a (possibly multi-line) task to one clipped line.
+            let one_line = |t: &str| {
+                let s = t.split_whitespace().collect::<Vec<_>>().join(" ");
+                let s = if s.chars().count() > 70 {
+                    format!("{}…", s.chars().take(70).collect::<String>())
+                } else {
+                    s
+                };
+                s.replace('|', "\\|")
+            };
+            // This session's label; in-memory workers are always "yours".
+            let me_label = session
+                .name
+                .clone()
+                .unwrap_or_else(|| crate::batch::short_id(&session.session_id).to_string());
+
+            let mut table =
+                String::from("| Worker | Session | Status | Doing |\n|---|---|---|---|\n");
+            let mut any = false;
+            let mut seen = std::collections::HashSet::new();
+            // In-memory coordinators launched by THIS session (live status).
+            for w in session.worker_jobs.lock().unwrap().iter() {
+                any = true;
+                seen.insert(w.id.clone());
+                table.push_str(&format!(
+                    "| {} | {} * | {} | {} |\n",
+                    w.id,
+                    me_label,
+                    w.status(),
+                    one_line(&w.task)
+                ));
+            }
+            // Durable runs from the shared store — every session's, so workers
+            // started elsewhere (or in a prior process) show up too. Skip ids
+            // already listed in-memory to avoid double-counting this session's.
+            if let Some(store) = &session.coordinator_store {
+                if let Ok(rows) = store.load_all() {
+                    for r in rows.iter().filter(|r| !seen.contains(&r.run_id)) {
+                        any = true;
+                        let is_me = r.session_id.as_deref() == Some(session.session_id.as_str());
+                        let label = r
+                            .session_name
+                            .clone()
+                            .or_else(|| {
+                                r.session_id.as_deref().map(|s| crate::batch::short_id(s).to_string())
+                            })
+                            .unwrap_or_else(|| "—".into());
+                        let session_cell = if is_me { format!("{label} *") } else { label };
+                        table.push_str(&format!(
+                            "| {} | {} | {} | {} |\n",
+                            crate::batch::short_id(&r.run_id),
+                            session_cell,
+                            r.phase,
+                            one_line(&r.task)
+                        ));
+                    }
                 }
+            }
+            if any {
                 println!("{}", crate::md::render_stdout(table.trim()));
+                println!("\x1b[2m* = launched from this session\x1b[0m");
+            } else {
+                println!("no background workers");
             }
         }
         Some("result") => {
@@ -1207,6 +1248,8 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                             // `:dispatch` keeps the shared-cwd behavior (no worktree).
                             isolate: false,
                             base: "main".to_string(),
+                            launch_session_id: session.session_id.clone(),
+                            launch_session_name: session.name.clone(),
                         };
                         let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
                         println!(
@@ -1271,6 +1314,8 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
                                     // The goal loop iterates in the live cwd (no worktree).
                                     isolate: false,
                                     base: "main".to_string(),
+                                    launch_session_id: session.session_id.clone(),
+                                    launch_session_name: session.name.clone(),
                                 };
                                 // KNOWN LIMITATION: the verifier still judges on
                                 // Claude (batch_model + the Claude credential

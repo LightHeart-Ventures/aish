@@ -815,6 +815,8 @@ you're working on it and the answer will appear here when ready — no job id, n
         env: session.env.clone(),
         isolate,
         base: base.to_string(),
+        launch_session_id: session.session_id.clone(),
+        launch_session_name: session.name.clone(),
     };
     let _id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
     Ok("Queued a background coordinator (full toolset + MCP in this directory; it can fan parallel \
@@ -858,10 +860,13 @@ fn background_status(session: &Session) -> Result<String> {
         if let Ok(rows) = store.load_all() {
             for r in rows {
                 any = true;
-                let owner = match r.session_id.as_deref() {
-                    Some(sid) if sid == session.session_id.as_str() => "you".into(),
-                    Some(sid) => crate::batch::short_id(sid).to_string(),
-                    None => "—".into(),
+                let owner = if r.session_id.as_deref() == Some(session.session_id.as_str()) {
+                    "you".into()
+                } else {
+                    r.session_name
+                        .clone()
+                        .or_else(|| r.session_id.as_deref().map(|s| crate::batch::short_id(s).to_string()))
+                        .unwrap_or_else(|| "—".into())
                 };
                 out.push_str(&format!(
                     "| `{}` | coordinator | {} | {} | {} | {} |\n",
