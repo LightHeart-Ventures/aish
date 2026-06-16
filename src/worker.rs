@@ -98,20 +98,54 @@ fn strip_sentinel(raw: &str, mark: &str) -> Option<String> {
     (!rest.is_empty()).then(|| rest.to_string())
 }
 
+/// Decide what (if anything) to forward to the user's terminal for ONE raw
+/// coordinator-stderr line, given whether `:worker-output` is on. Returns
+/// `(label_suffix, text)` to announce as `[label<suffix>] text`, or `None` to
+/// drop the line. Pure — the single source of truth for the suppression gate,
+/// so it's unit-testable without a live pipe.
+///
+/// Suppression policy (the default): a background coordinator is QUIET. With
+/// `show_output` off NOTHING from its stderr is forwarded — not its `🔧`
+/// tool-activity, not its turn narration. The user still sees the job is alive
+/// via the prompt's `⟳N` pulse and its completion notice (both independent of
+/// this stream); they just don't get the firehose of every tool call. Flipping
+/// `:worker-output on` opens the full live stream:
+/// - `🔧` tool activity → `[label] …`
+/// - `🗨` turn text (a standard model call) → `[label·standard] …`
+/// - `📦` batch fan-out notice → `[label·batch] …`
+fn forward_decision(line: &str, show_output: bool) -> Option<(&'static str, String)> {
+    if !show_output {
+        // Default: keep background coordinators quiet. The job's liveness is
+        // shown by the ⟳N prompt pulse + completion notice, not this stream.
+        return None;
+    }
+    if let Some(activity) = clean_activity_line(line) {
+        return Some(("", activity));
+    }
+    if let Some(text) = strip_sentinel(line, "🗨") {
+        return Some(("·standard", text));
+    }
+    if let Some(text) = strip_sentinel(line, "📦") {
+        return Some(("·batch", text));
+    }
+    None
+}
+
 /// Stream a child's stderr line by line, forwarding the interesting lines to the
 /// user's terminal live via `announce`, and retaining only the last
 /// `STDERR_TAIL_LINES` raw lines as a bounded ring for the failure message.
 /// Returns the retained tail joined with newlines (oldest-first).
 ///
-/// Three line kinds are recognized by sentinel:
-/// - `🔧` tool activity → always forwarded as `[label] …`.
-/// - `🗨` turn text (a standard model call) → forwarded as `[label·standard] …`
-///   only while `:worker-output` is on (`show_output`).
-/// - `📦` batch fan-out notice → forwarded as `[label·batch] …`, also gated on
-///   `show_output` (so "off" stays exactly today's tool-only stream).
+/// Forwarding is decided per line by [`forward_decision`], which gates ALL
+/// coordinator output (tool `🔧` lines included) behind the `:worker-output`
+/// toggle (`show_output`). Default (off) → a quiet background job; on → the full
+/// live `🔧`/`🗨`/`📦` stream. The toggle is read PER LINE, so flipping it
+/// mid-run takes effect on the next line.
 ///
-/// This keeps the child's stderr pipe drained (so it never blocks) and gives the
-/// user live activity without accumulating all of stderr in memory.
+/// The bounded tail is retained for EVERY line regardless of forwarding, so a
+/// failure message can quote recent stderr even when output is suppressed. This
+/// keeps the child's stderr pipe drained (so it never blocks) without
+/// accumulating all of stderr in memory.
 async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
     r: R,
     label: &str,
@@ -119,16 +153,9 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
 ) -> String {
     let mut lines = BufReader::new(r).lines();
     let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_LINES);
-    let base = format!("[{label}]");
     while let Ok(Some(line)) = lines.next_line().await {
-        if let Some(activity) = clean_activity_line(&line) {
-            crate::tools::announce(&base, &activity);
-        } else if show_output.load(Ordering::Relaxed) {
-            if let Some(text) = strip_sentinel(&line, "🗨") {
-                crate::tools::announce(&format!("[{label}·standard]"), &text);
-            } else if let Some(text) = strip_sentinel(&line, "📦") {
-                crate::tools::announce(&format!("[{label}·batch]"), &text);
-            }
+        if let Some((suffix, text)) = forward_decision(&line, show_output.load(Ordering::Relaxed)) {
+            crate::tools::announce(&format!("[{label}{suffix}]"), &text);
         }
         if tail.len() == STDERR_TAIL_LINES {
             tail.pop_front();
@@ -609,8 +636,12 @@ pub struct WorkerSpec {
     /// alongside the id purely for display.
     pub launch_session_name: Option<String>,
     /// Shared `:worker-output` toggle from the launching session. The live stderr
-    /// stream reads it per line, so flipping it mid-run starts/stops forwarding
-    /// this worker's *turn* output (the always-on `🔧` tool lines are unaffected).
+    /// stream reads it PER LINE (see `forward_decision`), so flipping it mid-run
+    /// starts/stops forwarding this worker's output. It gates ALL forwarded
+    /// coordinator output — the `🔧` tool-activity lines AND the turn/batch
+    /// narration — so a background job is QUIET by default (only its `⟳N` prompt
+    /// pulse and completion notice show) and streams its full activity only when
+    /// `:worker-output` is on.
     pub show_output: Arc<AtomicBool>,
 }
 
@@ -721,10 +752,10 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
 
     // Drain stdout and stderr concurrently (sequential reads can deadlock if the
     // child fills the other pipe's buffer). stdout is the final answer (capped);
-    // stderr is STREAMED live — its `🔧` tool-activity lines forward to the
-    // user's terminal as the coordinator works (prefixed with the worker id), so
-    // a background job isn't a silent black box. A bounded stderr tail is kept
-    // for the failure message.
+    // stderr is STREAMED live — but forwarding is gated behind `:worker-output`
+    // (see `stream_stderr`/`forward_decision`), so by default a background job is
+    // quiet: its `🔧` tool-activity isn't echoed. A bounded stderr tail is always
+    // retained for the failure message regardless of forwarding.
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let label = job.id.clone();
@@ -807,8 +838,8 @@ pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<Str
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     // stdout is the result (capped capture, unchanged). stderr is streamed live
-    // to the user's terminal as `[goal] 🔧 …` tool-activity, retaining only a
-    // bounded tail for the failure message — no unbounded accumulation.
+    // to the user's terminal — gated behind `:worker-output` like the background
+    // worker path — retaining only a bounded tail for the failure message.
     let show_output = spec.show_output.clone();
     let collect = tokio::spawn(async move {
         tokio::join!(read_capped(stdout, CAPTURE_CAP), stream_stderr(stderr, "goal", show_output))
@@ -1049,6 +1080,40 @@ mod tests {
         assert_eq!(strip_sentinel("🗨   ", "🗨"), None);
         // A 🔧 tool line is NOT a turn line (it routes through clean_activity_line).
         assert_eq!(strip_sentinel("🔧 git status", "🗨"), None);
+    }
+
+    #[test]
+    fn forward_decision_gates_all_output_on_worker_output_toggle() {
+        // The 🔧 static tool line (coordinator non-TTY shape).
+        let tool = "\x1b[2m  🔧 git status\x1b[0m";
+        let turn = "🗨 planning the migration";
+        let batch = "📦 fanned 3 sub-task(s) out";
+        let banner = "coordinator run abc starting";
+
+        // OFF (default): EVERYTHING is suppressed — including the 🔧 tool line
+        // that used to forward unconditionally. This is the headline behavior:
+        // a background coordinator is quiet by default.
+        assert_eq!(forward_decision(tool, false), None);
+        assert_eq!(forward_decision(turn, false), None);
+        assert_eq!(forward_decision(batch, false), None);
+        assert_eq!(forward_decision(banner, false), None);
+
+        // ON: the full live stream returns, each tagged with its label suffix.
+        assert_eq!(
+            forward_decision(tool, true),
+            Some(("", "🔧 git status".to_string()))
+        );
+        assert_eq!(
+            forward_decision(turn, true),
+            Some(("·standard", "planning the migration".to_string()))
+        );
+        assert_eq!(
+            forward_decision(batch, true),
+            Some(("·batch", "fanned 3 sub-task(s) out".to_string()))
+        );
+        // Noise (banner/blank) is dropped even when output is ON.
+        assert_eq!(forward_decision(banner, true), None);
+        assert_eq!(forward_decision("", true), None);
     }
 
     #[test]

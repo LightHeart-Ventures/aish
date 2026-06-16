@@ -1060,7 +1060,7 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
                  :workers                            list background coordinators (all sessions; * = this session)\n\
-                 :worker-output [on|off]             stream coordinators' turn output (·standard/·batch), not just 🔧 tool lines\n\
+                 :worker-output [on|off]             stream background coordinators' activity (🔧 tool + ·standard/·batch lines); off (default) keeps them quiet\n\
                  :results                            list finished background jobs (workers + batches)\n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
@@ -1104,11 +1104,11 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
             match target {
                 Some(true) => {
                     session.show_worker_output.store(true, Ordering::SeqCst);
-                    println!("worker output ON — coordinators' turn output now streams (tagged ·standard/·batch) alongside 🔧 tool lines");
+                    println!("worker output ON — background coordinators now stream their 🔧 tool activity and ·standard/·batch turn output");
                 }
                 Some(false) => {
                     session.show_worker_output.store(false, Ordering::SeqCst);
-                    println!("worker output OFF — only 🔧 tool lines stream");
+                    println!("worker output OFF — background coordinators run quietly (only the ⟳N pulse + completion notice show)");
                 }
                 None => println!("usage: :worker-output [on|off]"),
             }
