@@ -14,11 +14,12 @@
 //! `Session` — its own history, cwd, and MCP connections — so a background job
 //! can't corrupt the live session's state.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 /// How long a worker may run before it's killed. Generous — these are deferred,
@@ -56,6 +57,59 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, cap: usize) -> S
         s.push_str("\n…[output truncated — exceeded the capture cap]");
     }
     s
+}
+
+/// How many of the child's most-recent stderr lines we retain for the failure
+/// message. We stream stderr live rather than accumulating it (an unbounded
+/// accumulation was the OOM risk), so the failure path can only quote a bounded
+/// tail rather than the whole thing.
+const STDERR_TAIL_LINES: usize = 20;
+
+/// Decide whether a single raw coordinator-stderr line is worth forwarding to
+/// the user's terminal, and if so return the cleaned text to forward.
+///
+/// The coordinator runs non-TTY, so its tool-activity lines are static and
+/// escape-light: `"\x1b[2m  🔧 git status\x1b[0m"`. We forward only the lines
+/// that show tool activity (those containing `🔧`) so the goal stream isn't
+/// noisy — the "coordinator run … starting" banner and blank lines are dropped.
+/// Cleaning strips leading whitespace and the dim `\x1b[2m…\x1b[0m` wrapper, so
+/// `announce` (which re-wraps in dim) doesn't double-wrap.
+fn clean_activity_line(raw: &str) -> Option<String> {
+    if !raw.contains('🔧') {
+        return None;
+    }
+    let mut s = raw.trim();
+    // Strip the dim wrapper the coordinator emits around static tool lines.
+    s = s.strip_prefix("\x1b[2m").unwrap_or(s);
+    s = s.strip_suffix("\x1b[0m").unwrap_or(s);
+    let cleaned = s.trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(cleaned.to_string())
+}
+
+/// Stream a child's stderr line by line: forward tool-activity lines to the
+/// user's terminal live via `announce(prefix, …)`, and retain only the last
+/// `STDERR_TAIL_LINES` raw lines as a bounded ring for the failure message.
+/// Returns the retained tail joined with newlines (oldest-first).
+///
+/// This both keeps the child's stderr pipe drained (so it never blocks) and
+/// gives the user live `[goal] 🔧 …` activity, without accumulating all of
+/// stderr in memory.
+async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(r: R, prefix: &str) -> String {
+    let mut lines = BufReader::new(r).lines();
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_LINES);
+    while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(activity) = clean_activity_line(&line) {
+            crate::tools::announce(prefix, &activity);
+        }
+        if tail.len() == STDERR_TAIL_LINES {
+            tail.pop_front();
+        }
+        tail.push_back(line);
+    }
+    tail.into_iter().collect::<Vec<_>>().join("\n")
 }
 
 /// Default address-space / data cap for a worker child, in MB. Generous enough
@@ -367,8 +421,11 @@ pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<Str
     let mut child = cmd.spawn().map_err(|e| format!("couldn't launch goal worker: {e}"))?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
+    // stdout is the result (capped capture, unchanged). stderr is streamed live
+    // to the user's terminal as `[goal] 🔧 …` tool-activity, retaining only a
+    // bounded tail for the failure message — no unbounded accumulation.
     let collect = tokio::spawn(async move {
-        tokio::join!(read_capped(stdout, CAPTURE_CAP), read_capped(stderr, CAPTURE_CAP))
+        tokio::join!(read_capped(stdout, CAPTURE_CAP), stream_stderr(stderr, "[goal]"))
     });
     let status = match tokio::time::timeout(WORKER_TIMEOUT, child.wait()).await {
         Ok(Ok(s)) => s,
@@ -532,6 +589,31 @@ mod tests {
         assert_eq!(parse_u64_or(Some(""), DEFAULT_WORKER_MEM_MB), DEFAULT_WORKER_MEM_MB);
         // 0 is a legal "no limit" value and must round-trip, not fall back.
         assert_eq!(parse_u64_or(Some("0"), DEFAULT_WORKER_CPU_SECS), 0);
+    }
+
+    #[test]
+    fn clean_activity_line_forwards_only_tool_lines() {
+        // The coordinator's non-TTY static tool line: two leading spaces, dim-wrapped.
+        assert_eq!(
+            clean_activity_line("\x1b[2m  🔧 git status\x1b[0m"),
+            Some("🔧 git status".to_string())
+        );
+        // An MCP tool name, same shape.
+        assert_eq!(
+            clean_activity_line("\x1b[2m  🔧 mcp__atum__list_tools\x1b[0m"),
+            Some("🔧 mcp__atum__list_tools".to_string())
+        );
+        // A ✓/✗-prefixed post-execution line still carries 🔧 and is forwarded.
+        assert_eq!(
+            clean_activity_line("\x1b[2m  ✓ 🔧 read /etc/hosts\x1b[0m"),
+            Some("✓ 🔧 read /etc/hosts".to_string())
+        );
+        // No wrapper at all — still cleaned/forwarded.
+        assert_eq!(clean_activity_line("🔧 ls"), Some("🔧 ls".to_string()));
+        // Lines without the wrench are dropped (banner, blanks, prose).
+        assert_eq!(clean_activity_line("coordinator run abc starting"), None);
+        assert_eq!(clean_activity_line(""), None);
+        assert_eq!(clean_activity_line("   \x1b[2m\x1b[0m  "), None);
     }
 
     #[test]
