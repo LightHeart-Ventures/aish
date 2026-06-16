@@ -159,4 +159,85 @@ impl Backend {
             }
         }
     }
+
+    /// The stronger model this frontend should escalate hard, in-turn reasoning
+    /// to — or `None` when the frontend is already at/above it (escalation would
+    /// just be the model consulting itself). Returns `(provider, model)`:
+    /// - a small Claude model (haiku/sonnet) → the batch model (Opus by default);
+    /// - a non-default Grok model → Grok's strongest;
+    /// - the local model → Claude's strong model, but only when a Claude
+    ///   credential is available (an offline local run has nothing to escalate to);
+    /// - an Opus / default-Grok frontend → `None`.
+    ///
+    /// The engine recomputes this each turn and stashes it on the session so the
+    /// `escalate` tool can reconstruct the strong-model backend at call time.
+    pub fn escalation_target(
+        &self,
+        batch_model: &str,
+        env: &[(String, String)],
+    ) -> Option<(&'static str, String)> {
+        match self {
+            Backend::Claude(b) => resolve_escalation("claude", &b.model, batch_model, false),
+            Backend::Grok(b) => resolve_escalation("grok", &b.model, batch_model, false),
+            #[cfg(feature = "local")]
+            Backend::Local(_) => resolve_escalation(
+                "local",
+                "",
+                batch_model,
+                claude::Credential::resolve(env).is_ok(),
+            ),
+        }
+    }
+}
+
+/// Pure escalation policy, split out so it's unit-testable without constructing
+/// a live backend (which needs credentials). `claude_cred_ok` only matters for
+/// the local frontend, which must reach a cloud model to escalate at all.
+fn resolve_escalation(
+    kind: &str,
+    model: &str,
+    batch_model: &str,
+    claude_cred_ok: bool,
+) -> Option<(&'static str, String)> {
+    match kind {
+        // Opus is already the strongest Claude model — nothing to escalate to.
+        "claude" if model.contains("opus") => None,
+        "claude" => Some(("claude", batch_model.to_string())),
+        // Grok ships a single model here; if we're already on it, no escalation.
+        "grok" if model == grok::DEFAULT_MODEL => None,
+        "grok" => Some(("grok", grok::DEFAULT_MODEL.to_string())),
+        // The local model is the weakest frontend; escalate to Claude's strong
+        // model when (and only when) a Claude credential is reachable.
+        "local" if claude_cred_ok => Some(("claude", batch_model.to_string())),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escalation_policy() {
+        let opus = "claude-opus-4-8";
+        // Small Claude frontends escalate to the batch (strong) model.
+        assert_eq!(
+            resolve_escalation("claude", "claude-haiku-4-5", opus, false),
+            Some(("claude", opus.to_string()))
+        );
+        assert_eq!(
+            resolve_escalation("claude", "claude-sonnet-4-6", opus, false),
+            Some(("claude", opus.to_string()))
+        );
+        // An Opus frontend is already frontier — no self-escalation.
+        assert_eq!(resolve_escalation("claude", opus, opus, false), None);
+        // Grok on its only model: nothing stronger to reach.
+        assert_eq!(resolve_escalation("grok", grok::DEFAULT_MODEL, opus, false), None);
+        // Local escalates to Claude's strong model, but only with a credential.
+        assert_eq!(
+            resolve_escalation("local", "", opus, true),
+            Some(("claude", opus.to_string()))
+        );
+        assert_eq!(resolve_escalation("local", "", opus, false), None);
+    }
 }

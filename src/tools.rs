@@ -61,7 +61,7 @@ fn allow_key(call: &ToolCall) -> String {
     }
 }
 
-pub fn tool_defs(batch_mode: bool) -> Vec<ToolDef> {
+pub fn tool_defs(batch_mode: bool, escalate_available: bool) -> Vec<ToolDef> {
     let mut defs = vec![
         ToolDef {
             name: "run_program".into(),
@@ -215,7 +215,8 @@ a backend or worry about batches — just describe the task and offload it."
                 "type": "object",
                 "properties": {
                     "task": {"type": "string", "description": "The self-contained task to run in the background. It has no access to THIS conversation — include everything it needs. It CAN read the project files and use tools/MCP in the current directory."},
-                    "isolate": {"type": "boolean", "description": "Set TRUE for any task that WRITES or EDITS files or runs builds/tests — it then runs in its own dedicated git worktree (a fresh branch off HEAD) so it can't clobber the working tree of other parallel background jobs or your live session. Set FALSE for read-only / analysis tasks (search, summarize, inspect) that change nothing. If omitted, it defaults to TRUE when the current directory is a git repo (isolation is free when no changes are made — the worktree is auto-removed), FALSE otherwise. When an isolated job makes changes, its branch is left intact and reported back for you to review/merge; nothing is auto-merged."}
+                    "isolate": {"type": "boolean", "description": "Set TRUE for any task that WRITES or EDITS files or runs builds/tests — it then runs in its own dedicated git worktree (a fresh branch) so it can't clobber the working tree of other parallel background jobs or your live session. Set FALSE for read-only / analysis tasks (search, summarize, inspect) that change nothing. If omitted, it defaults to TRUE when the current directory is a git repo (isolation is free when no changes are made — the worktree is auto-removed), FALSE otherwise. When an isolated job makes changes, its branch is left intact and reported back for you to review/merge; nothing is auto-merged."},
+                    "base": {"type": "string", "enum": ["main", "head"], "description": "Which baseline an ISOLATED job branches from (ignored when isolate is false). \"main\" (default) = a CLEAN trunk baseline (latest origin/main when there's a remote, else local main) — use it for independent/new work so the job doesn't inherit unrelated in-progress changes. \"head\" = branch from the CURRENT checkout — use it ONLY when the task must build on the work currently in this branch (\"continue/extend what I'm doing\")."}
                 },
                 "required": ["task"]
             }),
@@ -228,6 +229,31 @@ sessions). Call this to answer \"what's running?\" / \"status\" instead of guess
 your own tracking. Returns a table: id, kind, owner, status, task."
                 .into(),
             schema: json!({ "type": "object", "properties": {} }),
+        });
+    }
+    // Synchronous escalation: only offered to a weak frontend (a stronger model
+    // is reachable). An Opus/default-Grok session never sees this tool — it would
+    // just be the model consulting itself.
+    if escalate_available {
+        defs.push(ToolDef {
+            name: "escalate".into(),
+            description: "Hand a hard reasoning or analysis sub-problem to a STRONGER model and get \
+its answer back THIS turn — a synchronous, blocking consult that returns in a few seconds. Reach for \
+it the moment a step needs deeper reasoning than you can do reliably yourself: diagnosing a confusing \
+error, planning a multi-step change, weighing an ambiguous or risky decision, careful code/logic \
+analysis. The strong model has NO tools and NO access to this conversation, the files, or the machine \
+— put EVERYTHING it needs into `task` (the question, the relevant output, the constraints). It returns \
+reasoning/text only; you then act on its answer with your own tools. Use this for a step you must \
+finish NOW but can't reason through alone; use run_in_background instead when the result can wait. \
+Escalating beats guessing."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "The self-contained problem to reason about: the question plus ALL the context, output, and constraints the strong model needs, since it sees nothing but this string."}
+                },
+                "required": ["task"]
+            }),
         });
     }
     defs
@@ -260,6 +286,7 @@ pub async fn execute(call: &ToolCall, session: &mut Session, confirm: &mut Confi
         "run_in_background" => run_in_background(call, session),
         "batch_result" => batch_result(call, session),
         "background_status" => background_status(session),
+        "escalate" => escalate(call, session).await,
         "get_skill" => get_skill(call, session).await,
         other if other.starts_with("mcp__") => mcp_call(call, session, confirm).await,
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
@@ -650,6 +677,53 @@ fn job_output(call: &ToolCall, session: &Session) -> Result<String> {
 // the tool set otherwise).
 // ---------------------------------------------------------------------------
 
+/// System prompt for a synchronous `escalate` consult: a pure-reasoning helper
+/// with no tools and no machine access, answering from the task text alone.
+const ESCALATE_SYSTEM: &str = "You are a strong reasoning model consulted by aish, an AI shell agent \
+running on a smaller, faster model. It has hit a step that needs deeper reasoning than it can do \
+reliably and has handed you that sub-problem. You have NO tools and NO access to its conversation, \
+files, or machine — reason only over what is in the message. Return a clear, concrete, \
+directly-usable answer: the decision, the command(s) or plan, or the analysis asked for, with just \
+enough reasoning to justify it. Be precise and concise; the shell agent will act on your answer.";
+
+/// Synchronous escalation: a weak frontend hands one hard sub-problem to the
+/// stronger model and gets its reasoning back WITHIN this turn. Unlike
+/// `run_in_background` (async coordinator), this blocks on a single tool-less
+/// completion against the `(provider, model)` the engine resolved for this turn
+/// (`session.escalation`) and returns the strong model's text. No tools, no
+/// machine access — the strong model answers from `task` alone.
+async fn escalate(call: &ToolCall, session: &Session) -> Result<String> {
+    let task = call.args["task"].as_str().map(str::trim).unwrap_or("");
+    if task.is_empty() {
+        anyhow::bail!(
+            "`task` is required — state the sub-problem in full (question + context + constraints); \
+the strong model sees nothing else"
+        );
+    }
+    // The engine recomputes this each turn before building the tool set, so the
+    // tool is only present when this is Some — but guard anyway.
+    let (provider, model) = session.escalation.clone().ok_or_else(|| {
+        anyhow::anyhow!("escalation isn't available on this backend/model (already the strongest)")
+    })?;
+    let backend = match provider.as_str() {
+        "grok" => crate::backend::Backend::new_grok(model, &session.env),
+        // claude (also the target a local frontend escalates to)
+        _ => crate::backend::claude::Credential::resolve(&session.env)
+            .and_then(|cred| crate::backend::Backend::new_claude(model, cred)),
+    }
+    .map_err(|e| anyhow::anyhow!("couldn't reach the strong model for escalation: {e:#}"))?;
+
+    let turn = backend
+        .complete(ESCALATE_SYSTEM, &[crate::backend::Msg::user(task)], &[])
+        .await
+        .map_err(|e| anyhow::anyhow!("escalation consult failed: {e:#}"))?;
+    let answer = turn.text.trim();
+    if answer.is_empty() {
+        anyhow::bail!("the strong model returned no usable text");
+    }
+    Ok(answer.to_string())
+}
+
 fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
     let task = call.args["task"].as_str().map(str::trim).unwrap_or("");
     if task.is_empty() {
@@ -726,6 +800,13 @@ you're working on it and the answer will appear here when ready — no job id, n
         Some(b) => b,
         None => crate::worker::is_git_repo(&session.cwd),
     };
+    // Base for the isolated worktree: default to a clean trunk baseline ("main"),
+    // so a job never inherits a stale/unrelated local checkout. The model passes
+    // base:"head" to continue the current branch's work instead.
+    let base = match call.args["base"].as_str() {
+        Some(b) if b.eq_ignore_ascii_case("head") => "head",
+        _ => "main",
+    };
     let spec = crate::worker::WorkerSpec {
         exe,
         cwd: session.cwd.clone(),
@@ -733,6 +814,7 @@ you're working on it and the answer will appear here when ready — no job id, n
         model: crate::worker::coordinator_model(&session.backend_kind, &session.batch_model),
         env: session.env.clone(),
         isolate,
+        base: base.to_string(),
     };
     let _id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
     Ok("Queued a background coordinator (full toolset + MCP in this directory; it can fan parallel \
@@ -1350,6 +1432,20 @@ fn char_ceil(s: &str, mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escalate_tool_gated_on_availability() {
+        let has = |defs: &[ToolDef], n: &str| defs.iter().any(|d| d.name == n);
+        // Offered only to a weak frontend (escalate_available = true).
+        let weak = tool_defs(true, true);
+        assert!(has(&weak, "escalate"));
+        // A frontier frontend never sees it — no self-escalation.
+        let strong = tool_defs(true, false);
+        assert!(!has(&strong, "escalate"));
+        // Independent of batch mode: escalate tracks its own flag.
+        assert!(has(&tool_defs(false, true), "escalate"));
+        assert!(!has(&tool_defs(false, false), "escalate"));
+    }
 
     #[test]
     fn env_value_resolution() {
