@@ -33,8 +33,15 @@ pub async fn run_turn(
     input: String,
     confirm: &mut Confirm<'_>,
 ) -> Result<String> {
-    let system = session.system_prompt();
-    let mut tool_defs = tools::tool_defs(session.batch_mode);
+    // Decide, for this turn, whether a stronger model is worth escalating to
+    // (weak frontend → Some) and stash it so the `escalate` tool can rebuild that
+    // backend at call time. Drives both the tool's availability and the nudge.
+    session.escalation = backend
+        .escalation_target(&session.batch_model, &session.env)
+        .map(|(provider, model)| (provider.to_string(), model));
+    let escalate_available = session.escalation.is_some();
+    let system = session.system_prompt(escalate_available);
+    let mut tool_defs = tools::tool_defs(session.batch_mode, escalate_available);
     if backend.include_mcp_tools() {
         tool_defs.extend(session.mcp.tool_defs());
     }
@@ -382,6 +389,10 @@ fn describe_call(call: &crate::backend::ToolCall) -> String {
             crate::batch::one_line(a["task"].as_str().unwrap_or("?"))
         ),
         "background_status" => "background status".to_string(),
+        "escalate" => format!(
+            "escalate → stronger model: {}",
+            crate::batch::one_line(a["task"].as_str().unwrap_or("?"))
+        ),
         other => other.to_string(),
     }
 }

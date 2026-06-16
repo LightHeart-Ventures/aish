@@ -1206,6 +1206,7 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                             env: session.env.clone(),
                             // `:dispatch` keeps the shared-cwd behavior (no worktree).
                             isolate: false,
+                            base: "main".to_string(),
                         };
                         let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
                         println!(
@@ -1269,6 +1270,7 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
                                     env: session.env.clone(),
                                     // The goal loop iterates in the live cwd (no worktree).
                                     isolate: false,
+                                    base: "main".to_string(),
                                 };
                                 // KNOWN LIMITATION: the verifier still judges on
                                 // Claude (batch_model + the Claude credential

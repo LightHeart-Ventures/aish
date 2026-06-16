@@ -125,6 +125,13 @@ pub struct Session {
     /// Background coordinators are spawned on this same backend (full parity), so
     /// `:dispatch`/`run_in_background`/`:goal` thread it through to `WorkerSpec`.
     pub backend_kind: String,
+    /// `(provider, model)` of the stronger model a weak frontend should escalate
+    /// hard, in-turn reasoning to — recomputed each turn by the engine from
+    /// `Backend::escalation_target`. `None` when the frontend is already frontier
+    /// (an Opus/default-Grok session, or an offline local run). When `Some`, the
+    /// `escalate` tool is offered and the capability nudge is added; the tool
+    /// reads this to reconstruct the strong-model backend at call time.
+    pub escalation: Option<(String, String)>,
 }
 
 impl Session {
@@ -156,6 +163,7 @@ impl Session {
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
             goal: None,
             backend_kind: "claude".to_string(),
+            escalation: None,
         })
     }
 
@@ -197,7 +205,7 @@ impl Session {
         }
     }
 
-    pub fn system_prompt(&self) -> String {
+    pub fn system_prompt(&self, escalate_available: bool) -> String {
         // NOTE: deliberately static after session start (starting dir, not live cwd)
         // so the prompt-cache prefix never changes. The model learns cwd changes
         // from change_dir tool results.
@@ -241,11 +249,12 @@ matter — aish renders these as aligned terminal tables. Be verbose with column
 terse, and order the rows deliberately: chronological for events or history, by stage for \
 pipelines or build/run phases, by category for mixed or grouped sets.\n\
 - Final replies are terse and shell-like. One line when one line will do, but reach for a table \
-the moment there are several items to compare. No markdown headers.{skills}{batch}",
+the moment there are several items to compare. No markdown headers.{skills}{batch}{escalate}",
             host = self.host_info,
             cwd = self.cwd.display(),
             skills = self.skills_prompt,
             batch = if self.batch_mode { BATCH_NUDGE } else { "" },
+            escalate = if escalate_available { ESCALATE_NUDGE } else { "" },
         )
     }
 }
@@ -265,6 +274,23 @@ preamble, then reply with ONE short, natural sentence — tailored to what they 
 handling it in the background and the answer will appear here when it's ready (e.g. \"On it — I'll work \
 that out in the background and post the answer here.\"). Do NOT predict or mention the job id, restate \
 the task, or explain cost/timing; the result auto-delivers.";
+
+/// Appended when the frontend is a smaller/faster model than the strongest one
+/// available (haiku/sonnet, or a local model with a Claude credential). It tells
+/// that weak frontend to lean on the two workers — `escalate` for hard reasoning
+/// it must finish THIS turn, `run_in_background` for deferrable work — instead of
+/// guessing past a step it can't reason through. Omitted entirely when the
+/// frontend is already frontier (Opus), so a strong model is never told to
+/// second-guess itself.
+const ESCALATE_NUDGE: &str = "\n\nYou are running on a smaller, faster model, and a STRONGER model is \
+one call away. Play to that: do the routing, dispatch, file edits, and straightforward steps yourself \
+— you are good at those and fast — but the moment a step needs deeper reasoning than you can do \
+reliably (a confusing error to diagnose, a multi-step plan, an ambiguous or risky judgment, careful \
+analysis), do NOT guess. If you need the answer to keep going THIS turn, call escalate(task) — a \
+synchronous consult that returns the stronger model's reasoning in a few seconds; put everything it \
+needs in `task` (it sees nothing else), then act on its answer with your tools. If the result can wait, \
+use run_in_background instead. Escalating a hard step is the correct, expected move here, not a \
+failure — a wrong guess you act on is far more costly than a few seconds of consulting.";
 
 /// Hard cap (bytes) on last-output text exposed via `$LAST`/`$_` and the
 /// automatic model-prompt context (TASK-13 AC3). Outputs longer than this are

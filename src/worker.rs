@@ -249,6 +249,11 @@ struct Worktree {
     branch: String,
     /// The source repo the worktree was carved from — used to remove it cleanly.
     src: PathBuf,
+    /// Commit sha the worktree branched from. Cleanup compares the worktree's tip
+    /// to THIS (not the source's live HEAD): branching off `origin/main` means the
+    /// base may differ from the source checkout, so an unchanged worktree's tip
+    /// equals `base_sha`, not `git_head(src)`.
+    base_sha: String,
 }
 
 /// True when `dir` is inside a git working tree. Cheap `git rev-parse` probe;
@@ -286,14 +291,82 @@ fn worktree_layout(src: &std::path::Path, id: &str) -> (String, PathBuf) {
     (branch, path)
 }
 
-/// Create a fresh worktree off the current HEAD for worker `id`. Best-effort:
-/// returns `None` (caller falls back to the shared `src` cwd) if `src` isn't a
-/// repo or the `git worktree add` fails, so isolation never blocks a job.
-fn create_worktree(src: &std::path::Path, id: &str) -> Option<Worktree> {
+/// Run a git command in `src`, returning trimmed stdout on success.
+fn git_out(src: &std::path::Path, args: &[&str]) -> Option<String> {
+    let o = std::process::Command::new("git").arg("-C").arg(src).args(args).output().ok()?;
+    o.status
+        .success()
+        .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// True when a git command in `src` exits 0 (output discarded).
+fn git_ok(src: &std::path::Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(src)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// The repo's trunk branch name — `origin/HEAD` when set (e.g. `main`/`master`),
+/// else whichever of `main`/`master` exists locally or on the remote, else `main`.
+fn trunk_branch(src: &std::path::Path) -> String {
+    if let Some(s) = git_out(src, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
+        if let Some(name) = s.strip_prefix("origin/") {
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    for cand in ["main", "master"] {
+        if git_ok(src, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{cand}")])
+            || git_ok(src, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/origin/{cand}")])
+        {
+            return cand.to_string();
+        }
+    }
+    "main".to_string()
+}
+
+/// Resolve the start-point ref an isolated worker should branch from.
+/// `"head"` → the session's current checkout (continue-my-work). Anything else →
+/// a clean trunk baseline: `origin/<trunk>` after a best-effort fetch when a
+/// remote exists (so workers never inherit a stale local trunk — the exact
+/// footgun behind branch sprawl), else the local trunk, else `HEAD`.
+fn resolve_base_ref(src: &std::path::Path, base: &str) -> String {
+    if base.eq_ignore_ascii_case("head") {
+        return "HEAD".to_string();
+    }
+    let trunk = trunk_branch(src);
+    if git_ok(src, &["remote", "get-url", "origin"]) {
+        // Refresh so the baseline is genuinely current; ignore failure (offline).
+        let _ = git_ok(src, &["fetch", "origin", &trunk]);
+        let remote_ref = format!("origin/{trunk}");
+        if git_ok(src, &["rev-parse", "--verify", "--quiet", &remote_ref]) {
+            return remote_ref;
+        }
+    }
+    if git_ok(src, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{trunk}")]) {
+        return trunk;
+    }
+    "HEAD".to_string()
+}
+
+/// Create a fresh worktree for worker `id`, branched from `base` (`"main"` for a
+/// clean trunk baseline, `"head"` to continue the current checkout — see
+/// `resolve_base_ref`). Best-effort: returns `None` (caller falls back to the
+/// shared `src` cwd) if `src` isn't a repo or `git worktree add` fails, so
+/// isolation never blocks a job.
+fn create_worktree(src: &std::path::Path, id: &str, base: &str) -> Option<Worktree> {
     if !is_git_repo(src) {
         return None;
     }
     let (branch, path) = worktree_layout(src, id);
+    let start_point = resolve_base_ref(src, base);
     // A stale dir from a crashed prior run would make `git worktree add` fail;
     // best-effort clear it first (only an empty/leftover one is expected here).
     let _ = std::process::Command::new("git")
@@ -309,17 +382,18 @@ fn create_worktree(src: &std::path::Path, id: &str) -> Option<Worktree> {
         .arg(src)
         .args(["worktree", "add", "-b", &branch])
         .arg(&path)
-        .arg("HEAD")
+        .arg(&start_point)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if ok {
-        Some(Worktree { path, branch, src: src.to_path_buf() })
-    } else {
-        None
+    if !ok {
+        return None;
     }
+    // Pin the base commit for clean-up accounting (tip == base_sha ⇒ no commits).
+    let base_sha = git_head(&path).unwrap_or_default();
+    Some(Worktree { path, branch, src: src.to_path_buf(), base_sha })
 }
 
 /// True when the worktree has neither uncommitted changes nor commits ahead of
@@ -340,12 +414,12 @@ fn worktree_is_clean(wt: &Worktree) -> bool {
     if dirty {
         return false;
     }
-    // Any commits added? The worktree branched off the source's HEAD; if its tip
-    // still equals the source's current HEAD, no commits were made → clean.
-    // (Comparing tips is robust without tracking an upstream.)
-    match (git_head(&wt.src), git_head(&wt.path)) {
-        (Some(src), Some(tip)) => src == tip,
-        _ => false, // can't compare → assume work was done, keep it
+    // Any commits added? The worktree branched from `base_sha`; if its tip still
+    // equals that, no commits were made → clean. (Compared against the recorded
+    // base, not the source's live HEAD, since the base may be origin/<trunk>.)
+    match git_head(&wt.path) {
+        Some(tip) => !wt.base_sha.is_empty() && tip == wt.base_sha,
+        None => false, // can't compare → assume work was done, keep it
     }
 }
 
@@ -485,6 +559,13 @@ pub struct WorkerSpec {
     /// `run_in_background` tool's `isolate` flag (smart-defaulted to true inside a
     /// repo). The goal loop and `:dispatch` leave this false (shared cwd).
     pub isolate: bool,
+    /// The git ref an isolated worker branches its worktree from. `"main"`
+    /// (the default) means a CLEAN trunk baseline — `origin/<trunk>` after a
+    /// best-effort fetch when a remote exists, else the local trunk — so a job
+    /// never inherits a stale or unrelated local checkout. `"head"` pins to the
+    /// session's current `HEAD` for "continue what I'm working on" tasks. Only
+    /// consulted when `isolate` is true.
+    pub base: String,
 }
 
 impl WorkerJob {
@@ -569,12 +650,14 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
 /// The run task: re-exec aish in `--coordinator` mode, capture stdout as the
 /// result, enforce a timeout, then surface it.
 async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: WorkerSpec) {
-    // Isolation: a writing/building coordinator gets its own git worktree off
-    // HEAD so parallel coordinators can't clobber the shared tree. Best-effort —
+    // Isolation: a writing/building coordinator gets its own git worktree
+    // (branched from `spec.base` — a clean trunk baseline by default, or the
+    // current HEAD on request) so parallel coordinators can't clobber the shared
+    // tree. Best-effort —
     // if `cwd` isn't a repo or `git worktree add` fails, we fall back to the
     // shared cwd (today's behavior). The worktree is torn down on completion if
     // the job made no changes; otherwise it's left intact and its branch reported.
-    let worktree = if spec.isolate { create_worktree(&spec.cwd, &job.id) } else { None };
+    let worktree = if spec.isolate { create_worktree(&spec.cwd, &job.id, &spec.base) } else { None };
     let run_cwd = worktree.as_ref().map(|w| w.path.clone()).unwrap_or_else(|| spec.cwd.clone());
     let mut cmd = worker_command(&spec, &task, &job.id, &run_cwd);
 
