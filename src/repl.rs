@@ -23,6 +23,36 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Install a background MCP connect's result into the session the moment it's
+/// ready (non-blocking). Replaces the placeholder host with the connected one
+/// and swaps in the skills catalog that includes the servers' published skills.
+/// A no-op once installed or while still connecting. See `mcp_rx` in `run`.
+fn install_mcp_if_ready(
+    rx: &mut Option<tokio::sync::oneshot::Receiver<(crate::mcp::McpHost, String)>>,
+    session: &mut Session,
+) {
+    let Some(receiver) = rx.as_mut() else {
+        return;
+    };
+    match receiver.try_recv() {
+        Ok((host, skills_prompt)) => {
+            let n = host.server_names().len();
+            session.mcp = host;
+            session.skills_prompt = skills_prompt;
+            *rx = None;
+            if n > 0 {
+                eprintln!(
+                    "\x1b[2mmcp: ready — {n} server{} connected\x1b[0m",
+                    if n == 1 { "" } else { "s" }
+                );
+            }
+        }
+        // Still connecting, or the connect task died — leave the placeholder.
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => *rx = None,
+    }
+}
+
 /// Blocking y/N/a prompt on the controlling TTY. `a` ("always") allows this
 /// call and persists the tool/command so it never prompts again.
 pub fn confirm_tty(prompt: &str) -> tools::Decision {
@@ -44,6 +74,8 @@ pub async fn run(
     mut backend: Backend,
     mut session: Session,
     aliases: HashMap<String, Vec<String>>,
+    mcp_config_paths: Vec<PathBuf>,
+    skills_dir: PathBuf,
 ) -> Result<()> {
     // Job-control signal disposition (TASK-115): aish ignores SIGINT/QUIT/TSTP/
     // TTOU/TTIN so a Ctrl-C/Ctrl-\/Ctrl-Z reaches the foreground child's process
@@ -70,6 +102,31 @@ pub async fn run(
     // for credential resolution before the backend is built); we just take the
     // aliases it parsed.
     let aliases = Arc::new(aliases);
+
+    // Deferred MCP connect. The handshake (a remote HTTP server's
+    // initialize → tools/list → prompts/list) is the dominant startup cost and
+    // used to run before this REPL existed, freezing the shell for seconds.
+    // Instead connect in the background and hand the result back over a oneshot;
+    // the loop installs the tools + skills catalog when it arrives. Until then
+    // the prompt is live and everything except MCP tools works. `engine::run_turn`
+    // reads `session.mcp.tool_defs()` fresh each turn, so a late arrival simply
+    // becomes available on the next turn.
+    let mut mcp_rx: Option<tokio::sync::oneshot::Receiver<(crate::mcp::McpHost, String)>> =
+        if mcp_config_paths.is_empty() {
+            None
+        } else {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let refs: Vec<&Path> = mcp_config_paths.iter().map(|p| p.as_path()).collect();
+                let host = crate::mcp::McpHost::start(&refs).await;
+                let skills_prompt = crate::skills::render_prompt_section(
+                    &crate::skills::load(&skills_dir),
+                    &host.skills(),
+                );
+                let _ = tx.send((host, skills_prompt));
+            });
+            Some(rx)
+        };
 
     let mut rl: Editor<AishHelper, DefaultHistory> = Editor::new()?;
     rl.set_helper(Some(AishHelper {
@@ -138,6 +195,11 @@ pub async fn run(
     }
 
     loop {
+        // Install MCP tools/skills as soon as the background connect finishes
+        // (see `mcp_rx` above). Checked here and again right before a model turn
+        // so a handshake that lands while the user is typing is still available
+        // for that very turn.
+        install_mcp_if_ready(&mut mcp_rx, &mut session);
         if needs_gap {
             println!();
             needs_gap = false;
@@ -199,6 +261,9 @@ pub async fn run(
                         Dispatch::NotACommand => {}
                     }
                 }
+
+                // Pick up a just-completed MCP connect so this turn has its tools.
+                install_mcp_if_ready(&mut mcp_rx, &mut session);
 
                 // Model turn: set the activity/reply apart from the typed line
                 // (direct commands above stay shell-immediate on purpose).
