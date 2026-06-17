@@ -16,6 +16,7 @@ mod repl;
 mod session;
 mod skills;
 mod tools;
+mod turn_audit;
 mod update;
 mod worker;
 

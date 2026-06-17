@@ -157,6 +157,17 @@ pub async fn drive(
         let _ = s.insert(run_id, &input, &session.session_id, session.name.as_deref());
     }
 
+    // Tier‑1 turn audit: attach (or re‑open, on a resume) the append‑only
+    // tool journal at `.atum/run-${run_id}.jsonl` inside the worktree. On a
+    // reconnect this recovers the completed turns so `engine::run_turn` replays
+    // them instead of re‑executing side‑effecting tool calls. Best‑effort:
+    // attach never fails (an unopenable journal degrades to a no‑op).
+    let audit = crate::turn_audit::TurnAudit::attach(&session.cwd, run_id);
+    if let Some(summary) = audit.resume_summary() {
+        eprintln!("\x1b[2maish: {summary}\x1b[0m");
+    }
+    session.turn_audit = Some(audit);
+
     let mut rounds = 0usize;
     // The coordinator's model HAS the full toolset (run_turn passes tool_defs),
     // but a model handed a big task headless sometimes rationalizes "I'm a

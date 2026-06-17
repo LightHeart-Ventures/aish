@@ -105,26 +105,55 @@ pub async fn run_turn(
             // the running spinner, the finished ✓/✗ line, and the retroactive
             // reveal — every place that renders the activity line.
             let desc = format!("{} {}", tool_glyph(&call.name), describe_call(call));
-            // Tool-execution phase: this call gets its own animated line while it
-            // runs — a braille spinner turning to the LEFT of a steady tool glyph.
-            // Calls execute sequentially, so only the current one animates; the
-            // spinner is replaced by a final static line (✓/✗ + desc) when the
-            // tool returns. `run_interactive` hands the terminal to a child, so it
-            // opts out of the animation (which would fight the child for stderr)
-            // and shows a plain static line.
-            let tool_spin = ToolSpinner::start(&desc, animates(&call.name));
-            // Pause the animation around any permission prompt: the spinner must
-            // not animate (or overwrite the prompt) while we wait for the answer,
-            // then it resumes for the tool's actual execution.
-            let stopper = tool_spin.stopper();
-            let mut gated = |p: &str| {
-                pause_spinner(&stopper);
-                let decision = confirm(p);
-                resume_spinner(&stopper);
-                decision
+
+            // Tier-1 turn audit (background coordinator only — None otherwise).
+            // Ask the journal whether this exact tool call was already completed
+            // in a prior, crashed run: a Replay short-circuits execution and
+            // feeds the model the RECORDED result (no duplicate side effect); an
+            // Execute journals a `pending` record and runs the tool live. The
+            // borrow ends with this expression, so `execute` can re-borrow below.
+            let audit_step = session
+                .turn_audit
+                .as_mut()
+                .map(|a| a.begin(&call.name, &call.args));
+
+            let result = if let Some(crate::turn_audit::Step::Replay { output, is_error }) =
+                &audit_step
+            {
+                // Resumed turn: surface a dim replay marker (no spinner, no
+                // re-execution) and reuse the journaled result.
+                let (output, is_error) = (output.clone(), *is_error);
+                eprintln!("\x1b[2m  \u{21ba} replayed {desc}\x1b[0m");
+                ToolResult { id: call.id.clone(), content: output, is_error }
+            } else {
+                // Live turn. Tool-execution phase: this call gets its own animated
+                // line while it runs — a braille spinner turning to the LEFT of a
+                // steady tool glyph. Calls execute sequentially, so only the
+                // current one animates; the spinner is replaced by a final static
+                // line (✓/✗ + desc) when the tool returns. `run_interactive` hands
+                // the terminal to a child, so it opts out of the animation (which
+                // would fight the child for stderr) and shows a plain static line.
+                let tool_spin = ToolSpinner::start(&desc, animates(&call.name));
+                // Pause the animation around any permission prompt: the spinner
+                // must not animate (or overwrite the prompt) while we wait for the
+                // answer, then it resumes for the tool's actual execution.
+                let stopper = tool_spin.stopper();
+                let mut gated = |p: &str| {
+                    pause_spinner(&stopper);
+                    let decision = confirm(p);
+                    resume_spinner(&stopper);
+                    decision
+                };
+                let result = tools::execute(call, session, &mut gated).await;
+                tool_spin.finish(&desc, result.is_error);
+                // Journal the terminal (complete/failed) record for this live turn.
+                if let Some(crate::turn_audit::Step::Execute { turn }) = audit_step {
+                    if let Some(a) = session.turn_audit.as_mut() {
+                        a.complete(turn, &call.name, &result);
+                    }
+                }
+                result
             };
-            let result = tools::execute(call, session, &mut gated).await;
-            tool_spin.finish(&desc, result.is_error);
             if session.raw_tool_output {
                 print_raw_result(&result);
             }

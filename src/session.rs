@@ -138,6 +138,12 @@ pub struct Session {
     /// `escalate` tool is offered and the capability nudge is added; the tool
     /// reads this to reconstruct the strong-model backend at call time.
     pub escalation: Option<(String, String)>,
+    /// Tier‑1 turn‑audit journal for a background coordinator run (see
+    /// `crate::turn_audit`). `Some` only for a headless `--coordinator` run, where
+    /// it is attached by `coordinator::drive` so `engine::run_turn` can journal
+    /// each tool call (and replay completed turns on a resume). Always `None` for
+    /// an interactive session — no journaling there.
+    pub turn_audit: Option<crate::turn_audit::TurnAudit>,
 }
 
 impl Session {
@@ -170,6 +176,7 @@ impl Session {
             backend_kind: "claude".to_string(),
             show_worker_output: Arc::new(AtomicBool::new(false)),
             escalation: None,
+            turn_audit: None,
         })
     }
 
