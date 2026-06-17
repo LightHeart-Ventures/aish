@@ -664,7 +664,8 @@ pub fn coordinator_model(backend_kind: &str, batch_model: &str) -> String {
 /// A background worker subprocess, tracked for the life of the session. Shared
 /// between the REPL (which lists/surfaces it) and the run task (which mutates it).
 pub struct WorkerJob {
-    /// Session-local handle, e.g. "worker_1".
+    /// Session-local handle, e.g. "w_a7k3m2pQ" (short `w_########` form; legacy
+    /// `worker_<uuid>` ids still display and match fine — it's an opaque string).
     pub id: String,
     pub task: String,
     inner: Mutex<JobInner>,
@@ -848,14 +849,44 @@ impl WorkerJob {
     }
 }
 
+/// Mint a fresh worker id in the short, readable `w_########` form: a `w_`
+/// prefix plus 8 random base62 characters (a-z, A-Z, 0-9), e.g. `w_a7k3m2pQ`.
+///
+/// Why base62-8 instead of the old 32-hex-char UUID: these ids exist only to
+/// disambiguate the handful of concurrent background workers a single host
+/// spawns in a session, and they appear constantly in terminal output, logs,
+/// and the `background_status` table — so readability wins. 62^8 ≈ 2.18×10^14
+/// (~218 trillion) distinct values give ample collision resistance at those
+/// counts (even a few thousand live ids keep collision odds negligible) while
+/// being ~4× shorter on screen. The randomness is drawn from a UUIDv4's 122
+/// bits, so no extra RNG dependency is pulled in — this is dedup-grade
+/// uniqueness, not a security token. The id is an opaque string everywhere it's
+/// used (only ever compared / `starts_with`-matched, never parsed), so older
+/// `worker_<uuid>`-format ids keep displaying and matching correctly.
+fn new_worker_id() -> String {
+    const ALPHABET: &[u8; 62] =
+        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    // Consume a UUIDv4's 122 random bits, peeling off one base62 digit at a
+    // time. The modulo bias against 2^128 is astronomically small at 8 digits.
+    let mut n = Uuid::new_v4().as_u128();
+    let mut suffix = String::with_capacity(8);
+    for _ in 0..8 {
+        suffix.push(ALPHABET[(n % 62) as usize] as char);
+        n /= 62;
+    }
+    format!("w_{suffix}")
+}
+
 /// Register a new background worker and start its run task. Returns the
 /// session-local job id. The spec is captured up front so the spawned task is
 /// self-contained.
 pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
     let mut guard = jobs.lock().unwrap();
-    // UUID-based id — globally unique, so workers from different sessions/repos
-    // never collide or mix in `:workers` listings or the coordinator store.
-    let id = format!("worker_{}", Uuid::new_v4().simple());
+    // Short, readable `w_########` id (see `new_worker_id`) — still unique enough
+    // that workers from different sessions/repos don't collide or mix in
+    // `:workers` listings or the coordinator store, but far easier to read in
+    // logs and the status table than the old 32-hex-char UUID.
+    let id = new_worker_id();
     let job = Arc::new(WorkerJob {
         id: id.clone(),
         task: task.clone(),
@@ -1160,12 +1191,34 @@ mod tests {
 
     #[test]
     fn spawn_assigns_unique_ids() {
-        // IDs are now UUID-based — globally unique, never collide across sessions.
-        let id1 = format!("worker_{}", uuid::Uuid::new_v4().simple());
-        let id2 = format!("worker_{}", uuid::Uuid::new_v4().simple());
-        assert!(id1.starts_with("worker_"));
-        assert!(id2.starts_with("worker_"));
+        // IDs are now the short `w_########` form — readable, and unique enough
+        // that two freshly-minted ids don't collide.
+        let id1 = new_worker_id();
+        let id2 = new_worker_id();
+        assert!(id1.starts_with("w_"));
+        assert!(id2.starts_with("w_"));
+        assert_eq!(id1.len(), 10); // "w_" + 8 chars
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn worker_id_format_and_collision_freeness() {
+        // AC: every id matches `w_` + exactly 8 [a-zA-Z0-9] chars, and a large
+        // batch is collision-free in practice (the readability/entropy tradeoff
+        // documented on `new_worker_id`).
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for _ in 0..10_000 {
+            let id = new_worker_id();
+            let suffix = id.strip_prefix("w_").expect("id must carry the w_ prefix");
+            assert_eq!(suffix.len(), 8, "suffix must be 8 chars: {id}");
+            assert!(
+                suffix.chars().all(|c| c.is_ascii_alphanumeric()),
+                "suffix must be alphanumeric (a-z, A-Z, 0-9): {id}"
+            );
+            assert!(seen.insert(id.clone()), "collision generating 10k ids: {id}");
+        }
+        assert_eq!(seen.len(), 10_000, "all 10k generated ids must be distinct");
     }
 
     #[test]
