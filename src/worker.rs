@@ -90,7 +90,7 @@ pub enum Pulse {
 /// status glyph) is the tool *beginning*, not an outcome → `None`. A `🗨` line is
 /// turn narration (`engine::emit_narration`) → a turn-completion pulse.
 fn classify_event(line: &str) -> Option<Pulse> {
-    if line.contains('🔧') {
+    if line.contains('🔧') || line.contains('⚙') {
         if line.contains('✓') {
             return Some(Pulse::ToolOk);
         }
@@ -121,7 +121,7 @@ const STDERR_TAIL_LINES: usize = 20;
 /// Cleaning strips leading whitespace and the dim `\x1b[2m…\x1b[0m` wrapper, so
 /// `announce` (which re-wraps in dim) doesn't double-wrap.
 fn clean_activity_line(raw: &str) -> Option<String> {
-    if !raw.contains('🔧') {
+    if !raw.contains('🔧') && !raw.contains('⚙') {
         return None;
     }
     let mut s = raw.trim();
