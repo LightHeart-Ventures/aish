@@ -4,6 +4,7 @@ mod coordinator;
 mod db;
 mod engine;
 mod goal;
+mod jobs;
 mod md;
 mod mcp;
 #[cfg(test)]
