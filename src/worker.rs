@@ -398,24 +398,51 @@ pub fn is_git_repo(dir: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// A short, filesystem- and branch-safe token derived from a session id, so two
+/// sessions that both number their workers from `worker_1` don't collide on the
+/// same worktree branch/path. Keeps only ASCII alphanumerics (a session uuid's
+/// leading hex is plenty to disambiguate) and caps the length. Empty in → empty
+/// out, so a sessionless caller (e.g. the goal loop) falls back to the old
+/// un-namespaced layout.
+fn short_session(session: &str) -> String {
+    session.chars().filter(|c| c.is_ascii_alphanumeric()).take(12).collect()
+}
+
 /// Build the branch name + worktree path for a worker. Pure (no IO) so it's
 /// unit-testable. The worktree lives OUTSIDE the repo — under the system temp
-/// dir, in a subdir keyed by a hash of the source path so two repos with the
-/// same basename don't collide — so it never pollutes the source repo's
-/// `git status` with an untracked dir. The branch is `aish/<id>`.
-fn worktree_layout(src: &std::path::Path, id: &str) -> (String, PathBuf) {
-    let branch = format!("aish/{id}");
-    // Stable per-repo key (FNV-1a of the absolute source path) so worktrees for
-    // the same repo cluster together and distinct repos never share a dir.
+/// dir, in a subdir keyed by a hash of the source path AND the launching session
+/// so two repos (or two sessions on the same repo) never collide — so it never
+/// pollutes the source repo's `git status` with an untracked dir. The branch is
+/// `aish/<session>/<id>` (or `aish/<id>` for a sessionless caller).
+///
+/// Session-namespacing is the fix for the cross-session collision bug: worker
+/// ids (`worker_1`, `worker_2`, …) are a PER-SESSION counter, so two independent
+/// aish sessions both mint `worker_1`. Without the session in the branch+path,
+/// the second session's `git worktree add -b aish/worker_1` collides with the
+/// first session's leftover branch (falling back to the shared cwd and mixing
+/// both sessions' work onto one tree) or its `worktree remove --force` clobbers
+/// the first session's live worktree. The session token makes each session's
+/// `worker_1` a distinct `aish/<session>/worker_1` branch + path.
+fn worktree_layout(src: &std::path::Path, id: &str, session: &str) -> (String, PathBuf) {
+    let sess = short_session(session);
+    let branch = if sess.is_empty() { format!("aish/{id}") } else { format!("aish/{sess}/{id}") };
+    // Stable per-(repo, session) key (FNV-1a of the absolute source path plus the
+    // session token) so worktrees for the same repo+session cluster together and
+    // distinct repos/sessions never share a dir.
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in src.to_string_lossy().as_bytes() {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
+    for b in sess.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let leaf = if sess.is_empty() { id.to_string() } else { format!("{sess}-{id}") };
     let path = std::env::temp_dir()
         .join("aish-worktrees")
         .join(format!("{hash:016x}"))
-        .join(id);
+        .join(leaf);
     (branch, path)
 }
 
@@ -489,11 +516,11 @@ fn resolve_base_ref(src: &std::path::Path, base: &str) -> String {
 /// `resolve_base_ref`). Best-effort: returns `None` (caller falls back to the
 /// shared `src` cwd) if `src` isn't a repo or `git worktree add` fails, so
 /// isolation never blocks a job.
-fn create_worktree(src: &std::path::Path, id: &str, base: &str) -> Option<Worktree> {
+fn create_worktree(src: &std::path::Path, id: &str, base: &str, session: &str) -> Option<Worktree> {
     if !is_git_repo(src) {
         return None;
     }
-    let (branch, path) = worktree_layout(src, id);
+    let (branch, path) = worktree_layout(src, id, session);
     let start_point = resolve_base_ref(src, base);
     // A stale dir from a crashed prior run would make `git worktree add` fail;
     // best-effort clear it first (only an empty/leftover one is expected here).
@@ -839,7 +866,14 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
     // if `cwd` isn't a repo or `git worktree add` fails, we fall back to the
     // shared cwd (today's behavior). The worktree is torn down on completion if
     // the job made no changes; otherwise it's left intact and its branch reported.
-    let worktree = if spec.isolate { create_worktree(&spec.cwd, &job.id, &spec.base) } else { None };
+    let worktree = if spec.isolate {
+        // Namespace the worktree by the LAUNCHING session so two sessions that
+        // both mint `worker_1` get distinct branches/paths (cross-session
+        // isolation) instead of colliding on `aish/worker_1`.
+        create_worktree(&spec.cwd, &job.id, &spec.base, &spec.launch_session_id)
+    } else {
+        None
+    };
     let run_cwd = worktree.as_ref().map(|w| w.path.clone()).unwrap_or_else(|| spec.cwd.clone());
     let mut cmd = worker_command(&spec, &task, &job.id, &run_cwd);
 
@@ -1304,20 +1338,39 @@ mod tests {
     #[test]
     fn worktree_layout_builds_branch_and_path() {
         let src = std::path::Path::new("/repo");
-        let (branch, path) = worktree_layout(src, "worker_3");
-        assert_eq!(branch, "aish/worker_3");
-        // Lives OUTSIDE the repo (in temp), keyed by repo, ending in the id — so
-        // it never pollutes the source `git status`.
+        let (branch, path) = worktree_layout(src, "worker_3", "sessAAAA");
+        assert_eq!(branch, "aish/sessAAAA/worker_3");
+        // Lives OUTSIDE the repo (in temp), keyed by repo+session, ending in the
+        // id — so it never pollutes the source `git status`.
         assert!(path.starts_with(std::env::temp_dir()), "got: {}", path.display());
-        assert!(path.ends_with("worker_3"), "got: {}", path.display());
+        assert!(path.ends_with("sessAAAA-worker_3"), "got: {}", path.display());
         assert!(!path.starts_with(src));
         // Distinct ids never collide on path or branch.
-        let (b2, p2) = worktree_layout(src, "worker_4");
+        let (b2, p2) = worktree_layout(src, "worker_4", "sessAAAA");
         assert_ne!(branch, b2);
         assert_ne!(path, p2);
-        // Distinct repos get distinct keyed dirs even with the same id.
-        let (_, other_repo) = worktree_layout(std::path::Path::new("/other"), "worker_3");
+        // Distinct repos get distinct keyed dirs even with the same id+session.
+        let (_, other_repo) = worktree_layout(std::path::Path::new("/other"), "worker_3", "sessAAAA");
         assert_ne!(path, other_repo);
+        // A sessionless caller falls back to the un-namespaced layout.
+        let (b0, p0) = worktree_layout(src, "worker_3", "");
+        assert_eq!(b0, "aish/worker_3");
+        assert!(p0.ends_with("worker_3"), "got: {}", p0.display());
+    }
+
+    #[test]
+    fn worktree_layout_isolates_same_id_across_sessions() {
+        // The cross-session collision bug: two independent aish sessions both
+        // mint `worker_1` (the id is a per-session counter). Namespacing the
+        // worktree branch + path by the launching session keeps them apart so
+        // one session's worker can't clobber or merge onto the other's tree.
+        let src = std::path::Path::new("/repo");
+        let (b1, p1) = worktree_layout(src, "worker_1", "11111111aaaa");
+        let (b2, p2) = worktree_layout(src, "worker_1", "22222222bbbb");
+        assert_ne!(b1, b2, "same id in two sessions must get distinct branches");
+        assert_ne!(p1, p2, "same id in two sessions must get distinct worktree paths");
+        assert_eq!(b1, "aish/11111111aaaa/worker_1");
+        assert_eq!(b2, "aish/22222222bbbb/worker_1");
     }
 
     #[tokio::test]
