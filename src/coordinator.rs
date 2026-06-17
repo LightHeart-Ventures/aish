@@ -45,6 +45,7 @@ use crate::backend::Backend;
 use crate::db::CoordinatorStore;
 use crate::session::Session;
 use crate::tools;
+use std::collections::HashSet;
 use std::time::Duration;
 
 /// Upper bound on agentic rounds (a misbehaving model can't spin forever).
@@ -332,6 +333,32 @@ pub fn rehydrate(session: &mut Session) {
     }
 }
 
+/// Count active (non-terminal) coordinator runs in the durable store whose
+/// `run_id` is NOT already tracked in `in_memory_ids` (this session's in-process
+/// worker subprocesses, which `worker::running_count` already counts). This is
+/// what makes the prompt's `⟳N` activity badge agree with `:workers`: a goal-loop
+/// generator turn (`run_once`, never registered in `worker_jobs`), a run launched
+/// from another session, and a run reattached after a restart all live ONLY in
+/// the durable store — so without counting them the prompt shows no activity
+/// indicator even while `:workers` lists them coordinating. Best-effort: a store
+/// read error counts 0 rather than breaking the prompt.
+pub fn active_store_count(store: &CoordinatorStore, in_memory_ids: &HashSet<String>) -> usize {
+    store
+        .load_all()
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|r| !in_memory_ids.contains(&r.run_id))
+                .filter(|r| {
+                    matches!(
+                        Phase::parse(&r.phase),
+                        Phase::Coordinating | Phase::AwaitingBatch
+                    )
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 /// Print a completed coordinator result above the prompt, matching the batch /
 /// worker completion block style so it reads consistently.
 fn print_completed(run_id: &str, result: &str) {
@@ -436,6 +463,38 @@ mod tests {
         // Malformed → None.
         assert_eq!(parse_sqlite_timestamp("not a timestamp"), None);
         assert_eq!(parse_sqlite_timestamp("2021-13"), None);
+    }
+
+    #[test]
+    fn active_store_count_counts_nonterminal_minus_in_memory() {
+        use std::collections::HashSet;
+        let path = std::env::temp_dir().join(format!("aish_active_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+
+        // A goal-loop generator turn (other-session/durable-only) — coordinating.
+        store.insert("goal-abc", "pursue goal", "sess-a", None).unwrap();
+        // A run awaiting a batch — also active.
+        store.insert("run_await", "fan out", "sess-b", None).unwrap();
+        store.set_phase("run_await", "awaiting_batch").unwrap();
+        // A finished run — terminal, must NOT count.
+        store.insert("run_done", "done work", "sess-c", None).unwrap();
+        store.set_done("run_done", "result").unwrap();
+        // A failed run — terminal, must NOT count.
+        store.insert("run_failed", "broke", "sess-d", None).unwrap();
+        store.set_failed("run_failed", "boom").unwrap();
+        // This session's own worker, ALSO tracked in-memory (deduped out so it
+        // isn't double-counted against worker::running_count).
+        store.insert("worker_7", "my worker", "sess-me", None).unwrap();
+
+        let in_memory: HashSet<String> = ["worker_7".to_string()].into_iter().collect();
+        // goal-abc + run_await = 2 active; run_done/run_failed terminal; worker_7 deduped.
+        assert_eq!(active_store_count(&store, &in_memory), 2);
+
+        // With nothing tracked in-memory, the own-worker row counts too → 3.
+        assert_eq!(active_store_count(&store, &HashSet::new()), 3);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

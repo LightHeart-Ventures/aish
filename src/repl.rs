@@ -70,6 +70,18 @@ pub fn confirm_tty(prompt: &str) -> tools::Decision {
     }
 }
 
+/// Emit an OSC 0 (icon name & window title) sequence to set the terminal window title.
+fn set_window_title(title: &str) {
+    print!("\x1b]0;{}\x07", title);
+    let _ = std::io::stdout().flush();
+}
+
+/// Emit an OSC 0 sequence with an empty string to reset the terminal window title.
+fn reset_window_title() {
+    print!("\x1b]0;\x07");
+    let _ = std::io::stdout().flush();
+}
+
 pub async fn run(
     mut backend: Backend,
     mut session: Session,
@@ -128,6 +140,25 @@ pub async fn run(
             Some(rx)
         };
 
+    // Best-effort self-update check. Runs the `gh` release query OFF the startup
+    // critical path; when a newer release exists for this platform the result
+    // lands on `update_rx`, and the loop prints a one-line notice + stashes it in
+    // `pending_update` so `:update` can install it without a second network call.
+    // Silent on any failure (no gh, offline, no releases, no matching asset).
+    let mut update_rx: Option<tokio::sync::oneshot::Receiver<crate::update::UpdateInfo>> =
+        if crate::update::gh_available() {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                if let Ok(Some(info)) = crate::update::check().await {
+                    let _ = tx.send(info);
+                }
+            });
+            Some(rx)
+        } else {
+            None
+        };
+    let mut pending_update: Option<crate::update::UpdateInfo> = None;
+
     let mut rl: Editor<AishHelper, DefaultHistory> = Editor::new()?;
     rl.set_helper(Some(AishHelper {
         cwd: session.cwd.clone(),
@@ -159,7 +190,11 @@ pub async fn run(
     if unsafe { libc::isatty(1) } == 1 {
         print!("\x1b[2J\x1b[H");
     }
-    println!("\x1b[1maish\x1b[0m — AI-native shell · {} · :help for commands", backend.describe());
+    println!(
+        "\x1b[1maish\x1b[0m \x1b[2mv{}\x1b[0m — AI-native shell · {} · :help for commands",
+        crate::update::current_version(),
+        backend.describe()
+    );
 
     let mut prev_dir: Option<PathBuf> = None;
     let mut needs_gap = false; // blank line between previous output and the prompt
@@ -200,6 +235,26 @@ pub async fn run(
         // so a handshake that lands while the user is typing is still available
         // for that very turn.
         install_mcp_if_ready(&mut mcp_rx, &mut session);
+        // Surface a discovered upgrade exactly once, above the prompt. The user
+        // chooses whether to act on it with `:update`.
+        if pending_update.is_none() {
+            if let Some(rx) = update_rx.as_mut() {
+                match rx.try_recv() {
+                    Ok(info) => {
+                        println!(
+                            "\x1b[1;32m✨ aish {} is available\x1b[0m (you have {}) — type \x1b[1m:update\x1b[0m to upgrade",
+                            info.version,
+                            crate::update::current_version()
+                        );
+                        needs_gap = true;
+                        pending_update = Some(info);
+                        update_rx = None;
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => update_rx = None,
+                }
+            }
+        }
         if needs_gap {
             println!();
             needs_gap = false;
@@ -210,8 +265,27 @@ pub async fn run(
         }
         // We're about to idle at the prompt — let the presenter flush results.
         busy.store(false, Ordering::SeqCst);
-        let running = crate::batch::running_count(&session.batch_jobs)
+        // In-memory background jobs owned by THIS session: Anthropic batches
+        // plus re-exec'd worker subprocesses (run_in_background / :dispatch).
+        let mut running = crate::batch::running_count(&session.batch_jobs)
             + crate::worker::running_count(&session.worker_jobs);
+        // Plus durable coordinator runs the in-memory tallies miss — goal-loop
+        // generator turns, runs launched from another session, and runs
+        // reattached after a restart live ONLY in the coordinator store. Counting
+        // their non-terminal rows (deduped against this session's in-memory
+        // worker ids) keeps the prompt badge in agreement with `:workers`, which
+        // already lists them. This is the fix for "`:workers` shows coordinating
+        // tasks but the prompt has no activity indicator".
+        if let Some(store) = &session.coordinator_store {
+            let in_memory: std::collections::HashSet<String> = session
+                .worker_jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|w| w.id.clone())
+                .collect();
+            running += crate::coordinator::active_store_count(store, &in_memory);
+        }
         // Colour the ⟳N badge by the most recent background-worker event
         // (green ✓ tool success, red ✗ tool failure, magenta ⟳ turn
         // completion), fading back to dim ⟳N after worker::PULSE_FADE.
@@ -234,7 +308,7 @@ pub async fn run(
                 busy.store(true, Ordering::SeqCst);
 
                 if let Some(cmd) = line.strip_prefix(':') {
-                    if handle_colon(cmd, &mut backend, &mut session).await {
+                    if handle_colon(cmd, &mut backend, &mut session, &mut pending_update).await {
                         break;
                     }
                     continue;
@@ -1102,7 +1176,12 @@ fn toggle_raw_output(session: &mut Session) {
 }
 
 /// Returns true when the REPL should exit.
-async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -> bool {
+async fn handle_colon(
+    cmd: &str,
+    backend: &mut Backend,
+    session: &mut Session,
+    pending_update: &mut Option<crate::update::UpdateInfo>,
+) -> bool {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
         Some("q" | "quit" | "exit") => return true,
@@ -1122,6 +1201,7 @@ async fn handle_colon(cmd: &str, backend: &mut Backend, session: &mut Session) -
                  :mcp tools [name]                   list MCP tools\n\
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
+                 :update                             check GitHub for a newer release and upgrade\n\
                  :batch <on|off|status|clear>        interactive batch mode: agent offloads deferrable\n\
                                                      work to background Anthropic batches (Opus, ~50%\n\
                                                      cheaper); jobs persist + reattach across restarts\n\
@@ -1519,11 +1599,61 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
         }
         Some("allow") => handle_allow(parts.next(), parts.next(), session),
         Some("batch") => handle_batch(parts.next(), parts.next(), session),
+        Some("update") => handle_update(pending_update, session).await,
         Some("mcp") => handle_mcp(parts.collect(), session).await,
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
     }
     false
+}
+
+/// `:update` checks GitHub for a newer release and, with confirmation, installs
+/// it via the `gh` CLI. A pending update discovered at startup is used directly;
+/// otherwise a fresh check runs on demand. Yolo mode skips the confirm.
+async fn handle_update(
+    pending_update: &mut Option<crate::update::UpdateInfo>,
+    session: &Session,
+) {
+    if !crate::update::gh_available() {
+        println!("update needs the GitHub CLI (`gh`) on PATH — see https://cli.github.com");
+        return;
+    }
+    let info = match pending_update.take() {
+        Some(info) => info,
+        None => {
+            println!("\x1b[2mchecking for updates…\x1b[0m");
+            match crate::update::check().await {
+                Ok(Some(info)) => info,
+                Ok(None) => {
+                    println!("aish is up to date ({}).", crate::update::current_version());
+                    return;
+                }
+                Err(e) => {
+                    println!("update check failed: {e:#}");
+                    return;
+                }
+            }
+        }
+    };
+    println!(
+        "aish {} is available (you have {}).",
+        info.version,
+        crate::update::current_version()
+    );
+    let go = session.mode == crate::session::Mode::Yolo
+        || matches!(
+            confirm_tty(&format!("download and install aish {}?", info.version)),
+            tools::Decision::AllowOnce | tools::Decision::AlwaysAllow
+        );
+    if !go {
+        println!("update cancelled — run :update when you're ready.");
+        *pending_update = Some(info); // keep it so the next :update needn't re-check
+        return;
+    }
+    if let Err(e) = crate::update::perform(&info).await {
+        println!("\x1b[31mupdate failed:\x1b[0m {e:#}");
+        *pending_update = Some(info);
+    }
 }
 
 /// `:mcp` manages MCP servers (like Claude Code's `/mcp`): list, reconnect, add,
