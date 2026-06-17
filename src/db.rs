@@ -372,7 +372,20 @@ impl CoordinatorStore {
                  session_name TEXT,
                  created_at   TEXT NOT NULL DEFAULT current_timestamp,
                  heartbeat_at TEXT NOT NULL DEFAULT current_timestamp
-             );",
+             );
+             -- Operator → coordinator mailbox (the :tell / SendMessage channel).
+             -- A row is a clarification/instruction queued for an in-flight run;
+             -- the coordinator drains (and deletes) its messages at each round
+             -- boundary. Indexed by run_id since every read is run-scoped.
+             CREATE TABLE IF NOT EXISTS coordinator_messages (
+                 id           INTEGER PRIMARY KEY,
+                 run_id       TEXT NOT NULL,
+                 message      TEXT NOT NULL,
+                 from_session TEXT,
+                 created_at   TEXT NOT NULL DEFAULT current_timestamp
+             );
+             CREATE INDEX IF NOT EXISTS idx_coord_msg_run
+                 ON coordinator_messages (run_id);",
         )
         .context("coordinator_runs schema init failed")?;
         // Back-compat: add session_name to a table created before it existed.
@@ -463,13 +476,78 @@ impl CoordinatorStore {
         Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
-    /// Drop terminal (done/failed) runs. Returns how many rows were removed.
+    /// Queue an operator message for an in-flight coordinator run — the write
+    /// side of the `:tell` / SendMessage channel. The message is picked up at
+    /// the start of the run's next round (see `coordinator::drive`), so delivery
+    /// is round-boundary, not instantaneous. `from_session` records the sender
+    /// for provenance. Returns the new message row id.
+    pub fn enqueue_message(
+        &self,
+        run_id: &str,
+        message: &str,
+        from_session: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO coordinator_messages (run_id, message, from_session) \
+             VALUES (?1, ?2, ?3)",
+            (run_id, message, from_session),
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Atomically take — and delete — every queued message for `run_id`, oldest
+    /// first. Delete-on-read: a message is folded into the coordinator's
+    /// transcript exactly once and must not repeat on the next round. The select
+    /// and delete run in one transaction, so a message inserted concurrently
+    /// (after the select, before the delete) is preserved for the next drain
+    /// rather than dropped. Returns the message texts in send order.
+    pub fn drain_messages(&self, run_id: &str) -> Result<Vec<String>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let taken: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, message FROM coordinator_messages WHERE run_id = ?1 ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map([run_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            rows.filter_map(std::result::Result::ok).collect()
+        };
+        if let Some(max_id) = taken.last().map(|(id, _)| *id) {
+            // Delete only the ids we actually read (id <= max_id), so a row
+            // inserted after the select survives for the next round.
+            tx.execute(
+                "DELETE FROM coordinator_messages WHERE run_id = ?1 AND id <= ?2",
+                (run_id, max_id),
+            )?;
+        }
+        tx.commit()?;
+        Ok(taken.into_iter().map(|(_, m)| m).collect())
+    }
+
+    /// How many messages are currently queued for a run (peek, no delete) — for
+    /// status display and the `:tell` confirmation line.
+    pub fn pending_message_count(&self, run_id: &str) -> Result<i64> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT count(*) FROM coordinator_messages WHERE run_id = ?1",
+            [run_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Drop terminal (done/failed) runs. Returns how many runs were removed.
+    /// Also purges any orphaned mailbox messages — those whose target run no
+    /// longer exists (delivered runs, reaped orphans) — so the mailbox can't
+    /// grow without bound.
     pub fn clear_finished(&self) -> Result<usize> {
-        Ok(self
-            .conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM coordinator_runs WHERE phase IN ('done', 'failed')", [])?)
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM coordinator_runs WHERE phase IN ('done', 'failed')", [])?;
+        let _ = conn.execute(
+            "DELETE FROM coordinator_messages \
+             WHERE run_id NOT IN (SELECT run_id FROM coordinator_runs)",
+            [],
+        );
+        Ok(n)
     }
 }
 
@@ -600,6 +678,47 @@ mod tests {
 
         assert_eq!(reopened.clear_finished().unwrap(), 2); // both terminal now
         assert!(reopened.load_all().unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn coordinator_messages_enqueue_drain_and_purge() {
+        let path = std::env::temp_dir().join(format!("aish_coordmsg_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+        store.insert("run_1", "audit the repo", "sess-a", Some("alpha")).unwrap();
+
+        // No messages yet.
+        assert_eq!(store.pending_message_count("run_1").unwrap(), 0);
+        assert!(store.drain_messages("run_1").unwrap().is_empty());
+
+        // Enqueue two messages for run_1 and one for an unrelated run.
+        store.enqueue_message("run_1", "focus on the auth module first", Some("sess-b")).unwrap();
+        store.enqueue_message("run_1", "skip the e2e tests", None).unwrap();
+        store.enqueue_message("run_2", "different run", None).unwrap();
+        assert_eq!(store.pending_message_count("run_1").unwrap(), 2);
+
+        // Drain run_1 — ordered oldest-first, scoped to run_1, delete-on-read.
+        let drained = store.drain_messages("run_1").unwrap();
+        assert_eq!(drained, vec![
+            "focus on the auth module first".to_string(),
+            "skip the e2e tests".to_string(),
+        ]);
+        // Second drain is empty (delete-on-read), and run_2's message is untouched.
+        assert!(store.drain_messages("run_1").unwrap().is_empty());
+        assert_eq!(store.pending_message_count("run_1").unwrap(), 0);
+        assert_eq!(store.pending_message_count("run_2").unwrap(), 1);
+
+        // A message survives across a process restart (fresh connection).
+        store.enqueue_message("run_1", "one more note", None).unwrap();
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        assert_eq!(reopened.drain_messages("run_1").unwrap(), vec!["one more note".to_string()]);
+
+        // clear_finished purges orphaned messages (run_2 was never inserted as a
+        // run, so its queued message has no owning run row → purged).
+        reopened.clear_finished().unwrap();
+        assert_eq!(reopened.pending_message_count("run_2").unwrap(), 0);
+
         let _ = std::fs::remove_file(&path);
     }
 
