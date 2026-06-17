@@ -399,51 +399,96 @@ pub fn is_git_repo(dir: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// A short, filesystem- and branch-safe token derived from a session id, so two
-/// sessions that both number their workers from `worker_1` don't collide on the
-/// same worktree branch/path. Keeps only ASCII alphanumerics (a session uuid's
-/// leading hex is plenty to disambiguate) and caps the length. Empty in → empty
-/// out, so a sessionless caller (e.g. the goal loop) falls back to the old
-/// un-namespaced layout.
-fn short_session(session: &str) -> String {
-    session.chars().filter(|c| c.is_ascii_alphanumeric()).take(12).collect()
+/// Parse a GitHub remote URL into a stable, filesystem-safe `owner--repo` key,
+/// or `None` when the URL isn't a parseable GitHub remote. Pure — unit-tested.
+/// Handles `https://github.com/owner/repo(.git)`, `git@github.com:owner/repo.git`,
+/// and `ssh://git@github.com/owner/repo.git`; strips a trailing `.git`/slash and
+/// sanitises the `/` separator to `--` (see `sanitize_repo_key`).
+fn repo_key_from_remote(url: &str) -> Option<String> {
+    let url = url.trim();
+    let rest = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| url.strip_prefix("https://github.com/"))
+        .or_else(|| url.strip_prefix("http://github.com/"))?;
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let mut parts = rest.splitn(2, '/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    Some(sanitize_repo_key(&format!("{owner}/{repo}")))
 }
 
-/// Build the branch name + worktree path for a worker. Pure (no IO) so it's
-/// unit-testable. The worktree lives OUTSIDE the repo — under the system temp
-/// dir, in a subdir keyed by a hash of the source path AND the launching session
-/// so two repos (or two sessions on the same repo) never collide — so it never
-/// pollutes the source repo's `git status` with an untracked dir. The branch is
-/// `aish/<session>/<id>` (or `aish/<id>` for a sessionless caller).
-///
-/// Session-namespacing is the fix for the cross-session collision bug: worker
-/// ids (`worker_1`, `worker_2`, …) are a PER-SESSION counter, so two independent
-/// aish sessions both mint `worker_1`. Without the session in the branch+path,
-/// the second session's `git worktree add -b aish/worker_1` collides with the
-/// first session's leftover branch (falling back to the shared cwd and mixing
-/// both sessions' work onto one tree) or its `worktree remove --force` clobbers
-/// the first session's live worktree. The session token makes each session's
-/// `worker_1` a distinct `aish/<session>/worker_1` branch + path.
-fn worktree_layout(src: &std::path::Path, id: &str, session: &str) -> (String, PathBuf) {
-    let sess = short_session(session);
-    let branch = if sess.is_empty() { format!("aish/{id}") } else { format!("aish/{sess}/{id}") };
-    // Stable per-(repo, session) key (FNV-1a of the absolute source path plus the
-    // session token) so worktrees for the same repo+session cluster together and
-    // distinct repos/sessions never share a dir.
+/// Map an `owner/repo` string to a filesystem- and branch-safe key: `/` → `--`,
+/// and any other char outside `[A-Za-z0-9._-]` → `-`. Pure.
+fn sanitize_repo_key(s: &str) -> String {
+    s.replace('/', "--")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' })
+        .collect()
+}
+
+/// Fallback repo-key for a local-only / non-GitHub repo: the source dir's
+/// basename plus a short FNV-1a hash of its absolute path, preserving
+/// collision-safety across two checkouts of the same-named repo. Pure given `src`.
+fn fallback_repo_key(src: &std::path::Path) -> String {
+    let base = src
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "repo".to_string());
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in src.to_string_lossy().as_bytes() {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    for b in sess.as_bytes() {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+    format!("{}-{:08x}", sanitize_repo_key(&base), (hash & 0xffff_ffff) as u32)
+}
+
+/// Resolve the `{repo-key}` for `src` (IO — reads the git `origin` remote):
+/// `owner--repo` from the GitHub remote when parseable, else the
+/// basename+shorthash fallback. See `repo_key_from_remote` / `fallback_repo_key`.
+fn repo_key(src: &std::path::Path) -> String {
+    git_out(src, &["remote", "get-url", "origin"])
+        .and_then(|url| repo_key_from_remote(&url))
+        .unwrap_or_else(|| fallback_repo_key(src))
+}
+
+/// The root under which all worker worktrees live: `$AISH_WORKTREE_DIR` when set
+/// and non-empty, else `~/.atum/worktrees`, else (no `$HOME`) a temp fallback.
+/// Moving off the OS temp dir is the whole point of ISS-2046 — the OS reaps temp
+/// dirs and could silently delete a worker's deliberately-kept (dirty) worktree.
+fn worktree_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("AISH_WORKTREE_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
     }
-    let leaf = if sess.is_empty() { id.to_string() } else { format!("{sess}-{id}") };
-    let path = std::env::temp_dir()
-        .join("aish-worktrees")
-        .join(format!("{hash:016x}"))
-        .join(leaf);
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() {
+        return PathBuf::from(home).join(".atum").join("worktrees");
+    }
+    std::env::temp_dir().join("aish-worktrees")
+}
+
+/// Create `dir` (and parents) and tighten it to `0700` — these worktrees can
+/// hold un-pushed work, so they're owner-only. Best-effort.
+fn ensure_dir_0700(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if std::fs::create_dir_all(dir).is_ok() {
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// Build the branch name + worktree path for a worker. Pure (the caller supplies
+/// the already-resolved `root` and `repo_key`), so it's unit-testable. The
+/// worktree lives at `{root}/{repo_key}/{id}` — OUTSIDE the source repo, so it
+/// never pollutes the source `git status` — and the branch is `aish/{id}`. The
+/// worker id is globally unique (`w_########`, #86), so no session prefix is
+/// needed to disambiguate two sessions / two checkouts: they harmlessly share the
+/// `{repo_key}` parent dir with distinct leaves.
+fn worktree_layout(root: &std::path::Path, repo_key: &str, id: &str) -> (String, PathBuf) {
+    let branch = format!("aish/{id}");
+    let path = root.join(repo_key).join(id);
     (branch, path)
 }
 
@@ -517,11 +562,19 @@ fn resolve_base_ref(src: &std::path::Path, base: &str) -> String {
 /// `resolve_base_ref`). Best-effort: returns `None` (caller falls back to the
 /// shared `src` cwd) if `src` isn't a repo or `git worktree add` fails, so
 /// isolation never blocks a job.
-fn create_worktree(src: &std::path::Path, id: &str, base: &str, session: &str) -> Option<Worktree> {
+fn create_worktree(src: &std::path::Path, id: &str, base: &str) -> Option<Worktree> {
     if !is_git_repo(src) {
         return None;
     }
-    let (branch, path) = worktree_layout(src, id, session);
+    let root = worktree_root();
+    let key = repo_key(src);
+    let (branch, path) = worktree_layout(&root, &key, id);
+    // Off the OS temp dir now (ISS-2046), so aish owns cleanup — create the root
+    // and the per-repo parent `0700` before `git worktree add` materialises the leaf.
+    ensure_dir_0700(&root);
+    if let Some(parent) = path.parent() {
+        ensure_dir_0700(parent);
+    }
     let start_point = resolve_base_ref(src, base);
     // A stale dir from a crashed prior run would make `git worktree add` fail;
     // best-effort clear it first (only an empty/leftover one is expected here).
@@ -609,6 +662,129 @@ pub fn prune_worktrees(dir: &std::path::Path) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+/// How long a CLEAN, orphaned-or-stale worktree may sit under the managed root
+/// before the startup sweeper reclaims it. A dirty / commits-ahead worktree is
+/// NEVER swept regardless of age. Override with `AISH_WORKTREE_MAX_AGE_DAYS`.
+const DEFAULT_WORKTREE_MAX_AGE_DAYS: u64 = 7;
+
+/// Pure sweep policy: should a discovered worktree leaf be reclaimed? NEVER when
+/// it has uncommitted changes (`dirty`) or commits ahead of its base (`ahead`) —
+/// the same conservative rule as `worktree_is_clean`. A clean, not-ahead leaf is
+/// swept when its git registration is gone (`orphaned`) OR it is at least
+/// `max_age_days` old. Unit-tested in isolation from any IO.
+fn should_sweep(dirty: bool, ahead: bool, orphaned: bool, age_days: u64, max_age_days: u64) -> bool {
+    if dirty || ahead {
+        return false; // never delete work left for the operator
+    }
+    orphaned || age_days >= max_age_days
+}
+
+/// Whether the worktree at `leaf` has commits on its branch ahead of the repo
+/// trunk it can see. Conservative: any git error → `true` (treat as ahead → keep).
+fn worktree_commits_ahead(leaf: &std::path::Path) -> bool {
+    let trunk = trunk_branch(leaf);
+    // Prefer the remote trunk ref (what isolated workers branch from), falling
+    // back to the local trunk; if neither resolves we can't compare → keep.
+    let base = if git_ok(leaf, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/origin/{trunk}")]) {
+        format!("origin/{trunk}")
+    } else if git_ok(leaf, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{trunk}")]) {
+        trunk
+    } else {
+        return true;
+    };
+    match git_out(leaf, &["rev-list", "--count", &format!("{base}..HEAD")]) {
+        Some(n) => n.trim() != "0",
+        None => true,
+    }
+}
+
+/// Age of `path` in whole days from its mtime, or 0 when unknown (a metadata
+/// error makes the leaf look "fresh", so the age rule alone won't reclaim it).
+fn dir_age_days(path: &std::path::Path) -> u64 {
+    let modified = match std::fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return 0,
+    };
+    match std::time::SystemTime::now().duration_since(modified) {
+        Ok(d) => d.as_secs() / 86_400,
+        Err(_) => 0,
+    }
+}
+
+/// The set of absolute worktree paths git currently tracks for `src` (parsed from
+/// `git worktree list --porcelain`). A leaf NOT in this set is orphaned
+/// (registration gone). Empty on any error.
+fn registered_worktrees(src: &std::path::Path) -> std::collections::HashSet<PathBuf> {
+    let mut set = std::collections::HashSet::new();
+    if let Some(out) = git_out(src, &["worktree", "list", "--porcelain"]) {
+        for line in out.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                let path = PathBuf::from(p.trim());
+                set.insert(path.canonicalize().unwrap_or(path));
+            }
+        }
+    }
+    set
+}
+
+/// Best-effort startup sweeper: reclaim orphaned/old CLEAN worktrees under the
+/// managed root so they don't accumulate now that the OS no longer GCs them
+/// (ISS-2046). Scoped to the current repo's `{repo-key}` subtree — each repo's
+/// startup cleans its own. The conservative `should_sweep` rule guarantees a
+/// dirty or commits-ahead worktree (work left for the operator) is NEVER removed.
+pub fn sweep_worktrees(src: &std::path::Path) {
+    if !is_git_repo(src) {
+        return;
+    }
+    let max_age = env_u64("AISH_WORKTREE_MAX_AGE_DAYS", DEFAULT_WORKTREE_MAX_AGE_DAYS);
+    let base_dir = worktree_root().join(repo_key(src));
+    let entries = match std::fs::read_dir(&base_dir) {
+        Ok(e) => e,
+        Err(_) => return, // nothing created under this repo-key yet
+    };
+    let registered = registered_worktrees(src);
+    for entry in entries.flatten() {
+        let leaf = entry.path();
+        if !leaf.is_dir() {
+            continue;
+        }
+        let canon = leaf.canonicalize().unwrap_or_else(|_| leaf.clone());
+        let orphaned = !registered.contains(&canon);
+        // Probe cleanliness IN the leaf. A git error → can't confirm clean → treat
+        // as dirty (keep): never delete work we can't account for.
+        let dirty = match git_out(&leaf, &["status", "--porcelain"]) {
+            Some(s) => !s.trim().is_empty(),
+            None => true,
+        };
+        let ahead = dirty || worktree_commits_ahead(&leaf);
+        let age = dir_age_days(&leaf);
+        if !should_sweep(dirty, ahead, orphaned, age, max_age) {
+            continue;
+        }
+        // Reclaim: drop git's registration (if any) + the `aish/<id>` branch, then
+        // the dir. `git worktree remove` deletes a REGISTERED leaf's dir; an orphan
+        // it won't touch, so remove that ourselves.
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(src)
+            .args(["worktree", "remove", "--force"])
+            .arg(&leaf)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if let Some(name) = leaf.file_name().and_then(|s| s.to_str()) {
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(src)
+                .args(["branch", "-D", &format!("aish/{name}")])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = std::fs::remove_dir_all(&leaf);
+    }
 }
 
 /// Remove a worktree and delete its branch — used when the worker made no
@@ -918,10 +1094,11 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
     // shared cwd (today's behavior). The worktree is torn down on completion if
     // the job made no changes; otherwise it's left intact and its branch reported.
     let worktree = if spec.isolate {
-        // Namespace the worktree by the LAUNCHING session so two sessions that
-        // both mint `worker_1` get distinct branches/paths (cross-session
-        // isolation) instead of colliding on `aish/worker_1`.
-        create_worktree(&spec.cwd, &job.id, &spec.base, &spec.launch_session_id)
+        // Worker ids are globally unique (`w_########`, #86), so the worktree
+        // leaf is just the id: two sessions / two checkouts share the `{repo-key}`
+        // parent dir but never collide on the leaf. Lives under `~/.atum/worktrees`
+        // (off the OS-reaped temp dir — ISS-2046), swept on startup if abandoned.
+        create_worktree(&spec.cwd, &job.id, &spec.base)
     } else {
         None
     };
@@ -1389,40 +1566,93 @@ mod tests {
 
     #[test]
     fn worktree_layout_builds_branch_and_path() {
-        let src = std::path::Path::new("/repo");
-        let (branch, path) = worktree_layout(src, "worker_3", "sessAAAA");
-        assert_eq!(branch, "aish/sessAAAA/worker_3");
-        // Lives OUTSIDE the repo (in temp), keyed by repo+session, ending in the
-        // id — so it never pollutes the source `git status`.
-        assert!(path.starts_with(std::env::temp_dir()), "got: {}", path.display());
-        assert!(path.ends_with("sessAAAA-worker_3"), "got: {}", path.display());
-        assert!(!path.starts_with(src));
+        let root = std::path::Path::new("/wt-root");
+        let (branch, path) = worktree_layout(root, "LightHeart-Ventures--aish", "w_a7k3m2pQ");
+        // Branch is just `aish/{id}` — the id is globally unique, no session prefix.
+        assert_eq!(branch, "aish/w_a7k3m2pQ");
+        // Path = {root}/{repo-key}/{id}; the leaf is exactly the worker id.
+        assert_eq!(path, root.join("LightHeart-Ventures--aish").join("w_a7k3m2pQ"));
+        assert!(path.ends_with("w_a7k3m2pQ"), "got: {}", path.display());
         // Distinct ids never collide on path or branch.
-        let (b2, p2) = worktree_layout(src, "worker_4", "sessAAAA");
+        let (b2, p2) = worktree_layout(root, "LightHeart-Ventures--aish", "w_ZZ00ay12");
         assert_ne!(branch, b2);
         assert_ne!(path, p2);
-        // Distinct repos get distinct keyed dirs even with the same id+session.
-        let (_, other_repo) = worktree_layout(std::path::Path::new("/other"), "worker_3", "sessAAAA");
-        assert_ne!(path, other_repo);
-        // A sessionless caller falls back to the un-namespaced layout.
-        let (b0, p0) = worktree_layout(src, "worker_3", "");
-        assert_eq!(b0, "aish/worker_3");
-        assert!(p0.ends_with("worker_3"), "got: {}", p0.display());
+        // Distinct repo-keys get distinct parent dirs even with the same id.
+        let (_, other) = worktree_layout(root, "other--repo", "w_a7k3m2pQ");
+        assert_ne!(path, other);
     }
 
     #[test]
-    fn worktree_layout_isolates_same_id_across_sessions() {
-        // The cross-session collision bug: two independent aish sessions both
-        // mint `worker_1` (the id is a per-session counter). Namespacing the
-        // worktree branch + path by the launching session keeps them apart so
-        // one session's worker can't clobber or merge onto the other's tree.
-        let src = std::path::Path::new("/repo");
-        let (b1, p1) = worktree_layout(src, "worker_1", "11111111aaaa");
-        let (b2, p2) = worktree_layout(src, "worker_1", "22222222bbbb");
-        assert_ne!(b1, b2, "same id in two sessions must get distinct branches");
-        assert_ne!(p1, p2, "same id in two sessions must get distinct worktree paths");
-        assert_eq!(b1, "aish/11111111aaaa/worker_1");
-        assert_eq!(b2, "aish/22222222bbbb/worker_1");
+    fn repo_key_from_remote_parses_https_and_ssh() {
+        // https, with and without the `.git` suffix.
+        assert_eq!(
+            repo_key_from_remote("https://github.com/LightHeart-Ventures/aish.git").as_deref(),
+            Some("LightHeart-Ventures--aish")
+        );
+        assert_eq!(
+            repo_key_from_remote("https://github.com/LightHeart-Ventures/aish").as_deref(),
+            Some("LightHeart-Ventures--aish")
+        );
+        // Trailing slash is stripped.
+        assert_eq!(
+            repo_key_from_remote("https://github.com/octo/Hello-World/").as_deref(),
+            Some("octo--Hello-World")
+        );
+        // `git@` ssh form.
+        assert_eq!(
+            repo_key_from_remote("git@github.com:LightHeart-Ventures/aish.git").as_deref(),
+            Some("LightHeart-Ventures--aish")
+        );
+        // `ssh://` form.
+        assert_eq!(
+            repo_key_from_remote("ssh://git@github.com/owner/repo.git").as_deref(),
+            Some("owner--repo")
+        );
+        // Non-GitHub / unparseable → None (caller falls back to basename+hash).
+        assert_eq!(repo_key_from_remote("https://gitlab.com/owner/repo.git"), None);
+        assert_eq!(repo_key_from_remote("git@bitbucket.org:owner/repo.git"), None);
+        assert_eq!(repo_key_from_remote("not a url"), None);
+        assert_eq!(repo_key_from_remote("https://github.com/owner"), None); // no repo segment
+    }
+
+    #[test]
+    fn sanitize_repo_key_maps_slash_and_unsafe_chars() {
+        assert_eq!(sanitize_repo_key("owner/repo"), "owner--repo");
+        // Allowed chars (alnum, dot, underscore, hyphen) survive.
+        assert_eq!(sanitize_repo_key("Acme.Co/My_Repo-1"), "Acme.Co--My_Repo-1");
+        // Anything else collapses to '-'.
+        assert_eq!(sanitize_repo_key("a b/c:d"), "a-b--c-d");
+    }
+
+    #[test]
+    fn fallback_repo_key_is_basename_plus_stable_shorthash() {
+        let a = fallback_repo_key(std::path::Path::new("/home/me/projects/aish"));
+        let b = fallback_repo_key(std::path::Path::new("/home/me/projects/aish"));
+        // Stable for the same absolute path.
+        assert_eq!(a, b);
+        assert!(a.starts_with("aish-"), "got: {a}");
+        // A different checkout of the same-named repo gets a distinct key
+        // (collision-safety preserved from the old FNV-of-abspath scheme).
+        let c = fallback_repo_key(std::path::Path::new("/tmp/aish"));
+        assert_ne!(a, c);
+        assert!(c.starts_with("aish-"), "got: {c}");
+    }
+
+    #[test]
+    fn should_sweep_keeps_dirty_or_ahead_reclaims_clean() {
+        // Never reclaim a dirty or commits-ahead worktree — regardless of
+        // orphan/age. This is the data-safety invariant.
+        assert!(!should_sweep(true, false, true, 999, 7));
+        assert!(!should_sweep(false, true, true, 999, 7));
+        assert!(!should_sweep(true, true, false, 0, 7));
+        // Clean + orphaned (registration gone) → reclaim immediately.
+        assert!(should_sweep(false, false, true, 0, 7));
+        // Clean + old enough → reclaim.
+        assert!(should_sweep(false, false, false, 7, 7));
+        assert!(should_sweep(false, false, false, 30, 7));
+        // Clean but young and still registered → keep.
+        assert!(!should_sweep(false, false, false, 6, 7));
+        assert!(!should_sweep(false, false, false, 0, 7));
     }
 
     #[tokio::test]

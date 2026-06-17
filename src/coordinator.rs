@@ -357,11 +357,12 @@ async fn await_batches_with_heartbeat(
 /// rows are cleared, so a second start is a no-op.
 pub fn rehydrate(session: &mut Session) {
     // Best-effort: prune git's record of worktrees whose directories are gone
-    // (e.g. a crashed isolated worker left a dangling registration). Cheap and
-    // safe — `git worktree prune` only drops already-missing entries.
-    // TODO(worktree): also `git worktree remove` empty leftover worktree dirs from
-    // crashed runs (those with a live dir but no commits) — needs a per-dir scan.
+    // (e.g. a crashed isolated worker left a dangling registration), then sweep
+    // the managed worktree root for orphaned/old CLEAN leftovers. Moving off the
+    // OS temp dir (ISS-2046) means the OS no longer GCs these, so aish must — the
+    // sweeper NEVER removes a dirty or commits-ahead worktree (operator's work).
     crate::worker::prune_worktrees(&session.cwd);
+    crate::worker::sweep_worktrees(&session.cwd);
 
     let Some(store) = session.coordinator_store.clone() else {
         return;
