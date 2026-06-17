@@ -318,6 +318,18 @@ pub async fn run(
                     db.record("input", &session.cwd.to_string_lossy(), &line);
                 }
 
+                // Auto-offload: any prompt mentioning "troubleshoot" is pushed
+                // to a background coordinator instead of handled inline.
+                // Troubleshooting is open-ended, parallelizable diagnostic work
+                // that shouldn't tie up the prompt — so it always goes to a
+                // full-tool worker whose result auto-delivers. Skipped only when
+                // already inside a coordinator (no nested coordinators).
+                if mentions_troubleshoot(&line) && !session.nested {
+                    println!();
+                    println!("{}", dispatch_coordinator(&line, &mut session));
+                    continue;
+                }
+
                 // Explicit routing escape hatches: `!cmd` forces direct
                 // execution, `?text` forces the model.
                 let (line, route) = split_route(line);
@@ -1171,6 +1183,58 @@ fn toggle_raw_output(session: &mut Session) {
     }
 }
 
+/// True when a prompt line mentions "troubleshoot" (case-insensitive). Such a
+/// line is auto-offloaded to a background coordinator — open-ended diagnostic
+/// work that shouldn't block the interactive prompt.
+fn mentions_troubleshoot(line: &str) -> bool {
+    line.to_ascii_lowercase().contains("troubleshoot")
+}
+
+/// Launch a background coordinator for `task`, returning the status line to
+/// print. Shared by the `:dispatch` command and the automatic "troubleshoot"
+/// auto-offload so both spawn workers identically (full toolset, shared cwd,
+/// result auto-delivers). Guards: refuses an empty task, refuses to nest inside
+/// a coordinator, and refuses when the active backend has no credential.
+fn dispatch_coordinator(task: &str, session: &mut Session) -> String {
+    let task = task.trim();
+    if task.is_empty() {
+        return "usage: :dispatch <task>   — launch a background coordinator for <task>".to_string();
+    }
+    if session.nested {
+        return "can't dispatch from inside a coordinator (no nested coordinators)".to_string();
+    }
+    let no_credential = match session.backend_kind.as_str() {
+        "grok" => !crate::backend::grok::credential_available(&session.env),
+        _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
+    };
+    if no_credential {
+        return "no credential for the active backend — Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY".to_string();
+    }
+    match std::env::current_exe() {
+        Ok(exe) => {
+            let spec = crate::worker::WorkerSpec {
+                exe,
+                cwd: session.cwd.clone(),
+                backend: session.backend_kind.clone(),
+                model: crate::worker::coordinator_model(&session.backend_kind, &session.batch_model),
+                env: session.env.clone(),
+                // Shared-cwd behavior (no worktree), matching `:dispatch`.
+                isolate: false,
+                base: "main".to_string(),
+                launch_session_id: session.session_id.clone(),
+                launch_session_name: session.name.clone(),
+                show_output: session.show_worker_output.clone(),
+            };
+            let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
+            format!(
+                "\x1b[2mdispatched background coordinator {id} — runs here with the full \
+toolset; result auto-delivers. :workers to check.\x1b[0m"
+            )
+        }
+        Err(e) => format!("can't locate the aish binary to launch the coordinator: {e}"),
+    }
+}
+
 /// Returns true when the REPL should exit.
 async fn handle_colon(
     cmd: &str,
@@ -1384,45 +1448,9 @@ async fn handle_colon(
         Some("dispatch") => {
             // Launch a background coordinator directly, without a model turn —
             // the deterministic equivalent of the model calling run_in_background.
+            // Shares dispatch_coordinator with the "troubleshoot" auto-offload.
             let task = parts.collect::<Vec<_>>().join(" ");
-            let task = task.trim();
-            if task.is_empty() {
-                println!("usage: :dispatch <task>   — launch a background coordinator for <task>");
-            } else if session.nested {
-                println!("can't :dispatch from inside a coordinator (no nested coordinators)");
-            } else if match session.backend_kind.as_str() {
-                "grok" => !crate::backend::grok::credential_available(&session.env),
-                _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
-            } {
-                println!("no credential for the active backend — Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY");
-            } else {
-                match std::env::current_exe() {
-                    Ok(exe) => {
-                        let spec = crate::worker::WorkerSpec {
-                            exe,
-                            cwd: session.cwd.clone(),
-                            backend: session.backend_kind.clone(),
-                            model: crate::worker::coordinator_model(
-                                &session.backend_kind,
-                                &session.batch_model,
-                            ),
-                            env: session.env.clone(),
-                            // `:dispatch` keeps the shared-cwd behavior (no worktree).
-                            isolate: false,
-                            base: "main".to_string(),
-                            launch_session_id: session.session_id.clone(),
-                            launch_session_name: session.name.clone(),
-                            show_output: session.show_worker_output.clone(),
-                        };
-                        let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
-                        println!(
-                            "\x1b[2mdispatched background coordinator {id} — runs here with the full \
-toolset; result auto-delivers. :workers to check.\x1b[0m"
-                        );
-                    }
-                    Err(e) => println!("can't locate the aish binary to launch the coordinator: {e}"),
-                }
-            }
+            println!("{}", dispatch_coordinator(&task, session));
         }
         Some("name") => {
             let rest = parts.collect::<Vec<_>>().join(" ");
@@ -2240,6 +2268,16 @@ mod tests {
         assert!(matches!(split_route("!who is x".into()), (l, Route::Direct) if l == "who is x"));
         assert!(matches!(split_route("?ls".into()), (l, Route::Model) if l == "ls"));
         assert!(matches!(split_route("ls".into()), (l, Route::Auto) if l == "ls"));
+    }
+
+    #[test]
+    fn mentions_troubleshoot_is_case_insensitive_substring() {
+        assert!(mentions_troubleshoot("troubleshoot the build"));
+        assert!(mentions_troubleshoot("please TROUBLESHOOT this"));
+        assert!(mentions_troubleshoot("can you Troubleshoot the flaky test"));
+        assert!(mentions_troubleshoot("auto-troubleshooting the worker")); // substring
+        assert!(!mentions_troubleshoot("trouble with the shooter"));
+        assert!(!mentions_troubleshoot("ls -la"));
     }
 
     // Snapshot of the three pure routing heuristics — `!`/`?` force routing,
