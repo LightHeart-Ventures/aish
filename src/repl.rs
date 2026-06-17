@@ -1405,6 +1405,75 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
     }
 }
 
+/// Queue an operator message for an in-flight background coordinator — the
+/// `:tell` / SendMessage channel. The message lands in the durable
+/// `coordinator_messages` mailbox keyed by the run's id and is folded into the
+/// coordinator's NEXT round (see `coordinator::drive`), so it's how you steer a
+/// running job — add a clarification, correct a wrong assumption, narrow scope —
+/// without killing and re-launching it. `id` is matched exactly or by prefix
+/// against this session's live workers first, then every durable run, so the
+/// short ids shown by `:workers` work. A terminal (finished) run is refused —
+/// nothing would read the message — and an ambiguous prefix lists the matches.
+fn tell_coordinator(id: Option<&str>, message: &str, session: &mut Session) {
+    let Some(id) = id else {
+        println!("usage: :tell <worker-id> <message>   — steer an in-flight coordinator");
+        return;
+    };
+    if message.is_empty() {
+        println!("usage: :tell <worker-id> <message>   — steer an in-flight coordinator");
+        return;
+    }
+    let Some(store) = session.coordinator_store.clone() else {
+        println!("coordinator store unavailable — can't queue messages");
+        return;
+    };
+    let hit = |rid: &str| rid == id || rid.starts_with(id);
+
+    // Candidates: (run_id, terminal?). This session's in-memory workers first —
+    // their run_id is known even before the child has written its store row, so a
+    // message sent immediately after launch still lands — then durable runs from
+    // any session (deduped on run_id).
+    let mut candidates: Vec<(String, bool)> = Vec::new();
+    for w in session.worker_jobs.lock().unwrap().iter() {
+        if hit(&w.id) {
+            candidates.push((w.id.clone(), matches!(w.status().as_str(), "done" | "failed")));
+        }
+    }
+    if let Ok(rows) = store.load_all() {
+        for r in rows {
+            if hit(&r.run_id) && !candidates.iter().any(|(rid, _)| rid == &r.run_id) {
+                candidates.push((r.run_id.clone(), matches!(r.phase.as_str(), "done" | "failed")));
+            }
+        }
+    }
+
+    match candidates.as_slice() {
+        [] => println!("no background coordinator matching '{id}' (see :workers)"),
+        [(run_id, terminal)] => {
+            let short = crate::batch::short_id(run_id);
+            if *terminal {
+                println!("coordinator {short} has already finished — message not queued (`:result {short}` to view its result)");
+                return;
+            }
+            match store.enqueue_message(run_id, message, Some(&session.session_id)) {
+                Ok(_) => {
+                    let pending = store.pending_message_count(run_id).unwrap_or(0);
+                    println!(
+                        "\x1b[2m✉ queued for {short} ({pending} pending) — folded in at the start of its next round\x1b[0m"
+                    );
+                }
+                Err(e) => println!("couldn't queue message: {e}"),
+            }
+        }
+        many => {
+            println!("'{id}' matches {} coordinators — be more specific:", many.len());
+            for (rid, _) in many {
+                println!("  {rid}");
+            }
+        }
+    }
+}
+
 /// Returns true when the REPL should exit.
 async fn handle_colon(
     cmd: &str,
@@ -1443,6 +1512,7 @@ async fn handle_colon(
                  :results                            list finished background jobs (workers + batches)\n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
+                 :tell <id> <message>                send instructions to an in-flight coordinator (folded in next round)\n\
                  :name <name>                        name the session (prefixes the prompt); bare :name clears\n\
                  :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
                                                      a verifier judges each turn. :goal status, :goal clear\n\
@@ -1637,6 +1707,13 @@ async fn handle_colon(
             // Shares dispatch_coordinator with the "troubleshoot" auto-offload.
             let task = parts.collect::<Vec<_>>().join(" ");
             println!("{}", dispatch_coordinator(&task, session));
+        }
+        Some("tell" | "msg" | "send") => {
+            // Steer an in-flight coordinator: queue an operator message that the
+            // running coordinator folds into its next round (see coordinator::drive).
+            let target = parts.next();
+            let message = parts.collect::<Vec<_>>().join(" ");
+            tell_coordinator(target, message.trim(), session);
         }
         Some("name") => {
             let rest = parts.collect::<Vec<_>>().join(" ");

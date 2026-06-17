@@ -24,6 +24,16 @@
 //! `awaiting_batch` — blocked on a spawned Batches job; heartbeats while it polls.
 //! `done` / `failed` — terminal. A `done` row is returned idempotently on resume.
 //!
+//! ## Operator mid-flight messaging (the `:tell` / SendMessage channel)
+//! The interactive session can steer a running coordinator without killing and
+//! re-launching it: `:tell <run-id> <message>` enqueues a row in the durable
+//! `coordinator_messages` mailbox (see `db::CoordinatorStore`). At each round
+//! boundary `drive` drains the mailbox for its `run_id` and folds the messages
+//! into the next turn as an operator interjection, so updated instructions or
+//! clarifications reach the model on its very next round. Delivery is
+//! round-boundary (a message sent mid-turn lands at the next round), and because
+//! the mailbox is durable it survives a restart and works across sessions.
+//!
 //! ## What aish adapts vs. atum
 //! atum injects the agent step + a real Batches client as seams and runs in a
 //! container with an external orchestrator lease. aish has neither: a single
@@ -134,6 +144,44 @@ pub struct Outcome {
     pub rounds: usize,
 }
 
+/// Render queued operator messages as an interjection block prepended to the
+/// next turn's input. The framing tells the model these are updated, supervisory
+/// instructions sent mid-run — they take precedence over earlier assumptions
+/// where they conflict — so a clarification actually redirects the work rather
+/// than being read as stale context. Pure, so it's unit-testable.
+fn format_interjection(messages: &[String]) -> String {
+    let body = messages
+        .iter()
+        .map(|m| format!("- {}", m.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "[Operator interjection — the human supervising this run sent you the message(s) below \
+mid-flight. Treat them as updated instructions/clarifications and fold them into your remaining \
+work; where they conflict with an earlier assumption, the interjection wins:]\n{body}"
+    )
+}
+
+/// Drain any operator messages queued for `run_id` and, when present, fold them
+/// into `next_input` as an interjection (see `format_interjection`). Returns the
+/// count folded so callers can emit a notice. A no-op (returns 0) when there's no
+/// store or nothing queued. Best-effort: a store error is swallowed (the run must
+/// not die because the mailbox read hiccuped).
+fn fold_operator_messages(store: Option<&CoordinatorStore>, run_id: &str, next_input: &mut String) -> usize {
+    let Some(s) = store else {
+        return 0;
+    };
+    let msgs = s.drain_messages(run_id).unwrap_or_default();
+    if msgs.is_empty() {
+        return 0;
+    }
+    let interjection = format_interjection(&msgs);
+    // Prepend so the operator's steer is the first thing the model reads this
+    // round, ahead of the fold-results / task continuation text.
+    *next_input = format!("{interjection}\n\n{next_input}");
+    msgs.len()
+}
+
 /// Drive a coordinator run to a terminal state, persisting phase transitions to
 /// `store` so a restart resumes. This is the headless `--coordinator` body
 /// (called by `engine::run_coordinator`): it runs full-tool agentic rounds and,
@@ -193,6 +241,16 @@ codes, diffs).\n\nTASK:\n{input}",
             return Outcome { phase: Phase::Failed, result: None, error: Some(error), rounds };
         }
 
+        // ── operator messages: fold any `:tell`/SendMessage interjections that
+        // arrived before this round into the upcoming turn. Delivery is
+        // round-boundary — a message sent mid-turn lands on the next round.
+        let folded = fold_operator_messages(store, run_id, &mut next_input);
+        if folded > 0 {
+            // Plain (no 🔧/🗨/📦 sentinel) so the parent's worker stream leaves it
+            // in the failure tail without forwarding or pulsing the prompt badge.
+            eprintln!("✉ folded {folded} operator message(s) into this round");
+        }
+
         // ── coordinating: one full-tool agentic turn ────────────────────────
         if let Some(s) = store {
             let _ = s.set_phase(run_id, Phase::Coordinating.as_str());
@@ -237,7 +295,20 @@ delivered above). Fold them into your work: continue the task, or give the final
             continue;
         }
 
-        // No pending sub-work and the turn produced a text answer → done.
+        // The turn produced a final text answer with no pending sub-work — it
+        // would normally end the run. But an operator message may have landed
+        // DURING this turn; pick it up before finishing so a late clarification
+        // isn't dropped on the floor. When present, continue another round with
+        // the interjection as the input instead of terminating.
+        let mut late_input = String::new();
+        let late = fold_operator_messages(store, run_id, &mut late_input);
+        if late > 0 {
+            eprintln!("✉ {late} operator message(s) arrived during the turn; continuing");
+            next_input = late_input;
+            continue;
+        }
+
+        // No pending sub-work, no pending messages → done.
         if let Some(s) = store {
             let _ = s.set_done(run_id, &answer);
         }
@@ -335,7 +406,8 @@ pub fn rehydrate(session: &mut Session) {
         }
     }
     // Drop terminal rows (the just-surfaced done runs and any failed/reaped ones)
-    // so the store doesn't grow without bound and a restart stays a no-op.
+    // so the store doesn't grow without bound and a restart stays a no-op. This
+    // also purges any orphaned mailbox messages (see CoordinatorStore::clear_finished).
     let _ = store.clear_finished();
     if surfaced > 0 || reaped > 0 {
         eprintln!(
@@ -461,6 +533,57 @@ mod tests {
         assert!(!Phase::AwaitingBatch.is_terminal() && Phase::AwaitingBatch.is_resumable());
         assert!(Phase::Done.is_terminal() && !Phase::Done.is_resumable());
         assert!(Phase::Failed.is_terminal() && !Phase::Failed.is_resumable());
+    }
+
+    #[test]
+    fn format_interjection_frames_messages_as_supervisory() {
+        let block = format_interjection(&[
+            "focus on the auth module first".to_string(),
+            "  skip the e2e tests  ".to_string(),
+        ]);
+        // The framing names it an operator interjection and asserts precedence.
+        assert!(block.contains("Operator interjection"));
+        assert!(block.contains("the interjection wins"));
+        // Each message is a trimmed bullet, in order.
+        assert!(block.contains("- focus on the auth module first"));
+        assert!(block.contains("- skip the e2e tests"));
+        let auth = block.find("auth module").unwrap();
+        let e2e = block.find("e2e tests").unwrap();
+        assert!(auth < e2e, "messages must keep send order");
+    }
+
+    #[test]
+    fn fold_operator_messages_prepends_and_drains() {
+        let path = std::env::temp_dir().join(format!("aish_fold_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+        store.insert("run_x", "do the thing", "sess", None).unwrap();
+
+        // No messages → no-op, input unchanged.
+        let mut input = "continue the task".to_string();
+        assert_eq!(fold_operator_messages(Some(&store), "run_x", &mut input), 0);
+        assert_eq!(input, "continue the task");
+
+        // One message → folded, prepended ahead of the existing input, drained.
+        store.enqueue_message("run_x", "use the staging DB", None).unwrap();
+        let mut input = "continue the task".to_string();
+        let n = fold_operator_messages(Some(&store), "run_x", &mut input);
+        assert_eq!(n, 1);
+        assert!(input.contains("use the staging DB"));
+        assert!(input.trim_end().ends_with("continue the task"), "original input kept after the interjection");
+        let interj = input.find("Operator interjection").unwrap();
+        let cont = input.find("continue the task").unwrap();
+        assert!(interj < cont, "interjection is prepended");
+        // Delete-on-read: a second fold sees nothing.
+        let mut input2 = "next".to_string();
+        assert_eq!(fold_operator_messages(Some(&store), "run_x", &mut input2), 0);
+        assert_eq!(input2, "next");
+
+        // No store → no-op.
+        let mut input3 = "x".to_string();
+        assert_eq!(fold_operator_messages(None, "run_x", &mut input3), 0);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
