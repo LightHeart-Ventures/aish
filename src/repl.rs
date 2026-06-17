@@ -431,7 +431,7 @@ struct AishHelper {
 }
 
 /// Builtins aish handles itself — always offered as command-name completions.
-const BUILTINS: &[&str] = &["cd", "exit", "logout"];
+const BUILTINS: &[&str] = &["cd", "exit", "logout", "jobs", "fg", "bg", "wait"];
 
 /// How long a PATH scan stays cached before it's re-scanned (picks up newly
 /// installed binaries without re-statting every PATH dir on each TAB).
@@ -1084,6 +1084,22 @@ async fn dispatch(
             builtin_cd(words.get(1).map(String::as_str), session, prev_dir);
             Dispatch::Handled
         }
+        "jobs" => {
+            builtin_jobs(session);
+            Dispatch::Handled
+        }
+        "bg" => {
+            builtin_bg(words.get(1).map(String::as_str), session);
+            Dispatch::Handled
+        }
+        "fg" => {
+            builtin_fg(words.get(1).map(String::as_str), session).await;
+            Dispatch::Handled
+        }
+        "wait" => {
+            builtin_wait(words.get(1).map(String::as_str), session).await;
+            Dispatch::Handled
+        }
         cmd => {
             // Resolve against the session's PATH — which includes any
             // `export PATH="$PATH:…"` from ~/.aishrc — falling back to the
@@ -1140,6 +1156,156 @@ fn builtin_cd(arg: Option<&str>, session: &mut Session, prev: &mut Option<PathBu
         Ok(c) => eprintln!("cd: {}: not a directory", c.display()),
         Err(e) => eprintln!("cd: {}: {e}", target.display()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Job-control builtins — jobs / fg / bg / wait (TASK-122 / S3.5)
+// ---------------------------------------------------------------------------
+//
+// These operate on the unified job table (src/jobs.rs): `jobs` lists, `bg`/`fg`
+// resume a stopped job (SIGCONT to its process group), and `fg`/`wait` block on
+// a job until it terminates. Job selection and listing live in `jobs.rs` (pure,
+// unit-tested); the SIGCONT signalling lives in `tools::resume_job`; this layer
+// is the dispatch glue plus the foreground/`wait` blocking.
+
+/// Parse an optional `%n`/`n`/`%%` operand and resolve it to a job. `None`
+/// selects the current job. The error string is surfaced as `<cmd>: <error>`.
+fn select_job(arg: Option<&str>, session: &Session) -> Result<Arc<tools::Job>, String> {
+    let spec = match arg {
+        None => None,
+        Some(tok) => {
+            Some(crate::jobs::JobSpec::parse(tok).ok_or_else(|| format!("{tok}: no such job"))?)
+        }
+    };
+    let table = session.jobs.lock().unwrap();
+    crate::jobs::resolve_job(&table, spec)
+}
+
+/// `jobs` — list every tracked job and its state. Shares its formatting with the
+/// `:jobs` meta-command via [`crate::jobs::format_listing`].
+fn builtin_jobs(session: &mut Session) {
+    let lines = {
+        let table = session.jobs.lock().unwrap();
+        crate::jobs::format_listing(&table)
+    };
+    if lines.is_empty() {
+        println!("no jobs");
+    }
+    for line in &lines {
+        println!("{line}");
+    }
+    session.last_status = 0;
+}
+
+/// `bg [job]` — resume a stopped job in the background (POSIX `bg`): SIGCONT it
+/// and let it keep running detached. A job that is already running or has
+/// finished is reported without re-signalling, matching bash.
+fn builtin_bg(arg: Option<&str>, session: &mut Session) {
+    match select_job(arg, session) {
+        Err(msg) => {
+            eprintln!("bg: {msg}");
+            session.last_status = 1;
+        }
+        Ok(job) if job.is_done() => {
+            eprintln!("bg: job {} has terminated ({})", job.id, job.status());
+            session.last_status = 1;
+        }
+        Ok(job) if job.is_stopped() => {
+            tools::resume_job(&job);
+            println!("[{}] {} &", job.id, job.desc);
+            session.last_status = 0;
+        }
+        Ok(job) => {
+            // Already running in the background — bash treats this as a no-op (exit 0).
+            eprintln!("bg: job {} already in background", job.id);
+            session.last_status = 0;
+        }
+    }
+}
+
+/// `fg [job]` — bring a job to the foreground (POSIX `fg`): SIGCONT it if it was
+/// stopped, then block until it finishes. The job's output already streams to
+/// the terminal and its stdin is `/dev/null`, so "foreground" here means the
+/// prompt waits on the job — there is no terminal hand-off to perform.
+async fn builtin_fg(arg: Option<&str>, session: &mut Session) {
+    let job = match select_job(arg, session) {
+        Err(msg) => {
+            eprintln!("fg: {msg}");
+            session.last_status = 1;
+            return;
+        }
+        Ok(job) => job,
+    };
+    if job.is_done() {
+        eprintln!("fg: job {} has terminated ({})", job.id, job.status());
+        session.last_status = 1;
+        return;
+    }
+    println!("{}", job.desc);
+    if job.is_stopped() {
+        tools::resume_job(&job);
+    }
+    let summary = await_job(&job).await;
+    session.last_status = job_exit_code(&summary);
+}
+
+/// `wait [job]` — wait for jobs to terminate (POSIX `wait`). With an operand,
+/// waits for that job; with none, waits for every active job. A stopped job will
+/// never terminate on its own, so — like bash with job control — `wait` returns
+/// immediately for one, reporting `128 + SIGTSTP`.
+async fn builtin_wait(arg: Option<&str>, session: &mut Session) {
+    match arg {
+        Some(tok) => {
+            let job = match select_job(Some(tok), session) {
+                Err(msg) => {
+                    eprintln!("wait: {msg}");
+                    session.last_status = 1;
+                    return;
+                }
+                Ok(job) => job,
+            };
+            if job.is_stopped() {
+                session.last_status = 128 + libc::SIGTSTP;
+                return;
+            }
+            let summary = await_job(&job).await;
+            session.last_status = job_exit_code(&summary);
+        }
+        None => {
+            // Snapshot the active (not done, not stopped) jobs, then block on each.
+            let active: Vec<Arc<tools::Job>> = {
+                let table = session.jobs.lock().unwrap();
+                table.iter().filter(|j| !j.is_done() && !j.is_stopped()).cloned().collect()
+            };
+            for job in &active {
+                await_job(job).await;
+            }
+            session.last_status = 0;
+        }
+    }
+}
+
+/// Block until `job` reaches its terminal state, returning its exit summary.
+/// Polls the shared job state — the background waiter (see
+/// `tools::spawn_background`) flips it to `Done`; the job's output streams to the
+/// terminal independently, so there is nothing to forward here.
+async fn await_job(job: &Arc<tools::Job>) -> String {
+    loop {
+        if job.is_done() {
+            return job.status();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Map a job's terminal summary (`"exited N"`, `"killed"`, …; produced by
+/// `tools::spawn_background`'s waiter) to a `$?` value the way a POSIX shell
+/// would: the child's exit code when it exited cleanly, else non-zero.
+fn job_exit_code(summary: &str) -> i32 {
+    summary
+        .strip_prefix("exited ")
+        .and_then(|n| n.trim().parse::<i32>().ok())
+        .unwrap_or(1)
 }
 
 /// PATH lookup with the executable bit checked — `which`, basically.
@@ -1292,8 +1458,8 @@ async fn handle_colon(
             if jobs.is_empty() {
                 println!("no background jobs");
             }
-            for j in jobs.iter() {
-                println!("[{}] {} — {}", j.id, j.status(), j.desc);
+            for line in &crate::jobs::format_listing(&jobs) {
+                println!("{line}");
             }
         }
         Some("kill") => match parts.next().and_then(|s| s.parse::<usize>().ok()) {
@@ -2246,7 +2412,27 @@ mod tests {
         assert_eq!(pv("what is the capital of texas"), Preview::Model); // prose
         assert_eq!(pv("definitelynotacommand"), Preview::Model); // unresolvable lead word
 
+        // TASK-122 job-control builtins route directly (they're in BUILTINS), so
+        // they never leak to the model. `wait` is also an everyday English word
+        // (in AMBIGUOUS_COMMANDS), so it previews dim — still dispatched direct.
+        assert_eq!(pv("jobs"), Preview::Direct);
+        assert_eq!(pv("fg"), Preview::Direct);
+        assert_eq!(pv("fg %1"), Preview::Direct);
+        assert_eq!(pv("bg %2"), Preview::Direct);
+        assert_eq!(pv("wait"), Preview::Ambiguous);
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // TASK-122 — `$?` mapping from a job's terminal summary (POSIX fg/wait).
+    #[test]
+    fn job_exit_code_maps_summary_to_status() {
+        assert_eq!(job_exit_code("exited 0"), 0);
+        assert_eq!(job_exit_code("exited 1"), 1);
+        assert_eq!(job_exit_code("exited 137"), 137);
+        // A signalled / unknown summary is non-zero, as a shell reports it.
+        assert_eq!(job_exit_code("killed"), 1);
+        assert_eq!(job_exit_code("wait failed: boom"), 1);
     }
 
     #[test]

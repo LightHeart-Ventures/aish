@@ -173,6 +173,73 @@ impl Job {
     }
 }
 
+/// A POSIX job specifier as accepted by `jobs` / `fg` / `bg` / `wait`: either a
+/// concrete job id (`%n` or a bare `n`) or the current job (`%%` / `%+`, also
+/// the default when the operand is omitted).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobSpec {
+    /// The current job — `%%`, `%+`, or no operand at all.
+    Current,
+    /// A specific job id — `%n` or a bare `n`.
+    Id(usize),
+}
+
+impl JobSpec {
+    /// Parse one job-control operand. `%%`/`%+` select the current job; `%n` and
+    /// a bare `n` select job `n`. Returns `None` for anything that isn't a valid
+    /// specifier (so callers can report "no such job").
+    pub fn parse(token: &str) -> Option<JobSpec> {
+        match token {
+            "%%" | "%+" => Some(JobSpec::Current),
+            _ => token
+                .strip_prefix('%')
+                .unwrap_or(token)
+                .parse::<usize>()
+                .ok()
+                .map(JobSpec::Id),
+        }
+    }
+}
+
+/// The "current job" (`%%`): the most recently added job that is still active.
+/// A stopped job is preferred over a running one (matching the POSIX shells'
+/// rule that the most recently stopped job is current); terminated jobs are
+/// skipped. `None` when there is no active job.
+pub fn current_job(table: &[Arc<Job>]) -> Option<Arc<Job>> {
+    table
+        .iter()
+        .rev()
+        .find(|j| j.is_stopped())
+        .or_else(|| table.iter().rev().find(|j| !j.is_done()))
+        .cloned()
+}
+
+/// Resolve a job specifier against the table. `None` (no operand) selects the
+/// current job. Returns a human-readable error string on no match, which the
+/// builtins surface as `<cmd>: <error>` and a non-zero `$?` (POSIX).
+pub fn resolve_job(table: &[Arc<Job>], spec: Option<JobSpec>) -> Result<Arc<Job>, String> {
+    match spec {
+        None | Some(JobSpec::Current) => {
+            current_job(table).ok_or_else(|| "no current job".to_string())
+        }
+        Some(JobSpec::Id(id)) => table
+            .iter()
+            .find(|j| j.id == id)
+            .cloned()
+            .ok_or_else(|| format!("no such job: {id}")),
+    }
+}
+
+/// Render the job table the way `jobs` (and the `:jobs` meta-command) list it:
+/// one `[id] <state> — <desc>` line per job, in table order. Empty when there
+/// are no jobs. The single source of truth for both listing call sites.
+pub fn format_listing(table: &[Arc<Job>]) -> Vec<String> {
+    table
+        .iter()
+        .map(|j| format!("[{}] {} — {}", j.id, j.status(), j.desc))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +333,69 @@ mod tests {
     fn foreground_has_no_kill_channel() {
         let fg = Job::foreground(1, "ls".into());
         assert!(!fg.kill());
+    }
+
+    // ── TASK-122: jobs / fg / bg / wait job selection + listing ──────────────
+
+    #[test]
+    fn job_spec_parses_posix_operands() {
+        assert_eq!(JobSpec::parse("%%"), Some(JobSpec::Current));
+        assert_eq!(JobSpec::parse("%+"), Some(JobSpec::Current));
+        assert_eq!(JobSpec::parse("%1"), Some(JobSpec::Id(1)));
+        assert_eq!(JobSpec::parse("3"), Some(JobSpec::Id(3)));
+        // Not specifiers.
+        assert_eq!(JobSpec::parse("%x"), None);
+        assert_eq!(JobSpec::parse("foo"), None);
+        assert_eq!(JobSpec::parse(""), None);
+    }
+
+    // AC ac_ea23cef2b000 — selecting the current job picks a stopped job over a
+    // running one, and skips terminated jobs (POSIX "current job" rule).
+    #[test]
+    fn current_job_prefers_stopped_then_most_recent_active() {
+        let table: Vec<Arc<Job>> = vec![
+            Job::background(1, "running-old".into()).0,
+            Job::background(2, "running-new".into()).0,
+        ];
+        // No stopped job → most recently added active job is current.
+        assert_eq!(current_job(&table).unwrap().id, 2);
+
+        // Stop the older job → it becomes current despite being added first.
+        table[0].stop();
+        assert_eq!(current_job(&table).unwrap().id, 1);
+
+        // A finished job is never current.
+        let done: Vec<Arc<Job>> = vec![Job::background(5, "done".into()).0];
+        done[0].finish("exited 0");
+        assert!(current_job(&done).is_none());
+    }
+
+    // AC ac_ea23cef2b000 — `%n` / bare id resolve to that job; an unknown id or
+    // an empty table is a reportable error (non-zero `$?` in the builtins).
+    #[test]
+    fn resolve_job_by_id_default_and_errors() {
+        let running = Job::background(1, "running".into()).0;
+        let stopped = Job::background(2, "stopped".into()).0;
+        stopped.stop();
+        let table = vec![running, stopped];
+
+        assert_eq!(resolve_job(&table, Some(JobSpec::Id(1))).unwrap().id, 1);
+        // Default (no operand) is the current job — the stopped one here.
+        assert_eq!(resolve_job(&table, None).unwrap().id, 2);
+        assert!(resolve_job(&table, Some(JobSpec::Id(99))).is_err());
+        assert!(resolve_job(&[], None).is_err());
+    }
+
+    // AC ac_ea23cef2b000 — `jobs` lists a running and a stopped job with their
+    // POSIX state labels, shared verbatim with the `:jobs` meta-command.
+    #[test]
+    fn format_listing_shows_running_and_stopped_state() {
+        let running = Job::background(1, "tail -f log".into()).0;
+        let stopped = Job::background(2, "sleep 100".into()).0;
+        stopped.stop();
+        let lines = format_listing(&[running, stopped]);
+        assert_eq!(lines[0], "[1] running — tail -f log");
+        assert_eq!(lines[1], "[2] stopped — sleep 100");
+        assert!(format_listing(&[]).is_empty());
     }
 }
