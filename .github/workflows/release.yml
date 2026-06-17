@@ -1,0 +1,149 @@
+name: Release
+
+# Triggered by pushing a semver tag (v0.4.0, v0.4.1, …). Builds release binaries
+# for every supported target, generates a SHA256 checksum next to each, and
+# publishes a GitHub Release with all artifacts attached. The `:update` command
+# (src/update.rs) consumes exactly these assets: it matches the per-platform
+# binary name and verifies it against the sibling `.sha256`.
+on:
+  push:
+    tags:
+      - "v*"
+
+# Need write access to create the release + upload assets.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: aish-x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: aish-aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: aish-x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: aish-x86_64-pc-windows-msvc.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+        shell: bash
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # --no-default-features drops the in-process local model (mistralrs), which
+      # is huge, slow to build, and not needed for the distributed binary. The
+      # released aish is the fast Claude/Grok build; users who want local
+      # inference build from source with `--features local`.
+      - name: Build release binary
+        run: cargo build --release --no-default-features --target ${{ matrix.target }}
+        shell: bash
+
+      # Stage the binary under its per-platform asset name and emit a SHA256
+      # sidecar (`<asset>.sha256`). The checksum file is the bare hex digest plus
+      # the filename — the format `shasum -c` / `sha256sum -c` expect, and what
+      # src/update.rs parses (first whitespace-delimited token = hex digest).
+      - name: Package binary + checksum (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/aish" "dist/${{ matrix.asset }}"
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+          cat "${{ matrix.asset }}.sha256"
+        shell: bash
+
+      - name: Package binary + checksum (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/aish.exe" "dist/${{ matrix.asset }}"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/${{ matrix.asset }}").Hash.ToLower()
+          # Match the `sha256sum`/`shasum` two-space text format so the checksum
+          # parser in src/update.rs reads the same first-token-is-digest shape.
+          "$hash  ${{ matrix.asset }}" | Out-File -Encoding ascii -NoNewline "dist/${{ matrix.asset }}.sha256"
+          Get-Content "dist/${{ matrix.asset }}.sha256"
+        shell: pwsh
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # download-artifact nests each artifact under its own directory; flatten
+      # them into one dir so every binary + checksum is a release asset.
+      - name: Flatten artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name 'aish-*' \) -exec cp {} dist/ \;
+          echo "Release assets:"
+          ls -l dist
+          echo
+          echo "Aggregated checksums:"
+          cat dist/*.sha256
+
+      # A single SHA256SUMS roll-up alongside the per-file sidecars — convenient
+      # for `sha256sum -c SHA256SUMS` and for humans eyeballing the release.
+      - name: Aggregate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: aish ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/aish-*
+            dist/SHA256SUMS
