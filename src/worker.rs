@@ -822,6 +822,29 @@ impl WorkerJob {
             other => format!("worker {} is still running (status: {other}).", self.id),
         }
     }
+    /// One-line result summary for table cells — mirrors `format_result` in tools.rs.
+    /// Running jobs return `"—"`; done jobs show `"✓ success"` (or `"✓ #NN"` when
+    /// the result text contains a PR reference); failed jobs show `"✗ <reason>"`
+    /// truncated to ~40 chars so the table stays readable.
+    pub fn result_cell(&self) -> String {
+        let i = self.inner.lock().unwrap();
+        match i.status.as_str() {
+            "done" => {
+                let r = i.result.as_deref().unwrap_or("");
+                if let Some(pr) = r.split_whitespace().find(|s| s.starts_with('#')) {
+                    format!("✓ {pr}")
+                } else {
+                    "✓ success".to_string()
+                }
+            }
+            "failed" => {
+                let e = i.error.as_deref().unwrap_or("unknown error");
+                let truncated = if e.len() > 40 { format!("{}…", &e[..40]) } else { e.to_string() };
+                format!("✗ {truncated}")
+            }
+            _ => "—".to_string(),
+        }
+    }
 }
 
 /// Register a new background worker and start its run task. Returns the
