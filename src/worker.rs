@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
+use uuid::Uuid;
 
 /// How long a worker may run before it's killed. Generous — these are deferred,
 /// possibly-long jobs — but bounded so a wedged child can't live forever.
@@ -852,13 +853,9 @@ impl WorkerJob {
 /// self-contained.
 pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
     let mut guard = jobs.lock().unwrap();
-    let n = guard
-        .iter()
-        .filter_map(|j| j.id.strip_prefix("worker_").and_then(|s| s.parse::<usize>().ok()))
-        .max()
-        .unwrap_or(0)
-        + 1;
-    let id = format!("worker_{n}");
+    // UUID-based id — globally unique, so workers from different sessions/repos
+    // never collide or mix in `:workers` listings or the coordinator store.
+    let id = format!("worker_{}", Uuid::new_v4().simple());
     let job = Arc::new(WorkerJob {
         id: id.clone(),
         task: task.clone(),
@@ -1162,34 +1159,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spawn_assigns_incrementing_ids() {
-        let jobs: WorkerJobs = Default::default();
-        let mk = |jobs: &WorkerJobs, id: usize| {
-            jobs.lock().unwrap().push(Arc::new(WorkerJob {
-                id: format!("worker_{id}"),
-                task: "t".into(),
-                inner: Mutex::new(JobInner {
-                    status: "running".into(),
-                    result: None,
-                    error: None,
-                    displayed: false,
-                    branch: None,
-                    last_tool_outcome: None,
-                    last_turn_completion: None,
-                }),
-            }));
-        };
-        mk(&jobs, 1);
-        mk(&jobs, 2);
-        let next = jobs
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|j| j.id.strip_prefix("worker_").and_then(|s| s.parse::<usize>().ok()))
-            .max()
-            .unwrap_or(0)
-            + 1;
-        assert_eq!(next, 3);
+    fn spawn_assigns_unique_ids() {
+        // IDs are now UUID-based — globally unique, never collide across sessions.
+        let id1 = format!("worker_{}", uuid::Uuid::new_v4().simple());
+        let id2 = format!("worker_{}", uuid::Uuid::new_v4().simple());
+        assert!(id1.starts_with("worker_"));
+        assert!(id2.starts_with("worker_"));
+        assert_ne!(id1, id2);
     }
 
     #[test]
