@@ -5,6 +5,13 @@ name: Release
 # publishes a GitHub Release with all artifacts attached. The `:update` command
 # (src/update.rs) consumes exactly these assets: it matches the per-platform
 # binary name and verifies it against the sibling `.sha256`.
+#
+# Targets are macOS (x86_64 + arm64) and Linux (x86_64) only. aish is Unix-only
+# by design — it relies on POSIX process groups (setpgid, kill(-pgid)), signals
+# (SIGKILL/SIGCONT, WIFEXITED), and pre_exec, none of which map onto Windows — so
+# the source does not compile for *-pc-windows-msvc. This matches src/update.rs,
+# whose target_triples() only ever resolves linux/macos assets (a Windows host
+# gets none), so a Windows release artifact would be unreachable by `:update`.
 on:
   push:
     tags:
@@ -35,9 +42,6 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset: aish-x86_64-unknown-linux-gnu
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            asset: aish-x86_64-pc-windows-msvc.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -69,8 +73,7 @@ jobs:
       # sidecar (`<asset>.sha256`). The checksum file is the bare hex digest plus
       # the filename — the format `shasum -c` / `sha256sum -c` expect, and what
       # src/update.rs parses (first whitespace-delimited token = hex digest).
-      - name: Package binary + checksum (Unix)
-        if: runner.os != 'Windows'
+      - name: Package binary + checksum
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -83,18 +86,6 @@ jobs:
           fi
           cat "${{ matrix.asset }}.sha256"
         shell: bash
-
-      - name: Package binary + checksum (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/aish.exe" "dist/${{ matrix.asset }}"
-          $hash = (Get-FileHash -Algorithm SHA256 "dist/${{ matrix.asset }}").Hash.ToLower()
-          # Match the `sha256sum`/`shasum` two-space text format so the checksum
-          # parser in src/update.rs reads the same first-token-is-digest shape.
-          "$hash  ${{ matrix.asset }}" | Out-File -Encoding ascii -NoNewline "dist/${{ matrix.asset }}.sha256"
-          Get-Content "dist/${{ matrix.asset }}.sha256"
-        shell: pwsh
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
