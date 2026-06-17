@@ -2,12 +2,18 @@
 //!
 //! aish ships as a single binary, so "upgrade" means: find the newest published
 //! GitHub release, and — if it's newer than the running build and carries an
-//! asset for this platform — download that asset, unpack the `aish` binary, and
+//! asset for this platform — download that asset, extract the `aish` binary, and
 //! atomically swap it over the running executable. All release I/O goes through
 //! the `gh` CLI (the task's "gh release function"): `gh release view` to
-//! discover the latest tag + assets, `gh release download` to fetch the tarball.
+//! discover the latest tag + assets, `gh release download` to fetch the asset.
 //! Using `gh` means we inherit the user's existing GitHub auth and never have to
 //! hold a token ourselves.
+//!
+//! Asset format: the release workflow publishes the per-platform binary as a
+//! RAW executable (`aish-<triple>`), not an archive. For resilience the updater
+//! also accepts a gzip tarball (`*.tar.gz` / `*.tgz` / `*.tar`) and extracts the
+//! `aish` binary from it — so older or differently-packaged releases keep
+//! working. The packaging form is decided by the asset's filename extension.
 //!
 //! The check is best-effort and SILENT on failure: no `gh`, no network, no
 //! releases, or no matching asset all resolve to "no update available" with no
@@ -41,7 +47,8 @@ pub struct UpdateInfo {
     pub tag: String,
     /// Normalized numeric version (e.g. `0.4.1`).
     pub version: String,
-    /// The release asset that matches this platform (a `.tar.gz`).
+    /// The release asset that matches this platform — either a raw binary
+    /// (`aish-<triple>`) or a gzip tarball (`*.tar.gz`).
     pub asset_name: String,
 }
 
@@ -59,7 +66,7 @@ struct GhRelease {
 }
 
 /// Rust target triples whose release asset would run on this host, most-preferred
-/// first. Asset names embed the triple (e.g.
+/// first. Asset names embed the triple (e.g. `aish-x86_64-unknown-linux-gnu` or
 /// `aish-v0.3.0-x86_64-unknown-linux-gnu.tar.gz`), so we match on substring.
 /// An empty list means "unknown platform" → we won't claim any asset fits.
 fn target_triples() -> &'static [&'static str] {
@@ -72,12 +79,24 @@ fn target_triples() -> &'static [&'static str] {
     }
 }
 
+/// True when an asset filename names a gzip tarball we should run through `tar`.
+/// Anything else (notably the raw `aish-<triple>` binary) is treated as the
+/// `aish` executable directly.
+fn is_tarball(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.ends_with(".tar.gz") || n.ends_with(".tgz") || n.ends_with(".tar")
+}
+
 /// Pick the asset matching this platform from a release's asset list. Prefers
 /// triples in `target_triples()` order; returns the first asset whose name
-/// contains a matching triple.
+/// contains a matching triple. Checksum sidecars (`*.sha256`) are skipped so we
+/// never mistake `aish-<triple>.sha256` for the binary itself.
 fn match_asset<'a>(assets: &'a [GhAsset]) -> Option<&'a str> {
     for triple in target_triples() {
-        if let Some(a) = assets.iter().find(|a| a.name.contains(triple)) {
+        if let Some(a) = assets
+            .iter()
+            .find(|a| a.name.contains(triple) && !a.name.ends_with(".sha256"))
+        {
             return Some(&a.name);
         }
     }
@@ -166,7 +185,7 @@ pub async fn check() -> Result<Option<UpdateInfo>> {
     }))
 }
 
-/// Download the release asset, unpack the `aish` binary, and atomically replace
+/// Download the release asset, extract the `aish` binary, and atomically replace
 /// the running executable. Prints brief progress to stdout. On macOS the freshly
 /// installed binary is re-signed with an ad-hoc signature (matching the Makefile)
 /// so AMFI doesn't SIGKILL it on next launch.
@@ -215,25 +234,43 @@ pub async fn perform(info: &UpdateInfo) -> Result<()> {
         );
     }
 
-    let archive = work.join(&info.asset_name);
-    if !archive.exists() {
+    let downloaded = work.join(&info.asset_name);
+    if !downloaded.exists() {
         let _ = std::fs::remove_dir_all(&work);
-        bail!("downloaded asset not found at {}", archive.display());
+        bail!("downloaded asset not found at {}", downloaded.display());
     }
 
-    println!("\x1b[2munpacking …\x1b[0m");
-    let untar = tokio::process::Command::new("tar")
-        .args(["-xzf", &archive.to_string_lossy(), "-C", &work.to_string_lossy()])
-        .output()
-        .await
-        .context("running tar to unpack the release")?;
-    if !untar.status.success() {
-        let _ = std::fs::remove_dir_all(&work);
-        bail!("tar failed: {}", String::from_utf8_lossy(&untar.stderr).trim());
-    }
-
-    let new_bin = find_binary(&work, "aish")
-        .ok_or_else(|| anyhow!("no `aish` binary found inside {}", info.asset_name))?;
+    // The release ships the platform binary either as a raw executable
+    // (`aish-<triple>`, the current format) or — for resilience against older /
+    // differently-packaged releases — as a gzip tarball. Decide which by the
+    // asset's filename extension and pull out the `aish` binary accordingly.
+    let new_bin = if is_tarball(&info.asset_name) {
+        println!("\x1b[2munpacking …\x1b[0m");
+        let untar = tokio::process::Command::new("tar")
+            .args([
+                "-xzf",
+                &downloaded.to_string_lossy(),
+                "-C",
+                &work.to_string_lossy(),
+            ])
+            .output()
+            .await
+            .context("running tar to unpack the release")?;
+        if !untar.status.success() {
+            let _ = std::fs::remove_dir_all(&work);
+            bail!("tar failed: {}", String::from_utf8_lossy(&untar.stderr).trim());
+        }
+        match find_binary(&work, "aish") {
+            Some(p) => p,
+            None => {
+                let _ = std::fs::remove_dir_all(&work);
+                bail!("no `aish` binary found inside {}", info.asset_name);
+            }
+        }
+    } else {
+        // Raw binary asset — the downloaded file *is* the new aish.
+        downloaded.clone()
+    };
 
     // Stage the new binary alongside the destination (same filesystem, so the
     // final rename is atomic), make it executable, then re-sign on macOS.
@@ -345,6 +382,47 @@ mod tests {
         } else {
             assert!(target_triples().is_empty());
         }
+    }
+
+    #[test]
+    fn matches_raw_binary_assets() {
+        // The current release format: raw per-platform binaries with no
+        // extension, each accompanied by a `.sha256` sidecar.
+        let assets = vec![
+            GhAsset { name: "aish-x86_64-unknown-linux-gnu".into() },
+            GhAsset { name: "aish-x86_64-unknown-linux-gnu.sha256".into() },
+            GhAsset { name: "aish-aarch64-apple-darwin".into() },
+            GhAsset { name: "aish-aarch64-apple-darwin.sha256".into() },
+            GhAsset { name: "aish-x86_64-apple-darwin".into() },
+            GhAsset { name: "aish-x86_64-apple-darwin.sha256".into() },
+            GhAsset { name: "SHA256SUMS".into() },
+        ];
+        if let Some(name) = match_asset(&assets) {
+            // Never pick a checksum sidecar, always a real per-platform binary.
+            assert!(!name.ends_with(".sha256"));
+            assert!(target_triples().iter().any(|t| name.contains(t)));
+        } else {
+            assert!(target_triples().is_empty());
+        }
+    }
+
+    #[test]
+    fn never_matches_a_checksum_sidecar() {
+        // A sidecar present without its binary must NOT be selected.
+        let assets = vec![GhAsset {
+            name: "aish-aarch64-apple-darwin.sha256".into(),
+        }];
+        assert!(match_asset(&assets).is_none());
+    }
+
+    #[test]
+    fn tarball_detection() {
+        assert!(is_tarball("aish-v0.3.0-x86_64-apple-darwin.tar.gz"));
+        assert!(is_tarball("aish.TGZ"));
+        assert!(is_tarball("bundle.tar"));
+        // Raw binaries and checksum sidecars are not tarballs.
+        assert!(!is_tarball("aish-aarch64-apple-darwin"));
+        assert!(!is_tarball("aish-aarch64-apple-darwin.sha256"));
     }
 
     #[test]
