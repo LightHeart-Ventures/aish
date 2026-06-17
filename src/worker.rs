@@ -114,14 +114,26 @@ const STDERR_TAIL_LINES: usize = 20;
 /// Decide whether a single raw coordinator-stderr line is worth forwarding to
 /// the user's terminal, and if so return the cleaned text to forward.
 ///
-/// The coordinator runs non-TTY, so its tool-activity lines are static and
-/// escape-light: `"\x1b[2m  🔧 git status\x1b[0m"`. We forward only the lines
-/// that show tool activity (those containing `🔧`) so the goal stream isn't
-/// noisy — the "coordinator run … starting" banner and blank lines are dropped.
-/// Cleaning strips leading whitespace and the dim `\x1b[2m…\x1b[0m` wrapper, so
-/// `announce` (which re-wraps in dim) doesn't double-wrap.
+/// The coordinator runs non-TTY, so a tool emits TWO static lines per call (see
+/// `engine::ToolSpinner`): a bare `🔧 <desc>` START line at `start`, then a
+/// `✓/✗ 🔧 <desc>` RESULT line at `finish` (the latter is what `classify_event`
+/// reads to drive the prompt-badge pulse). Forwarding BOTH made every tool call
+/// appear TWICE in the `:worker-output` stream — the duplicate tool-call logging
+/// bug. We now forward ONLY the RESULT line (the one carrying the `✓/✗` outcome)
+/// so each tool call is logged exactly once; the bare START line is dropped here
+/// (the badge pulse still fires from the RESULT line in `stream_stderr`,
+/// independent of this gate). The "coordinator run … starting" banner and blank
+/// lines carry no wrench and are dropped too. Cleaning strips leading whitespace
+/// and the outer dim `\x1b[2m…\x1b[0m` wrapper, so `announce` (which re-wraps in
+/// dim) doesn't double-wrap.
 fn clean_activity_line(raw: &str) -> Option<String> {
     if !raw.contains('🔧') && !raw.contains('⚙') {
+        return None;
+    }
+    // Forward only the RESULT line (it carries the ✓/✗ outcome). The bare START
+    // line — a wrench with no status glyph — is the tool *beginning*; forwarding
+    // it as well is exactly the duplicate. Drop it.
+    if !raw.contains('✓') && !raw.contains('✗') {
         return None;
     }
     let mut s = raw.trim();
@@ -155,7 +167,7 @@ fn strip_sentinel(raw: &str, mark: &str) -> Option<String> {
 /// via the prompt's `⟳N` pulse and its completion notice (both independent of
 /// this stream); they just don't get the firehose of every tool call. Flipping
 /// `:worker-output on` opens the full live stream:
-/// - `🔧` tool activity → `[label] …`
+/// - `🔧` tool activity (the `✓/✗ 🔧` RESULT line, once per call) → `[label] …`
 /// - `🗨` turn text (a standard model call) → `[label·standard] …`
 /// - `📦` batch fan-out notice → `[label·batch] …`
 fn forward_decision(line: &str, show_output: bool) -> Option<(&'static str, String)> {
@@ -1179,24 +1191,31 @@ mod tests {
     }
 
     #[test]
-    fn clean_activity_line_forwards_only_tool_lines() {
-        // The coordinator's non-TTY static tool line: two leading spaces, dim-wrapped.
-        assert_eq!(
-            clean_activity_line("\x1b[2m  🔧 git status\x1b[0m"),
-            Some("🔧 git status".to_string())
-        );
-        // An MCP tool name, same shape.
-        assert_eq!(
-            clean_activity_line("\x1b[2m  🔧 mcp__atum__list_tools\x1b[0m"),
-            Some("🔧 mcp__atum__list_tools".to_string())
-        );
-        // A ✓/✗-prefixed post-execution line still carries 🔧 and is forwarded.
+    fn clean_activity_line_forwards_only_result_lines() {
+        // Per tool the coordinator emits a bare START line then a ✓/✗ RESULT
+        // line. To avoid logging each tool call twice, only the RESULT line is
+        // forwarded; the bare START line is dropped.
+        //
+        // RESULT line (✓ success) — forwarded.
         assert_eq!(
             clean_activity_line("\x1b[2m  ✓ 🔧 read /etc/hosts\x1b[0m"),
             Some("✓ 🔧 read /etc/hosts".to_string())
         );
-        // No wrapper at all — still cleaned/forwarded.
-        assert_eq!(clean_activity_line("🔧 ls"), Some("🔧 ls".to_string()));
+        // RESULT line (✗ failure) — forwarded.
+        assert_eq!(
+            clean_activity_line("\x1b[2m  ✗ 🔧 write x\x1b[0m"),
+            Some("✗ 🔧 write x".to_string())
+        );
+        // RESULT line with the real inner colour codes engine.rs emits — still
+        // forwarded; the outer dim wrapper is stripped, inner colour preserved.
+        assert_eq!(
+            clean_activity_line("\x1b[2m  \x1b[32m✓\x1b[0m 🔧 read /etc/hosts\x1b[0m"),
+            Some("\x1b[32m✓\x1b[0m 🔧 read /etc/hosts".to_string())
+        );
+        // Bare START lines (wrench, no ✓/✗) are the duplicate — DROPPED now.
+        assert_eq!(clean_activity_line("\x1b[2m  🔧 git status\x1b[0m"), None);
+        assert_eq!(clean_activity_line("\x1b[2m  🔧 mcp__atum__list_tools\x1b[0m"), None);
+        assert_eq!(clean_activity_line("🔧 ls"), None);
         // Lines without the wrench are dropped (banner, blanks, prose).
         assert_eq!(clean_activity_line("coordinator run abc starting"), None);
         assert_eq!(clean_activity_line(""), None);
@@ -1225,24 +1244,28 @@ mod tests {
 
     #[test]
     fn forward_decision_gates_all_output_on_worker_output_toggle() {
-        // The 🔧 static tool line (coordinator non-TTY shape).
-        let tool = "\x1b[2m  🔧 git status\x1b[0m";
+        // A tool emits a bare START line then a ✓/✗ RESULT line. Only the RESULT
+        // line is forwarded (so each tool call logs exactly once).
+        let tool_start = "\x1b[2m  🔧 git status\x1b[0m";
+        let tool_result = "\x1b[2m  ✓ 🔧 git status\x1b[0m";
         let turn = "🗨 planning the migration";
         let batch = "📦 fanned 3 sub-task(s) out";
         let banner = "coordinator run abc starting";
 
-        // OFF (default): EVERYTHING is suppressed — including the 🔧 tool line
-        // that used to forward unconditionally. This is the headline behavior:
+        // OFF (default): EVERYTHING is suppressed. This is the headline behavior:
         // a background coordinator is quiet by default.
-        assert_eq!(forward_decision(tool, false), None);
+        assert_eq!(forward_decision(tool_start, false), None);
+        assert_eq!(forward_decision(tool_result, false), None);
         assert_eq!(forward_decision(turn, false), None);
         assert_eq!(forward_decision(batch, false), None);
         assert_eq!(forward_decision(banner, false), None);
 
-        // ON: the full live stream returns, each tagged with its label suffix.
+        // ON: the full live stream returns, each tagged with its label suffix —
+        // but the tool call is forwarded ONCE, via its RESULT line only.
+        assert_eq!(forward_decision(tool_start, true), None); // duplicate START — dropped
         assert_eq!(
-            forward_decision(tool, true),
-            Some(("", "🔧 git status".to_string()))
+            forward_decision(tool_result, true),
+            Some(("", "✓ 🔧 git status".to_string()))
         );
         assert_eq!(
             forward_decision(turn, true),
@@ -1255,6 +1278,27 @@ mod tests {
         // Noise (banner/blank) is dropped even when output is ON.
         assert_eq!(forward_decision(banner, true), None);
         assert_eq!(forward_decision("", true), None);
+    }
+
+    #[test]
+    fn worker_output_logs_each_tool_call_exactly_once() {
+        // Regression: the duplicate tool-call logging bug. A single tool call
+        // produces a START line then a RESULT line on the coordinator's stderr;
+        // with :worker-output ON, the forwarder must emit exactly ONE line for
+        // that call (the RESULT line), not two.
+        let per_call = [
+            "\x1b[2m  🔧 mcp__atum__atum_get_project_task\x1b[0m", // START
+            "\x1b[2m  ✓ 🔧 mcp__atum__atum_get_project_task\x1b[0m", // RESULT
+        ];
+        let forwarded: Vec<String> = per_call
+            .iter()
+            .filter_map(|l| forward_decision(l, true).map(|(_, t)| t))
+            .collect();
+        assert_eq!(
+            forwarded,
+            vec!["✓ 🔧 mcp__atum__atum_get_project_task".to_string()],
+            "each tool call must forward exactly once (the RESULT line)"
+        );
     }
 
     #[test]
