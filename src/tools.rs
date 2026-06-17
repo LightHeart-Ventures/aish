@@ -1115,7 +1115,16 @@ async fn run_interactive(call: &ToolCall, session: &mut Session, confirm: &mut C
         return Ok("user declined to run this command".into());
     }
 
-    let status = run_on_tty(&program, &args, &env, session).await?;
+    let status = match run_on_tty(&program, &args, &env, session).await? {
+        ForegroundOutcome::Exited(status) => status,
+        // Ctrl-Z suspended the program; the job lives on, resumable with `fg`.
+        ForegroundOutcome::Stopped(job) => {
+            return Ok(format!(
+                "[interactive session suspended: job {} stopped — resume it with fg]",
+                job.id
+            ));
+        }
+    };
     session.set_last_status(&status);
     Ok(match status.code() {
         Some(code) => format!("[interactive session ended: exit code {code}]"),
@@ -1127,6 +1136,14 @@ async fn run_interactive(call: &ToolCall, session: &mut Session, confirm: &mut C
             }
         }
     })
+}
+
+/// Outcome of running a child in the foreground: it ran to termination, or a
+/// Ctrl-Z (SIGTSTP) suspended it, leaving it `Stopped` in the job table for
+/// `fg`/`bg` to resume (TASK-121 / S3.4).
+pub enum ForegroundOutcome {
+    Exited(std::process::ExitStatus),
+    Stopped(Arc<Job>),
 }
 
 /// Hand the terminal to a child program: inherited stdin/stdout/stderr, wait
@@ -1146,12 +1163,17 @@ async fn run_interactive(call: &ToolCall, session: &mut Session, confirm: &mut C
 /// observed through `tokio::signal` (which multiplexes the handler) so tokio
 /// keeps reaping its own captured/background/pipeline children and never
 /// `waitpid(-1)`s — disjoint PID sets, no double-reap.
+///
+/// Returns [`ForegroundOutcome::Exited`] when the child terminates, or
+/// [`ForegroundOutcome::Stopped`] when a Ctrl-Z (SIGTSTP) suspends it — at which
+/// point the prompt returns and the still-alive child stays in the job table as
+/// `Stopped`, resumable with `fg`/`bg` (TASK-121 / S3.4).
 pub async fn run_on_tty(
     program: &str,
     args: &[String],
     extra_env: &[(String, String)],
     session: &Session,
-) -> Result<std::process::ExitStatus> {
+) -> Result<ForegroundOutcome> {
     use std::os::unix::process::CommandExt;
 
     let _guard = TtyGuard::engage();
@@ -1202,11 +1224,11 @@ pub async fn run_on_tty(
     let job = {
         let mut jobs = session.jobs.lock().unwrap();
         let id = jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
-        let job = Job::foreground(id, desc);
+        let job = Job::foreground(id, desc, pid);
         jobs.push(job.clone());
         job
     };
-    let mut child = ForegroundChild { pid, reaped: false, job: job.clone() };
+    let mut child = ForegroundChild { pid, reaped: false, suspended: false, job: job.clone() };
 
     // Mirror the child's setpgid from the parent too (closes the spawn race;
     // EACCES once the child has exec'd is expected — ignore it), then hand it
@@ -1221,23 +1243,94 @@ pub async fn run_on_tty(
     // that drops this future mid-await.
     let _reclaim = ForegroundReclaim { on_tty };
 
-    // Reap loop: poll first (covers an exit between spawn and the first await),
-    // then wait for the next SIGCHLD. waitpid is scoped to `pid` only.
+    foreground_wait(pid, &job, &mut child, &mut sigchld).await
+}
+
+/// Drive a foreground child via its SIGCHLD stream until it either terminates
+/// or a Ctrl-Z (SIGTSTP) suspends it (TASK-121 / S3.4). Shared by the initial
+/// launch ([`run_on_tty`]) and the `fg` resume path ([`resume_on_tty`]).
+///
+/// Polls once first (covers an exit between spawn and the first await), then
+/// blocks on the next SIGCHLD. `waitpid` is scoped to `pid` only. On exit it
+/// marks `child.reaped` so the guard does not re-reap an already-harvested pid;
+/// on a stop it marks `child.suspended` so the guard leaves the still-alive
+/// stopped child for `fg`/`bg` to resume rather than killing it.
+async fn foreground_wait(
+    pid: libc::pid_t,
+    job: &Arc<Job>,
+    child: &mut ForegroundChild,
+    sigchld: &mut tokio::signal::unix::Signal,
+) -> Result<ForegroundOutcome> {
     loop {
-        if let Some(status) = reap_foreground(pid, &job)? {
+        if let Some(status) = reap_foreground(pid, job)? {
             child.reaped = true;
-            return Ok(status);
+            return Ok(ForegroundOutcome::Exited(status));
         }
-        // The reaper just recorded any Ctrl-Z stop in the job table; real
-        // suspend-to-background (the fg/bg UX) is TASK-121. Until then, resume a
-        // stopped foreground child in place so it keeps running and the terminal
-        // stays live.
+        // The reaper recorded the Ctrl-Z stop in the job table; hand the prompt
+        // back and leave the child suspended for `fg`/`bg` to resume.
         if job.status() == "stopped" {
-            // SAFETY: continuing our own child's process group (pgid == pid).
-            unsafe { libc::kill(-pid, libc::SIGCONT) };
+            child.suspended = true;
+            return Ok(ForegroundOutcome::Stopped(job.clone()));
         }
         sigchld.recv().await;
     }
+}
+
+/// Resume a stopped job in the foreground (`fg`): hand it back the terminal,
+/// SIGCONT its process group, and wait on it again. Returns when it stops once
+/// more or exits. The job must carry a [`Job::pid`] (a suspended foreground
+/// job always does); errors otherwise (TASK-121 / S3.4).
+pub async fn resume_on_tty(job: Arc<Job>) -> Result<ForegroundOutcome> {
+    let pid = job
+        .pid()
+        .ok_or_else(|| anyhow::anyhow!("job {} has no resumable process", job.id))?
+        as libc::pid_t;
+
+    let _guard = TtyGuard::engage();
+    let mut sigchld = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+        .map_err(|e| anyhow::anyhow!("failed to watch SIGCHLD: {e}"))?;
+
+    // Hand the child the terminal before continuing it so it can read/write.
+    let on_tty = unsafe { libc::isatty(0) == 1 };
+    if on_tty {
+        with_sigttou_ignored(|| unsafe { libc::tcsetpgrp(0, pid) });
+    }
+    let _reclaim = ForegroundReclaim { on_tty };
+
+    let mut child = ForegroundChild { pid, reaped: false, suspended: false, job: job.clone() };
+    // SAFETY: continuing our own child's process group (pgid == pid).
+    unsafe { libc::kill(-pid, libc::SIGCONT) };
+    job.resume();
+    foreground_wait(pid, &job, &mut child, &mut sigchld).await
+}
+
+/// Resume a stopped job in the background (`bg`): SIGCONT its process group and
+/// reap it off-terminal so the shell keeps the prompt. A blocking `waitpid`
+/// records the child's eventual stop/exit in the job table without a foreground
+/// waiter (TASK-121 / S3.4).
+pub fn resume_background(job: Arc<Job>) -> Result<()> {
+    let pid = job
+        .pid()
+        .ok_or_else(|| anyhow::anyhow!("job {} has no resumable process", job.id))?
+        as libc::pid_t;
+    // SAFETY: continuing our own child's process group (pgid == pid).
+    unsafe { libc::kill(-pid, libc::SIGCONT) };
+    job.resume();
+    // Reap the now-detached child so its terminal state lands in the table.
+    tokio::task::spawn_blocking(move || loop {
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+        if r <= 0 {
+            job.finish("killed");
+            return;
+        }
+        // Done -> recorded + return; stopped again -> recorded, stop waiting
+        // (a re-stopped bg job waits for the next fg/bg); otherwise keep waiting.
+        if apply_wait_status(&job, status).is_some() || libc::WIFSTOPPED(status) {
+            return;
+        }
+    });
+    Ok(())
 }
 
 /// One non-blocking pass of the foreground reaper: drain every pending
@@ -1341,16 +1434,19 @@ fn reset_job_control_signals() {
 /// normal exit path the SIGCHLD task has already reaped it (`reaped = true`); if
 /// the future is dropped first (Ctrl-C aborts the turn), SIGKILL the child's
 /// group and reap it so no orphan lingers — replacing the `kill_on_drop` we gave
-/// up by spawning raw.
+/// up by spawning raw. A Ctrl-Z stop sets `suspended = true`: the child is left
+/// alive in the job table for `fg`/`bg` to resume (TASK-121), so the guard must
+/// not kill it.
 struct ForegroundChild {
     pid: libc::pid_t,
     reaped: bool,
+    suspended: bool,
     job: Arc<Job>,
 }
 
 impl Drop for ForegroundChild {
     fn drop(&mut self) {
-        if !self.reaped {
+        if !self.reaped && !self.suspended {
             // SAFETY: signalling/reaping our own child's process group (pgid == pid).
             unsafe {
                 libc::kill(-self.pid, libc::SIGKILL);
@@ -1656,9 +1752,9 @@ mod tests {
         // SIGCHLD reaper path. Runs in CI without a controlling tty (on_tty is
         // false), exercising setpgid + the reaper without the tcsetpgrp dance.
         let session = Session::new().unwrap();
-        let ok = run_on_tty("true", &[], &[], &session).await.unwrap();
+        let ok = exited(run_on_tty("true", &[], &[], &session).await.unwrap());
         assert!(ok.success());
-        let bad = run_on_tty("false", &[], &[], &session).await.unwrap();
+        let bad = exited(run_on_tty("false", &[], &[], &session).await.unwrap());
         assert_eq!(bad.code(), Some(1));
     }
 
@@ -1675,14 +1771,16 @@ mod tests {
         // AC1: child runs in its own pgrp (verified via /proc). Exercises the
         // real run_on_tty spawn path; the probe shell reports its own pgrp.
         let session = Session::new().unwrap();
-        let status = run_on_tty(
-            "sh",
-            &["-c".to_string(), OWN_PGRP_PROBE.to_string()],
-            &[],
-            &session,
-        )
-        .await
-        .unwrap();
+        let status = exited(
+            run_on_tty(
+                "sh",
+                &["-c".to_string(), OWN_PGRP_PROBE.to_string()],
+                &[],
+                &session,
+            )
+            .await
+            .unwrap(),
+        );
         assert!(
             status.success(),
             "foreground child was not its own process-group leader"
@@ -1696,14 +1794,16 @@ mod tests {
         // race would intermittently flip the probe's exit code.
         let session = Session::new().unwrap();
         for i in 0..20 {
-            let status = run_on_tty(
-                "sh",
-                &["-c".to_string(), OWN_PGRP_PROBE.to_string()],
-                &[],
-                &session,
-            )
-            .await
-            .unwrap();
+            let status = exited(
+                run_on_tty(
+                    "sh",
+                    &["-c".to_string(), OWN_PGRP_PROBE.to_string()],
+                    &[],
+                    &session,
+                )
+                .await
+                .unwrap(),
+            );
             assert!(
                 status.success(),
                 "setpgid race on launch {i}: child not its own group leader"
@@ -1802,7 +1902,7 @@ mod tests {
         let proc = cmd.spawn().unwrap();
         let pid = proc.id() as libc::pid_t;
         drop(proc);
-        let job = Job::foreground(1, "sleep 30".into());
+        let job = Job::foreground(1, "sleep 30".into(), pid);
 
         // Mirror run_on_tty's loop: reap on each SIGCHLD wakeup until `done`
         // holds. Bounded so a missed wakeup fails loudly instead of hanging.
@@ -1836,6 +1936,77 @@ mod tests {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         drive(&mut sigchld, pid, &job, |e, _j| e.is_some()).await;
         assert_eq!(job.status(), "killed", "an exited child must update the job table");
+    }
+
+    /// Unwrap a foreground run expected to terminate (not Ctrl-Z-suspend).
+    fn exited(outcome: ForegroundOutcome) -> std::process::ExitStatus {
+        match outcome {
+            ForegroundOutcome::Exited(status) => status,
+            ForegroundOutcome::Stopped(job) => panic!("expected exit, job {} was stopped", job.id),
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_z_suspends_to_prompt_then_fg_resumes_to_completion() {
+        // AC ac_03accb2f9097 + ac_3edf43a3c5de (TASK-121): a foreground child
+        // that stops (Ctrl-Z / SIGTSTP) returns the prompt with the job marked
+        // Stopped and the child still alive; `fg` (resume_on_tty) SIGCONTs it and
+        // the job runs to completion. The child stops itself with SIGSTOP — the
+        // same stop a terminal Ctrl-Z delivers to the foreground process group.
+        // No controlling tty in CI (on_tty == false), so the tcsetpgrp dance is
+        // skipped and only the stop/resume wiring is exercised.
+        let session = Session::new().unwrap();
+
+        // AC1: run_on_tty must RETURN (prompt back) on the stop, not block.
+        let job = match run_on_tty(
+            "sh",
+            &["-c".to_string(), "kill -STOP $$; exit 7".to_string()],
+            &[],
+            &session,
+        )
+        .await
+        .unwrap()
+        {
+            ForegroundOutcome::Stopped(job) => job,
+            ForegroundOutcome::Exited(s) => panic!("expected a stop, got exit {:?}", s.code()),
+        };
+        assert_eq!(job.status(), "stopped", "the suspended job must show Stopped");
+        assert_eq!(session.jobs.lock().unwrap().len(), 1, "the stopped child must stay in the table");
+
+        // AC2: fg resumes it — SIGCONT continues the job through to its exit.
+        let resumed = exited(resume_on_tty(job.clone()).await.unwrap());
+        assert_eq!(resumed.code(), Some(7), "resumed job must run to completion");
+        assert_eq!(job.status(), "exited 7");
+    }
+
+    #[tokio::test]
+    async fn bg_resumes_a_stopped_job_off_terminal() {
+        // AC ac_3edf43a3c5de (TASK-121): `bg` SIGCONTs a stopped job and reaps it
+        // off-terminal, so it runs to completion without a foreground waiter.
+        let session = Session::new().unwrap();
+        let job = match run_on_tty(
+            "sh",
+            &["-c".to_string(), "kill -STOP $$; exit 0".to_string()],
+            &[],
+            &session,
+        )
+        .await
+        .unwrap()
+        {
+            ForegroundOutcome::Stopped(job) => job,
+            ForegroundOutcome::Exited(s) => panic!("expected a stop, got exit {:?}", s.code()),
+        };
+        assert_eq!(job.status(), "stopped");
+
+        resume_background(job.clone()).unwrap();
+        // The blocking reaper finishes the job shortly after SIGCONT.
+        for _ in 0..100 {
+            if job.status() == "exited 0" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(job.status(), "exited 0", "bg-resumed job must run to completion");
     }
 
     #[tokio::test]

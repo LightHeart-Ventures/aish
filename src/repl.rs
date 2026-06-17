@@ -1016,6 +1016,28 @@ async fn dispatch(
             builtin_cd(words.get(1).map(String::as_str), session, prev_dir);
             Dispatch::Handled
         }
+        // Resume a Ctrl-Z-stopped job (TASK-121). `fg` reattaches it to the
+        // terminal and waits; `bg` continues it detached.
+        "fg" => {
+            match resume_target(session, words.get(1).map(String::as_str)) {
+                Some(job) => match tools::resume_on_tty(job).await {
+                    Ok(outcome) => report_foreground(outcome, session),
+                    Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e:#}"),
+                },
+                None => eprintln!("fg: no stopped job"),
+            }
+            Dispatch::Handled
+        }
+        "bg" => {
+            match resume_target(session, words.get(1).map(String::as_str)) {
+                Some(job) => match tools::resume_background(job.clone()) {
+                    Ok(()) => println!("[{}]+ {} &", job.id, job.desc),
+                    Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e:#}"),
+                },
+                None => eprintln!("bg: no stopped job"),
+            }
+            Dispatch::Handled
+        }
         cmd => {
             // Resolve against the session's PATH — which includes any
             // `export PATH="$PATH:…"` from ~/.aishrc — falling back to the
@@ -1051,18 +1073,40 @@ async fn dispatch(
                 return Dispatch::Handled;
             }
             match tools::run_on_tty(&path.to_string_lossy(), &words[1..], &[], session).await {
-                Ok(status) => {
-                    session.set_last_status(&status);
-                    if let Some(code) = status.code() {
-                        if code != 0 {
-                            eprintln!("\x1b[2m[exit {code}]\x1b[0m");
-                        }
-                    }
-                }
+                Ok(outcome) => report_foreground(outcome, session),
                 Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e:#}"),
             }
             Dispatch::Handled
         }
+    }
+}
+
+/// Report the result of a foreground run (direct dispatch or `fg` resume):
+/// record the exit status (printing a dim `[exit N]` for a nonzero code), or
+/// print the suspended-job notice on a Ctrl-Z stop (TASK-121).
+fn report_foreground(outcome: tools::ForegroundOutcome, session: &mut Session) {
+    match outcome {
+        tools::ForegroundOutcome::Exited(status) => {
+            session.set_last_status(&status);
+            if let Some(code) = status.code() {
+                if code != 0 {
+                    eprintln!("\x1b[2m[exit {code}]\x1b[0m");
+                }
+            }
+        }
+        tools::ForegroundOutcome::Stopped(job) => {
+            println!("\n[{}]+ Stopped  {}", job.id, job.desc);
+        }
+    }
+}
+
+/// The job a bare `fg`/`bg` (or `fg <id>` / `fg %<id>`) should resume: the given
+/// id if supplied, else the most recently stopped job (TASK-121).
+fn resume_target(session: &Session, arg: Option<&str>) -> Option<Arc<tools::Job>> {
+    let jobs = session.jobs.lock().unwrap();
+    match arg.and_then(|s| s.trim_start_matches('%').parse::<usize>().ok()) {
+        Some(id) => jobs.iter().find(|j| j.id == id).cloned(),
+        None => jobs.iter().rev().find(|j| j.status() == "stopped").cloned(),
     }
 }
 
@@ -2345,10 +2389,13 @@ mod tests {
     /// Exit code of `cmd` through the genuine `tools::run_on_tty`.
     async fn aish_direct_code(cmd: &str, session: &Session) -> Option<i32> {
         let (program, args) = resolve_for_oracle(cmd, session);
-        tools::run_on_tty(&program.to_string_lossy(), &args, &[], session)
+        match tools::run_on_tty(&program.to_string_lossy(), &args, &[], session)
             .await
             .expect("run_on_tty")
-            .code()
+        {
+            tools::ForegroundOutcome::Exited(status) => status.code(),
+            tools::ForegroundOutcome::Stopped(_) => panic!("oracle command unexpectedly stopped"),
+        }
     }
 
     /// Run `cmd` through the oracle (`bash -c`) in `cwd`, returning its stdout.
