@@ -185,6 +185,114 @@ pub async fn check() -> Result<Option<UpdateInfo>> {
     }))
 }
 
+/// Format a byte count for human eyes (`24.7 MB`, `512 B`). Used by the download
+/// status indicator so the user can see the asset growing as it streams in.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+/// Run `gh release download` for `info` into `work`, rendering a LIVE download
+/// status indicator while the asset streams in: a braille spinner, the bytes
+/// pulled so far (polled off the on-disk partial), and elapsed seconds, redrawn
+/// in place on a single line. When stdout isn't a TTY (e.g. `aish --update` from
+/// a script or CI) we skip the animation and emit one static line instead, so
+/// logs stay clean. Returns `Err` carrying gh's stderr on failure.
+async fn download_asset(repo: &str, info: &UpdateInfo, work: &Path) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let target = work.join(&info.asset_name);
+    // Send gh's own output to a file (not a pipe) so a chatty download can never
+    // wedge on a full pipe buffer while we're busy animating, and so we can still
+    // surface the real error message on failure.
+    let err_path = work.join(".gh-download.log");
+    let err_file = std::fs::File::create(&err_path).context("creating the gh download log")?;
+
+    let mut child = tokio::process::Command::new("gh")
+        .args([
+            "release",
+            "download",
+            &info.tag,
+            "--repo",
+            repo,
+            "--pattern",
+            &info.asset_name,
+            "--dir",
+            &work.to_string_lossy(),
+            "--clobber",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(err_file))
+        .spawn()
+        .context("running `gh release download`")?;
+
+    let interactive = std::io::stdout().is_terminal();
+    if !interactive {
+        // No place to animate — announce the download once and let it run.
+        println!("\x1b[2mdownloading {} …\x1b[0m", info.asset_name);
+    }
+
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let started = Instant::now();
+    let mut frame = 0usize;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("waiting on `gh release download`")?
+        {
+            break status;
+        }
+        if interactive {
+            let bytes = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+            let mut out = std::io::stdout().lock();
+            // \r to the line start, redraw, \x1b[K to wipe any leftover tail.
+            let _ = write!(
+                out,
+                "\r\x1b[2m{}\x1b[0m downloading {} — \x1b[1m{}\x1b[0m in {:.0}s\x1b[K",
+                FRAMES[frame],
+                info.asset_name,
+                human_bytes(bytes),
+                started.elapsed().as_secs_f64(),
+            );
+            let _ = out.flush();
+            frame = (frame + 1) % FRAMES.len();
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    };
+
+    if interactive {
+        // Clear the spinner line so the final state prints fresh.
+        let mut out = std::io::stdout().lock();
+        let _ = write!(out, "\r\x1b[K");
+        let _ = out.flush();
+    }
+
+    if !status.success() {
+        let err = std::fs::read_to_string(&err_path).unwrap_or_default();
+        bail!("gh release download failed: {}", err.trim());
+    }
+
+    let bytes = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "\x1b[32m✓\x1b[0m downloaded {} ({})",
+        info.asset_name,
+        human_bytes(bytes)
+    );
+    Ok(())
+}
+
 /// Download the release asset, extract the `aish` binary, and atomically replace
 /// the running executable. Prints brief progress to stdout. On macOS the freshly
 /// installed binary is re-signed with an ad-hoc signature (matching the Makefile)
@@ -209,29 +317,10 @@ pub async fn perform(info: &UpdateInfo) -> Result<()> {
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).context("creating the update scratch dir")?;
 
-    println!("\x1b[2mdownloading {} …\x1b[0m", info.asset_name);
-    let dl = tokio::process::Command::new("gh")
-        .args([
-            "release",
-            "download",
-            &info.tag,
-            "--repo",
-            &repo,
-            "--pattern",
-            &info.asset_name,
-            "--dir",
-            &work.to_string_lossy(),
-            "--clobber",
-        ])
-        .output()
-        .await
-        .context("running `gh release download`")?;
-    if !dl.status.success() {
+    // Fetch the asset with a live download status indicator.
+    if let Err(e) = download_asset(&repo, info, &work).await {
         let _ = std::fs::remove_dir_all(&work);
-        bail!(
-            "gh release download failed: {}",
-            String::from_utf8_lossy(&dl.stderr).trim()
-        );
+        return Err(e);
     }
 
     let downloaded = work.join(&info.asset_name);
@@ -429,5 +518,16 @@ mod tests {
     fn no_asset_when_none_match() {
         let assets = vec![GhAsset { name: "aish-v0.3.0-sparc64-unknown-haiku.tar.gz".into() }];
         assert!(match_asset(&assets).is_none());
+    }
+
+    #[test]
+    fn human_bytes_scales_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(1536), "1.5 KB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(human_bytes(25 * 1024 * 1024 + 700 * 1024), "25.7 MB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
     }
 }
