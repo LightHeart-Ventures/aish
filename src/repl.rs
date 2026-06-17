@@ -1510,7 +1510,7 @@ async fn handle_colon(
                 .unwrap_or_else(|| crate::batch::short_id(&session.session_id).to_string());
 
             let mut table =
-                String::from("| Worker | Session | Status | Doing |\n|---|---|---|---|\n");
+                String::from("| Worker | Session | Status | Doing | Result |\n|---|---|---|---|---|\n");
             let mut any = false;
             let mut seen = std::collections::HashSet::new();
             // In-memory coordinators launched by THIS session (live status).
@@ -1518,11 +1518,12 @@ async fn handle_colon(
                 any = true;
                 seen.insert(w.id.clone());
                 table.push_str(&format!(
-                    "| {} | {} * | {} | {} |\n",
+                    "| {} | {} * | {} | {} | {} |\n",
                     w.id,
                     me_label,
                     w.status(),
-                    one_line(&w.task)
+                    one_line(&w.task),
+                    w.result_cell()
                 ));
             }
             // Durable runs from the shared store — every session's, so workers
@@ -1541,12 +1542,27 @@ async fn handle_colon(
                             })
                             .unwrap_or_else(|| "—".into());
                         let session_cell = if is_me { format!("{label} *") } else { label };
+                        let result_cell = match (r.result.as_deref(), r.error.as_deref()) {
+                            (Some(res), None) => {
+                                if let Some(pr) = res.split_whitespace().find(|s| s.starts_with('#')) {
+                                    format!("✓ {pr}")
+                                } else {
+                                    "✓ success".to_string()
+                                }
+                            }
+                            (None, Some(e)) => {
+                                let t = if e.len() > 40 { format!("{}…", &e[..40]) } else { e.to_string() };
+                                format!("✗ {t}")
+                            }
+                            _ => "—".to_string(),
+                        };
                         table.push_str(&format!(
-                            "| {} | {} | {} | {} |\n",
+                            "| {} | {} | {} | {} | {} |\n",
                             crate::batch::short_id(&r.run_id),
                             session_cell,
                             r.phase,
-                            one_line(&r.task)
+                            one_line(&r.task),
+                            result_cell
                         ));
                     }
                 }
