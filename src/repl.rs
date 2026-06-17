@@ -159,12 +159,30 @@ pub async fn run(
         };
     let mut pending_update: Option<crate::update::UpdateInfo> = None;
 
-    let mut rl: Editor<AishHelper, DefaultHistory> = Editor::new()?;
+    // List-style completion with the whole candidate menu shown on the first
+    // trigger (not the rustyline default of silently cycling one candidate at a
+    // time). This is what lets a single `:` — or a TAB after a `:` prefix — pop
+    // up the command palette as a visible menu below the prompt.
+    let config = rustyline::Config::builder()
+        .completion_type(rustyline::CompletionType::List)
+        .completion_show_all_if_ambiguous(true)
+        .build();
+    let mut rl: Editor<AishHelper, DefaultHistory> = Editor::with_config(config)?;
+    // Shared flag: the `:` key handler sets it and the completer consumes it, so
+    // a bare-`:` palette trigger on an empty line is told apart from a plain TAB.
+    let colon_pending = Arc::new(AtomicBool::new(false));
+    // Shared cell: a name char typed inside the `:`-palette stashes itself here
+    // and re-fires completion so the popup menu filters live as you type (the
+    // List menu is otherwise a one-shot print). The completer takes() it and
+    // appends it to the prefix it filters against. See [`PaletteFilter`].
+    let palette_char: Arc<Mutex<Option<char>>> = Arc::new(Mutex::new(None));
     rl.set_helper(Some(AishHelper {
         cwd: session.cwd.clone(),
         path: session_path(&session),
         aliases: aliases.clone(),
         cmd_cache: Arc::new(Mutex::new(None)),
+        colon_pending: colon_pending.clone(),
+        palette_char: palette_char.clone(),
     }));
     let history_path = dirs_history_path();
     let _ = rl.load_history(&history_path);
@@ -184,6 +202,35 @@ pub async fn run(
         KeyEvent(KeyCode::Esc, Modifiers::NONE),
         EventHandler::Simple(Cmd::Kill(Movement::WholeBuffer)),
     );
+
+    // Typing ':' at the very start of an empty line pops up the command palette:
+    // the handler flags the trigger and fires completion, the completer returns
+    // the `:`-command catalog (see AishHelper::complete), and List-completion
+    // renders it as a menu while extending the buffer to `:`. Anywhere else `:`
+    // self-inserts as usual (paths, arguments, mid-line text).
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Char(':'), Modifiers::NONE),
+        EventHandler::Conditional(Box::new(ColonPalette { pending: colon_pending.clone() })),
+    );
+
+    // Live palette filtering: while the buffer is a single `:`-token, each name
+    // char (a-z and `-`, the only chars in a `:`-command) re-fires completion so
+    // the popup menu narrows as you type instead of staying frozen on the full
+    // list. The handler stashes the char and returns Complete; the completer
+    // appends it to the filter prefix (see AishHelper::complete). Outside the
+    // palette the handler is a no-op (returns None), so the key self-inserts as
+    // usual. rustyline can't both insert AND complete in one keystroke, so this
+    // stash-then-complete is how the inserted char and the filtered menu stay in
+    // sync. See [`PaletteFilter`].
+    for c in ('a'..='z').chain(std::iter::once('-')) {
+        rl.bind_sequence(
+            KeyEvent(KeyCode::Char(c), Modifiers::NONE),
+            EventHandler::Conditional(Box::new(PaletteFilter {
+                ch: c,
+                pending: palette_char.clone(),
+            })),
+        );
+    }
 
     // Start on a clean screen (interactive terminals only — keep piped output clean).
     // SAFETY: plain isatty query.
@@ -428,6 +475,14 @@ struct AishHelper {
     aliases: Arc<HashMap<String, Vec<String>>>,
     /// Lazily-populated, TTL-refreshed cache of executable names on PATH.
     cmd_cache: Arc<Mutex<Option<CmdCache>>>,
+    /// Set by the `:` key handler, consumed by `complete`, so a bare-`:` palette
+    /// trigger on an empty line is distinguished from a plain TAB (which lists
+    /// PATH commands). See [`ColonPalette`].
+    colon_pending: Arc<AtomicBool>,
+    /// A name char typed inside the `:`-palette, stashed by [`PaletteFilter`]
+    /// and consumed by `complete` so the typed char is folded into the filter
+    /// prefix — turning the one-shot List menu into a live, narrowing popup.
+    palette_char: Arc<Mutex<Option<char>>>,
 }
 
 /// Builtins aish handles itself — always offered as command-name completions.
@@ -444,9 +499,150 @@ struct CmdCache {
     names: Vec<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Colon command palette — completion for `:` REPL meta-commands
+// ---------------------------------------------------------------------------
+
+/// The `:`-command catalog: `(name, one-line description)`, kept in alphabetical
+/// order so the popup menu reads tidily. Surfaced as a menu when the user types
+/// `:` at the start of a line (or TABs a `:` prefix). Keep this in sync with the
+/// arms of `handle_colon` and the `:help` text.
+const COLON_COMMANDS: &[(&str, &str)] = &[
+    ("allow", "list / revoke always-allowed tools"),
+    ("backend", "switch backend (claude|grok|local)"),
+    ("batch", "background batch mode (on|off|status)"),
+    ("dispatch", "launch a background coordinator"),
+    ("goal", "pursue a goal in the background"),
+    ("help", "show command help"),
+    ("jobs", "list background jobs"),
+    ("kill", "kill a background job"),
+    ("mcp", "manage MCP servers"),
+    ("mode", "set confirmation level"),
+    ("model", "switch model (opus|sonnet|haiku)"),
+    ("name", "name this session"),
+    ("new", "clear conversation history"),
+    ("quit", "exit aish"),
+    ("result", "view a finished job's result"),
+    ("results", "list finished background jobs"),
+    ("tell", "message an in-flight coordinator"),
+    ("update", "upgrade aish to the latest release"),
+    ("worker-output", "stream coordinators' activity"),
+    ("workers", "list background coordinators"),
+    ("yolo", "toggle yolo mode"),
+];
+
+/// Catalog command names whose name starts with `prefix` (the text after the
+/// leading `:`), in catalog order. Pure + unit-tested.
+fn colon_command_matches(prefix: &str) -> Vec<&'static str> {
+    COLON_COMMANDS
+        .iter()
+        .filter(|(name, _)| name.starts_with(prefix))
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// Build the palette completion candidates for the text after a leading `:`.
+/// `start` is 0 — the whole `:<prefix>` token is replaced. The display carries
+/// the description (what the menu shows); the replacement is `:<name> ` (the
+/// space leaves the cursor ready for any argument).
+fn complete_colon(after: &str) -> (usize, Vec<Pair>) {
+    let pairs = colon_command_matches(after)
+        .into_iter()
+        .map(|name| {
+            let desc = COLON_COMMANDS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map_or("", |(_, d)| *d);
+            Pair {
+                display: format!(":{name:<14} {desc}"),
+                replacement: format!(":{name} "),
+            }
+        })
+        .collect();
+    (0, pairs)
+}
+
+/// `:` key handler. On an empty line it flags the palette trigger and fires
+/// completion (the completer then returns the catalog); anywhere else it returns
+/// `None` so `:` self-inserts normally (inside a path, an argument, mid-line).
+struct ColonPalette {
+    pending: Arc<AtomicBool>,
+}
+
+impl ConditionalEventHandler for ColonPalette {
+    fn handle(&self, _: &Event, _: RepeatCount, _: bool, ctx: &EventContext) -> Option<Cmd> {
+        if ctx.line().is_empty() && ctx.pos() == 0 {
+            self.pending.store(true, Ordering::SeqCst);
+            Some(Cmd::Complete)
+        } else {
+            None
+        }
+    }
+}
+
+/// Per-character key handler that keeps the `:`-command palette filtering live
+/// as you type. rustyline's List-completion menu is a one-shot print — once it
+/// pops up on `:`, plain self-insert keystrokes never refresh it. Each name char
+/// (`a`-`z`, `-`) is bound to one of these: when the buffer is a single bare
+/// `:`-token and the cursor is at its end, the handler stashes the char and
+/// returns `Cmd::Complete`. The completer then appends the stashed char to the
+/// prefix it filters against and returns the narrowed candidate set, so both the
+/// buffer (via the longest-common-prefix extension) and the menu advance by one
+/// char — the effect of "insert + re-filter" that a single `Cmd` can't express
+/// on its own. Everywhere else it returns `None`, so the key self-inserts as
+/// normal (paths, arguments, prose).
+struct PaletteFilter {
+    /// The literal char this binding fires for — stashed for the completer.
+    ch: char,
+    pending: Arc<Mutex<Option<char>>>,
+}
+
+impl ConditionalEventHandler for PaletteFilter {
+    fn handle(&self, _: &Event, _: RepeatCount, _: bool, ctx: &EventContext) -> Option<Cmd> {
+        let line = ctx.line();
+        // Only when the cursor sits at the end of a bare `:`-token (no space yet,
+        // so we're still picking the command name). `line[1..]` is safe: a
+        // leading `:` is one byte.
+        if ctx.pos() != line.len()
+            || !line.starts_with(':')
+            || line[1..].contains(char::is_whitespace)
+        {
+            return None;
+        }
+        *self.pending.lock().unwrap() = Some(self.ch);
+        Some(Cmd::Complete)
+    }
+}
+
 impl Completer for AishHelper {
     type Candidate = Pair;
     fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
+        // Colon command palette. When the first token is a `:` REPL meta-command
+        // we complete against the command catalog, not PATH/paths. Two entries:
+        //   * the line already starts with `:` (e.g. `:mo` + TAB), or
+        //   * a bare `:` was just typed on an empty line — the ColonPalette key
+        //     handler flagged `colon_pending` and fired completion *before* the
+        //     char was inserted, so the buffer is still empty here; the catalog's
+        //     common prefix `:` lands in the buffer and the menu pops up.
+        // A name char typed inside the palette (stashed by PaletteFilter) is
+        // folded into the filter prefix here — it was NOT inserted into the
+        // buffer (the handler returned Complete, not SelfInsert), so appending it
+        // is what advances the buffer (via the LCP extension) and narrows the
+        // menu in lockstep. take() so it never leaks into a later completion.
+        let pending_char = self.palette_char.lock().unwrap().take();
+        let before = &line[..pos];
+        if let Some(after) = before.strip_prefix(':') {
+            if !after.contains(char::is_whitespace) {
+                self.colon_pending.store(false, Ordering::SeqCst);
+                let prefix = match pending_char {
+                    Some(c) => format!("{after}{c}"),
+                    None => after.to_string(),
+                };
+                return Ok(complete_colon(&prefix));
+            }
+        } else if before.is_empty() && self.colon_pending.swap(false, Ordering::SeqCst) {
+            return Ok(complete_colon(""));
+        }
         let start = line[..pos].rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
         // Word one (the command position): everything before the cursor's word is
         // blank. Complete against PATH binaries + builtins + aliases. Later words
@@ -1488,6 +1684,7 @@ async fn handle_colon(
             println!(
                 "type a command (first word in PATH) to run it directly — anything else goes to the model\n\
                  prefix ! to force direct execution, ? to force the model\n\
+                 type : (then a letter, or TAB) to pop up the :command palette\n\
                  :mode <paranoid|careful|normal|yolo> confirmation level (paranoid asks for everything,\n\
                                                      normal only for write/create/delete, yolo never)\n\
                  :model <opus|sonnet|haiku|full-id>  switch model\n\
@@ -1513,7 +1710,7 @@ async fn handle_colon(
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
                  :tell <id> <message>                send instructions to an in-flight coordinator (folded in next round)\n\
-                 :name <name>                        name the session (prefixes the prompt); bare :name clears\n\
+                 :name <name>                        name the session (prefixes the prompt); auto-set to the repo name at startup, bare :name clears\n\
                  :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
                                                      a verifier judges each turn. :goal status, :goal clear\n\
                  :allow                              list always-allowed tools/commands\n\
@@ -2243,6 +2440,8 @@ mod tests {
             path: dir.to_string_lossy().into_owned(),
             aliases: Arc::new(aliases),
             cmd_cache: Arc::new(Mutex::new(None)),
+            colon_pending: Arc::new(AtomicBool::new(false)),
+            palette_char: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2551,6 +2750,83 @@ mod tests {
         assert!(matches!(split_route("!who is x".into()), (l, Route::Direct) if l == "who is x"));
         assert!(matches!(split_route("?ls".into()), (l, Route::Model) if l == "ls"));
         assert!(matches!(split_route("ls".into()), (l, Route::Auto) if l == "ls"));
+    }
+
+    // ---- colon command palette ------------------------------------------
+    #[test]
+    fn colon_catalog_is_sorted_and_unique() {
+        let names: Vec<&str> = COLON_COMMANDS.iter().map(|(n, _)| *n).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "COLON_COMMANDS must stay alphabetical");
+        let mut dedup = sorted.clone();
+        dedup.dedup();
+        assert_eq!(dedup.len(), names.len(), "COLON_COMMANDS has a duplicate name");
+        assert!(!COLON_COMMANDS.is_empty());
+    }
+
+    #[test]
+    fn colon_command_matches_filters_by_prefix() {
+        // Empty prefix → the whole catalog (the bare-`:` popup).
+        assert_eq!(colon_command_matches("").len(), COLON_COMMANDS.len());
+        // A discriminating prefix narrows to its family.
+        assert_eq!(colon_command_matches("wo"), vec!["worker-output", "workers"]);
+        // A unique prefix yields exactly one.
+        assert_eq!(colon_command_matches("ba"), vec!["backend", "batch"]);
+        assert_eq!(colon_command_matches("y"), vec!["yolo"]);
+        // `result` and `results` share a prefix — both come back, in order.
+        assert_eq!(colon_command_matches("result"), vec!["result", "results"]);
+        // No match → empty (and definitely no panic).
+        assert!(colon_command_matches("zzz").is_empty());
+    }
+
+    #[test]
+    fn complete_colon_narrows_as_prefix_deepens() {
+        // Live-filter invariant: each extra char the PaletteFilter folds into the
+        // prefix narrows the candidate set monotonically, ending at one match.
+        // (`complete` appends the typed char to `after` before calling this.)
+        let names = |after: &str| {
+            complete_colon(after)
+                .1
+                .into_iter()
+                .map(|p| p.replacement.trim_start_matches(':').trim_end().to_string())
+                .collect::<Vec<_>>()
+        };
+        // commands starting with 'm': mcp, mode, model.
+        assert_eq!(names("m"), vec!["mcp", "mode", "model"]);
+        // typing m -> o -> d -> e -> l narrows mcp/mode/model down to just model
+        assert_eq!(names("mo"), vec!["mode", "model"]);
+        assert_eq!(names("mod"), vec!["mode", "model"]);
+        assert_eq!(names("mode"), vec!["mode", "model"]);
+        assert_eq!(names("model"), vec!["model"]);
+        // a char that matches nothing yields an empty set (menu closes / beeps).
+        assert!(names("modez").is_empty());
+    }
+
+    #[test]
+    fn complete_colon_replacements_and_start() {
+        // start is always 0 so the whole `:<prefix>` token is replaced.
+        let (start, pairs) = complete_colon("mo");
+        assert_eq!(start, 0);
+        // `mode` and `model` both match `mo`.
+        let repls: Vec<&str> = pairs.iter().map(|p| p.replacement.as_str()).collect();
+        assert_eq!(repls, vec![":mode ", ":model "]);
+        // The display carries the description; the replacement does not.
+        assert!(pairs[0].display.starts_with(":mode"));
+        assert!(pairs[0].display.contains("confirmation"));
+
+        // The empty-prefix popup offers every command, each replaceable as `:name `.
+        let (start, all) = complete_colon("");
+        assert_eq!(start, 0);
+        assert_eq!(all.len(), COLON_COMMANDS.len());
+        assert!(all.iter().all(|p| p.replacement.starts_with(':') && p.replacement.ends_with(' ')));
+
+        // Every catalog command's replacement, stripped of `:` and trailing space,
+        // is a name `handle_colon` can route (guards against catalog/replacement drift).
+        for p in &all {
+            let name = p.replacement.trim_start_matches(':').trim_end();
+            assert!(COLON_COMMANDS.iter().any(|(n, _)| *n == name));
+        }
     }
 
     #[test]
