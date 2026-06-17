@@ -54,6 +54,11 @@ pub struct Job {
     pub id: usize,
     pub desc: String,
     pub kind: JobKind,
+    /// Process-group leader pid (`pgid == pid`) of a foreground job, used by
+    /// `fg`/`bg` to deliver SIGCONT when resuming a Ctrl-Z-stopped job
+    /// (TASK-121). `None` for background jobs — they are reaped by their own
+    /// waiter task and are never suspended to the prompt.
+    pid: Option<i32>,
     state: Mutex<JobState>,
     buffer: Mutex<String>,
     /// Channel that asks the background waiter task to kill the child. `None`
@@ -74,6 +79,7 @@ impl Job {
             id,
             desc,
             kind: JobKind::Background,
+            pid: None,
             state: Mutex::new(JobState::Running),
             buffer: Mutex::new(String::new()),
             kill: Mutex::new(Some(kill_tx)),
@@ -81,12 +87,14 @@ impl Job {
         (job, kill_rx)
     }
 
-    /// A foreground job (the shell waits on it; no kill channel).
-    pub fn foreground(id: usize, desc: String) -> Arc<Self> {
+    /// A foreground job (the shell waits on it; no kill channel). `pid` is the
+    /// child's process-group leader so `fg`/`bg` can SIGCONT it on resume.
+    pub fn foreground(id: usize, desc: String, pid: i32) -> Arc<Self> {
         Arc::new(Job {
             id,
             desc,
             kind: JobKind::Foreground,
+            pid: Some(pid),
             state: Mutex::new(JobState::Running),
             buffer: Mutex::new(String::new()),
             kill: Mutex::new(None),
@@ -96,6 +104,12 @@ impl Job {
     /// Current state label: `"running"`, `"stopped"`, or the exit summary.
     pub fn status(&self) -> String {
         self.state.lock().unwrap().label()
+    }
+
+    /// The process-group leader pid for a foreground job, used to deliver
+    /// SIGCONT on `fg`/`bg` resume (TASK-121). `None` for background jobs.
+    pub fn pid(&self) -> Option<i32> {
+        self.pid
     }
 
     /// Mark the job finished with the given exit summary.
@@ -166,7 +180,7 @@ mod tests {
             let mut table = jobs.lock().unwrap();
             let (bg, _kill_rx) = Job::background(1, "tail -f log".into());
             table.push(bg);
-            table.push(Job::foreground(2, "cargo build".into()));
+            table.push(Job::foreground(2, "cargo build".into(), 1234));
         }
         let table = jobs.lock().unwrap();
         assert_eq!(table.len(), 2);
@@ -181,7 +195,7 @@ mod tests {
     // kinds and rejects illegal transitions out of the terminal state.
     #[test]
     fn running_stopped_done_transitions() {
-        let fg = Job::foreground(1, "sleep 100".into());
+        let fg = Job::foreground(1, "sleep 100".into(), 1234);
         assert_eq!(fg.status(), "running");
         fg.stop();
         assert_eq!(fg.status(), "stopped");
@@ -237,7 +251,7 @@ mod tests {
     // Foreground jobs have no kill channel — the shell waits on them directly.
     #[test]
     fn foreground_has_no_kill_channel() {
-        let fg = Job::foreground(1, "ls".into());
+        let fg = Job::foreground(1, "ls".into(), 1234);
         assert!(!fg.kill());
     }
 }
