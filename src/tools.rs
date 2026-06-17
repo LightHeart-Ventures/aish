@@ -550,7 +550,12 @@ branch, and open a pull request (gh pr create) instead."
     }
 
     if background {
-        return spawn_background(&program, &args, &env, session, display);
+        let (id, pid) = spawn_background(&program, &args, &env, session, display)?;
+        return Ok(format!(
+            "started background job {id} (pid {pid}). It runs until it exits or the user kills it \
+(:kill {id}); its output streams live to the user's terminal. You do NOT receive that output — \
+read it with job_output {{\"job\": {id}}} when you need it."
+        ));
     }
 
     let mut child = tokio::process::Command::new(&program)
@@ -635,13 +640,17 @@ pub fn announce(prefix: &str, line: &str) {
     eprint!("\r\x1b[2K\x1b[2m{prefix} {line}\x1b[0m\n");
 }
 
-fn spawn_background(
+/// Launch a detached background job: spawn the child, register it in the
+/// session job table, and return its `(id, pid)` immediately. Shared by the
+/// model's `run_program {background:true}` path and the shell's trailing-`&`
+/// path (TASK-119 / S3.2).
+pub(crate) fn spawn_background(
     program: &str,
     args: &[String],
     env: &[(String, String)],
     session: &Session,
     display: String,
-) -> Result<String> {
+) -> Result<(usize, u32)> {
     let mut child = tokio::process::Command::new(program)
         .args(args)
         .current_dir(&session.cwd)
@@ -686,11 +695,7 @@ fn spawn_background(
     });
 
     jobs.push(job);
-    Ok(format!(
-        "started background job {id} (pid {pid}). It runs until it exits or the user kills it \
-(:kill {id}); its output streams live to the user's terminal. You do NOT receive that output — \
-read it with job_output {{\"job\": {id}}} when you need it."
-    ))
+    Ok((id, pid))
 }
 
 /// Stream one job pipe line by line: echo to the terminal, append to the

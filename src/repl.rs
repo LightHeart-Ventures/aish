@@ -730,6 +730,19 @@ enum Route {
     Model,  // `?` prefix
 }
 
+/// A trailing `&` backgrounds the command (TASK-119 / S3.2): the command is
+/// launched through the job table and the prompt returns immediately. Returns
+/// the line with a single trailing `&` stripped plus whether one was present.
+/// A bare `&` (no command) and `&&` (logical-and, which aish doesn't implement)
+/// are left intact so they still route to the model like other shell machinery.
+fn split_background(line: &str) -> (&str, bool) {
+    let trimmed = line.trim_end();
+    match trimmed.strip_suffix('&') {
+        Some(rest) if !rest.is_empty() && !rest.ends_with('&') => (rest.trim_end(), true),
+        _ => (line, false),
+    }
+}
+
 fn split_route(line: String) -> (String, Route) {
     if let Some(rest) = line.strip_prefix('!') {
         (rest.trim().to_string(), Route::Direct)
@@ -908,10 +921,19 @@ async fn dispatch(
     aliases: &HashMap<String, Vec<String>>,
     prev_dir: &mut Option<PathBuf>,
 ) -> Dispatch {
+    // A trailing `&` backgrounds the command (TASK-119): strip it before
+    // tokenizing — `&` is otherwise shell machinery that routes to the model.
+    let (line, background) = split_background(line);
+
     // A pipeline (a | b | c) is the one bit of shell syntax aish runs itself:
     // connect each stage's stdout to the next stage's stdin. Run it directly
     // only when every stage is a real program; otherwise route to the model.
     if let Some(stages) = pipeline::parse(line) {
+        // Backgrounding a pipeline isn't supported (TASK-119 covers a single
+        // command); leave it for the model rather than run it in the foreground.
+        if background {
+            return Dispatch::NotACommand;
+        }
         // Same session-aware PATH the single-command path uses below.
         let path_var = session
             .env
@@ -1013,6 +1035,21 @@ async fn dispatch(
                 }
                 return Dispatch::NotACommand;
             };
+            if background {
+                // Launch detached through the job table and return the prompt
+                // immediately with the new job id (TASK-119).
+                match tools::spawn_background(
+                    &path.to_string_lossy(),
+                    &words[1..],
+                    &[],
+                    session,
+                    words.join(" "),
+                ) {
+                    Ok((id, pid)) => println!("[{id}] {pid}"),
+                    Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e:#}"),
+                }
+                return Dispatch::Handled;
+            }
             match tools::run_on_tty(&path.to_string_lossy(), &words[1..], &[], session).await {
                 Ok(status) => {
                     session.set_last_status(&status);
@@ -2103,6 +2140,35 @@ mod tests {
         session.env.push(("LAST".into(), "override".into()));
         assert_eq!(rc::tokenize_with("echo $LAST", var_lookup(&session)).unwrap(), vec!["echo", "override"]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn trailing_amp_parsing() {
+        // A trailing `&` (with or without a space) is a background marker.
+        assert_eq!(split_background("sleep 30 &"), ("sleep 30", true));
+        assert_eq!(split_background("sleep 30&"), ("sleep 30", true));
+        // No marker / bare `&` / `&&` are left intact for the model.
+        assert_eq!(split_background("ls -l"), ("ls -l", false));
+        assert_eq!(split_background("&"), ("&", false));
+        assert_eq!(split_background("a && b"), ("a && b", false));
+    }
+
+    // AC ac_12f2f4d5b975 — `sleep 30 &` returns the prompt (Dispatch::Handled,
+    // not a blocking foreground wait) and registers a running job with an id.
+    #[tokio::test]
+    async fn trailing_amp_launches_background_job() {
+        let mut session = Session::new().unwrap();
+        let aliases = HashMap::new();
+        let mut prev_dir = None;
+
+        let d = dispatch("sleep 30 &", false, &mut session, &aliases, &mut prev_dir).await;
+        assert!(matches!(d, Dispatch::Handled), "background launch returns the prompt");
+
+        let jobs = session.jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 1, "the command is registered as one background job");
+        assert_eq!(jobs[0].id, 1, "the launched job has an id");
+        assert_eq!(jobs[0].status(), "running", "it is still running, not waited on");
+        jobs[0].kill(); // don't leak the `sleep` past the test
     }
 
     #[test]
