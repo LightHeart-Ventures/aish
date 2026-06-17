@@ -658,6 +658,22 @@ pub fn hangup_jobs_on_exit(jobs: &Jobs) {
     }
 }
 
+/// Resume a stopped job for `bg`/`fg` (TASK-122 / S3.5): send SIGCONT to the
+/// job's process group so the suspended child actually runs again, then flip the
+/// shared job state to running. A job with no recorded pgid (one that never
+/// spawned a child) just has its state updated. Mirrors the SIGCONT half of
+/// [`hangup_jobs_on_exit`].
+pub fn resume_job(job: &Job) {
+    if let Some(pgid) = job.pgid() {
+        // SAFETY: signalling a managed job's own process group (pgid == leader pid),
+        // which the shell put in its own group at spawn.
+        unsafe {
+            libc::kill(-pgid, libc::SIGCONT);
+        }
+    }
+    job.resume();
+}
+
 fn spawn_background(
     program: &str,
     args: &[String],
@@ -1933,5 +1949,55 @@ mod tests {
         }
         assert_eq!(calls.get(), 1, "second rm should have skipped the prompt");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // AC ac_ea23cef2b000 — `bg`/`fg` continue a genuinely stopped job: SIGCONT
+    // reaches the suspended child's process group and the shared state flips back
+    // to running. Spawns a real `sleep`, SIGSTOPs it, then asserts `resume_job`
+    // both continues the process (WIFCONTINUED) and updates the job state.
+    #[test]
+    fn resume_job_continues_a_stopped_child() {
+        use std::os::unix::process::CommandExt;
+
+        // Spawn `sleep 30` as its own process-group leader (mirrors spawn_background).
+        let child = unsafe {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .pre_exec(|| match libc::setpgid(0, 0) {
+                    0 => Ok(()),
+                    _ => Err(std::io::Error::last_os_error()),
+                })
+                .spawn()
+                .expect("spawn sleep")
+        };
+        let pid = child.id() as libc::pid_t;
+        std::mem::forget(child); // we reap via waitpid below
+        unsafe { libc::setpgid(pid, pid) }; // close the spawn race (EACCES after exec is fine)
+
+        // Suspend the whole group, then confirm the kernel reports it stopped.
+        assert_eq!(unsafe { libc::kill(-pid, libc::SIGSTOP) }, 0, "SIGSTOP: {}", std::io::Error::last_os_error());
+        let mut status: libc::c_int = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) }, pid);
+        assert!(unsafe { libc::WIFSTOPPED(status) }, "child should be stopped");
+
+        // Build the matching Job and resume it.
+        let (job, _kill_rx) = Job::background(1, "sleep 30".into());
+        job.set_pgid(pid);
+        job.stop();
+        resume_job(&job);
+        assert_eq!(job.status(), "running", "state should flip back to running");
+
+        // The SIGCONT must reach the child: the kernel reports it continued.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WCONTINUED | libc::WUNTRACED) },
+            pid
+        );
+        assert!(unsafe { libc::WIFCONTINUED(status) }, "child should have been continued by SIGCONT");
+
+        // Cleanup: kill the group and reap.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, 0);
+        }
     }
 }
