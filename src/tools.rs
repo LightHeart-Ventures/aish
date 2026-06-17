@@ -226,7 +226,7 @@ a backend or worry about batches — just describe the task and offload it."
             description: "List ALL background jobs and their LIVE status — background coordinators \
 (running in this session) and durable coordinator runs / Anthropic batch jobs (shared across \
 sessions). Call this to answer \"what's running?\" / \"status\" instead of guessing or inventing \
-your own tracking. Returns a table: id, kind, owner, status, task."
+your own tracking. Returns a table: id, kind, owner, status, task, result."
                 .into(),
             schema: json!({ "type": "object", "properties": {} }),
         });
@@ -243,7 +243,7 @@ it the moment a step needs deeper reasoning than you can do reliably yourself: d
 error, planning a multi-step change, weighing an ambiguous or risky decision, careful code/logic \
 analysis. The strong model has NO tools and NO access to this conversation, the files, or the machine \
 — put EVERYTHING it needs into `task` (the question, the relevant output, the constraints). It returns \
-reasoning/text only; you then act on its answer with your own tools. Use this for a step you must \
+reasoning/text only; you then act on its answer with your tools. Use this for a step you must \
 finish NOW but can't reason through alone; use run_in_background instead when the result can wait. \
 Escalating beats guessing."
                 .into(),
@@ -930,8 +930,32 @@ fn background_status(session: &Session) -> Result<String> {
             t
         }
     };
+    
+    let format_result = |result: Option<&String>, error: Option<&String>| -> String {
+        match (result, error) {
+            (Some(r), None) => {
+                // Check if result contains a PR reference
+                if let Some(pr_match) = r.split_whitespace().find(|s| s.starts_with("#")) {
+                    format!("✓ {}", pr_match)
+                } else {
+                    "✓ success".to_string()
+                }
+            }
+            (None, Some(e)) => {
+                // Truncate error message to ~40 chars
+                let truncated = if e.len() > 40 {
+                    format!("{}…", &e[..40])
+                } else {
+                    e.clone()
+                };
+                format!("✗ {}", truncated)
+            }
+            _ => "—".to_string(),
+        }
+    };
+    
     let mut out =
-        String::from("| ID | Kind | Owner | Status | Since | Task |\n|---|---|---|---|---|---|\n");
+        String::from("| ID | Kind | Owner | Status | Since | Task | Result |\n|---|---|---|---|---|---|---|\n");
     let mut any = false;
 
     // This session's full-tool background coordinators (in memory; the live
@@ -939,7 +963,7 @@ fn background_status(session: &Session) -> Result<String> {
     for w in session.worker_jobs.lock().unwrap().iter() {
         any = true;
         out.push_str(&format!(
-            "| `{}` | coordinator | you | {} | — | {} |\n",
+            "| `{}` | coordinator | you | {} | — | {} | — |\n",
             crate::batch::short_id(&w.id),
             w.status(),
             trunc(&w.task)
@@ -959,13 +983,15 @@ fn background_status(session: &Session) -> Result<String> {
                         .or_else(|| r.session_id.as_deref().map(|s| crate::batch::short_id(s).to_string()))
                         .unwrap_or_else(|| "—".into())
                 };
+                let result = format_result(r.result.as_ref(), r.error.as_ref());
                 out.push_str(&format!(
-                    "| `{}` | coordinator | {} | {} | {} | {} |\n",
+                    "| `{}` | coordinator | {} | {} | {} | {} | {} |\n",
                     crate::batch::short_id(&r.run_id),
                     owner,
                     r.phase,
                     r.created_at.as_deref().unwrap_or("—"),
-                    trunc(&r.task)
+                    trunc(&r.task),
+                    result
                 ));
             }
         }
@@ -986,13 +1012,15 @@ fn background_status(session: &Session) -> Result<String> {
                 } else {
                     owner
                 };
+                let result = format_result(r.result.as_ref(), r.error.as_ref());
                 out.push_str(&format!(
-                    "| `{}` | batch | {} | {} | {} | {} |\n",
+                    "| `{}` | batch | {} | {} | {} | {} | {} |\n",
                     crate::batch::short_id(&r.local_id),
                     owner,
                     r.status,
                     r.created_at.as_deref().unwrap_or("—"),
-                    trunc(&r.task)
+                    trunc(&r.task),
+                    result
                 ));
             }
         }
@@ -1208,7 +1236,7 @@ pub async fn run_on_tty(
         });
         // aish ignores the job-control signals (see ignore_job_control_signals);
         // SIG_IGN is inherited across exec, so restore the default disposition in
-        // the child or it would be deaf to Ctrl-C/Ctrl-\/Ctrl-Z. Async-signal-safe:
+        // the child or it would be deaf to Ctrl-C/Ctrl-\\/Ctrl-Z. Async-signal-safe:
         // signal(2) only.
         cmd.pre_exec(|| {
             reset_job_control_signals();
