@@ -407,6 +407,10 @@ pub async fn run(
         }
     }
 
+    // Don't leave managed jobs — especially stopped ones — orphaned on exit:
+    // hang them up (SIGCONT + SIGHUP) so they terminate with the shell (TASK-123).
+    tools::hangup_jobs_on_exit(&session.jobs);
+
     let _ = rl.save_history(&history_path);
     println!("bye");
     Ok(())
