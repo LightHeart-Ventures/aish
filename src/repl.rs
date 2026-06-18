@@ -1053,6 +1053,12 @@ const AMBIGUOUS_COMMANDS: &[&str] = &[
     // starting with either ("clear the pointer so it reflects green",
     // "open the door slowly") is prose, not an invocation.
     "clear", "open",
+    // cut (ISS-2044): real use carries a `-b/-c/-f` flag and a file/delimiter
+    // (`cut -f1 file.txt`, `cut -d, -f2 data`); a bare-word phrase starting
+    // with it ("cut new release", "cut release notes") is a release-management
+    // intent, not the textutils binary. The membership lookup below already
+    // lowercases, so `Cut`/`CUT` match too.
+    "cut",
 ];
 
 /// Subset of `AMBIGUOUS_COMMANDS` whose *idiomatic* first argument is a number:
@@ -2597,6 +2603,10 @@ mod tests {
         assert!(prose("clear the pointer so it reflects green"));
         assert!(prose("clear the screen for me"));
         assert!(prose("open the door slowly"));
+        // ISS-2044: bare-word phrases led by `cut` are release intent, not textutils.
+        assert!(prose("cut new release"));
+        assert!(prose("cut release notes"));
+        assert!(prose("Cut the release for me")); // case-insensitive lead word
 
         // real invocations stay direct
         assert!(!prose("who"));
@@ -2609,6 +2619,8 @@ mod tests {
         assert!(!prose("open file.txt")); // dot in the path → command
         assert!(!prose("sort -n data")); // flag → command (sort not ambiguous either)
         assert!(!prose("touch newfile.txt")); // dot in the path → command
+        assert!(!prose("cut -f1 file.txt")); // real cut: flag + filename stays a command
+        assert!(!prose("cut -c 1-5 data")); // real cut: flag + range stays a command
         // ISS-1480 negatives must keep routing direct
         assert!(!prose("kill 1234 now")); // digits → command
         assert!(!prose("head 50")); // 2 words → not prose
