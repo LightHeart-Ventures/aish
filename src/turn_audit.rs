@@ -234,6 +234,31 @@ impl TurnAudit {
         self.write_record(record);
     }
 
+    /// Journal the model's end‑of‑round *synthesis* — the final narrative text a
+    /// coordinator round produced (its tool‑less answer for that round). Tool
+    /// calls are already journaled per turn; this captures the reasoning/answer
+    /// between them so the `.jsonl` is a complete record of what the agent did
+    /// AND said each round. That makes a loop legible: a run that emits the same
+    /// synthesis round after round is visibly spinning, which the bare tool log
+    /// can hide. Recorded with a distinct `kind`/`status` of `synthesis` and a
+    /// monotonically increasing `round` index; `load_completed` ignores it (it
+    /// is not a replayable tool turn), so it never affects the resume contract.
+    /// Best‑effort like every other write — a failure is swallowed.
+    pub fn synthesis(&mut self, round: u64, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return; // nothing substantive to record
+        }
+        self.write_record(json!({
+            "runId": self.run_id,
+            "round": round,
+            "kind": "synthesis",
+            "status": "synthesis",
+            "text": truncate(trimmed, MAX_OUTPUT_LEN),
+            "timestamp": now_iso8601(),
+        }));
+    }
+
     /// Number of turns replayed so far this run (for the post‑run summary).
     #[allow(dead_code)]
     pub fn replayed(&self) -> usize {
@@ -481,6 +506,41 @@ mod tests {
         assert_eq!(complete["status"], "complete");
         assert_eq!(complete["output"]["is_error"], false);
         assert!(complete["output"]["content"].as_str().unwrap().contains("package"));
+    }
+
+    #[test]
+    fn synthesis_is_journaled_and_ignored_on_replay() {
+        let dir = tmp_dir("synthesis");
+        {
+            let mut audit = TurnAudit::attach(&dir, "run_s");
+            // A normal completed tool turn...
+            let Step::Execute { turn } = audit.begin("read_file", &json!({"path": "a"})) else {
+                panic!("expected execute");
+            };
+            audit.complete(turn, "read_file", &ok_result("A"));
+            // ...followed by an end-of-round synthesis line.
+            audit.synthesis(0, "  I read the file and found the bug in fn main.  ");
+            // An empty/whitespace synthesis is dropped (no record written).
+            audit.synthesis(1, "   ");
+        }
+
+        // The synthesis line landed as its own `synthesis` record with the text.
+        let raw = std::fs::read_to_string(dir.join(".atum/run-run_s.jsonl")).unwrap();
+        let synth: Vec<Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["status"] == "synthesis")
+            .collect();
+        assert_eq!(synth.len(), 1, "exactly one synthesis record (the empty one skipped)");
+        assert_eq!(synth[0]["round"], 0);
+        assert!(synth[0]["text"].as_str().unwrap().contains("found the bug"));
+
+        // On reconnect the synthesis record does NOT become a replayable turn —
+        // only the one real tool turn is recovered, so the resume contract holds.
+        let mut audit = TurnAudit::attach(&dir, "run_s");
+        assert_eq!(audit.recovered, 1);
+        assert!(matches!(audit.begin("read_file", &json!({"path": "a"})), Step::Replay { .. }));
+        assert!(matches!(audit.begin("list_dir", &json!({})), Step::Execute { .. }));
     }
 
     #[test]
