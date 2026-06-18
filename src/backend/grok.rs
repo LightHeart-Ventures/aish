@@ -525,7 +525,7 @@ same oversized call.]",
 
     // raw=None always — OpenAI carries no thinking-block echo requirement, so
     // rebuild-from-normalized in render_messages is correct.
-    Ok(Turn { text, tool_calls, raw: None, truncated_tool_call })
+    Ok(Turn { text, tool_calls, raw: None, truncated_tool_call, truncated_text: false })
 }
 
 /// Render normalized history into OpenAI chat-completions messages. The system
