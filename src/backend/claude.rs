@@ -131,8 +131,11 @@ impl ClaudeBackend {
             // exactly the multi-turn shape prompt caching is for.
             "cache_control": {"type": "ephemeral"},
         });
-        // Adaptive thinking is the 4.6+ Opus/Sonnet surface; Haiku doesn't take it.
-        if self.model.contains("opus") || self.model.contains("sonnet") {
+        // Adaptive thinking is the 4.6+ Opus/Sonnet surface; Haiku doesn't take
+        // it — AND it is incompatible with assistant-prefill, so it's suppressed
+        // whenever the request ends with an assistant message (our truncation
+        // continuation resumes a partial answer that way). See `wants_thinking`.
+        if wants_thinking(&self.model, history) {
             body["thinking"] = json!({"type": "adaptive"});
         }
 
@@ -190,6 +193,19 @@ impl ClaudeBackend {
     }
 }
 
+/// Whether to attach the adaptive-thinking block to a request. Two gates:
+/// 1. only Opus/Sonnet 4.x take adaptive thinking (Haiku doesn't); and
+/// 2. extended thinking is INCOMPATIBLE with assistant-prefill — when the final
+///    history message is an assistant turn (our truncation-continuation round
+///    leaves the partial answer there for the model to resume), the API rejects
+///    a request that also enables thinking. So suppress it on any prefill.
+///
+/// Pure (no IO) so the policy is unit-testable.
+fn wants_thinking(model: &str, history: &[Msg]) -> bool {
+    let prefilling = matches!(history.last(), Some(m) if m.role == Role::Assistant);
+    !prefilling && (model.contains("opus") || model.contains("sonnet"))
+}
+
 /// Parse a Claude `/messages` response body into a normalized `Turn`. Pure (no
 /// IO) so the truncation handling is unit-testable. Splits content into text +
 /// tool calls, preserves `raw` for adaptive-thinking history, and applies the
@@ -222,13 +238,21 @@ fn parse_response(v: &Value) -> Result<Turn> {
     }
     // `raw` echoes the assistant content verbatim into history (preserves
     // thinking signatures with adaptive thinking + tools). `None` falls back to
-    // rebuilding from text+tool_calls — used by the truncation path below.
+    // rebuilding from text+tool_calls — used by the truncation paths below.
     let mut raw: Option<Value> = Some(v["content"].clone());
     let mut truncated_tool_call = false;
+    let mut truncated_text = false;
     if stop_reason == "max_tokens" {
         if tool_calls.is_empty() {
-            // Plain text got cut off — note it and let it stand.
-            text.push_str("\n[response truncated: hit max_tokens]");
+            // Plain text got cut off mid-stream. DON'T append a note (it would
+            // pollute the answer the model is about to resume) and DROP `raw` so
+            // the trailing assistant message we feed back is clean text with no
+            // thinking block — a thinking block can't ride along on a prefill
+            // (thinking is disabled on the continuation request). The engine
+            // continues the answer via an assistant-prefill round and merges the
+            // chunks. See `engine::run_turn`.
+            raw = None;
+            truncated_text = true;
         } else {
             // A tool call was cut off mid-emit: its `input` JSON is truncated, so
             // executing it would run a malformed call (e.g. a 0-byte write) and the
@@ -265,13 +289,14 @@ same oversized call.]",
             output_tokens: g("output_tokens"),
         }
     });
-    Ok(Turn { text, tool_calls, raw, truncated_tool_call, usage })
+    Ok(Turn { text, tool_calls, raw, truncated_tool_call, usage, truncated_text })
 }
 
 /// Render normalized history into Claude wire messages.
 fn render_messages(history: &[Msg]) -> Vec<Value> {
+    let last = history.len().saturating_sub(1);
     let mut out = Vec::with_capacity(history.len());
-    for msg in history {
+    for (i, msg) in history.iter().enumerate() {
         match msg.role {
             Role::Assistant => {
                 // Echo raw content verbatim when we have it — preserves thinking
@@ -279,7 +304,13 @@ fn render_messages(history: &[Msg]) -> Vec<Value> {
                 let content = msg.raw.clone().unwrap_or_else(|| {
                     let mut blocks = Vec::new();
                     if !msg.text.is_empty() {
-                        blocks.push(json!({"type": "text", "text": msg.text}));
+                        // A trailing assistant message is a PREFILL the model
+                        // resumes; the API rejects assistant content that ends
+                        // with whitespace, so trim it on the last message only.
+                        let t = if i == last { msg.text.trim_end() } else { msg.text.as_str() };
+                        if !t.is_empty() {
+                            blocks.push(json!({"type": "text", "text": t}));
+                        }
                     }
                     for tc in &msg.tool_calls {
                         blocks.push(json!({
@@ -330,6 +361,7 @@ mod tests {
         let turn = parse_response(&v).unwrap();
         assert_eq!(turn.tool_calls.len(), 1);
         assert!(!turn.truncated_tool_call);
+        assert!(!turn.truncated_text);
         assert!(turn.raw.is_some(), "normal turns keep raw for thinking history");
         assert_eq!(turn.text, "doing it");
     }
@@ -348,6 +380,7 @@ mod tests {
         // The partial tool call must NOT be surfaced for execution.
         assert!(turn.tool_calls.is_empty(), "truncated tool call must not execute");
         assert!(turn.truncated_tool_call, "must flag so the loop continues");
+        assert!(!turn.truncated_text, "a dropped tool call is not a prose continuation");
         // raw is dropped so the broken/empty tool_use isn't re-fed to the API.
         assert!(turn.raw.is_none());
         // The model is told to retry smaller.
@@ -356,17 +389,54 @@ mod tests {
     }
 
     #[test]
-    fn truncated_plain_text_is_noted_but_stands() {
-        // max_tokens with NO tool call: just note it; nothing to drop.
+    fn truncated_plain_text_is_flagged_for_prefill_continuation() {
+        // max_tokens with NO tool call: flag for a prefill-continuation round.
         let v = json!({
             "stop_reason": "max_tokens",
-            "content": [{"type": "text", "text": "a very long answer"}]
+            "content": [{"type": "text", "text": "a very long answer that ran"}]
         });
         let turn = parse_response(&v).unwrap();
         assert!(turn.tool_calls.is_empty());
-        assert!(!turn.truncated_tool_call, "plain-text truncation isn't a dropped tool call");
-        assert!(turn.raw.is_some());
-        assert!(turn.text.contains("response truncated"));
+        assert!(!turn.truncated_tool_call);
+        assert!(turn.truncated_text, "plain-text truncation drives the continuation loop");
+        // The partial answer is kept verbatim — NO in-band note that would
+        // pollute the resumed answer — and raw is dropped so the prefill is
+        // clean text (no thinking block).
+        assert_eq!(turn.text, "a very long answer that ran");
+        assert!(!turn.text.contains("truncated"));
+        assert!(turn.raw.is_none());
+    }
+
+    #[test]
+    fn thinking_suppressed_on_assistant_prefill() {
+        // A normal request whose last message is from the user enables thinking
+        // on Opus/Sonnet.
+        let hist = vec![Msg::user("hi")];
+        assert!(wants_thinking("claude-opus-4-8", &hist));
+        assert!(wants_thinking("claude-sonnet-4-6", &hist));
+        // Haiku never takes adaptive thinking.
+        assert!(!wants_thinking("claude-haiku-4-5", &hist));
+        // A trailing ASSISTANT message is a prefill (truncation continuation) —
+        // thinking must be suppressed or the API rejects the request.
+        let prefill = vec![
+            Msg::user("hi"),
+            Msg { role: Role::Assistant, text: "partial answer".into(), tool_calls: vec![], tool_results: vec![], raw: None },
+        ];
+        assert!(!wants_thinking("claude-opus-4-8", &prefill), "no thinking on prefill");
+    }
+
+    #[test]
+    fn render_trims_trailing_whitespace_on_prefill_message() {
+        // The trailing assistant message (a prefill) must not end with whitespace
+        // — the API rejects it. Trimming applies only to the LAST message.
+        let hist = vec![
+            Msg::user("hi"),
+            Msg { role: Role::Assistant, text: "resume me   \n".into(), tool_calls: vec![], tool_results: vec![], raw: None },
+        ];
+        let msgs = render_messages(&hist);
+        let last = msgs.last().unwrap();
+        let text = last["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "resume me", "trailing whitespace stripped on the prefill message");
     }
 
     #[test]

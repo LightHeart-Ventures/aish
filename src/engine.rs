@@ -61,6 +61,16 @@ pub async fn run_turn(
     // any spinner exists so the download progress line owns stderr.
     backend.prepare().await?;
 
+    // While set, the model is mid-PREFILL-CONTINUATION: a prior round's plain-text
+    // answer hit the output limit, so its partial text is the trailing assistant
+    // message in `history` and each subsequent round RESUMES it. We MERGE the new
+    // chunk into that same message (a second consecutive assistant message would
+    // break role alternation) and keep going until the answer completes — instead
+    // of handing the user a reply cut off mid-sentence. Only backends that resume
+    // a trailing assistant message verbatim opt in (see
+    // `Backend::supports_prefill_continuation`).
+    let mut continuing = false;
+
     for _ in 0..MAX_ITERATIONS {
         // Model-reasoning phase: the "thinking" spinner owns stderr while the
         // backend produces the next message (which may consume prior tool
@@ -72,13 +82,6 @@ pub async fn run_turn(
         let turn = turn?;
         let usage = turn.usage;
 
-        session.history.push(Msg {
-            role: Role::Assistant,
-            text: turn.text.clone(),
-            tool_calls: turn.tool_calls.clone(),
-            tool_results: vec![],
-            raw: turn.raw,
-        });
         // Update the running context figure from the backend's reported usage
         // (the prompt the model just saw), or a char-based estimate as a fallback.
         session.context_used = match usage {
@@ -86,19 +89,64 @@ pub async fn run_turn(
             None => crate::context::estimate_history_tokens(&session.history),
         };
 
-        // A response cut off mid-tool-call had its partial tool call dropped (see
-        // claude.rs) — `tool_calls` is empty but this is NOT a final answer. The
-        // corrective note is already in `turn.text` (now in history as the
-        // assistant message); loop so the model retries with a smaller edit.
-        if turn.truncated_tool_call {
-            if !turn.text.trim().is_empty() {
-                emit_narration(session, &turn.text);
+        if continuing {
+            // Prefill-continuation round: fold this chunk into the partial answer
+            // already sitting as the last assistant message (don't append a new
+            // one — consecutive assistant messages break role alternation).
+            let merged = match session.history.last_mut() {
+                Some(last) => {
+                    last.text.push_str(&turn.text);
+                    last.raw = None; // stay clean text(+tool) — no stale thinking block
+                    last.tool_calls = turn.tool_calls.clone();
+                    last.text.clone()
+                }
+                None => turn.text.clone(),
+            };
+            // The continuation itself was cut off again → keep resuming.
+            if turn.truncated_text && turn.tool_calls.is_empty() {
+                continue;
             }
-            continue;
-        }
+            continuing = false;
+            // A clean continuation with no tool call IS the finished answer.
+            if turn.tool_calls.is_empty() {
+                return Ok(merged);
+            }
+            // Rare: the model resumed its prose and then requested a tool. The
+            // merged message already carries those tool calls; fall through to
+            // execute them like any other tool round.
+        } else {
+            session.history.push(Msg {
+                role: Role::Assistant,
+                text: turn.text.clone(),
+                tool_calls: turn.tool_calls.clone(),
+                tool_results: vec![],
+                raw: turn.raw,
+            });
 
-        if turn.tool_calls.is_empty() {
-            return Ok(turn.text);
+            // A response cut off mid-tool-call had its partial tool call dropped
+            // (see claude.rs) — `tool_calls` is empty but this is NOT a final
+            // answer. The corrective note is already in `turn.text` (now in history
+            // as the assistant message); loop so the model retries with a smaller
+            // edit.
+            if turn.truncated_tool_call {
+                if !turn.text.trim().is_empty() {
+                    emit_narration(session, &turn.text);
+                }
+                continue;
+            }
+
+            if turn.tool_calls.is_empty() {
+                // A final answer that hit the output limit is RESUMED via a
+                // prefill-continuation round (on backends that support it) rather
+                // than returned half-finished. The partial text is already the
+                // trailing assistant message, so the next `complete` continues it;
+                // chunks accumulate into that message and we return the whole thing.
+                if turn.truncated_text && backend.supports_prefill_continuation() {
+                    continuing = true;
+                    continue;
+                }
+                return Ok(turn.text);
+            }
         }
 
         // Interim narration from the model (its reasoning between tool calls) —
