@@ -512,7 +512,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("tell", "message an in-flight coordinator"),
     ("update", "upgrade aish to the latest release"),
     ("worker-output", "stream coordinators' activity"),
-    ("workers", "list background coordinators"),
+    ("workers", "list this session's coordinators (all = every session)"),
     ("yolo", "toggle yolo mode"),
 ];
 
@@ -1695,7 +1695,7 @@ async fn handle_colon(
                  :batch model <opus|sonnet|haiku|id> model background batches run on (default opus)\n\
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
-                 :workers                            list background coordinators (all sessions; * = this session)\n\
+                 :workers [all]                      list this session's background coordinators (all = every session)\n\
                  :worker-output [on|off]             stream background coordinators' activity (🔧 tool + ·standard/·batch lines); off (default) keeps them quiet\n\
                  :results                            list finished background jobs (workers + batches)\n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
@@ -1751,6 +1751,11 @@ async fn handle_colon(
             }
         }
         Some("workers") => {
+            // `:workers` lists THIS session's coordinators by default — the ones
+            // launched from this terminal — so a busy multi-terminal host never
+            // shows another terminal's background workers here. `:workers all`
+            // widens to every session's durable runs (the old behavior).
+            let show_all = matches!(parts.next(), Some("all"));
             // Collapse a (possibly multi-line) task to one clipped line.
             let one_line = |t: &str| {
                 let s = t.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1789,7 +1794,12 @@ async fn handle_colon(
             // already listed in-memory to avoid double-counting this session's.
             if let Some(store) = &session.coordinator_store {
                 if let Ok(rows) = store.load_all() {
-                    for r in rows.iter().filter(|r| !seen.contains(&r.run_id)) {
+                    for r in rows.iter().filter(|r| {
+                        !seen.contains(&r.run_id)
+                            && (show_all
+                                || r.session_id.as_deref()
+                                    == Some(session.session_id.as_str()))
+                    }) {
                         any = true;
                         let is_me = r.session_id.as_deref() == Some(session.session_id.as_str());
                         let label = r
@@ -1827,9 +1837,19 @@ async fn handle_colon(
             }
             if any {
                 println!("{}", crate::md::render_stdout(table.trim()));
-                println!("\x1b[2m* = launched from this session\x1b[0m");
-            } else {
+                if show_all {
+                    println!("\x1b[2m* = launched from this session\x1b[0m");
+                } else {
+                    println!(
+                        "\x1b[2mthis session's coordinators — :workers all for every session\x1b[0m"
+                    );
+                }
+            } else if show_all {
                 println!("no background workers");
+            } else {
+                println!(
+                    "no background workers in this session — :workers all to see every session"
+                );
             }
         }
         Some("result") => {
