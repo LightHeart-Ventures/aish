@@ -476,6 +476,27 @@ impl CoordinatorStore {
         Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
+    /// Count prior terminal-`failed` runs whose `task` text matches `task`
+    /// exactly. This backs the coordinator's pre-dispatch circuit breaker
+    /// (`coordinator::drive`): if the same task has already failed N times, a
+    /// fresh dispatch is refused fast instead of looping a known-bad request.
+    /// The match is exact on the stored task string — `drive` normalizes the
+    /// task before keying, so callers compare like with like. Best-effort
+    /// semantics live at the call site; this is just the count.
+    ///
+    /// NOTE (durability): `clear_finished` purges terminal rows on a clean
+    /// restart, so this counter is effectively per-session-lifetime — it stops
+    /// in-session re-dispatch storms (a goal loop re-launching the same task),
+    /// not a cross-restart history. That's the same boundary the rest of the
+    /// store's terminal bookkeeping lives within.
+    pub fn failed_attempts(&self, task: &str) -> Result<i64> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT count(*) FROM coordinator_runs WHERE task = ?1 AND phase = 'failed'",
+            [task],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Queue an operator message for an in-flight coordinator run — the write
     /// side of the `:tell` / SendMessage channel. The message is picked up at
     /// the start of the run's next round (see `coordinator::drive`), so delivery
@@ -720,6 +741,35 @@ mod tests {
         assert_eq!(reopened.pending_message_count("run_2").unwrap(), 0);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failed_attempts_counts_only_matching_failed_runs() {
+        let p = std::env::temp_dir().join(format!("aish_failattempts_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let store = CoordinatorStore::open(&p).unwrap();
+
+        // No history → zero.
+        assert_eq!(store.failed_attempts("fix the build").unwrap(), 0);
+
+        // Two failed runs for the same task, one still coordinating, one done,
+        // and one failed run for a DIFFERENT task.
+        store.insert("r1", "fix the build", "s", None).unwrap();
+        store.set_failed("r1", "boom").unwrap();
+        store.insert("r2", "fix the build", "s", None).unwrap();
+        store.set_failed("r2", "boom again").unwrap();
+        store.insert("r3", "fix the build", "s", None).unwrap(); // coordinating
+        store.insert("r4", "fix the build", "s", None).unwrap();
+        store.set_done("r4", "ok").unwrap(); // done, not failed
+        store.insert("r5", "ship the docs", "s", None).unwrap();
+        store.set_failed("r5", "nope").unwrap(); // different task
+
+        // Only the two failed rows for the exact task are counted.
+        assert_eq!(store.failed_attempts("fix the build").unwrap(), 2);
+        assert_eq!(store.failed_attempts("ship the docs").unwrap(), 1);
+        assert_eq!(store.failed_attempts("unrelated").unwrap(), 0);
+
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

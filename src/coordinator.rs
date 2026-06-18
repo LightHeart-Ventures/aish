@@ -58,13 +58,57 @@ use crate::tools;
 use std::collections::HashSet;
 use std::time::Duration;
 
-/// Upper bound on agentic rounds (a misbehaving model can't spin forever).
-/// Mirrors atum's `DEFAULT_MAX_STEPS` backstop, scaled for a shell session.
-/// Bounded but generous: real multi-file work (rewrite a crate, iterate to a
-/// green build) needs many rounds, and the parent-side stdout capture is already
-/// capped at 1MB (`worker::read_capped`), so rounds aren't the OOM lever — a
-/// runaway still terminates here. Most work completes well under this.
-const MAX_ROUNDS: usize = 36;
+/// Default upper bound on agentic rounds (a misbehaving model can't spin
+/// forever). Mirrors atum's `DEFAULT_MAX_STEPS` backstop, scaled for a shell
+/// session. Bounded but generous: real multi-file work (rewrite a crate,
+/// iterate to a green build) needs many rounds, and the parent-side stdout
+/// capture is already capped at 1MB (`worker::read_capped`), so rounds aren't
+/// the OOM lever — a runaway still terminates here. Most work completes well
+/// under this.
+///
+/// Overridable at runtime via `AISH_COORDINATOR_MAX_ROUNDS` — a deliberately
+/// *non-durable* bandaid (per the loop-exhaustion review): when a legitimate
+/// task is genuinely starved by the cap you can lift it without a rebuild, but
+/// the real fix is fewer wasted rounds (the circuit breaker + decision-point
+/// prompt below, and richer context upstream), not a bigger number.
+const DEFAULT_MAX_ROUNDS: usize = 48;
+
+/// Pre-dispatch circuit breaker (loop guard): refuse to start a *new* run when
+/// this many prior runs of the SAME task have already terminated in `failed`.
+/// A task that has failed this often is unlikely to succeed on yet another
+/// identical attempt — failing fast saves a whole multi-round burn. Overridable
+/// via `AISH_COORDINATOR_MAX_FAILED_ATTEMPTS`; `0` disables the gate.
+const DEFAULT_MAX_FAILED_ATTEMPTS: usize = 3;
+
+/// The effective round cap for this run (env override, clamped, else default).
+fn max_rounds() -> usize {
+    env_usize("AISH_COORDINATOR_MAX_ROUNDS", DEFAULT_MAX_ROUNDS, 1, 1000)
+}
+
+/// The effective failed-attempt circuit-breaker threshold (env override,
+/// clamped, else default). `0` means the gate is disabled.
+fn max_failed_attempts() -> usize {
+    env_usize("AISH_COORDINATOR_MAX_FAILED_ATTEMPTS", DEFAULT_MAX_FAILED_ATTEMPTS, 0, 1000)
+}
+
+/// Read a `usize` from environment variable `var`, accept it only when it parses
+/// and falls within `[min, max]`, otherwise fall back to `default`. Keeps the
+/// runtime knobs above forgiving: a typo'd or wild value silently reverts to the
+/// safe default rather than uncapping (or zero-capping) the coordinator. The
+/// parse/clamp decision is the pure [`clamp_usize`], so it's unit-testable
+/// without mutating process env (unsafe under edition 2024).
+fn env_usize(var: &str, default: usize, min: usize, max: usize) -> usize {
+    clamp_usize(std::env::var(var).ok(), default, min, max)
+}
+
+/// Pure parse-and-clamp: `raw` (a possibly-absent env value) is accepted only
+/// when it parses to a `usize` inside `[min, max]`; anything else yields
+/// `default`. Leading/trailing whitespace is tolerated.
+fn clamp_usize(raw: Option<String>, default: usize, min: usize, max: usize) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= min && n <= max)
+        .unwrap_or(default)
+}
 
 /// How often to beat the run's durable heartbeat while awaiting batches — proof
 /// of liveness so a restart can tell a live run from an orphaned one. Matches
@@ -205,6 +249,36 @@ pub async fn drive(
         let _ = s.insert(run_id, &input, &session.session_id, session.name.as_deref());
     }
 
+    // ── Pre-dispatch circuit breaker (loop guard, per the loop-exhaustion
+    // review). If this exact task has already failed `max_failed_attempts()`
+    // times, a fresh identical run is very unlikely to fare differently —
+    // refuse fast instead of burning another full multi-round attempt on a
+    // known-bad request. The current run's own row (just inserted as
+    // `coordinating`) is never counted; only prior `failed` rows are. The
+    // counter is per-store-lifetime (terminal rows are purged on a clean
+    // restart via `clear_finished`), so this stops in-session re-dispatch
+    // storms — e.g. a goal loop relaunching the same task — rather than acting
+    // as cross-restart history. Disabled when the threshold is 0.
+    if let Some(s) = store {
+        let cap = max_failed_attempts();
+        if cap > 0 {
+            let prior = s.failed_attempts(&input).unwrap_or(0) as usize;
+            if prior >= cap {
+                let error = format!(
+                    "pre-dispatch circuit breaker: this task already failed {prior} time(s) (cap {cap}) — refusing to re-dispatch a known-bad request. Change the task, or raise/clear AISH_COORDINATOR_MAX_FAILED_ATTEMPTS to override."
+                );
+                eprintln!("\x1b[2maish: {error}\x1b[0m");
+                let _ = s.set_failed(run_id, &error);
+                return Outcome {
+                    phase: Phase::Failed,
+                    result: None,
+                    error: Some(error),
+                    rounds: 0,
+                };
+            }
+        }
+    }
+
     // Tier‑1 turn audit: attach (or re‑open, on a resume) the append‑only
     // tool journal at `.atum/run-${run_id}.jsonl` inside the worktree. On a
     // reconnect this recovers the completed turns so `engine::run_turn` replays
@@ -217,24 +291,37 @@ pub async fn drive(
     session.turn_audit = Some(audit);
 
     let mut rounds = 0usize;
+    // Read the round cap once per run so a single env value governs the whole
+    // loop (a mid-run env change can't move the goalposts under us).
+    let round_cap = max_rounds();
     // The coordinator's model HAS the full toolset (run_turn passes tool_defs),
     // but a model handed a big task headless sometimes rationalizes "I'm a
     // text-only assistant without file access" and refuses on turn 1 instead of
     // calling read_file. Lead the first turn with an explicit assertion of its
     // capabilities to head that off; later rounds use the fold-results message.
+    //
+    // The DECISION POINTS block is an explicit anti-loop directive (per the
+    // loop-exhaustion review): it tells the model to stop re-trying the same
+    // failing approach and instead declare a concrete blocker, which is a
+    // *successful* terminal outcome here — spinning is not.
     let mut next_input = format!(
         "You are running headless as an autonomous aish coordinator in {cwd}. You have your FULL \
 toolset RIGHT NOW — read_file, write_file, list_dir, change_dir, run_program (build, test, git, \
 gh, anything), and the connected MCP servers. You CAN read and edit files and run commands on \
 this machine. Do NOT claim to be a text-only assistant or that you lack access — call the tools \
 and actually do the work, then report what you did with concrete evidence (command output, exit \
-codes, diffs).\n\nTASK:\n{input}",
+codes, diffs).\n\nDECISION POINTS — avoid loops: If you notice you are repeating the same action or re-deriving a \
+fact you already have, STOP and change approach. After about 3 failed attempts at the SAME \
+sub-problem, do NOT keep retrying the same way — either try a materially different approach or \
+stop and report explicitly: say \"I'm blocked because <specific reason>\", list what you tried \
+and what you observed, and give your best partial result. A clearly-stated blocker is a \
+successful outcome; an endless retry loop is a failure.\n\nTASK:\n{input}",
         cwd = session.cwd.display(),
     );
 
     loop {
-        if rounds >= MAX_ROUNDS {
-            let error = format!("coordinator exceeded the {MAX_ROUNDS}-round cap");
+        if rounds >= round_cap {
+            let error = format!("coordinator exceeded the {round_cap}-round cap");
             if let Some(s) = store {
                 let _ = s.set_failed(run_id, &error);
             }
@@ -269,6 +356,15 @@ codes, diffs).\n\nTASK:\n{input}",
                 return Outcome { phase: Phase::Failed, result: None, error: Some(error), rounds };
             }
         };
+
+        // Tier-1 audit: journal this round's end-of-turn synthesis (the model's
+        // tool-less narrative answer for the round) alongside the per-turn tool
+        // calls already logged by `engine::run_turn`. A run that emits the same
+        // synthesis round after round is visibly looping in the `.jsonl` — the
+        // bare tool log alone can hide that. Best-effort; empty text is skipped.
+        if let Some(a) = session.turn_audit.as_mut() {
+            a.synthesis(rounds as u64, &answer);
+        }
 
         // ── awaiting_batch: did this round fan work out to the Batches API? ──
         // The model offloads heavy sub-work via the run_in_background→batch path,
@@ -598,6 +694,24 @@ mod tests {
         // Malformed → None.
         assert_eq!(parse_sqlite_timestamp("not a timestamp"), None);
         assert_eq!(parse_sqlite_timestamp("2021-13"), None);
+    }
+
+    #[test]
+    fn clamp_usize_parses_clamps_and_falls_back() {
+        // Unset / absent → default.
+        assert_eq!(clamp_usize(None, 48, 1, 1000), 48);
+        // A clean in-range value is taken (whitespace tolerated).
+        assert_eq!(clamp_usize(Some("  64 ".into()), 48, 1, 1000), 64);
+        // Out of range (low/high) → default, never an uncapped or zero cap.
+        assert_eq!(clamp_usize(Some("0".into()), 48, 1, 1000), 48);
+        assert_eq!(clamp_usize(Some("99999".into()), 48, 1, 1000), 48);
+        // Unparseable → default.
+        assert_eq!(clamp_usize(Some("lots".into()), 48, 1, 1000), 48);
+        // The circuit-breaker case: 0 is a VALID disable value when min allows it.
+        assert_eq!(clamp_usize(Some("0".into()), 3, 0, 1000), 0);
+        // Boundaries are inclusive.
+        assert_eq!(clamp_usize(Some("1".into()), 48, 1, 1000), 1);
+        assert_eq!(clamp_usize(Some("1000".into()), 48, 1, 1000), 1000);
     }
 
     #[test]
