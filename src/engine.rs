@@ -243,6 +243,53 @@ fn stderr_is_tty() -> bool {
     unsafe { libc::isatty(2) == 1 }
 }
 
+/// Width in columns of the stderr terminal, used to keep an animated activity
+/// line on a SINGLE physical row. The transient redraw is `\r` + `\x1b[2K`
+/// (carriage-return + erase-line), which only returns to and clears the row the
+/// cursor is on. A line longer than the terminal wraps onto extra rows, the
+/// redraw clears just the last of them, and the rest stay on screen — so each
+/// frame scrolls a fresh copy instead of animating in place. Queried via
+/// TIOCGWINSZ on fd 2; falls back to `$COLUMNS`, then a conservative 80.
+fn stderr_cols() -> usize {
+    // SAFETY: a read-only TIOCGWINSZ ioctl on fd 2.
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(2, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+            return ws.ws_col as usize;
+        }
+    }
+    std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(80)
+}
+
+/// Truncate `s` to at most `max` terminal columns (Unicode *display* width, so a
+/// wide glyph like 🔧 counts as two), appending an ellipsis when it overflows.
+/// This is what keeps the animated tool line to one physical row: the desc is a
+/// full command line that easily exceeds the terminal, and a wrapped line breaks
+/// the `\r`+erase redraw (see `stderr_cols`). A line that already fits is
+/// returned unchanged.
+fn truncate_to_cols(s: &str, max: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if s.width() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let budget = max.saturating_sub(1); // leave a column for the ellipsis
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > budget {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
 /// Transient "⠋ thinking…" line on stderr while the model is working — the
 /// model-reasoning phase indicator. TTY-gated; erased on drop (first token,
 /// tool call, or turn abort).
@@ -297,6 +344,12 @@ struct ToolSpinner {
 /// stays put while the spinner turns.
 const TOOL_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Columns consumed to the LEFT of the desc on an animated tool line: the
+/// two-space indent (2) + the braille spinner glyph (1) + the space after it (1).
+/// The desc is truncated to `stderr_cols() - PREFIX_COLS` so the whole line fits
+/// one physical row.
+const PREFIX_COLS: usize = 4;
+
 /// The steady glyph shown to the RIGHT of the animated braille spinner on a
 /// tool-activity line. Most tools use the 🔧 wrench; `escalate` uses a ⚙️ gear so
 /// a hand-off to the stronger model reads as its own distinct event — a static
@@ -332,7 +385,13 @@ impl ToolSpinner {
         eprint!("\x1b[?25l"); // hide the cursor so it doesn't blink at the spinner's tail
         let state = Arc::new(Mutex::new(Spin::Running));
         let s = state.clone();
-        let desc = desc.to_string();
+        // Clamp the desc to a single physical row. A wrapped line would break the
+        // per-frame `\r`+erase redraw (it only clears the cursor's row), making
+        // the spinner scroll a fresh copy every frame instead of animating in
+        // place. `-1` leaves the last column empty so a desc that exactly fills
+        // the width doesn't trip the terminal's deferred-wrap at the margin.
+        let budget = stderr_cols().saturating_sub(PREFIX_COLS + 1);
+        let desc = truncate_to_cols(desc, budget);
         let task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(80));
             // Consume the immediate first tick so no frame draws for the first
@@ -575,6 +634,46 @@ mod tests {
         assert!(TOOL_FRAMES.iter().all(|f| !f.is_empty()));
         // i % len wraps back to frame 0 after a full cycle.
         assert_eq!(TOOL_FRAMES[0 % TOOL_FRAMES.len()], TOOL_FRAMES[TOOL_FRAMES.len() % TOOL_FRAMES.len()]);
+    }
+
+    #[test]
+    fn truncate_to_cols_keeps_short_lines_intact() {
+        use unicode_width::UnicodeWidthStr;
+        // A line at or under the budget is returned byte-for-byte unchanged — no
+        // ellipsis, no allocation surprises.
+        assert_eq!(truncate_to_cols("read foo.rs", 40), "read foo.rs");
+        assert_eq!(truncate_to_cols("", 10), "");
+        // Exactly at the limit is still left alone.
+        let s = "abcdef";
+        assert_eq!(truncate_to_cols(s, s.width()), s);
+    }
+
+    #[test]
+    fn truncate_to_cols_clamps_long_lines_to_width() {
+        use unicode_width::UnicodeWidthStr;
+        // The whole point of the fix: a desc longer than the terminal is clamped
+        // so the animated `\r`+erase line stays on ONE physical row. The result
+        // never exceeds the budget and ends in an ellipsis to mark the cut.
+        let long = "run_program ./scripts/init-rpc-node.sh ".repeat(20);
+        for max in [10usize, 20, 40, 80] {
+            let out = truncate_to_cols(&long, max);
+            assert!(out.width() <= max, "width {} exceeds max {max}: {out:?}", out.width());
+            assert!(out.ends_with('…'), "truncated line should end with an ellipsis: {out:?}");
+        }
+        // A zero budget can't even hold the ellipsis — produce nothing rather
+        // than overflow the row.
+        assert_eq!(truncate_to_cols("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_to_cols_counts_wide_glyphs_as_two() {
+        use unicode_width::UnicodeWidthStr;
+        // 🔧 is two display columns. Measuring by chars would let a wrench-led
+        // desc overflow the row by one column and reintroduce the wrap bug.
+        let desc = "🔧 ".to_string() + &"x".repeat(100);
+        let out = truncate_to_cols(&desc, 10);
+        assert!(out.width() <= 10, "wide-glyph desc overflowed: width {}", out.width());
+        assert!(out.starts_with('🔧'), "leading glyph preserved: {out:?}");
     }
 
     #[test]
