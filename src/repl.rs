@@ -496,12 +496,15 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("allow", "list / revoke always-allowed tools"),
     ("backend", "switch backend (claude|grok|local)"),
     ("batch", "background batch mode (on|off|status)"),
+    ("compact", "compact history, offload to memory"),
+    ("context", "show context-window usage"),
     ("dispatch", "launch a background coordinator"),
     ("goal", "pursue a goal in the background"),
     ("help", "show command help"),
     ("jobs", "list background jobs"),
     ("kill", "kill a background job"),
     ("mcp", "manage MCP servers"),
+    ("memories", "stored memories / organize"),
     ("mode", "set confirmation level"),
     ("model", "switch model (opus|sonnet|haiku)"),
     ("name", "name this session"),
@@ -1661,6 +1664,72 @@ fn tell_coordinator(id: Option<&str>, message: &str, session: &mut Session) {
     }
 }
 
+/// `:context` — show how full the model's context window is, plus the history
+/// and stored-memory counts. The usage figure is the running estimate the engine
+/// maintains from each turn's reported token usage (see `crate::context`).
+fn handle_context(backend: &Backend, session: &Session) {
+    let window = backend.context_window();
+    let used = session.context_used;
+    let pct = if window > 0 { used * 100 / window } else { 0 };
+    let mem = session.db.as_ref().and_then(|d| d.memory_count().ok()).unwrap_or(0);
+    println!(
+        "context: {used} / {window} tokens ({pct}%) · {} message(s) in history · {mem} stored memories",
+        session.history.len()
+    );
+    if used == 0 {
+        println!("  (usage updates after the first model turn)");
+    } else if crate::context::should_compact(used, window, crate::context::COMPACT_THRESHOLD_PCT) {
+        println!(
+            "  over the {}% compaction threshold — the next turn will offload older history to memory (or run :compact now)",
+            crate::context::COMPACT_THRESHOLD_PCT
+        );
+    }
+}
+
+/// `:compact` — force a context compaction now: offload the oldest slice of the
+/// conversation to the SQLite memories table (recoverable via the recall tool,
+/// tagged `context-offload`) and replace it with a short in-context summary.
+fn handle_compact(backend: &Backend, session: &mut Session) {
+    match crate::context::plan_compaction(&session.history, crate::context::KEEP_RECENT_MSGS) {
+        Some(plan) => {
+            if let Some(db) = &session.db {
+                let _ = db.remember(&plan.offload, Some("context-offload"));
+            }
+            let dropped = plan.dropped;
+            crate::context::apply_compaction(&mut session.history, &plan);
+            session.context_used = crate::context::estimate_history_tokens(&session.history);
+            let window = backend.context_window();
+            let pct = if window > 0 { session.context_used * 100 / window } else { 0 };
+            println!(
+                "compacted — {dropped} message(s) offloaded to memory (recall \"context-offload\"); context now ~{pct}%"
+            );
+        }
+        None => println!("nothing to compact yet — the conversation is short"),
+    }
+}
+
+/// `:memories [organize]` — show the stored-memory count, or run an organization
+/// (dedup) pass that prunes duplicate memories from the SQLite store.
+fn handle_memories(sub: Option<&str>, session: &Session) {
+    let Some(db) = &session.db else {
+        println!("memory store unavailable");
+        return;
+    };
+    match sub {
+        Some("organize" | "organise" | "gc" | "dedup") => match db.organize_memories() {
+            Ok(n) => println!(
+                "organized — {n} duplicate memory(ies) pruned ({} remain)",
+                db.memory_count().unwrap_or(0)
+            ),
+            Err(e) => println!("organize failed: {e:#}"),
+        },
+        _ => {
+            let n = db.memory_count().unwrap_or(0);
+            println!("{n} stored memories · :memories organize to dedup/consolidate");
+        }
+    }
+}
+
 /// Returns true when the REPL should exit.
 async fn handle_colon(
     cmd: &str,
@@ -1688,6 +1757,9 @@ async fn handle_colon(
                  :mcp tools [name]                   list MCP tools\n\
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
+                 :context                            show context-window usage (tokens, %, memories)\n\
+                 :compact                            offload older history to long-term memory now\n\
+                 :memories [organize]                list stored memories, or dedup them\n\
                  :update                             check GitHub for a newer release and upgrade\n\
                  :batch <on|off|status|clear>        interactive batch mode: agent offloads deferrable\n\
                                                      work to background Anthropic batches (Opus, ~50%\n\
@@ -2096,6 +2168,9 @@ async fn handle_colon(
         Some("batch") => handle_batch(parts.next(), parts.next(), session),
         Some("update") => handle_update(pending_update, session).await,
         Some("mcp") => handle_mcp(parts.collect(), session).await,
+        Some("context") => handle_context(backend, session),
+        Some("compact") => handle_compact(backend, session),
+        Some("memories" | "memory") => handle_memories(parts.next(), session),
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
     }
@@ -2873,7 +2948,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         // commands starting with 'm': mcp, mode, model.
-        assert_eq!(names("m"), vec!["mcp", "mode", "model"]);
+        assert_eq!(names("m"), vec!["mcp", "memories", "mode", "model"]);
         // typing m -> o -> d -> e -> l narrows mcp/mode/model down to just model
         assert_eq!(names("mo"), vec!["mode", "model"]);
         assert_eq!(names("mod"), vec!["mode", "model"]);

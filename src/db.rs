@@ -13,6 +13,10 @@ use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// Run a memory-organization (dedup) pass every Nth `remember`, so the store
+/// self-prunes near-identical rows without an explicit command. Best-effort.
+const ORGANIZE_EVERY: i64 = 25;
+
 pub struct Db {
     conn: Connection,
 }
@@ -102,7 +106,14 @@ impl Db {
             "INSERT INTO memories (content, tags) VALUES (?1, ?2)",
             (content, tags),
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = self.conn.last_insert_rowid();
+        // Periodic self-organization: every ORGANIZE_EVERY writes, prune duplicate
+        // memories so the store doesn't accumulate near-identical rows. Best-effort
+        // — a failure here must never fail the remember itself.
+        if ORGANIZE_EVERY > 0 && id % ORGANIZE_EVERY == 0 {
+            let _ = self.organize_memories();
+        }
+        Ok(id)
     }
 
     /// Keyword recall (newest first). `query` empty → most recent memories.
@@ -122,6 +133,43 @@ impl Db {
             })
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Number of stored memories.
+    pub fn memory_count(&self) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT count(*) FROM memories", [], |r| r.get(0))?)
+    }
+
+    /// Every stored memory (id ascending) — the input to an organization pass.
+    pub fn all_memories(&self) -> Result<Vec<MemoryRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, content, coalesce(tags, '') FROM memories ORDER BY id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(MemoryRow { id: r.get(0)?, content: r.get(1)?, tags: r.get(2)? })
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Delete one memory (and any paired vector row) by id.
+    pub fn delete_memory(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM memories WHERE id = ?1", [id])?;
+        // The vec0 mirror is unused until an embedder is wired in, but keep the
+        // delete paired so a future embedding never outlives its memory.
+        let _ = self.conn.execute("DELETE FROM vec_memories WHERE memory_id = ?1", [id]);
+        Ok(())
+    }
+
+    /// Organize the memory store: prune exact-duplicate memories, keeping the
+    /// newest of each duplicate set. Returns how many rows were removed.
+    /// Deterministic + idempotent — the dedup decision is the pure [`dedup_plan`].
+    pub fn organize_memories(&self) -> Result<usize> {
+        let rows = self.all_memories()?;
+        let victims = dedup_plan(&rows);
+        for id in &victims {
+            self.delete_memory(*id)?;
+        }
+        Ok(victims.len())
     }
 
     /// Add a tool/command to the persistent always-allow list (idempotent).
@@ -177,6 +225,48 @@ impl Db {
             .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
             .optional()?)
     }
+}
+
+/// One stored memory row — the unit an organization pass operates on.
+#[derive(Debug, Clone)]
+pub struct MemoryRow {
+    pub id: i64,
+    pub content: String,
+    /// Tags carried with the row for completeness (and future tag-aware
+    /// consolidation); dedup keys on `content` today, so this is write-only.
+    #[allow(dead_code)]
+    pub tags: String,
+}
+
+/// Normalize memory content for duplicate detection: trim ends, lowercase, and
+/// collapse internal whitespace runs to a single space. So "User  Prefers Terse"
+/// and "user prefers terse" are recognized as the same memory.
+fn normalize_memory(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
+}
+
+/// Pure dedup plan: given memories in any order, return the ids to DELETE so each
+/// distinct normalized content keeps only its NEWEST row (highest id). The
+/// returned ids are the older duplicates, sorted ascending. Order-independent
+/// and idempotent (re-running on the survivors returns an empty plan).
+pub fn dedup_plan(rows: &[MemoryRow]) -> Vec<i64> {
+    use std::collections::HashMap;
+    // normalized content -> highest id seen (the keeper).
+    let mut keeper: HashMap<String, i64> = HashMap::new();
+    for r in rows {
+        let key = normalize_memory(&r.content);
+        let slot = keeper.entry(key).or_insert(r.id);
+        if r.id > *slot {
+            *slot = r.id;
+        }
+    }
+    let mut victims: Vec<i64> = rows
+        .iter()
+        .filter(|r| keeper.get(&normalize_memory(&r.content)).copied() != Some(r.id))
+        .map(|r| r.id)
+        .collect();
+    victims.sort_unstable();
+    victims
 }
 
 /// One persisted background batch job (the `model` column is recorded but not
@@ -720,6 +810,48 @@ mod tests {
         assert_eq!(reopened.pending_message_count("run_2").unwrap(), 0);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dedup_plan_keeps_newest_of_each_duplicate() {
+        let rows = vec![
+            MemoryRow { id: 1, content: "user prefers terse replies".into(), tags: "".into() },
+            // Same content modulo case + whitespace → a duplicate of #1.
+            MemoryRow { id: 2, content: "User Prefers  Terse Replies".into(), tags: "pref".into() },
+            MemoryRow { id: 3, content: "project is a rust shell".into(), tags: "".into() },
+        ];
+        // Keeps the newest of the dup pair (id 2) + the distinct id 3; deletes id 1.
+        assert_eq!(dedup_plan(&rows), vec![1]);
+        // Idempotent: running again on the survivors removes nothing.
+        let survivors: Vec<MemoryRow> = rows.into_iter().filter(|r| r.id != 1).collect();
+        assert!(dedup_plan(&survivors).is_empty());
+        // No duplicates → empty plan.
+        let distinct = vec![
+            MemoryRow { id: 1, content: "a".into(), tags: "".into() },
+            MemoryRow { id: 2, content: "b".into(), tags: "".into() },
+        ];
+        assert!(dedup_plan(&distinct).is_empty());
+    }
+
+    #[test]
+    fn organize_memories_prunes_duplicates_in_store() {
+        let db = temp_db("organize");
+        db.remember("hello world", None).unwrap();
+        db.remember("HELLO   world", Some("greet")).unwrap(); // dup of the first
+        db.remember("a distinct fact", None).unwrap();
+        assert_eq!(db.memory_count().unwrap(), 3);
+
+        let removed = db.organize_memories().unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(db.memory_count().unwrap(), 2);
+
+        // The surviving duplicate is the NEWEST row (the tagged one); recall it.
+        let hits = db.recall("hello", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].contains("greet"));
+
+        // Idempotent — a second pass removes nothing.
+        assert_eq!(db.organize_memories().unwrap(), 0);
     }
 
     #[test]

@@ -84,6 +84,11 @@ pub struct Session {
     /// keeps `a` working even when the persistent store is unavailable (AC3).
     /// Populated on every 'a' answer and consulted before the DB.
     pub session_allows: HashSet<String>,
+    /// Running estimate of how many tokens the current `history` occupies in the
+    /// model's context window — updated after each turn from the backend's
+    /// reported usage (or a char-based estimate). Drives auto-compaction and the
+    /// `:context` readout. Starts at 0 (no turn taken yet). Session-local.
+    pub context_used: usize,
     /// Interactive background mode (on by default, persisted; toggle with `:batch`).
     /// When on, the agent gets the run_in_background/background_status tools and a
     /// system-prompt nudge to offload deferrable work to a full background
@@ -165,6 +170,7 @@ impl Session {
             jobs: Default::default(),
             last_status: 0,
             session_allows: HashSet::new(),
+            context_used: 0,
             batch_mode: true,
             batch_model: crate::batch::DEFAULT_BATCH_MODEL.to_string(),
             batch_jobs: Default::default(),

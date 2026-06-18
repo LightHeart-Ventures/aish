@@ -1,5 +1,6 @@
 mod backend;
 mod batch;
+mod context;
 mod coordinator;
 mod db;
 mod engine;
