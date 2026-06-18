@@ -312,27 +312,12 @@ pub async fn run(
         }
         // We're about to idle at the prompt — let the presenter flush results.
         busy.store(false, Ordering::SeqCst);
-        // In-memory background jobs owned by THIS session: Anthropic batches
-        // plus re-exec'd worker subprocesses (run_in_background / :dispatch).
-        let mut running = crate::batch::running_count(&session.batch_jobs)
-            + crate::worker::running_count(&session.worker_jobs);
-        // Plus durable coordinator runs the in-memory tallies miss — goal-loop
-        // generator turns, runs launched from another session, and runs
-        // reattached after a restart live ONLY in the coordinator store. Counting
-        // their non-terminal rows (deduped against this session's in-memory
-        // worker ids) keeps the prompt badge in agreement with `:workers`, which
-        // already lists them. This is the fix for "`:workers` shows coordinating
-        // tasks but the prompt has no activity indicator".
-        if let Some(store) = &session.coordinator_store {
-            let in_memory: std::collections::HashSet<String> = session
-                .worker_jobs
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|w| w.id.clone())
-                .collect();
-            running += crate::coordinator::active_store_count(store, &in_memory);
-        }
+        // Combined background-job tally — Anthropic batches + re-exec'd workers
+        // + durable coordinator runs the in-memory tallies miss (goal-loop turns,
+        // other-session runs, runs reattached after a restart). This is the ⟳N
+        // badge count; `:update` reuses the SAME helper to warn about version
+        // skew before swapping the binary (ISS-2045).
+        let running = background_running_count(&session);
         // Colour the ⟳N badge by the most recent background-worker event
         // (green ✓ tool success, red ✗ tool failure, magenta ⟳ turn
         // completion), fading back to dim ⟳N after worker::PULSE_FADE.
@@ -2094,6 +2079,53 @@ async fn handle_colon(
 /// `:update` checks GitHub for a newer release and, with confirmation, installs
 /// it via the `gh` CLI. A pending update discovered at startup is used directly;
 /// otherwise a fresh check runs on demand. Yolo mode skips the confirm.
+/// Combined count of background work still tied to THIS aish binary: in-memory
+/// Anthropic batches + re-exec'd workers (`run_in_background` / `:dispatch`),
+/// plus durable coordinator runs the in-memory tallies miss (goal-loop turns,
+/// runs launched from another session, runs reattached after a restart). This
+/// is the exact tally the prompt's ⟳N badge shows; `:update` reuses it to gate
+/// the version-skew warning (ISS-2045). Batches are counted too — they're
+/// durable + reattach, so they aren't a *data-loss* risk, but their local
+/// polling task still runs in this (about-to-be-stale) parent.
+fn background_running_count(session: &Session) -> usize {
+    let batches = crate::batch::running_count(&session.batch_jobs);
+    let workers = crate::worker::running_count(&session.worker_jobs);
+    let coordinators = session.coordinator_store.as_ref().map_or(0, |store| {
+        let in_memory: std::collections::HashSet<String> = session
+            .worker_jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|w| w.id.clone())
+            .collect();
+        crate::coordinator::active_store_count(store, &in_memory)
+    });
+    combined_running_count(batches, workers, coordinators)
+}
+
+/// Sum the three background-job tallies (batches, workers, durable coordinators)
+/// into the combined "still on the current binary" count the `:update` skew gate
+/// checks. Pure over the tallies so it's unit-testable (ISS-2045 AC6).
+fn combined_running_count(batches: usize, workers: usize, coordinators: usize) -> usize {
+    batches + workers + coordinators
+}
+
+/// Build the `:update` confirmation prompt. With background jobs still on the
+/// current binary (`running > 0`) it spells out the version-skew consequence and
+/// names the count so the user makes an informed choice before the atomic binary
+/// swap (ISS-2045); with none it's the plain install confirm (behavior
+/// unchanged). Pure over the count + version for unit-testing.
+fn update_confirm_prompt(running: usize, version: &str) -> String {
+    if running == 0 {
+        format!("download and install aish {version}?")
+    } else {
+        let plural = if running == 1 { "" } else { "s" };
+        format!(
+            "\u{26a0} {running} background job{plural} (workers/batches/coordinators) still on the current binary. Updating now leaves them on the OLD version while new work spawns on the NEW one (version skew). Download and install aish {version} anyway?"
+        )
+    }
+}
+
 async fn handle_update(
     pending_update: &mut Option<crate::update::UpdateInfo>,
     session: &Session,
@@ -2124,9 +2156,16 @@ async fn handle_update(
         info.version,
         crate::update::current_version()
     );
+    // Count background work still on the current binary BEFORE the swap. When any
+    // is in flight, an atomic `perform` would leave a mixed-version fleet — the
+    // parent + already-spawned children on the old inode, anything spawned after
+    // on the new one — so we surface the skew and require an explicit confirm
+    // (ISS-2045). With nothing running, the prompt is the unchanged single
+    // confirm. Yolo mode proceeds without asking either way.
+    let running = background_running_count(session);
     let go = session.mode == crate::session::Mode::Yolo
         || matches!(
-            confirm_tty(&format!("download and install aish {}?", info.version)),
+            confirm_tty(&update_confirm_prompt(running, &info.version)),
             tools::Decision::AllowOnce | tools::Decision::AlwaysAllow
         );
     if !go {
@@ -2137,6 +2176,15 @@ async fn handle_update(
     if let Err(e) = crate::update::perform(&info).await {
         println!("\x1b[31mupdate failed:\x1b[0m {e:#}");
         *pending_update = Some(info);
+        return;
+    }
+    // The swap took effect on disk but in-flight jobs keep running the OLD inode;
+    // the new binary applies on next launch. Remind the user when skew is live.
+    if running > 0 {
+        let plural = if running == 1 { "" } else { "s" };
+        println!(
+            "\x1b[33mnote:\x1b[0m {running} background job{plural} still on the old binary — the new version applies to work started after the next restart."
+        );
     }
 }
 
@@ -2837,6 +2885,40 @@ mod tests {
         assert!(mentions_troubleshoot("auto-troubleshooting the worker")); // substring
         assert!(!mentions_troubleshoot("trouble with the shooter"));
         assert!(!mentions_troubleshoot("ls -la"));
+    }
+
+    // ---- ISS-2045: :update running-job skew gate ------------------------
+    #[test]
+    fn combined_running_count_sums_the_three_tallies() {
+        // Pure sum over (batches, workers, coordinators) — the count the skew
+        // gate thresholds on.
+        assert_eq!(combined_running_count(0, 0, 0), 0);
+        assert_eq!(combined_running_count(1, 0, 0), 1); // batch alone counts
+        assert_eq!(combined_running_count(0, 2, 0), 2); // workers alone
+        assert_eq!(combined_running_count(0, 0, 3), 3); // durable coordinators alone
+        assert_eq!(combined_running_count(2, 3, 4), 9); // all three
+    }
+
+    #[test]
+    fn update_confirm_prompt_warns_only_when_jobs_running() {
+        // Count 0 → plain confirm, behavior unchanged (AC3).
+        let calm = update_confirm_prompt(0, "0.5.0");
+        assert_eq!(calm, "download and install aish 0.5.0?");
+        assert!(!calm.contains("skew"));
+
+        // Count > 0 → explicit skew warning that NAMES the count and the
+        // consequence (AC2/AC4), and still carries the version.
+        let warn = update_confirm_prompt(3, "0.5.0");
+        assert!(warn.contains('3'), "warning must name the count: {warn}");
+        assert!(warn.contains("version skew"), "warning must name the consequence: {warn}");
+        assert!(warn.to_lowercase().contains("old"));
+        assert!(warn.contains("0.5.0"));
+        // Mentions every job class so batches are counted for skew (AC5).
+        assert!(warn.contains("workers/batches/coordinators"));
+
+        // Singular vs plural agreement on the job noun.
+        assert!(update_confirm_prompt(1, "1.0.0").contains("job "));
+        assert!(update_confirm_prompt(2, "1.0.0").contains("jobs "));
     }
 
     // Snapshot of the three pure routing heuristics — `!`/`?` force routing,
