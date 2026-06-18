@@ -62,6 +62,14 @@ pub struct Turn {
     /// the model the corrective note in `text` instead of treating the empty
     /// `tool_calls` as a final answer — so it can retry with a smaller edit.
     pub truncated_tool_call: bool,
+    /// Set when the response hit the output limit on PLAIN TEXT (no tool call) —
+    /// the visible answer was cut off mid-stream. The agentic loop continues the
+    /// answer via an assistant-PREFILL round (the partial text is left as the
+    /// trailing assistant message and the model resumes it; chunks are merged)
+    /// rather than returning a half-finished reply. Mutually exclusive with
+    /// `truncated_tool_call` (a turn either dropped a partial tool call or had
+    /// its prose cut — not both). See `engine::run_turn`.
+    pub truncated_text: bool,
 }
 
 /// A tool definition in neutral form (JSON Schema input).
@@ -124,6 +132,16 @@ impl Backend {
             #[cfg(feature = "local")]
             Backend::Local(b) => b.complete(system, history, tools).await,
         }
+    }
+
+    /// Whether this backend can resume a truncated PLAIN-TEXT answer via an
+    /// assistant-prefill continuation round. Claude's Messages API resumes a
+    /// trailing assistant message verbatim, so the engine continues cut-off
+    /// answers there. The OpenAI-shaped chat-completions backends (Grok, local)
+    /// don't have well-defined assistant-prefill continuation, so they keep the
+    /// in-band "[response truncated]" note instead of risking a re-answer loop.
+    pub fn supports_prefill_continuation(&self) -> bool {
+        matches!(self, Backend::Claude(_))
     }
 
     pub fn describe(&self) -> String {

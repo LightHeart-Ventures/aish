@@ -159,7 +159,7 @@ impl LocalBackend {
             })
             .collect();
 
-        Ok(Turn { text, tool_calls, raw: None, truncated_tool_call: false })
+        Ok(Turn { text, tool_calls, raw: None, truncated_tool_call: false, truncated_text: false })
     }
 }
 
