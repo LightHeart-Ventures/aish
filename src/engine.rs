@@ -49,6 +49,10 @@ pub async fn run_turn(
     // output so a prompt like "summarize that" can reference it without
     // re-running. Mid-conversation the output is already in `history`, so we
     // don't duplicate it.
+    // Context-awareness: before adding this turn, compact the conversation if it
+    // has grown past the window threshold — offloading the oldest slice to the
+    // SQLite memories table and replacing it with a short in-context summary.
+    maybe_compact(backend, session);
     let input = seed_context(session.history.is_empty(), session.last_output(), input);
     session.history.push(Msg::user(input));
     session.last_turn_tools.clear();
@@ -76,6 +80,14 @@ pub async fn run_turn(
         let turn = backend.complete(&system, &session.history, &tool_defs).await;
         drop(spinner);
         let turn = turn?;
+        let usage = turn.usage;
+
+        // Update the running context figure from the backend's reported usage
+        // (the prompt the model just saw), or a char-based estimate as a fallback.
+        session.context_used = match usage {
+            Some(u) => u.total(),
+            None => crate::context::estimate_history_tokens(&session.history),
+        };
 
         if continuing {
             // Prefill-continuation round: fold this chunk into the partial answer
@@ -249,6 +261,42 @@ pub async fn run_coordinator(
             anyhow::bail!("{err}")
         }
     }
+}
+
+/// Before a new turn, compact the conversation when it has grown past the
+/// context-window threshold: offload the oldest slice to the SQLite `memories`
+/// table (recoverable via the `recall` tool, tagged `context-offload`) and
+/// replace it in-context with a short summary message. Keeps long, agentic
+/// sessions — interactive and headless coordinator alike — from overflowing the
+/// model's window. A no-op until usage is known (`context_used` > 0) and the
+/// conversation is long enough to split on a safe assistant boundary.
+fn maybe_compact(backend: &Backend, session: &mut Session) {
+    let window = backend.context_window();
+    if !crate::context::should_compact(
+        session.context_used,
+        window,
+        crate::context::COMPACT_THRESHOLD_PCT,
+    ) {
+        return;
+    }
+    let Some(plan) =
+        crate::context::plan_compaction(&session.history, crate::context::KEEP_RECENT_MSGS)
+    else {
+        return;
+    };
+    // Offload the dropped transcript to durable memory BEFORE mutating history,
+    // so nothing is lost even if the process dies right after.
+    if let Some(db) = &session.db {
+        let _ = db.remember(&plan.offload, Some("context-offload"));
+    }
+    let dropped = plan.dropped;
+    crate::context::apply_compaction(&mut session.history, &plan);
+    // Exact next-turn usage isn't known yet; re-seat the figure from an estimate.
+    session.context_used = crate::context::estimate_history_tokens(&session.history);
+    eprintln!(
+        "\x1b[2maish: context at/over {}% — compacted {dropped} earlier message(s) to memory\x1b[0m",
+        crate::context::COMPACT_THRESHOLD_PCT
+    );
 }
 
 /// Print the model's interim narration. In an interactive session it goes out

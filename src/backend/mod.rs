@@ -62,6 +62,11 @@ pub struct Turn {
     /// the model the corrective note in `text` instead of treating the empty
     /// `tool_calls` as a final answer — so it can retry with a smaller edit.
     pub truncated_tool_call: bool,
+    /// Token usage the backend reported for this completion, when available.
+    /// Drives context-window awareness + compaction (see `crate::context`).
+    /// `None` when the backend doesn't report usage; the engine then falls
+    /// back to a char-based estimate.
+    pub usage: Option<crate::context::Usage>,
     /// Set when the response hit the output limit on PLAIN TEXT (no tool call) —
     /// the visible answer was cut off mid-stream. The agentic loop continues the
     /// answer via an assistant-PREFILL round (the partial text is left as the
@@ -150,6 +155,17 @@ impl Backend {
             Backend::Grok(b) => format!("grok ({} · {})", b.model, b.auth_label()),
             #[cfg(feature = "local")]
             Backend::Local(b) => format!("local ({} · in-process)", b.file),
+        }
+    }
+
+    /// The model's approximate context window (tokens) — what the engine and
+    /// `:context` measure usage against to decide when to compact history.
+    pub fn context_window(&self) -> usize {
+        match self {
+            Backend::Claude(b) => crate::context::context_window(&b.model),
+            Backend::Grok(b) => crate::context::context_window(&b.model),
+            #[cfg(feature = "local")]
+            Backend::Local(_) => crate::context::context_window("local"),
         }
     }
 

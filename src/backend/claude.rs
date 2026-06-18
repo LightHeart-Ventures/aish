@@ -278,7 +278,18 @@ same oversized call.]",
         }
     }
 
-    Ok(Turn { text, tool_calls, raw, truncated_tool_call, truncated_text })
+    let usage = v.get("usage").map(|u| {
+        let g = |k: &str| u.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+        // Sum the plain + cached input buckets so the figure reflects the FULL
+        // prompt the model saw, not just the uncached remainder.
+        crate::context::Usage {
+            input_tokens: g("input_tokens")
+                + g("cache_read_input_tokens")
+                + g("cache_creation_input_tokens"),
+            output_tokens: g("output_tokens"),
+        }
+    });
+    Ok(Turn { text, tool_calls, raw, truncated_tool_call, usage, truncated_text })
 }
 
 /// Render normalized history into Claude wire messages.
@@ -426,6 +437,27 @@ mod tests {
         let last = msgs.last().unwrap();
         let text = last["content"][0]["text"].as_str().unwrap();
         assert_eq!(text, "resume me", "trailing whitespace stripped on the prefill message");
+    }
+
+    #[test]
+    fn parse_response_captures_usage_including_cache_buckets() {
+        let v = json!({
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": {
+                "input_tokens": 100,
+                "cache_read_input_tokens": 900,
+                "cache_creation_input_tokens": 50,
+                "output_tokens": 20
+            }
+        });
+        let turn = parse_response(&v).unwrap();
+        let u = turn.usage.expect("usage parsed");
+        assert_eq!(u.input_tokens, 1050); // 100 + 900 + 50
+        assert_eq!(u.output_tokens, 20);
+        // A response with no usage block leaves it None.
+        let bare = json!({"stop_reason": "end_turn", "content": [{"type":"text","text":"x"}]});
+        assert!(parse_response(&bare).unwrap().usage.is_none());
     }
 
     // Credentials. Built directly (not via resolve) so the tests never depend on
