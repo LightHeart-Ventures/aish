@@ -52,6 +52,11 @@ struct Args {
     #[arg(long)]
     update: bool,
 
+    /// Login shell: source profiles and become a session leader. Also implied
+    /// by an argv[0] beginning with `-` (e.g. `-aish`), the classic convention.
+    #[arg(short = 'l', long = "login")]
+    login: bool,
+
     /// Run headless as a background coordinator: like -c, but AWAIT all
     /// background batch jobs before exiting (plain -c would orphan them). Runs
     /// unattended in yolo mode. Requires --run-id. This is how aish re-execs
@@ -133,6 +138,18 @@ async fn main() -> Result<()> {
     timer.mark("rc::load");
     let mut session = session::Session::new()?;
     timer.mark("Session::new");
+    // Login-shell semantics (S4.4 / TASK-127): honor `-l`/`--login` and the
+    // classic dash-argv0 convention. A login shell becomes a session leader
+    // owning a fresh controlling tty; profile sourcing (S4.5) keys off this.
+    let argv0 = std::env::args().next().unwrap_or_default();
+    session.login = session::is_login_invocation(args.login, &argv0);
+    if session.login {
+        // Best-effort: setsid() returns EPERM when we are already a process-
+        // group leader (the common case under a normal exec) — ignore that and
+        // never abort startup on failure.
+        // SAFETY: setsid() takes no arguments and only affects this process.
+        unsafe { libc::setsid(); }
+    }
     session.env = rc.env;
     // Shell identity (S4.6 / TASK-129): expose the running shell + its pids so
     // spawned children and `$VAR` dispatch see them, and login tooling (`chsh`)
