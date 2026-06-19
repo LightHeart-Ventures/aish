@@ -188,8 +188,8 @@ impl Session {
 
     /// Set a session environment variable (last-wins), replacing any existing
     /// entries with the same key so every spawned child sees exactly one value.
-    /// The in-process env-mutating builtins (`set`, `cd` updating `$PWD`) keep
-    /// the per-spawn env coherent through this.
+    /// This is how the in-process env-mutating builtins (`set`, `unset`, and `cd`
+    /// updating `$PWD`/`$OLDPWD`) keep the per-spawn env coherent.
     pub fn set_var(&mut self, key: &str, value: impl Into<String>) {
         let value = value.into();
         self.env.retain(|(k, _)| k != key);
