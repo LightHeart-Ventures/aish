@@ -143,14 +143,32 @@ async fn main() -> Result<()> {
     // owning a fresh controlling tty; profile sourcing (S4.5) keys off this.
     let argv0 = std::env::args().next().unwrap_or_default();
     session.login = session::is_login_invocation(args.login, &argv0);
+    // The aliases + per-spawn env the session runs with. For a non-login shell
+    // these are just ~/.aishrc's; a login shell layers ~/.aishrc OVER the profile
+    // files below. The rc fields are consumed into these owners either way.
+    let (mut aliases, mut env) = (rc.aliases, rc.env);
     if session.login {
         // Best-effort: setsid() returns EPERM when we are already a process-
         // group leader (the common case under a normal exec) — ignore that and
         // never abort startup on failure.
         // SAFETY: setsid() takes no arguments and only affects this process.
         unsafe { libc::setsid(); }
+        // Profile sourcing (S4.5 / TASK-128): source /etc/profile then ~/.profile
+        // BENEATH ~/.aishrc. Profiles are the base layer; ~/.aishrc is overlaid on
+        // top, so a name set in both resolves to the ~/.aishrc value — the
+        // "/etc/profile → ~/.profile → ~/.aishrc" precedence the card specifies.
+        // env is a last-wins list (read in reverse), so appending the rc env after
+        // the profile env makes rc win; aliases overlay by name for the same effect.
+        let profiles = rc::load_login_profiles();
+        let mut merged_env = profiles.env;
+        merged_env.extend(env);
+        env = merged_env;
+        let mut merged_aliases = profiles.aliases;
+        merged_aliases.extend(aliases);
+        aliases = merged_aliases;
+        timer.mark("profiles sourced");
     }
-    session.env = rc.env;
+    session.env = env;
     let backend = match args.backend.as_str() {
         "claude" => {
             let cred = backend::claude::Credential::resolve(&session.env)?;
@@ -289,7 +307,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    repl::run(backend, session, rc.aliases, mcp_paths, skills_dir).await
+    repl::run(backend, session, aliases, mcp_paths, skills_dir).await
 }
 
 fn aish_dir() -> PathBuf {
