@@ -3,6 +3,7 @@ mod batch;
 mod context;
 mod coordinator;
 mod db;
+mod editor;
 mod engine;
 mod goal;
 mod jobs;

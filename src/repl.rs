@@ -5,17 +5,12 @@ use crate::rc;
 use crate::session::Session;
 use crate::tools;
 use anyhow::Result;
+use crate::editor::{LineEditor, ReadOutcome};
 use rustyline::completion::{Completer, Pair};
-use rustyline::error::ReadlineError;
-use rustyline::ExternalPrinter;
 use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::Hinter;
-use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
-use rustyline::{
-    Cmd, ConditionalEventHandler, Context, Editor, Event, EventContext, EventHandler, Helper,
-    KeyCode, KeyEvent, Modifiers, Movement, RepeatCount,
-};
+use rustyline::{Context, Helper};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -159,40 +154,14 @@ pub async fn run(
         };
     let mut pending_update: Option<crate::update::UpdateInfo> = None;
 
-    // List-style completion with the whole candidate menu shown on the first
-    // trigger (not the rustyline default of silently cycling one candidate at a
-    // time). TAB on a `:` prefix lists the matching `:`-commands; the live,
-    // as-you-type command palette is rendered by the Hinter (see `palette_hint`),
-    // which redraws the menu in place without re-printing the prompt.
-    let config = rustyline::Config::builder()
-        .completion_type(rustyline::CompletionType::List)
-        .completion_show_all_if_ambiguous(true)
-        .build();
-    let mut rl: Editor<AishHelper, DefaultHistory> = Editor::with_config(config)?;
-    rl.set_helper(Some(AishHelper {
-        cwd: session.cwd.clone(),
-        path: session_path(&session),
-        aliases: aliases.clone(),
-        cmd_cache: Arc::new(Mutex::new(None)),
-    }));
-    let history_path = dirs_history_path();
-    let _ = rl.load_history(&history_path);
-
-    // Ctrl-O toggles raw tool output. The handler can't reach the Session, so
-    // it just flags the request and bails out of the line editor (Interrupt);
-    // the loop below performs the toggle, status line, and retroactive reveal.
-    let raw_toggle = Arc::new(AtomicBool::new(false));
-    rl.bind_sequence(
-        KeyEvent::ctrl('O'),
-        EventHandler::Conditional(Box::new(CtrlOToggle { pending: raw_toggle.clone() })),
-    );
-
-    // Esc clears the current input line (a harmless no-op when it's already
-    // empty, so it only clears when there's text to clear).
-    rl.bind_sequence(
-        KeyEvent(KeyCode::Esc, Modifiers::NONE),
-        EventHandler::Simple(Cmd::Kill(Movement::WholeBuffer)),
-    );
+    // The line editor is driven through the `LineEditor` trait (S5.1/TASK-130)
+    // so the concrete editor — rustyline today, reedline-capable tomorrow — is a
+    // one-line swap at this construction site. The rustyline impl configures
+    // list-style completion (the whole candidate menu on the first TAB), installs
+    // the `AishHelper` (completion + the live `:`-palette Hinter + the
+    // route-preview Highlighter), loads history, and binds Ctrl-O / Esc.
+    let helper = AishHelper::new(session.cwd.clone(), session_path(&session), aliases.clone());
+    let mut editor = crate::editor::RustylineEditor::new(helper, dirs_history_path())?;
 
     // The `:`-command palette renders live as an inline hint below the prompt
     // (see `palette_hint` and the Hinter impl): type `:` and the menu appears,
@@ -222,7 +191,7 @@ pub async fn run(
     // or the user's typing. ExternalPrinter redraws the prompt after printing.
     // If the terminal can't provide a printer, we leave inline printing on.
     let busy = Arc::new(AtomicBool::new(false));
-    if let Ok(mut printer) = rl.create_external_printer() {
+    if let Some(mut printer) = editor.take_printer() {
         crate::present::enable_deferred();
         let busy = busy.clone();
         let batch_jobs = session.batch_jobs.clone();
@@ -276,9 +245,7 @@ pub async fn run(
             needs_gap = false;
         }
         // Tab completion resolves against the session's cwd, which `cd` mutates.
-        if let Some(h) = rl.helper_mut() {
-            h.cwd.clone_from(&session.cwd);
-        }
+        editor.set_cwd(&session.cwd);
         // We're about to idle at the prompt — let the presenter flush results.
         busy.store(false, Ordering::SeqCst);
         // Combined background-job tally — Anthropic batches + re-exec'd workers
@@ -297,13 +264,13 @@ pub async fn run(
             None => String::new(),
         };
         let prompt = format!("{name}{badge}\x1b[36m{}\x1b[0m ❯ ", short_cwd(&session));
-        match rl.readline(&prompt) {
-            Ok(line) => {
+        match editor.read_line(&prompt) {
+            ReadOutcome::Line(line) => {
                 let line = line.trim().to_string();
                 if line.is_empty() {
                     continue;
                 }
-                let _ = rl.add_history_entry(&line);
+                editor.add_history(&line);
                 needs_gap = true;
                 // Now working — hold background results until the next pause.
                 busy.store(true, Ordering::SeqCst);
@@ -392,16 +359,14 @@ pub async fn run(
                     }
                 }
             }
-            Err(ReadlineError::Interrupted) => {
-                // Ctrl-O routes here too (handler returns Interrupt); distinguish
-                // it from a plain Ctrl-C clear-line via the toggle flag.
-                if raw_toggle.swap(false, Ordering::SeqCst) {
-                    toggle_raw_output(&mut session);
-                }
+            ReadOutcome::CtrlO => {
+                // The Ctrl-O key handler requested a raw-output toggle; perform it.
+                toggle_raw_output(&mut session);
                 continue;
             }
-            Err(ReadlineError::Eof) => break,            // Ctrl-D: exit
-            Err(e) => {
+            ReadOutcome::Interrupted => continue, // Ctrl-C: clear the line, loop
+            ReadOutcome::Eof => break,            // Ctrl-D: exit
+            ReadOutcome::Error(e) => {
                 eprintln!("aish: readline error: {e}");
                 break;
             }
@@ -412,7 +377,7 @@ pub async fn run(
     // hang them up (SIGCONT + SIGHUP) so they terminate with the shell (TASK-123).
     tools::hangup_jobs_on_exit(&session.jobs);
 
-    let _ = rl.save_history(&history_path);
+    editor.save_history();
     println!("bye");
     Ok(())
 }
@@ -421,7 +386,7 @@ pub async fn run(
 // Tab completion — filenames and directories, against the session's cwd
 // ---------------------------------------------------------------------------
 
-struct AishHelper {
+pub(crate) struct AishHelper {
     cwd: PathBuf,
     /// Session PATH (rc exports + process PATH) used for command-name completion.
     path: String,
@@ -429,6 +394,26 @@ struct AishHelper {
     aliases: Arc<HashMap<String, Vec<String>>>,
     /// Lazily-populated, TTL-refreshed cache of executable names on PATH.
     cmd_cache: Arc<Mutex<Option<CmdCache>>>,
+}
+
+impl AishHelper {
+    /// Build the helper that backs completion, the live `:`-palette Hinter, and
+    /// the route-preview Highlighter. `path` is the session PATH (rc exports +
+    /// process PATH); the PATH-scan cache starts empty.
+    pub(crate) fn new(
+        cwd: PathBuf,
+        path: String,
+        aliases: Arc<HashMap<String, Vec<String>>>,
+    ) -> Self {
+        Self { cwd, path, aliases, cmd_cache: Arc::new(Mutex::new(None)) }
+    }
+
+    /// Re-point completion/highlighting at `cwd` (the session's cwd, which `cd`
+    /// mutates between reads).
+    pub(crate) fn set_cwd(&mut self, cwd: &Path) {
+        self.cwd.clear();
+        self.cwd.push(cwd);
+    }
 }
 
 /// Builtins aish handles itself — always offered as command-name completions.
@@ -551,7 +536,7 @@ fn palette_hint(line: &str, pos: usize) -> Option<String> {
 /// input. Unlike rustyline's blanket `AsRef<str>` Hint impl, `completion()`
 /// returns `None`, so Right-arrow / End never insert the menu text into the
 /// line buffer — the hint is purely visual.
-struct PaletteHint(String);
+pub(crate) struct PaletteHint(String);
 
 impl rustyline::hint::Hint for PaletteHint {
     fn display(&self) -> &str {
@@ -1680,20 +1665,6 @@ pub(crate) fn resolve_program(cmd: &str, cwd: &Path, path_var: &str) -> Option<P
     None
 }
 
-/// Ctrl-O key handler: signal a raw-output toggle and leave the line editor so
-/// the run loop can act on it. Returns `Cmd::Interrupt` to discard the typed
-/// line without submitting it.
-struct CtrlOToggle {
-    pending: Arc<AtomicBool>,
-}
-
-impl ConditionalEventHandler for CtrlOToggle {
-    fn handle(&self, _: &Event, _: RepeatCount, _: bool, _: &EventContext) -> Option<Cmd> {
-        self.pending.store(true, Ordering::SeqCst);
-        Some(Cmd::Interrupt)
-    }
-}
-
 /// Flip raw tool output, print one-line status, and — when switching on —
 /// reveal the most recent turn's raw results.
 fn toggle_raw_output(session: &mut Session) {
@@ -2703,6 +2674,7 @@ fn dirs_history_path() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustyline::history::DefaultHistory;
 
     // S4.2 — `source` folds a file's exports into the session env.
     #[test]
