@@ -471,7 +471,8 @@ struct AishHelper {
 }
 
 /// Builtins aish handles itself — always offered as command-name completions.
-const BUILTINS: &[&str] = &["cd", "exit", "logout", "jobs", "fg", "bg", "wait"];
+const BUILTINS: &[&str] =
+    &["cd", "exit", "logout", "jobs", "fg", "bg", "wait", "source", ".", "exec"];
 
 /// How long a PATH scan stays cached before it's re-scanned (picks up newly
 /// installed binaries without re-statting every PATH dir on each TAB).
@@ -1274,6 +1275,14 @@ async fn dispatch(
             builtin_cd(words.get(1).map(String::as_str), session, prev_dir);
             Dispatch::Handled
         }
+        "source" | "." => {
+            builtin_source(&words[1..], session);
+            Dispatch::Handled
+        }
+        "exec" => {
+            builtin_exec(&words[1..], session);
+            Dispatch::Handled
+        }
         "jobs" => {
             builtin_jobs(session);
             Dispatch::Handled
@@ -1346,6 +1355,88 @@ fn builtin_cd(arg: Option<&str>, session: &mut Session, prev: &mut Option<PathBu
         Ok(c) => eprintln!("cd: {}: not a directory", c.display()),
         Err(e) => eprintln!("cd: {}: {e}", target.display()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// source / . / exec builtins (S4.2)
+// ---------------------------------------------------------------------------
+//
+// A subprocess can't change its parent, so `source`/`.` run in-process: they
+// re-read a file through the same parser ~/.aishrc uses (`rc::parse`) and fold
+// its `export NAME=value` lines into `session.env` (last-wins, so every later
+// spawn sees the new value). `exec` is the opposite — it replaces the aish
+// process image with the named program, mirroring a POSIX shell's `exec`.
+
+/// `source FILE` / `. FILE` — apply FILE's `export`/`alias` lines to the live
+/// session. There is no shell underneath aish, so "sourcing" reuses
+/// `rc::parse`: `export` lines update the session env; functions/conditionals
+/// are ignored just as they are in ~/.aishrc. Aliases are parsed but cannot be
+/// installed at runtime (the alias table is built once at startup), so only the
+/// env exports take effect this session — reported, not silently dropped.
+fn builtin_source(args: &[String], session: &mut Session) {
+    let Some(path) = args.first() else {
+        eprintln!("source: usage: source FILE");
+        session.last_status = 2;
+        return;
+    };
+    let resolved = {
+        let p = std::path::Path::new(path);
+        if p.is_absolute() { p.to_path_buf() } else { session.cwd.join(p) }
+    };
+    let text = match std::fs::read_to_string(&resolved) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("source: {path}: {e}");
+            session.last_status = 1;
+            return;
+        }
+    };
+    let parsed = rc::parse(&text);
+    for (k, v) in parsed.env {
+        // last-wins so later spawns carry the new value (var_lookup reads in rev).
+        session.env.retain(|(k2, _)| k2 != &k);
+        session.env.push((k, v));
+    }
+    if !parsed.aliases.is_empty() {
+        eprintln!(
+            "\x1b[2msource: {path}: applied env exports; {} alias(es) ignored (aliases load at startup)\x1b[0m",
+            parsed.aliases.len()
+        );
+    }
+    session.last_status = 0;
+}
+
+/// `exec CMD [args...]` — replace the aish process image with CMD, the way a
+/// POSIX shell's `exec` does. The session's `export`s and cwd are applied first
+/// (same `.current_dir().envs(session.env)` shape every normal spawn uses), so
+/// the replacement inherits exactly what a spawned child would. With no
+/// argument `exec` is a successful no-op (bash would apply redirections and
+/// return; aish has none). On failure we print the error and set a non-zero
+/// status WITHOUT exiting — `exec` only returns when it could not run the
+/// program, and the shell must survive that.
+fn builtin_exec(args: &[String], session: &mut Session) {
+    use std::os::unix::process::CommandExt;
+    let Some(program) = args.first() else {
+        session.last_status = 0;
+        return;
+    };
+    let path_var = session
+        .env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    let target = resolve_program(program, &session.cwd, &path_var)
+        .unwrap_or_else(|| std::path::PathBuf::from(program));
+    let err = std::process::Command::new(&target)
+        .args(&args[1..])
+        .current_dir(&session.cwd)
+        .envs(session.env.iter().map(|(k, v)| (k, v)))
+        .exec();
+    eprintln!("exec: {program}: {err}");
+    session.last_status = 127;
 }
 
 // ---------------------------------------------------------------------------
@@ -2540,6 +2631,52 @@ fn dirs_history_path() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // S4.2 — `source` folds a file's exports into the session env.
+    #[test]
+    fn source_applies_exports_to_session_env() {
+        let mut session = Session::new().unwrap();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("aish_source_{}.rc", std::process::id()));
+        std::fs::write(&path, "export FOO=bar\nexport BAZ=qux\nalias ll='ls -l'\n").unwrap();
+
+        builtin_source(&[path.to_string_lossy().into_owned()], &mut session);
+        let get = |s: &Session, k: &str| {
+            s.env.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+        };
+        assert_eq!(get(&session, "FOO"), Some("bar".into()));
+        assert_eq!(get(&session, "BAZ"), Some("qux".into()));
+        assert_eq!(session.last_status, 0);
+
+        // Re-sourcing an updated value replaces in place (last-wins, no dupes).
+        std::fs::write(&path, "export FOO=baz\n").unwrap();
+        builtin_source(&[path.to_string_lossy().into_owned()], &mut session);
+        assert_eq!(get(&session, "FOO"), Some("baz".into()));
+        assert_eq!(session.env.iter().filter(|(k, _)| k == "FOO").count(), 1);
+
+        // No argument is a usage error.
+        builtin_source(&[], &mut session);
+        assert_eq!(session.last_status, 2);
+
+        // A missing file is a non-zero status, not a panic.
+        builtin_source(&["/no/such/aish/rc/file".into()], &mut session);
+        assert_ne!(session.last_status, 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // S4.2 — `exec` of a nonexistent program reports and sets a non-zero status
+    // WITHOUT replacing the process (the failure path; a successful exec can't
+    // be unit-tested since it never returns).
+    #[test]
+    fn exec_missing_program_sets_nonzero_status() {
+        let mut session = Session::new().unwrap();
+        builtin_exec(&["this-command-does-not-exist-aish".into()], &mut session);
+        assert_ne!(session.last_status, 0);
+        // No args is a successful no-op.
+        builtin_exec(&[], &mut session);
+        assert_eq!(session.last_status, 0);
+    }
 
     #[test]
     fn path_completion() {

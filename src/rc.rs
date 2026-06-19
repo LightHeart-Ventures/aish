@@ -64,7 +64,7 @@ pub fn load() -> Rc {
     parse(&std::fs::read_to_string(&path).unwrap_or_default())
 }
 
-fn parse(text: &str) -> Rc {
+pub(crate) fn parse(text: &str) -> Rc {
     let mut rc = Rc::default();
     for line in text.lines() {
         let line = line.trim();
