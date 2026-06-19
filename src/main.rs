@@ -24,7 +24,7 @@ mod worker;
 
 use anyhow::Result;
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "aish", about = "An AI-native shell — no bash, just intent")]
@@ -70,12 +70,18 @@ struct Args {
     #[arg(long = "run-id")]
     run_id: Option<String>,
 
-    /// Path to an aish script to run non-interactively, then exit (TASK-17).
-    /// Each line runs as if typed at the prompt; blank lines and `#` comments
-    /// are skipped (so a `#!/usr/bin/env aish` shebang line works). The process
-    /// exits with the status of the last line. Ignored when `-c` is also given.
-    #[arg(value_name = "SCRIPT")]
-    script: Option<PathBuf>,
+    /// Script to run non-interactively, then exit, plus its arguments
+    /// (TASK-17/18). The FIRST value is the script path; the rest are passed
+    /// through as the script's positional parameters `$1`/`$2`/… (with `$0` the
+    /// script path). Each script line runs as if typed at the prompt; blank
+    /// lines and `#` comments are skipped, so a `#!/usr/bin/env aish` shebang
+    /// line works and the kernel's `aish <script> <args…>` invocation is handled
+    /// as-is. The process exits with the status of the last line. Ignored when
+    /// `-c` is given. `trailing_var_arg` + `allow_hyphen_values` collect the
+    /// operands verbatim so a script's own `-flag` args aren't parsed as aish
+    /// flags.
+    #[arg(value_name = "SCRIPT [ARGS…]", trailing_var_arg = true, allow_hyphen_values = true)]
+    script_argv: Vec<String>,
 }
 
 /// Lightweight, env-gated startup phase timer. Enabled by `AISH_TIME_STARTUP=1`
@@ -250,7 +256,7 @@ async fn main() -> Result<()> {
     //   * One-shot (-c / --coordinator / a script) — connect SYNCHRONOUSLY: the
     //     run needs the MCP tools immediately, with no interactive loop to
     //     install them into later.
-    let interactive = args.command.is_none() && args.script.is_none();
+    let interactive = args.command.is_none() && args.script_argv.is_empty();
     if interactive {
         session.skills_prompt =
             skills::render_prompt_section(&skills::load(&skills_dir), &[]);
@@ -331,10 +337,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Script mode (TASK-17): run the file's lines non-interactively and exit with
-    // the status of the last line, like `sh script`.
-    if let Some(path) = args.script {
-        let code = script::run(&backend, &mut session, &path).await?;
+    // Script mode (TASK-17/18): run the file's lines non-interactively and exit
+    // with the status of the last line, like `sh script`. The first operand is
+    // the script path; the remaining ones become the script's positional
+    // parameters ($1/$2/…, with $0 the script path) so an executable
+    // `#!/usr/bin/env aish` script receives the argv the kernel appended (TASK-18).
+    // `normalize_script_argv` smooths the Linux/macOS shebang-argv difference.
+    if let Some((path, script_args)) = normalize_script_argv(&args.script_argv).split_first() {
+        let code = script::run(&backend, &mut session, Path::new(path), script_args).await?;
         std::process::exit(code);
     }
 
@@ -343,4 +353,60 @@ async fn main() -> Result<()> {
 
 fn aish_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".aish")
+}
+
+/// Normalize the script operand vector across the Linux/macOS shebang split
+/// (TASK-18). When the kernel runs a `#!/usr/bin/env aish` script it appends the
+/// script path before the user's args — but the two platforms disagree on the
+/// shape: Linux hands the interpreter `[script, args…]` (path once), while macOS
+/// (XNU) hands it `[script, script, args…]` — the path is duplicated. Collapse a
+/// single leading exact-duplicate so `$0`/`$1`/`$#` line up identically on both.
+/// A normal `aish foo.aish bar` invocation has no duplicate, so this is a no-op
+/// there; the only false-positive is the pathological `aish foo foo`, where the
+/// repeated operand is intentionally treated as the macOS doubling.
+fn normalize_script_argv(argv: &[String]) -> &[String] {
+    match argv {
+        [first, second, ..] if first == second => &argv[1..],
+        _ => argv,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_script_argv;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn normalize_collapses_macos_shebang_duplicate() {
+        // macOS (XNU): the kernel duplicates the script path → collapse to one.
+        let argv = v(&["/tmp/s.aish", "/tmp/s.aish", "alpha", "beta"]);
+        assert_eq!(
+            normalize_script_argv(&argv),
+            &v(&["/tmp/s.aish", "alpha", "beta"])[..]
+        );
+    }
+
+    #[test]
+    fn normalize_leaves_linux_shebang_untouched() {
+        // Linux: the path appears once already → no change.
+        let argv = v(&["/tmp/s.aish", "alpha", "beta"]);
+        assert_eq!(normalize_script_argv(&argv), &argv[..]);
+        // A direct `aish foo.aish` with no args is also untouched.
+        let one = v(&["/tmp/s.aish"]);
+        assert_eq!(normalize_script_argv(&one), &one[..]);
+        // Empty stays empty (no script supplied).
+        let none: Vec<String> = Vec::new();
+        assert_eq!(normalize_script_argv(&none), &none[..]);
+    }
+
+    #[test]
+    fn normalize_only_collapses_a_leading_duplicate() {
+        // A duplicate that is NOT the leading pair (e.g. a real repeated arg)
+        // must survive — only the script-path doubling is collapsed.
+        let argv = v(&["/tmp/s.aish", "alpha", "alpha"]);
+        assert_eq!(normalize_script_argv(&argv), &argv[..]);
+    }
 }
