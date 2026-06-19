@@ -307,20 +307,25 @@ pub fn tokenize_with(line: &str, lookup: impl Fn(&str) -> Option<String>) -> Opt
 
 /// Result of reading a `$…` reference after the `$` has been consumed.
 enum Dollar {
-    /// A `$NAME` / `${NAME}` reference; carries the looked-up value (empty when
-    /// the variable is unset).
+    /// A `$NAME` / `${NAME}` reference, a special parameter (`$?`/`$$`), or a
+    /// positional parameter (`$1`, `$@`, `$*`, `$#`); carries the looked-up value
+    /// (empty when unset).
     Expanded(String),
-    /// A bare `$` that doesn't start a name (e.g. `$`, `$5`, `$ `) — keep it as
-    /// a literal dollar sign.
+    /// A bare `$` that doesn't start a name (e.g. `$`, `$.`, `$ `, end-of-input)
+    /// — keep it as a literal dollar sign.
     Literal,
 }
 
 /// Read a variable reference from `chars` (the `$` is already consumed) and
-/// resolve it via `lookup`. Supports `$NAME` and `${NAME}` where NAME is
-/// `[A-Za-z_][A-Za-z0-9_]*`, plus the special parameter `$?` (last exit status).
-/// Returns None for a malformed `${…}` (unterminated
-/// or containing an invalid character) so the caller rejects the line and routes
-/// it to the model.
+/// resolve it via `lookup`. Supports:
+///   * `$NAME` / `${NAME}` where NAME is `[A-Za-z_][A-Za-z0-9_]*` (`${12}` too);
+///   * the special parameters `$?` (last exit status) and `$$` (shell pid);
+///   * the positional parameters `$1`..`$9` (one digit unbraced, POSIX — `$12`
+///     is `$1` then `2`), and the positional-list specials `$@`/`$*` (the script
+///     args, space-joined) and `$#` (their count). These feed script mode's
+///     positional parameters (TASK-18) and resolve empty/zero elsewhere.
+/// Returns None for a malformed `${…}` (unterminated or containing an invalid
+/// character) so the caller rejects the line and routes it to the model.
 fn expand_dollar(
     chars: &mut std::iter::Peekable<std::str::Chars>,
     lookup: &impl Fn(&str) -> Option<String>,
@@ -328,6 +333,16 @@ fn expand_dollar(
     match chars.peek() {
         Some('{') => {
             chars.next(); // consume '{'
+            // A positional-list special as the sole braced content: ${@} ${*} ${#}.
+            if let Some(&c) = chars.peek() {
+                if matches!(c, '@' | '*' | '#') {
+                    chars.next();
+                    return match chars.next() {
+                        Some('}') => Some(Dollar::Expanded(lookup(&c.to_string()).unwrap_or_default())),
+                        _ => None, // ${@x} / unterminated → route to the model
+                    };
+                }
+            }
             let mut name = String::new();
             loop {
                 match chars.next() {
@@ -354,6 +369,19 @@ fn expand_dollar(
         Some('$') => {
             chars.next();
             Some(Dollar::Expanded(lookup("$").unwrap_or_default()))
+        }
+        // `$1`..`$9` — a positional parameter (single digit, unbraced; POSIX
+        // treats `$12` as `$1` then a literal `2`). Feeds script mode's
+        // positional params (TASK-18); resolves empty in the REPL/pipeline paths.
+        Some(&c) if c.is_ascii_digit() => {
+            chars.next();
+            Some(Dollar::Expanded(lookup(&c.to_string()).unwrap_or_default()))
+        }
+        // `$@` / `$*` / `$#` — the positional-list special parameters: the script
+        // args space-joined (`$@`/`$*`) and their count (`$#`).
+        Some(&c) if matches!(c, '@' | '*' | '#') => {
+            chars.next();
+            Some(Dollar::Expanded(lookup(&c.to_string()).unwrap_or_default()))
         }
         Some(&c) if c.is_ascii_alphabetic() || c == '_' => {
             let mut name = String::new();
@@ -627,6 +655,42 @@ mod tests {
         // an unset pid expands to empty and drops the standalone word
         let none = |_: &str| -> Option<String> { None };
         assert_eq!(tokenize_with("echo $$", none).unwrap(), vec!["echo"]);
+    }
+
+    #[test]
+    fn tokenizer_expands_positional_parameters() {
+        // TASK-18: `$1`..`$9`, `$@`/`$*`, `$#` resolve through `lookup` so script
+        // mode can feed in the kernel-appended argv. A lookup mimicking a script
+        // invoked as `deploy.aish staging v2` ($0=deploy.aish, $1=staging, …).
+        let params = |name: &str| match name {
+            "0" => Some("deploy.aish".to_string()),
+            "1" => Some("staging".to_string()),
+            "2" => Some("v2".to_string()),
+            "#" => Some("2".to_string()),
+            "@" | "*" => Some("staging v2".to_string()),
+            _ => None,
+        };
+        let tok = |line: &str| tokenize_with(line, params);
+
+        // bare single-digit positionals
+        assert_eq!(tok("echo $1 $2").unwrap(), vec!["echo", "staging", "v2"]);
+        // $0 is the script name
+        assert_eq!(tok("echo $0").unwrap(), vec!["echo", "deploy.aish"]);
+        // braced form, including the two-digit ${12} (one reference, not $1 then 2)
+        let twelve = |name: &str| (name == "12").then(|| "twelfth".to_string());
+        assert_eq!(tokenize_with("echo ${12}", twelve).unwrap(), vec!["echo", "twelfth"]);
+        // `$@`/`$*` expand to the space-joined args as ONE word (aish never
+        // re-splits an expansion), and `$#` to the count.
+        assert_eq!(tok("echo $@").unwrap(), vec!["echo", "staging v2"]);
+        assert_eq!(tok("echo $*").unwrap(), vec!["echo", "staging v2"]);
+        assert_eq!(tok("echo count=$#").unwrap(), vec!["echo", "count=2"]);
+        // braced specials resolve too
+        assert_eq!(tok("echo ${#}").unwrap(), vec!["echo", "2"]);
+        // POSIX: unbraced `$12` is `$1` followed by a literal `2`
+        assert_eq!(tok("echo $12").unwrap(), vec!["echo", "staging2"]);
+        // an unset positional drops the standalone word (empty expansion)
+        let none = |_: &str| -> Option<String> { None };
+        assert_eq!(tokenize_with("echo $9", none).unwrap(), vec!["echo"]);
     }
 
     #[test]

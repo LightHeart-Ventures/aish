@@ -1,13 +1,25 @@
-//! Script mode (TASK-17): `aish <file>` runs the file's lines non-interactively,
-//! then exits with the status of the last line — the shell-script entry point.
+//! Script mode (TASK-17/18): `aish <file> [args…]` runs the file's lines
+//! non-interactively, then exits with the status of the last line — the
+//! shell-script entry point.
 //!
 //! Each non-blank, non-comment line is executed as if typed at the prompt: a
 //! line that resolves to a program (or a pipeline of programs, or the `cd`
 //! builtin) runs directly on the terminal; anything else is handed to the model,
 //! exactly like the interactive REPL. `#` comment lines and blank lines are
 //! skipped — and because a `#!` shebang line is just a `#` comment, a script
-//! beginning with `#!/usr/bin/env aish` Just Works (that's the seam TASK-18
-//! builds on). The `!`/`?` route prefixes still force direct/model.
+//! beginning with `#!/usr/bin/env aish` Just Works. That makes aish a valid
+//! shebang interpreter: `chmod +x script.aish && ./script.aish foo bar` has the
+//! kernel run `aish /path/script.aish foo bar`, and TASK-18 wires the trailing
+//! `foo bar` through as the positional parameters `$1`/`$2`, with `$0` the
+//! script path, `$#` the count, and `$@`/`$*` the whole list (see `var_lookup`).
+//! The `!`/`?` route prefixes still force direct/model.
+//!
+//! No-TTY safety (TASK-18, cron/CI): a script run without a controlling
+//! terminal must never block on a confirmation read. Direct dispatch already
+//! degrades gracefully (`run_on_tty` skips the `tcsetpgrp` hand-off when stdin
+//! isn't a tty); for the model path we pick the confirm hook up front — an
+//! interactive tty prompts as usual, no tty auto-denies (a script can't answer
+//! a y/N), so a model tool call can't hang an unattended run.
 //!
 //! Unlike the interactive prompt this path deliberately SKIPS the
 //! "looks-like-English" routing heuristics (`looks_like_prose`, the bare-`yes`
@@ -35,12 +47,35 @@ enum Step {
     NotACommand,
 }
 
-/// Execute an aish script file. Returns the exit status of the last executed
-/// line (`$?`), matching `sh script`. A read error is surfaced as an `Err` so
-/// `main` can report it and exit non-zero.
-pub async fn run(backend: &Backend, session: &mut Session, path: &Path) -> Result<i32> {
+/// Execute an aish script file. `args` are the kernel-appended operands a
+/// shebang invocation passes through (`aish <script> <args…>`), exposed to the
+/// script as the positional parameters `$1`/`$2`/… with `$0` the script path
+/// (TASK-18). Returns the exit status of the last executed line (`$?`), matching
+/// `sh script`. A read error is surfaced as an `Err` so `main` can report it and
+/// exit non-zero.
+pub async fn run(backend: &Backend, session: &mut Session, path: &Path, args: &[String]) -> Result<i32> {
     let src = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("aish: cannot read script {}: {e}", path.display()))?;
+    // Positional parameters: params[0] = $0 (the script path), params[1..] = $1…
+    // — the shell convention exposed by `var_lookup`/`positional`.
+    let mut params: Vec<String> = Vec::with_capacity(args.len() + 1);
+    params.push(path.to_string_lossy().into_owned());
+    params.extend(args.iter().cloned());
+
+    // No-TTY safety (cron/CI): pick the model-turn confirm hook ONCE, up front.
+    // With a controlling terminal we prompt as usual; without one a script can't
+    // answer y/N, so auto-deny rather than block on a stdin read that never
+    // returns. Direct dispatch's own tty hand-off is already guarded downstream.
+    // SAFETY: isatty is a plain query on fd 0.
+    let on_tty = unsafe { libc::isatty(0) == 1 };
+    let mut confirm = move |prompt: &str| -> tools::Decision {
+        if on_tty {
+            confirm_tty(prompt)
+        } else {
+            tools::Decision::Deny
+        }
+    };
+
     let mut prev_dir: Option<PathBuf> = None;
     for raw in executable_lines(&src) {
         let (line, route) = split_route(raw);
@@ -48,7 +83,7 @@ pub async fn run(backend: &Backend, session: &mut Session, path: &Path) -> Resul
             continue;
         }
         if route != Route::Model {
-            match run_directly(&line, route == Route::Direct, session, &mut prev_dir).await {
+            match run_directly(&line, route == Route::Direct, session, &params, &mut prev_dir).await {
                 Step::Ran => continue,
                 Step::Quit => break,
                 Step::NotACommand => {}
@@ -57,7 +92,7 @@ pub async fn run(backend: &Backend, session: &mut Session, path: &Path) -> Resul
         // A non-command line (or a `?`-forced one) goes to the model, exactly as
         // at the interactive prompt. Errors don't abort the script — they set a
         // non-zero `$?` and execution continues, like `sh` without `set -e`.
-        match engine::run_turn(backend, session, line, &mut confirm_tty).await {
+        match engine::run_turn(backend, session, line, &mut confirm).await {
             Ok(text) => {
                 let text = text.trim();
                 if !text.is_empty() {
@@ -109,10 +144,13 @@ fn split_route(line: &str) -> (String, Route) {
 /// without the model. Returns [`Step::NotACommand`] when the line doesn't
 /// resolve to something runnable so the caller can route it to the model;
 /// `force` (a `!` prefix) turns that miss into a reported error instead.
+/// `params` are the script's positional parameters (`$0`/`$1`/…) used by
+/// `$VAR` expansion.
 async fn run_directly(
     line: &str,
     force: bool,
     session: &mut Session,
+    params: &[String],
     prev_dir: &mut Option<PathBuf>,
 ) -> Step {
     let path_var = session_path(session);
@@ -144,9 +182,10 @@ async fn run_directly(
         return Step::NotACommand;
     }
 
-    // Single command. `$VAR`/`$?` expand against the session's exports first,
-    // then the process environment — what the spawned program would see.
-    let Some(mut words) = rc::tokenize_with(line, var_lookup(session)) else {
+    // Single command. `$VAR`/`$?` and the positional `$0`/`$1`/`$@`/… expand
+    // against the script params and the session's exports first, then the
+    // process environment — what the spawned program would see.
+    let Some(mut words) = rc::tokenize_with(line, var_lookup(session, params)) else {
         if force {
             eprintln!("aish: can't run that directly — it uses shell syntax aish doesn't implement");
             session.last_status = 1;
@@ -261,12 +300,41 @@ fn session_path(session: &Session) -> String {
         .unwrap_or_default()
 }
 
-/// `$VAR`/`$?` resolver for script lines: session exports first (a user override
-/// wins), then `$?` (last exit status), then the process environment.
-fn var_lookup(session: &Session) -> impl Fn(&str) -> Option<String> + '_ {
+/// Resolve a script positional parameter (`$0`/`$1`/…, `$#`, `$@`/`$*`) from
+/// `params` (where `params[0]` is `$0`). Returns `None` when `name` isn't a
+/// positional reference, so `var_lookup` can fall through to session exports and
+/// the environment. Pure + unit-tested.
+fn positional(name: &str, params: &[String]) -> Option<String> {
+    match name {
+        // `$#` — the count of positional parameters, excluding `$0`.
+        "#" => Some(params.len().saturating_sub(1).to_string()),
+        // `$@` / `$*` — every positional from `$1` on, space-joined. aish has no
+        // word-splitting/quoting distinction here, so the two behave the same.
+        "@" | "*" => Some(params.iter().skip(1).cloned().collect::<Vec<_>>().join(" ")),
+        // `$0`/`$1`/… — a positional by index; out-of-range is the empty string,
+        // matching a POSIX shell. A non-numeric name is not a positional.
+        n => n
+            .parse::<usize>()
+            .ok()
+            .map(|i| params.get(i).cloned().unwrap_or_default()),
+    }
+}
+
+/// `$VAR`/`$?`/`$$` and positional-parameter resolver for script lines.
+/// Resolution order: `$?` (last exit status) and `$$` (shell pid) first, then
+/// the script's positional parameters (`$0`/`$1`/`$#`/`$@`/…), then session
+/// exports (a user override wins), then the process environment.
+fn var_lookup<'a>(session: &'a Session, params: &'a [String]) -> impl Fn(&str) -> Option<String> + 'a {
     move |name: &str| {
         if name == "?" {
             return Some(session.last_status.to_string());
+        }
+        if name == "$" {
+            // `$$` — the shell's own pid (S4.6), resolved live like the REPL.
+            return Some(std::process::id().to_string());
+        }
+        if let Some(v) = positional(name, params) {
+            return Some(v);
         }
         session
             .env
@@ -309,5 +377,84 @@ mod tests {
         assert!(matches!(split_route("!ls -la"), (l, Route::Direct) if l == "ls -la"));
         assert!(matches!(split_route("?what is up"), (l, Route::Model) if l == "what is up"));
         assert!(matches!(split_route("echo hi"), (l, Route::Auto) if l == "echo hi"));
+    }
+
+    // ---- TASK-18: positional parameters ($0/$1/$#/$@/$*) -----------------
+
+    #[test]
+    fn positional_resolves_indices_count_and_all() {
+        // params[0] = $0 (script path), then $1, $2, …
+        let params = vec![
+            "/tmp/build.aish".to_string(),
+            "release".to_string(),
+            "x86_64".to_string(),
+        ];
+        assert_eq!(positional("0", &params).as_deref(), Some("/tmp/build.aish"));
+        assert_eq!(positional("1", &params).as_deref(), Some("release"));
+        assert_eq!(positional("2", &params).as_deref(), Some("x86_64"));
+        // Out-of-range positionals are the empty string (POSIX), not absent.
+        assert_eq!(positional("3", &params).as_deref(), Some(""));
+        // `$#` counts the operands, excluding $0.
+        assert_eq!(positional("#", &params).as_deref(), Some("2"));
+        // `$@` / `$*` join $1.. with spaces (identical here).
+        assert_eq!(positional("@", &params).as_deref(), Some("release x86_64"));
+        assert_eq!(positional("*", &params).as_deref(), Some("release x86_64"));
+        // A non-numeric, non-special name is NOT a positional → None, so the
+        // caller falls through to env lookup.
+        assert_eq!(positional("HOME", &params), None);
+        assert_eq!(positional("PATH", &params), None);
+    }
+
+    #[test]
+    fn positional_with_no_args_has_zero_count_and_empty_all() {
+        // Only $0 present (no operands): $# is 0, $@/$* are empty, $1 is "".
+        let params = vec!["/tmp/noargs.aish".to_string()];
+        assert_eq!(positional("#", &params).as_deref(), Some("0"));
+        assert_eq!(positional("@", &params).as_deref(), Some(""));
+        assert_eq!(positional("1", &params).as_deref(), Some(""));
+        assert_eq!(positional("0", &params).as_deref(), Some("/tmp/noargs.aish"));
+    }
+
+    #[test]
+    fn var_lookup_expands_positionals_specials_and_env() {
+        let mut session = Session::new().unwrap();
+        session.set_var("GREETING", "hello");
+        session.last_status = 7;
+        let params = vec!["script.aish".to_string(), "world".to_string()];
+        let lookup = var_lookup(&session, &params);
+
+        // Positional parameters resolve through var_lookup.
+        assert_eq!(lookup("0").as_deref(), Some("script.aish"));
+        assert_eq!(lookup("1").as_deref(), Some("world"));
+        assert_eq!(lookup("#").as_deref(), Some("1"));
+        assert_eq!(lookup("@").as_deref(), Some("world"));
+        // Specials: `$?` is the last status, `$$` the live pid.
+        assert_eq!(lookup("?").as_deref(), Some("7"));
+        assert_eq!(lookup("$").as_deref(), Some(&*std::process::id().to_string()));
+        // Session exports still resolve (and aren't shadowed by positionals).
+        assert_eq!(lookup("GREETING").as_deref(), Some("hello"));
+        // An unknown name is None (var_lookup falls through to the env, which
+        // doesn't have this one either).
+        assert_eq!(lookup("NO_SUCH_VAR_XYZ_18"), None);
+    }
+
+    #[test]
+    fn tokenize_expands_positionals_in_a_script_line() {
+        // End-to-end: a script line referencing $1/$2/$# tokenizes with the
+        // params substituted, exactly as the spawned program would receive them.
+        let session = Session::new().unwrap();
+        let params = vec![
+            "deploy.aish".to_string(),
+            "staging".to_string(),
+            "v2".to_string(),
+        ];
+        let words = rc::tokenize_with("echo deploying $1 $2 count $#", var_lookup(&session, &params))
+            .expect("line tokenizes");
+        assert_eq!(words, vec!["echo", "deploying", "staging", "v2", "count", "2"]);
+
+        // `$@` expands to the args space-joined as a SINGLE word — aish never
+        // re-splits an expansion (a variable can't smuggle extra argv words).
+        let all = rc::tokenize_with("echo $@", var_lookup(&session, &params)).expect("tokenizes");
+        assert_eq!(all, vec!["echo", "staging v2"]);
     }
 }
