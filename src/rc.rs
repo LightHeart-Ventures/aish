@@ -96,7 +96,7 @@ pub fn load_login_profiles() -> Rc {
     rc
 }
 
-fn parse(text: &str) -> Rc {
+pub(crate) fn parse(text: &str) -> Rc {
     let mut rc = Rc::default();
     parse_into(text, &mut rc);
     rc
@@ -347,6 +347,13 @@ fn expand_dollar(
         Some('?') => {
             chars.next();
             Some(Dollar::Expanded(lookup("?").unwrap_or_default()))
+        }
+        // `$$` — this shell's process id. A double-dollar special parameter
+        // resolved through the same lookup as `$?`, so the dispatch path feeds
+        // it the live pid (see repl::var_lookup).
+        Some('$') => {
+            chars.next();
+            Some(Dollar::Expanded(lookup("$").unwrap_or_default()))
         }
         Some(&c) if c.is_ascii_alphabetic() || c == '_' => {
             let mut name = String::new();
@@ -606,6 +613,20 @@ mod tests {
         // any other unknown variable
         let none = |_: &str| -> Option<String> { None };
         assert_eq!(tokenize_with("echo $?", none).unwrap(), vec!["echo"]);
+    }
+
+    #[test]
+    fn tokenizer_expands_pid() {
+        // `$$` resolves through the same lookup the dispatch path uses to feed in
+        // the shell's own process id (S4.6).
+        let pid = |name: &str| (name == "$").then(|| "4242".to_string());
+        let tok = |line: &str| tokenize_with(line, pid);
+        assert_eq!(tok("echo $$").unwrap(), vec!["echo", "4242"]);
+        // adjacent to literal text
+        assert_eq!(tok("echo pid=$$").unwrap(), vec!["echo", "pid=4242"]);
+        // an unset pid expands to empty and drops the standalone word
+        let none = |_: &str| -> Option<String> { None };
+        assert_eq!(tokenize_with("echo $$", none).unwrap(), vec!["echo"]);
     }
 
     #[test]

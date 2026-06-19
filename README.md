@@ -74,6 +74,7 @@ Mostly ~/models (412G of GGUF weights) — 87% of your usage.
 export ANTHROPIC_API_KEY=sk-ant-…
 cargo run --release                 # interactive shell
 cargo run --release -- -c "prompt"  # one-shot (login-shell -c style)
+cargo run --release -- script.aish  # run a script file, then exit
 cargo run --release -- --backend local   # offline, in-process Qwen3-1.7B
 cargo run --release -- --mode careful    # stricter confirmation gate
 cargo build --no-default-features   # fast Claude-only build (skips mistral.rs)
@@ -94,12 +95,58 @@ REPL commands: `:mode <paranoid|careful|normal|yolo>` · `:model <opus|sonnet|ha
 Ctrl-C aborts the current turn — or interrupts the foreground child during a
 TTY hand-off, exactly like a shell.
 
+## Scripting
+
+`aish <file>` runs a script non-interactively, then exits with the status of
+its last line — the shell-script entry point:
+
+```sh
+aish deploy.aish        # run the file's lines, then exit
+```
+
+Each line is handled exactly as if typed at the prompt: a real command (or
+pipeline, or `cd`) runs directly; anything else routes to the model. Blank
+lines and `#` comments are skipped, and the `!`/`?` route prefixes work. A
+script is treated as explicit, so a bare command word like `who` runs the
+`who` program rather than being second-guessed as English.
+
+Because the leading `#!` line is a `#` comment, a script can carry a shebang
+and be run as a program directly:
+
+```aish
+#!/usr/bin/env aish
+# back up the project, then summarize what changed
+tar czf /backups/proj.tgz .
+summarize what just got archived and flag anything unexpected
+```
+
+```sh
+chmod +x backup.aish
+./backup.aish           # the kernel execs aish with the script path
+```
+
+## Make aish your login shell
+
+`aish` exports the standard shell identity vars so tools that inspect the
+environment behave: `SHELL` points at the running binary, and `$$` / `$PPID`
+expand to the shell's and parent's process ids in direct dispatch (`echo $$`).
+
+`make install` registers the installed binary in `/etc/shells` (idempotent,
+best-effort — it may prompt for `sudo`) so you can adopt it as a login shell:
+
+```sh
+make install                 # builds, installs, signs, and registers in /etc/shells
+chsh -s "$(command -v aish)"  # make it your login shell
+```
+
+To register an already-installed binary without rebuilding: `make register-shell`.
+
 ## Status
 
 Working prototype. Known gaps vs a classic shell (see the gap analysis):
 no pipes/redirection/`$VAR`/globs in direct dispatch (those lines route to the
-model), no job control (Ctrl-Z), no script-interpreter mode, path-only tab
-completion. History and memories are stored unencrypted in `~/.aish/aish.db`.
+model), no job control (Ctrl-Z), path-only tab completion. History and memories
+are stored unencrypted in `~/.aish/aish.db`.
 
 ## License
 

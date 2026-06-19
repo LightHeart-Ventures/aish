@@ -193,12 +193,22 @@ impl Session {
 
     /// Set a session environment variable (last-wins), replacing any existing
     /// entries with the same key so every spawned child sees exactly one value.
-    /// This is how the env-mutating builtins (`cd` updating `$PWD`/`$OLDPWD`,
-    /// and later `export`/`unset`) keep the per-spawn env coherent.
+    /// This is how the in-process env-mutating builtins (`set`, `unset`, and `cd`
+    /// updating `$PWD`/`$OLDPWD`) keep the per-spawn env coherent.
     pub fn set_var(&mut self, key: &str, value: impl Into<String>) {
         let value = value.into();
         self.env.retain(|(k, _)| k != key);
         self.env.push((key.to_string(), value));
+    }
+
+    /// Remove every entry for `key` from the session env. Returns true when
+    /// something was removed. Backs the `unset` builtin: a subprocess can’t
+    /// change its parent, so unset must drop the var here so later spawns no
+    /// longer carry it.
+    pub fn unset_var(&mut self, key: &str) -> bool {
+        let before = self.env.len();
+        self.env.retain(|(k, _)| k != key);
+        self.env.len() != before
     }
 
     /// Record the exit status of the command just dispatched, so the next line
