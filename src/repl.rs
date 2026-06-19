@@ -680,6 +680,21 @@ enum Preview {
     Plain,
 }
 
+impl Preview {
+    /// The ANSI SGR prefix the route-preview Highlighter paints the whole line
+    /// with — the single source of truth for the green=direct / cyan=model /
+    /// dim=ambiguous contract (TASK-132). `Plain` returns `None` so a `:`-command
+    /// or an empty line keeps the terminal's default color.
+    fn ansi(self) -> Option<&'static str> {
+        match self {
+            Preview::Direct => Some("\x1b[32m"),   // green — runs as a shell command
+            Preview::Model => Some("\x1b[36m"),    // cyan  — handed to the model
+            Preview::Ambiguous => Some("\x1b[2m"), // dim   — real binary that's also English
+            Preview::Plain => None,                // uncolored — `:`-command / empty
+        }
+    }
+}
+
 /// Classify a line the way `dispatch` will route it, using only what the
 /// completer already holds (cwd, PATH, aliases). `$VAR` isn't expanded here — a
 /// preview approximation — but every other decision mirrors `dispatch`.
@@ -731,14 +746,15 @@ fn route_preview(line: &str, cwd: &Path, path: &str, aliases: &HashMap<String, V
 }
 
 impl Highlighter for AishHelper {
+    /// Paint the whole input line by the route `dispatch` would take, so a
+    /// mis-route is visible BEFORE Enter (TASK-132). The color is sourced from
+    /// [`Preview::ansi`] — the one green/cyan/dim mapping — and a `Plain` line
+    /// (a `:`-command or empty buffer) is returned untouched.
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
-        let color = match route_preview(line, &self.cwd, &self.path, &self.aliases) {
-            Preview::Direct => "\x1b[32m",    // green — shell command
-            Preview::Model => "\x1b[36m",     // cyan — goes to the model
-            Preview::Ambiguous => "\x1b[2m",  // dim — real binary that's also English
-            Preview::Plain => return std::borrow::Cow::Borrowed(line),
-        };
-        std::borrow::Cow::Owned(format!("{color}{line}\x1b[0m"))
+        match route_preview(line, &self.cwd, &self.path, &self.aliases).ansi() {
+            Some(color) => std::borrow::Cow::Owned(format!("{color}{line}\x1b[0m")),
+            None => std::borrow::Cow::Borrowed(line),
+        }
     }
 
     fn highlight_char(&self, _line: &str, _pos: usize, kind: CmdKind) -> bool {
@@ -3046,6 +3062,41 @@ mod tests {
         assert_eq!(pv("fg %1"), Preview::Direct);
         assert_eq!(pv("bg %2"), Preview::Direct);
         assert_eq!(pv("wait"), Preview::Ambiguous);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn highlight_paints_line_by_route() {
+        use rustyline::highlight::Highlighter as _;
+        let dir = std::env::temp_dir().join(format!("aish_hl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        make_exec(&dir.join("tool"));  // a plain resolvable binary
+        make_exec(&dir.join("clear")); // resolvable AND an everyday English word
+        let helper = helper_for(&dir, HashMap::new());
+        let paint = |line: &str| helper.highlight(line, 0).to_string();
+
+        let (green, cyan, dim, reset) = ("\x1b[32m", "\x1b[36m", "\x1b[2m", "\x1b[0m");
+
+        // green = direct: a resolvable, non-ambiguous command.
+        assert_eq!(paint("tool --flag"), format!("{green}tool --flag{reset}"));
+        // cyan = model: prose, and an unresolvable lead word.
+        assert_eq!(paint("what is the capital of texas"), format!("{cyan}what is the capital of texas{reset}"));
+        assert_eq!(paint("toolnope"), format!("{cyan}toolnope{reset}"));
+        // dim = ambiguous: resolves but is also an English word.
+        assert_eq!(paint("clear"), format!("{dim}clear{reset}"));
+        // Forced `!`/`?` prefixes win over the heuristics.
+        assert_eq!(paint("!clear the screen for me"), format!("{green}!clear the screen for me{reset}"));
+        assert_eq!(paint("?tool --flag"), format!("{cyan}?tool --flag{reset}"));
+        // Plain: a `:`-command and an empty buffer stay the terminal default (untouched).
+        assert_eq!(paint(":help"), ":help");
+        assert_eq!(paint(""), "");
+
+        // The AC — the line recolors live as routing flips (binary resolves vs
+        // prose): the same lead word paints green once it resolves to a real
+        // binary and cyan when it does not.
+        assert_ne!(paint("tool"), paint("toolnope"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
