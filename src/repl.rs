@@ -161,28 +161,19 @@ pub async fn run(
 
     // List-style completion with the whole candidate menu shown on the first
     // trigger (not the rustyline default of silently cycling one candidate at a
-    // time). This is what lets a single `:` — or a TAB after a `:` prefix — pop
-    // up the command palette as a visible menu below the prompt.
+    // time). TAB on a `:` prefix lists the matching `:`-commands; the live,
+    // as-you-type command palette is rendered by the Hinter (see `palette_hint`),
+    // which redraws the menu in place without re-printing the prompt.
     let config = rustyline::Config::builder()
         .completion_type(rustyline::CompletionType::List)
         .completion_show_all_if_ambiguous(true)
         .build();
     let mut rl: Editor<AishHelper, DefaultHistory> = Editor::with_config(config)?;
-    // Shared flag: the `:` key handler sets it and the completer consumes it, so
-    // a bare-`:` palette trigger on an empty line is told apart from a plain TAB.
-    let colon_pending = Arc::new(AtomicBool::new(false));
-    // Shared cell: a name char typed inside the `:`-palette stashes itself here
-    // and re-fires completion so the popup menu filters live as you type (the
-    // List menu is otherwise a one-shot print). The completer takes() it and
-    // appends it to the prefix it filters against. See [`PaletteFilter`].
-    let palette_char: Arc<Mutex<Option<char>>> = Arc::new(Mutex::new(None));
     rl.set_helper(Some(AishHelper {
         cwd: session.cwd.clone(),
         path: session_path(&session),
         aliases: aliases.clone(),
         cmd_cache: Arc::new(Mutex::new(None)),
-        colon_pending: colon_pending.clone(),
-        palette_char: palette_char.clone(),
     }));
     let history_path = dirs_history_path();
     let _ = rl.load_history(&history_path);
@@ -203,34 +194,12 @@ pub async fn run(
         EventHandler::Simple(Cmd::Kill(Movement::WholeBuffer)),
     );
 
-    // Typing ':' at the very start of an empty line pops up the command palette:
-    // the handler flags the trigger and fires completion, the completer returns
-    // the `:`-command catalog (see AishHelper::complete), and List-completion
-    // renders it as a menu while extending the buffer to `:`. Anywhere else `:`
-    // self-inserts as usual (paths, arguments, mid-line text).
-    rl.bind_sequence(
-        KeyEvent(KeyCode::Char(':'), Modifiers::NONE),
-        EventHandler::Conditional(Box::new(ColonPalette { pending: colon_pending.clone() })),
-    );
-
-    // Live palette filtering: while the buffer is a single `:`-token, each name
-    // char (a-z and `-`, the only chars in a `:`-command) re-fires completion so
-    // the popup menu narrows as you type instead of staying frozen on the full
-    // list. The handler stashes the char and returns Complete; the completer
-    // appends it to the filter prefix (see AishHelper::complete). Outside the
-    // palette the handler is a no-op (returns None), so the key self-inserts as
-    // usual. rustyline can't both insert AND complete in one keystroke, so this
-    // stash-then-complete is how the inserted char and the filtered menu stay in
-    // sync. See [`PaletteFilter`].
-    for c in ('a'..='z').chain(std::iter::once('-')) {
-        rl.bind_sequence(
-            KeyEvent(KeyCode::Char(c), Modifiers::NONE),
-            EventHandler::Conditional(Box::new(PaletteFilter {
-                ch: c,
-                pending: palette_char.clone(),
-            })),
-        );
-    }
+    // The `:`-command palette renders live as an inline hint below the prompt
+    // (see `palette_hint` and the Hinter impl): type `:` and the menu appears,
+    // and each extra char filters it in place — rustyline redraws the hint
+    // without re-printing the prompt or stacking menus. No key bindings are
+    // needed; `:` and the name chars self-insert normally, and TAB still
+    // completes a `:`-prefix via the Completer.
 
     // Start on a clean screen (interactive terminals only — keep piped output clean).
     // SAFETY: plain isatty query.
@@ -460,14 +429,6 @@ struct AishHelper {
     aliases: Arc<HashMap<String, Vec<String>>>,
     /// Lazily-populated, TTL-refreshed cache of executable names on PATH.
     cmd_cache: Arc<Mutex<Option<CmdCache>>>,
-    /// Set by the `:` key handler, consumed by `complete`, so a bare-`:` palette
-    /// trigger on an empty line is distinguished from a plain TAB (which lists
-    /// PATH commands). See [`ColonPalette`].
-    colon_pending: Arc<AtomicBool>,
-    /// A name char typed inside the `:`-palette, stashed by [`PaletteFilter`]
-    /// and consumed by `complete` so the typed char is folded into the filter
-    /// prefix — turning the one-shot List menu into a live, narrowing popup.
-    palette_char: Arc<Mutex<Option<char>>>,
 }
 
 /// Builtins aish handles itself — always offered as command-name completions.
@@ -550,86 +511,66 @@ fn complete_colon(after: &str) -> (usize, Vec<Pair>) {
     (0, pairs)
 }
 
-/// `:` key handler. On an empty line it flags the palette trigger and fires
-/// completion (the completer then returns the catalog); anywhere else it returns
-/// `None` so `:` self-inserts normally (inside a path, an argument, mid-line).
-struct ColonPalette {
-    pending: Arc<AtomicBool>,
-}
-
-impl ConditionalEventHandler for ColonPalette {
-    fn handle(&self, _: &Event, _: RepeatCount, _: bool, ctx: &EventContext) -> Option<Cmd> {
-        if ctx.line().is_empty() && ctx.pos() == 0 {
-            self.pending.store(true, Ordering::SeqCst);
-            Some(Cmd::Complete)
-        } else {
-            None
-        }
+/// Build the live `:`-command palette shown as an inline hint below the prompt.
+/// Returns the menu text — a leading newline, then one dim row per matching
+/// command (`:name   description`) — when the buffer is a bare `:`-token with the
+/// cursor at its end, or `None` otherwise. rustyline recomputes this on every
+/// keystroke and redraws the hint in place (clearing the prior rows), so the
+/// list filters as you type WITHOUT re-printing the prompt or stacking menus.
+fn palette_hint(line: &str, pos: usize) -> Option<String> {
+    // Only while typing the command name: cursor at the end of a bare `:`-token
+    // (no space yet — once an argument starts, the palette is done).
+    if pos != line.len() {
+        return None;
     }
+    let after = line.strip_prefix(':')?;
+    if after.contains(char::is_whitespace) {
+        return None;
+    }
+    let names = colon_command_matches(after);
+    if names.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for name in names {
+        let desc = COLON_COMMANDS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map_or("", |(_, d)| *d);
+        // The leading newline drops each row onto its own line below the input;
+        // the whole row is dim so it reads as a hint, not as typed text.
+        out.push_str(&format!("\n\x1b[2m:{name:<14} {desc}\x1b[0m"));
+    }
+    Some(out)
 }
 
-/// Per-character key handler that keeps the `:`-command palette filtering live
-/// as you type. rustyline's List-completion menu is a one-shot print — once it
-/// pops up on `:`, plain self-insert keystrokes never refresh it. Each name char
-/// (`a`-`z`, `-`) is bound to one of these: when the buffer is a single bare
-/// `:`-token and the cursor is at its end, the handler stashes the char and
-/// returns `Cmd::Complete`. The completer then appends the stashed char to the
-/// prefix it filters against and returns the narrowed candidate set, so both the
-/// buffer (via the longest-common-prefix extension) and the menu advance by one
-/// char — the effect of "insert + re-filter" that a single `Cmd` can't express
-/// on its own. Everywhere else it returns `None`, so the key self-inserts as
-/// normal (paths, arguments, prose).
-struct PaletteFilter {
-    /// The literal char this binding fires for — stashed for the completer.
-    ch: char,
-    pending: Arc<Mutex<Option<char>>>,
-}
+/// A display-only multi-line hint: the `:`-command palette rendered below the
+/// input. Unlike rustyline's blanket `AsRef<str>` Hint impl, `completion()`
+/// returns `None`, so Right-arrow / End never insert the menu text into the
+/// line buffer — the hint is purely visual.
+struct PaletteHint(String);
 
-impl ConditionalEventHandler for PaletteFilter {
-    fn handle(&self, _: &Event, _: RepeatCount, _: bool, ctx: &EventContext) -> Option<Cmd> {
-        let line = ctx.line();
-        // Only when the cursor sits at the end of a bare `:`-token (no space yet,
-        // so we're still picking the command name). `line[1..]` is safe: a
-        // leading `:` is one byte.
-        if ctx.pos() != line.len()
-            || !line.starts_with(':')
-            || line[1..].contains(char::is_whitespace)
-        {
-            return None;
-        }
-        *self.pending.lock().unwrap() = Some(self.ch);
-        Some(Cmd::Complete)
+impl rustyline::hint::Hint for PaletteHint {
+    fn display(&self) -> &str {
+        &self.0
+    }
+    fn completion(&self) -> Option<&str> {
+        None
     }
 }
 
 impl Completer for AishHelper {
     type Candidate = Pair;
     fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
-        // Colon command palette. When the first token is a `:` REPL meta-command
-        // we complete against the command catalog, not PATH/paths. Two entries:
-        //   * the line already starts with `:` (e.g. `:mo` + TAB), or
-        //   * a bare `:` was just typed on an empty line — the ColonPalette key
-        //     handler flagged `colon_pending` and fired completion *before* the
-        //     char was inserted, so the buffer is still empty here; the catalog's
-        //     common prefix `:` lands in the buffer and the menu pops up.
-        // A name char typed inside the palette (stashed by PaletteFilter) is
-        // folded into the filter prefix here — it was NOT inserted into the
-        // buffer (the handler returned Complete, not SelfInsert), so appending it
-        // is what advances the buffer (via the LCP extension) and narrows the
-        // menu in lockstep. take() so it never leaks into a later completion.
-        let pending_char = self.palette_char.lock().unwrap().take();
+        // Colon command palette (explicit TAB). When the buffer is a
+        // `:`-prefixed token we complete against the command catalog, not
+        // PATH/paths. The live, as-you-type menu is rendered separately by the
+        // Hinter (`palette_hint`); this branch only fires on an explicit TAB.
         let before = &line[..pos];
         if let Some(after) = before.strip_prefix(':') {
             if !after.contains(char::is_whitespace) {
-                self.colon_pending.store(false, Ordering::SeqCst);
-                let prefix = match pending_char {
-                    Some(c) => format!("{after}{c}"),
-                    None => after.to_string(),
-                };
-                return Ok(complete_colon(&prefix));
+                return Ok(complete_colon(after));
             }
-        } else if before.is_empty() && self.colon_pending.swap(false, Ordering::SeqCst) {
-            return Ok(complete_colon(""));
         }
         let start = line[..pos].rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
         // Word one (the command position): everything before the cursor's word is
@@ -722,7 +663,16 @@ fn session_path(session: &Session) -> String {
 }
 
 impl Hinter for AishHelper {
-    type Hint = String;
+    type Hint = PaletteHint;
+
+    /// Render the live `:`-command palette as an inline hint below the input.
+    /// Returns `None` for every non-palette line, so ordinary input is
+    /// unaffected. rustyline recomputes this each keystroke and redraws the hint
+    /// in place (clearing the prior rows), which is what makes the menu filter
+    /// without re-printing the prompt. See [`palette_hint`].
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<PaletteHint> {
+        palette_hint(line, pos).map(PaletteHint)
+    }
 }
 /// What the dispatch routing WOULD do with the current line — surfaced live as
 /// the user types (TASK-132) so a mis-route is visible and correctable BEFORE
@@ -2589,8 +2539,6 @@ mod tests {
             path: dir.to_string_lossy().into_owned(),
             aliases: Arc::new(aliases),
             cmd_cache: Arc::new(Mutex::new(None)),
-            colon_pending: Arc::new(AtomicBool::new(false)),
-            palette_char: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2937,9 +2885,9 @@ mod tests {
 
     #[test]
     fn complete_colon_narrows_as_prefix_deepens() {
-        // Live-filter invariant: each extra char the PaletteFilter folds into the
-        // prefix narrows the candidate set monotonically, ending at one match.
-        // (`complete` appends the typed char to `after` before calling this.)
+        // Live-filter invariant: each extra char narrows the candidate set
+        // monotonically, ending at a single match. `palette_hint` and the TAB
+        // completer share `colon_command_matches`, so this pins both.
         let names = |after: &str| {
             complete_colon(after)
                 .1
@@ -2982,6 +2930,32 @@ mod tests {
             let name = p.replacement.trim_start_matches(':').trim_end();
             assert!(COLON_COMMANDS.iter().any(|(n, _)| *n == name));
         }
+    }
+
+    #[test]
+    fn palette_hint_filters_in_place() {
+        // A bare `:` shows the whole catalog as a multi-line hint (one row per
+        // command), each row carrying its name and description.
+        let full = palette_hint(":", 1).expect("bare `:` yields the palette");
+        assert_eq!(full.matches('\n').count(), COLON_COMMANDS.len());
+        assert!(full.starts_with('\n'), "hint drops onto its own line below the input");
+        assert!(full.contains(":mode"));
+        assert!(full.contains("confirmation"));
+
+        // Typing narrows it in place: `:wo` -> worker-output + workers only.
+        let wo = palette_hint(":wo", 3).expect("`:wo` matches the worker commands");
+        assert_eq!(wo.matches('\n').count(), 2);
+        assert!(wo.contains(":worker-output"));
+        assert!(wo.contains(":workers"));
+
+        // No hint once an argument starts (a space ends the command name)...
+        assert!(palette_hint(":mode dev", 9).is_none());
+        // ...when the cursor isn't at the end of the buffer...
+        assert!(palette_hint(":mode", 2).is_none());
+        // ...for a non-`:` line...
+        assert!(palette_hint("ls -la", 6).is_none());
+        // ...or when nothing matches.
+        assert!(palette_hint(":zzz", 4).is_none());
     }
 
     #[test]
