@@ -14,6 +14,7 @@ mod pipeline;
 mod present;
 mod rc;
 mod repl;
+mod script;
 mod session;
 mod skills;
 mod tools;
@@ -63,6 +64,13 @@ struct Args {
     /// coordinator store for result read-back).
     #[arg(long = "run-id")]
     run_id: Option<String>,
+
+    /// Path to an aish script to run non-interactively, then exit (TASK-17).
+    /// Each line runs as if typed at the prompt; blank lines and `#` comments
+    /// are skipped (so a `#!/usr/bin/env aish` shebang line works). The process
+    /// exits with the status of the last line. Ignored when `-c` is also given.
+    #[arg(value_name = "SCRIPT")]
+    script: Option<PathBuf>,
 }
 
 /// Lightweight, env-gated startup phase timer. Enabled by `AISH_TIME_STARTUP=1`
@@ -204,10 +212,10 @@ async fn main() -> Result<()> {
     //     late arrival simply becomes available on the next turn. The prompt now
     //     appears in ~tens of ms instead of after the full handshake.
     //
-    //   * One-shot (-c / --coordinator) — connect SYNCHRONOUSLY: that single
-    //     turn needs the MCP tools immediately, with no interactive loop to
+    //   * One-shot (-c / --coordinator / a script) — connect SYNCHRONOUSLY: the
+    //     run needs the MCP tools immediately, with no interactive loop to
     //     install them into later.
-    let interactive = args.command.is_none();
+    let interactive = args.command.is_none() && args.script.is_none();
     if interactive {
         session.skills_prompt =
             skills::render_prompt_section(&skills::load(&skills_dir), &[]);
@@ -286,6 +294,13 @@ async fn main() -> Result<()> {
         let out = engine::run_turn(&backend, &mut session, prompt, &mut repl::confirm_tty).await?;
         println!("{}", md::render_stdout(&out));
         return Ok(());
+    }
+
+    // Script mode (TASK-17): run the file's lines non-interactively and exit with
+    // the status of the last line, like `sh script`.
+    if let Some(path) = args.script {
+        let code = script::run(&backend, &mut session, &path).await?;
+        std::process::exit(code);
     }
 
     repl::run(backend, session, rc.aliases, mcp_paths, skills_dir).await
