@@ -432,8 +432,10 @@ struct AishHelper {
 }
 
 /// Builtins aish handles itself — always offered as command-name completions.
-const BUILTINS: &[&str] =
-    &["cd", "exit", "logout", "jobs", "fg", "bg", "wait", "source", ".", "exec"];
+const BUILTINS: &[&str] = &[
+    "cd", "exit", "logout", "jobs", "fg", "bg", "wait", "pwd", "unset", "set", "umask",
+    "source", ".", "exec",
+];
 
 /// How long a PATH scan stays cached before it's re-scanned (picks up newly
 /// installed binaries without re-statting every PATH dir on each TAB).
@@ -1230,6 +1232,22 @@ async fn dispatch(
             builtin_cd(words.get(1).map(String::as_str), session, prev_dir);
             Dispatch::Handled
         }
+        "pwd" => {
+            builtin_pwd(session);
+            Dispatch::Handled
+        }
+        "unset" => {
+            builtin_unset(&words[1..], session);
+            Dispatch::Handled
+        }
+        "set" => {
+            builtin_set(&words[1..], session);
+            Dispatch::Handled
+        }
+        "umask" => {
+            builtin_umask(words.get(1).map(String::as_str), session);
+            Dispatch::Handled
+        }
         "source" | "." => {
             builtin_source(&words[1..], session);
             Dispatch::Handled
@@ -1319,6 +1337,37 @@ fn builtin_cd(arg: Option<&str>, session: &mut Session, prev: &mut Option<PathBu
 }
 
 // ---------------------------------------------------------------------------
+// Env-mutating builtins — pwd / unset / set / umask (S4.1)
+// ---------------------------------------------------------------------------
+//
+// A subprocess can’t change its parent, so these run in-process and mutate the
+// session state every spawn inherits (`session.env` → Command::envs, the process
+// umask → inherited by children). `pwd` reports the session’s own cwd — which
+// `cd` maintains — rather than shelling out.
+
+/// `pwd` — print the shell’s working directory (the session’s cwd, which `cd`
+/// keeps current). A builtin so it always agrees with `session.cwd` and needs no
+/// `/bin/pwd`.
+fn builtin_pwd(session: &Session) {
+    println!("{}", session.cwd.display());
+    // pwd of an existing cwd cannot fail.
+    // (last_status left to the caller’s default success.)
+}
+
+/// `unset NAME...` — drop each variable from the session env so later spawns no
+/// longer carry it. Unknown names are a no-op, as in POSIX.
+fn builtin_unset(names: &[String], session: &mut Session) {
+    if names.is_empty() {
+        eprintln!("unset: usage: unset NAME...");
+        session.last_status = 2;
+        return;
+    }
+    for name in names {
+        session.unset_var(name);
+    }
+    session.last_status = 0;
+}
+
 // source / . / exec builtins (S4.2)
 // ---------------------------------------------------------------------------
 //
@@ -1365,6 +1414,68 @@ fn builtin_source(args: &[String], session: &mut Session) {
         );
     }
     session.last_status = 0;
+}
+
+/// `set` — with no args, list the session env as sorted `NAME=value` lines (the
+/// POSIX “list shell variables” shape). With `NAME=value` operands, assign each
+/// into the session env (last-wins) so the new value reaches every later spawn.
+/// A bare word that isn’t an assignment is reported and skipped.
+fn builtin_set(args: &[String], session: &mut Session) {
+    if args.is_empty() {
+        // Collapse to last-wins, then sort by name for a stable listing.
+        let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for (k, v) in &session.env {
+            seen.insert(k.as_str(), v.as_str());
+        }
+        let mut pairs: Vec<(&str, &str)> = seen.into_iter().collect();
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in pairs {
+            println!("{k}={v}");
+        }
+        session.last_status = 0;
+        return;
+    }
+    let mut ok = true;
+    for a in args {
+        match a.split_once('=') {
+            Some((name, value)) if !name.is_empty() => session.set_var(name, value),
+            _ => {
+                eprintln!("set: {a}: not a NAME=value assignment");
+                ok = false;
+            }
+        }
+    }
+    session.last_status = if ok { 0 } else { 1 };
+}
+
+/// `umask [mode]` — with no arg, print the current file-creation mask in octal;
+/// with an octal `mode`, set it. The mask is process state inherited by every
+/// child, so this is reflected in spawned programs. Reading is the standard
+/// set-to-zero-then-restore dance (there is no getter in libc).
+fn builtin_umask(arg: Option<&str>, session: &mut Session) {
+    match arg {
+        None => {
+            // SAFETY: querying the umask by setting it to 0 and restoring it.
+            let cur = unsafe {
+                let m = libc::umask(0);
+                libc::umask(m);
+                m
+            };
+            println!("{:04o}", cur as u32);
+            session.last_status = 0;
+        }
+        Some(spec) => match u32::from_str_radix(spec, 8) {
+            Ok(mode) if mode <= 0o777 => {
+                // SAFETY: setting the process file-creation mask.
+                unsafe { libc::umask(mode as libc::mode_t) };
+                session.last_status = 0;
+            }
+            _ => {
+                eprintln!("umask: {spec}: invalid octal mode");
+                session.last_status = 1;
+            }
+        },
+    }
 }
 
 /// `exec CMD [args...]` — replace the aish process image with CMD, the way a
@@ -2996,6 +3107,61 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // S4.1 — env-mutating builtins change session state spawned children inherit.
+    #[test]
+    fn set_and_unset_mutate_session_env() {
+        let mut session = Session::new().unwrap();
+        let get = |s: &Session, k: &str| s.env.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+
+        builtin_set(&["FOO=bar".into(), "BAZ=qux".into()], &mut session);
+        assert_eq!(get(&session, "FOO"), Some("bar".into()));
+        assert_eq!(get(&session, "BAZ"), Some("qux".into()));
+        assert_eq!(session.last_status, 0);
+
+        // Re-assigning replaces in place — no duplicate entries pile up.
+        builtin_set(&["FOO=baz".into()], &mut session);
+        assert_eq!(get(&session, "FOO"), Some("baz".into()));
+        assert_eq!(session.env.iter().filter(|(k, _)| k == "FOO").count(), 1);
+
+        // A non-assignment operand is reported and sets a non-zero status.
+        builtin_set(&["notanassignment".into()], &mut session);
+        assert_eq!(session.last_status, 1);
+
+        // unset drops the var so later spawns no longer carry it.
+        builtin_unset(&["FOO".into()], &mut session);
+        assert_eq!(get(&session, "FOO"), None);
+        assert_eq!(get(&session, "BAZ"), Some("qux".into()));
+        assert_eq!(session.last_status, 0);
+
+        // unset with no names is a usage error.
+        builtin_unset(&[], &mut session);
+        assert_eq!(session.last_status, 2);
+    }
+
+    // S4.1 — umask sets the process mask (inherited by children); read-back works.
+    #[test]
+    fn umask_sets_and_reads_back() {
+        let mut session = Session::new().unwrap();
+        // Save the current mask so the test leaves the process untouched.
+        let saved = unsafe {
+            let m = libc::umask(0);
+            libc::umask(m);
+            m
+        };
+        builtin_umask(Some("077"), &mut session);
+        assert_eq!(session.last_status, 0);
+        let now = unsafe {
+            let m = libc::umask(0);
+            libc::umask(m);
+            m
+        };
+        assert_eq!(now, 0o077);
+        // An invalid mode is rejected without changing the mask.
+        builtin_umask(Some("nope"), &mut session);
+        assert_eq!(session.last_status, 1);
+        // SAFETY: restore the saved mask.
+        unsafe { libc::umask(saved) };
+    }
     // S4.3 — cd keeps $PWD/$OLDPWD in step so spawned children see the real cwd.
     #[test]
     fn cd_updates_pwd_and_oldpwd() {
