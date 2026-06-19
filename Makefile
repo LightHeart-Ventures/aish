@@ -16,7 +16,7 @@ RELEASE  = target/release/$(BIN)
 DEST     = $(BINDIR)/$(BIN)
 UNAME_S := $(shell uname -s)
 
-.PHONY: all build install sign uninstall clean
+.PHONY: all build install sign uninstall clean register-shell
 
 all: build
 
@@ -29,7 +29,21 @@ install: build
 	mkdir -p $(BINDIR)
 	install -m 0755 $(RELEASE) $(DEST)
 	@$(MAKE) --no-print-directory sign DEST=$(DEST)
+	@$(MAKE) --no-print-directory register-shell DEST=$(DEST)
 	@echo "installed $(DEST)"
+
+# Register the installed binary in /etc/shells so `chsh -s $(DEST)` accepts it
+# as a login shell. Idempotent (skips when already listed) and best-effort: a
+# failure (no sudo, read-only /etc) warns but never fails the install.
+register-shell:
+	@if grep -qxF "$(DEST)" /etc/shells 2>/dev/null; then \
+		echo "/etc/shells already lists $(DEST)"; \
+	else \
+		echo "registering $(DEST) in /etc/shells (may prompt for sudo)"; \
+		echo "$(DEST)" | sudo tee -a /etc/shells >/dev/null \
+			&& echo "registered $(DEST) — now run: chsh -s $(DEST)" \
+			|| echo "could not write /etc/shells — add $(DEST) manually to use chsh"; \
+	fi
 
 # Re-sign the installed binary with a fresh ad-hoc signature. No-op off macOS.
 sign:
