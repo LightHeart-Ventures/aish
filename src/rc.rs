@@ -64,8 +64,53 @@ pub fn load() -> Rc {
     parse(&std::fs::read_to_string(&path).unwrap_or_default())
 }
 
+/// Source the login-shell profile files in POSIX order — `/etc/profile` then
+/// `~/.profile` — returning their merged aliases/exports (S4.5 / TASK-128).
+///
+/// Only the two line shapes aish understands (`alias`/`export`) are honored,
+/// exactly like [`load`]; everything a real profile leans on (conditionals,
+/// `$(…)`, shell functions) is ignored, since there is no shell underneath to
+/// run it. A missing or unreadable file is simply skipped, so this is safe to
+/// call on any system. `$NAME` references in `export` values resolve against the
+/// names gathered so far across BOTH files and then the process environment, so
+/// a `PATH` extended in `/etc/profile` is visible to `~/.profile`.
+///
+/// Login shells call this BEFORE layering `~/.aishrc` on top (see `main`), so an
+/// `export`/`alias` in `~/.aishrc` overrides the same name from a profile — the
+/// "/etc/profile then ~/.profile then ~/.aishrc" precedence the card asks for.
+/// Non-login shells never call it, matching the convention that profiles are a
+/// login-only concern.
+pub fn load_login_profiles() -> Rc {
+    let mut rc = Rc::default();
+    let mut files: Vec<PathBuf> = vec![PathBuf::from("/etc/profile")];
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            files.push(PathBuf::from(&home).join(".profile"));
+        }
+    }
+    for f in &files {
+        if let Ok(text) = std::fs::read_to_string(f) {
+            parse_into(&text, &mut rc);
+        }
+    }
+    rc
+}
+
 pub(crate) fn parse(text: &str) -> Rc {
     let mut rc = Rc::default();
+    parse_into(text, &mut rc);
+    rc
+}
+
+/// Parse `text`'s `alias`/`export` lines INTO an existing [`Rc`], accumulating
+/// onto whatever it already holds. Later assignments win (env is a last-wins
+/// list read in reverse; an alias overwrites an earlier one of the same name),
+/// and `$NAME` references in `export` values resolve against the names gathered
+/// so far — INCLUDING those from earlier-parsed files — then the process
+/// environment. That cross-file visibility is what lets a login shell source
+/// several profile files in sequence (see [`load_login_profiles`]) and have a
+/// `PATH` extended in `/etc/profile` flow into `~/.profile`.
+fn parse_into(text: &str, rc: &mut Rc) {
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("alias ") {
@@ -82,7 +127,7 @@ pub(crate) fn parse(text: &str) -> Rc {
             match split_assignment(rest) {
                 // Command substitution genuinely needs a shell we don't have.
                 Some((_, value)) if value.contains('`') => eprintln!(
-                    "\x1b[2maish: ~/.aishrc: skipped `{line}` — command substitution (`) needs a shell\x1b[0m"
+                    "\x1b[2maish: rc: skipped `{line}` — command substitution (`) needs a shell\x1b[0m"
                 ),
                 // Resolve $NAME / ${NAME} against the exports parsed so far, then
                 // the process env — so `export PATH=\"$PATH:$HOME/.local/bin\"`
@@ -92,12 +137,11 @@ pub(crate) fn parse(text: &str) -> Rc {
                     rc.env.push((name, expanded));
                 }
                 None => eprintln!(
-                    "\x1b[2maish: ~/.aishrc: skipped `{line}` — not a plain NAME=value export\x1b[0m"
+                    "\x1b[2maish: rc: skipped `{line}` — not a plain NAME=value export\x1b[0m"
                 ),
             }
         }
     }
-    rc
 }
 
 /// Parse `NAME=value` where value may be 'single', "double", or bare-quoted.
@@ -441,6 +485,47 @@ mod tests {
     fn command_substitution_export_is_skipped() {
         let rc = parse("export NOW=`date`\n");
         assert!(!rc.env.iter().any(|(k, _)| k == "NOW"));
+    }
+
+    #[test]
+    fn parse_into_accumulates_across_files() {
+        // S4.5 / TASK-128: profile sourcing parses several files INTO one Rc.
+        // A name exported by the first "file" must be visible to a `$`-reference
+        // in the second, and a later alias/export of the same name wins.
+        let mut rc = Rc::default();
+        // Stand-in for /etc/profile.
+        parse_into(
+            "export AISH_PROFILE_BASE=/opt/tools\n\
+             export PATH=$AISH_PROFILE_BASE/bin\n\
+             alias ll='ls -l'\n",
+            &mut rc,
+        );
+        // Stand-in for ~/.profile: extends PATH using the var from the first file
+        // (cross-file visibility) and redefines the `ll` alias (last wins).
+        parse_into(
+            "export PATH=$PATH:$AISH_PROFILE_BASE/sbin\n\
+             alias ll='ls -alF'\n",
+            &mut rc,
+        );
+        let path = rc.env.iter().rev().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone());
+        assert_eq!(path, Some("/opt/tools/bin:/opt/tools/sbin".to_string()));
+        assert_eq!(rc.aliases["ll"], vec!["ls", "-alF"]);
+    }
+
+    #[test]
+    fn login_profiles_layer_under_aishrc() {
+        // Models main's login layering: profiles are the base, ~/.aishrc on top,
+        // so a name set in both resolves to the ~/.aishrc value (last-wins).
+        let mut profiles = Rc::default();
+        parse_into("export EDITOR=nano\nexport PAGER=less\n", &mut profiles);
+        let aishrc = parse("export EDITOR=vim\n");
+
+        // The merge main performs: profile env first, rc env appended.
+        let mut env = profiles.env.clone();
+        env.extend(aishrc.env.clone());
+        let lookup = |k: &str| env.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(lookup("EDITOR"), Some("vim".to_string())); // ~/.aishrc wins
+        assert_eq!(lookup("PAGER"), Some("less".to_string())); // profile-only survives
     }
 
     #[test]
