@@ -1119,6 +1119,11 @@ fn var_lookup(session: &Session) -> impl Fn(&str) -> Option<String> + '_ {
         if name == "?" {
             return Some(session.last_status.to_string());
         }
+        if name == "$" {
+            // `$$` — the shell's own pid (S4.6). Resolved live so it stays
+            // correct without a stored env entry.
+            return Some(std::process::id().to_string());
+        }
         if let Some(v) = session.env.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.clone()) {
             return Some(v);
         }
