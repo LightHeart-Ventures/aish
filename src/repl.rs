@@ -1340,8 +1340,14 @@ fn builtin_cd(arg: Option<&str>, session: &mut Session, prev: &mut Option<PathBu
     };
     match target.canonicalize() {
         Ok(c) if c.is_dir() => {
-            *prev = Some(session.cwd.clone());
-            session.cwd = c;
+            // Keep $OLDPWD/$PWD in step with the move so spawned children see the
+            // shell's real working directory (S4.3). OLDPWD is where we were; PWD
+            // is where we land. Both go through set_var so each stays a single,
+            // last-wins entry in the per-spawn env.
+            let old = std::mem::replace(&mut session.cwd, c.clone());
+            session.set_var("OLDPWD", old.to_string_lossy().into_owned());
+            session.set_var("PWD", c.to_string_lossy().into_owned());
+            *prev = Some(old);
         }
         Ok(c) => eprintln!("cd: {}: not a directory", c.display()),
         Err(e) => eprintln!("cd: {}: {e}", target.display()),
@@ -2898,6 +2904,39 @@ mod tests {
         session.env.push(("LAST".into(), "override".into()));
         assert_eq!(rc::tokenize_with("echo $LAST", var_lookup(&session)).unwrap(), vec!["echo", "override"]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // S4.3 — cd keeps $PWD/$OLDPWD in step so spawned children see the real cwd.
+    #[test]
+    fn cd_updates_pwd_and_oldpwd() {
+        let mut session = Session::new().unwrap();
+        let base = std::env::temp_dir();
+        let a = base.join(format!("aish_cd_a_{}", std::process::id()));
+        let b = base.join(format!("aish_cd_b_{}", std::process::id()));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let (a, b) = (a.canonicalize().unwrap(), b.canonicalize().unwrap());
+        session.cwd = a.clone();
+        let mut prev = None;
+        let var = |s: &Session, k: &str| s.env.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+
+        builtin_cd(b.to_str(), &mut session, &mut prev);
+        assert_eq!(session.cwd, b);
+        assert_eq!(var(&session, "PWD"), Some(b.to_string_lossy().into_owned()));
+        assert_eq!(var(&session, "OLDPWD"), Some(a.to_string_lossy().into_owned()));
+
+        // `cd -` swaps back, and PWD/OLDPWD swap with it.
+        builtin_cd(Some("-"), &mut session, &mut prev);
+        assert_eq!(session.cwd, a);
+        assert_eq!(var(&session, "PWD"), Some(a.to_string_lossy().into_owned()));
+        assert_eq!(var(&session, "OLDPWD"), Some(b.to_string_lossy().into_owned()));
+
+        // set_var keeps exactly one entry per key — no stale duplicates accrue.
+        assert_eq!(session.env.iter().filter(|(k, _)| k == "PWD").count(), 1);
+        assert_eq!(session.env.iter().filter(|(k, _)| k == "OLDPWD").count(), 1);
+
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
     }
 
     #[test]
