@@ -186,6 +186,16 @@ impl Session {
         })
     }
 
+    /// Set a session environment variable (last-wins), replacing any existing
+    /// entries with the same key so every spawned child sees exactly one value.
+    /// This is how the env-mutating builtins (`cd` updating `$PWD`/`$OLDPWD`,
+    /// and later `export`/`unset`) keep the per-spawn env coherent.
+    pub fn set_var(&mut self, key: &str, value: impl Into<String>) {
+        let value = value.into();
+        self.env.retain(|(k, _)| k != key);
+        self.env.push((key.to_string(), value));
+    }
+
     /// Record the exit status of the command just dispatched, so the next line
     /// can expand `$?`. Signal termination maps to 128 + signal, as POSIX shells
     /// report it.
