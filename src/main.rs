@@ -134,6 +134,22 @@ async fn main() -> Result<()> {
     let mut session = session::Session::new()?;
     timer.mark("Session::new");
     session.env = rc.env;
+    // Shell identity (S4.6 / TASK-129): expose the running shell + its pids so
+    // spawned children and `$VAR` dispatch see them, and login tooling (`chsh`)
+    // finds the right interpreter.
+    //   * SHELL — absolute path to THIS aish binary (exported to children).
+    //   * PPID  — parent process id (exported to children).
+    //   * $$    — this shell's own pid, resolved dynamically by the dispatch
+    //             tokenizer (see rc::expand_dollar + repl::var_lookup); not a
+    //             stored env entry, matching how POSIX shells treat the special
+    //             parameter.
+    let shell_path = std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "aish".to_string());
+    session.set_var("SHELL", shell_path);
+    // SAFETY: getppid() always succeeds and is reentrant.
+    session.set_var("PPID", (unsafe { libc::getppid() }).to_string());
     let backend = match args.backend.as_str() {
         "claude" => {
             let cred = backend::claude::Credential::resolve(&session.env)?;

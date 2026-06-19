@@ -94,6 +94,22 @@ REPL commands: `:mode <paranoid|careful|normal|yolo>` · `:model <opus|sonnet|ha
 Ctrl-C aborts the current turn — or interrupts the foreground child during a
 TTY hand-off, exactly like a shell.
 
+## Make aish your login shell
+
+`aish` exports the standard shell identity vars so tools that inspect the
+environment behave: `SHELL` points at the running binary, and `$$` / `$PPID`
+expand to the shell's and parent's process ids in direct dispatch (`echo $$`).
+
+`make install` registers the installed binary in `/etc/shells` (idempotent,
+best-effort — it may prompt for `sudo`) so you can adopt it as a login shell:
+
+```sh
+make install                 # builds, installs, signs, and registers in /etc/shells
+chsh -s "$(command -v aish)"  # make it your login shell
+```
+
+To register an already-installed binary without rebuilding: `make register-shell`.
+
 ## Status
 
 Working prototype. Known gaps vs a classic shell (see the gap analysis):
