@@ -143,6 +143,10 @@ pub struct Session {
     /// `escalate` tool is offered and the capability nudge is added; the tool
     /// reads this to reconstruct the strong-model backend at call time.
     pub escalation: Option<(String, String)>,
+    /// True when aish was launched as a login shell (`-l`/`--login`, or an
+    /// argv[0] beginning with `-`). Login shells source the profile files and
+    /// become a session leader; non-login shells skip that. Set in `main`.
+    pub login: bool,
     /// Tier‑1 turn‑audit journal for a background coordinator run (see
     /// `crate::turn_audit`). `Some` only for a headless `--coordinator` run, where
     /// it is attached by `coordinator::drive` so `engine::run_turn` can journal
@@ -183,6 +187,7 @@ impl Session {
             show_worker_output: Arc::new(AtomicBool::new(false)),
             escalation: None,
             turn_audit: None,
+            login: false,
         })
     }
 
@@ -351,6 +356,13 @@ fn truncate_last(mut s: String) -> String {
     s
 }
 
+/// True when aish was invoked as a login shell: either the explicit `-l` /
+/// `--login` flag, or the classic convention of an argv[0] beginning with `-`
+/// (e.g. `-aish`, as `login`(1)/`getty` exec a login shell). Pure for testing.
+pub fn is_login_invocation(login_flag: bool, argv0: &str) -> bool {
+    login_flag || argv0.starts_with('-')
+}
+
 fn host_info() -> String {
     let os = std::fs::read_to_string("/etc/os-release")
         .ok()
@@ -395,6 +407,20 @@ mod tests {
         let out = truncate_last(s);
         assert!(out.ends_with("…[truncated]"));
         assert!(out.is_char_boundary(out.len() - "\n…[truncated]".len()));
+    }
+
+    #[test]
+    fn login_invocation_detection() {
+        // Explicit flag wins regardless of argv0.
+        assert!(is_login_invocation(true, "aish"));
+        assert!(is_login_invocation(true, "/usr/local/bin/aish"));
+        // Classic dash-argv0 convention (login(1)/getty).
+        assert!(is_login_invocation(false, "-aish"));
+        assert!(is_login_invocation(false, "-bash"));
+        // Ordinary interactive/non-login invocations.
+        assert!(!is_login_invocation(false, "aish"));
+        assert!(!is_login_invocation(false, "/usr/local/bin/aish"));
+        assert!(!is_login_invocation(false, ""));
     }
 
     #[test]
