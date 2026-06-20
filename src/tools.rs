@@ -25,6 +25,12 @@ pub enum Decision {
     AllowOnce,
     /// Allow this call and persist the tool/command so it never prompts again.
     AlwaysAllow,
+    /// Allow this call and persist a recursive grant for the target's directory
+    /// (the 'd' answer). On a read/write/delete prompt this allows every access
+    /// of the SAME permission kind to anything under that directory, recursively.
+    /// Where no directory can be derived (a non-path tool), the gate treats it
+    /// as a one-time allow.
+    AllowDir,
 }
 
 /// Frontend-provided confirmation hook. Engine stays TTY-free.
@@ -39,9 +45,115 @@ fn gate(session: &mut Session, key: &str, prompt: &str, confirm: &mut Confirm<'_
     }
     match confirm(prompt) {
         Decision::Deny => false,
-        Decision::AllowOnce => true,
+        // 'd' (AllowDir) is path-scoped; the generic gate has no path in scope,
+        // so it degrades to a one-time allow here. The path-aware gates
+        // (`gate_path`, `gate_delete`) handle the recursive directory grant.
+        Decision::AllowOnce | Decision::AllowDir => true,
         Decision::AlwaysAllow => {
             session.allow_tool(key);
+            true
+        }
+    }
+}
+
+/// A path-scoped permission kind for the directory ('d') grant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Perm {
+    Read,
+    Write,
+    Delete,
+}
+
+impl Perm {
+    fn as_str(self) -> &'static str {
+        match self {
+            Perm::Read => "read",
+            Perm::Write => "write",
+            Perm::Delete => "delete",
+        }
+    }
+}
+
+/// File-deletion programs whose path arguments carry a delete permission — the
+/// `run_program` delete gate offers the directory ('d') grant for these.
+const DELETE_COMMANDS: &[&str] = &["rm", "rmdir", "unlink", "shred"];
+
+/// Gate a path-scoped file operation (read/write), offering the directory ('d')
+/// grant. Proceeds without prompting when the whole tool is always-allowed, or
+/// when `path` already falls under a directory grant for `perm`. Otherwise the
+/// user is prompted: 'a' persists the tool (every path), 'd' persists `path`'s
+/// parent directory as a recursive grant for `perm`, 'y' allows just this call.
+fn gate_path(
+    session: &mut Session,
+    perm: Perm,
+    path: &Path,
+    tool_key: &str,
+    prompt: &str,
+    confirm: &mut Confirm<'_>,
+) -> bool {
+    if session.is_tool_allowed(tool_key) || session.is_path_allowed(perm.as_str(), path) {
+        return true;
+    }
+    match confirm(prompt) {
+        Decision::Deny => false,
+        Decision::AllowOnce => true,
+        Decision::AlwaysAllow => {
+            session.allow_tool(tool_key);
+            true
+        }
+        Decision::AllowDir => {
+            // Grant the file's parent directory recursively for this permission.
+            // No derivable parent (a bare name or the filesystem root) → behaves
+            // like a one-time allow.
+            if let Some(dir) = path.parent() {
+                if !dir.as_os_str().is_empty() {
+                    session.allow_path_dir(perm.as_str(), dir);
+                }
+            }
+            true
+        }
+    }
+}
+
+/// Gate a `run_program` file-deletion command (rm/rmdir/unlink/shred), offering
+/// the directory ('d') grant. Proceeds without prompting when the binary is
+/// always-allowed, or when every path argument is already covered by a delete
+/// directory grant. On 'a' the whole binary is persisted; on 'd' each path
+/// argument's parent directory is persisted as a recursive delete grant.
+fn gate_delete(
+    session: &mut Session,
+    program: &str,
+    args: &[String],
+    prompt: &str,
+    confirm: &mut Confirm<'_>,
+) -> bool {
+    let bin = bin_name(program);
+    let paths: Vec<PathBuf> = args
+        .iter()
+        .filter(|a| !a.starts_with('-'))
+        .map(|a| resolve(session, a))
+        .collect();
+    if session.is_tool_allowed(bin)
+        || (!paths.is_empty()
+            && paths.iter().all(|p| session.is_path_allowed(Perm::Delete.as_str(), p)))
+    {
+        return true;
+    }
+    match confirm(prompt) {
+        Decision::Deny => false,
+        Decision::AllowOnce => true,
+        Decision::AlwaysAllow => {
+            session.allow_tool(bin);
+            true
+        }
+        Decision::AllowDir => {
+            for p in &paths {
+                if let Some(dir) = p.parent() {
+                    if !dir.as_os_str().is_empty() {
+                        session.allow_path_dir(Perm::Delete.as_str(), dir);
+                    }
+                }
+            }
             true
         }
     }
@@ -263,7 +375,15 @@ Escalating beats guessing."
 pub async fn execute(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> ToolResult {
     // Paranoid mode confirms everything once, centrally; the per-tool gates
     // below then stand down (see exec_needs_confirm and friends).
-    if session.mode == crate::session::Mode::Paranoid {
+    // read_file/write_file and run_program/run_interactive run their OWN gates
+    // below (the path-aware ones offer the 'd' directory grant), so they're
+    // excluded here to avoid a double prompt.
+    if session.mode == crate::session::Mode::Paranoid
+        && !matches!(
+            call.name.as_str(),
+            "read_file" | "write_file" | "run_program" | "run_interactive"
+        )
+    {
         let args = truncate_middle(serde_json::to_string(&call.args).unwrap_or_default(), 200);
         if !gate(session, &allow_key(call), &format!("{} {args}", call.name), confirm) {
             return ToolResult {
@@ -276,7 +396,7 @@ pub async fn execute(call: &ToolCall, session: &mut Session, confirm: &mut Confi
     let result = match call.name.as_str() {
         "run_program" => run_program(call, session, confirm).await,
         "run_interactive" => run_interactive(call, session, confirm).await,
-        "read_file" => read_file(call, session),
+        "read_file" => read_file(call, session, confirm),
         "write_file" => write_file(call, session, confirm),
         "list_dir" => list_dir(call, session),
         "change_dir" => change_dir(call, session),
@@ -403,7 +523,9 @@ fn is_destructive(program: &str, args: &[String]) -> bool {
 fn exec_needs_confirm(mode: crate::session::Mode, program: &str, args: &[String]) -> bool {
     use crate::session::Mode;
     match mode {
-        Mode::Paranoid => false, // already confirmed centrally in execute()
+        // run_program/run_interactive self-gate (they're excluded from the
+        // central paranoid gate in execute()), so confirm here too.
+        Mode::Paranoid => true,
         Mode::Careful => !is_read_only(program, args),
         Mode::Normal => is_destructive(program, args),
         Mode::Yolo => false,
@@ -543,10 +665,18 @@ branch, and open a pull request (gh pr create) instead."
         args.join(" "),
         if background { " (background)" } else { "" }
     );
-    if exec_needs_confirm(session.mode, &program, &args)
-        && !gate(session, bin_name(&program), display.trim(), confirm)
-    {
-        return Ok("user declined to run this command".into());
+    if exec_needs_confirm(session.mode, &program, &args) {
+        // File-deletion commands route through the path-aware delete gate, which
+        // offers the directory ('d') grant; everything else uses the generic
+        // binary-keyed gate.
+        let allowed = if DELETE_COMMANDS.contains(&bin_name(&program)) {
+            gate_delete(session, &program, &args, display.trim(), confirm)
+        } else {
+            gate(session, bin_name(&program), display.trim(), confirm)
+        };
+        if !allowed {
+            return Ok("user declined to run this command".into());
+        }
     }
 
     if background {
@@ -1457,9 +1587,17 @@ async fn mcp_call(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<
     Ok(truncate_middle(session.mcp.call(&call.name, &call.args).await?, MAX_OUTPUT))
 }
 
-fn read_file(call: &ToolCall, session: &Session) -> Result<String> {
+fn read_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
     let path = call.args["path"].as_str().ok_or_else(|| anyhow::anyhow!("missing path"))?;
     let full = resolve(session, path);
+    // Reads run free except in paranoid mode, where they confirm — with the 'd'
+    // option to allow every read under the file's directory recursively.
+    if session.mode == crate::session::Mode::Paranoid {
+        let prompt = format!("read {}", full.display());
+        if !gate_path(session, Perm::Read, &full, "read_file", &prompt, confirm) {
+            return Ok("user declined the read".into());
+        }
+    }
     let content = std::fs::read_to_string(&full)
         .map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
     Ok(truncate_middle(content, MAX_FILE_READ))
@@ -1470,14 +1608,15 @@ fn write_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>)
     let content = call.args["content"].as_str().ok_or_else(|| anyhow::anyhow!("missing content"))?;
     let full = resolve(session, path);
 
-    // A write is destructive in every mode short of yolo (paranoid already asked).
-    if matches!(session.mode, crate::session::Mode::Careful | crate::session::Mode::Normal) {
+    // A write is destructive in every mode short of yolo. The 'd' option allows
+    // every write under the file's directory recursively.
+    if !matches!(session.mode, crate::session::Mode::Yolo) {
         let preview: String = content.lines().take(5).collect::<Vec<_>>().join("\n  │ ");
         let more = content.lines().count().saturating_sub(5);
         let suffix = if more > 0 { format!("\n  │ … +{more} lines") } else { String::new() };
         let action = if full.exists() { "overwrite" } else { "write" };
         let prompt = format!("{action} {} ({} bytes)\n  │ {preview}{suffix}\n ", full.display(), content.len());
-        if !gate(session, "write_file", &prompt, confirm) {
+        if !gate_path(session, Perm::Write, &full, "write_file", &prompt, confirm) {
             return Ok("user declined the write".into());
         }
     }
@@ -1949,6 +2088,73 @@ mod tests {
         }
         assert_eq!(calls.get(), 1, "second rm should have skipped the prompt");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn allow_dir_grants_recursive_read_permission() {
+        // Paranoid mode confirms reads. Answering 'd' (AllowDir) on one file
+        // grants every read under that file's directory, recursively — so a
+        // sibling read in the same dir proceeds without a second prompt, while a
+        // read OUTSIDE the granted dir still prompts.
+        use std::cell::Cell;
+        let dir = std::env::temp_dir().join(format!("aish_allowdir_{}", std::process::id()));
+        let sub = dir.join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), b"[package]").unwrap();
+        std::fs::write(sub.join("main.rs"), b"fn main() {}").unwrap();
+        let outside = std::env::temp_dir().join(format!("aish_allowdir_out_{}.txt", std::process::id()));
+        std::fs::write(&outside, b"x").unwrap();
+
+        let mut session = Session::new().unwrap();
+        let dbpath = std::env::temp_dir().join(format!("aish_allowdir_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&dbpath);
+        session.db = Some(crate::db::Db::open(&dbpath).unwrap());
+        session.mode = crate::session::Mode::Paranoid;
+
+        let rd = |p: &std::path::Path| ToolCall {
+            id: "t".into(),
+            name: "read_file".into(),
+            args: json!({ "path": p.to_string_lossy() }),
+        };
+
+        let calls = Cell::new(0);
+        // First read in the dir: prompt fires, user answers 'd'.
+        {
+            let mut confirm = |_: &str| {
+                calls.set(calls.get() + 1);
+                Decision::AllowDir
+            };
+            let r = execute(&rd(&dir.join("Cargo.toml")), &mut session, &mut confirm).await;
+            assert!(!r.is_error && !r.content.contains("declined"), "got: {}", r.content);
+        }
+        assert_eq!(calls.get(), 1);
+        assert!(session.is_path_allowed("read", &sub.join("main.rs")));
+
+        // A sibling read under the SAME directory must not prompt (would Deny).
+        {
+            let mut confirm = |_: &str| {
+                calls.set(calls.get() + 1);
+                Decision::Deny
+            };
+            let r = execute(&rd(&sub.join("main.rs")), &mut session, &mut confirm).await;
+            assert!(!r.is_error && !r.content.contains("declined"), "got: {}", r.content);
+        }
+        assert_eq!(calls.get(), 1, "sibling read under the granted dir must skip the prompt");
+
+        // A read OUTSIDE the granted dir still prompts (here: denied).
+        {
+            let mut confirm = |_: &str| {
+                calls.set(calls.get() + 1);
+                Decision::Deny
+            };
+            let r = execute(&rd(&outside), &mut session, &mut confirm).await;
+            assert!(r.content.contains("declined"), "outside read should prompt+deny: {}", r.content);
+        }
+        assert_eq!(calls.get(), 2, "read outside the granted dir must prompt");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_file(&dbpath);
     }
 
     // AC ac_ea23cef2b000 — `bg`/`fg` continue a genuinely stopped job: SIGCONT

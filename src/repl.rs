@@ -52,7 +52,7 @@ fn install_mcp_if_ready(
 /// call and persists the tool/command so it never prompts again.
 pub fn confirm_tty(prompt: &str) -> tools::Decision {
     use tools::Decision;
-    print!("\x1b[33mrun?\x1b[0m {prompt} \x1b[33m[y/N/a]\x1b[0m ");
+    print!("\x1b[33mrun?\x1b[0m {prompt} \x1b[33m[y/N/a/d]\x1b[0m ");
     std::io::stdout().flush().ok();
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).is_err() {
@@ -61,6 +61,10 @@ pub fn confirm_tty(prompt: &str) -> tools::Decision {
     match line.trim() {
         "y" | "Y" | "yes" => Decision::AllowOnce,
         "a" | "A" | "always" => Decision::AlwaysAllow,
+        // 'd' = allow this permission for the whole directory, recursively. Only
+        // meaningful on a read/write/delete prompt (where a path is in scope);
+        // elsewhere the gate treats it as a one-time allow.
+        "d" | "D" | "dir" => Decision::AllowDir,
         _ => Decision::Deny,
     }
 }
@@ -469,7 +473,7 @@ struct CmdCache {
 /// `:` at the start of a line (or TABs a `:` prefix). Keep this in sync with the
 /// arms of `handle_colon` and the `:help` text.
 const COLON_COMMANDS: &[(&str, &str)] = &[
-    ("allow", "list / revoke always-allowed tools"),
+    ("allow", "list / revoke always-allowed tools & dir grants"),
     ("backend", "switch backend (claude|grok|local)"),
     ("batch", "background batch mode (on|off|status)"),
     ("compact", "compact history, offload to memory"),
@@ -1986,9 +1990,10 @@ async fn handle_colon(
                  :name <name>                        name the session (prefixes the prompt); auto-set to the repo name at startup, bare :name clears\n\
                  :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
                                                      a verifier judges each turn. :goal status, :goal clear\n\
-                 :allow                              list always-allowed tools/commands\n\
-                 :allow remove <tool>                revoke an always-allowed tool/command\n\
+                 :allow                              list always-allowed tools/commands + dir grants\n\
+                 :allow remove <tool>|<perm>:<dir>   revoke a tool or a directory grant\n\
                  a at a prompt                       always-allow this tool (see :allow)\n\
+                 d at a read/write/delete prompt     allow that permission for the whole dir, recursively\n\
                  Ctrl-O                              toggle raw tool output (show/squelch tool results)\n\
                  :quit                               exit (also Ctrl-D or `exit`)"
             );
@@ -2477,7 +2482,7 @@ async fn handle_update(
     let go = session.mode == crate::session::Mode::Yolo
         || matches!(
             confirm_tty(&update_confirm_prompt(running, &info.version)),
-            tools::Decision::AllowOnce | tools::Decision::AlwaysAllow
+            tools::Decision::AllowOnce | tools::Decision::AlwaysAllow | tools::Decision::AllowDir
         );
     if !go {
         println!("update cancelled — run :update when you're ready.");
@@ -2621,34 +2626,63 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
     }
 }
 
-/// `:allow` lists the always-allowed tools; `:allow remove <tool>` revokes one.
+/// `:allow` lists the always-allowed tools and directory grants;
+/// `:allow remove <tool>` revokes a tool, `:allow remove <perm>:<dir>` a dir grant.
 fn handle_allow(sub: Option<&str>, arg: Option<&str>, session: &Session) {
     let Some(db) = session.db.as_ref() else {
         println!("allow: persistent store unavailable");
         return;
     };
     match sub {
-        None => match db.allowed_tools() {
-            Ok(tools) if tools.is_empty() => {
-                println!("no always-allowed tools — press 'a' at a confirmation prompt to add one")
+        None => {
+            match db.allowed_tools() {
+                Ok(tools) if tools.is_empty() => {
+                    println!("no always-allowed tools — press 'a' at a confirmation prompt to add one")
+                }
+                Ok(tools) => {
+                    println!("always-allowed tools:");
+                    for (t, ts) in tools {
+                        println!("  {t}  ({ts})");
+                    }
+                }
+                Err(e) => println!("allow: {e:#}"),
             }
-            Ok(tools) => {
-                println!("always-allowed tools:");
-                for (t, ts) in tools {
-                    println!("  {t}  ({ts})");
+            // Directory-scoped grants (the 'd' answer) — listed alongside the
+            // tool allow-list so every standing permission is visible in one place.
+            if let Ok(dirs) = db.allowed_dirs() {
+                if !dirs.is_empty() {
+                    println!("directory grants (recursive):");
+                    for (perm, dir, ts) in dirs {
+                        println!("  {perm:<6} {dir}  ({ts})");
+                    }
                 }
             }
-            Err(e) => println!("allow: {e:#}"),
-        },
+        }
         Some("remove") => match arg {
-            Some(tool) => match db.revoke(tool) {
-                Ok(true) => println!("removed {tool} from the always-allow list"),
-                Ok(false) => println!("{tool} wasn't on the always-allow list"),
-                Err(e) => println!("allow: {e:#}"),
-            },
-            None => println!("usage: :allow remove <tool>"),
+            // `<perm>:<dir>` (e.g. `read:/tmp/proj`) revokes a directory grant;
+            // a bare name revokes a tool/command from the always-allow list.
+            Some(spec) => {
+                if let Some((perm, dir)) = spec.split_once(':') {
+                    if matches!(perm, "read" | "write" | "delete") {
+                        match db.revoke_dir(perm, dir) {
+                            Ok(true) => println!("removed {perm} grant on {dir}"),
+                            Ok(false) => println!("no {perm} grant on {dir}"),
+                            Err(e) => println!("allow: {e:#}"),
+                        }
+                        return;
+                    }
+                }
+                match db.revoke(spec) {
+                    Ok(true) => println!("removed {spec} from the always-allow list"),
+                    Ok(false) => println!("{spec} wasn't on the always-allow list"),
+                    Err(e) => println!("allow: {e:#}"),
+                }
+            }
+            None => println!("usage: :allow remove <tool> | <perm>:<dir>"),
         },
-        Some(other) => println!("unknown :allow subcommand '{other}' — usage: :allow [remove <tool>]"),
+        Some(other) => println!(
+            "unknown :allow subcommand '{other}' — usage: :allow [remove <tool> | <perm>:<dir>]"
+        ),
     }
 }
 
