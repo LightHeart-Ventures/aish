@@ -304,6 +304,13 @@ pub async fn drive(
     // loop-exhaustion review): it tells the model to stop re-trying the same
     // failing approach and instead declare a concrete blocker, which is a
     // *successful* terminal outcome here — spinning is not.
+    //
+    // The WRAPPING UP block nudges the agent to finish PR-worthy work the way a
+    // human would: commit on its (already dedicated) branch, push, and open a
+    // DRAFT pull request via `gh` — it has the same git+gh auth as the launching
+    // session. Isolated workers otherwise strand their commits on `aish/<id>`
+    // with no PR; this nudge closes that gap while staying opt-out for read-only
+    // tasks that produced nothing committable.
     let mut next_input = format!(
         "You are running headless as an autonomous aish coordinator in {cwd}. You have your FULL \
 toolset RIGHT NOW — read_file, write_file, list_dir, change_dir, run_program (build, test, git, \
@@ -315,7 +322,16 @@ fact you already have, STOP and change approach. After about 3 failed attempts a
 sub-problem, do NOT keep retrying the same way — either try a materially different approach or \
 stop and report explicitly: say \"I'm blocked because <specific reason>\", list what you tried \
 and what you observed, and give your best partial result. A clearly-stated blocker is a \
-successful outcome; an endless retry loop is a failure.\n\nTASK:\n{input}",
+successful outcome; an endless retry loop is a failure.\n\nWRAPPING UP — open a draft PR for \
+PR-worthy work: When you finish, if you created or changed files that are meant to land (a fix, \
+feature, refactor, or docs) — as opposed to a read-only investigation, question, or analysis that \
+produced no committable changes — do NOT leave the work uncommitted or stranded on a local branch. \
+You have the SAME git + gh auth as the interactive session, so finish the job: stage and commit on a \
+feature branch (you are typically already on a dedicated work branch — commit THERE; never commit to \
+or push the default branch), push it, and open a DRAFT pull request with `gh pr create --draft --fill` \
+(pass `--title`/`--body` when `--fill` cannot infer them). Put the PR URL in your final answer. If there \
+are no committable changes, or `gh`/the remote is unavailable, skip the PR and report the branch name \
+plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
         cwd = session.cwd.display(),
     );
 
