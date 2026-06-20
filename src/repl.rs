@@ -489,10 +489,11 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("model", "switch model (opus|sonnet|haiku)"),
     ("name", "name this session"),
     ("new", "clear conversation history"),
-    ("quit", "exit aish"),
-    ("result", "view a finished job's result"),    ("tell", "message an in-flight coordinator"),
-    ("update", "upgrade aish to the latest release"),
     ("output", "stream coordinators' activity"),
+    ("quit", "exit aish"),
+    ("result", "view a finished job's result"),
+    ("tell", "message an in-flight coordinator"),
+    ("update", "upgrade aish to the latest release"),
     ("workers", "list this session's coordinators (all = every session)"),
     ("yolo", "toggle yolo mode"),
 ];
@@ -1980,8 +1981,7 @@ async fn handle_colon(
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
                  :workers [all]                      list this session's background coordinators (all = every session)\n\
-                 :output [on|off]             stream background coordinators' activity (🔧 tool + ·standard/·batch lines); off (default) keeps them quiet\n\
-                 \n\
+                 :output [on|off]                    stream background coordinators' activity (🔧 tool + ·standard/·batch lines); off (default) keeps them quiet\n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
                  :tell <id> <message>                send instructions to an in-flight coordinator (folded in next round)\n\
@@ -2140,7 +2140,7 @@ async fn handle_colon(
         Some("result") => {
             // View a finished background job's full result on demand.
             let Some(&id) = parts.next().as_ref() else {
-                println!("usage: :result <job>   (id or prefix from a completion notice / :results)");
+                println!("usage: :result <job>   (id or prefix from a completion notice / :workers)");
                 return false;
             };
             let hit = |jid: &str| jid == id || jid.starts_with(id);
@@ -2163,35 +2163,6 @@ async fn handle_colon(
             match found {
                 Some(r) => println!("{}", crate::md::render_stdout(r.trim())),
                 None => println!("no background job matching '{id}' (see :workers)"),
-            }
-        }
-        Some("results") => {
-            // List background jobs (workers + batches) so the user can :result one.
-            let mut table = String::from("| Job | Status | Task |\n|---|---|---|\n");
-            let mut any = false;
-            for j in session.worker_jobs.lock().unwrap().iter() {
-                any = true;
-                table.push_str(&format!(
-                    "| {} | {} | {} |\n",
-                    j.id,
-                    j.status(),
-                    crate::batch::one_line(&j.task).replace('|', "\\|")
-                ));
-            }
-            for j in session.batch_jobs.lock().unwrap().iter() {
-                any = true;
-                table.push_str(&format!(
-                    "| {} | {} | {} |\n",
-                    crate::batch::short_id(&j.id),
-                    j.status(),
-                    crate::batch::one_line(&j.task).replace('|', "\\|")
-                ));
-            }
-            if any {
-                println!("{}", crate::md::render_stdout(table.trim()));
-                println!("\x1b[2m:result <job> to view a result\x1b[0m");
-            } else {
-                println!("no background jobs");
             }
         }
         Some("dispatch") => {
@@ -3382,8 +3353,8 @@ mod tests {
         // A unique prefix yields exactly one.
         assert_eq!(colon_command_matches("ba"), vec!["backend", "batch"]);
         assert_eq!(colon_command_matches("y"), vec!["yolo"]);
-        // `result` and `results` share a prefix — both come back, in order.
-        assert_eq!(colon_command_matches("result"), vec!["result", "results"]);
+        // `result` is unique now — the old `results` duplicate was removed (#117).
+        assert_eq!(colon_command_matches("result"), vec!["result"]);
         // No match → empty (and definitely no panic).
         assert!(colon_command_matches("zzz").is_empty());
     }
@@ -3447,11 +3418,11 @@ mod tests {
         assert!(full.contains(":mode"));
         assert!(full.contains("confirmation"));
 
-        // Typing narrows it in place: `:wo` -> output + workers only.
-        let wo = palette_hint(":wo", 3).expect("`:wo` matches the worker commands");
-        assert_eq!(wo.matches('\n').count(), 2);
-        assert!(wo.contains(":output"));
-        assert!(wo.contains(":workers"));
+        // Typing narrows it in place: `:n` -> name + new only.
+        let n = palette_hint(":n", 2).expect("`:n` matches the name/new commands");
+        assert_eq!(n.matches('\n').count(), 2);
+        assert!(n.contains(":name"));
+        assert!(n.contains(":new"));
 
         // No hint once an argument starts (a space ends the command name)...
         assert!(palette_hint(":mode dev", 9).is_none());
