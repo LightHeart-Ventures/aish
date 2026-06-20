@@ -394,6 +394,27 @@ pub(crate) struct AishHelper {
     aliases: Arc<HashMap<String, Vec<String>>>,
     /// Lazily-populated, TTL-refreshed cache of executable names on PATH.
     cmd_cache: Arc<Mutex<Option<CmdCache>>>,
+    /// Single-entry memo of the last route-preview decision, keyed on the exact
+    /// `(line, cwd)` it was computed for (S5.4 / TASK-133). The Highlighter calls
+    /// `route_preview` on *every* repaint, and rustyline repaints on each
+    /// keystroke, cursor move, forced refresh, and hint toggle. `route_preview`
+    /// walks PATH (`resolve_program` stats each dir) and tokenizes the line, so
+    /// recomputing it for an unchanged buffer is the per-repaint cost that reads
+    /// as flicker/lag at typing speed. Keyed on `(line, cwd)`, this serves a
+    /// repeated paint of the same buffer in O(1); any edit (a new line) or a `cd`
+    /// (new cwd) misses and recomputes exactly once.
+    route_cache: Mutex<Option<RouteMemo>>,
+}
+
+/// One memoized route-preview decision, keyed on the exact `(line, cwd)` it was
+/// computed for (S5.4 / TASK-133). `Preview` is `Copy`, so a cache hit is a
+/// cheap compare + return with no allocation. Held behind a `Mutex` because the
+/// Highlighter only sees `&self`; the lock is uncontended (readline is
+/// single-threaded).
+struct RouteMemo {
+    line: String,
+    cwd: PathBuf,
+    preview: Preview,
 }
 
 impl AishHelper {
@@ -405,7 +426,13 @@ impl AishHelper {
         path: String,
         aliases: Arc<HashMap<String, Vec<String>>>,
     ) -> Self {
-        Self { cwd, path, aliases, cmd_cache: Arc::new(Mutex::new(None)) }
+        Self {
+            cwd,
+            path,
+            aliases,
+            cmd_cache: Arc::new(Mutex::new(None)),
+            route_cache: Mutex::new(None),
+        }
     }
 
     /// Re-point completion/highlighting at `cwd` (the session's cwd, which `cd`
@@ -745,20 +772,53 @@ fn route_preview(line: &str, cwd: &Path, path: &str, aliases: &HashMap<String, V
     }
 }
 
+impl AishHelper {
+    /// The route-preview decision for `line`, memoized on `(line, cwd)` (S5.4 /
+    /// TASK-133). The Highlighter hits this on every repaint; when the buffer is
+    /// unchanged from the last paint (a cursor move, a forced refresh, a hint
+    /// toggle, or rustyline re-highlighting to reset its highlight flag) it
+    /// returns the cached decision without re-walking PATH or re-tokenizing — the
+    /// flicker-free contract. The first paint of a new buffer (each keystroke)
+    /// computes once and re-seeds the memo.
+    fn cached_preview(&self, line: &str) -> Preview {
+        let mut cache = self.route_cache.lock().unwrap();
+        if let Some(memo) = cache.as_ref() {
+            if memo.line == line && memo.cwd == self.cwd {
+                return memo.preview;
+            }
+        }
+        let preview = route_preview(line, &self.cwd, &self.path, &self.aliases);
+        *cache = Some(RouteMemo {
+            line: line.to_string(),
+            cwd: self.cwd.clone(),
+            preview,
+        });
+        preview
+    }
+}
+
 impl Highlighter for AishHelper {
     /// Paint the whole input line by the route `dispatch` would take, so a
     /// mis-route is visible BEFORE Enter (TASK-132). The color is sourced from
     /// [`Preview::ansi`] — the one green/cyan/dim mapping — and a `Plain` line
-    /// (a `:`-command or empty buffer) is returned untouched.
+    /// (a `:`-command or empty buffer) is returned untouched. The route is read
+    /// through [`AishHelper::cached_preview`] so a repeated paint of the same
+    /// buffer is an O(1) memo hit — the flicker-free guarantee at typing speed
+    /// (S5.4 / TASK-133); only a genuine edit pays the recompute, exactly once.
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
-        match route_preview(line, &self.cwd, &self.path, &self.aliases).ansi() {
+        match self.cached_preview(line).ansi() {
             Some(color) => std::borrow::Cow::Owned(format!("{color}{line}\x1b[0m")),
             None => std::borrow::Cow::Borrowed(line),
         }
     }
 
+    /// Tell rustyline when a repaint must re-run the highlighter. A bare cursor
+    /// move can't change the route (the buffer is identical), so it returns
+    /// `false` and rustyline keeps the current colors. Any content edit returns
+    /// `true` to re-color the whole line; that repaint's `highlight` call is a
+    /// cheap memo lookup that recomputes only because the buffer actually changed
+    /// — so the route is computed at most once per distinct line (S5.4 / TASK-133).
     fn highlight_char(&self, _line: &str, _pos: usize, kind: CmdKind) -> bool {
-        // Re-color on edits (not on bare cursor moves — the route can't change).
         kind != CmdKind::MoveCursor
     }
 }
@@ -2786,6 +2846,7 @@ mod tests {
             path: dir.to_string_lossy().into_owned(),
             aliases: Arc::new(aliases),
             cmd_cache: Arc::new(Mutex::new(None)),
+            route_cache: Mutex::new(None),
         }
     }
 
@@ -3099,6 +3160,48 @@ mod tests {
         assert_ne!(paint("tool"), paint("toolnope"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cached_preview_memoizes_and_tracks_cwd() {
+        // S5.4 / TASK-133: the Highlighter reads the route through
+        // `cached_preview`, which must agree with the uncached `route_preview`
+        // on every buffer and stay stable across the repeated paints rustyline
+        // fires for one unchanged line (the flicker-free contract).
+        let dir = std::env::temp_dir().join(format!("aish_memo_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        make_exec(&dir.join("tool")); // a plain resolvable binary
+        let mut helper = helper_for(&dir, HashMap::new());
+
+        // Cached answer equals the direct classifier for each route class.
+        let oracle = |l: &str| route_preview(l, &helper.cwd, &helper.path, &helper.aliases);
+        for line in ["tool --flag", "what is the capital of texas", ":help", ""] {
+            assert_eq!(helper.cached_preview(line), oracle(line), "mismatch for {line:?}");
+        }
+        assert_eq!(helper.cached_preview("tool --flag"), Preview::Direct);
+        assert_eq!(helper.cached_preview("what is the capital of texas"), Preview::Model);
+
+        // Repeated paints of the SAME buffer return the same decision (memo hit),
+        // and interleaving a different line never corrupts the prior answer.
+        let direct = helper.cached_preview("tool --flag");
+        assert_eq!(helper.cached_preview("tool --flag"), direct);
+        assert_eq!(helper.cached_preview("what is the capital of texas"), Preview::Model);
+        assert_eq!(helper.cached_preview("tool --flag"), direct);
+
+        // A `cd` (new cwd) invalidates the memo: the same lead word now resolves
+        // nowhere, so the route flips from Direct to Model on the next paint.
+        let empty = std::env::temp_dir().join(format!("aish_memo_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).unwrap();
+        helper.set_cwd(&empty);
+        // helper_for sets `path` to the original dir; point it at the empty dir
+        // too so "tool" truly resolves nowhere after the move.
+        helper.path = empty.to_string_lossy().into_owned();
+        assert_eq!(helper.cached_preview("tool --flag"), Preview::Model);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     // TASK-122 — `$?` mapping from a job's terminal summary (POSIX fg/wait).
