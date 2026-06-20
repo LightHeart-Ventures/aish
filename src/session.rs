@@ -51,7 +51,7 @@ pub struct Session {
     /// How much the safety gate asks before acting (paranoid → yolo).
     pub mode: Mode,
     /// Optional session name, shown as a `[NAME] |` prefix on the prompt. Set
-    /// with `:name <name>`, cleared with bare `:name`. Session-local.
+    /// with `:rename <name>`, cleared with bare `:rename`. Session-local.
     pub name: Option<String>,
     /// Stable per-process id (a uuid). Batch jobs are tagged with it so results
     /// auto-deliver only to the session that spawned them; other sessions can

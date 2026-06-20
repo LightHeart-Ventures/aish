@@ -487,7 +487,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("memories", "stored memories / organize"),
     ("mode", "set confirmation level"),
     ("model", "switch model (opus|sonnet|haiku)"),
-    ("name", "name this session"),
+    ("rename", "rename this session"),
     ("new", "clear conversation history"),
     ("quit", "exit aish"),
     ("result", "view a finished job's result"),    ("tell", "message an in-flight coordinator"),
@@ -1985,7 +1985,7 @@ async fn handle_colon(
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
                  :tell <id> <message>                send instructions to an in-flight coordinator (folded in next round)\n\
-                 :name <name>                        name the session (prefixes the prompt); auto-set to the repo name at startup, bare :name clears\n\
+                 :rename <name>                      name the session (prefixes the prompt); auto-set to the repo name at startup, bare :rename clears\n\
                  :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
                                                      a verifier judges each turn. :goal status, :goal clear\n\
                  :allow                              list always-allowed tools/commands + dir grants\n\
@@ -2208,14 +2208,14 @@ async fn handle_colon(
             let message = parts.collect::<Vec<_>>().join(" ");
             tell_coordinator(target, message.trim(), session);
         }
-        Some("name") => {
+        Some("rename") => {
             let rest = parts.collect::<Vec<_>>().join(" ");
             let rest = rest.trim();
             if rest.is_empty() {
                 if session.name.take().is_some() {
                     println!("session name cleared");
                 } else {
-                    println!("usage: :name <name>   (bare :name clears it)");
+                    println!("usage: :rename <name>   (bare :rename clears it)");
                 }
             } else {
                 session.name = Some(rest.to_string());
