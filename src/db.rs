@@ -63,6 +63,12 @@ impl Db {
                  tool TEXT PRIMARY KEY,
                  ts   TEXT NOT NULL DEFAULT current_timestamp
              );
+             CREATE TABLE IF NOT EXISTS allowed_dirs (
+                 perm TEXT NOT NULL,
+                 dir  TEXT NOT NULL,
+                 ts   TEXT NOT NULL DEFAULT current_timestamp,
+                 PRIMARY KEY (perm, dir)
+             );
              CREATE TABLE IF NOT EXISTS settings (
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL
@@ -205,6 +211,53 @@ impl Db {
         let n = self
             .conn
             .execute("DELETE FROM allowed_tools WHERE tool = ?1", [tool])?;
+        Ok(n > 0)
+    }
+
+    /// Grant `perm` (read|write|delete) recursively for everything under `dir`
+    /// — the directory ('d') answer at a confirmation prompt. Idempotent.
+    pub fn allow_dir(&self, perm: &str, dir: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO allowed_dirs (perm, dir) VALUES (?1, ?2)",
+            (perm, dir),
+        )?;
+        Ok(())
+    }
+
+    /// Is `path` covered by a directory grant for `perm`? A grant on `dir`
+    /// covers `dir` itself and everything beneath it (component-wise prefix, so
+    /// `/a/b` grants `/a/b/c` but never `/a/bc`).
+    pub fn is_dir_allowed(&self, perm: &str, path: &str) -> Result<bool> {
+        let target = Path::new(path);
+        let mut stmt = self.conn.prepare("SELECT dir FROM allowed_dirs WHERE perm = ?1")?;
+        let dirs = stmt.query_map([perm], |r| r.get::<_, String>(0))?;
+        for dir in dirs.filter_map(std::result::Result::ok) {
+            if target.starts_with(&dir) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Every directory grant as `(perm, dir, ts)`, ordered — backs the `:allow`
+    /// listing.
+    pub fn allowed_dirs(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT perm, dir, ts FROM allowed_dirs ORDER BY perm, dir")?;
+        let rows = stmt.query_map([], |r| {
+            let row: (String, String, String) = (r.get(0)?, r.get(1)?, r.get(2)?);
+            Ok(row)
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Drop a directory grant. Returns true if a row was removed.
+    pub fn revoke_dir(&self, perm: &str, dir: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM allowed_dirs WHERE perm = ?1 AND dir = ?2",
+            (perm, dir),
+        )?;
         Ok(n > 0)
     }
 
@@ -902,6 +955,33 @@ mod tests {
         assert_eq!(store.failed_attempts("unrelated").unwrap(), 0);
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn dir_allowlist_roundtrip_and_prefix_match() {
+        let db = temp_db("allowdir");
+        // Nothing granted yet.
+        assert!(!db.is_dir_allowed("read", "/tmp/proj/Cargo.toml").unwrap());
+        // Grant read on a directory; it covers the dir and everything beneath.
+        db.allow_dir("read", "/tmp/proj").unwrap();
+        db.allow_dir("read", "/tmp/proj").unwrap(); // idempotent
+        assert!(db.is_dir_allowed("read", "/tmp/proj/Cargo.toml").unwrap());
+        assert!(db.is_dir_allowed("read", "/tmp/proj/src/main.rs").unwrap());
+        assert!(db.is_dir_allowed("read", "/tmp/proj").unwrap());
+        // Component-wise prefix: a sibling sharing a name prefix is NOT covered.
+        assert!(!db.is_dir_allowed("read", "/tmp/proj2/x").unwrap());
+        // Perm is scoped: a read grant is not a write grant.
+        assert!(!db.is_dir_allowed("write", "/tmp/proj/Cargo.toml").unwrap());
+        // Listing + revoke.
+        db.allow_dir("write", "/tmp/other").unwrap();
+        let dirs = db.allowed_dirs().unwrap();
+        assert_eq!(
+            dirs.iter().map(|(p, d, _)| (p.as_str(), d.as_str())).collect::<Vec<_>>(),
+            vec![("read", "/tmp/proj"), ("write", "/tmp/other")]
+        );
+        assert!(db.revoke_dir("read", "/tmp/proj").unwrap());
+        assert!(!db.revoke_dir("read", "/tmp/proj").unwrap()); // already gone
+        assert!(!db.is_dir_allowed("read", "/tmp/proj/Cargo.toml").unwrap());
     }
 
     #[test]

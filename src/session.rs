@@ -84,6 +84,12 @@ pub struct Session {
     /// keeps `a` working even when the persistent store is unavailable (AC3).
     /// Populated on every 'a' answer and consulted before the DB.
     pub session_allows: HashSet<String>,
+    /// Directory-scoped permission grants for THIS session only — the in-memory
+    /// fallback that keeps the 'd' answer working when the persistent store is
+    /// unavailable. Each entry is `(perm, dir)` where perm is read|write|delete
+    /// and the grant covers `dir` recursively. Populated on every 'd' answer and
+    /// consulted before the DB.
+    pub session_dir_allows: HashSet<(String, PathBuf)>,
     /// Running estimate of how many tokens the current `history` occupies in the
     /// model's context window — updated after each turn from the backend's
     /// reported usage (or a char-based estimate). Drives auto-compaction and the
@@ -174,6 +180,7 @@ impl Session {
             jobs: Default::default(),
             last_status: 0,
             session_allows: HashSet::new(),
+            session_dir_allows: HashSet::new(),
             context_used: 0,
             batch_mode: true,
             batch_model: crate::batch::DEFAULT_BATCH_MODEL.to_string(),
@@ -246,6 +253,36 @@ impl Session {
                 let _ = db.allow(key);
             }
             None => eprintln!("note: allow-list won't persist — database unavailable"),
+        }
+    }
+
+    /// True when `path` falls under a directory granted for `perm` (a prior 'd'
+    /// answer). Checks the in-memory session grants first, then the persistent
+    /// store. Best-effort: no store → only the session set applies.
+    pub fn is_path_allowed(&self, perm: &str, path: &std::path::Path) -> bool {
+        if self
+            .session_dir_allows
+            .iter()
+            .any(|(p, dir)| p == perm && path.starts_with(dir))
+        {
+            return true;
+        }
+        self.db
+            .as_ref()
+            .is_some_and(|db| db.is_dir_allowed(perm, &path.to_string_lossy()).unwrap_or(false))
+    }
+
+    /// Grant `perm` recursively for everything under `dir` — the 'd' answer.
+    /// Always recorded in the session set so it holds for the rest of this
+    /// session; also persisted when a store is available.
+    pub fn allow_path_dir(&mut self, perm: &str, dir: &std::path::Path) {
+        self.session_dir_allows
+            .insert((perm.to_string(), dir.to_path_buf()));
+        match &self.db {
+            Some(db) => {
+                let _ = db.allow_dir(perm, &dir.to_string_lossy());
+            }
+            None => eprintln!("note: directory allow won't persist — database unavailable"),
         }
     }
 
@@ -417,6 +454,21 @@ mod tests {
         let out = truncate_last(s);
         assert!(out.ends_with("…[truncated]"));
         assert!(out.is_char_boundary(out.len() - "\n…[truncated]".len()));
+    }
+
+    #[test]
+    fn path_allow_dir_covers_subtree_per_perm() {
+        let mut session = Session::new().unwrap();
+        // No store → only the session set applies.
+        let toml = std::path::Path::new("/tmp/proj/Cargo.toml");
+        assert!(!session.is_path_allowed("read", toml));
+        session.allow_path_dir("read", std::path::Path::new("/tmp/proj"));
+        // The granted dir and everything under it is allowed for that perm.
+        assert!(session.is_path_allowed("read", toml));
+        assert!(session.is_path_allowed("read", std::path::Path::new("/tmp/proj/src/main.rs")));
+        // Different perm, or a sibling dir, is not.
+        assert!(!session.is_path_allowed("write", toml));
+        assert!(!session.is_path_allowed("read", std::path::Path::new("/tmp/proj2/x")));
     }
 
     #[test]
