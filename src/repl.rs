@@ -490,11 +490,9 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("name", "name this session"),
     ("new", "clear conversation history"),
     ("quit", "exit aish"),
-    ("result", "view a finished job's result"),
-    ("results", "list finished background jobs"),
-    ("tell", "message an in-flight coordinator"),
+    ("result", "view a finished job's result"),    ("tell", "message an in-flight coordinator"),
     ("update", "upgrade aish to the latest release"),
-    ("worker-output", "stream coordinators' activity"),
+    ("output", "stream coordinators' activity"),
     ("workers", "list this session's coordinators (all = every session)"),
     ("yolo", "toggle yolo mode"),
 ];
@@ -1982,8 +1980,8 @@ async fn handle_colon(
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
                  :workers [all]                      list this session's background coordinators (all = every session)\n\
-                 :worker-output [on|off]             stream background coordinators' activity (🔧 tool + ·standard/·batch lines); off (default) keeps them quiet\n\
-                 :results                            list finished background jobs (workers + batches)\n\
+                 :output [on|off]             stream background coordinators' activity (🔧 tool + ·standard/·batch lines); off (default) keeps them quiet\n\
+                 \n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
                  :tell <id> <message>                send instructions to an in-flight coordinator (folded in next round)\n\
@@ -2018,7 +2016,7 @@ async fn handle_colon(
             }
             None => println!("usage: :kill <job-id>"),
         },
-        Some("worker-output" | "wo") => {
+        Some("output" | "wo") => {
             let target = match parts.next() {
                 Some("on") => Some(true),
                 Some("off") => Some(false),
@@ -2034,7 +2032,7 @@ async fn handle_colon(
                     session.show_worker_output.store(false, Ordering::SeqCst);
                     println!("worker output OFF — background coordinators run quietly (only the ⟳N pulse + completion notice show)");
                 }
-                None => println!("usage: :worker-output [on|off]"),
+                None => println!("usage: :output [on|off]"),
             }
         }
         Some("workers") => {
@@ -2164,7 +2162,7 @@ async fn handle_colon(
                 });
             match found {
                 Some(r) => println!("{}", crate::md::render_stdout(r.trim())),
-                None => println!("no background job matching '{id}' (see :results)"),
+                None => println!("no background job matching '{id}' (see :workers)"),
             }
         }
         Some("results") => {
@@ -3380,7 +3378,7 @@ mod tests {
         // Empty prefix → the whole catalog (the bare-`:` popup).
         assert_eq!(colon_command_matches("").len(), COLON_COMMANDS.len());
         // A discriminating prefix narrows to its family.
-        assert_eq!(colon_command_matches("wo"), vec!["worker-output", "workers"]);
+        assert_eq!(colon_command_matches("o"), vec!["output"]);
         // A unique prefix yields exactly one.
         assert_eq!(colon_command_matches("ba"), vec!["backend", "batch"]);
         assert_eq!(colon_command_matches("y"), vec!["yolo"]);
@@ -3449,10 +3447,10 @@ mod tests {
         assert!(full.contains(":mode"));
         assert!(full.contains("confirmation"));
 
-        // Typing narrows it in place: `:wo` -> worker-output + workers only.
+        // Typing narrows it in place: `:wo` -> output + workers only.
         let wo = palette_hint(":wo", 3).expect("`:wo` matches the worker commands");
         assert_eq!(wo.matches('\n').count(), 2);
-        assert!(wo.contains(":worker-output"));
+        assert!(wo.contains(":output"));
         assert!(wo.contains(":workers"));
 
         // No hint once an argument starts (a space ends the command name)...
