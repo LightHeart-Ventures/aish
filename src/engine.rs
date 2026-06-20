@@ -163,7 +163,7 @@ pub async fn run_turn(
             // hand-off to the stronger model) so it travels with the desc through
             // the running spinner, the finished ✓/✗ line, and the retroactive
             // reveal — every place that renders the activity line.
-            let desc = format!("{} {}", tool_glyph(&call.name), describe_call(call));
+            let desc = flatten_ws(&format!("{} {}", tool_glyph(&call.name), describe_call(call)));
 
             // Tier-1 turn audit (background coordinator only — None otherwise).
             // Ask the journal whether this exact tool call was already completed
@@ -597,6 +597,21 @@ fn tool_result_line(desc: &str, is_error: bool) -> String {
     }
 }
 
+/// Collapse a desc to a SINGLE display line: every run of whitespace — including
+/// embedded newlines, carriage returns and tabs (a `gh pr create --body`
+/// markdown payload, a multi-line `remember` note, an argv with a heredoc) —
+/// becomes one space, and the ends are trimmed. Companion to `truncate_to_cols`:
+/// a newline has display width 0, so width-based truncation can NOT catch it —
+/// an embedded newline survives, and the spinner per-frame CR+erase redraw only
+/// clears the cursor row, so every frame scrolls a fresh copy of the desc tail
+/// instead of animating in place (the multi-line tool-call bug). Flattening at
+/// the source keeps the whole activity line — running spinner, ✓/✗ finish
+/// line, and retroactive reveal — on one physical row before `truncate_to_cols`
+/// clamps its width.
+fn flatten_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn describe_call(call: &crate::backend::ToolCall) -> String {
     let a = &call.args;
     match call.name.as_str() {
@@ -769,6 +784,27 @@ mod tests {
         let out = truncate_to_cols(&desc, 10);
         assert!(out.width() <= 10, "wide-glyph desc overflowed: width {}", out.width());
         assert!(out.starts_with('🔧'), "leading glyph preserved: {out:?}");
+    }
+
+    #[test]
+    fn flatten_ws_collapses_embedded_newlines_to_one_line() {
+        // The multi-line tool-call bug: a `gh pr create --body` argv carries an
+        // embedded markdown body with newlines. Width truncation cannot catch a
+        // width-0 newline, so it must be flattened at the source or the spinner
+        // scrolls a fresh copy every frame.
+        let desc = "🔧 gh pr create --title fix --body ## Issue\n\nbody\n- a\n- b";
+        let out = flatten_ws(desc);
+        assert!(!out.contains('\n'), "newlines must be gone: {out:?}");
+        assert!(!out.contains('\r'), "carriage returns must be gone: {out:?}");
+        assert!(!out.contains('\t'), "tabs must be gone: {out:?}");
+        assert_eq!(out, "🔧 gh pr create --title fix --body ## Issue body - a - b");
+    }
+
+    #[test]
+    fn flatten_ws_squeezes_runs_and_trims() {
+        assert_eq!(flatten_ws("  a   b\t c \n"), "a b c");
+        assert_eq!(flatten_ws("single"), "single");
+        assert_eq!(flatten_ws("\n\n"), "");
     }
 
     #[test]
