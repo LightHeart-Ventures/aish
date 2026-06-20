@@ -487,12 +487,13 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("memories", "stored memories / organize"),
     ("mode", "set confirmation level"),
     ("model", "switch model (opus|sonnet|haiku)"),
-    ("rename", "rename this session"),
     ("new", "clear conversation history"),
-    ("quit", "exit aish"),
-    ("result", "view a finished job's result"),    ("tell", "message an in-flight coordinator"),
-    ("update", "upgrade aish to the latest release"),
     ("output", "stream coordinators' activity"),
+    ("quit", "exit aish"),
+    ("rename", "rename this session"),
+    ("result", "view a finished job's result"),
+    ("tell", "message an in-flight coordinator"),
+    ("update", "upgrade aish to the latest release"),
     ("workers", "list this session's coordinators (all = every session)"),
     ("yolo", "toggle yolo mode"),
 ];
@@ -3382,8 +3383,8 @@ mod tests {
         // A unique prefix yields exactly one.
         assert_eq!(colon_command_matches("ba"), vec!["backend", "batch"]);
         assert_eq!(colon_command_matches("y"), vec!["yolo"]);
-        // `result` and `results` share a prefix — both come back, in order.
-        assert_eq!(colon_command_matches("result"), vec!["result", "results"]);
+        // `result` is now a unique prefix (the `:results` alias was removed in #117).
+        assert_eq!(colon_command_matches("result"), vec!["result"]);
         // No match → empty (and definitely no panic).
         assert!(colon_command_matches("zzz").is_empty());
     }
@@ -3447,11 +3448,11 @@ mod tests {
         assert!(full.contains(":mode"));
         assert!(full.contains("confirmation"));
 
-        // Typing narrows it in place: `:wo` -> output + workers only.
-        let wo = palette_hint(":wo", 3).expect("`:wo` matches the worker commands");
-        assert_eq!(wo.matches('\n').count(), 2);
-        assert!(wo.contains(":output"));
-        assert!(wo.contains(":workers"));
+        // Typing narrows it in place: `:re` -> rename + result only.
+        let re = palette_hint(":re", 3).expect("`:re` matches rename + result");
+        assert_eq!(re.matches('\n').count(), 2);
+        assert!(re.contains(":rename"));
+        assert!(re.contains(":result"));
 
         // No hint once an argument starts (a space ends the command name)...
         assert!(palette_hint(":mode dev", 9).is_none());
