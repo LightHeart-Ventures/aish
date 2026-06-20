@@ -35,7 +35,10 @@ fn repo() -> String {
 }
 
 /// The version compiled into this binary (Cargo package version, e.g.
-/// `0.4.0-dev`).
+/// `0.4.0-dev`). This is automatically baked in from Cargo.toml at compile
+/// time via `env!("CARGO_PKG_VERSION")`. **IMPORTANT: Always keep Cargo.toml's
+/// [package] version field in sync with the current release tag to prevent
+/// version detection drift during updates.**
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -529,5 +532,18 @@ mod tests {
         assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
         assert_eq!(human_bytes(25 * 1024 * 1024 + 700 * 1024), "25.7 MB");
         assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn current_version_is_valid_semver() {
+        // Safeguard: ensure Cargo.toml version is always a valid semver that the
+        // version detection logic can parse. This test fails if someone forgets
+        // to update Cargo.toml when cutting a release (the bug from ISS-2XXX).
+        let v = current_version();
+        assert!(
+            parse_semver(v).is_some(),
+            "Cargo.toml version '{}' is not valid semver — ensure it matches the release tag",
+            v
+        );
     }
 }
