@@ -480,7 +480,7 @@ pub struct CoordinatorRow {
     /// Owning session (uuid) — the LAUNCHING interactive session, used both to
     /// detect orphaned runs at startup and to mark "your" rows in `:workers`.
     pub session_id: Option<String>,
-    /// The launching session's friendly name (`:name`), for display.
+    /// The launching session's friendly name (`:rename`), for display.
     pub session_name: Option<String>,
     pub created_at: Option<String>,
     /// Last liveness beat (SQLite `current_timestamp` string). A run whose owner

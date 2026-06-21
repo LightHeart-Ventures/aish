@@ -913,7 +913,7 @@ pub struct WorkerSpec {
     /// child's throwaway uuid. This is what makes `:workers`/`background_status`
     /// recognize a background job as belonging to "you".
     pub launch_session_id: String,
-    /// The launching session's friendly name (`:name`), if it has one — carried
+    /// The launching session's friendly name (`:rename`), if it has one — carried
     /// alongside the id purely for display.
     pub launch_session_name: Option<String>,
     /// Shared `:worker-output` toggle from the launching session. The live stderr
