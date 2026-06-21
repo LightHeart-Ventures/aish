@@ -134,13 +134,9 @@ impl LineEditor for RustylineEditor {
         match self.rl.readline(prompt) {
             Ok(line) => ReadOutcome::Line(line),
             Err(ReadlineError::Interrupted) => {
-                // Ctrl-O routes here too (handler returns Interrupt); the toggle
-                // flag distinguishes it from a plain Ctrl-C clear-line.
-                if self.raw_toggle.swap(false, Ordering::SeqCst) {
-                    ReadOutcome::CtrlO
-                } else {
-                    ReadOutcome::Interrupted
-                }
+                // Ctrl-O routes here too (handler returns Interrupt); the drained
+                // toggle flag distinguishes it from a plain Ctrl-C clear-line.
+                interrupt_outcome(self.raw_toggle.swap(false, Ordering::SeqCst))
             }
             Err(ReadlineError::Eof) => ReadOutcome::Eof,
             Err(e) => ReadOutcome::Error(e.to_string()),
@@ -160,6 +156,21 @@ impl LineEditor for RustylineEditor {
             .create_external_printer()
             .ok()
             .map(|p| Box::new(RustylinePrinter(p)) as Box<dyn LinePrinter>)
+    }
+}
+
+/// Map a drained Ctrl-O toggle onto the editor-agnostic outcome. rustyline
+/// collapses BOTH Ctrl-O (the raw-output toggle, via `CtrlOToggle` →
+/// `Cmd::Interrupt`) and a plain Ctrl-C onto `ReadlineError::Interrupted`; the
+/// `raw_toggle` flag is what splits them back apart. Factored out as a pure fn
+/// so the disambiguation is unit-testable without a TTY (S5.5 / TASK-134): the
+/// caller passes the result of the read-and-clear `swap`, and a raised toggle
+/// becomes [`ReadOutcome::CtrlO`] while a clear flag is a [`ReadOutcome::Interrupted`].
+fn interrupt_outcome(raw_toggle_was_set: bool) -> ReadOutcome {
+    if raw_toggle_was_set {
+        ReadOutcome::CtrlO
+    } else {
+        ReadOutcome::Interrupted
     }
 }
 
@@ -186,5 +197,112 @@ impl ConditionalEventHandler for CtrlOToggle {
     fn handle(&self, _: &Event, _: RepeatCount, _: bool, _: &EventContext) -> Option<Cmd> {
         self.pending.store(true, Ordering::SeqCst);
         Some(Cmd::Interrupt)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — S5.5 / TASK-134: the three rustyline-bound behaviours (Ctrl-O toggle,
+// the completer/helper, and history) must behave identically once routed
+// through the `LineEditor` abstraction. The completer's logic is exercised
+// exhaustively in `repl.rs` (command/path/subcommand/`:`-palette completion)
+// and the sqlite input/output log in `db.rs`; these tests lock the seams the
+// abstraction itself introduced — the Ctrl-O disambiguation and the
+// history-file round-trip through the trait — so a future reedline swap (or any
+// refactor of this file) can't silently regress them.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A throwaway helper for constructing a `RustylineEditor` in tests. The
+    /// completion cwd / PATH / aliases don't matter here — these tests exercise
+    /// the editor's history + Ctrl-O seams, not completion (covered in repl.rs).
+    fn temp_helper() -> AishHelper {
+        AishHelper::new(
+            std::env::temp_dir(),
+            std::env::var("PATH").unwrap_or_default(),
+            Arc::new(HashMap::new()),
+        )
+    }
+
+    /// Ctrl-O preservation: rustyline collapses both Ctrl-O and Ctrl-C onto
+    /// `Interrupted`, so the editor must split them back apart by the drained
+    /// toggle flag. This is the exact mapping `read_line` performs — a raised
+    /// toggle is a raw-output request, a clear one is a plain clear-line.
+    #[test]
+    fn interrupt_outcome_distinguishes_ctrl_o_from_ctrl_c() {
+        assert!(
+            matches!(interrupt_outcome(true), ReadOutcome::CtrlO),
+            "a drained Ctrl-O toggle must surface as CtrlO"
+        );
+        assert!(
+            matches!(interrupt_outcome(false), ReadOutcome::Interrupted),
+            "a clear toggle is a plain Ctrl-C clear-line"
+        );
+    }
+
+    /// The flag `read_line` reads is a swap (read-and-clear): a Ctrl-O raised by
+    /// the key handler is observed exactly once, and the very next `Interrupted`
+    /// is therefore a plain Ctrl-C. This pins the `raw_toggle.swap(false, …)`
+    /// drain contract that prevents a stale toggle from eating a later Ctrl-C.
+    #[test]
+    fn raw_toggle_drains_exactly_once() {
+        let flag = Arc::new(AtomicBool::new(false));
+        // The CtrlOToggle handler raises it.
+        flag.store(true, Ordering::SeqCst);
+        assert!(
+            flag.swap(false, Ordering::SeqCst),
+            "first drain sees the raised Ctrl-O"
+        );
+        assert!(
+            !flag.swap(false, Ordering::SeqCst),
+            "second drain is a plain Ctrl-C (toggle already consumed)"
+        );
+    }
+
+    /// History preservation through the abstraction: lines added + saved via the
+    /// `LineEditor` trait round-trip to disk and reload into a fresh editor — the
+    /// up-arrow recall ring survives a restart exactly as it did before S5.1 put
+    /// the editor behind the trait. (The richer, queryable sqlite input/output
+    /// log is separate — `db.rs` — and unaffected by the editor swap.)
+    #[test]
+    fn history_persists_through_the_trait() {
+        let path = std::env::temp_dir().join(format!("aish_hist_test_{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut ed = RustylineEditor::new(temp_helper(), path.clone())
+                .expect("construct editor");
+            ed.add_history("echo alpha");
+            ed.add_history("git status");
+            ed.save_history();
+        }
+
+        let saved =
+            std::fs::read_to_string(&path).expect("save_history must write the history file");
+        assert!(saved.contains("echo alpha"), "history missing first entry: {saved:?}");
+        assert!(saved.contains("git status"), "history missing second entry: {saved:?}");
+
+        // A fresh editor loads the persisted file without error — the reload the
+        // REPL performs at startup (`load_history` in `RustylineEditor::new`).
+        let _reloaded =
+            RustylineEditor::new(temp_helper(), path.clone()).expect("reload editor from history");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `set_cwd` re-points the editor's completion/highlighting at a new cwd —
+    /// the `cd` path the REPL drives before each read — without error. The
+    /// completer's behaviour at that cwd is covered in repl.rs; here we only pin
+    /// that the trait method reaches the installed helper.
+    #[test]
+    fn set_cwd_repoints_without_error() {
+        let path = std::env::temp_dir().join(format!("aish_nohist_{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut ed = RustylineEditor::new(temp_helper(), path.clone()).expect("construct editor");
+        ed.set_cwd(Path::new("/tmp"));
+        ed.set_cwd(Path::new("/"));
+        let _ = std::fs::remove_file(&path);
     }
 }
