@@ -162,8 +162,13 @@ pub async fn run_turn(
             // Prefix the per-tool glyph (🔧 for most tools, ⚙️ for an `escalate`
             // hand-off to the stronger model) so it travels with the desc through
             // the running spinner, the finished ✓/✗ line, and the retroactive
-            // reveal — every place that renders the activity line.
-            let desc = flatten_ws(&format!("{} {}", tool_glyph(&call.name), describe_call(call)));
+            // reveal — every place that renders the activity line. Flatten ONLY
+            // the description (collapses embedded newlines from e.g. a
+            // `gh pr create --body` payload); the glyph + its spacing is joined
+            // afterward so the gear's trailing space — its visual gap before the
+            // desc, since the gear renders narrow unlike the double-width wrench —
+            // isn't collapsed away by the flatten.
+            let desc = format!("{} {}", tool_glyph(&call.name), flatten_ws(&describe_call(call)));
 
             // Tier-1 turn audit (background coordinator only — None otherwise).
             // Ask the journal whether this exact tool call was already completed
@@ -451,9 +456,15 @@ const PREFIX_COLS: usize = 4;
 /// escalation marker with the live "thinking" spinner to its left — rather than
 /// looking like just another tool call. Baked into the desc at the call site so
 /// it travels through the running spinner, the ✓/✗ finish line, and the reveal.
+///
+/// The gear carries a TRAILING SPACE: it renders as a narrow (single-column)
+/// glyph in most terminals — unlike the double-width wrench — so without the
+/// extra space the desc crowds right up against it. The call site flattens only
+/// the description (not the glyph), so this space survives to give the gear a
+/// clear gap before the text.
 fn tool_glyph(tool_name: &str) -> &'static str {
     match tool_name {
-        "escalate" => "⚙\u{fe0f}", // gear + VS16 emoji-presentation selector
+        "escalate" => "⚙\u{fe0f} ", // gear + VS16 emoji-presentation selector + spacer
         _ => "🔧",
     }
 }
@@ -705,9 +716,10 @@ mod tests {
 
     #[test]
     fn tool_glyph_escalate_is_gear_others_wrench() {
-        // The escalate hand-off gets the static gear (with VS16), distinct from
-        // the wrench every other tool shows — so it reads as its own event.
-        assert_eq!(tool_glyph("escalate"), "⚙\u{fe0f}");
+        // The escalate hand-off gets the static gear (with VS16) plus a trailing
+        // spacer, distinct from the wrench every other tool shows — so it reads
+        // as its own event and the narrow gear keeps a clear gap before the desc.
+        assert_eq!(tool_glyph("escalate"), "⚙\u{fe0f} ");
         assert_eq!(tool_glyph("run_program"), "🔧");
         assert_eq!(tool_glyph("read_file"), "🔧");
         assert_eq!(tool_glyph("mcp__atum__list_tools"), "🔧");
@@ -716,14 +728,20 @@ mod tests {
     #[test]
     fn escalate_activity_line_uses_gear_glyph() {
         // The desc the spinner/finish/reveal all render carries the gear, and the
-        // finished line keeps the colorized status mark in front of it.
+        // finished line keeps the colorized status mark in front of it. The call
+        // site flattens only the description and joins the glyph with a separating
+        // space, so the gear's own trailing spacer survives → a clear gap (two
+        // spaces total) between the narrow gear and the text.
         let call = crate::backend::ToolCall {
             id: "t".into(),
             name: "escalate".into(),
             args: serde_json::json!({ "task": "estimate the LOE" }),
         };
-        let desc = format!("{} {}", tool_glyph(&call.name), describe_call(&call));
-        assert!(desc.starts_with("⚙\u{fe0f} escalate → stronger model:"), "got: {desc}");
+        let desc = format!("{} {}", tool_glyph(&call.name), flatten_ws(&describe_call(&call)));
+        assert!(
+            desc.starts_with("⚙\u{fe0f}  escalate → stronger model:"),
+            "gear must keep a clear gap before the desc: {desc}"
+        );
         assert!(!desc.contains('🔧'), "escalate must not show the wrench: {desc}");
         let done = tool_result_line(&desc, false);
         assert!(done.contains("\x1b[32m✓\x1b[0m"), "done line should be green-checked: {done}");
