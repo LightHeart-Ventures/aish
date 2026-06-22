@@ -121,6 +121,21 @@ impl RustylineEditor {
             EventHandler::Simple(Cmd::Kill(Movement::WholeBuffer)),
         );
 
+        // Fish-style history ghost text (S6.2 / TASK-136): accept the inline
+        // autosuggestion with → or Ctrl-F. Both route through `AcceptHint`,
+        // which inserts the suggested completion when an acceptable hint is shown
+        // at end-of-line and otherwise performs a plain forward-character move —
+        // so Ctrl-F keeps its readline meaning, and → on the display-only
+        // `:`-palette (no completion) just moves the cursor instead of beeping.
+        rl.bind_sequence(
+            KeyEvent(KeyCode::Right, Modifiers::NONE),
+            EventHandler::Conditional(Box::new(AcceptHint)),
+        );
+        rl.bind_sequence(
+            KeyEvent::ctrl('F'),
+            EventHandler::Conditional(Box::new(AcceptHint)),
+        );
+
         Ok(Self {
             rl,
             history_path,
@@ -221,6 +236,26 @@ impl ConditionalEventHandler for CtrlOToggle {
     fn handle(&self, _: &Event, _: RepeatCount, _: bool, _: &EventContext) -> Option<Cmd> {
         self.pending.store(true, Ordering::SeqCst);
         Some(Cmd::Interrupt)
+    }
+}
+
+/// → / Ctrl-F hint-acceptance handler for the fish-style history
+/// autosuggestion (S6.2 / TASK-136). When an *acceptable* hint is displayed
+/// (one whose `completion()` is `Some` — the ghost text, not the display-only
+/// `:`-palette) and the cursor sits at end-of-line, accept it by inserting the
+/// suggested completion (`Cmd::CompleteHint`). Otherwise fall back to a normal
+/// forward-character move so the keys keep their readline meaning mid-line and
+/// never beep on the palette. `ctx.hint_text()` returns the current hint's
+/// `completion()`, so it is `Some` exactly for ghost text.
+struct AcceptHint;
+
+impl ConditionalEventHandler for AcceptHint {
+    fn handle(&self, _: &Event, n: RepeatCount, _: bool, ctx: &EventContext) -> Option<Cmd> {
+        if ctx.hint_text().is_some() && ctx.pos() == ctx.line().len() {
+            Some(Cmd::CompleteHint)
+        } else {
+            Some(Cmd::Move(Movement::ForwardChar(n)))
+        }
     }
 }
 

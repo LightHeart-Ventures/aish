@@ -34,6 +34,22 @@
 //! round-boundary (a message sent mid-turn lands at the next round), and because
 //! the mailbox is durable it survives a restart and works across sessions.
 //!
+//! ## Worker-exit evaluation (auto-resume / nudge / flag-for-operator)
+//! `engine::run_turn` no longer spins the whole iteration budget away and throws
+//! the work out: it tags an abnormal stop with a greppable
+//! [`crate::loopguard::ExitReason`] banner on the first line of its answer
+//! (`loop-detected` / `forced-summarize` / `budget-exhausted`). After each round
+//! `drive` reads that banner and picks a [`crate::loopguard::Disposition`]:
+//!   * **resume** an out-of-budget stop — drive another round with a "continue,
+//!     don't redo completed work" directive (the work so far is preserved in
+//!     history / the turn-audit replay);
+//!   * **nudge** a confirmed loop — feed a change-approach directive instead of
+//!     blindly resuming the same path;
+//!   * **flag for the operator** once auto-recovery is spent — stop and record a
+//!     clear failure so a human can take over.
+//! Auto-recoveries are capped ([`crate::loopguard::MAX_AUTO_RECOVERIES`]) so the
+//! recovery itself can't become an infinite loop.
+//!
 //! ## What aish adapts vs. atum
 //! atum injects the agent step + a real Batches client as seams and runs in a
 //! container with an external orchestrator lease. aish has neither: a single
@@ -291,6 +307,10 @@ pub async fn drive(
     session.turn_audit = Some(audit);
 
     let mut rounds = 0usize;
+    // How many times we've auto-recovered (resume/nudge) a worker that ended
+    // abnormally this run. Bounded by `loopguard::MAX_AUTO_RECOVERIES` so the
+    // recovery can't itself spin forever — past the cap we flag the operator.
+    let mut auto_recoveries = 0usize;
     // Read the round cap once per run so a single env value governs the whole
     // loop (a mid-run env change can't move the goalposts under us).
     let round_cap = max_rounds();
@@ -380,6 +400,49 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
         // bare tool log alone can hide that. Best-effort; empty text is skipped.
         if let Some(a) = session.turn_audit.as_mut() {
             a.synthesis(rounds as u64, &answer);
+        }
+
+        // ── Worker-exit evaluation: did this round's turn end abnormally? The
+        // engine tags a loop-detected / forced-summarize / budget-exhausted stop
+        // with a parseable banner on the first line of the answer. Decide a
+        // recovery disposition rather than treating the (possibly partial) answer
+        // as a finished result.
+        if let Some(reason) = crate::loopguard::ExitReason::parse_banner(&answer) {
+            let disp = crate::loopguard::classify_disposition(
+                &reason,
+                auto_recoveries,
+                crate::loopguard::MAX_AUTO_RECOVERIES,
+            );
+            if disp.is_recovery() {
+                // Auto-resume the work from where it left off, or nudge the model
+                // off a loop — feed the matching directive into the next round and
+                // keep driving (still bounded by `round_cap`). The completed work
+                // is preserved in history + the turn-audit replay, so a resume
+                // continues rather than restarting from scratch.
+                auto_recoveries += 1;
+                eprintln!(
+                    "\x1b[2maish: round {rounds} ended [{}] — {} (auto-recovery {auto_recoveries}/{})\x1b[0m",
+                    reason.tag(),
+                    disp.verb(),
+                    crate::loopguard::MAX_AUTO_RECOVERIES,
+                );
+                next_input = crate::loopguard::recovery_directive(disp, &reason)
+                    .unwrap_or_else(|| "Continue the task from where you left off.".to_string());
+                continue;
+            }
+            // FlagOperator: auto-recovery is exhausted (or the stop isn't one to
+            // paper over). Stop the run and record a clear, human-actionable
+            // failure so the operator can take over — the partial answer is
+            // preserved on the worktree branch + the turn-audit journal.
+            let error = format!(
+                "flagged for operator after {auto_recoveries} auto-recovery attempt(s): {}",
+                reason.detail()
+            );
+            eprintln!("\x1b[2maish: {error}\x1b[0m");
+            if let Some(s) = store {
+                let _ = s.set_failed(run_id, &error);
+            }
+            return Outcome { phase: Phase::Failed, result: Some(answer), error: Some(error), rounds };
         }
 
         // ── awaiting_batch: did this round fan work out to the Batches API? ──

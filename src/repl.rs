@@ -334,6 +334,51 @@ pub async fn run(
                     continue;
                 }
 
+                // Model-based next-command suggestion (S6.3 / TASK-137):
+                // `:suggest` (alias `:sg`) asks the model for the single most
+                // plausible NEXT command given the session so far (recent
+                // commands + last output), renders it pre-filled in the editor,
+                // and runs it only after the user accepts (Enter) or edits it —
+                // the same trust surface as the rewrite preview. An optional
+                // trailing hint nudges it (`:sg now run the tests`). Nothing runs
+                // unconfirmed: the candidate is only ever placed in the buffer.
+                if let Some(hint) = crate::suggest::parse_invocation(&line) {
+                    let hint = hint.to_string();
+                    print!("\x1b[2m  ⚙ suggesting…\x1b[0m");
+                    std::io::stdout().flush().ok();
+                    let candidate =
+                        crate::suggest::suggest_next_command(&backend, &session, &hint).await;
+                    print!("\r\x1b[2K"); // wipe the transient spinner line
+                    std::io::stdout().flush().ok();
+                    match candidate {
+                        Ok(Some(cmd)) => {
+                            println!(
+                                "\x1b[2m  suggestion — edit, Enter to run, Ctrl-C to cancel:\x1b[0m"
+                            );
+                            match editor.read_line_with_initial(&prompt, &cmd) {
+                                ReadOutcome::Line(edited) => {
+                                    let edited = edited.trim().to_string();
+                                    if !edited.is_empty() {
+                                        // Re-dispatch as if typed (history + routing).
+                                        injected = Some(edited);
+                                    }
+                                }
+                                ReadOutcome::Interrupted => {
+                                    println!("\x1b[33m^C\x1b[0m suggestion dismissed")
+                                }
+                                ReadOutcome::CtrlO => toggle_raw_output(&mut session),
+                                ReadOutcome::Eof => break,
+                                ReadOutcome::Error(e) => eprintln!("aish: readline error: {e}"),
+                            }
+                        }
+                        Ok(None) => println!(
+                            "\x1b[2m  no next-command suggestion from the current context — keep going, or \x1b[0m?<intent>\x1b[2m to ask the model\x1b[0m"
+                        ),
+                        Err(e) => eprintln!("\x1b[31maish:\x1b[0m suggestion failed: {e:#}"),
+                    }
+                    continue;
+                }
+
                 if let Some(cmd) = line.strip_prefix(':') {
                     if handle_colon(cmd, &mut backend, &mut session, &mut pending_update).await {
                         break;
@@ -548,6 +593,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("rename", "rename this session"),
     ("result", "view a finished job's result"),
     ("rewrite", "AI-rewrite intent into a command (edit/accept before run)"),
+    ("suggest", "AI-suggest the next command from context (edit/accept before run)"),
     ("tell", "message an in-flight coordinator"),
     ("update", "upgrade aish to the latest release"),
     ("workers", "list this session's coordinators (all = every session)"),
@@ -618,18 +664,26 @@ fn palette_hint(line: &str, pos: usize) -> Option<String> {
     Some(out)
 }
 
-/// A display-only multi-line hint: the `:`-command palette rendered below the
-/// input. Unlike rustyline's blanket `AsRef<str>` Hint impl, `completion()`
-/// returns `None`, so Right-arrow / End never insert the menu text into the
-/// line buffer — the hint is purely visual.
-pub(crate) struct PaletteHint(String);
+/// An inline hint painted after the prompt. One type carries both shapes the
+/// single `Hinter` emits: the display-only `:`-command palette (`completion`
+/// `None`, so →/Ctrl-F never insert its menu text), and the fish-style
+/// history ghost text (`completion` `Some(suffix)`, so →/Ctrl-F accept it).
+/// See S6.2 / TASK-136.
+///
+/// `display` carries its own ANSI (the palette's dim rows; the ghost text's
+/// gray) — rustyline zero-widths SGR escapes when it computes layout, so the
+/// embedded color never disturbs cursor math.
+pub(crate) struct AishHint {
+    display: String,
+    completion: Option<String>,
+}
 
-impl rustyline::hint::Hint for PaletteHint {
+impl rustyline::hint::Hint for AishHint {
     fn display(&self) -> &str {
-        &self.0
+        &self.display
     }
     fn completion(&self) -> Option<&str> {
-        None
+        self.completion.as_deref()
     }
 }
 
@@ -736,16 +790,68 @@ fn session_path(session: &Session) -> String {
         .unwrap_or_default()
 }
 
-impl Hinter for AishHelper {
-    type Hint = PaletteHint;
+/// The gray (bright-black) SGR the history ghost text is painted with — the
+/// fish convention for an unaccepted autosuggestion. rustyline treats SGR
+/// escapes as zero-width, so embedding it in the hint `display` keeps the
+/// cursor math correct.
+const GHOST_COLOR: &str = "\x1b[90m";
 
-    /// Render the live `:`-command palette as an inline hint below the input.
-    /// Returns `None` for every non-palette line, so ordinary input is
-    /// unaffected. rustyline recomputes this each keystroke and redraws the hint
-    /// in place (clearing the prior rows), which is what makes the menu filter
-    /// without re-printing the prompt. See [`palette_hint`].
-    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<PaletteHint> {
-        palette_hint(line, pos).map(PaletteHint)
+/// The trailing remainder of `entry` after the prefix `line` — the ghost text —
+/// when `line` is a strict, non-empty, case-sensitive prefix of `entry`. `None`
+/// for an empty line, an exact match (nothing left to suggest), or a non-prefix.
+/// Pure + unit-tested.
+fn ghost_suffix(line: &str, entry: &str) -> Option<String> {
+    if line.is_empty() || entry.len() <= line.len() || !entry.starts_with(line) {
+        return None;
+    }
+    Some(entry[line.len()..].to_string())
+}
+
+/// Fish-style history autosuggestion: scan `history` newest→oldest for the
+/// first entry that strictly extends `line`, and return its ghost-text
+/// remainder. Fires only with the cursor at end-of-line (`pos == line.len()`) —
+/// fish never suggests mid-edit. The scan walks rustyline's indexed
+/// `History::get` (dyn-safe, unlike the RPITIT `iter`) from the most recent
+/// entry down, so the freshest match wins.
+fn history_suggestion(
+    line: &str,
+    pos: usize,
+    history: &dyn rustyline::history::History,
+) -> Option<String> {
+    use rustyline::history::SearchDirection;
+    if line.is_empty() || pos != line.len() {
+        return None;
+    }
+    let mut idx = history.len();
+    while idx > 0 {
+        idx -= 1;
+        if let Ok(Some(res)) = history.get(idx, SearchDirection::Reverse) {
+            if let Some(suffix) = ghost_suffix(line, res.entry.as_ref()) {
+                return Some(suffix);
+            }
+        }
+    }
+    None
+}
+
+impl Hinter for AishHelper {
+    type Hint = AishHint;
+
+    /// Emit the inline hint. The live `:`-command palette takes precedence (a
+    /// display-only menu); otherwise the fish-style history autosuggestion paints
+    /// the most recent matching command as gray ghost text after the cursor,
+    /// acceptable with →/Ctrl-F (S6.2 / TASK-136). Returns `None` when neither
+    /// applies, leaving ordinary input untouched. rustyline recomputes this each
+    /// keystroke and redraws the hint in place.
+    fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<AishHint> {
+        if let Some(menu) = palette_hint(line, pos) {
+            return Some(AishHint { display: menu, completion: None });
+        }
+        let suffix = history_suggestion(line, pos, ctx.history())?;
+        Some(AishHint {
+            display: format!("{GHOST_COLOR}{suffix}\x1b[0m"),
+            completion: Some(suffix),
+        })
     }
 }
 /// What the dispatch routing WOULD do with the current line — surfaced live as
@@ -2044,6 +2150,9 @@ async fn handle_colon(
                  :tell <id> <message>                send instructions to an in-flight coordinator (folded in next round)\n\
                  :rename <name>                      name the session (prefixes the prompt); auto-set to the repo name at startup, bare :rename clears\n\
                  :rewrite <intent>                   AI-rewrite intent into ONE command, prefilled to edit/accept before it runs (alias :rw)\n\
+                 :suggest [hint]                     AI-suggest the next command from session context, prefilled to edit/accept before it runs (alias :sg)\n\
+                 :suggest [hint]                     AI-suggest the next command from session context, prefilled to edit/accept before it runs (alias :sg)\n\
+                 :suggest [hint]                     AI-suggest the next command from session context, prefilled to edit/accept before it runs (alias :sg)\n\
                  :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
                                                      a verifier judges each turn. :goal status, :goal clear\n\
                  :allow                              list always-allowed tools/commands + dir grants\n\
@@ -3520,6 +3629,90 @@ mod tests {
         assert!(palette_hint("ls -la", 6).is_none());
         // ...or when nothing matches.
         assert!(palette_hint(":zzz", 4).is_none());
+    }
+
+    // ---- S6.2 / TASK-136: fish-style history ghost text -----------------
+    #[test]
+    fn ghost_suffix_only_for_strict_prefix() {
+        // A strict prefix yields just the trailing remainder.
+        assert_eq!(ghost_suffix("git", "git status").as_deref(), Some(" status"));
+        assert_eq!(ghost_suffix("git ", "git status").as_deref(), Some("status"));
+        assert_eq!(ghost_suffix("cargo b", "cargo build").as_deref(), Some("uild"));
+        // An exact match leaves nothing to suggest.
+        assert_eq!(ghost_suffix("git status", "git status"), None);
+        // Empty line never suggests (fish shows nothing on a blank prompt).
+        assert_eq!(ghost_suffix("", "git status"), None);
+        // Non-prefix and case mismatch do not match (case-sensitive).
+        assert_eq!(ghost_suffix("sl", "git status"), None);
+        assert_eq!(ghost_suffix("GIT", "git status"), None);
+    }
+
+    /// Build a `DefaultHistory` with `entries` added oldest-first (so the last is
+    /// the most recent), matching how the REPL appends submitted lines.
+    fn history_with(entries: &[&str]) -> DefaultHistory {
+        use rustyline::history::History as _;
+        let mut h = DefaultHistory::new();
+        for e in entries {
+            let _ = h.add(e);
+        }
+        h
+    }
+
+    #[test]
+    fn history_suggestion_picks_most_recent_match() {
+        let h = history_with(&["git status", "git stash", "cargo test"]);
+        // Newest matching entry wins: `git st` -> the most recent `git stash`.
+        assert_eq!(history_suggestion("git st", 6, &h).as_deref(), Some("ash"));
+        // A prefix matching only the older entry still resolves.
+        assert_eq!(history_suggestion("git stat", 8, &h).as_deref(), Some("us"));
+        // A unique prefix.
+        assert_eq!(history_suggestion("car", 3, &h).as_deref(), Some("go test"));
+    }
+
+    #[test]
+    fn history_suggestion_requires_cursor_at_end() {
+        let h = history_with(&["git status"]);
+        // Cursor mid-line (pos < len) suppresses the suggestion — fish only
+        // autosuggests at end-of-buffer.
+        assert_eq!(history_suggestion("git", 1, &h), None);
+        // At end-of-line it resolves.
+        assert_eq!(history_suggestion("git", 3, &h).as_deref(), Some(" status"));
+    }
+
+    #[test]
+    fn history_suggestion_empty_and_no_match() {
+        let empty = history_with(&[]);
+        assert_eq!(history_suggestion("git", 3, &empty), None);
+        let h = history_with(&["git status"]);
+        // No history entry extends the line.
+        assert_eq!(history_suggestion("docker ps", 9, &h), None);
+        // Empty line never suggests.
+        assert_eq!(history_suggestion("", 0, &h), None);
+    }
+
+    #[test]
+    fn hint_prefers_palette_then_ghost_text() {
+        use rustyline::hint::Hint as _;
+        let dir = std::env::temp_dir();
+        let helper = helper_for(&dir, HashMap::new());
+        let h = history_with(&["git status"]);
+        let ctx = Context::new(&h);
+
+        // A `:`-prefix yields the display-only palette: a multi-line menu with no
+        // completion (→/Ctrl-F must not insert it).
+        let palette = helper.hint(":m", 2, &ctx).expect("palette hint");
+        assert!(palette.display().contains(":mode"));
+        assert!(palette.completion().is_none(), "palette must not be acceptable");
+
+        // A history-extending line yields gray ghost text whose completion is the
+        // plain trailing remainder (what →/Ctrl-F insert).
+        let ghost = helper.hint("git", 3, &ctx).expect("ghost hint");
+        assert_eq!(ghost.completion(), Some(" status"));
+        assert!(ghost.display().contains(" status"));
+        assert!(ghost.display().starts_with(GHOST_COLOR), "ghost text is gray");
+
+        // No palette, no history match — no hint at all.
+        assert!(helper.hint("nomatch-xyz", 11, &ctx).is_none());
     }
 
     #[test]

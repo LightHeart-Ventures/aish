@@ -107,6 +107,20 @@ impl Db {
             .optional()?)
     }
 
+    /// The most recent command `input` rows (newest in the DB), returned in
+    /// chronological order (oldest first) — the running command context the
+    /// next-command suggestion (S6.3 / TASK-137) feeds the model. Capped at
+    /// `limit`. Empty when nothing has been typed yet.
+    pub fn recent_inputs(&self, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content FROM history WHERE kind = 'input' ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |r| r.get::<_, String>(0))?;
+        let mut out: Vec<String> = rows.filter_map(std::result::Result::ok).collect();
+        out.reverse(); // newest-first query → chronological (oldest first)
+        Ok(out)
+    }
+
     pub fn remember(&self, content: &str, tags: Option<&str>) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO memories (content, tags) VALUES (?1, ?2)",
@@ -761,6 +775,28 @@ mod tests {
         db.record("input", "/tmp", "next question");
         db.record("output", "/tmp", "second reply");
         assert_eq!(db.last_output().unwrap().as_deref(), Some("second reply"));
+    }
+
+    #[test]
+    fn recent_inputs_returns_chronological_capped() {
+        let db = temp_db("recent_inputs");
+        // Nothing typed yet.
+        assert!(db.recent_inputs(10).unwrap().is_empty());
+        // Outputs are ignored; only `input` rows are returned.
+        db.record("input", "/tmp", "cd repo");
+        db.record("output", "/tmp", "ok");
+        db.record("input", "/tmp", "git status");
+        db.record("input", "/tmp", "cargo test");
+        // Chronological (oldest first), outputs excluded.
+        assert_eq!(
+            db.recent_inputs(10).unwrap(),
+            vec!["cd repo".to_string(), "git status".to_string(), "cargo test".to_string()]
+        );
+        // Cap keeps the NEWEST `limit`, still chronological.
+        assert_eq!(
+            db.recent_inputs(2).unwrap(),
+            vec!["git status".to_string(), "cargo test".to_string()]
+        );
     }
 
     #[test]

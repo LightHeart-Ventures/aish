@@ -22,11 +22,33 @@ type SpinState = Arc<Mutex<Spin>>;
 // Per-turn tool-call iteration backstop. Generous enough that a legitimate
 // multi-file task (read several files, edit them, build, test, fix) completes
 // within one turn, but still a hard stop so a runaway tool loop terminates.
+// The loop no longer SLAMS into this cap empty-handed: the budget phases in
+// `crate::loopguard` fire a soft warning at ~75% and a forced summarize-exit at
+// ~90% (see the loop below), so the model converges and hands back a partial
+// answer before the hard limit is ever reached.
 const MAX_ITERATIONS: usize = 50;
 
 /// One full agentic turn: user input → (model ⇄ tools)* → final text.
 /// Frontend-agnostic: confirmation is a callback, output goes through eprintln
 /// only for transient activity lines.
+///
+/// ## Loop-guard / graceful degradation (see `crate::loopguard`)
+/// The `model ⇄ tools` loop is bounded by `MAX_ITERATIONS`, but three guards
+/// keep it from burning that whole budget spinning and then throwing the work
+/// away:
+///   1. **Same-call repeat guard** — an identical `(tool, args)` call repeated
+///      past a threshold is NOT re-executed (no duplicate side effect); the
+///      model is fed a corrective result, and a confirmed loop breaks the turn
+///      with a tagged `loop-detected` stop.
+///   2. **Soft warning** — past ~75% of the budget, a "converge now" notice is
+///      folded into the system prompt.
+///   3. **Forced summarize** — past ~90%, the model is handed NO tools and must
+///      produce a best-effort final answer, returned with a `forced-summarize`
+///      banner instead of an empty hard-cap stop.
+/// An abnormal stop prepends a greppable [`crate::loopguard::ExitReason::banner`]
+/// line to the answer so the coordinator can pick a recovery disposition
+/// (resume / nudge / flag-for-operator) — even across the worker subprocess
+/// stdout boundary.
 pub async fn run_turn(
     backend: &Backend,
     session: &mut Session,
@@ -71,13 +93,37 @@ pub async fn run_turn(
     // `Backend::supports_prefill_continuation`).
     let mut continuing = false;
 
-    for _ in 0..MAX_ITERATIONS {
+    // Per-turn loop guards: a same-call repeat tally + the budget thresholds that
+    // drive the soft-warning → forced-summarize graceful degradation. Both live
+    // only for this turn (dropped with the function) so nothing bleeds across.
+    let mut repeat_guard = crate::loopguard::RepeatGuard::default();
+
+    for iteration in 1..=MAX_ITERATIONS {
+        // Budget phase for THIS round: Normal → run freely; SoftWarn → fold a
+        // "converge now" notice into the prompt; ForceSummarize → hand the model
+        // NO tools so it must produce a best-effort final answer rather than being
+        // killed empty-handed at the hard cap.
+        let phase = crate::loopguard::budget_phase(iteration, MAX_ITERATIONS);
+        let force = matches!(phase, crate::loopguard::BudgetPhase::ForceSummarize);
+        // The base prompt stays byte-stable (prompt-cache friendly); the budget
+        // suffix is appended only while converging/forcing.
+        let effective_system = match phase {
+            crate::loopguard::BudgetPhase::Normal => system.clone(),
+            other => format!(
+                "{system}{}",
+                crate::loopguard::budget_suffix(other, MAX_ITERATIONS.saturating_sub(iteration))
+            ),
+        };
+        // No tools on the forced-summarize step — the model literally cannot keep
+        // looping, so a final (possibly partial) answer is guaranteed.
+        let active_tools: &[crate::backend::ToolDef] = if force { &[] } else { &tool_defs };
+
         // Model-reasoning phase: the "thinking" spinner owns stderr while the
         // backend produces the next message (which may consume prior tool
         // results). It is stopped before any tool-execution animation begins,
         // so the two never run at once.
         let spinner = Spinner::start();
-        let turn = backend.complete(&system, &session.history, &tool_defs).await;
+        let turn = backend.complete(&effective_system, &session.history, active_tools).await;
         drop(spinner);
         let turn = turn?;
         let usage = turn.usage;
@@ -88,6 +134,37 @@ pub async fn run_turn(
             Some(u) => u.total(),
             None => crate::context::estimate_history_tokens(&session.history),
         };
+
+        // ── Forced summarize: graceful degradation before the hard limit. The
+        // model had no tools this step, so `turn.text` is its best final answer.
+        // Record it in history (so the transcript stays well-formed) and return
+        // it tagged `forced-summarize`, so the coordinator can decide whether to
+        // auto-resume the remaining work.
+        if force {
+            let text = if continuing {
+                match session.history.last_mut() {
+                    Some(last) => {
+                        last.text.push_str(&turn.text);
+                        last.raw = None;
+                        last.tool_calls.clear();
+                        last.text.clone()
+                    }
+                    None => turn.text.clone(),
+                }
+            } else {
+                session.history.push(Msg {
+                    role: Role::Assistant,
+                    text: turn.text.clone(),
+                    tool_calls: vec![],
+                    tool_results: vec![],
+                    raw: turn.raw,
+                });
+                turn.text.clone()
+            };
+            let reason = crate::loopguard::ExitReason::ForcedSummarize { iterations: iteration };
+            eprintln!("\x1b[2maish: {}\x1b[0m", reason.log_line());
+            return Ok(crate::loopguard::with_banner(&reason, &text));
+        }
 
         if continuing {
             // Prefill-continuation round: fold this chunk into the partial answer
@@ -158,6 +235,10 @@ pub async fn run_turn(
         }
 
         let mut results: Vec<ToolResult> = Vec::with_capacity(turn.tool_calls.len());
+        // Set when the same-call guard CONFIRMS a loop this round: we still finish
+        // the round's bookkeeping (push the synthetic results so history stays
+        // well-formed), then break the turn with a tagged `loop-detected` stop.
+        let mut loop_break: Option<(String, usize)> = None;
         for call in &turn.tool_calls {
             // Prefix the per-tool glyph (🔧 for most tools, ⚙️ for an `escalate`
             // hand-off to the stronger model) so it travels with the desc through
@@ -169,6 +250,36 @@ pub async fn run_turn(
             // desc, since the gear renders narrow unlike the double-width wrench —
             // isn't collapsed away by the flatten.
             let desc = format!("{} {}", tool_glyph(&call.name), flatten_ws(&describe_call(call)));
+
+            // ── Same-call repeat guard (loop detection). A tool call whose exact
+            // (name, args) signature has recurred past the soft threshold is NOT
+            // re-executed — that avoids a duplicate side effect (a second
+            // `git push`, a re-sent notification) — and the model is fed a
+            // corrective result so it can re-plan. Once it crosses the HARD limit
+            // (it kept repeating even after being told to stop) the turn is broken
+            // with a `loop-detected` stop. Logged so loops are greppable.
+            let repeat_count = repeat_guard.record(&call.name, &call.args);
+            let repeat = crate::loopguard::repeat_action(repeat_count);
+            if !matches!(repeat, crate::loopguard::RepeatAction::Allow) {
+                eprintln!(
+                    "\x1b[2m  ⚠ {}\x1b[0m",
+                    crate::loopguard::repeat_log_line(&desc, repeat_count, repeat)
+                );
+                let result = ToolResult {
+                    id: call.id.clone(),
+                    content: crate::loopguard::blocked_result_text(&desc, repeat_count),
+                    is_error: true,
+                };
+                if session.raw_tool_output {
+                    print_raw_result(&result);
+                }
+                session.last_turn_tools.push((desc.clone(), result.clone()));
+                results.push(result);
+                if matches!(repeat, crate::loopguard::RepeatAction::Break) {
+                    loop_break = Some((desc.clone(), repeat_count));
+                }
+                continue;
+            }
 
             // Tier-1 turn audit (background coordinator only — None otherwise).
             // Ask the journal whether this exact tool call was already completed
@@ -226,9 +337,31 @@ pub async fn run_turn(
         }
         eprintln!(); // breathing room between tool activity and what follows
         session.history.push(Msg::tool_results(results));
+
+        // Confirmed loop this round → stop the turn with a tagged partial answer,
+        // so the work isn't silently spun away and the coordinator can decide a
+        // recovery disposition.
+        if let Some((call_desc, count)) = loop_break {
+            let reason = crate::loopguard::ExitReason::LoopDetected { call: call_desc, count };
+            eprintln!("\x1b[2maish: {}\x1b[0m", reason.log_line());
+            let partial = if turn.text.trim().is_empty() {
+                "Stopped by the loop guard before a final answer was produced.".to_string()
+            } else {
+                turn.text.clone()
+            };
+            return Ok(crate::loopguard::with_banner(&reason, &partial));
+        }
     }
 
-    Ok("[stopped: turn exceeded the tool-call iteration limit]".into())
+    // Hard backstop. With the forced-summarize step firing at FORCE_SUMMARIZE_PCT
+    // this is effectively unreachable, but keep a tagged exit so a future budget
+    // change can't silently resurrect the old "throw the work away" stop.
+    let reason = crate::loopguard::ExitReason::BudgetExhausted { iterations: MAX_ITERATIONS };
+    eprintln!("\x1b[2maish: {}\x1b[0m", reason.log_line());
+    Ok(crate::loopguard::with_banner(
+        &reason,
+        "Stopped after exhausting the tool-call iteration budget without a final answer.",
+    ))
 }
 
 /// Headless background coordinator: the durable, resumable multi-round loop

@@ -7,6 +7,7 @@ mod editor;
 mod engine;
 mod goal;
 mod jobs;
+mod loopguard;
 mod md;
 mod mcp;
 #[cfg(test)]
@@ -19,6 +20,7 @@ mod rewrite;
 mod script;
 mod session;
 mod skills;
+mod suggest;
 mod tools;
 mod turn_audit;
 mod update;
