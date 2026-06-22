@@ -368,8 +368,32 @@ impl GrokBackend {
 
             match resp {
                 Ok(r) => {
-                    let status = r.status().as_u16();
-                    let v: Value = r.json().await.context("API returned non-JSON")?;
+                    // Decode to text first so a non-JSON gateway/edge body (502/503
+                    // HTML, empty body, challenge page) is a retryable signal, not a
+                    // fatal decode error that stops the worker. See
+                    // `super::read_status_and_json`.
+                    let (status, parsed) = match super::read_status_and_json(r).await {
+                        Ok(p) => p,
+                        Err(e) if !last => {
+                            eprintln!("\x1b[2m  network error reading body ({e}), retrying…\x1b[0m");
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(MAX_DELAY);
+                            continue;
+                        }
+                        Err(e) => return Err(e).context("reading grok api response body"),
+                    };
+                    let v = match parsed {
+                        Ok(v) => v,
+                        Err(snippet) => {
+                            if !last {
+                                eprintln!("\x1b[2m  api returned non-JSON ({status}), retrying…\x1b[0m");
+                                tokio::time::sleep(delay).await;
+                                delay = (delay * 2).min(MAX_DELAY);
+                                continue;
+                            }
+                            bail!("grok api ({status}): non-JSON response: {snippet}");
+                        }
+                    };
                     if status == 200 {
                         return Ok(v);
                     }

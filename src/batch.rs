@@ -508,8 +508,29 @@ impl BatchClient {
             }
             match req.send().await {
                 Ok(r) => {
-                    let status = r.status().as_u16();
-                    let v: Value = r.json().await.context("batch api returned non-JSON")?;
+                    // Decode to text first so a non-JSON gateway/edge body is a
+                    // retryable signal, not a fatal decode error. See
+                    // `crate::backend::read_status_and_json`.
+                    let (status, parsed) = match crate::backend::read_status_and_json(r).await {
+                        Ok(p) => p,
+                        Err(_) if attempt < 2 => {
+                            tokio::time::sleep(delay).await;
+                            delay *= 2;
+                            continue;
+                        }
+                        Err(e) => return Err(e).context("reading batch api response body"),
+                    };
+                    let v = match parsed {
+                        Ok(v) => v,
+                        Err(snippet) => {
+                            if attempt < 2 {
+                                tokio::time::sleep(delay).await;
+                                delay *= 2;
+                                continue;
+                            }
+                            bail!("batch api ({status}): non-JSON response: {snippet}");
+                        }
+                    };
                     if (200..300).contains(&status) {
                         return Ok(v);
                     }

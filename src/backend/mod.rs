@@ -6,6 +6,45 @@ pub mod local;
 use anyhow::Result;
 use serde_json::Value;
 
+/// Read a finished HTTP response into `(status, parsed-or-snippet)`.
+///
+/// The body is decoded as TEXT first and only THEN parsed as JSON. This is the
+/// difference between a transient hiccup and a dead worker: the public API sits
+/// behind proxies / load balancers / edge caches that answer an overloaded or
+/// failing upstream with a NON-JSON body — a 502/503/504 HTML error page, an
+/// empty body, a Cloudflare challenge, a plain-text "Internal Server Error".
+/// Calling `.json()` straight off the response turns any of those into a fatal
+/// `error decoding response body … expected value at line 1 column 1`, which
+/// (propagated through `?`) stops the worker mid-run. By decoding to text first
+/// we hand the caller a recoverable signal (`Err(snippet)`) it can fold into its
+/// normal retry-the-transient-5xx path instead of aborting.
+///
+/// Returns `Err` only when the body bytes themselves can't be read (a genuine
+/// transport error); a body that simply isn't JSON comes back as
+/// `Ok((status, Err(snippet)))`.
+pub async fn read_status_and_json(
+    resp: reqwest::Response,
+) -> reqwest::Result<(u16, std::result::Result<Value, String>)> {
+    let status = resp.status().as_u16();
+    let body = resp.text().await?;
+    let parsed = serde_json::from_str::<Value>(&body).map_err(|_| body_snippet(&body));
+    Ok((status, parsed))
+}
+
+/// First ~200 whitespace-collapsed chars of a response body, for embedding a
+/// non-JSON body into an error/log line without dumping a whole HTML page.
+pub fn body_snippet(body: &str) -> String {
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "<empty body>".to_string();
+    }
+    if collapsed.chars().count() > 200 {
+        format!("{}…", collapsed.chars().take(200).collect::<String>())
+    } else {
+        collapsed
+    }
+}
+
 /// One tool invocation requested by the model.
 #[derive(Debug, Clone)]
 pub struct ToolCall {
@@ -252,7 +291,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn body_snippet_handles_empty_and_long_bodies() {
+        assert_eq!(body_snippet(""), "<empty body>");
+        assert_eq!(body_snippet("   \n\t "), "<empty body>");
+        // whitespace is collapsed
+        assert_eq!(body_snippet("502  Bad\n\nGateway"), "502 Bad Gateway");
+        // long bodies are clipped with an ellipsis
+        let long = "x".repeat(500);
+        let s = body_snippet(&long);
+        assert!(s.ends_with('…'));
+        assert_eq!(s.chars().count(), 201); // 200 chars + ellipsis
+    }
+
+    #[test]
     fn escalation_policy() {
+
         let opus = "claude-opus-4-8";
         // Small Claude frontends escalate to the batch (strong) model.
         assert_eq!(
