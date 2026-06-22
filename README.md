@@ -64,6 +64,10 @@ Mostly ~/models (412G of GGUF weights) — 87% of your usage.
 - **cwd is session state**, applied per-exec — `cd` is a builtin/tool that
   mutates the session, never a subprocess. Tab completion (files/dirs,
   `~`-aware, quoting names with spaces) follows it.
+- **History ghost text.** As you type, the most recent matching command from
+  history is previewed inline as gray fish-style ghost text; press `→` or
+  `Ctrl-F` at end-of-line to accept it. Purely visual until accepted — Enter
+  still runs only what you typed.
 - **Frontend/engine split.** The REPL (rustyline) is decoupled from the engine
   (session + tools + backend) so it can graduate to a real login shell
   (`/etc/shells`, signals, job control) without rework.
@@ -93,7 +97,8 @@ AISH_LOCAL_MODEL_ID=Qwen/Qwen3-4B-GGUF cargo run --release -- --backend local
 REPL commands: `:mode <paranoid|careful|normal|yolo>` · `:model <opus|sonnet|haiku|id>` ·
 `:backend <claude|local>` · `:yolo` · `:new` · `:help` · `:quit` (or Ctrl-D / `exit`).
 Ctrl-C aborts the current turn — or interrupts the foreground child during a
-TTY hand-off, exactly like a shell.
+TTY hand-off, exactly like a shell. `→`/`Ctrl-F` accept the history
+autosuggestion.
 
 ## Scripting
 
