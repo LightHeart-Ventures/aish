@@ -15,6 +15,7 @@ mod pipeline;
 mod present;
 mod rc;
 mod repl;
+mod rewrite;
 mod script;
 mod session;
 mod skills;
