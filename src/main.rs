@@ -1,3 +1,4 @@
+mod autosuggest;
 mod backend;
 mod batch;
 mod context;
