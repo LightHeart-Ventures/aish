@@ -187,6 +187,10 @@ pub async fn run(
 
     let mut prev_dir: Option<PathBuf> = None;
     let mut needs_gap = false; // blank line between previous output and the prompt
+    // A command the user accepted from a rewrite preview (S6.4 / TASK-138) is
+    // parked here and consumed at the top of the next iteration so it flows
+    // through the SAME dispatch path as a typed line — no logic is duplicated.
+    let mut injected: Option<String> = None;
 
     // Background-result presenter. When interactive, finished batch/worker jobs
     // queue their results (present::enable_deferred) and this task prints them
@@ -268,7 +272,12 @@ pub async fn run(
             None => String::new(),
         };
         let prompt = format!("{name}{badge}\x1b[36m{}\x1b[0m ❯ ", short_cwd(&session));
-        match editor.read_line(&prompt) {
+        // Consume an accepted-rewrite line before falling back to the editor.
+        let outcome = match injected.take() {
+            Some(l) => ReadOutcome::Line(l),
+            None => editor.read_line(&prompt),
+        };
+        match outcome {
             ReadOutcome::Line(line) => {
                 let line = line.trim().to_string();
                 if line.is_empty() {
@@ -278,6 +287,52 @@ pub async fn run(
                 needs_gap = true;
                 // Now working — hold background results until the next pause.
                 busy.store(true, Ordering::SeqCst);
+
+                // Inline AI command-rewrite preview (S6.4 / TASK-138): `:rewrite
+                // <intent>` (alias `:rw`) asks the model to translate intent into
+                // ONE concrete command, shows it pre-filled in the editor, and runs
+                // it only after the user accepts (Enter) or edits it. Nothing runs
+                // unconfirmed — the candidate is only ever placed in the buffer.
+                if let Some(intent) = crate::rewrite::parse_invocation(&line) {
+                    let intent = intent.to_string();
+                    if intent.is_empty() {
+                        println!("\x1b[2musage: :rewrite <what you want to do>  (alias :rw)\x1b[0m");
+                        continue;
+                    }
+                    print!("\x1b[2m  ⚙ rewriting…\x1b[0m");
+                    std::io::stdout().flush().ok();
+                    let candidate =
+                        crate::rewrite::rewrite_to_command(&backend, &session, &intent).await;
+                    print!("\r\x1b[2K"); // wipe the transient spinner line
+                    std::io::stdout().flush().ok();
+                    match candidate {
+                        Ok(Some(cmd)) => {
+                            println!(
+                                "\x1b[2m  candidate — edit, Enter to run, Ctrl-C to cancel:\x1b[0m"
+                            );
+                            match editor.read_line_with_initial(&prompt, &cmd) {
+                                ReadOutcome::Line(edited) => {
+                                    let edited = edited.trim().to_string();
+                                    if !edited.is_empty() {
+                                        // Re-dispatch as if typed (history + routing).
+                                        injected = Some(edited);
+                                    }
+                                }
+                                ReadOutcome::Interrupted => {
+                                    println!("\x1b[33m^C\x1b[0m rewrite cancelled")
+                                }
+                                ReadOutcome::CtrlO => toggle_raw_output(&mut session),
+                                ReadOutcome::Eof => break,
+                                ReadOutcome::Error(e) => eprintln!("aish: readline error: {e}"),
+                            }
+                        }
+                        Ok(None) => println!(
+                            "\x1b[2m  couldn't express that as a single command — try \x1b[0m?{intent}\x1b[2m to let the model work it out\x1b[0m"
+                        ),
+                        Err(e) => eprintln!("\x1b[31maish:\x1b[0m rewrite failed: {e:#}"),
+                    }
+                    continue;
+                }
 
                 if let Some(cmd) = line.strip_prefix(':') {
                     if handle_colon(cmd, &mut backend, &mut session, &mut pending_update).await {
@@ -492,6 +547,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("quit", "exit aish"),
     ("rename", "rename this session"),
     ("result", "view a finished job's result"),
+    ("rewrite", "AI-rewrite intent into a command (edit/accept before run)"),
     ("tell", "message an in-flight coordinator"),
     ("update", "upgrade aish to the latest release"),
     ("workers", "list this session's coordinators (all = every session)"),
@@ -1987,6 +2043,7 @@ async fn handle_colon(
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
                  :tell <id> <message>                send instructions to an in-flight coordinator (folded in next round)\n\
                  :rename <name>                      name the session (prefixes the prompt); auto-set to the repo name at startup, bare :rename clears\n\
+                 :rewrite <intent>                   AI-rewrite intent into ONE command, prefilled to edit/accept before it runs (alias :rw)\n\
                  :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
                                                      a verifier judges each turn. :goal status, :goal clear\n\
                  :allow                              list always-allowed tools/commands + dir grants\n\
@@ -3449,10 +3506,11 @@ mod tests {
         assert!(full.contains("confirmation"));
 
         // Typing narrows it in place: `:re` -> rename + result only.
-        let re = palette_hint(":re", 3).expect("`:re` matches rename + result");
-        assert_eq!(re.matches('\n').count(), 2);
+        let re = palette_hint(":re", 3).expect("`:re` matches rename + result + rewrite");
+        assert_eq!(re.matches('\n').count(), 3);
         assert!(re.contains(":rename"));
         assert!(re.contains(":result"));
+        assert!(re.contains(":rewrite"));
 
         // No hint once an argument starts (a space ends the command name)...
         assert!(palette_hint(":mode dev", 9).is_none());

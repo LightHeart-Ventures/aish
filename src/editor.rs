@@ -56,6 +56,12 @@ pub trait LineEditor {
     fn set_cwd(&mut self, cwd: &Path);
     /// Read one line, drawing `prompt`. Returns the editor-agnostic outcome.
     fn read_line(&mut self, prompt: &str) -> ReadOutcome;
+    /// Read one line pre-filled with `initial` text (the cursor lands at its
+    /// end), drawing `prompt`. Backs the inline command-rewrite preview (S6.4 /
+    /// TASK-138): the model's candidate command is placed in the buffer so the
+    /// user can accept it (Enter) or edit it before it runs. Same outcome
+    /// variants as [`LineEditor::read_line`].
+    fn read_line_with_initial(&mut self, prompt: &str, initial: &str) -> ReadOutcome;
     /// Append a submitted line to the in-memory history ring.
     fn add_history(&mut self, line: &str);
     /// Persist history to disk (best-effort — failure is ignored).
@@ -121,6 +127,24 @@ impl RustylineEditor {
             raw_toggle,
         })
     }
+
+    /// Map a rustyline `readline*` result onto the editor-agnostic
+    /// [`ReadOutcome`]. Shared by [`read_line`](LineEditor::read_line) and
+    /// [`read_line_with_initial`](LineEditor::read_line_with_initial) so the
+    /// Ctrl-O/Ctrl-C disambiguation and EOF/error mapping stay identical on both
+    /// entry points.
+    fn outcome(&self, res: rustyline::Result<String>) -> ReadOutcome {
+        match res {
+            Ok(line) => ReadOutcome::Line(line),
+            Err(ReadlineError::Interrupted) => {
+                // Ctrl-O routes here too (handler returns Interrupt); the drained
+                // toggle flag distinguishes it from a plain Ctrl-C clear-line.
+                interrupt_outcome(self.raw_toggle.swap(false, Ordering::SeqCst))
+            }
+            Err(ReadlineError::Eof) => ReadOutcome::Eof,
+            Err(e) => ReadOutcome::Error(e.to_string()),
+        }
+    }
 }
 
 impl LineEditor for RustylineEditor {
@@ -131,16 +155,16 @@ impl LineEditor for RustylineEditor {
     }
 
     fn read_line(&mut self, prompt: &str) -> ReadOutcome {
-        match self.rl.readline(prompt) {
-            Ok(line) => ReadOutcome::Line(line),
-            Err(ReadlineError::Interrupted) => {
-                // Ctrl-O routes here too (handler returns Interrupt); the drained
-                // toggle flag distinguishes it from a plain Ctrl-C clear-line.
-                interrupt_outcome(self.raw_toggle.swap(false, Ordering::SeqCst))
-            }
-            Err(ReadlineError::Eof) => ReadOutcome::Eof,
-            Err(e) => ReadOutcome::Error(e.to_string()),
-        }
+        let res = self.rl.readline(prompt);
+        self.outcome(res)
+    }
+
+    fn read_line_with_initial(&mut self, prompt: &str, initial: &str) -> ReadOutcome {
+        // rustyline takes the pre-filled buffer as a (left, right) split around
+        // the cursor; we want the whole candidate to the LEFT so the cursor
+        // lands at end-of-line, ready to edit or Enter.
+        let res = self.rl.readline_with_initial(prompt, (initial, ""));
+        self.outcome(res)
     }
 
     fn add_history(&mut self, line: &str) {
