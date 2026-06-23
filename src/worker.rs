@@ -156,23 +156,65 @@ fn strip_sentinel(raw: &str, mark: &str) -> Option<String> {
     (!rest.is_empty()).then(|| rest.to_string())
 }
 
-/// Source glyph for a tool, chosen by its NAME prefix — the local-vs-MCP
-/// distinction surfaced in the `:output on` activity stream: a ⚙️ gear for a
-/// LOCAL-execution tool (the ones aish runs in-process — `run_program`,
-/// `run_interactive`, `read_file`, `write_file`, `list_dir`, `change_dir`,
-/// `remember`, …) and a 🔧 wrench for an MCP TOOL CALL (a server tool whose
-/// catalog name is prefixed `mcp__<server>__<tool>`, or the bare `mcp_`/`atum_`
-/// shorthands). Pure + unit-tested — the single source of truth for the source
-/// distinction, so it can be reused by any caller that has a tool name in hand.
+/// Source glyph for a tool, chosen by its NAME — the per-tool distinction
+/// surfaced in the `:output on` activity stream. The tool name is normalised to
+/// lowercase, then resolved with EXACT matches first and a SUBSTRING fallback:
 ///
-/// Examples: `source_emoji("run_program")` → ⚙️, `source_emoji("mcp__atum__atum_list_project_board")` → 🔧.
+///   * `escalate`                        → 🧠 (model escalation)
+///   * `run_in_background`               → 🔄 (background coordinator)
+///   * `read_file` / `write_file`        → 📄 (file read/write)
+///   * `delete_file` / `remove_file`     → 🗑️ (file deletion)
+///   * `run_script` / `bash` / `sh`      → 📜 (shell script)
+///   * `run_program` / `run_interactive` → 📦 (subprocess exec)
+///   * `mcp__*` / `mcp_*` / `atum_*`     → 🔧 (MCP tool call, unchanged)
+///   * anything else                     → ⚙️ (local execution, the default)
+///
+/// Pure + unit-tested — the single source of truth for the per-tool glyph, so it
+/// can be reused by any caller that has a tool name in hand.
+///
+/// Examples: `source_emoji("run_program")` → 📦, `source_emoji("read_file")` → 📄,
+/// `source_emoji("mcp__atum__atum_list_project_board")` → 🔧.
 fn source_emoji(tool_name: &str) -> &'static str {
-    let name = tool_name.trim();
-    if name.starts_with("mcp__") || name.starts_with("mcp_") || name.starts_with("atum_") {
-        "🔧" // MCP tool call
-    } else {
-        "⚙️" // local execution (gear + VS16 emoji-presentation selector)
+    let name = tool_name.trim().to_ascii_lowercase();
+    let n = name.as_str();
+    // MCP tool calls — `mcp__<server>__<tool>`, or the bare `mcp_`/`atum_`
+    // shorthands — keep the wrench, resolved ahead of the local matching below.
+    if n.starts_with("mcp__") || n.starts_with("mcp_") || n.starts_with("atum_") {
+        return "🔧"; // MCP tool call
     }
+    // Exact matches first (normalised lowercase tool name).
+    match n {
+        "escalate" => return "🧠",
+        "run_in_background" => return "🔄",
+        "read_file" | "write_file" => return "📄",
+        "delete_file" | "remove_file" => return "🗑️",
+        "run_script" | "bash" | "sh" => return "📜",
+        "run_program" | "run_interactive" => return "📦",
+        _ => {}
+    }
+    // Substring fallback for fully-qualified / decorated variants. Uses the
+    // distinctive underscore forms so a bare descriptive verb (e.g. the `read`
+    // token a coordinator emits for a local read) still falls through to the
+    // default gear rather than over-matching a short fragment.
+    if n.contains("escalate") {
+        return "🧠";
+    }
+    if n.contains("run_in_background") {
+        return "🔄";
+    }
+    if n.contains("delete_file") || n.contains("remove_file") {
+        return "🗑️";
+    }
+    if n.contains("read_file") || n.contains("write_file") {
+        return "📄";
+    }
+    if n.contains("run_script") {
+        return "📜";
+    }
+    if n.contains("run_program") || n.contains("run_interactive") {
+        return "📦";
+    }
+    "⚙️" // local execution (gear + VS16 emoji-presentation selector)
 }
 
 /// Best-effort extraction of the identifying tool token from a forwarded
@@ -1791,19 +1833,29 @@ mod tests {
         assert_eq!(source_emoji("mcp__atum__atum_list_project_board"), "🔧");
         assert_eq!(source_emoji("mcp_atum_list_tools"), "🔧");
         assert_eq!(source_emoji("atum_get_project_task"), "🔧");
-        // Local-execution tools (run in-process) get the ⚙️ gear.
-        assert_eq!(source_emoji("run_program"), "⚙️");
-        assert_eq!(source_emoji("run_interactive"), "⚙️");
-        assert_eq!(source_emoji("read_file"), "⚙️");
-        assert_eq!(source_emoji("write_file"), "⚙️");
+        // Per-tool local glyphs (exact, normalised matches).
+        assert_eq!(source_emoji("escalate"), "🧠");
+        assert_eq!(source_emoji("run_in_background"), "🔄");
+        assert_eq!(source_emoji("read_file"), "📄");
+        assert_eq!(source_emoji("write_file"), "📄");
+        assert_eq!(source_emoji("delete_file"), "🗑️");
+        assert_eq!(source_emoji("remove_file"), "🗑️");
+        assert_eq!(source_emoji("run_script"), "📜");
+        assert_eq!(source_emoji("bash"), "📜");
+        assert_eq!(source_emoji("sh"), "📜");
+        assert_eq!(source_emoji("run_program"), "📦");
+        assert_eq!(source_emoji("run_interactive"), "📦");
+        // Normalisation: case-insensitive + whitespace-trimmed.
+        assert_eq!(source_emoji("READ_FILE"), "📄");
+        assert_eq!(source_emoji("  atum_foo "), "🔧");
+        // Substring fallback catches fully-qualified variants.
+        assert_eq!(source_emoji("aish_read_file_v2"), "📄");
+        // Local tools with no specific mapping get the ⚙️ gear default.
         assert_eq!(source_emoji("list_dir"), "⚙️");
         assert_eq!(source_emoji("change_dir"), "⚙️");
         assert_eq!(source_emoji("remember"), "⚙️");
-        // Unknown / empty token falls back to the local gear (safe default).
-        assert_eq!(source_emoji("escalate"), "⚙️");
+        // Empty token falls back to the local gear (safe default).
         assert_eq!(source_emoji(""), "⚙️");
-        // Surrounding whitespace is ignored (the token may arrive untrimmed).
-        assert_eq!(source_emoji("  atum_foo "), "🔧");
     }
 
     #[test]
