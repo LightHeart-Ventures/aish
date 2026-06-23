@@ -21,6 +21,7 @@ mod rewrite;
 mod scope;
 mod script;
 mod session;
+mod skillfish;
 mod skills;
 mod style;
 mod suggest;
@@ -59,6 +60,11 @@ struct Args {
     /// Check for a newer published release, upgrade if one exists, and exit.
     #[arg(long)]
     update: bool,
+
+    /// Fetch and import a skill from skill.fish (opt-in), then exit. Accepts a
+    /// URL (https://skill.fish/owner/name[@version]) or the owner/name shorthand.
+    #[arg(long = "skill-fetch", value_name = "REF")]
+    skill_fetch: Option<String>,
 
     /// Disable ANSI color/emoji output. Also auto-disabled when stdout is
     /// not a TTY (piped/redirected) or when the NO_COLOR env var is set.
@@ -157,6 +163,19 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    // `aish --skill-fetch <ref>`: opt-in skill.fish import. Runs WITHOUT a
+    // backend or credentials — it only fetches a SKILL.md over HTTPS and writes
+    // it into ~/.aish/skills/, then exits. See src/skillfish.rs.
+    if let Some(reference) = args.skill_fetch.as_deref() {
+        let skills_dir = aish_dir().join("skills");
+        let _ = std::fs::create_dir_all(&skills_dir);
+        if let Err(e) = skillfish::run_fetch(reference, &skills_dir).await {
+            eprintln!("\x1b[31maish:\x1b[0m skill fetch failed: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // Load ~/.aishrc up front, BEFORE building the backend: its `export` lines
     // (credentials included) populate session.env, and the Claude backend
     // resolves its credential from those rc exports as well as the process env —
