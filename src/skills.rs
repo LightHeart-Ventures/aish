@@ -40,7 +40,8 @@ pub fn load(dir: &Path) -> Vec<Skill> {
 
 /// Pull `name:` and `description:` out of a `---`-fenced frontmatter block.
 /// Single-line values only — that's what the convention uses in practice.
-fn parse_frontmatter(text: &str) -> Option<(String, String)> {
+/// Shared with the skill.fish importer, which validates fetched SKILL.md files.
+pub fn parse_frontmatter(text: &str) -> Option<(String, String)> {
     let rest = text.strip_prefix("---")?;
     let end = rest.find("\n---")?;
     let mut name = None;
