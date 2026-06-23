@@ -2143,7 +2143,7 @@ async fn handle_colon(
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
                  :workers [all]                      list this session's background coordinators (all = every session)\n\
-                 :output [on|off]             stream background coordinators' activity (💭 thinking + 🔧 tool + ·standard/·batch lines); off (default) keeps them quiet\n\
+                 :output [on|off]             stream background coordinators' activity (💭 thinking + 🔧 tool + ·standard/·batch lines) in a contained bordered pane; off (default) keeps them quiet\n\
                  \n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
@@ -2193,10 +2193,18 @@ async fn handle_colon(
             match target {
                 Some(true) => {
                     session.show_worker_output.store(true, Ordering::SeqCst);
-                    println!("worker output ON — background coordinators now stream their 💭 thinking, tool activity (⚙️ local · 🔧 MCP) and ·standard/·batch turn output");
+                    println!("worker output ON — background coordinators now stream their 💭 thinking, tool activity (⚙️ local · 🔧 MCP) and ·standard/·batch turn output, framed in a contained pane:");
+                    // Open the contained pane: every streamed coordinator line
+                    // is now rendered as a bordered row under this top frame
+                    // (see worker::pane_row), so the activity reads as a
+                    // bordered side-column distinct from the user's own shell
+                    // scroll, not loose interleaved lines (w_sn1fHhd5).
+                    println!("{}", crate::worker::pane_open());
                 }
                 Some(false) => {
                     session.show_worker_output.store(false, Ordering::SeqCst);
+                    // Close the contained pane, then report the quiet default.
+                    println!("{}", crate::worker::pane_close());
                     println!("worker output OFF — background coordinators run quietly (only the ⟳N pulse + completion notice show)");
                 }
                 None => println!("usage: :output [on|off]"),
