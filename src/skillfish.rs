@@ -4,7 +4,8 @@
 //! skills published in the same SKILL.md convention aish already uses locally
 //! (YAML frontmatter with `name:`/`description:`, then a markdown body — see
 //! src/skills.rs). This module is the OPT-IN bridge: nothing here runs unless
-//! the user explicitly asks for a skill, with `aish --skill-fetch <ref>`.
+//! the user explicitly asks for a skill, with `aish --skill-fetch <ref>` /
+//! `aish --skill-search <query>` or the interactive `:skill` commands.
 //!
 //! Flow: parse a ref → fetch the raw SKILL.md over HTTPS → validate it really
 //! is a SKILL.md → write it under ~/.aish/skills/<name>/SKILL.md, where the
@@ -18,6 +19,7 @@
 //! any credentials. Both land a SKILL.md in the same local catalog.
 
 use anyhow::{Context, Result, bail};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -104,14 +106,21 @@ fn check_url(url: &str) -> Result<()> {
     bail!("refusing to fetch a skill over a non-HTTPS URL: {url}");
 }
 
+/// The shared reqwest client: an `aish/<version>` user-agent and a 20s timeout.
+/// Reused by both the raw-SKILL fetch and the registry search so the two paths
+/// present identically to the registry.
+fn http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent(concat!("aish/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(20))
+        .build()?)
+}
+
 /// Low-level fetch of a raw SKILL.md from an absolute URL (no env lookup), so
 /// tests can point it at a loopback server without mutating process env.
 pub async fn fetch_url(url: &str) -> Result<String> {
     check_url(url)?;
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("aish/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(20))
-        .build()?;
+    let client = http_client()?;
     let resp = client.get(url).send().await.with_context(|| format!("fetching {url}"))?;
     if !resp.status().is_success() {
         bail!("skill.fish returned HTTP {} for {url}", resp.status().as_u16());
@@ -157,6 +166,181 @@ pub async fn run_fetch(input: &str, skills_dir: &Path) -> Result<()> {
         println!("  \x1b[2m{desc}\x1b[0m");
     }
     println!("  It's in your skills catalog now — aish will use it when a task matches.");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Search — query the registry catalog (Phase 2)
+// ---------------------------------------------------------------------------
+
+/// One entry in a skill.fish search response. Every field is optional on the
+/// wire (the registry may omit a version or description), so each carries a
+/// serde default; `author` also accepts the `owner` key and `reference` the
+/// `ref`/`slug` keys, matching the shapes the registry has used in practice.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct SearchResult {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, alias = "owner")]
+    pub author: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default, alias = "ref", alias = "slug")]
+    pub reference: String,
+}
+
+impl SearchResult {
+    /// The `owner/name` reference a user can paste into `--skill-fetch`. Prefers
+    /// the explicit `reference` from the response, else composes `author/name`,
+    /// else falls back to the bare name. Doubles as the dedup key.
+    pub fn ref_or_synth(&self) -> String {
+        let r = self.reference.trim();
+        if !r.is_empty() {
+            r.to_string()
+        } else if !self.author.is_empty() && !self.name.is_empty() {
+            format!("{}/{}", self.author, self.name)
+        } else {
+            self.name.clone()
+        }
+    }
+}
+
+/// Percent-encode a query value for a URL query string: the RFC 3986 unreserved
+/// set passes through, everything else becomes `%XX`. Small and dependency-free
+/// so the search URL is deterministic and unit-testable.
+fn encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// The search endpoint URL on `base` for `query`.
+fn search_url_with_base(base: &str, query: &str) -> String {
+    format!(
+        "{}/api/v1/search?q={}&limit=50",
+        base.trim_end_matches('/'),
+        encode_query(query)
+    )
+}
+
+/// Parse a search response body into a deduped list of results. Accepts either
+/// a bare JSON array or an object wrapping the array under `results`/`skills`/
+/// `data` (the registry shape isn't contractually fixed, so we're liberal).
+/// Unparsable entries are skipped; duplicates (by reference) are dropped, keeping
+/// the first. An empty list is a valid result, never an error.
+fn parse_search_body(body: &str) -> Result<Vec<SearchResult>> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).context("skill.fish search response was not valid JSON")?;
+    let arr = v
+        .get("results")
+        .or_else(|| v.get("skills"))
+        .or_else(|| v.get("data"))
+        .and_then(|x| x.as_array())
+        .cloned()
+        .or_else(|| v.as_array().cloned())
+        .unwrap_or_default();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in arr {
+        let Ok(r) = serde_json::from_value::<SearchResult>(item) else {
+            continue;
+        };
+        if seen.insert(r.ref_or_synth()) {
+            out.push(r);
+        }
+    }
+    Ok(out)
+}
+
+/// Search `base`'s registry catalog for `query` (no env lookup), so tests can
+/// point it at a loopback server without mutating process env.
+async fn search_with_base(base: &str, query: &str) -> Result<Vec<SearchResult>> {
+    let url = search_url_with_base(base, query);
+    check_url(&url)?;
+    let client = http_client()?;
+    let resp = client.get(&url).send().await.with_context(|| format!("searching {url}"))?;
+    if !resp.status().is_success() {
+        bail!("skill.fish returned HTTP {} for {url}", resp.status().as_u16());
+    }
+    let body = resp.text().await.context("reading the search response")?;
+    parse_search_body(&body)
+}
+
+/// Search the configured registry catalog for `query`. An empty result list is
+/// returned as `Ok(vec![])`, not an error.
+pub async fn search(query: &str) -> Result<Vec<SearchResult>> {
+    search_with_base(&registry(), query).await
+}
+
+/// Render search results as a plain, aligned text table (returned, not printed,
+/// so it's unit-testable). Columns: the `owner/name` reference, the version, and
+/// a truncated one-line description. An empty list renders the "no matches" line.
+pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
+    if results.is_empty() {
+        return format!("No skills found for {query:?}.");
+    }
+    const DESC_MAX: usize = 60;
+    let refs: Vec<String> = results.iter().map(|r| r.ref_or_synth()).collect();
+    let vers: Vec<String> = results
+        .iter()
+        .map(|r| if r.version.trim().is_empty() { "-".to_string() } else { r.version.clone() })
+        .collect();
+    let descs: Vec<String> = results.iter().map(|r| truncate(&r.description, DESC_MAX)).collect();
+
+    let ref_w = refs
+        .iter()
+        .map(|s| s.chars().count())
+        .chain(std::iter::once("SKILL".len()))
+        .max()
+        .unwrap_or(5);
+    let ver_w = vers
+        .iter()
+        .map(|s| s.chars().count())
+        .chain(std::iter::once("VERSION".len()))
+        .max()
+        .unwrap_or(7);
+
+    let mut out = String::new();
+    out.push_str(&format!("{:<ref_w$}  {:<ver_w$}  {}\n", "SKILL", "VERSION", "DESCRIPTION"));
+    for i in 0..results.len() {
+        out.push_str(&format!("{:<ref_w$}  {:<ver_w$}  {}\n", refs[i], vers[i], descs[i]));
+    }
+    out.push_str(&format!(
+        "\n{} result(s) — fetch one with `aish --skill-fetch <skill>` or `:skill add <skill>`",
+        results.len()
+    ));
+    out
+}
+
+/// Collapse newlines and cap a string at `max` display chars (ellipsis when cut).
+fn truncate(s: &str, max: usize) -> String {
+    let s = s.replace(['\n', '\r'], " ");
+    if s.chars().count() <= max {
+        return s;
+    }
+    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
+/// CLI entry point for `aish --skill-search <query>`: search the registry and
+/// print the result table.
+pub async fn run_search(query: &str) -> Result<()> {
+    let query = query.trim();
+    if query.is_empty() {
+        bail!("empty search query — try `aish --skill-search <query>`");
+    }
+    println!("\x1b[2msearching skill.fish for {query:?} …\x1b[0m");
+    let results = search(query).await?;
+    println!("{}", print_results_table(query, &results));
     Ok(())
 }
 
@@ -233,22 +417,8 @@ mod tests {
     // behind a bot challenge) and without mutating process-global env.
     #[tokio::test]
     async fn fetch_and_import_flow_over_loopback() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
         let body = "---\nname: loopback-skill\ndescription: Served locally.\n---\nbody\n";
-        tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 2048];
-            let _ = sock.read(&mut buf).await;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/markdown\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
-            let _ = sock.flush().await;
-        });
+        let port = serve_once("200 OK", body.to_string()).await;
 
         let url = format!("http://127.0.0.1:{port}/acme/loopback-skill/raw");
         let fetched = fetch_url(&url).await.unwrap();
@@ -260,5 +430,131 @@ mod tests {
         assert!(path.ends_with("loopback-skill/SKILL.md"));
         assert_eq!(crate::skills::load(&tmp).len(), 1);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- Phase 2: search ------------------------------------------------
+
+    /// One-shot loopback HTTP server: serves `status_line` (e.g. "200 OK") with
+    /// `body` once, then closes. Returns the bound port. Shared by the fetch and
+    /// search integration tests so neither touches the public registry or env.
+    async fn serve_once(status_line: &str, body: String) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let status_line = status_line.to_string();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn search_returns_parsed_results() {
+        let body = r#"{"results":[{"name":"git-helper","author":"acme","description":"Helps with git.","version":"1.0.0","reference":"acme/git-helper"}]}"#;
+        let port = serve_once("200 OK", body.to_string()).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let got = search_with_base(&base, "git").await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "git-helper");
+        assert_eq!(got[0].author, "acme");
+        assert_eq!(got[0].version, "1.0.0");
+        assert_eq!(got[0].ref_or_synth(), "acme/git-helper");
+    }
+
+    #[test]
+    fn search_dedups_duplicate_refs() {
+        // Two identical references collapse to one; a distinct one survives.
+        let body = r#"[
+            {"name":"a","author":"o","reference":"o/a"},
+            {"name":"a","author":"o","reference":"o/a"},
+            {"name":"b","author":"o","reference":"o/b"}
+        ]"#;
+        let got = parse_search_body(body).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].ref_or_synth(), "o/a");
+        assert_eq!(got[1].ref_or_synth(), "o/b");
+    }
+
+    #[test]
+    fn search_synthesizes_reference_from_owner_name() {
+        // `owner` alias fills author; reference is synthesized when absent.
+        let body = r#"[{"name":"x","owner":"acme","description":"d"}]"#;
+        let got = parse_search_body(body).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].author, "acme");
+        assert_eq!(got[0].ref_or_synth(), "acme/x");
+    }
+
+    #[tokio::test]
+    async fn search_empty_results_is_ok() {
+        let port = serve_once("200 OK", "{\"results\":[]}".to_string()).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let got = search_with_base(&base, "nonexistent").await.unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_http_error_propagates() {
+        let port = serve_once("500 Internal Server Error", "oops".to_string()).await;
+        let base = format!("http://127.0.0.1:{port}");
+        assert!(search_with_base(&base, "x").await.is_err());
+    }
+
+    #[test]
+    fn search_query_is_url_encoded() {
+        let u = search_url_with_base("https://skill.fish", "git helper & more/v2");
+        assert!(u.starts_with("https://skill.fish/api/v1/search?q="), "got {u}");
+        assert!(u.contains("git%20helper"), "space not encoded: {u}");
+        assert!(u.contains("%26"), "& not encoded: {u}");
+        assert!(u.contains("%2F"), "/ not encoded: {u}");
+        assert!(u.ends_with("&limit=50"), "missing limit: {u}");
+        // A trailing slash on the base is normalized away (no `//api`).
+        assert_eq!(
+            search_url_with_base("http://localhost:9/", "q"),
+            "http://localhost:9/api/v1/search?q=q&limit=50"
+        );
+    }
+
+    #[test]
+    fn print_results_table_handles_empty() {
+        assert_eq!(print_results_table("foo", &[]), "No skills found for \"foo\".");
+    }
+
+    #[test]
+    fn print_results_table_lists_results() {
+        let r = SearchResult {
+            name: "git-helper".into(),
+            author: "acme".into(),
+            description: "Helps with git operations.".into(),
+            version: "1.0.0".into(),
+            reference: "acme/git-helper".into(),
+        };
+        let s = print_results_table("git", &[r]);
+        assert!(s.contains("SKILL"));
+        assert!(s.contains("VERSION"));
+        assert!(s.contains("acme/git-helper"));
+        assert!(s.contains("1.0.0"));
+        assert!(s.contains("Helps with git operations."));
+        assert!(s.contains("1 result(s)"));
+    }
+
+    #[test]
+    fn truncate_caps_long_description() {
+        let long = "x".repeat(80);
+        let t = truncate(&long, 60);
+        assert_eq!(t.chars().count(), 60);
+        assert!(t.ends_with('…'));
+        // Short strings pass through unchanged; newlines collapse to spaces.
+        assert_eq!(truncate("short", 60), "short");
+        assert_eq!(truncate("a\nb", 60), "a b");
     }
 }
