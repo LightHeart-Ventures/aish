@@ -317,6 +317,12 @@ fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str, cwd: &std::path::
     // `std::os::unix::process::CommandExt::pre_exec`); no extra trait import.
     unsafe {
         cmd.pre_exec(move || {
+            // New session (detach from the controlling terminal) so a SIGHUP when
+            // the launching interactive session exits doesn't kill this coordinator
+            // mid-write, before it can persist its terminal `coordinator_runs` row.
+            // (coordinator-lifecycle bug.) SAFETY: setsid() is async-signal-safe;
+            // EPERM (already a group leader) is harmless and ignored.
+            libc::setsid();
             apply_rlimits(mem_mb, cpu_secs);
             Ok(())
         });
@@ -789,6 +795,55 @@ pub fn sweep_worktrees(src: &std::path::Path) {
         }
         let _ = std::fs::remove_dir_all(&leaf);
     }
+}
+
+/// A worktree leaf that still holds work (uncommitted changes or commits ahead
+/// of its base) — a salvage candidate when its `coordinator_runs` row was lost
+/// to an early termination. `id` is the worker/run id (the leaf name), `branch`
+/// is `aish/<id>`, `path` the absolute worktree dir.
+pub struct OrphanWork {
+    pub id: String,
+    pub branch: String,
+    pub path: PathBuf,
+}
+
+/// Scan the managed worktree root for THIS repo and return every leaf that still
+/// holds work (dirty OR commits-ahead of its base). The coordinator's salvage
+/// pass cross-references these against the durable store to recover runs whose
+/// row was lost on early termination (coordinator-lifecycle bug). Best-effort —
+/// empty on any error; non-git / unreadable leaves are skipped.
+pub fn work_bearing_worktrees(src: &std::path::Path) -> Vec<OrphanWork> {
+    if !is_git_repo(src) {
+        return Vec::new();
+    }
+    let base_dir = worktree_root().join(repo_key(src));
+    let entries = match std::fs::read_dir(&base_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let leaf = entry.path();
+        if !leaf.is_dir() || !is_git_repo(&leaf) {
+            continue;
+        }
+        let dirty = match git_out(&leaf, &["status", "--porcelain"]) {
+            Some(s) => !s.trim().is_empty(),
+            None => continue, // can't read it as a worktree → skip
+        };
+        let ahead = worktree_commits_ahead(&leaf);
+        if !(dirty || ahead) {
+            continue;
+        }
+        if let Some(name) = leaf.file_name().and_then(|s| s.to_str()) {
+            out.push(OrphanWork {
+                id: name.to_string(),
+                branch: format!("aish/{name}"),
+                path: leaf.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// Remove a worktree and delete its branch — used when the worker made no
