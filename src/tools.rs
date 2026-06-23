@@ -342,6 +342,22 @@ your own tracking. Returns a table: id, kind, owner, status, task, result."
                 .into(),
             schema: json!({ "type": "object", "properties": {} }),
         });
+        // The agent-facing side of the `:tell` channel (the human types `:tell`;
+        // the model calls this). Lets the interactive agent and one coordinator
+        // STEER another in-flight coordinator without killing + relaunching it.
+        defs.push(ToolDef {
+            name: "tell".into(),
+            description: "Steer an in-flight background coordinator WITHOUT restarting it: queue a message (a clarification, a course-correction, a narrower scope) that is folded into that coordinator's NEXT round. This is the `:tell` channel — how you and your background coordinators message each other mid-flight. Call background_status to find the target run id. Only a still-running coordinator can receive a message; a finished one has nothing to read it."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The coordinator's run id, or an unambiguous prefix (e.g. the short 8-char id shown by background_status)."},
+                    "message": {"type": "string", "description": "The steering message — updated instructions or a clarification. It is treated as a supervisory interjection and takes precedence over the coordinator's earlier assumptions where they conflict."}
+                },
+                "required": ["id", "message"]
+            }),
+        });
     }
     // Synchronous escalation: only offered to a weak frontend (a stronger model
     // is reachable). An Opus/default-Grok session never sees this tool — it would
@@ -406,6 +422,7 @@ pub async fn execute(call: &ToolCall, session: &mut Session, confirm: &mut Confi
         "run_in_background" => run_in_background(call, session),
         "batch_result" => batch_result(call, session),
         "background_status" => background_status(session),
+        "tell" => tell(call, session),
         "escalate" => escalate(call, session).await,
         "get_skill" => get_skill(call, session).await,
         other if other.starts_with("mcp__") => mcp_call(call, session, confirm).await,
@@ -1067,6 +1084,76 @@ when ready — no job id, no restating the task."
 /// workers (in memory) and all sessions' Anthropic batches (from the shared
 /// store). This is what lets the model answer "what's running?" with facts
 /// instead of fabricating its own tracking (see the Haiku failure transcript).
+/// `tell` tool — the agent-facing side of the `:tell` / SendMessage channel.
+/// Queues a steering message for an in-flight background coordinator (resolved by
+/// run id, exact or unambiguous prefix) so it is folded into that coordinator's
+/// NEXT round (see `coordinator::drive`). This is how the interactive agent, and
+/// one coordinator, message ANOTHER running coordinator mid-flight — to clarify,
+/// correct course, or narrow scope — without killing and relaunching it. Mirrors
+/// the REPL `:tell` command (`repl::tell_coordinator`): this session's in-memory
+/// workers are matched first, then every durable run; a terminal run is refused
+/// (nothing would read it) and an ambiguous prefix lists the matches.
+fn tell(call: &ToolCall, session: &Session) -> Result<String> {
+    let id = call.args["id"].as_str().unwrap_or_default().trim();
+    let message = call.args["message"].as_str().unwrap_or_default().trim();
+    if id.is_empty() || message.is_empty() {
+        anyhow::bail!(
+            "tell requires both `id` (a coordinator run id from background_status) and a non-empty `message`"
+        );
+    }
+    let Some(store) = &session.coordinator_store else {
+        anyhow::bail!("coordinator store unavailable — can't queue messages");
+    };
+    let hit = |rid: &str| rid == id || rid.starts_with(id);
+
+    // (run_id, terminal?). This session's in-memory workers first — their id is
+    // known before the child writes its store row, so a message sent right after
+    // launch still lands — then durable runs from any session (deduped on run_id).
+    let mut candidates: Vec<(String, bool)> = Vec::new();
+    for w in session.worker_jobs.lock().unwrap().iter() {
+        if hit(&w.id) {
+            candidates.push((w.id.clone(), matches!(w.status().as_str(), "done" | "failed")));
+        }
+    }
+    if let Ok(rows) = store.load_all() {
+        for r in rows {
+            if hit(&r.run_id) && !candidates.iter().any(|(rid, _)| rid == &r.run_id) {
+                candidates.push((r.run_id.clone(), matches!(r.phase.as_str(), "done" | "failed")));
+            }
+        }
+    }
+
+    match candidates.as_slice() {
+        [] => anyhow::bail!(
+            "no in-flight coordinator matching '{id}' — call background_status to list run ids"
+        ),
+        [(run_id, terminal)] => {
+            let short = crate::batch::short_id(run_id);
+            if *terminal {
+                anyhow::bail!(
+                    "coordinator {short} has already finished — nothing would read the message"
+                );
+            }
+            store.enqueue_message(run_id, message, Some(&session.session_id))?;
+            let pending = store.pending_message_count(run_id).unwrap_or(0);
+            Ok(format!(
+                "✉ queued for coordinator {short} ({pending} pending) — folded in at the start of its next round"
+            ))
+        }
+        many => {
+            let ids = many
+                .iter()
+                .map(|(rid, _)| crate::batch::short_id(rid).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "'{id}' matches {} coordinators ({ids}) — use a longer id prefix",
+                many.len()
+            )
+        }
+    }
+}
+
 fn background_status(session: &Session) -> Result<String> {
     let trunc = |t: &str| -> String {
         let t = t.replace('|', "\\|");
@@ -1726,6 +1813,17 @@ mod tests {
         // Independent of batch mode: escalate tracks its own flag.
         assert!(has(&tool_defs(false, true), "escalate"));
         assert!(!has(&tool_defs(false, false), "escalate"));
+    }
+
+    #[test]
+    fn tell_tool_offered_only_in_batch_mode() {
+        let has = |defs: &[ToolDef], n: &str| defs.iter().any(|d| d.name == n);
+        // The `tell` channel rides with background mode — there are no
+        // coordinators to steer when batch mode is off.
+        assert!(has(&tool_defs(true, false), "tell"));
+        assert!(has(&tool_defs(true, true), "tell"));
+        assert!(!has(&tool_defs(false, false), "tell"));
+        assert!(!has(&tool_defs(false, true), "tell"));
     }
 
     #[test]
