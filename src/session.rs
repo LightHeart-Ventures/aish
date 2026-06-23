@@ -357,7 +357,7 @@ which can itself fan heavy parallel sub-work out to the Anthropic Batches API. T
 result auto-delivers here when it's done. It returns a job id immediately and survives restarts. PREFER \
 run_in_background for deferrable, parallelizable, or non-urgent work — it keeps the conversation moving. \
 Only answer inline when the user needs the result right now. To answer \"what's running?\" call \
-background_status (never invent your own tracking). When you offload, call run_in_background with NO \
+background_status (never invent your own tracking). Steer a coordinator that is ALREADY running without restarting it: call the `tell` tool with its run id (from background_status) and a message — a clarification, a course-correction, a narrower scope — and it is folded into that coordinator's next round; this is how you and your background coordinators message each other mid-flight. When you offload, call run_in_background with NO \
 preamble, then reply with ONE short, natural sentence — tailored to what they asked — saying you're \
 handling it in the background and the answer will appear here when it's ready (e.g. \"On it — I'll work \
 that out in the background and post the answer here.\"). Do NOT predict or mention the job id, restate \
