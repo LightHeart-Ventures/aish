@@ -27,8 +27,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Fail the release fast (before any expensive cross-target builds) if the
+  # pushed tag does not match the version baked into Cargo.toml. The runtime
+  # version string comes from env!("CARGO_PKG_VERSION") (see src/update.rs
+  # current_version()), so a tag/Cargo.toml drift ships a binary that reports
+  # the wrong version — which makes `:update` compare the new tag against the
+  # stale baked version forever and re-download on every startup. Guarding here
+  # makes that drift impossible to release.
+  verify-version:
+    name: verify tag matches Cargo.toml version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Assert tag == Cargo.toml package version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          echo "tag version:        $tag"
+          echo "Cargo.toml version: $cargo_version"
+          if [ "$tag" != "$cargo_version" ]; then
+            echo "::error::Release tag v$tag does not match Cargo.toml version $cargo_version. Bump Cargo.toml (and Cargo.lock) before tagging so the binary reports the right version."
+            exit 1
+          fi
+        shell: bash
+
   build:
     name: build ${{ matrix.target }}
+    needs: verify-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
