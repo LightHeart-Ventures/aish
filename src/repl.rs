@@ -37,12 +37,12 @@ fn install_mcp_if_ready(
             *rx = None;
             if n > 0 {
                 eprintln!(
-                    "\x1b[2mmcp: ready â {n} server{} connected\x1b[0m",
+                    "\x1b[2mmcp: ready — {n} server{} connected\x1b[0m",
                     if n == 1 { "" } else { "s" }
                 );
             }
         }
-        // Still connecting, or the connect task died â leave the placeholder.
+        // Still connecting, or the connect task died — leave the placeholder.
         Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
         Err(tokio::sync::oneshot::error::TryRecvError::Closed) => *rx = None,
     }
@@ -95,14 +95,14 @@ pub async fn run(
     // SIGINT is also observed by the ctrl_c task below for model-turn aborts.
     // With real process-group ownership (TASK-113/114) the terminal delivers a
     // Ctrl-C straight to the foreground child's process group, so aish only ever
-    // receives SIGINT when IT owns the terminal â i.e. during a model turn. That
+    // receives SIGINT when IT owns the terminal — i.e. during a model turn. That
     // makes the old tty_handoff disambiguation flag unnecessary; TASK-116 removed it.
     tools::ignore_job_control_signals();
 
     // Install the process-wide SIGINT handler up front. A Ctrl-C during a
     // direct-dispatch child is delivered by the terminal straight to that child's
     // own process group (it leads its own pgrp and owns the tty via tcsetpgrp), so
-    // this task just keeps a tokio SIGINT handler installed â aish is never killed.
+    // this task just keeps a tokio SIGINT handler installed — aish is never killed.
     tokio::spawn(async {
         loop {
             let _ = tokio::signal::ctrl_c().await;
@@ -115,7 +115,7 @@ pub async fn run(
     let aliases = Arc::new(aliases);
 
     // Deferred MCP connect. The handshake (a remote HTTP server's
-    // initialize â tools/list â prompts/list) is the dominant startup cost and
+    // initialize → tools/list → prompts/list) is the dominant startup cost and
     // used to run before this REPL existed, freezing the shell for seconds.
     // Instead connect in the background and hand the result back over a oneshot;
     // the loop installs the tools + skills catalog when it arrives. Until then
@@ -159,7 +159,7 @@ pub async fn run(
     let mut pending_update: Option<crate::update::UpdateInfo> = None;
 
     // The line editor is driven through the `LineEditor` trait (S5.1/TASK-130)
-    // so the concrete editor â rustyline today, reedline-capable tomorrow â is a
+    // so the concrete editor — rustyline today, reedline-capable tomorrow — is a
     // one-line swap at this construction site. The rustyline impl configures
     // list-style completion (the whole candidate menu on the first TAB), installs
     // the `AishHelper` (completion + the live `:`-palette Hinter + the
@@ -169,18 +169,18 @@ pub async fn run(
 
     // The `:`-command palette renders live as an inline hint below the prompt
     // (see `palette_hint` and the Hinter impl): type `:` and the menu appears,
-    // and each extra char filters it in place â rustyline redraws the hint
+    // and each extra char filters it in place — rustyline redraws the hint
     // without re-printing the prompt or stacking menus. No key bindings are
     // needed; `:` and the name chars self-insert normally, and TAB still
     // completes a `:`-prefix via the Completer.
 
-    // Start on a clean screen (interactive terminals only â keep piped output clean).
+    // Start on a clean screen (interactive terminals only — keep piped output clean).
     // SAFETY: plain isatty query.
     if unsafe { libc::isatty(1) } == 1 {
         print!("\x1b[2J\x1b[H");
     }
     println!(
-        "\x1b[1maish\x1b[0m \x1b[2mv{}\x1b[0m â AI-native shell Â· {} Â· :help for commands",
+        "\x1b[1maish\x1b[0m \x1b[2mv{}\x1b[0m — AI-native shell · {} · :help for commands",
         crate::update::current_version(),
         backend.describe()
     );
@@ -189,12 +189,12 @@ pub async fn run(
     let mut needs_gap = false; // blank line between previous output and the prompt
     // A command the user accepted from a rewrite preview (S6.4 / TASK-138) is
     // parked here and consumed at the top of the next iteration so it flows
-    // through the SAME dispatch path as a typed line â no logic is duplicated.
+    // through the SAME dispatch path as a typed line — no logic is duplicated.
     let mut injected: Option<String> = None;
 
     // Background-result presenter. When interactive, finished batch/worker jobs
     // queue their results (present::enable_deferred) and this task prints them
-    // ABOVE the prompt via rustyline's ExternalPrinter â but only at a pause in
+    // ABOVE the prompt via rustyline's ExternalPrinter — but only at a pause in
     // work (`busy == false`), so a result never blurts over a command in flight
     // or the user's typing. ExternalPrinter redraws the prompt after printing.
     // If the terminal can't provide a printer, we leave inline printing on.
@@ -209,10 +209,10 @@ pub async fn run(
             loop {
                 tick.tick().await;
                 if busy.load(Ordering::SeqCst) {
-                    continue; // mid-command/turn â hold results until a pause
+                    continue; // mid-command/turn — hold results until a pause
                 }
                 // Notify (one line per finished job), don't dump the full result
-                // over the prompt â the user views it on demand with `:result`.
+                // over the prompt — the user views it on demand with `:result`.
                 let mut notices = crate::batch::notify_pending(&batch_jobs);
                 notices.extend(crate::worker::notify_pending(&worker_jobs));
                 for n in notices {
@@ -235,7 +235,7 @@ pub async fn run(
                 match rx.try_recv() {
                     Ok(info) => {
                         println!(
-                            "\x1b[1;32mâ¨ aish {} is available\x1b[0m (you have {}) â type \x1b[1m:update\x1b[0m to upgrade",
+                            "\x1b[1;32m✨ aish {} is available\x1b[0m (you have {}) — type \x1b[1m:update\x1b[0m to upgrade",
                             info.version,
                             crate::update::current_version()
                         );
@@ -254,24 +254,24 @@ pub async fn run(
         }
         // Tab completion resolves against the session's cwd, which `cd` mutates.
         editor.set_cwd(&session.cwd);
-        // We're about to idle at the prompt â let the presenter flush results.
+        // We're about to idle at the prompt — let the presenter flush results.
         busy.store(false, Ordering::SeqCst);
-        // Combined background-job tally â Anthropic batches + re-exec'd workers
+        // Combined background-job tally — Anthropic batches + re-exec'd workers
         // + durable coordinator runs the in-memory tallies miss (goal-loop turns,
-        // other-session runs, runs reattached after a restart). This is the â³N
+        // other-session runs, runs reattached after a restart). This is the ⟳N
         // badge count; `:update` reuses the SAME helper to warn about version
         // skew before swapping the binary (ISS-2045).
         let running = background_running_count(&session);
-        // Colour the â³N badge by the most recent background-worker event
-        // (green â tool success, red â tool failure, magenta â³ turn
-        // completion), fading back to dim â³N after worker::PULSE_FADE.
+        // Colour the ⟳N badge by the most recent background-worker event
+        // (green ✓ tool success, red ✗ tool failure, magenta ⟳ turn
+        // completion), fading back to dim ⟳N after worker::PULSE_FADE.
         let pulse = crate::worker::fresh_pulse(&session.worker_jobs);
         let badge = crate::worker::pulse_badge(running, pulse);
         let name = match &session.name {
             Some(n) => format!("\x1b[1;35m[{n}]\x1b[0m | "), // bold magenta, set apart from the cyan path
             None => String::new(),
         };
-        let prompt = format!("{name}{badge}\x1b[36m{}\x1b[0m â¯ ", short_cwd(&session));
+        let prompt = format!("{name}{badge}\x1b[36m{}\x1b[0m ❯ ", short_cwd(&session));
         // Consume an accepted-rewrite line before falling back to the editor.
         let outcome = match injected.take() {
             Some(l) => ReadOutcome::Line(l),
@@ -285,21 +285,21 @@ pub async fn run(
                 }
                 editor.add_history(&line);
                 needs_gap = true;
-                // Now working â hold background results until the next pause.
+                // Now working — hold background results until the next pause.
                 busy.store(true, Ordering::SeqCst);
 
                 // Inline AI command-rewrite preview (S6.4 / TASK-138): `:rewrite
                 // <intent>` (alias `:rw`) asks the model to translate intent into
                 // ONE concrete command, shows it pre-filled in the editor, and runs
                 // it only after the user accepts (Enter) or edits it. Nothing runs
-                // unconfirmed â the candidate is only ever placed in the buffer.
+                // unconfirmed — the candidate is only ever placed in the buffer.
                 if let Some(intent) = crate::rewrite::parse_invocation(&line) {
                     let intent = intent.to_string();
                     if intent.is_empty() {
                         println!("\x1b[2musage: :rewrite <what you want to do>  (alias :rw)\x1b[0m");
                         continue;
                     }
-                    print!("\x1b[2m  â rewritingâ¦\x1b[0m");
+                    print!("\x1b[2m  ⚙ rewriting…\x1b[0m");
                     std::io::stdout().flush().ok();
                     let candidate =
                         crate::rewrite::rewrite_to_command(&backend, &session, &intent).await;
@@ -308,7 +308,7 @@ pub async fn run(
                     match candidate {
                         Ok(Some(cmd)) => {
                             println!(
-                                "\x1b[2m  candidate â edit, Enter to run, Ctrl-C to cancel:\x1b[0m"
+                                "\x1b[2m  candidate — edit, Enter to run, Ctrl-C to cancel:\x1b[0m"
                             );
                             match editor.read_line_with_initial(&prompt, &cmd) {
                                 ReadOutcome::Line(edited) => {
@@ -327,7 +327,7 @@ pub async fn run(
                             }
                         }
                         Ok(None) => println!(
-                            "\x1b[2m  couldn't express that as a single command â try \x1b[0m?{intent}\x1b[2m to let the model work it out\x1b[0m"
+                            "\x1b[2m  couldn't express that as a single command — try \x1b[0m?{intent}\x1b[2m to let the model work it out\x1b[0m"
                         ),
                         Err(e) => eprintln!("\x1b[31maish:\x1b[0m rewrite failed: {e:#}"),
                     }
@@ -338,13 +338,13 @@ pub async fn run(
                 // `:suggest` (alias `:sg`) asks the model for the single most
                 // plausible NEXT command given the session so far (recent
                 // commands + last output), renders it pre-filled in the editor,
-                // and runs it only after the user accepts (Enter) or edits it â
+                // and runs it only after the user accepts (Enter) or edits it —
                 // the same trust surface as the rewrite preview. An optional
                 // trailing hint nudges it (`:sg now run the tests`). Nothing runs
                 // unconfirmed: the candidate is only ever placed in the buffer.
                 if let Some(hint) = crate::suggest::parse_invocation(&line) {
                     let hint = hint.to_string();
-                    print!("\x1b[2m  â suggestingâ¦\x1b[0m");
+                    print!("\x1b[2m  ⚙ suggesting…\x1b[0m");
                     std::io::stdout().flush().ok();
                     let candidate =
                         crate::suggest::suggest_next_command(&backend, &session, &hint).await;
@@ -353,7 +353,7 @@ pub async fn run(
                     match candidate {
                         Ok(Some(cmd)) => {
                             println!(
-                                "\x1b[2m  suggestion â edit, Enter to run, Ctrl-C to cancel:\x1b[0m"
+                                "\x1b[2m  suggestion — edit, Enter to run, Ctrl-C to cancel:\x1b[0m"
                             );
                             match editor.read_line_with_initial(&prompt, &cmd) {
                                 ReadOutcome::Line(edited) => {
@@ -372,7 +372,7 @@ pub async fn run(
                             }
                         }
                         Ok(None) => println!(
-                            "\x1b[2m  no next-command suggestion from the current context â keep going, or \x1b[0m?<intent>\x1b[2m to ask the model\x1b[0m"
+                            "\x1b[2m  no next-command suggestion from the current context — keep going, or \x1b[0m?<intent>\x1b[2m to ask the model\x1b[0m"
                         ),
                         Err(e) => eprintln!("\x1b[31maish:\x1b[0m suggestion failed: {e:#}"),
                     }
@@ -393,7 +393,7 @@ pub async fn run(
                 // Auto-offload: any prompt mentioning "troubleshoot" is pushed
                 // to a background coordinator instead of handled inline.
                 // Troubleshooting is open-ended, parallelizable diagnostic work
-                // that shouldn't tie up the prompt â so it always goes to a
+                // that shouldn't tie up the prompt — so it always goes to a
                 // full-tool worker whose result auto-delivers. Skipped only when
                 // already inside a coordinator (no nested coordinators).
                 if mentions_troubleshoot(&line) && !session.nested {
@@ -430,7 +430,7 @@ pub async fn run(
                 // Agentic turn. A Ctrl-C aborts it. Real process-group ownership
                 // means a foreground child (run_interactive) receives terminal
                 // signals directly via its own pgrp, so aish only gets SIGINT here
-                // when it owns the terminal â i.e. the turn itself is what to abort.
+                // when it owns the terminal — i.e. the turn itself is what to abort.
                 // No tty_handoff flag needed (TASK-116).
                 let pre_len = session.history.len();
                 let mut aborted = false;
@@ -451,7 +451,7 @@ pub async fn run(
                 }
                 if aborted {
                     // A half-finished turn can leave a dangling tool_use with no
-                    // tool_result â the next request would 400. Roll it back.
+                    // tool_result — the next request would 400. Roll it back.
                     session.history.truncate(pre_len);
                     println!("\x1b[33m^C\x1b[0m turn aborted");
                 } else if let Some(text) = reply {
@@ -477,7 +477,7 @@ pub async fn run(
         }
     }
 
-    // Don't leave managed jobs â especially stopped ones â orphaned on exit:
+    // Don't leave managed jobs — especially stopped ones — orphaned on exit:
     // hang them up (SIGCONT + SIGHUP) so they terminate with the shell (TASK-123).
     tools::hangup_jobs_on_exit(&session.jobs);
 
@@ -487,14 +487,14 @@ pub async fn run(
 }
 
 // ---------------------------------------------------------------------------
-// Tab completion â filenames and directories, against the session's cwd
+// Tab completion — filenames and directories, against the session's cwd
 // ---------------------------------------------------------------------------
 
 pub(crate) struct AishHelper {
     cwd: PathBuf,
     /// Session PATH (rc exports + process PATH) used for command-name completion.
     path: String,
-    /// Aliases from ~/.aishrc â offered as command names alongside PATH + builtins.
+    /// Aliases from ~/.aishrc — offered as command names alongside PATH + builtins.
     aliases: Arc<HashMap<String, Vec<String>>>,
     /// Lazily-populated, TTL-refreshed cache of executable names on PATH.
     cmd_cache: Arc<Mutex<Option<CmdCache>>>,
@@ -547,7 +547,7 @@ impl AishHelper {
     }
 }
 
-/// Builtins aish handles itself â always offered as command-name completions.
+/// Builtins aish handles itself — always offered as command-name completions.
 const BUILTINS: &[&str] = &[
     "cd", "exit", "logout", "jobs", "fg", "bg", "wait", "pwd", "unset", "set", "umask",
     "source", ".", "exec",
@@ -565,7 +565,7 @@ struct CmdCache {
 }
 
 // ---------------------------------------------------------------------------
-// Colon command palette â completion for `:` REPL meta-commands
+// Colon command palette — completion for `:` REPL meta-commands
 // ---------------------------------------------------------------------------
 
 /// The `:`-command catalog: `(name, one-line description)`, kept in alphabetical
@@ -611,7 +611,7 @@ fn colon_command_matches(prefix: &str) -> Vec<&'static str> {
 }
 
 /// Build the palette completion candidates for the text after a leading `:`.
-/// `start` is 0 â the whole `:<prefix>` token is replaced. The display carries
+/// `start` is 0 — the whole `:<prefix>` token is replaced. The display carries
 /// the description (what the menu shows); the replacement is `:<name> ` (the
 /// space leaves the cursor ready for any argument).
 fn complete_colon(after: &str) -> (usize, Vec<Pair>) {
@@ -632,14 +632,14 @@ fn complete_colon(after: &str) -> (usize, Vec<Pair>) {
 }
 
 /// Build the live `:`-command palette shown as an inline hint below the prompt.
-/// Returns the menu text â a leading newline, then one dim row per matching
-/// command (`:name   description`) â when the buffer is a bare `:`-token with the
+/// Returns the menu text — a leading newline, then one dim row per matching
+/// command (`:name   description`) — when the buffer is a bare `:`-token with the
 /// cursor at its end, or `None` otherwise. rustyline recomputes this on every
 /// keystroke and redraws the hint in place (clearing the prior rows), so the
 /// list filters as you type WITHOUT re-printing the prompt or stacking menus.
 fn palette_hint(line: &str, pos: usize) -> Option<String> {
     // Only while typing the command name: cursor at the end of a bare `:`-token
-    // (no space yet â once an argument starts, the palette is done).
+    // (no space yet — once an argument starts, the palette is done).
     if pos != line.len() {
         return None;
     }
@@ -666,12 +666,12 @@ fn palette_hint(line: &str, pos: usize) -> Option<String> {
 
 /// An inline hint painted after the prompt. One type carries both shapes the
 /// single `Hinter` emits: the display-only `:`-command palette (`completion`
-/// `None`, so â/Ctrl-F never insert its menu text), and the fish-style
-/// history ghost text (`completion` `Some(suffix)`, so â/Ctrl-F accept it).
+/// `None`, so →/Ctrl-F never insert its menu text), and the fish-style
+/// history ghost text (`completion` `Some(suffix)`, so →/Ctrl-F accept it).
 /// See S6.2 / TASK-136.
 ///
 /// `display` carries its own ANSI (the palette's dim rows; the ghost text's
-/// gray) â rustyline zero-widths SGR escapes when it computes layout, so the
+/// gray) — rustyline zero-widths SGR escapes when it computes layout, so the
 /// embedded color never disturbs cursor math.
 pub(crate) struct AishHint {
     display: String,
@@ -790,13 +790,13 @@ fn session_path(session: &Session) -> String {
         .unwrap_or_default()
 }
 
-/// The gray (bright-black) SGR the history ghost text is painted with â the
+/// The gray (bright-black) SGR the history ghost text is painted with — the
 /// fish convention for an unaccepted autosuggestion. rustyline treats SGR
 /// escapes as zero-width, so embedding it in the hint `display` keeps the
 /// cursor math correct.
 const GHOST_COLOR: &str = "\x1b[90m";
 
-/// The trailing remainder of `entry` after the prefix `line` â the ghost text â
+/// The trailing remainder of `entry` after the prefix `line` — the ghost text —
 /// when `line` is a strict, non-empty, case-sensitive prefix of `entry`. `None`
 /// for an empty line, an exact match (nothing left to suggest), or a non-prefix.
 /// Pure + unit-tested.
@@ -807,9 +807,9 @@ fn ghost_suffix(line: &str, entry: &str) -> Option<String> {
     Some(entry[line.len()..].to_string())
 }
 
-/// Fish-style history autosuggestion: scan `history` newestâoldest for the
+/// Fish-style history autosuggestion: scan `history` newest→oldest for the
 /// first entry that strictly extends `line`, and return its ghost-text
-/// remainder. Fires only with the cursor at end-of-line (`pos == line.len()`) â
+/// remainder. Fires only with the cursor at end-of-line (`pos == line.len()`) —
 /// fish never suggests mid-edit. The scan walks rustyline's indexed
 /// `History::get` (dyn-safe, unlike the RPITIT `iter`) from the most recent
 /// entry down, so the freshest match wins.
@@ -840,7 +840,7 @@ impl Hinter for AishHelper {
     /// Emit the inline hint. The live `:`-command palette takes precedence (a
     /// display-only menu); otherwise the fish-style history autosuggestion paints
     /// the most recent matching command as gray ghost text after the cursor,
-    /// acceptable with â/Ctrl-F (S6.2 / TASK-136). Returns `None` when neither
+    /// acceptable with →/Ctrl-F (S6.2 / TASK-136). Returns `None` when neither
     /// applies, leaving ordinary input untouched. rustyline recomputes this each
     /// keystroke and redraws the hint in place.
     fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<AishHint> {
@@ -854,7 +854,7 @@ impl Hinter for AishHelper {
         })
     }
 }
-/// What the dispatch routing WOULD do with the current line â surfaced live as
+/// What the dispatch routing WOULD do with the current line — surfaced live as
 /// the user types (TASK-132) so a mis-route is visible and correctable BEFORE
 /// Enter, instead of silently running the wrong thing. Reuses the exact dispatch
 /// predicates so the preview can't disagree with the real decision.
@@ -865,31 +865,31 @@ enum Preview {
     /// Goes to the model (cyan).
     Model,
     /// Would dispatch directly, but the lead word is a real binary that's also an
-    /// everyday English word (`clear`, `watch`, `pr`, â¦) â a judgment call worth
+    /// everyday English word (`clear`, `watch`, `pr`, …) — a judgment call worth
     /// a glance (dim). Add `?` to force the model or `!` to force direct.
     Ambiguous,
-    /// A `:` REPL command, or nothing to classify â left uncolored.
+    /// A `:` REPL command, or nothing to classify — left uncolored.
     Plain,
 }
 
 impl Preview {
     /// The ANSI SGR prefix the route-preview Highlighter paints the whole line
-    /// with â the single source of truth for the green=direct / cyan=model /
+    /// with — the single source of truth for the green=direct / cyan=model /
     /// dim=ambiguous contract (TASK-132). `Plain` returns `None` so a `:`-command
     /// or an empty line keeps the terminal's default color.
     fn ansi(self) -> Option<&'static str> {
         match self {
-            Preview::Direct => Some("\x1b[32m"),   // green â runs as a shell command
-            Preview::Model => Some("\x1b[36m"),    // cyan  â handed to the model
-            Preview::Ambiguous => Some("\x1b[2m"), // dim   â real binary that's also English
-            Preview::Plain => None,                // uncolored â `:`-command / empty
+            Preview::Direct => Some("\x1b[32m"),   // green — runs as a shell command
+            Preview::Model => Some("\x1b[36m"),    // cyan  — handed to the model
+            Preview::Ambiguous => Some("\x1b[2m"), // dim   — real binary that's also English
+            Preview::Plain => None,                // uncolored — `:`-command / empty
         }
     }
 }
 
 /// Classify a line the way `dispatch` will route it, using only what the
-/// completer already holds (cwd, PATH, aliases). `$VAR` isn't expanded here â a
-/// preview approximation â but every other decision mirrors `dispatch`.
+/// completer already holds (cwd, PATH, aliases). `$VAR` isn't expanded here — a
+/// preview approximation — but every other decision mirrors `dispatch`.
 fn route_preview(line: &str, cwd: &Path, path: &str, aliases: &HashMap<String, Vec<String>>) -> Preview {
     let l = line.trim();
     if l.is_empty() || l.starts_with(':') {
@@ -908,7 +908,7 @@ fn route_preview(line: &str, cwd: &Path, path: &str, aliases: &HashMap<String, V
             .all(|s| s.first().is_some_and(|p| resolve_program(p, cwd, path).is_some()));
         return if all { Preview::Direct } else { Preview::Model };
     }
-    // Shell machinery / apostrophes don't tokenize â model.
+    // Shell machinery / apostrophes don't tokenize → model.
     let Some(words) = rc::tokenize(l) else {
         return Preview::Model;
     };
@@ -942,7 +942,7 @@ impl AishHelper {
     /// TASK-133). The Highlighter hits this on every repaint; when the buffer is
     /// unchanged from the last paint (a cursor move, a forced refresh, a hint
     /// toggle, or rustyline re-highlighting to reset its highlight flag) it
-    /// returns the cached decision without re-walking PATH or re-tokenizing â the
+    /// returns the cached decision without re-walking PATH or re-tokenizing — the
     /// flicker-free contract. The first paint of a new buffer (each keystroke)
     /// computes once and re-seeds the memo.
     fn cached_preview(&self, line: &str) -> Preview {
@@ -965,10 +965,10 @@ impl AishHelper {
 impl Highlighter for AishHelper {
     /// Paint the whole input line by the route `dispatch` would take, so a
     /// mis-route is visible BEFORE Enter (TASK-132). The color is sourced from
-    /// [`Preview::ansi`] â the one green/cyan/dim mapping â and a `Plain` line
+    /// [`Preview::ansi`] — the one green/cyan/dim mapping — and a `Plain` line
     /// (a `:`-command or empty buffer) is returned untouched. The route is read
     /// through [`AishHelper::cached_preview`] so a repeated paint of the same
-    /// buffer is an O(1) memo hit â the flicker-free guarantee at typing speed
+    /// buffer is an O(1) memo hit — the flicker-free guarantee at typing speed
     /// (S5.4 / TASK-133); only a genuine edit pays the recompute, exactly once.
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
         match self.cached_preview(line).ansi() {
@@ -982,7 +982,7 @@ impl Highlighter for AishHelper {
     /// `false` and rustyline keeps the current colors. Any content edit returns
     /// `true` to re-color the whole line; that repaint's `highlight` call is a
     /// cheap memo lookup that recomputes only because the buffer actually changed
-    /// â so the route is computed at most once per distinct line (S5.4 / TASK-133).
+    /// — so the route is computed at most once per distinct line (S5.4 / TASK-133).
     fn highlight_char(&self, _line: &str, _pos: usize, kind: CmdKind) -> bool {
         kind != CmdKind::MoveCursor
     }
@@ -991,7 +991,7 @@ impl Validator for AishHelper {}
 impl Helper for AishHelper {}
 
 // ---------------------------------------------------------------------------
-// Command-aware completion (word 2+) â static tables
+// Command-aware completion (word 2+) — static tables
 // ---------------------------------------------------------------------------
 //
 // Scope decision (TASK-11): static tables, not a carapace-style spec source.
@@ -1000,7 +1000,7 @@ impl Helper for AishHelper {}
 // task only asks for four high-traffic tools (git, cargo, docker, kubectl),
 // so a handful of `&'static [&str]` tables is the minimum that satisfies it,
 // stays dependency-free, and is trivially unit-testable. Any command without a
-// table â or any word past the subcommand slot â degrades to path completion.
+// table — or any word past the subcommand slot — degrades to path completion.
 
 /// Static completion table for one command: its subcommands (offered in the
 /// first-argument slot) and its common flags (offered when the word starts
@@ -1088,7 +1088,7 @@ fn complete_line(line: &str, pos: usize, cwd: &Path) -> (usize, Vec<Pair>) {
     let cmd = line.split_whitespace().next().unwrap_or("");
 
     // How many complete tokens precede the word under the cursor. 0 means we're
-    // still typing the command itself â path completion (the Completer impl
+    // still typing the command itself → path completion (the Completer impl
     // routes that case to command-name completion before calling here).
     let words_before = line[..start].split_whitespace().count();
     if words_before == 0 {
@@ -1102,13 +1102,13 @@ fn complete_line(line: &str, pos: usize, cwd: &Path) -> (usize, Vec<Pair>) {
                 return (start, pairs);
             }
         } else if words_before == 1 {
-            // First-argument slot â subcommand completion.
+            // First-argument slot → subcommand completion.
             let pairs = matches(spec.subcommands, word);
             if !pairs.is_empty() {
                 return (start, pairs);
             }
         }
-        // No table match â fall through to path completion (graceful).
+        // No table match → fall through to path completion (graceful).
     }
 
     complete_path(line, pos, cwd)
@@ -1164,11 +1164,11 @@ fn complete_path(line: &str, pos: usize, cwd: &Path) -> (usize, Vec<Pair>) {
 }
 
 // ---------------------------------------------------------------------------
-// Direct dispatch â the "real shell" path
+// Direct dispatch — the "real shell" path
 // ---------------------------------------------------------------------------
 
 enum Dispatch {
-    /// Not an executable/builtin â route the line to the model.
+    /// Not an executable/builtin — route the line to the model.
     NotACommand,
     /// Ran (or errored) right here; prompt again.
     Handled,
@@ -1194,22 +1194,22 @@ fn split_route(line: String) -> (String, Route) {
 }
 
 /// Real commands that double as English function words. For these, a line of
-/// nothing but bare words is almost certainly a question ("who is â¦",
-/// "find me big files"), not an invocation â flags, paths, digits, or quotes
+/// nothing but bare words is almost certainly a question ("who is …",
+/// "find me big files"), not an invocation — flags, paths, digits, or quotes
 /// flip it back to a command.
 ///
-/// HEURISTIC STOPGAP: this hand-curated word list is a blunt instrument â it
+/// HEURISTIC STOPGAP: this hand-curated word list is a blunt instrument — it
 /// can only ever catch commands we thought to enumerate (cf. ISS-1480, the
 /// `clear`/`open` class below). The durable fix is model-based route preview
 /// (S5/S6: TASK-132/137), which decides routing by understanding the line
 /// rather than matching its lead word; this list goes away once that lands.
 ///
-/// Additions in the `clear â¦ green` class are deliberately conservative: a word
+/// Additions in the `clear … green` class are deliberately conservative: a word
 /// only belongs here if a 3+word all-alphabetic line starting with it is far
 /// more likely prose than a real invocation. Real invocations of these carry a
-/// flag, path, dot, or digit (handled by the guards in `looks_like_prose`) â so
+/// flag, path, dot, or digit (handled by the guards in `looks_like_prose`) — so
 /// commands whose plain `cmd a b c` form is a legitimate multi-arg call
-/// (`say`, `touch`, `file`, `link`, `paste`, `join`, `mail`, `banner`, â¦) are
+/// (`say`, `touch`, `file`, `link`, `paste`, `join`, `mail`, `banner`, …) are
 /// intentionally excluded to avoid swallowing real usage.
 const AMBIGUOUS_COMMANDS: &[&str] = &[
     "who", "w", "find", "time", "test", "yes", "look", "last", "watch", "date",
@@ -1240,7 +1240,7 @@ const NUMERIC_ARG_COMMANDS: &[&str] =
 fn looks_like_prose(line: &str, words: &[String]) -> bool {
     // The membership check is case-insensitive: on a case-insensitive
     // filesystem (macOS) `PR`/`What`/`FIND` resolve to the lowercase binary, so
-    // they're just as ambiguous. We only lowercase for the *lookup* â the argv
+    // they're just as ambiguous. We only lowercase for the *lookup* — the argv
     // handed to exec is never mutated.
     if words.len() < 3 {
         return false;
@@ -1249,15 +1249,15 @@ fn looks_like_prose(line: &str, words: &[String]) -> bool {
     if !AMBIGUOUS_COMMANDS.contains(&lead.as_str()) || line.contains(['"', '\'']) {
         return false;
     }
-    // A comma reads as a sentence, not an argv â "watch for events from atum,
-    // let me knowâ¦" must go to the model even though `watch` is real.
+    // A comma reads as a sentence, not an argv — "watch for events from atum,
+    // let me know…" must go to the model even though `watch` is real.
     if line.contains(", ") {
         return true;
     }
 
     // Classify each token (trailing sentence punctuation forgiven): is it a
     // plain alphabetic English word, a bare run of digits, or "other" (a flag
-    // `-n`, a path `a/b`, a filename `file.txt`, a version `1.2`, â¦)?
+    // `-n`, a path `a/b`, a filename `file.txt`, a version `1.2`, …)?
     let trim = |w: &str| w.trim_end_matches([',', '.', '!', '?', ';', ':']).to_string();
     let is_alpha = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphabetic());
     let is_digits = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit());
@@ -1276,14 +1276,14 @@ fn looks_like_prose(line: &str, words: &[String]) -> bool {
     // We accept that as prose ONLY when every guard holds, so real invocations
     // can't slip through:
     //   * the lead word does NOT take a numeric operand (so `kill 1234 now`,
-    //     `head 50 lines`, `tail 100 fast`, `top 1 now` stay commands â for
+    //     `head 50 lines`, `tail 100 fast`, `top 1 now` stay commands — for
     //     those the digit is a genuine argument, not a sentence number);
     //   * the LAST token is a plain alphabetic predicate ("merged"/"closed"/
-    //     "is") â a sentence ends in a word, an invocation often ends in a
+    //     "is") — a sentence ends in a word, an invocation often ends in a
     //     value/path;
     //   * exactly one token is purely numeric (two numbers reads like argv:
     //     `head 50 100`); and
-    //   * every remaining token is plain alphabetic â no flag/path/filename/
+    //   * every remaining token is plain alphabetic — no flag/path/filename/
     //     version token (those are unambiguous command syntax). This is why
     //     `pr file.txt` (a real pr invocation) is NOT prose: "file.txt" is an
     //     "other" token, and it's only two words anyway.
@@ -1298,14 +1298,14 @@ fn looks_like_prose(line: &str, words: &[String]) -> bool {
 
 /// Ambiguous commands whose argument must itself be a runnable program
 /// (`watch ls`, `time make`, `nice cargo`). These never trip `looks_like_prose`
-/// â they're typically used as two-word lines, below its `>= 3 words` bar â yet
+/// — they're typically used as two-word lines, below its `>= 3 words` bar — yet
 /// `watch orch_c1b45797b841` (an atum id the user wants the model to look up via
-/// MCP) is intent, not an invocation: `orch_â¦` isn't a command, so a real
+/// MCP) is intent, not an invocation: `orch_…` isn't a command, so a real
 /// `watch` can't run it.
 ///
 /// So for these verbs, a bare `<verb> <word>` line routes to the model when the
-/// argument doesn't resolve to a program. Deliberately narrow â exactly two
-/// words, no leading-dash flag â so genuine usage keeps dispatching directly:
+/// argument doesn't resolve to a program. Deliberately narrow — exactly two
+/// words, no leading-dash flag — so genuine usage keeps dispatching directly:
 /// `watch df`, `time ls`, `watch -n 5 free`, `time ls -l`. Surface-form
 /// heuristic; the durable fix is model-based route preview (S5/S6:
 /// TASK-132/137), which understands the line instead of matching its lead word.
@@ -1324,12 +1324,12 @@ fn looks_like_command_arg_intent(words: &[String], cwd: &Path, path_var: &str) -
         return false;
     }
     // A resolvable argument means a genuine `watch <cmd>` call; an unresolvable
-    // one (an id, a typo, an English word) reads as intent â model.
+    // one (an id, a typo, an English word) reads as intent → model.
     resolve_program(arg, cwd, path_var).is_none()
 }
 
 /// A lone confirmation token typed at the prompt (`y`, `yes`, `n`, `no`) is
-/// almost certainly a stray answer to a prompt that is no longer there â not a
+/// almost certainly a stray answer to a prompt that is no longer there — not a
 /// request to run the `yes` flood. Route it to the model rather than dispatch
 /// `yes`/`y` as a command. Case-insensitive; only a single bare word qualifies,
 /// so `yes hello` and a forced `!yes` still run directly.
@@ -1341,7 +1341,7 @@ fn is_stray_confirmation(words: &[String]) -> bool {
 /// session `export`s first (so a user override wins), then the TASK-13
 /// last-output bindings `$LAST` / `$_` (the most recent recorded output,
 /// truncated per the last-output policy), then the process environment. This
-/// lets the next line reference the previous output without re-running it â
+/// lets the next line reference the previous output without re-running it —
 /// e.g. `echo $LAST`.
 fn var_lookup(session: &Session) -> impl Fn(&str) -> Option<String> + '_ {
     move |name: &str| {
@@ -1349,7 +1349,7 @@ fn var_lookup(session: &Session) -> impl Fn(&str) -> Option<String> + '_ {
             return Some(session.last_status.to_string());
         }
         if name == "$" {
-            // `$$` â the shell's own pid (S4.6). Resolved live so it stays
+            // `$$` — the shell's own pid (S4.6). Resolved live so it stays
             // correct without a stored env entry.
             return Some(std::process::id().to_string());
         }
@@ -1402,19 +1402,19 @@ async fn dispatch(
             return Dispatch::Handled;
         }
         if force {
-            eprintln!("aish: a pipeline stage isn't an executable â can't run it directly");
+            eprintln!("aish: a pipeline stage isn't an executable — can't run it directly");
             return Dispatch::Handled;
         }
         return Dispatch::NotACommand;
     }
 
-    // Lines with shell machinery (globs, redirection, â¦) or that don't
+    // Lines with shell machinery (globs, redirection, …) or that don't
     // tokenize (apostrophes in English) go to the model. `$VAR` references are
     // expanded here against the session's exports first, then the process
-    // environment â matching what the spawned program would see.
+    // environment — matching what the spawned program would see.
     let Some(mut words) = rc::tokenize_with(line, var_lookup(session)) else {
         if force {
-            eprintln!("aish: can't run that directly â it uses shell syntax aish doesn't implement");
+            eprintln!("aish: can't run that directly — it uses shell syntax aish doesn't implement");
             return Dispatch::Handled;
         }
         return Dispatch::NotACommand;
@@ -1423,9 +1423,9 @@ async fn dispatch(
         return Dispatch::NotACommand;
     };
 
-    // English that happens to start with a command word ("who is â¦"), a bare
+    // English that happens to start with a command word ("who is …"), a bare
     // stray confirmation ("yes"), or a command-taking verb whose argument isn't
-    // a real program ("watch orch_â¦") goes to the model â unless the user forced
+    // a real program ("watch orch_…") goes to the model — unless the user forced
     // it with `!` or aliased the word.
     if !force
         && !aliases.contains_key(first)
@@ -1442,7 +1442,7 @@ async fn dispatch(
         words = expanded;
     }
 
-    // Tilde expansion for arguments â programs receive literal argv.
+    // Tilde expansion for arguments — programs receive literal argv.
     let home = std::env::var("HOME").unwrap_or_default();
     for w in words.iter_mut().skip(1) {
         if *w == "~" {
@@ -1499,8 +1499,8 @@ async fn dispatch(
             Dispatch::Handled
         }
         cmd => {
-            // Resolve against the session's PATH â which includes any
-            // `export PATH="$PATH:â¦"` from ~/.aishrc â falling back to the
+            // Resolve against the session's PATH — which includes any
+            // `export PATH="$PATH:…"` from ~/.aishrc — falling back to the
             // process PATH when the rc file sets none.
             let path_var = session
                 .env
@@ -1563,24 +1563,24 @@ fn builtin_cd(arg: Option<&str>, session: &mut Session, prev: &mut Option<PathBu
 }
 
 // ---------------------------------------------------------------------------
-// Env-mutating builtins â pwd / unset / set / umask (S4.1)
+// Env-mutating builtins — pwd / unset / set / umask (S4.1)
 // ---------------------------------------------------------------------------
 //
-// A subprocess canât change its parent, so these run in-process and mutate the
-// session state every spawn inherits (`session.env` â Command::envs, the process
-// umask â inherited by children). `pwd` reports the sessionâs own cwd â which
-// `cd` maintains â rather than shelling out.
+// A subprocess can’t change its parent, so these run in-process and mutate the
+// session state every spawn inherits (`session.env` → Command::envs, the process
+// umask → inherited by children). `pwd` reports the session’s own cwd — which
+// `cd` maintains — rather than shelling out.
 
-/// `pwd` â print the shellâs working directory (the sessionâs cwd, which `cd`
+/// `pwd` — print the shell’s working directory (the session’s cwd, which `cd`
 /// keeps current). A builtin so it always agrees with `session.cwd` and needs no
 /// `/bin/pwd`.
 fn builtin_pwd(session: &Session) {
     println!("{}", session.cwd.display());
     // pwd of an existing cwd cannot fail.
-    // (last_status left to the callerâs default success.)
+    // (last_status left to the caller’s default success.)
 }
 
-/// `unset NAME...` â drop each variable from the session env so later spawns no
+/// `unset NAME...` — drop each variable from the session env so later spawns no
 /// longer carry it. Unknown names are a no-op, as in POSIX.
 fn builtin_unset(names: &[String], session: &mut Session) {
     if names.is_empty() {
@@ -1600,15 +1600,15 @@ fn builtin_unset(names: &[String], session: &mut Session) {
 // A subprocess can't change its parent, so `source`/`.` run in-process: they
 // re-read a file through the same parser ~/.aishrc uses (`rc::parse`) and fold
 // its `export NAME=value` lines into `session.env` (last-wins, so every later
-// spawn sees the new value). `exec` is the opposite â it replaces the aish
+// spawn sees the new value). `exec` is the opposite — it replaces the aish
 // process image with the named program, mirroring a POSIX shell's `exec`.
 
-/// `source FILE` / `. FILE` â apply FILE's `export`/`alias` lines to the live
+/// `source FILE` / `. FILE` — apply FILE's `export`/`alias` lines to the live
 /// session. There is no shell underneath aish, so "sourcing" reuses
 /// `rc::parse`: `export` lines update the session env; functions/conditionals
 /// are ignored just as they are in ~/.aishrc. Aliases are parsed but cannot be
 /// installed at runtime (the alias table is built once at startup), so only the
-/// env exports take effect this session â reported, not silently dropped.
+/// env exports take effect this session — reported, not silently dropped.
 fn builtin_source(args: &[String], session: &mut Session) {
     let Some(path) = args.first() else {
         eprintln!("source: usage: source FILE");
@@ -1642,10 +1642,10 @@ fn builtin_source(args: &[String], session: &mut Session) {
     session.last_status = 0;
 }
 
-/// `set` â with no args, list the session env as sorted `NAME=value` lines (the
-/// POSIX âlist shell variablesâ shape). With `NAME=value` operands, assign each
+/// `set` — with no args, list the session env as sorted `NAME=value` lines (the
+/// POSIX “list shell variables” shape). With `NAME=value` operands, assign each
 /// into the session env (last-wins) so the new value reaches every later spawn.
-/// A bare word that isnât an assignment is reported and skipped.
+/// A bare word that isn’t an assignment is reported and skipped.
 fn builtin_set(args: &[String], session: &mut Session) {
     if args.is_empty() {
         // Collapse to last-wins, then sort by name for a stable listing.
@@ -1674,7 +1674,7 @@ fn builtin_set(args: &[String], session: &mut Session) {
     session.last_status = if ok { 0 } else { 1 };
 }
 
-/// `umask [mode]` â with no arg, print the current file-creation mask in octal;
+/// `umask [mode]` — with no arg, print the current file-creation mask in octal;
 /// with an octal `mode`, set it. The mask is process state inherited by every
 /// child, so this is reflected in spawned programs. Reading is the standard
 /// set-to-zero-then-restore dance (there is no getter in libc).
@@ -1704,13 +1704,13 @@ fn builtin_umask(arg: Option<&str>, session: &mut Session) {
     }
 }
 
-/// `exec CMD [args...]` â replace the aish process image with CMD, the way a
+/// `exec CMD [args...]` — replace the aish process image with CMD, the way a
 /// POSIX shell's `exec` does. The session's `export`s and cwd are applied first
 /// (same `.current_dir().envs(session.env)` shape every normal spawn uses), so
 /// the replacement inherits exactly what a spawned child would. With no
 /// argument `exec` is a successful no-op (bash would apply redirections and
 /// return; aish has none). On failure we print the error and set a non-zero
-/// status WITHOUT exiting â `exec` only returns when it could not run the
+/// status WITHOUT exiting — `exec` only returns when it could not run the
 /// program, and the shell must survive that.
 fn builtin_exec(args: &[String], session: &mut Session) {
     use std::os::unix::process::CommandExt;
@@ -1738,7 +1738,7 @@ fn builtin_exec(args: &[String], session: &mut Session) {
 }
 
 // ---------------------------------------------------------------------------
-// Job-control builtins â jobs / fg / bg / wait (TASK-122 / S3.5)
+// Job-control builtins — jobs / fg / bg / wait (TASK-122 / S3.5)
 // ---------------------------------------------------------------------------
 //
 // These operate on the unified job table (src/jobs.rs): `jobs` lists, `bg`/`fg`
@@ -1760,7 +1760,7 @@ fn select_job(arg: Option<&str>, session: &Session) -> Result<Arc<tools::Job>, S
     crate::jobs::resolve_job(&table, spec)
 }
 
-/// `jobs` â list every tracked job and its state. Shares its formatting with the
+/// `jobs` — list every tracked job and its state. Shares its formatting with the
 /// `:jobs` meta-command via [`crate::jobs::format_listing`].
 fn builtin_jobs(session: &mut Session) {
     let lines = {
@@ -1776,7 +1776,7 @@ fn builtin_jobs(session: &mut Session) {
     session.last_status = 0;
 }
 
-/// `bg [job]` â resume a stopped job in the background (POSIX `bg`): SIGCONT it
+/// `bg [job]` — resume a stopped job in the background (POSIX `bg`): SIGCONT it
 /// and let it keep running detached. A job that is already running or has
 /// finished is reported without re-signalling, matching bash.
 fn builtin_bg(arg: Option<&str>, session: &mut Session) {
@@ -1795,17 +1795,17 @@ fn builtin_bg(arg: Option<&str>, session: &mut Session) {
             session.last_status = 0;
         }
         Ok(job) => {
-            // Already running in the background â bash treats this as a no-op (exit 0).
+            // Already running in the background — bash treats this as a no-op (exit 0).
             eprintln!("bg: job {} already in background", job.id);
             session.last_status = 0;
         }
     }
 }
 
-/// `fg [job]` â bring a job to the foreground (POSIX `fg`): SIGCONT it if it was
+/// `fg [job]` — bring a job to the foreground (POSIX `fg`): SIGCONT it if it was
 /// stopped, then block until it finishes. The job's output already streams to
 /// the terminal and its stdin is `/dev/null`, so "foreground" here means the
-/// prompt waits on the job â there is no terminal hand-off to perform.
+/// prompt waits on the job — there is no terminal hand-off to perform.
 async fn builtin_fg(arg: Option<&str>, session: &mut Session) {
     let job = match select_job(arg, session) {
         Err(msg) => {
@@ -1828,9 +1828,9 @@ async fn builtin_fg(arg: Option<&str>, session: &mut Session) {
     session.last_status = job_exit_code(&summary);
 }
 
-/// `wait [job]` â wait for jobs to terminate (POSIX `wait`). With an operand,
+/// `wait [job]` — wait for jobs to terminate (POSIX `wait`). With an operand,
 /// waits for that job; with none, waits for every active job. A stopped job will
-/// never terminate on its own, so â like bash with job control â `wait` returns
+/// never terminate on its own, so — like bash with job control — `wait` returns
 /// immediately for one, reporting `128 + SIGTSTP`.
 async fn builtin_wait(arg: Option<&str>, session: &mut Session) {
     match arg {
@@ -1865,7 +1865,7 @@ async fn builtin_wait(arg: Option<&str>, session: &mut Session) {
 }
 
 /// Block until `job` reaches its terminal state, returning its exit summary.
-/// Polls the shared job state â the background waiter (see
+/// Polls the shared job state — the background waiter (see
 /// `tools::spawn_background`) flips it to `Done`; the job's output streams to the
 /// terminal independently, so there is nothing to forward here.
 async fn await_job(job: &Arc<tools::Job>) -> String {
@@ -1877,7 +1877,7 @@ async fn await_job(job: &Arc<tools::Job>) -> String {
     }
 }
 
-/// Map a job's terminal summary (`"exited N"`, `"killed"`, â¦; produced by
+/// Map a job's terminal summary (`"exited N"`, `"killed"`, …; produced by
 /// `tools::spawn_background`'s waiter) to a `$?` value the way a POSIX shell
 /// would: the child's exit code when it exited cleanly, else non-zero.
 fn job_exit_code(summary: &str) -> i32 {
@@ -1887,7 +1887,7 @@ fn job_exit_code(summary: &str) -> i32 {
         .unwrap_or(1)
 }
 
-/// PATH lookup with the executable bit checked â `which`, basically.
+/// PATH lookup with the executable bit checked — `which`, basically.
 pub(crate) fn resolve_program(cmd: &str, cwd: &Path, path_var: &str) -> Option<PathBuf> {
     fn is_exec(p: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
@@ -1906,7 +1906,7 @@ pub(crate) fn resolve_program(cmd: &str, cwd: &Path, path_var: &str) -> Option<P
     None
 }
 
-/// Flip raw tool output, print one-line status, and â when switching on â
+/// Flip raw tool output, print one-line status, and — when switching on —
 /// reveal the most recent turn's raw results.
 fn toggle_raw_output(session: &mut Session) {
     session.raw_tool_output = !session.raw_tool_output;
@@ -1919,7 +1919,7 @@ fn toggle_raw_output(session: &mut Session) {
 }
 
 /// True when a prompt line mentions "troubleshoot" (case-insensitive). Such a
-/// line is auto-offloaded to a background coordinator â open-ended diagnostic
+/// line is auto-offloaded to a background coordinator — open-ended diagnostic
 /// work that shouldn't block the interactive prompt.
 fn mentions_troubleshoot(line: &str) -> bool {
     line.to_ascii_lowercase().contains("troubleshoot")
@@ -1933,7 +1933,7 @@ fn mentions_troubleshoot(line: &str) -> bool {
 fn dispatch_coordinator(task: &str, session: &mut Session) -> String {
     let task = task.trim();
     if task.is_empty() {
-        return "usage: :dispatch <task>   â launch a background coordinator for <task>".to_string();
+        return "usage: :dispatch <task>   — launch a background coordinator for <task>".to_string();
     }
     if session.nested {
         return "can't dispatch from inside a coordinator (no nested coordinators)".to_string();
@@ -1943,7 +1943,7 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> String {
         _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
     };
     if no_credential {
-        return "no credential for the active backend â Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY Â· Grok: ~/.grok/auth.json or XAI_API_KEY".to_string();
+        return "no credential for the active backend — Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY".to_string();
     }
     match std::env::current_exe() {
         Ok(exe) => {
@@ -1962,7 +1962,7 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> String {
             };
             let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
             format!(
-                "\x1b[2mdispatched background coordinator {id} â runs here with the full \
+                "\x1b[2mdispatched background coordinator {id} — runs here with the full \
 toolset; result auto-delivers. :workers to check.\x1b[0m"
             )
         }
@@ -1970,33 +1970,33 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
     }
 }
 
-/// Queue an operator message for an in-flight background coordinator â the
+/// Queue an operator message for an in-flight background coordinator — the
 /// `:tell` / SendMessage channel. The message lands in the durable
 /// `coordinator_messages` mailbox keyed by the run's id and is folded into the
 /// coordinator's NEXT round (see `coordinator::drive`), so it's how you steer a
-/// running job â add a clarification, correct a wrong assumption, narrow scope â
+/// running job — add a clarification, correct a wrong assumption, narrow scope —
 /// without killing and re-launching it. `id` is matched exactly or by prefix
 /// against this session's live workers first, then every durable run, so the
-/// short ids shown by `:workers` work. A terminal (finished) run is refused â
-/// nothing would read the message â and an ambiguous prefix lists the matches.
+/// short ids shown by `:workers` work. A terminal (finished) run is refused —
+/// nothing would read the message — and an ambiguous prefix lists the matches.
 fn tell_coordinator(id: Option<&str>, message: &str, session: &mut Session) {
     let Some(id) = id else {
-        println!("usage: :tell <worker-id> <message>   â steer an in-flight coordinator");
+        println!("usage: :tell <worker-id> <message>   — steer an in-flight coordinator");
         return;
     };
     if message.is_empty() {
-        println!("usage: :tell <worker-id> <message>   â steer an in-flight coordinator");
+        println!("usage: :tell <worker-id> <message>   — steer an in-flight coordinator");
         return;
     }
     let Some(store) = session.coordinator_store.clone() else {
-        println!("coordinator store unavailable â can't queue messages");
+        println!("coordinator store unavailable — can't queue messages");
         return;
     };
     let hit = |rid: &str| rid == id || rid.starts_with(id);
 
-    // Candidates: (run_id, terminal?). This session's in-memory workers first â
+    // Candidates: (run_id, terminal?). This session's in-memory workers first —
     // their run_id is known even before the child has written its store row, so a
-    // message sent immediately after launch still lands â then durable runs from
+    // message sent immediately after launch still lands — then durable runs from
     // any session (deduped on run_id).
     let mut candidates: Vec<(String, bool)> = Vec::new();
     for w in session.worker_jobs.lock().unwrap().iter() {
@@ -2017,21 +2017,21 @@ fn tell_coordinator(id: Option<&str>, message: &str, session: &mut Session) {
         [(run_id, terminal)] => {
             let short = crate::batch::short_id(run_id);
             if *terminal {
-                println!("coordinator {short} has already finished â message not queued (`:result {short}` to view its result)");
+                println!("coordinator {short} has already finished — message not queued (`:result {short}` to view its result)");
                 return;
             }
             match store.enqueue_message(run_id, message, Some(&session.session_id)) {
                 Ok(_) => {
                     let pending = store.pending_message_count(run_id).unwrap_or(0);
                     println!(
-                        "\x1b[2mâ queued for {short} ({pending} pending) â folded in at the start of its next round\x1b[0m"
+                        "\x1b[2m✉ queued for {short} ({pending} pending) — folded in at the start of its next round\x1b[0m"
                     );
                 }
                 Err(e) => println!("couldn't queue message: {e}"),
             }
         }
         many => {
-            println!("'{id}' matches {} coordinators â be more specific:", many.len());
+            println!("'{id}' matches {} coordinators — be more specific:", many.len());
             for (rid, _) in many {
                 println!("  {rid}");
             }
@@ -2039,7 +2039,7 @@ fn tell_coordinator(id: Option<&str>, message: &str, session: &mut Session) {
     }
 }
 
-/// `:context` â show how full the model's context window is, plus the history
+/// `:context` — show how full the model's context window is, plus the history
 /// and stored-memory counts. The usage figure is the running estimate the engine
 /// maintains from each turn's reported token usage (see `crate::context`).
 fn handle_context(backend: &Backend, session: &Session) {
@@ -2048,20 +2048,20 @@ fn handle_context(backend: &Backend, session: &Session) {
     let pct = if window > 0 { used * 100 / window } else { 0 };
     let mem = session.db.as_ref().and_then(|d| d.memory_count().ok()).unwrap_or(0);
     println!(
-        "context: {used} / {window} tokens ({pct}%) Â· {} message(s) in history Â· {mem} stored memories",
+        "context: {used} / {window} tokens ({pct}%) · {} message(s) in history · {mem} stored memories",
         session.history.len()
     );
     if used == 0 {
         println!("  (usage updates after the first model turn)");
     } else if crate::context::should_compact(used, window, crate::context::COMPACT_THRESHOLD_PCT) {
         println!(
-            "  over the {}% compaction threshold â the next turn will offload older history to memory (or run :compact now)",
+            "  over the {}% compaction threshold — the next turn will offload older history to memory (or run :compact now)",
             crate::context::COMPACT_THRESHOLD_PCT
         );
     }
 }
 
-/// `:compact` â force a context compaction now: offload the oldest slice of the
+/// `:compact` — force a context compaction now: offload the oldest slice of the
 /// conversation to the SQLite memories table (recoverable via the recall tool,
 /// tagged `context-offload`) and replace it with a short in-context summary.
 fn handle_compact(backend: &Backend, session: &mut Session) {
@@ -2076,14 +2076,14 @@ fn handle_compact(backend: &Backend, session: &mut Session) {
             let window = backend.context_window();
             let pct = if window > 0 { session.context_used * 100 / window } else { 0 };
             println!(
-                "compacted â {dropped} message(s) offloaded to memory (recall \"context-offload\"); context now ~{pct}%"
+                "compacted — {dropped} message(s) offloaded to memory (recall \"context-offload\"); context now ~{pct}%"
             );
         }
-        None => println!("nothing to compact yet â the conversation is short"),
+        None => println!("nothing to compact yet — the conversation is short"),
     }
 }
 
-/// `:memories [organize]` â show the stored-memory count, or run an organization
+/// `:memories [organize]` — show the stored-memory count, or run an organization
 /// (dedup) pass that prunes duplicate memories from the SQLite store.
 fn handle_memories(sub: Option<&str>, session: &Session) {
     let Some(db) = &session.db else {
@@ -2093,14 +2093,14 @@ fn handle_memories(sub: Option<&str>, session: &Session) {
     match sub {
         Some("organize" | "organise" | "gc" | "dedup") => match db.organize_memories() {
             Ok(n) => println!(
-                "organized â {n} duplicate memory(ies) pruned ({} remain)",
+                "organized — {n} duplicate memory(ies) pruned ({} remain)",
                 db.memory_count().unwrap_or(0)
             ),
             Err(e) => println!("organize failed: {e:#}"),
         },
         _ => {
             let n = db.memory_count().unwrap_or(0);
-            println!("{n} stored memories Â· :memories organize to dedup/consolidate");
+            println!("{n} stored memories · :memories organize to dedup/consolidate");
         }
     }
 }
@@ -2117,7 +2117,7 @@ async fn handle_colon(
         Some("q" | "quit" | "exit") => return true,
         Some("help") => {
             println!(
-                "type a command (first word in PATH) to run it directly â anything else goes to the model\n\
+                "type a command (first word in PATH) to run it directly — anything else goes to the model\n\
                  prefix ! to force direct execution, ? to force the model\n\
                  type : (then a letter, or TAB) to pop up the :command palette\n\
                  :mode <paranoid|careful|normal|yolo> confirmation level (paranoid asks for everything,\n\
@@ -2143,7 +2143,7 @@ async fn handle_colon(
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
                  :workers [all]                      list this session's background coordinators (all = every session)\n\
-                 :output [on|off]             stream background coordinators' activity (ð­ thinking + ð§ tool + Â·standard/Â·batch lines); off (default) keeps them quiet\n\
+                 :output [on|off]             stream background coordinators' activity (💭 thinking + 🔧 tool + ·standard/·batch lines); off (default) keeps them quiet\n\
                  \n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
@@ -2197,14 +2197,14 @@ async fn handle_colon(
                 }
                 Some(false) => {
                     session.show_worker_output.store(false, Ordering::SeqCst);
-                    println!("worker output OFF â background coordinators run quietly (only the â³N pulse + completion notice show)");
+                    println!("worker output OFF — background coordinators run quietly (only the ⟳N pulse + completion notice show)");
                 }
                 None => println!("usage: :output [on|off]"),
             }
         }
         Some("workers") => {
-            // `:workers` lists THIS session's coordinators by default â the ones
-            // launched from this terminal â so a busy multi-terminal host never
+            // `:workers` lists THIS session's coordinators by default — the ones
+            // launched from this terminal — so a busy multi-terminal host never
             // shows another terminal's background workers here. `:workers all`
             // widens to every session's durable runs (the old behavior).
             let show_all = matches!(parts.next(), Some("all"));
@@ -2212,7 +2212,7 @@ async fn handle_colon(
             let one_line = |t: &str| {
                 let s = t.split_whitespace().collect::<Vec<_>>().join(" ");
                 let s = if s.chars().count() > 70 {
-                    format!("{}â¦", s.chars().take(70).collect::<String>())
+                    format!("{}…", s.chars().take(70).collect::<String>())
                 } else {
                     s
                 };
@@ -2241,7 +2241,7 @@ async fn handle_colon(
                     w.result_cell()
                 ));
             }
-            // Durable runs from the shared store â every session's, so workers
+            // Durable runs from the shared store — every session's, so workers
             // started elsewhere (or in a prior process) show up too. Skip ids
             // already listed in-memory to avoid double-counting this session's.
             if let Some(store) = &session.coordinator_store {
@@ -2260,21 +2260,21 @@ async fn handle_colon(
                             .or_else(|| {
                                 r.session_id.as_deref().map(|s| crate::batch::short_id(s).to_string())
                             })
-                            .unwrap_or_else(|| "â".into());
+                            .unwrap_or_else(|| "—".into());
                         let session_cell = if is_me { format!("{label} *") } else { label };
                         let result_cell = match (r.result.as_deref(), r.error.as_deref()) {
                             (Some(res), None) => {
                                 if let Some(pr) = res.split_whitespace().find(|s| s.starts_with('#')) {
-                                    format!("â {pr}")
+                                    format!("✓ {pr}")
                                 } else {
-                                    "â success".to_string()
+                                    "✓ success".to_string()
                                 }
                             }
                             (None, Some(e)) => {
-                                let t = if e.len() > 40 { format!("{}â¦", &e[..40]) } else { e.to_string() };
-                                format!("â {t}")
+                                let t = if e.len() > 40 { format!("{}…", &e[..40]) } else { e.to_string() };
+                                format!("✗ {t}")
                             }
-                            _ => "â".to_string(),
+                            _ => "—".to_string(),
                         };
                         table.push_str(&format!(
                             "| {} | {} | {} | {} | {} |\n",
@@ -2293,14 +2293,14 @@ async fn handle_colon(
                     println!("\x1b[2m* = launched from this session\x1b[0m");
                 } else {
                     println!(
-                        "\x1b[2mthis session's coordinators â :workers all for every session\x1b[0m"
+                        "\x1b[2mthis session's coordinators — :workers all for every session\x1b[0m"
                     );
                 }
             } else if show_all {
                 println!("no background workers");
             } else {
                 println!(
-                    "no background workers in this session â :workers all to see every session"
+                    "no background workers in this session — :workers all to see every session"
                 );
             }
         }
@@ -2362,7 +2362,7 @@ async fn handle_colon(
             }
         }
         Some("dispatch") => {
-            // Launch a background coordinator directly, without a model turn â
+            // Launch a background coordinator directly, without a model turn —
             // the deterministic equivalent of the model calling run_in_background.
             // Shares dispatch_coordinator with the "troubleshoot" auto-offload.
             let task = parts.collect::<Vec<_>>().join(" ");
@@ -2395,7 +2395,7 @@ async fn handle_colon(
             match rest {
                 "" => match &session.goal {
                     Some(g) => println!("{}", g.status_line()),
-                    None => println!("no goal set â `:goal <condition>` to set one (requires :batch on)"),
+                    None => println!("no goal set — `:goal <condition>` to set one (requires :batch on)"),
                 },
                 "clear" | "stop" | "off" | "reset" | "none" | "cancel" => match session.goal.take() {
                     Some(g) => {
@@ -2406,9 +2406,9 @@ async fn handle_colon(
                 },
                 cond => {
                     if !session.batch_mode {
-                        println!("`:goal` runs as background batch work â enable it first with `:batch on`");
+                        println!("`:goal` runs as background batch work — enable it first with `:batch on`");
                     } else if session.goal.as_ref().is_some_and(|g| g.is_active()) {
-                        println!("a goal is already active (one per session) â `:goal clear` it first");
+                        println!("a goal is already active (one per session) — `:goal clear` it first");
                     } else {
                         match (
                             crate::backend::claude::Credential::resolve(&session.env),
@@ -2434,7 +2434,7 @@ async fn handle_colon(
                                 };
                                 // KNOWN LIMITATION: the verifier still judges on
                                 // Claude (batch_model + the Claude credential
-                                // resolved above) â xAI has no judge here, so a
+                                // resolved above) — xAI has no judge here, so a
                                 // Grok `:goal` runs its GENERATOR on Grok but
                                 // requires a Claude credential to judge each turn.
                                 let g = crate::goal::spawn(
@@ -2444,10 +2444,10 @@ async fn handle_colon(
                                     cred,
                                 );
                                 session.goal = Some(g);
-                                println!("\x1b[2mgoal set â pursuing it in the background; progress and the result appear here. `:goal` for status, `:goal clear` to stop.\x1b[0m");
+                                println!("\x1b[2mgoal set — pursuing it in the background; progress and the result appear here. `:goal` for status, `:goal clear` to stop.\x1b[0m");
                             }
                             (Err(_), _) => {
-                                println!("no Claude credential â set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY")
+                                println!("no Claude credential — set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY")
                             }
                             (_, Err(e)) => {
                                 println!("can't locate the aish binary to run goal workers: {e}")
@@ -2466,7 +2466,7 @@ async fn handle_colon(
                     other => other,
                 };
                 backend.set_model(id.to_string());
-                println!("model â {}", backend.describe());
+                println!("model → {}", backend.describe());
             }
             None => println!("{}", backend.describe()),
         },
@@ -2481,7 +2481,7 @@ async fn handle_colon(
                         Ok(b) => {
                             *backend = b;
                             session.backend_kind = backend.kind().to_string();
-                            println!("backend â {}", backend.describe());
+                            println!("backend → {}", backend.describe());
                         }
                         Err(e) => println!("can't switch: {e:#}"),
                     }
@@ -2498,7 +2498,7 @@ async fn handle_colon(
                         Ok(b) => {
                             *backend = b;
                             session.backend_kind = backend.kind().to_string();
-                            println!("backend â {}", backend.describe());
+                            println!("backend → {}", backend.describe());
                         }
                         Err(e) => println!("can't switch: {e:#}"),
                     }
@@ -2512,7 +2512,7 @@ async fn handle_colon(
                     *backend = Backend::new_local();
                     session.backend_kind = backend.kind().to_string();
                     println!(
-                        "backend â {} (loads on first use; MCP tools off â they don't fit a small context window)",
+                        "backend → {} (loads on first use; MCP tools off — they don't fit a small context window)",
                         backend.describe()
                     );
                 }
@@ -2524,7 +2524,7 @@ async fn handle_colon(
         Some("mode") => match parts.next().and_then(crate::session::Mode::parse) {
             Some(m) => {
                 session.mode = m;
-                println!("mode â {}", describe_mode(m));
+                println!("mode → {}", describe_mode(m));
             }
             None => println!(
                 "mode: {}\nusage: :mode <paranoid|careful|normal|yolo>",
@@ -2532,13 +2532,13 @@ async fn handle_colon(
             ),
         },
         Some("yolo") => {
-            // legacy toggle: yolo â normal
+            // legacy toggle: yolo ⇄ normal
             session.mode = if session.mode == crate::session::Mode::Yolo {
                 crate::session::Mode::Normal
             } else {
                 crate::session::Mode::Yolo
             };
-            println!("mode â {}", describe_mode(session.mode));
+            println!("mode → {}", describe_mode(session.mode));
         }
         Some("new") => {
             session.history.clear();
@@ -2551,7 +2551,7 @@ async fn handle_colon(
         Some("context") => handle_context(backend, session),
         Some("compact") => handle_compact(backend, session),
         Some("memories" | "memory") => handle_memories(parts.next(), session),
-        Some(other) => println!("unknown command :{other} â try :help"),
+        Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
     }
     false
@@ -2564,8 +2564,8 @@ async fn handle_colon(
 /// Anthropic batches + re-exec'd workers (`run_in_background` / `:dispatch`),
 /// plus durable coordinator runs the in-memory tallies miss (goal-loop turns,
 /// runs launched from another session, runs reattached after a restart). This
-/// is the exact tally the prompt's â³N badge shows; `:update` reuses it to gate
-/// the version-skew warning (ISS-2045). Batches are counted too â they're
+/// is the exact tally the prompt's ⟳N badge shows; `:update` reuses it to gate
+/// the version-skew warning (ISS-2045). Batches are counted too — they're
 /// durable + reattach, so they aren't a *data-loss* risk, but their local
 /// polling task still runs in this (about-to-be-stale) parent.
 fn background_running_count(session: &Session) -> usize {
@@ -2612,13 +2612,13 @@ async fn handle_update(
     session: &Session,
 ) {
     if !crate::update::gh_available() {
-        println!("update needs the GitHub CLI (`gh`) on PATH â see https://cli.github.com");
+        println!("update needs the GitHub CLI (`gh`) on PATH — see https://cli.github.com");
         return;
     }
     let info = match pending_update.take() {
         Some(info) => info,
         None => {
-            println!("\x1b[2mchecking for updatesâ¦\x1b[0m");
+            println!("\x1b[2mchecking for updates…\x1b[0m");
             match crate::update::check().await {
                 Ok(Some(info)) => info,
                 Ok(None) => {
@@ -2638,9 +2638,9 @@ async fn handle_update(
         crate::update::current_version()
     );
     // Count background work still on the current binary BEFORE the swap. When any
-    // is in flight, an atomic `perform` would leave a mixed-version fleet â the
+    // is in flight, an atomic `perform` would leave a mixed-version fleet — the
     // parent + already-spawned children on the old inode, anything spawned after
-    // on the new one â so we surface the skew and require an explicit confirm
+    // on the new one — so we surface the skew and require an explicit confirm
     // (ISS-2045). With nothing running, the prompt is the unchanged single
     // confirm. Yolo mode proceeds without asking either way.
     let running = background_running_count(session);
@@ -2650,7 +2650,7 @@ async fn handle_update(
             tools::Decision::AllowOnce | tools::Decision::AlwaysAllow | tools::Decision::AllowDir
         );
     if !go {
-        println!("update cancelled â run :update when you're ready.");
+        println!("update cancelled — run :update when you're ready.");
         *pending_update = Some(info); // keep it so the next :update needn't re-check
         return;
     }
@@ -2664,7 +2664,7 @@ async fn handle_update(
     if running > 0 {
         let plural = if running == 1 { "" } else { "s" };
         println!(
-            "\x1b[33mnote:\x1b[0m {running} background job{plural} still on the old binary â the new version applies to work started after the next restart."
+            "\x1b[33mnote:\x1b[0m {running} background job{plural} still on the old binary — the new version applies to work started after the next restart."
         );
     }
 }
@@ -2681,7 +2681,7 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
             }
             for s in servers {
                 println!(
-                    "  {} [{}] {} â {} tool{}, {} skill{}",
+                    "  {} [{}] {} — {} tool{}, {} skill{}",
                     s.name,
                     s.kind,
                     s.detail,
@@ -2732,11 +2732,11 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
         }
         Some((&"add", rest)) => {
             let Some((&name, tail)) = rest.split_first() else {
-                println!("usage: :mcp add <name> <command|url> [argsâ¦]");
+                println!("usage: :mcp add <name> <command|url> [args…]");
                 return;
             };
             let Some((&first, extra)) = tail.split_first() else {
-                println!("usage: :mcp add <name> <command|url> [argsâ¦]");
+                println!("usage: :mcp add <name> <command|url> [args…]");
                 return;
             };
             let spec = if first.starts_with("http://") || first.starts_with("https://") {
@@ -2758,7 +2758,7 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
                 Ok((false, _)) => println!("no connected server {name}"),
                 Ok((true, true)) => println!("disconnected and unsaved {name}"),
                 Ok((true, false)) => {
-                    println!("disconnected {name} (defined in project .mcp.json â it returns on restart)")
+                    println!("disconnected {name} (defined in project .mcp.json — it returns on restart)")
                 }
                 Err(e) => println!("mcp remove {name}: {e:#}"),
             }
@@ -2786,7 +2786,7 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
             }
         }
         Some((other, _)) => {
-            println!("unknown :mcp subcommand '{other}' â usage: :mcp [list|reconnect|add|remove|tools]")
+            println!("unknown :mcp subcommand '{other}' — usage: :mcp [list|reconnect|add|remove|tools]")
         }
     }
 }
@@ -2802,7 +2802,7 @@ fn handle_allow(sub: Option<&str>, arg: Option<&str>, session: &Session) {
         None => {
             match db.allowed_tools() {
                 Ok(tools) if tools.is_empty() => {
-                    println!("no always-allowed tools â press 'a' at a confirmation prompt to add one")
+                    println!("no always-allowed tools — press 'a' at a confirmation prompt to add one")
                 }
                 Ok(tools) => {
                     println!("always-allowed tools:");
@@ -2812,7 +2812,7 @@ fn handle_allow(sub: Option<&str>, arg: Option<&str>, session: &Session) {
                 }
                 Err(e) => println!("allow: {e:#}"),
             }
-            // Directory-scoped grants (the 'd' answer) â listed alongside the
+            // Directory-scoped grants (the 'd' answer) — listed alongside the
             // tool allow-list so every standing permission is visible in one place.
             if let Ok(dirs) = db.allowed_dirs() {
                 if !dirs.is_empty() {
@@ -2846,7 +2846,7 @@ fn handle_allow(sub: Option<&str>, arg: Option<&str>, session: &Session) {
             None => println!("usage: :allow remove <tool> | <perm>:<dir>"),
         },
         Some(other) => println!(
-            "unknown :allow subcommand '{other}' â usage: :allow [remove <tool> | <perm>:<dir>]"
+            "unknown :allow subcommand '{other}' — usage: :allow [remove <tool> | <perm>:<dir>]"
         ),
     }
 }
@@ -2865,7 +2865,7 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
             session.batch_mode = true;
             persist(session);
             println!(
-                "batch mode on â the agent can offload deferrable work to background batches on {} (takes effect next turn)",
+                "batch mode on — the agent can offload deferrable work to background batches on {} (takes effect next turn)",
                 session.batch_model
             );
         }
@@ -2883,7 +2883,7 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
                     other => other,
                 };
                 session.batch_model = id.to_string();
-                println!("batch model â {}", session.batch_model);
+                println!("batch model → {}", session.batch_model);
             }
             None => println!("batch model: {}\nusage: :batch model <opus|sonnet|haiku|full-id>", session.batch_model),
         },
@@ -2895,7 +2895,7 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
                     Err(e) => println!("batch clear: {e:#}"),
                 }
             } else {
-                println!("cleared (session-only â no persistent store)");
+                println!("cleared (session-only — no persistent store)");
             }
             session
                 .batch_jobs
@@ -2905,7 +2905,7 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
         }
         None | Some("status") => {
             println!(
-                "batch mode: {} Â· model: {}",
+                "batch mode: {} · model: {}",
                 if session.batch_mode { "on" } else { "off" },
                 session.batch_model
             );
@@ -2919,7 +2919,7 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
             }
         }
         Some(other) => {
-            println!("unknown :batch subcommand '{other}' â usage: :batch [on|off|status|clear|model <id>]")
+            println!("unknown :batch subcommand '{other}' — usage: :batch [on|off|status|clear|model <id>]")
         }
     }
 }
@@ -2927,10 +2927,10 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
 fn describe_mode(m: crate::session::Mode) -> String {
     use crate::session::Mode;
     match m {
-        Mode::Paranoid => "paranoid â confirm every tool call".into(),
-        Mode::Careful => "careful â confirm anything not provably read-only".into(),
-        Mode::Normal => "normal â confirm write/create/delete".into(),
-        Mode::Yolo => "\x1b[31myolo â nothing is confirmed\x1b[0m".into(),
+        Mode::Paranoid => "paranoid — confirm every tool call".into(),
+        Mode::Careful => "careful — confirm anything not provably read-only".into(),
+        Mode::Normal => "normal — confirm write/create/delete".into(),
+        Mode::Yolo => "\x1b[31myolo — nothing is confirmed\x1b[0m".into(),
     }
 }
 
@@ -2951,7 +2951,7 @@ mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
 
-    // S4.2 â `source` folds a file's exports into the session env.
+    // S4.2 — `source` folds a file's exports into the session env.
     #[test]
     fn source_applies_exports_to_session_env() {
         let mut session = Session::new().unwrap();
@@ -2984,7 +2984,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // S4.2 â `exec` of a nonexistent program reports and sets a non-zero status
+    // S4.2 — `exec` of a nonexistent program reports and sets a non-zero status
     // WITHOUT replacing the process (the failure path; a successful exec can't
     // be unit-tested since it never returns).
     #[test]
@@ -3019,7 +3019,7 @@ mod tests {
         let (_, pairs) = complete_path("ls ", 3, &dir);
         assert!(pairs.iter().all(|p| !p.replacement.starts_with('.')));
 
-        // whitespace in a name â double-quoted replacement
+        // whitespace in a name → double-quoted replacement
         let (_, pairs) = complete_path("cat wi", 6, &dir);
         assert_eq!(pairs[0].replacement, "\"with space.txt\"");
 
@@ -3077,7 +3077,7 @@ mod tests {
         assert!(pairs.iter().any(|p| p.replacement == "gs"), "alias gs missing");
 
         // non-executable files are not offered. (rustyline's Pair has no Debug;
-        // report the replacement strings â `{pairs:?}` broke main's test build.)
+        // report the replacement strings — `{pairs:?}` broke main's test build.)
         let (_, pairs) = helper.complete_command("READ", 4, 0);
         let names: Vec<&str> = pairs.iter().map(|p| p.replacement.as_str()).collect();
         assert!(names.is_empty(), "non-exec README offered: {names:?}");
@@ -3102,7 +3102,7 @@ mod tests {
         assert!(pairs.iter().any(|p| p.replacement == "sub.txt"));
         assert!(!pairs.iter().any(|p| p.replacement == "cargo"));
 
-        // a slash in word one means it's a path (e.g. ./script) â filename
+        // a slash in word one means it's a path (e.g. ./script) → filename
         // completion (the dir part is kept verbatim in the replacement).
         let (_, pairs) = helper.complete_command("./su", 4, 0);
         assert!(pairs.iter().any(|p| p.display == "sub.txt"));
@@ -3122,7 +3122,7 @@ mod tests {
         let first = helper.cached_path_commands();
         assert!(first.contains(&"foo".to_string()));
 
-        // A binary added after the first scan must NOT appear within the TTL â
+        // A binary added after the first scan must NOT appear within the TTL —
         // proving the scan is served from cache (AC2: no re-scan on every TAB).
         make_exec(&dir.join("bar"));
         let second = helper.cached_path_commands();
@@ -3162,7 +3162,7 @@ mod tests {
     #[test]
     fn unknown_command_degrades_to_path() {
         // AC2: unknown commands must not error and must fall back to path
-        // completion (here: no matching paths â empty, but never a panic).
+        // completion (here: no matching paths → empty, but never a panic).
         let dir = std::env::temp_dir().join(format!("aish_unknown_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -3189,7 +3189,7 @@ mod tests {
     #[test]
     fn prose_detection() {
         let prose = |l: &str| looks_like_prose(l, &rc::tokenize(l).unwrap());
-        // English questions that start with a command word â model
+        // English questions that start with a command word → model
         assert!(prose("who is zachary hohertz"));
         assert!(prose("find me big files"));
         assert!(prose("make this file executable"));
@@ -3214,24 +3214,24 @@ mod tests {
         assert!(!prose("find . -name foo"));
         assert!(!prose("tail logfile"));
         assert!(!prose("clear")); // bare clear-screen stays direct (only 1 word)
-        assert!(!prose("open file.txt")); // dot in the path â command
-        assert!(!prose("sort -n data")); // flag â command (sort not ambiguous either)
-        assert!(!prose("touch newfile.txt")); // dot in the path â command
+        assert!(!prose("open file.txt")); // dot in the path → command
+        assert!(!prose("sort -n data")); // flag → command (sort not ambiguous either)
+        assert!(!prose("touch newfile.txt")); // dot in the path → command
         assert!(!prose("cut -f1 file.txt")); // real cut: flag + filename stays a command
         assert!(!prose("cut -c 1-5 data")); // real cut: flag + range stays a command
         // ISS-1480 negatives must keep routing direct
-        assert!(!prose("kill 1234 now")); // digits â command
-        assert!(!prose("head 50")); // 2 words â not prose
-        assert!(!prose("pr file.txt")); // dot in the path â command
+        assert!(!prose("kill 1234 now")); // digits → command
+        assert!(!prose("head 50")); // 2 words → not prose
+        assert!(!prose("pr file.txt")); // dot in the path → command
         assert!(!prose("echo hello there world")); // echo isn't ambiguous
         assert!(!prose("cat \"my file\" backup")); // quotes signal shell intent
 
         // sentence punctuation is prose evidence, not command evidence
         assert!(prose("watch for events from atum, let me know about activity in this sprint"));
         assert!(prose("find big files, oldest first"));
-        // `?` is a glob metachar: tokenize already rejects it â model
+        // `?` is a glob metachar: tokenize already rejects it → model
         assert!(rc::tokenize("who is on this machine right now?").is_none());
-        // â¦but flags/paths still win even with a trailing comma elsewhere
+        // …but flags/paths still win even with a trailing comma elsewhere
         assert!(!prose("watch -n 5 free"));
         assert!(!prose("tail logs/app.log"));
 
@@ -3243,7 +3243,7 @@ mod tests {
         assert!(prose("PR 22 merged")); // case-insensitive lead word
         assert!(prose("PR is merged")); // no digit at all
         assert!(prose("pr 22 was merged"));
-        // â¦without breaking real invocations. `pr` with a filename, and the
+        // …without breaking real invocations. `pr` with a filename, and the
         // numeric-operand commands, stay direct even though a number is present.
         assert!(!prose("pr file.txt")); // genuine pr usage takes a filename
         assert!(!prose("kill 1234")); // PID operand
@@ -3270,7 +3270,7 @@ mod tests {
         let path = dir.to_string_lossy().to_string();
         let intent = |s: &str| looks_like_command_arg_intent(&tok(s), &cwd, &path);
 
-        // The reported bug: `watch <atum-id>` (and peers) â model â the argument
+        // The reported bug: `watch <atum-id>` (and peers) → model — the argument
         // isn't a runnable command, so it can't be a real invocation.
         assert!(intent("watch orch_c1b45797b841"));
         assert!(intent("time some_made_up_target"));
@@ -3278,9 +3278,9 @@ mod tests {
         // Genuine command-taking invocations stay direct.
         assert!(!intent("watch tool")); // `tool` resolves on our PATH
         assert!(!intent("watch -n")); // a flag is real invocation syntax
-        // Not a command-taking verb â not intercepted here (handled, or not, elsewhere).
+        // Not a command-taking verb → not intercepted here (handled, or not, elsewhere).
         assert!(!intent("git status"));
-        assert!(!intent("make build")); // make targets aren't programs â deliberately excluded
+        assert!(!intent("make build")); // make targets aren't programs — deliberately excluded
         // Only the exact two-word shape qualifies.
         assert!(!intent("watch")); // 1 word
         assert!(!intent("watch tool extra")); // 3 words
@@ -3316,7 +3316,7 @@ mod tests {
 
         // TASK-122 job-control builtins route directly (they're in BUILTINS), so
         // they never leak to the model. `wait` is also an everyday English word
-        // (in AMBIGUOUS_COMMANDS), so it previews dim â still dispatched direct.
+        // (in AMBIGUOUS_COMMANDS), so it previews dim — still dispatched direct.
         assert_eq!(pv("jobs"), Preview::Direct);
         assert_eq!(pv("fg"), Preview::Direct);
         assert_eq!(pv("fg %1"), Preview::Direct);
@@ -3353,7 +3353,7 @@ mod tests {
         assert_eq!(paint(":help"), ":help");
         assert_eq!(paint(""), "");
 
-        // The AC â the line recolors live as routing flips (binary resolves vs
+        // The AC — the line recolors live as routing flips (binary resolves vs
         // prose): the same lead word paints green once it resolves to a real
         // binary and cyan when it does not.
         assert_ne!(paint("tool"), paint("toolnope"));
@@ -3403,7 +3403,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&empty);
     }
 
-    // TASK-122 â `$?` mapping from a job's terminal summary (POSIX fg/wait).
+    // TASK-122 — `$?` mapping from a job's terminal summary (POSIX fg/wait).
     #[test]
     fn job_exit_code_maps_summary_to_status() {
         assert_eq!(job_exit_code("exited 0"), 0);
@@ -3432,7 +3432,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // S4.1 â env-mutating builtins change session state spawned children inherit.
+    // S4.1 — env-mutating builtins change session state spawned children inherit.
     #[test]
     fn set_and_unset_mutate_session_env() {
         let mut session = Session::new().unwrap();
@@ -3443,7 +3443,7 @@ mod tests {
         assert_eq!(get(&session, "BAZ"), Some("qux".into()));
         assert_eq!(session.last_status, 0);
 
-        // Re-assigning replaces in place â no duplicate entries pile up.
+        // Re-assigning replaces in place — no duplicate entries pile up.
         builtin_set(&["FOO=baz".into()], &mut session);
         assert_eq!(get(&session, "FOO"), Some("baz".into()));
         assert_eq!(session.env.iter().filter(|(k, _)| k == "FOO").count(), 1);
@@ -3463,7 +3463,7 @@ mod tests {
         assert_eq!(session.last_status, 2);
     }
 
-    // S4.1 â umask sets the process mask (inherited by children); read-back works.
+    // S4.1 — umask sets the process mask (inherited by children); read-back works.
     #[test]
     fn umask_sets_and_reads_back() {
         let mut session = Session::new().unwrap();
@@ -3487,7 +3487,7 @@ mod tests {
         // SAFETY: restore the saved mask.
         unsafe { libc::umask(saved) };
     }
-    // S4.3 â cd keeps $PWD/$OLDPWD in step so spawned children see the real cwd.
+    // S4.3 — cd keeps $PWD/$OLDPWD in step so spawned children see the real cwd.
     #[test]
     fn cd_updates_pwd_and_oldpwd() {
         let mut session = Session::new().unwrap();
@@ -3512,7 +3512,7 @@ mod tests {
         assert_eq!(var(&session, "PWD"), Some(a.to_string_lossy().into_owned()));
         assert_eq!(var(&session, "OLDPWD"), Some(b.to_string_lossy().into_owned()));
 
-        // set_var keeps exactly one entry per key â no stale duplicates accrue.
+        // set_var keeps exactly one entry per key — no stale duplicates accrue.
         assert_eq!(session.env.iter().filter(|(k, _)| k == "PWD").count(), 1);
         assert_eq!(session.env.iter().filter(|(k, _)| k == "OLDPWD").count(), 1);
 
@@ -3542,7 +3542,7 @@ mod tests {
 
     #[test]
     fn colon_command_matches_filters_by_prefix() {
-        // Empty prefix â the whole catalog (the bare-`:` popup).
+        // Empty prefix → the whole catalog (the bare-`:` popup).
         assert_eq!(colon_command_matches("").len(), COLON_COMMANDS.len());
         // A discriminating prefix narrows to its family.
         assert_eq!(colon_command_matches("o"), vec!["output"]);
@@ -3551,7 +3551,7 @@ mod tests {
         assert_eq!(colon_command_matches("y"), vec!["yolo"]);
         // `result` is now a unique prefix (the `:results` alias was removed in #117).
         assert_eq!(colon_command_matches("result"), vec!["result"]);
-        // No match â empty (and definitely no panic).
+        // No match → empty (and definitely no panic).
         assert!(colon_command_matches("zzz").is_empty());
     }
 
@@ -3672,7 +3672,7 @@ mod tests {
     #[test]
     fn history_suggestion_requires_cursor_at_end() {
         let h = history_with(&["git status"]);
-        // Cursor mid-line (pos < len) suppresses the suggestion â fish only
+        // Cursor mid-line (pos < len) suppresses the suggestion — fish only
         // autosuggests at end-of-buffer.
         assert_eq!(history_suggestion("git", 1, &h), None);
         // At end-of-line it resolves.
@@ -3699,19 +3699,19 @@ mod tests {
         let ctx = Context::new(&h);
 
         // A `:`-prefix yields the display-only palette: a multi-line menu with no
-        // completion (â/Ctrl-F must not insert it).
+        // completion (→/Ctrl-F must not insert it).
         let palette = helper.hint(":m", 2, &ctx).expect("palette hint");
         assert!(palette.display().contains(":mode"));
         assert!(palette.completion().is_none(), "palette must not be acceptable");
 
         // A history-extending line yields gray ghost text whose completion is the
-        // plain trailing remainder (what â/Ctrl-F insert).
+        // plain trailing remainder (what →/Ctrl-F insert).
         let ghost = helper.hint("git", 3, &ctx).expect("ghost hint");
         assert_eq!(ghost.completion(), Some(" status"));
         assert!(ghost.display().contains(" status"));
         assert!(ghost.display().starts_with(GHOST_COLOR), "ghost text is gray");
 
-        // No palette, no history match â no hint at all.
+        // No palette, no history match — no hint at all.
         assert!(helper.hint("nomatch-xyz", 11, &ctx).is_none());
     }
 
@@ -3728,7 +3728,7 @@ mod tests {
     // ---- ISS-2045: :update running-job skew gate ------------------------
     #[test]
     fn combined_running_count_sums_the_three_tallies() {
-        // Pure sum over (batches, workers, coordinators) â the count the skew
+        // Pure sum over (batches, workers, coordinators) — the count the skew
         // gate thresholds on.
         assert_eq!(combined_running_count(0, 0, 0), 0);
         assert_eq!(combined_running_count(1, 0, 0), 1); // batch alone counts
@@ -3739,12 +3739,12 @@ mod tests {
 
     #[test]
     fn update_confirm_prompt_warns_only_when_jobs_running() {
-        // Count 0 â plain confirm, behavior unchanged (AC3).
+        // Count 0 → plain confirm, behavior unchanged (AC3).
         let calm = update_confirm_prompt(0, "0.5.0");
         assert_eq!(calm, "download and install aish 0.5.0?");
         assert!(!calm.contains("skew"));
 
-        // Count > 0 â explicit skew warning that NAMES the count and the
+        // Count > 0 → explicit skew warning that NAMES the count and the
         // consequence (AC2/AC4), and still carries the version.
         let warn = update_confirm_prompt(3, "0.5.0");
         assert!(warn.contains('3'), "warning must name the count: {warn}");
@@ -3759,8 +3759,8 @@ mod tests {
         assert!(update_confirm_prompt(2, "1.0.0").contains("jobs "));
     }
 
-    // Snapshot of the three pure routing heuristics â `!`/`?` force routing,
-    // looks_like_prose, and the tokenizer gate â so a tweak to any of them
+    // Snapshot of the three pure routing heuristics — `!`/`?` force routing,
+    // looks_like_prose, and the tokenizer gate — so a tweak to any of them
     // surfaces as a golden diff instead of silently reshaping UX. The
     // executable-resolution step in `dispatch` is intentionally excluded to
     // keep the snapshot hermetic (no PATH/filesystem dependence); "direct"
@@ -3793,7 +3793,7 @@ mod tests {
         // value diff, not a reshuffle.
         let groups: &[(&str, &[&str])] = &[
             (
-                "looks_like_prose â English starting with a real command word routes to the model, real invocations stay direct",
+                "looks_like_prose — English starting with a real command word routes to the model, real invocations stay direct",
                 &[
                     "who is zachary hohertz",
                     "find me big files",
@@ -3812,7 +3812,7 @@ mod tests {
                 ],
             ),
             (
-                "bare-yes guard â a lone confirmation token (y/yes/n/no) routes to the model; multi-word invocations stay direct",
+                "bare-yes guard — a lone confirmation token (y/yes/n/no) routes to the model; multi-word invocations stay direct",
                 &[
                     "yes",
                     "yes please",
@@ -3822,7 +3822,7 @@ mod tests {
                 ],
             ),
             (
-                "!/? force routing â explicit escape hatches override every other heuristic",
+                "!/? force routing — explicit escape hatches override every other heuristic",
                 &[
                     "!who is zachary hohertz",
                     "!ls -la",
@@ -3832,7 +3832,7 @@ mod tests {
                 ],
             ),
             (
-                "tokenizer gate â shell syntax and prose punctuation the tokenizer rejects route to the model",
+                "tokenizer gate — shell syntax and prose punctuation the tokenizer rejects route to the model",
                 &[
                     "who is on this machine right now?",
                     "echo *.rs",
@@ -3843,7 +3843,7 @@ mod tests {
 
         let mut snap = String::new();
         snap.push_str("# routing decision snapshot (TASK-110)\n");
-        snap.push_str("# direct = run on the terminal Â· model = hand the line to the model\n");
+        snap.push_str("# direct = run on the terminal · model = hand the line to the model\n");
         snap.push_str("# regenerate after an intended heuristic change: UPDATE_GOLDEN=1 cargo test routing_decision_snapshot\n");
         for (heading, cases) in groups {
             snap.push('\n');
@@ -3860,7 +3860,7 @@ mod tests {
         }
 
         let golden = std::fs::read_to_string(golden_path)
-            .expect("missing tests/golden/routing_decisions.snap â run UPDATE_GOLDEN=1 cargo test to create it");
+            .expect("missing tests/golden/routing_decisions.snap — run UPDATE_GOLDEN=1 cargo test to create it");
         if golden != snap {
             let mut diff = String::new();
             for (i, (g, a)) in golden.lines().zip(snap.lines()).enumerate() {
@@ -3873,14 +3873,14 @@ mod tests {
                 diff.push_str(&format!("  line count differs: golden={gn} actual={an}\n"));
             }
             panic!(
-                "routing decision snapshot drift â a routing heuristic changed.\n\
+                "routing decision snapshot drift — a routing heuristic changed.\n\
                  Review the diff below; if the change is intended, regenerate the \n\
                  golden file with `UPDATE_GOLDEN=1 cargo test routing_decision_snapshot`.\n\n{diff}"
             );
         }
     }
 
-    // ---- TASK-109: oracle harness â direct-dispatch path ------------------
+    // ---- TASK-109: oracle harness — direct-dispatch path ------------------
     //
     // Sibling to pipeline.rs's pipeline-path oracle. A line with no `|` takes
     // the *direct-dispatch* path: `dispatch` resolves one program via
@@ -3888,8 +3888,8 @@ mod tests {
     // ground truth aish's single-command path must reproduce on stdout bytes
     // and exit status.
     //
-    // `run_on_tty` inherits the terminal's stdout, so â exactly as the pipeline
-    // oracle appends a `dd` sink rather than read the terminal â the stdout
+    // `run_on_tty` inherits the terminal's stdout, so — exactly as the pipeline
+    // oracle appends a `dd` sink rather than read the terminal — the stdout
     // cases mirror `run_on_tty`'s spawn configuration (same cwd, same session
     // env, kill_on_drop) but pipe stdout into a capture buffer. The exit-status
     // cases call the genuine `run_on_tty`, so the production path is exercised
@@ -3963,7 +3963,7 @@ mod tests {
         let corpus = [
             "echo hello world",
             "seq 1 20",
-            "seq 5 1",        // descending with the default step â empty output
+            "seq 5 1",        // descending with the default step → empty output
             "seq 1 2 9",      // strided: 1 3 5 7 9
             "printf %s+%s 3 4",
             "expr 6 + 7",
@@ -3995,9 +3995,9 @@ mod tests {
             "false",
             "test -d /",
             "test -f /no/such/path/aish-oracle",
-            "grep -q anything /dev/null", // empty file â no match â exit 1
-            "expr 1 = 1",                 // result 1 (true) â exit 0
-            "expr 1 = 2",                 // result 0 (false) â exit 1
+            "grep -q anything /dev/null", // empty file → no match → exit 1
+            "expr 1 = 1",                 // result 1 (true) → exit 0
+            "expr 1 = 2",                 // result 0 (false) → exit 1
         ];
         for cmd in corpus {
             let got = aish_direct_code(cmd, &session).await;
@@ -4016,7 +4016,7 @@ mod tests {
         let bash = bash_stdout("echo different", &session.cwd);
         assert_ne!(
             aish, bash,
-            "direct oracle failed to detect an intentional divergence â the harness is blind"
+            "direct oracle failed to detect an intentional divergence — the harness is blind"
         );
     }
 }
