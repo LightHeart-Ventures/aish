@@ -18,6 +18,7 @@ mod present;
 mod rc;
 mod repl;
 mod rewrite;
+mod scope;
 mod script;
 mod session;
 mod skills;
@@ -204,6 +205,13 @@ async fn main() -> Result<()> {
     session.set_var("SHELL", shell_path);
     // SAFETY: getppid() always succeeds and is reentrant.
     session.set_var("PPID", (unsafe { libc::getppid() }).to_string());
+    // Session identity (session-scoped jobs — docs/session-scoped-jobs.md):
+    // export the stable per-session id so every spawned child can tag the work
+    // it does back to THIS shell. A background coordinator re-adopts the
+    // launching session's id below (from AISH_LAUNCH_SESSION_ID) and re-exports
+    // it, so the coordinator and the jobs it spawns all attribute to the human's
+    // original session, not the coordinator's throwaway uuid.
+    session.set_var("AISH_SESSION_ID", session.session_id.clone());
     let backend = match args.backend.as_str() {
         "claude" => {
             let cred = backend::claude::Credential::resolve(&session.env)?;
@@ -328,6 +336,10 @@ async fn main() -> Result<()> {
             if let Ok(sid) = std::env::var("AISH_LAUNCH_SESSION_ID") {
                 if !sid.is_empty() {
                     session.session_id = sid;
+                    // Re-export so any children THIS coordinator spawns inherit
+                    // the launching session's id too (the env still carries the
+                    // child's throwaway uuid from the startup export above).
+                    session.set_var("AISH_SESSION_ID", session.session_id.clone());
                 }
             }
             if let Ok(name) = std::env::var("AISH_LAUNCH_SESSION_NAME") {
