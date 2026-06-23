@@ -252,6 +252,9 @@ pub async fn run(
             println!();
             needs_gap = false;
         }
+        // If the coordinator we're attached to has finished (or vanished), detach
+        // automatically and say so above the prompt.
+        auto_detach_finished(&mut session);
         // Tab completion resolves against the session's cwd, which `cd` mutates.
         editor.set_cwd(&session.cwd);
         // We're about to idle at the prompt — let the presenter flush results.
@@ -271,7 +274,13 @@ pub async fn run(
             Some(n) => format!("\x1b[1;35m[{n}]\x1b[0m | "), // bold magenta, set apart from the cyan path
             None => String::new(),
         };
-        let prompt = format!("{name}{badge}\x1b[36m{}\x1b[0m ❯ ", short_cwd(&session));
+        // `:attach`ed coordinator indicator — bold yellow `⇄<id>` makes it obvious
+        // that what you type is steered to that coordinator, not run here.
+        let attach = match &*session.attached.lock().unwrap() {
+            Some(run_id) => format!("\x1b[1;33m⇄{} \x1b[0m", crate::batch::short_id(run_id)),
+            None => String::new(),
+        };
+        let prompt = format!("{name}{attach}{badge}\x1b[36m{}\x1b[0m ❯ ", short_cwd(&session));
         // Consume an accepted-rewrite line before falling back to the editor.
         let outcome = match injected.take() {
             Some(l) => ReadOutcome::Line(l),
@@ -383,6 +392,15 @@ pub async fn run(
                     if handle_colon(cmd, &mut backend, &mut session, &mut pending_update).await {
                         break;
                     }
+                    continue;
+                }
+
+                // Attached to a coordinator: a plain line is operator input steered
+                // to it (the `:tell` channel), not a local command or a model turn.
+                // `:`-commands above still run — `:detach` ends it.
+                let attached_run = session.attached.lock().unwrap().clone();
+                if let Some(run_id) = attached_run {
+                    send_to_attached(&run_id, &line, &mut session);
                     continue;
                 }
 
@@ -574,10 +592,12 @@ struct CmdCache {
 /// arms of `handle_colon` and the `:help` text.
 const COLON_COMMANDS: &[(&str, &str)] = &[
     ("allow", "list / revoke always-allowed tools & dir grants"),
+    ("attach", "watch + steer a running coordinator (input goes to it)"),
     ("backend", "switch backend (claude|grok|local)"),
     ("batch", "background batch mode (on|off|status)"),
     ("compact", "compact history, offload to memory"),
     ("context", "show context-window usage"),
+    ("detach", "stop watching the attached coordinator"),
     ("dispatch", "launch a background coordinator"),
     ("goal", "pursue a goal in the background"),
     ("help", "show command help"),
@@ -1959,6 +1979,7 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> String {
                 launch_session_id: session.session_id.clone(),
                 launch_session_name: session.name.clone(),
                 show_output: session.show_worker_output.clone(),
+                attached: session.attached.clone(),
             };
             let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
             format!(
@@ -1967,6 +1988,103 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
             )
         }
         Err(e) => format!("can't locate the aish binary to launch the coordinator: {e}"),
+    }
+}
+
+/// `:attach <id>` — attach the interactive session to a LIVE coordinator this
+/// session launched, so its activity streams live (per-worker, independent of the
+/// session-wide `:worker-output` toggle) and what you type is steered to it via
+/// the `:tell` mailbox. Only this session's in-memory, non-terminal workers
+/// qualify. An ambiguous prefix lists the matches; a finished or unknown id is
+/// reported. `:detach` (or the worker finishing) ends it.
+fn attach_worker(id: Option<&str>, session: &mut Session) {
+    let Some(id) = id else {
+        println!("usage: :attach <worker-id>   — watch + steer a running coordinator (:detach to stop)");
+        return;
+    };
+    let hit = |wid: &str| wid == id || wid.starts_with(id);
+    let mut live: Vec<String> = Vec::new();
+    let mut saw_terminal = false;
+    for w in session.worker_jobs.lock().unwrap().iter() {
+        if hit(&w.id) {
+            if matches!(w.status().as_str(), "done" | "failed") {
+                saw_terminal = true;
+            } else {
+                live.push(w.id.clone());
+            }
+        }
+    }
+    match live.as_slice() {
+        [] => {
+            if saw_terminal {
+                println!("coordinator '{id}' has already finished — `:result {id}` to view its result");
+            } else {
+                println!("no live coordinator in this session matching '{id}' (see :workers)");
+            }
+        }
+        [run_id] => {
+            *session.attached.lock().unwrap() = Some(run_id.clone());
+            let short = crate::batch::short_id(run_id);
+            println!(
+                "\x1b[1;33m⇄ attached to {short}\x1b[0m — streaming its activity live; what you type is steered to it. \x1b[2m:detach to stop.\x1b[0m"
+            );
+        }
+        many => {
+            println!("'{id}' matches {} live coordinators — be more specific:", many.len());
+            for rid in many {
+                println!("  {rid}");
+            }
+        }
+    }
+}
+
+/// `:detach` — stop watching the attached coordinator. It keeps running in the
+/// background; its result still auto-delivers and shows in `:workers`.
+fn detach_worker(session: &mut Session) {
+    match session.attached.lock().unwrap().take() {
+        Some(run_id) => {
+            let short = crate::batch::short_id(&run_id);
+            println!(
+                "\x1b[2m⇄ detached from {short} — it keeps running; :workers to check, :result {short} when done\x1b[0m"
+            );
+        }
+        None => println!("not attached to any coordinator"),
+    }
+}
+
+/// Steer the attached coordinator: queue a typed operator line into its durable
+/// mailbox (the same `:tell` channel) so it's folded into the coordinator's next
+/// round. Called for every plain line typed while attached. Delegates to
+/// `tell_coordinator` so the candidate-resolution and enqueue logic stays in one
+/// place.
+fn send_to_attached(run_id: &str, message: &str, session: &mut Session) {
+    let message = message.trim();
+    if message.is_empty() {
+        return;
+    }
+    tell_coordinator(Some(run_id), message, session);
+}
+
+/// Auto-detach when the attached coordinator is no longer a live worker in this
+/// session (it finished, failed, or is gone). Printed above the prompt so the
+/// operator isn't left typing into a dead mailbox. A no-op when not attached.
+fn auto_detach_finished(session: &mut Session) {
+    let attached = session.attached.lock().unwrap().clone();
+    let Some(run_id) = attached else {
+        return;
+    };
+    let still_live = session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|w| w.id == run_id && !matches!(w.status().as_str(), "done" | "failed"));
+    if !still_live {
+        *session.attached.lock().unwrap() = None;
+        let short = crate::batch::short_id(&run_id);
+        println!(
+            "\x1b[2m⇄ {short} finished — detached. :result {short} to view its result.\x1b[0m"
+        );
     }
 }
 
@@ -2148,6 +2266,8 @@ async fn handle_colon(
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
                  :tell <id> <message>                send instructions to an in-flight coordinator (folded in next round)\n\
+                 :attach <id>                        watch a running coordinator live + steer it (typed lines go to it)\n\
+                 :detach                             stop watching the attached coordinator (it keeps running)\n\
                  :rename <name>                      name the session (prefixes the prompt); auto-set to the repo name at startup, bare :rename clears\n\
                  :rewrite <intent>                   AI-rewrite intent into ONE command, prefilled to edit/accept before it runs (alias :rw)\n\
                  :suggest [hint]                     AI-suggest the next command from session context, prefilled to edit/accept before it runs (alias :sg)\n\
@@ -2373,6 +2493,8 @@ async fn handle_colon(
             let task = parts.collect::<Vec<_>>().join(" ");
             println!("{}", dispatch_coordinator(&task, session));
         }
+        Some("attach") => attach_worker(parts.next(), session),
+        Some("detach") => detach_worker(session),
         Some("tell" | "msg" | "send") => {
             // Steer an in-flight coordinator: queue an operator message that the
             // running coordinator folds into its next round (see coordinator::drive).
@@ -2436,6 +2558,7 @@ async fn handle_colon(
                                     launch_session_id: session.session_id.clone(),
                                     launch_session_name: session.name.clone(),
                                     show_output: session.show_worker_output.clone(),
+                                    attached: session.attached.clone(),
                                 };
                                 // KNOWN LIMITATION: the verifier still judges on
                                 // Claude (batch_model + the Claude credential
@@ -3718,6 +3841,12 @@ mod tests {
 
         // No palette, no history match — no hint at all.
         assert!(helper.hint("nomatch-xyz", 11, &ctx).is_none());
+    }
+
+    #[test]
+    fn attach_detach_in_catalog() {
+        assert_eq!(colon_command_matches("at"), vec!["attach"]);
+        assert_eq!(colon_command_matches("det"), vec!["detach"]);
     }
 
     #[test]
