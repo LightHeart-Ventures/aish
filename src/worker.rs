@@ -246,6 +246,47 @@ fn forward_decision(line: &str, show_output: bool) -> Option<(&'static str, Stri
     None
 }
 
+// ---------------------------------------------------------------------------
+// Contained `:output` pane — frame streamed coordinator activity (w_sn1fHhd5)
+// ---------------------------------------------------------------------------
+//
+// `:output on` streams a background coordinator's live activity to the user's
+// terminal. Without containment those lines blend into the user's own shell
+// scroll, indistinguishable from interactive command output. A line-streaming
+// REPL can't carve a fixed split-screen region for them without a full TUI
+// takeover, and several coordinators interleave their lines concurrently — so
+// the coherent "pane" is a box-drawing LEFT BORDER carried by every forwarded
+// row: a bordered side-column that visually groups the coordinator stream and
+// sets it apart from interactive output, with a top/bottom frame bracketing the
+// region when the pane is opened (`:output on`) and closed (`:output off`).
+// Every row self-identifies with its `[label·suffix]` gutter and lines up under
+// the one shared border, so interleaving stays readable.
+
+/// The cyan box-drawing left border every pane row carries — the pane's "wall".
+const PANE_BORDER: &str = "\x1b[36m┃\x1b[0m";
+
+/// Render one forwarded coordinator line as a row of the contained `:output`
+/// pane: `┃ [label·suffix] text`. The border + `[label·suffix]` gutter are
+/// chrome (cyan border, dim label); `text` is emitted verbatim so it keeps
+/// whatever inline colour the coordinator produced — the green `✓`/red `✗` on a
+/// tool RESULT line, the `⚙️`/`🔧` source glyph, the turn/batch narration. The
+/// shared left border on every row is what CONTAINS the stream as a bordered
+/// column distinct from the user's interleaved shell output. Pure — unit-tested.
+pub fn pane_row(label: &str, suffix: &str, text: &str) -> String {
+    format!("{PANE_BORDER} \x1b[2m[{label}{suffix}]\x1b[0m {text}")
+}
+
+/// The pane's TOP frame, printed once when `:output` is switched on so the rows
+/// that follow read as a bracketed region rather than loose lines. Pure.
+pub fn pane_open() -> String {
+    "\x1b[36m┏━ coordinator output \x1b[0m\x1b[2m(:output on — live activity)\x1b[0m\x1b[36m ━━━━━━\x1b[0m".to_string()
+}
+
+/// The pane's BOTTOM frame, printed once when `:output` is switched off. Pure.
+pub fn pane_close() -> String {
+    "\x1b[36m┗━ coordinator output \x1b[0m\x1b[2m(:output off)\x1b[0m\x1b[36m ━━━━━━━━━━━━━━━\x1b[0m".to_string()
+}
+
 /// Stream a child's stderr line by line, forwarding the interesting lines to the
 /// user's terminal live via `announce`, and retaining only the last
 /// `STDERR_TAIL_LINES` raw lines as a bounded ring for the failure message.
@@ -300,7 +341,12 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
             label,
         );
         if let Some((suffix, text)) = forward_decision(&line, on) {
-            crate::tools::announce(&format!("[{label}{suffix}]"), &text);
+            // Frame each forwarded line as a row of the contained `:output`
+            // pane (a box-drawing left border + label gutter), so coordinator
+            // activity reads as a bordered column rather than blending into
+            // the user's shell scroll. `announce_raw` prints the pre-framed row
+            // (which carries its own colour) over the prompt.
+            crate::tools::announce_raw(&pane_row(label, suffix, &text));
         }
         if tail.len() == STDERR_TAIL_LINES {
             tail.pop_front();
@@ -1825,6 +1871,37 @@ mod tests {
             forward_decision(mcp, true),
             Some(("", "🔧 ✓ 🔧 mcp__atum__atum_get_project_task".to_string()))
         );
+    }
+
+    #[test]
+    fn pane_row_frames_with_border_label_and_preserved_text() {
+        // A pane row carries the cyan box-drawing left border, the dim
+        // [label·suffix] gutter, then the text VERBATIM (so any inline colour
+        // the coordinator emitted survives). This is what visually contains
+        // the `:output` stream as a bordered side-column (w_sn1fHhd5).
+        let row = pane_row("w_a7k3m2pQ", "·thinking", "planning the migration");
+        assert!(row.starts_with(PANE_BORDER), "row must open with the pane border: {row}");
+        assert!(row.contains("┃"), "border glyph present: {row}");
+        assert!(row.contains("[w_a7k3m2pQ·thinking]"), "gutter carries label+suffix: {row}");
+        assert!(row.ends_with("planning the migration"), "text preserved at the end: {row}");
+
+        // An empty suffix (a tool-activity line) yields just [label]; the
+        // text's own colour codes are passed through untouched.
+        let colored = pane_row("w_a7k3m2pQ", "", "\x1b[32m✓\x1b[0m 🔧 read /etc/hosts");
+        assert!(colored.contains("[w_a7k3m2pQ]"), "empty suffix → bare label: {colored}");
+        assert!(colored.contains("\x1b[32m✓\x1b[0m 🔧 read /etc/hosts"), "inline colour preserved: {colored}");
+    }
+
+    #[test]
+    fn pane_frames_bracket_the_region() {
+        // The open/close frames bracket the pane when `:output` is toggled.
+        // Both carry the cyan border-drawing characters and name the pane.
+        let open = pane_open();
+        let close = pane_close();
+        assert!(open.contains("┏"), "open frame has a top-left corner: {open}");
+        assert!(open.contains("coordinator output"), "open frame names the pane: {open}");
+        assert!(close.contains("┗"), "close frame has a bottom-left corner: {close}");
+        assert!(close.contains("coordinator output"), "close frame names the pane: {close}");
     }
 
     #[test]
