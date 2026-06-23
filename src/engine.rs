@@ -122,6 +122,7 @@ pub async fn run_turn(
         // backend produces the next message (which may consume prior tool
         // results). It is stopped before any tool-execution animation begins,
         // so the two never run at once.
+        emit_thinking(session);
         let spinner = Spinner::start();
         let turn = backend.complete(&effective_system, &session.history, active_tools).await;
         drop(spinner);
@@ -451,6 +452,19 @@ fn emit_narration(session: &Session, text: &str) {
         }
     } else {
         eprintln!("{rendered}");
+    }
+}
+
+/// Signal the start of the model-reasoning ("thinking") phase. An interactive
+/// session shows the live `Spinner` (TTY-only) instead, so this fires only in a
+/// background coordinator (`session.nested`), where it emits a `💭` sentinel the
+/// parent's worker stream recognizes and surfaces as `[label·thinking]` when
+/// `:worker-output` is on. It lets the user see the agent is reasoning between
+/// tool calls, not just its `🔧` tool activity. One line per round; the
+/// interactive path is untouched (the `Spinner` still owns stderr there).
+fn emit_thinking(session: &Session) {
+    if session.nested {
+        eprintln!("💭 thinking…");
     }
 }
 

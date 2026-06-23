@@ -168,6 +168,7 @@ fn strip_sentinel(raw: &str, mark: &str) -> Option<String> {
 /// via the prompt's `⟳N` pulse and its completion notice (both independent of
 /// this stream); they just don't get the firehose of every tool call. Flipping
 /// `:worker-output on` opens the full live stream:
+/// - `💭` thinking notice (entered the model-reasoning phase) → `[label·thinking] …`
 /// - `🔧` tool activity (the `✓/✗ 🔧` RESULT line, once per call) → `[label] …`
 /// - `🗨` turn text (a standard model call) → `[label·standard] …`
 /// - `📦` batch fan-out notice → `[label·batch] …`
@@ -179,6 +180,9 @@ fn forward_decision(line: &str, show_output: bool) -> Option<(&'static str, Stri
     }
     if let Some(activity) = clean_activity_line(line) {
         return Some(("", activity));
+    }
+    if let Some(text) = strip_sentinel(line, "💭") {
+        return Some(("·thinking", text));
     }
     if let Some(text) = strip_sentinel(line, "🗨") {
         return Some(("·standard", text));
@@ -1541,6 +1545,25 @@ mod tests {
         // Noise (banner/blank) is dropped even when output is ON.
         assert_eq!(forward_decision(banner, true), None);
         assert_eq!(forward_decision("", true), None);
+    }
+
+    #[test]
+    fn forward_decision_surfaces_thinking_when_output_on() {
+        // A coordinator emits a 💭 sentinel when it enters its model-reasoning
+        // phase. Like every other coordinator line it is gated behind
+        // :worker-output: suppressed by default, and surfaced as a
+        // [label·thinking] line when the toggle is on.
+        let thinking = "💭 thinking…";
+        // OFF (default): suppressed with everything else.
+        assert_eq!(forward_decision(thinking, false), None);
+        // ON: forwarded with the ·thinking label suffix.
+        assert_eq!(
+            forward_decision(thinking, true),
+            Some(("·thinking", "thinking…".to_string()))
+        );
+        // The 💭 sentinel is a turn-ish narration, not a 🔧 tool line, so it must
+        // NOT be classified as a tool-activity line.
+        assert_eq!(clean_activity_line(thinking), None);
     }
 
     #[test]
