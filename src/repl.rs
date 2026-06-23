@@ -2143,7 +2143,7 @@ async fn handle_colon(
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
                  :workers [all]                      list this session's background coordinators (all = every session)\n\
-                 :output [on|off]             stream background coordinators' activity (🔧 tool + ·standard/·batch lines); off (default) keeps them quiet\n\
+                 :output [on|off]             stream background coordinators' activity (💭 thinking + 🔧 tool + ·standard/·batch lines); off (default) keeps them quiet\n\
                  \n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
@@ -2193,7 +2193,7 @@ async fn handle_colon(
             match target {
                 Some(true) => {
                     session.show_worker_output.store(true, Ordering::SeqCst);
-                    println!("worker output ON — background coordinators now stream their 🔧 tool activity and ·standard/·batch turn output");
+                    println!("worker output ON — background coordinators now stream their 💭 thinking, 🔧 tool activity and ·standard/·batch turn output");
                 }
                 Some(false) => {
                     session.show_worker_output.store(false, Ordering::SeqCst);
