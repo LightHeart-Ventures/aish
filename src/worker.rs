@@ -156,6 +156,56 @@ fn strip_sentinel(raw: &str, mark: &str) -> Option<String> {
     (!rest.is_empty()).then(|| rest.to_string())
 }
 
+/// Source glyph for a tool, chosen by its NAME prefix — the local-vs-MCP
+/// distinction surfaced in the `:output on` activity stream: a ⚙️ gear for a
+/// LOCAL-execution tool (the ones aish runs in-process — `run_program`,
+/// `run_interactive`, `read_file`, `write_file`, `list_dir`, `change_dir`,
+/// `remember`, …) and a 🔧 wrench for an MCP TOOL CALL (a server tool whose
+/// catalog name is prefixed `mcp__<server>__<tool>`, or the bare `mcp_`/`atum_`
+/// shorthands). Pure + unit-tested — the single source of truth for the source
+/// distinction, so it can be reused by any caller that has a tool name in hand.
+///
+/// Examples: `source_emoji("run_program")` → ⚙️, `source_emoji("mcp__atum__atum_list_project_board")` → 🔧.
+fn source_emoji(tool_name: &str) -> &'static str {
+    let name = tool_name.trim();
+    if name.starts_with("mcp__") || name.starts_with("mcp_") || name.starts_with("atum_") {
+        "🔧" // MCP tool call
+    } else {
+        "⚙️" // local execution (gear + VS16 emoji-presentation selector)
+    }
+}
+
+/// Best-effort extraction of the identifying tool token from a forwarded
+/// activity line (`<status> 🔧 <token> …`): the first whitespace-delimited
+/// word after the 🔧 wrench. For an MCP tool the coordinator emits the raw
+/// catalog name as the desc (e.g. `mcp__atum__…`), so the token classifies
+/// correctly; for a local tool the desc is a human verb (`read`, `write`, a
+/// program name) that has no MCP prefix → the gear. A miss returns `""`, which
+/// `source_emoji` maps to the local gear (the safe, common-case default).
+fn activity_tool_token(line: &str) -> &str {
+    // No wrench → no token (the caller skips decoration in that case anyway).
+    match line.split_once('🔧') {
+        Some((_, after)) => after.split_whitespace().next().unwrap_or(""),
+        None => "",
+    }
+}
+
+/// Decorate a forwarded coordinator activity line with a source glyph that
+/// distinguishes a local-execution tool (⚙️) from an MCP tool call (🔧),
+/// classified from the tool descriptor via [`activity_tool_token`] +
+/// [`source_emoji`]. The original line is preserved VERBATIM and the glyph is
+/// purely PREPENDED — backward-compatible visual sugar that carries no data.
+/// Only the `:output on` forwarding path calls this (see `forward_decision`), so
+/// the emoji appears solely when worker output is being streamed; a line that
+/// already carries its own source marker (the ⚙️ `escalate` gear, no wrench) is
+/// left untouched so it isn't double-marked.
+fn decorate_activity_source(line: &str) -> String {
+    if !line.contains('🔧') {
+        return line.to_string();
+    }
+    format!("{} {}", source_emoji(activity_tool_token(line)), line)
+}
+
 /// Decide what (if anything) to forward to the user's terminal for ONE raw
 /// coordinator-stderr line, given whether `:worker-output` is on. Returns
 /// `(label_suffix, text)` to announce as `[label<suffix>] text`, or `None` to
@@ -179,7 +229,10 @@ fn forward_decision(line: &str, show_output: bool) -> Option<(&'static str, Stri
         return None;
     }
     if let Some(activity) = clean_activity_line(line) {
-        return Some(("", activity));
+        // Prepend a source glyph (⚙️ local execution / 🔧 MCP tool call) before the
+        // tool descriptor. Reached ONLY when show_output is true (:output on), so
+        // the emoji is applied solely while worker activity is being streamed.
+        return Some(("", decorate_activity_source(&activity)));
     }
     if let Some(text) = strip_sentinel(line, "💭") {
         return Some(("·thinking", text));
@@ -1532,7 +1585,8 @@ mod tests {
         assert_eq!(forward_decision(tool_start, true), None); // duplicate START — dropped
         assert_eq!(
             forward_decision(tool_result, true),
-            Some(("", "✓ 🔧 git status".to_string()))
+            // A local tool (git) gets the ⚙️ gear prepended.
+            Some(("", "⚙️ ✓ 🔧 git status".to_string()))
         );
         assert_eq!(
             forward_decision(turn, true),
@@ -1582,8 +1636,98 @@ mod tests {
             .collect();
         assert_eq!(
             forwarded,
-            vec!["✓ 🔧 mcp__atum__atum_get_project_task".to_string()],
+            // MCP tool → 🔧 wrench prepended; still exactly one forwarded line.
+            vec!["🔧 ✓ 🔧 mcp__atum__atum_get_project_task".to_string()],
             "each tool call must forward exactly once (the RESULT line)"
+        );
+    }
+
+    #[test]
+    fn source_emoji_picks_gear_for_local_wrench_for_mcp() {
+        // MCP tool calls — names prefixed `mcp__<server>__<tool>`, or the bare
+        // `mcp_`/`atum_` shorthands — get the 🔧 wrench.
+        assert_eq!(source_emoji("mcp__atum__atum_list_project_board"), "🔧");
+        assert_eq!(source_emoji("mcp_atum_list_tools"), "🔧");
+        assert_eq!(source_emoji("atum_get_project_task"), "🔧");
+        // Local-execution tools (run in-process) get the ⚙️ gear.
+        assert_eq!(source_emoji("run_program"), "⚙️");
+        assert_eq!(source_emoji("run_interactive"), "⚙️");
+        assert_eq!(source_emoji("read_file"), "⚙️");
+        assert_eq!(source_emoji("write_file"), "⚙️");
+        assert_eq!(source_emoji("list_dir"), "⚙️");
+        assert_eq!(source_emoji("change_dir"), "⚙️");
+        assert_eq!(source_emoji("remember"), "⚙️");
+        // Unknown / empty token falls back to the local gear (safe default).
+        assert_eq!(source_emoji("escalate"), "⚙️");
+        assert_eq!(source_emoji(""), "⚙️");
+        // Surrounding whitespace is ignored (the token may arrive untrimmed).
+        assert_eq!(source_emoji("  atum_foo "), "🔧");
+    }
+
+    #[test]
+    fn activity_tool_token_extracts_word_after_wrench() {
+        // The desc follows the 🔧 wrench; the first token after it identifies
+        // the tool source.
+        assert_eq!(activity_tool_token("✓ 🔧 read /etc/hosts"), "read");
+        assert_eq!(
+            activity_tool_token("✓ 🔧 mcp__atum__atum_list_project_board"),
+            "mcp__atum__atum_list_project_board"
+        );
+        // Inner colour codes around the status glyph don't disturb extraction.
+        assert_eq!(
+            activity_tool_token("\x1b[32m✓\x1b[0m 🔧 write x"),
+            "write"
+        );
+        // No wrench → empty token (decoration is skipped by the caller).
+        assert_eq!(activity_tool_token("no wrench here"), "");
+    }
+
+    #[test]
+    fn decorate_activity_source_prepends_gear_or_wrench() {
+        // A local tool result line gets the ⚙️ gear prepended; the original
+        // line is preserved verbatim after it (purely additive visual sugar).
+        assert_eq!(
+            decorate_activity_source("✓ 🔧 read /etc/hosts"),
+            "⚙️ ✓ 🔧 read /etc/hosts"
+        );
+        // An MCP tool result line gets the 🔧 wrench prepended.
+        assert_eq!(
+            decorate_activity_source("✓ 🔧 mcp__atum__atum_get_project_task"),
+            "🔧 ✓ 🔧 mcp__atum__atum_get_project_task"
+        );
+        // A failure line is decorated the same way (status glyph preserved).
+        assert_eq!(
+            decorate_activity_source("✗ 🔧 write x"),
+            "⚙️ ✗ 🔧 write x"
+        );
+        // A line with no wrench (e.g. an escalate ⚙️ line) is left untouched
+        // so it isn't double-marked.
+        assert_eq!(
+            decorate_activity_source("✓ ⚙️ escalate → stronger model: x"),
+            "✓ ⚙️ escalate → stronger model: x"
+        );
+    }
+
+    #[test]
+    fn forward_decision_prepends_source_glyph_only_when_output_on() {
+        // The decoration is reached ONLY through forward_decision's activity
+        // branch, which short-circuits to None when output is OFF — so the emoji
+        // is applied solely while :output on is streaming. This holds for both
+        // the async background worker and the synchronous goal-loop stream, since
+        // both route every line through forward_decision.
+        let local = "\x1b[2m  ✓ 🔧 read /etc/hosts\x1b[0m";
+        let mcp = "\x1b[2m  ✓ 🔧 mcp__atum__atum_get_project_task\x1b[0m";
+        // OFF: nothing forwarded, so nothing is decorated.
+        assert_eq!(forward_decision(local, false), None);
+        assert_eq!(forward_decision(mcp, false), None);
+        // ON: local → gear, MCP → wrench, each prepended to the preserved line.
+        assert_eq!(
+            forward_decision(local, true),
+            Some(("", "⚙️ ✓ 🔧 read /etc/hosts".to_string()))
+        );
+        assert_eq!(
+            forward_decision(mcp, true),
+            Some(("", "🔧 ✓ 🔧 mcp__atum__atum_get_project_task".to_string()))
         );
     }
 
