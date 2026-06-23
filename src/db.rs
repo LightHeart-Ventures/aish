@@ -658,11 +658,13 @@ impl CoordinatorStore {
     /// task before keying, so callers compare like with like. Best-effort
     /// semantics live at the call site; this is just the count.
     ///
-    /// NOTE (durability): `clear_finished` purges terminal rows on a clean
-    /// restart, so this counter is effectively per-session-lifetime — it stops
-    /// in-session re-dispatch storms (a goal loop re-launching the same task),
-    /// not a cross-restart history. That's the same boundary the rest of the
-    /// store's terminal bookkeeping lives within.
+    /// NOTE (durability): `clear_finished` now purges only `done` rows; `failed`
+    /// rows are RETAINED (bounded by `coordinator::reap_failed_runs`'s
+    /// keep-recent + max-age window — #129 item 5). So this counter persists
+    /// ACROSS restarts within that retention window, not just per-session: a task
+    /// that keeps failing stays known-bad until its failed rows age/count out.
+    /// Salvage rows carry a synthetic task string, so they never trip a real
+    /// task's breaker.
     pub fn failed_attempts(&self, task: &str) -> Result<i64> {
         Ok(self.conn.lock().unwrap().query_row(
             "SELECT count(*) FROM coordinator_runs WHERE task = ?1 AND phase = 'failed'",
@@ -730,19 +732,48 @@ impl CoordinatorStore {
         )?)
     }
 
-    /// Drop terminal (done/failed) runs. Returns how many runs were removed.
-    /// Also purges any orphaned mailbox messages — those whose target run no
-    /// longer exists (delivered runs, reaped orphans) — so the mailbox can't
-    /// grow without bound.
+    /// Drop terminal `done` runs (a delivered/surfaced result needs no further
+    /// retention). `failed` runs are intentionally RETAINED so a reaped orphan
+    /// or errored run stays inspectable in `background_status` / `:workers`
+    /// instead of vanishing — their bounded retention (keep-recent + max-age) is
+    /// handled separately by `delete_runs` via `coordinator::reap_failed_runs`,
+    /// so the table still can't grow without bound. Also purges any orphaned
+    /// mailbox messages — those whose target run no longer exists — so the
+    /// mailbox can't grow without bound. Returns how many `done` runs were
+    /// removed. (coordinator-lifecycle bug #129 item 5: stop destroying the
+    /// forensic trail of failed runs.)
     pub fn clear_finished(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
-        let n = conn.execute("DELETE FROM coordinator_runs WHERE phase IN ('done', 'failed')", [])?;
+        let n = conn.execute("DELETE FROM coordinator_runs WHERE phase = 'done'", [])?;
         let _ = conn.execute(
             "DELETE FROM coordinator_messages \
              WHERE run_id NOT IN (SELECT run_id FROM coordinator_runs)",
             [],
         );
         Ok(n)
+    }
+
+    /// Delete the given runs by id (and purge any now-orphaned mailbox
+    /// messages). Backs the bounded `failed`-row retention sweep
+    /// (`coordinator::reap_failed_runs`): `clear_finished` keeps `failed` rows
+    /// for forensics, so a separate age/count-bounded reaper trims them here.
+    /// Returns how many run rows were deleted. No-op (returns 0) for an empty
+    /// slice. (coordinator-lifecycle bug #129 item 5.)
+    pub fn delete_runs(&self, run_ids: &[String]) -> Result<usize> {
+        if run_ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut deleted = 0usize;
+        for id in run_ids {
+            deleted += conn.execute("DELETE FROM coordinator_runs WHERE run_id = ?1", [id])?;
+        }
+        let _ = conn.execute(
+            "DELETE FROM coordinator_messages \
+             WHERE run_id NOT IN (SELECT run_id FROM coordinator_runs)",
+            [],
+        );
+        Ok(deleted)
     }
 }
 
@@ -893,7 +924,16 @@ mod tests {
         assert_eq!(one.phase, "failed");
         assert_eq!(one.error.as_deref(), Some("exceeded round cap"));
 
-        assert_eq!(reopened.clear_finished().unwrap(), 2); // both terminal now
+        // clear_finished now purges only `done` runs; `failed` rows are RETAINED
+        // for forensics (#129 item 5) and trimmed separately by delete_runs /
+        // coordinator::reap_failed_runs.
+        assert_eq!(reopened.clear_finished().unwrap(), 1); // only run_2 (done)
+        let after = reopened.load_all().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].run_id, "run_1");
+        assert_eq!(after[0].phase, "failed");
+        // delete_runs trims a retained failed row explicitly (the reaper's primitive).
+        assert_eq!(reopened.delete_runs(&["run_1".to_string()]).unwrap(), 1);
         assert!(reopened.load_all().unwrap().is_empty());
         let _ = std::fs::remove_file(&path);
     }

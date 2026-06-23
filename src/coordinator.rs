@@ -107,6 +107,106 @@ fn max_failed_attempts() -> usize {
     env_usize("AISH_COORDINATOR_MAX_FAILED_ATTEMPTS", DEFAULT_MAX_FAILED_ATTEMPTS, 0, 1000)
 }
 
+/// Bounded retention for terminal `failed` runs (coordinator-lifecycle bug #129
+/// item 5). `clear_finished` now KEEPS `failed` rows so a reaped/errored run
+/// stays inspectable instead of vanishing; this caps how many survive so the
+/// table can't grow without bound. Keep at most the `KEEP` most-recent failed
+/// rows, and drop any failed row older than `MAX_AGE_DAYS`. Both are overridable
+/// at runtime (`AISH_COORDINATOR_FAILED_KEEP`,
+/// `AISH_COORDINATOR_FAILED_MAX_AGE_DAYS`).
+const DEFAULT_FAILED_RETENTION_KEEP: usize = 50;
+const DEFAULT_FAILED_RETENTION_MAX_AGE_DAYS: usize = 14;
+
+/// Effective keep-recent bound for `failed` rows (env override, clamped). `0`
+/// keeps none (every failed row is eligible to be reaped by count).
+fn failed_retention_keep() -> usize {
+    env_usize("AISH_COORDINATOR_FAILED_KEEP", DEFAULT_FAILED_RETENTION_KEEP, 0, 100_000)
+}
+
+/// Effective max age (in seconds) for a retained `failed` row (env override is
+/// in days, clamped). A failed row older than this is reaped regardless of the
+/// keep-recent count.
+fn failed_retention_max_age_secs() -> i64 {
+    let days = env_usize(
+        "AISH_COORDINATOR_FAILED_MAX_AGE_DAYS",
+        DEFAULT_FAILED_RETENTION_MAX_AGE_DAYS,
+        0,
+        3650,
+    );
+    days as i64 * 86_400
+}
+
+/// Pure bounded-retention decision for terminal `failed` runs. Given each failed
+/// run's `(run_id, created_at_secs)` (a `None` timestamp is treated as the
+/// oldest — and so always eligible to reap), return the run ids to DELETE so
+/// that at most `keep_recent` of the MOST-RECENT rows survive AND no surviving
+/// row is older than `max_age_secs`. Rows are ordered newest-first by
+/// `created_at` (ties broken by run_id desc for determinism); a row is reaped
+/// when it falls beyond the keep window OR exceeds the age bound. The result
+/// order is newest→oldest among victims. Order-independent and idempotent
+/// (re-running on the survivors returns an empty plan). (coordinator-lifecycle
+/// bug #129 item 5.)
+fn failed_retention_plan(
+    rows: &[(String, Option<i64>)],
+    now_secs: i64,
+    keep_recent: usize,
+    max_age_secs: i64,
+) -> Vec<String> {
+    let mut ordered: Vec<&(String, Option<i64>)> = rows.iter().collect();
+    ordered.sort_by(|a, b| {
+        b.1.unwrap_or(i64::MIN)
+            .cmp(&a.1.unwrap_or(i64::MIN))
+            .then_with(|| b.0.cmp(&a.0))
+    });
+    let mut victims = Vec::new();
+    for (idx, (run_id, created)) in ordered.iter().enumerate() {
+        let beyond_keep = idx >= keep_recent;
+        let too_old = match created {
+            Some(secs) => now_secs.saturating_sub(*secs) > max_age_secs,
+            None => true, // no timestamp → can't prove it's fresh → reap-eligible
+        };
+        if beyond_keep || too_old {
+            victims.push((*run_id).clone());
+        }
+    }
+    victims
+}
+
+/// Apply bounded retention to the store's terminal `failed` rows using the
+/// runtime knobs + wall clock. Best-effort; returns the count reaped. Thin
+/// wrapper over the deterministic [`reap_failed_runs_with`].
+fn reap_failed_runs(store: &CoordinatorStore) -> usize {
+    reap_failed_runs_with(
+        store,
+        failed_retention_keep(),
+        failed_retention_max_age_secs(),
+        now_unix_secs(),
+    )
+}
+
+/// Testable core of [`reap_failed_runs`]: load the store's `failed` rows, decide
+/// the bounded-retention victims via [`failed_retention_plan`], and delete them.
+/// Parameterized on the knobs + `now_secs` so it's deterministic under test (no
+/// env / wall-clock dependence). Best-effort; a store read/write error yields 0.
+fn reap_failed_runs_with(
+    store: &CoordinatorStore,
+    keep_recent: usize,
+    max_age_secs: i64,
+    now_secs: i64,
+) -> usize {
+    let rows = match store.load_all() {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    let failed: Vec<(String, Option<i64>)> = rows
+        .into_iter()
+        .filter(|r| Phase::parse(&r.phase) == Phase::Failed)
+        .map(|r| (r.run_id, r.created_at.as_deref().and_then(parse_sqlite_timestamp)))
+        .collect();
+    let plan = failed_retention_plan(&failed, now_secs, keep_recent, max_age_secs);
+    store.delete_runs(&plan).unwrap_or(0)
+}
+
 /// Read a `usize` from environment variable `var`, accept it only when it parses
 /// and falls within `[min, max]`, otherwise fall back to `default`. Keeps the
 /// runtime knobs above forgiving: a typo'd or wild value silently reverts to the
@@ -271,10 +371,11 @@ pub async fn drive(
     // refuse fast instead of burning another full multi-round attempt on a
     // known-bad request. The current run's own row (just inserted as
     // `coordinating`) is never counted; only prior `failed` rows are. The
-    // counter is per-store-lifetime (terminal rows are purged on a clean
-    // restart via `clear_finished`), so this stops in-session re-dispatch
-    // storms — e.g. a goal loop relaunching the same task — rather than acting
-    // as cross-restart history. Disabled when the threshold is 0.
+    // counter now persists across restarts within the failed-row retention
+    // window (`clear_finished` keeps `failed` rows; `reap_failed_runs` bounds
+    // them — #129 item 5), so a task that keeps failing stays known-bad until
+    // its failed rows age/count out, not just for the session. Disabled when the
+    // threshold is 0.
     if let Some(s) = store {
         let cap = max_failed_attempts();
         if cap > 0 {
@@ -600,23 +701,29 @@ pub fn rehydrate(session: &mut Session) {
             }
         }
     }
-    // Drop terminal rows (the just-surfaced done runs and any failed/reaped ones)
-    // so the store doesn't grow without bound and a restart stays a no-op. This
-    // also purges any orphaned mailbox messages (see CoordinatorStore::clear_finished).
+    // Drop terminal `done` rows (the just-surfaced results) and purge orphaned
+    // mailbox messages. `failed` rows are RETAINED for forensics (#129 item 5)
+    // so a reaped/errored run stays visible in `:workers` instead of vanishing.
     let _ = store.clear_finished();
+    // Bound the now-retained `failed` rows: keep a recent, age-limited window so
+    // the forensic trail survives a restart without the table growing unbounded.
+    // Runs BEFORE salvage and BEFORE the post-sweep id snapshot, so a work-bearing
+    // worktree whose row we trim here is simply re-derived by salvage below (the
+    // worktree is the durable source of truth; the store row is a derived view).
+    let reaped_failed = reap_failed_runs(&store);
     // Salvage runs whose durable row was lost on early termination. Run AFTER the
-    // terminal-row purge and key off a FRESH post-purge id set, so the `failed`
-    // salvage rows we write this pass survive the boot (they're re-derived from
-    // the surviving worktree — not duplicated — on the next startup). The
-    // worktree is the durable source of truth; the store row is a derived view.
+    // terminal-row purge + failed-row reap and key off a FRESH post-sweep id set,
+    // so the `failed` salvage rows we write this pass survive the boot (they're
+    // re-derived from the surviving worktree — not duplicated — on the next
+    // startup).
     let known_after: HashSet<String> = store
         .load_all()
         .map(|rows| rows.into_iter().map(|r| r.run_id).collect())
         .unwrap_or_default();
     let salvaged = salvage_orphaned_worktrees(&session.cwd, &store, &known_after);
-    if surfaced > 0 || reaped > 0 || salvaged > 0 {
+    if surfaced > 0 || reaped > 0 || salvaged > 0 || reaped_failed > 0 {
         eprintln!(
-            "\x1b[2maish: reattached coordinator runs ({surfaced} delivered, {reaped} reaped, {salvaged} salvaged)\x1b[0m"
+            "\x1b[2maish: reattached coordinator runs ({surfaced} delivered, {reaped} reaped, {salvaged} salvaged, {reaped_failed} failed-pruned)\x1b[0m"
         );
     }
 }
@@ -859,6 +966,77 @@ mod tests {
         // No work in the leaf → nothing to recover, regardless of row state.
         assert!(!is_salvageable(false, false));
         assert!(!is_salvageable(true, false));
+    }
+
+    #[test]
+    fn failed_retention_plan_keeps_recent_and_drops_old_and_excess() {
+        let now = 1_000_000i64;
+        let day = 86_400i64;
+        let rows = vec![
+            ("r_new1".to_string(), Some(now - day)),
+            ("r_new2".to_string(), Some(now - 2 * day)),
+            ("r_old".to_string(), Some(now - 30 * day)), // exceeds the 14d age bound
+            ("r_none".to_string(), None),                // unknown ts → reap-eligible
+        ];
+        // Generous count bound (10), 14-day age bound: only the old + unknown go.
+        let plan = failed_retention_plan(&rows, now, 10, 14 * day);
+        assert!(plan.contains(&"r_old".to_string()));
+        assert!(plan.contains(&"r_none".to_string()));
+        assert!(!plan.contains(&"r_new1".to_string()));
+        assert!(!plan.contains(&"r_new2".to_string()));
+
+        // keep_recent = 1 keeps only the single most-recent fresh row (r_new1).
+        let plan = failed_retention_plan(&rows, now, 1, 14 * day);
+        assert!(!plan.contains(&"r_new1".to_string()), "newest survives the count bound");
+        assert!(plan.contains(&"r_new2".to_string()), "older fresh row trimmed by count");
+        assert!(plan.contains(&"r_old".to_string()));
+        assert!(plan.contains(&"r_none".to_string()));
+    }
+
+    #[test]
+    fn failed_retention_plan_is_idempotent_and_order_independent() {
+        let now = 1_000_000i64;
+        let day = 86_400i64;
+        let rows = vec![
+            ("a".to_string(), Some(now - day)),
+            ("b".to_string(), Some(now - 2 * day)),
+            ("c".to_string(), Some(now - 3 * day)),
+        ];
+        // keep 2 → drops the single oldest ("c"), regardless of input order.
+        let plan = failed_retention_plan(&rows, now, 2, 100 * day);
+        assert_eq!(plan, vec!["c".to_string()]);
+        let mut shuffled = rows.clone();
+        shuffled.reverse();
+        assert_eq!(failed_retention_plan(&shuffled, now, 2, 100 * day), vec!["c".to_string()]);
+        // Re-running on the survivors removes nothing (idempotent).
+        let survivors: Vec<_> = rows.into_iter().filter(|(id, _)| id != "c").collect();
+        assert!(failed_retention_plan(&survivors, now, 2, 100 * day).is_empty());
+    }
+
+    #[test]
+    fn reap_failed_runs_trims_failed_only_to_bound() {
+        let path = std::env::temp_dir().join(format!("aish_reapfailed_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+        store.insert("f1", "t", "s", None).unwrap();
+        store.set_failed("f1", "boom").unwrap();
+        store.insert("f2", "t", "s", None).unwrap();
+        store.set_failed("f2", "boom").unwrap();
+        store.insert("ok", "t", "s", None).unwrap();
+        store.set_done("ok", "done").unwrap();
+        store.insert("live", "t", "s", None).unwrap(); // coordinating
+
+        let now = now_unix_secs();
+        // Generous bounds keep all (few, fresh) failed rows.
+        assert_eq!(reap_failed_runs_with(&store, 10, 100 * 86_400, now), 0);
+        // keep=0 reaps every failed row, but leaves done + coordinating intact.
+        assert_eq!(reap_failed_runs_with(&store, 0, 100 * 86_400, now), 2);
+        let ids: Vec<String> = store.load_all().unwrap().into_iter().map(|r| r.run_id).collect();
+        assert!(ids.contains(&"ok".to_string()), "done row is clear_finished's job, not the reaper's");
+        assert!(ids.contains(&"live".to_string()), "non-terminal untouched");
+        assert!(!ids.contains(&"f1".to_string()));
+        assert!(!ids.contains(&"f2".to_string()));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
