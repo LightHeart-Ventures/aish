@@ -22,6 +22,7 @@ mod scope;
 mod script;
 mod session;
 mod skills;
+mod style;
 mod suggest;
 mod tools;
 mod turn_audit;
@@ -58,6 +59,11 @@ struct Args {
     /// Check for a newer published release, upgrade if one exists, and exit.
     #[arg(long)]
     update: bool,
+
+    /// Disable ANSI color/emoji output. Also auto-disabled when stdout is
+    /// not a TTY (piped/redirected) or when the NO_COLOR env var is set.
+    #[arg(long = "no-color")]
+    no_color: bool,
 
     /// Login shell: source profiles and become a session leader. Also implied
     /// by an argv[0] beginning with `-` (e.g. `-aish`), the classic convention.
@@ -128,6 +134,8 @@ async fn main() -> Result<()> {
     let mut timer = StartupTimer::new();
     let args = Args::parse();
     timer.mark("args parsed");
+    // Honor --no-color process-wide before anything styles output.
+    style::set_no_color(args.no_color);
 
     // `aish --update`: non-interactive self-upgrade. Check the latest release and,
     // if it's newer for this platform, download + swap the binary, then exit.
