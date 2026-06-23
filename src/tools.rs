@@ -782,6 +782,17 @@ pub fn announce(prefix: &str, line: &str) {
     eprint!("\r\x1b[2K\x1b[2m{prefix} {line}\x1b[0m\n");
 }
 
+/// Print a PRE-FORMATTED line (which carries its own colour) over the current
+/// terminal line, like [`announce`] but WITHOUT the dim wrapper or trailing-
+/// space prefix join. The caller has already framed the line — e.g. the
+/// contained `:output` pane rows (`worker::pane_row`), which supply their own
+/// box-drawing border + label gutter. As with `announce`, the `\r\x1b[2K`
+/// erases whatever was on the line (the prompt) and rustyline redraws it on
+/// the next keypress.
+pub fn announce_raw(line: &str) {
+    eprint!("\r\x1b[2K{line}\n");
+}
+
 /// Hang up every still-live managed job when the shell exits, so none is
 /// orphaned (TASK-123 / S3.6). For each non-terminal job with a known process
 /// group: if it is stopped, continue it first (SIGCONT) — a stopped process
