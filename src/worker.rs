@@ -517,9 +517,12 @@ fn repo_key(src: &std::path::Path) -> String {
 }
 
 /// The root under which all worker worktrees live: `$AISH_WORKTREE_DIR` when set
-/// and non-empty, else `~/.atum/worktrees`, else (no `$HOME`) a temp fallback.
+/// and non-empty, else `~/.aish/worktrees`, else (no `$HOME`) a temp fallback.
 /// Moving off the OS temp dir is the whole point of ISS-2046 — the OS reaps temp
 /// dirs and could silently delete a worker's deliberately-kept (dirty) worktree.
+/// It lives under aish's OWN home (`~/.aish`, alongside the DB / skills /
+/// `.mcp.json`), NOT `~/.atum` (the atum CLI's config dir) — the latter was a
+/// stray port artifact that polluted an unrelated tool's directory.
 fn worktree_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("AISH_WORKTREE_DIR") {
         if !dir.is_empty() {
@@ -528,7 +531,7 @@ fn worktree_root() -> PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_default();
     if !home.is_empty() {
-        return PathBuf::from(home).join(".atum").join("worktrees");
+        return PathBuf::from(home).join(".aish").join("worktrees");
     }
     std::env::temp_dir().join("aish-worktrees")
 }
@@ -1208,7 +1211,7 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
     let worktree = if spec.isolate {
         // Worker ids are globally unique (`w_########`, #86), so the worktree
         // leaf is just the id: two sessions / two checkouts share the `{repo-key}`
-        // parent dir but never collide on the leaf. Lives under `~/.atum/worktrees`
+        // parent dir but never collide on the leaf. Lives under `~/.aish/worktrees`
         // (off the OS-reaped temp dir — ISS-2046), swept on startup if abandoned.
         create_worktree(&spec.cwd, &job.id, &spec.base)
     } else {
