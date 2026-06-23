@@ -364,6 +364,14 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
             return Outcome { phase: Phase::Failed, result: None, error: Some(error), rounds };
         }
 
+        // Liveness: beat the run's heartbeat at EVERY round boundary, not only
+        // while awaiting a batch. A long `coordinating` round (many tool calls,
+        // no batch fan-out) otherwise lets the heartbeat go stale, risking a
+        // false orphan-reap by a concurrent startup. (coordinator-lifecycle bug)
+        if let Some(s) = store {
+            let _ = s.heartbeat(run_id);
+        }
+
         // ── operator messages: fold any `:tell`/SendMessage interjections that
         // arrived before this round into the upcoming turn. Delivery is
         // round-boundary — a message sent mid-turn lands on the next round.
@@ -539,6 +547,17 @@ pub fn rehydrate(session: &mut Session) {
     crate::worker::prune_worktrees(&session.cwd);
     crate::worker::sweep_worktrees(&session.cwd);
 
+    // A coordinator CHILD (`AISH_COORDINATOR=1`) runs the full `main()` startup
+    // before it reaches `run_coordinator`. Without this guard EVERY spawned
+    // child would surface + reap + purge the SHARED `coordinator_runs` store at
+    // boot — deleting sibling runs' rows and "surfacing" their results into the
+    // child's captured (and invisible) stdout. That is the core mechanism behind
+    // lost coordinator rows/results. Only the launching interactive session owns
+    // the reattach + salvage sweep; a child just runs its one task.
+    if std::env::var_os("AISH_COORDINATOR").is_some() {
+        return;
+    }
+
     let Some(store) = session.coordinator_store.clone() else {
         return;
     };
@@ -585,11 +604,67 @@ pub fn rehydrate(session: &mut Session) {
     // so the store doesn't grow without bound and a restart stays a no-op. This
     // also purges any orphaned mailbox messages (see CoordinatorStore::clear_finished).
     let _ = store.clear_finished();
-    if surfaced > 0 || reaped > 0 {
+    // Salvage runs whose durable row was lost on early termination. Run AFTER the
+    // terminal-row purge and key off a FRESH post-purge id set, so the `failed`
+    // salvage rows we write this pass survive the boot (they're re-derived from
+    // the surviving worktree — not duplicated — on the next startup). The
+    // worktree is the durable source of truth; the store row is a derived view.
+    let known_after: HashSet<String> = store
+        .load_all()
+        .map(|rows| rows.into_iter().map(|r| r.run_id).collect())
+        .unwrap_or_default();
+    let salvaged = salvage_orphaned_worktrees(&session.cwd, &store, &known_after);
+    if surfaced > 0 || reaped > 0 || salvaged > 0 {
         eprintln!(
-            "\x1b[2maish: reattached coordinator runs ({surfaced} delivered, {reaped} reaped)\x1b[0m"
+            "\x1b[2maish: reattached coordinator runs ({surfaced} delivered, {reaped} reaped, {salvaged} salvaged)\x1b[0m"
         );
     }
+}
+
+/// Pure salvage decision: a worktree that still holds work but has NO surviving
+/// `coordinator_runs` row was lost to an early termination — recover it. When a
+/// row already exists (terminal or not), the normal lifecycle owns it, so don't
+/// double-report. Unit-tested.
+fn is_salvageable(has_row: bool, has_work: bool) -> bool {
+    has_work && !has_row
+}
+
+/// Recover runs whose durable row was lost on early termination: scan the managed
+/// worktree root for work-bearing leaves (uncommitted changes or commits ahead),
+/// and for any with no surviving store row, insert a `failed` salvage row and
+/// announce the recoverable branch/path — so the otherwise-invisible work shows
+/// up in `:workers` again and an operator can review/merge it. Best-effort: a
+/// store write that fails is skipped, never sinking startup. Returns the count
+/// salvaged. (coordinator-lifecycle bug: rows lost on early termination.)
+fn salvage_orphaned_worktrees(
+    cwd: &std::path::Path,
+    store: &CoordinatorStore,
+    known: &HashSet<String>,
+) -> usize {
+    let mut salvaged = 0usize;
+    for w in crate::worker::work_bearing_worktrees(cwd) {
+        if !is_salvageable(known.contains(&w.id), true) {
+            continue;
+        }
+        let error = format!(
+            "salvaged: coordinator_runs row lost on early termination — work preserved on branch `{}` at {} (review/merge from the parent repo; not auto-merged)",
+            w.branch,
+            w.path.display(),
+        );
+        if store
+            .insert_salvaged(&w.id, &format!("(salvaged orphan worktree {})", w.id), &error)
+            .is_ok()
+        {
+            eprintln!(
+                "\x1b[2maish: salvaged orphaned worker {} — work on branch `{}` ({})\x1b[0m",
+                w.id,
+                w.branch,
+                w.path.display(),
+            );
+            salvaged += 1;
+        }
+    }
+    salvaged
 }
 
 /// Count active (non-terminal) coordinator runs in the durable store whose
@@ -773,6 +848,17 @@ mod tests {
         // Malformed → None.
         assert_eq!(parse_sqlite_timestamp("not a timestamp"), None);
         assert_eq!(parse_sqlite_timestamp("2021-13"), None);
+    }
+
+    #[test]
+    fn is_salvageable_only_when_work_exists_and_no_row() {
+        // Work-bearing worktree with no surviving store row → salvage it.
+        assert!(is_salvageable(false, true));
+        // A surviving row (terminal or live) means the lifecycle owns it — skip.
+        assert!(!is_salvageable(true, true));
+        // No work in the leaf → nothing to recover, regardless of row state.
+        assert!(!is_salvageable(false, false));
+        assert!(!is_salvageable(true, false));
     }
 
     #[test]

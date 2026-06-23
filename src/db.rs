@@ -571,6 +571,22 @@ impl CoordinatorStore {
         Ok(())
     }
 
+    /// Insert a terminal `failed` SALVAGE row for a run whose normal row was lost
+    /// to an early termination, reconstructed from a surviving worktree. The
+    /// worktree (with its un-pushed work) is the durable source of truth; this
+    /// re-derives the missing store row so the otherwise-invisible failure shows
+    /// up in `:workers` / `background_status` again. Idempotent (ON CONFLICT DO
+    /// NOTHING) so a re-derive on the next startup can't duplicate it. `error`
+    /// carries the recoverable branch/path. (coordinator-lifecycle bug.)
+    pub fn insert_salvaged(&self, run_id: &str, task: &str, error: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO coordinator_runs (run_id, task, phase, error) \
+             VALUES (?1, ?2, 'failed', ?3) ON CONFLICT(run_id) DO NOTHING",
+            (run_id, task, error),
+        )?;
+        Ok(())
+    }
+
     /// Advance the run's phase marker (and bump the heartbeat, since a phase
     /// transition is itself proof of liveness).
     pub fn set_phase(&self, run_id: &str, phase: &str) -> Result<()> {

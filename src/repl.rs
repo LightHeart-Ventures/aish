@@ -2193,7 +2193,7 @@ async fn handle_colon(
             match target {
                 Some(true) => {
                     session.show_worker_output.store(true, Ordering::SeqCst);
-                    println!("worker output ON — background coordinators now stream their 💭 thinking, 🔧 tool activity and ·standard/·batch turn output");
+                    println!("worker output ON — background coordinators now stream their 💭 thinking, tool activity (⚙️ local · 🔧 MCP) and ·standard/·batch turn output");
                 }
                 Some(false) => {
                     session.show_worker_output.store(false, Ordering::SeqCst);
@@ -2233,12 +2233,13 @@ async fn handle_colon(
                 any = true;
                 seen.insert(w.id.clone());
                 table.push_str(&format!(
-                    "| {} | {} * | {} | {} | {} |\n",
+                    "| {} {} | {} * | {} | {} | {} |\n",
+                    crate::style::job_type_emoji("worker"),
                     w.id,
                     me_label,
-                    w.status(),
+                    crate::style::styled_status(&w.status()),
                     one_line(&w.task),
-                    w.result_cell()
+                    crate::style::styled_result(&w.result_cell())
                 ));
             }
             // Durable runs from the shared store — every session's, so workers
@@ -2277,12 +2278,13 @@ async fn handle_colon(
                             _ => "—".to_string(),
                         };
                         table.push_str(&format!(
-                            "| {} | {} | {} | {} | {} |\n",
+                            "| {} {} | {} | {} | {} | {} |\n",
+                            crate::style::job_type_emoji("coordinator"),
                             crate::batch::short_id(&r.run_id),
                             session_cell,
-                            r.phase,
+                            crate::style::styled_status(&r.phase),
                             one_line(&r.task),
-                            result_cell
+                            crate::style::styled_result(&result_cell)
                         ));
                     }
                 }
@@ -2290,10 +2292,13 @@ async fn handle_colon(
             if any {
                 println!("{}", crate::md::render_stdout(table.trim()));
                 if show_all {
-                    println!("\x1b[2m* = launched from this session\x1b[0m");
+                    println!("{}", crate::style::dim("* = launched from this session"));
                 } else {
                     println!(
-                        "\x1b[2mthis session's coordinators — :workers all for every session\x1b[0m"
+                        "{}",
+                        crate::style::dim(
+                            "this session's coordinators — :workers all for every session"
+                        )
                     );
                 }
             } else if show_all {
