@@ -1082,6 +1082,7 @@ you're working on it and the answer will appear here when ready — no job id, n
         launch_session_id: session.session_id.clone(),
         launch_session_name: session.name.clone(),
         show_output: session.show_worker_output.clone(),
+        attached: session.attached.clone(),
     };
     let _id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
     Ok("Queued a background coordinator (full toolset + MCP in this directory; it can fan parallel \

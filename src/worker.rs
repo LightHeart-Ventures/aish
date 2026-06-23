@@ -302,10 +302,20 @@ pub fn pane_close() -> String {
 /// failure message can quote recent stderr even when output is suppressed. This
 /// keeps the child's stderr pipe drained (so it never blocks) without
 /// accumulating all of stderr in memory.
+/// Whether a coordinator stderr line should be forwarded to the user's terminal:
+/// the session-wide `:worker-output` toggle is on, OR this specific worker is the
+/// one currently `:attach`ed to (so `:attach <id>` streams exactly one
+/// coordinator without flipping the global toggle). Pure → unit-testable without
+/// a live pipe.
+fn should_forward(show_output: bool, attached: Option<&str>, label: &str) -> bool {
+    show_output || attached == Some(label)
+}
+
 async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
     r: R,
     label: &str,
     show_output: Arc<AtomicBool>,
+    attached: Arc<Mutex<Option<String>>>,
     pulse: Option<Arc<WorkerJob>>,
 ) -> String {
     let mut lines = BufReader::new(r).lines();
@@ -322,7 +332,15 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                 None => {}
             }
         }
-        if let Some((suffix, text)) = forward_decision(&line, show_output.load(Ordering::Relaxed)) {
+        // Forward when the session-wide toggle is on OR this worker is the one
+        // `:attach`ed to (the per-worker `:attach` stream).
+        let attached_id = attached.lock().ok().and_then(|g| g.clone());
+        let on = should_forward(
+            show_output.load(Ordering::Relaxed),
+            attached_id.as_deref(),
+            label,
+        );
+        if let Some((suffix, text)) = forward_decision(&line, on) {
             // Frame each forwarded line as a row of the contained `:output`
             // pane (a box-drawing left border + label gutter), so coordinator
             // activity reads as a bordered column rather than blending into
@@ -1085,6 +1103,12 @@ pub struct WorkerSpec {
     /// pulse and completion notice show) and streams its full activity only when
     /// `:worker-output` is on.
     pub show_output: Arc<AtomicBool>,
+    /// Shared "attached coordinator" handle from the launching session
+    /// (`:attach`/`:detach`). When it holds THIS worker's id, the live stderr
+    /// stream forwards this worker's activity even with `:worker-output` off — so
+    /// `:attach <id>` watches exactly one coordinator without flipping the
+    /// session-wide toggle. Read per line, like `show_output`.
+    pub attached: Arc<Mutex<Option<String>>>,
 }
 
 impl WorkerJob {
@@ -1288,11 +1312,12 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
     let stderr = child.stderr.take().expect("piped stderr");
     let label = job.id.clone();
     let show_output = spec.show_output.clone();
+    let attached = spec.attached.clone();
     let pulse_job = job.clone();
     let collect = tokio::spawn(async move {
         tokio::join!(
             read_capped(stdout, CAPTURE_CAP),
-            stream_stderr(stderr, &label, show_output, Some(pulse_job))
+            stream_stderr(stderr, &label, show_output, attached, Some(pulse_job))
         )
     });
 
@@ -1373,10 +1398,11 @@ pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<Str
     // to the user's terminal — gated behind `:worker-output` like the background
     // worker path — retaining only a bounded tail for the failure message.
     let show_output = spec.show_output.clone();
+    let attached = spec.attached.clone();
     let collect = tokio::spawn(async move {
         tokio::join!(
             read_capped(stdout, CAPTURE_CAP),
-            stream_stderr(stderr, "goal", show_output, None)
+            stream_stderr(stderr, "goal", show_output, attached, None)
         )
     });
     let status = match tokio::time::timeout(WORKER_TIMEOUT, child.wait()).await {
@@ -1526,6 +1552,18 @@ fn flush_results(jobs: &WorkerJobs) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_forward_gates_on_toggle_or_attach() {
+        // Session-wide `:worker-output` on → always forward, attach irrelevant.
+        assert!(should_forward(true, None, "w_aaa"));
+        assert!(should_forward(true, Some("w_bbb"), "w_aaa"));
+        // Toggle off and not attached to THIS worker → suppressed (quiet default).
+        assert!(!should_forward(false, None, "w_aaa"));
+        assert!(!should_forward(false, Some("w_bbb"), "w_aaa"));
+        // Toggle off but attached to THIS worker → forwarded (the :attach stream).
+        assert!(should_forward(false, Some("w_aaa"), "w_aaa"));
+    }
 
     #[test]
     fn spawn_assigns_unique_ids() {
@@ -1984,7 +2022,8 @@ mod tests {
         );
         let show = Arc::new(AtomicBool::new(false));
         let reader = lines.as_bytes();
-        let _tail = stream_stderr(reader, "worker_1", show, Some(job.clone())).await;
+        let attached = Arc::new(Mutex::new(None));
+        let _tail = stream_stderr(reader, "worker_1", show, attached, Some(job.clone())).await;
         // Most recent event was the tool FAILURE -> red cross pulse.
         assert_eq!(job.latest_pulse().map(|(p, _)| p), Some(Pulse::ToolErr));
         // And it is fresh, so the aggregate badge is the red-cross variant.

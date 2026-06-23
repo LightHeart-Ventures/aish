@@ -2,7 +2,7 @@ use crate::backend::{Msg, ToolResult};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
 
 /// How much the safety gate asks before acting.
@@ -159,6 +159,13 @@ pub struct Session {
     /// each tool call (and replay completed turns on a resume). Always `None` for
     /// an interactive session — no journaling there.
     pub turn_audit: Option<crate::turn_audit::TurnAudit>,
+    /// Shared "attached coordinator" handle (`:attach`/`:detach`). Holds the
+    /// run-id of the background coordinator this interactive session is currently
+    /// attached to, or `None`. Cloned into every `WorkerSpec` so the live stderr
+    /// stream forwards exactly the attached worker's activity even with
+    /// `:worker-output` off, and read at the prompt to steer typed lines to it.
+    /// Session-local, never persisted.
+    pub attached: Arc<Mutex<Option<String>>>,
 }
 
 impl Session {
@@ -195,6 +202,7 @@ impl Session {
             escalation: None,
             turn_audit: None,
             login: false,
+            attached: Arc::new(Mutex::new(None)),
         })
     }
 
