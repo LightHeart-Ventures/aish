@@ -35,13 +35,28 @@ already terminated in `failed` ≥ N times (default **3**, env
 counted; only prior `failed` rows are. This fails fast instead of burning a full
 multi-round attempt on a known-bad request.
 
-*Durability boundary:* `clear_finished` purges terminal rows on a clean restart,
-so this counter is effectively per-store-lifetime. It stops **in-session
-re-dispatch storms** (e.g. a goal loop relaunching the same task), not a
-cross-restart history — the same boundary the rest of the store's terminal
-bookkeeping lives within. Durable cross-restart attempt history would need a
-separate non-purged table; deferred as not worth the complexity for the
-in-session loop case this targets.
+*Durability boundary:* `clear_finished` now purges only terminal `done` rows on
+a restart; `failed` rows are **retained** for forensics and bounded by a
+keep-recent + max-age reaper (`coordinator::reap_failed_runs`, #129 item 5). So
+this counter now persists **across restarts** within that retention window — a
+task that keeps failing stays known-bad until its failed rows age or count out,
+rather than resetting every session. Salvage rows carry a synthetic task string,
+so they never trip a real task's breaker.
+
+### Failed-row retention (#129 item 5)
+
+Background coordinators were losing their `coordinator_runs` rows on early
+termination, in part because `rehydrate` reaped a non-terminal orphan to
+`failed` and then `clear_finished` immediately purged **both** `done` and
+`failed` rows — destroying the forensic trail before an operator could read it.
+`clear_finished` now deletes only `done` rows; `failed` rows survive so a
+reaped/errored run stays visible in `background_status` / `:workers` with its
+reason. To keep the table bounded, `rehydrate` runs `reap_failed_runs` right
+after `clear_finished` (and before the salvage sweep): it keeps at most the
+`AISH_COORDINATOR_FAILED_KEEP` most-recent failed rows and drops any older than
+`AISH_COORDINATOR_FAILED_MAX_AGE_DAYS`. Because the reap runs before salvage, a
+work-bearing worktree whose row is trimmed is simply re-derived from the
+worktree (the durable source of truth) on the same boot.
 
 ### 2. Synthesis logging (rec #2, aish half)
 Tier-1 turn audit (`src/turn_audit.rs`) already journals every **tool call**
@@ -87,11 +102,17 @@ outcome; an endless retry loop is a failure.
 |---------|---------|-------|--------|
 | `AISH_COORDINATOR_MAX_ROUNDS` | 48 | 1–1000 | Per-run agentic round cap (bandaid). |
 | `AISH_COORDINATOR_MAX_FAILED_ATTEMPTS` | 3 | 0–1000 | Pre-dispatch circuit-breaker threshold; `0` disables. |
+| `AISH_COORDINATOR_FAILED_KEEP` | 50 | 0–100000 | Max retained terminal `failed` rows (keep-recent bound); `0` keeps none. |
+| `AISH_COORDINATOR_FAILED_MAX_AGE_DAYS` | 14 | 0–3650 | Drop retained `failed` rows older than this many days. |
 
 ## Tests
 
 - `db::tests::failed_attempts_counts_only_matching_failed_runs`
 - `turn_audit::tests::synthesis_is_journaled_and_ignored_on_replay`
 - `coordinator::tests::clamp_usize_parses_clamps_and_falls_back`
+- `coordinator::tests::failed_retention_plan_keeps_recent_and_drops_old_and_excess` (#129 item 5)
+- `coordinator::tests::failed_retention_plan_is_idempotent_and_order_independent` (#129 item 5)
+- `coordinator::tests::reap_failed_runs_trims_failed_only_to_bound` (#129 item 5)
+- `db::tests::coordinator_store_roundtrip_and_resume` (clear_finished now done-only; delete_runs)
 
 All green under `cargo test --no-default-features` (the CI gate).
