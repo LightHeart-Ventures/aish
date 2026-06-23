@@ -518,6 +518,7 @@ impl CoordinatorStore {
             .with_context(|| format!("can't open coordinator store at {}", path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
              CREATE TABLE IF NOT EXISTS coordinator_runs (
                  run_id       TEXT PRIMARY KEY,
                  task         TEXT NOT NULL,
