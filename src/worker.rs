@@ -307,6 +307,79 @@ fn should_forward(show_output: bool, attached: Option<&str>, label: &str) -> boo
     show_output || attached == Some(label)
 }
 
+/// Braille frames for the `:output` pane's animated "thinking…" indicator — the
+/// SAME cycle the interactive engine spinner uses (`engine::Spinner`), so a
+/// coordinator's model-reasoning phase reads identically in the pane and in an
+/// interactive turn.
+const THINKING_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// True when the parent's stderr (where pane rows are drawn) is a terminal — the
+/// gate for the animated thinking spinner. A piped/non-TTY parent (tests, the
+/// goal loop under `-c`) gets no animation; the static transcript still records
+/// the notice. Mirrors `engine::stderr_is_tty`.
+fn stderr_is_tty() -> bool {
+    // SAFETY: plain isatty query on fd 2.
+    unsafe { libc::isatty(2) == 1 }
+}
+
+/// True when a raw coordinator-stderr line is the model-reasoning notice
+/// (`💭 thinking…`, emitted once per round by `engine::emit_thinking`). The
+/// parent renders this as an ANIMATED thinking row in the `:output` pane —
+/// matching the interactive `Spinner` — instead of a static row. Pure.
+fn is_thinking_notice(raw: &str) -> bool {
+    strip_sentinel(raw, "💭").is_some()
+}
+
+/// A transient, animated "thinking…" row for ONE worker in the `:output` pane —
+/// the streaming-pane analogue of the interactive engine's `Spinner`. While the
+/// coordinator is in its model-reasoning phase (it emitted a `💭 thinking…`
+/// notice and hasn't produced its next activity line yet) this redraws a cyan
+/// braille spinner beside dim "thinking…" IN PLACE on the pane's current row,
+/// framed as a normal pane row (border + `[label]` gutter) so it lines up under
+/// the stream. It is erased and replaced by the worker's next forwarded line —
+/// exactly like the interactive thinking indicator, which animates and then
+/// vanishes when output begins. TTY-gated: `start` returns `None` off a terminal,
+/// and the caller then falls back to a one-shot static row.
+struct ThinkingSpinner {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ThinkingSpinner {
+    /// Start animating a thinking row for `label`, or `None` when stderr isn't a
+    /// TTY (no animation possible — the caller prints the static notice instead).
+    fn start(label: &str) -> Option<Self> {
+        if !stderr_is_tty() {
+            return None;
+        }
+        eprint!("\x1b[?25l"); // hide the cursor while the spinner turns
+        let label = label.to_string();
+        let task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(80));
+            for i in 0.. {
+                tick.tick().await;
+                // Cyan braille frame + dim "thinking…", mirroring the interactive
+                // spinner's look, framed as a pane row so it carries the same
+                // border + `[label]` gutter as every other streamed line.
+                let body = format!(
+                    "\x1b[36m{}\x1b[0m \x1b[2;36mthinking…\x1b[0m",
+                    THINKING_FRAMES[i % THINKING_FRAMES.len()]
+                );
+                eprint!("\r\x1b[2K{}", pane_row(&label, &body));
+            }
+        });
+        Some(Self { task })
+    }
+
+    /// Stop animating and erase the spinner row, restoring the cursor. The next
+    /// pane print (which leads with `\r\x1b[2K`) writes its row onto the cleared
+    /// line, so the transient thinking row leaves no trace — mirroring the
+    /// interactive spinner being replaced by output.
+    fn stop(self) {
+        self.task.abort();
+        eprint!("\r\x1b[2K\x1b[?25h");
+    }
+}
+
 async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
     r: R,
     label: &str,
@@ -316,6 +389,11 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
 ) -> String {
     let mut lines = BufReader::new(r).lines();
     let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_LINES);
+    // The in-flight animated "thinking…" row for this worker, if any. It is
+    // started when a `💭 thinking…` notice is forwarded and torn down (erased)
+    // the moment the next forwarded line replaces it — exactly like the
+    // interactive thinking spinner that animates then vanishes when output begins.
+    let mut thinking: Option<ThinkingSpinner> = None;
     while let Ok(Some(line)) = lines.next_line().await {
         // Drive the prompt-badge pulse from EVERY line (independent of the
         // `:worker-output` forwarding gate) so the badge colour-pulses even when
@@ -349,18 +427,51 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                 label,
             );
             if on {
-                // Frame each forwarded line as a row of the contained
-                // `:output` pane (a box-drawing left border + label gutter) so
-                // coordinator activity reads as a bordered column rather than
-                // blending into the user’s shell scroll. `announce_raw` prints
-                // the pre-framed row (which carries its own colour).
-                crate::tools::announce_raw(&pane_row(label, &text));
+                if is_thinking_notice(&line) {
+                    // Model-reasoning phase: replace any prior thinking row, then
+                    // animate THIS one in place (transient) until the worker's
+                    // next forwarded line lands — matching the interactive
+                    // `Spinner` that animates then vanishes when output begins.
+                    // Off a TTY there's no animation: fall back to a one-shot
+                    // static row so piped parents still see the notice.
+                    if let Some(spin) = thinking.take() {
+                        spin.stop();
+                    }
+                    thinking = ThinkingSpinner::start(label);
+                    if thinking.is_none() {
+                        crate::tools::announce_raw(&pane_row(label, &text));
+                    }
+                } else {
+                    // Any other forwarded line ENDS the thinking phase: stop +
+                    // erase the spinner so this row lands on the cleared line,
+                    // then print it. `announce_raw` re-clears the line first, so
+                    // the transient thinking row leaves no trace.
+                    if let Some(spin) = thinking.take() {
+                        spin.stop();
+                    }
+                    // Frame each forwarded line as a row of the contained
+                    // `:output` pane (a box-drawing left border + label gutter)
+                    // so coordinator activity reads as a bordered column rather
+                    // than blending into the user's shell scroll. `announce_raw`
+                    // prints the pre-framed row (which carries its own colour).
+                    crate::tools::announce_raw(&pane_row(label, &text));
+                }
+            } else if let Some(spin) = thinking.take() {
+                // Forwarding just turned off for this worker (e.g. `:detach`
+                // mid-think): stop the animation so it doesn't keep drawing while
+                // suppressed.
+                spin.stop();
             }
         }
         if tail.len() == STDERR_TAIL_LINES {
             tail.pop_front();
         }
         tail.push_back(line);
+    }
+    // Stream ended — tear down any lingering thinking spinner so it doesn't leave
+    // the cursor hidden or a half-drawn frame behind.
+    if let Some(spin) = thinking.take() {
+        spin.stop();
     }
     tail.into_iter().collect::<Vec<_>>().join("\n")
 }
@@ -1931,6 +2042,19 @@ mod tests {
         // The 💭 sentinel is a turn-ish narration, not a 🔧 tool line, so it must
         // NOT be classified as a tool-activity line.
         assert_eq!(clean_activity_line(thinking), None);
+    }
+
+    #[test]
+    fn is_thinking_notice_detects_the_reasoning_sentinel() {
+        // The 💭 notice drives the ANIMATED thinking row in the pane; every other
+        // line (tool RESULT, 🗨 narration, 📦 batch, noise) does NOT.
+        assert!(is_thinking_notice("💭 thinking…"));
+        assert!(is_thinking_notice("  💭 thinking…")); // leading indent tolerated
+        assert!(!is_thinking_notice("🗨 planning the migration"));
+        assert!(!is_thinking_notice("📦 fanned 3 sub-task(s) out"));
+        assert!(!is_thinking_notice("\x1b[2m  ✓ 🔧 read /etc/hosts\x1b[0m"));
+        assert!(!is_thinking_notice("💭")); // bare sentinel, no text -> not a notice
+        assert!(!is_thinking_notice(""));
     }
 
     #[test]
