@@ -226,6 +226,27 @@ impl Session {
         self.env.len() != before
     }
 
+    /// Re-scan the on-disk skills directory and rebuild `skills_prompt` so a
+    /// skill added or removed mid-session (via the `:skill` commands) is
+    /// advertised to the model from the very next turn — no restart. The MCP
+    /// skills currently published by the connected servers are preserved (read
+    /// fresh from the live `McpHost`), so reloading the local catalog never drops
+    /// the MCP half of the prompt. Resolves the directory exactly like startup
+    /// does (`~/.aish/skills`); the heavy lifting is in `reload_skills_from`.
+    pub fn reload_skills(&mut self) -> Result<()> {
+        self.reload_skills_from(&default_skills_dir());
+        Ok(())
+    }
+
+    /// `reload_skills` against an explicit directory — the testable core. Loads
+    /// the local catalog from `skills_dir` and re-renders `skills_prompt`,
+    /// keeping the live MCP skills alongside it.
+    pub fn reload_skills_from(&mut self, skills_dir: &std::path::Path) {
+        let local = crate::skills::load(skills_dir);
+        let mcp = self.mcp.skills();
+        self.skills_prompt = crate::skills::render_prompt_section(&local, &mcp);
+    }
+
     /// Record the exit status of the command just dispatched, so the next line
     /// can expand `$?`. Signal termination maps to 128 + signal, as POSIX shells
     /// report it.
@@ -353,6 +374,15 @@ the moment there are several items to compare. No markdown headers.{skills}{batc
             escalate = if escalate_available { ESCALATE_NUDGE } else { "" },
         )
     }
+}
+
+/// The default on-disk skills directory: `~/.aish/skills`. Mirrors main.rs's
+/// `aish_dir().join("skills")` so the interactive `:skill` reload and the
+/// startup catalog scan agree on where local skills live.
+fn default_skills_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".aish")
+        .join("skills")
 }
 
 /// Appended to the system prompt when batch mode is on (ported from atum's
@@ -505,5 +535,62 @@ mod tests {
         let out = session.last_output().unwrap();
         assert!(out.ends_with("…[truncated]"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Phase 2: reload_skills -----------------------------------------
+
+    /// Write a minimal valid SKILL.md under `dir/<name>/SKILL.md`.
+    fn write_skill(dir: &std::path::Path, name: &str, desc: &str) {
+        let d = dir.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("SKILL.md"), format!("---\nname: {name}\ndescription: {desc}\n---\nbody\n"))
+            .unwrap();
+    }
+
+    #[test]
+    fn reload_picks_up_new_skill() {
+        let mut session = Session::new().unwrap();
+        let tmp = std::env::temp_dir().join(format!("aish-reload-add-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Empty dir → empty section.
+        session.reload_skills_from(&tmp);
+        assert_eq!(session.skills_prompt, "");
+        // Add a skill on disk → reload advertises it.
+        write_skill(&tmp, "demo", "Demo skill.");
+        session.reload_skills_from(&tmp);
+        assert!(session.skills_prompt.contains("demo"), "{}", session.skills_prompt);
+        assert!(session.skills_prompt.contains("Demo skill."));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn reload_drops_removed_skill() {
+        let mut session = Session::new().unwrap();
+        let tmp = std::env::temp_dir().join(format!("aish-reload-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        write_skill(&tmp, "gone", "To be removed.");
+        session.reload_skills_from(&tmp);
+        assert!(session.skills_prompt.contains("gone"));
+        // Remove the skill dir → reload no longer advertises it.
+        std::fs::remove_dir_all(tmp.join("gone")).unwrap();
+        session.reload_skills_from(&tmp);
+        assert!(!session.skills_prompt.contains("gone"), "{}", session.skills_prompt);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn reload_matches_fresh_init() {
+        // A reload produces exactly the prompt section a fresh load+render would
+        // (with no MCP servers connected, the default McpHost contributes none).
+        let tmp = std::env::temp_dir().join(format!("aish-reload-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        write_skill(&tmp, "alpha", "First.");
+        write_skill(&tmp, "beta", "Second.");
+        let fresh = crate::skills::render_prompt_section(&crate::skills::load(&tmp), &[]);
+        let mut session = Session::new().unwrap();
+        session.reload_skills_from(&tmp);
+        assert_eq!(session.skills_prompt, fresh);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
