@@ -66,6 +66,11 @@ struct Args {
     #[arg(long = "skill-fetch", value_name = "REF")]
     skill_fetch: Option<String>,
 
+    /// Search the skill.fish registry catalog and print matches, then exit. Each
+    /// printed `owner/name` ref can be passed straight to --skill-fetch.
+    #[arg(long = "skill-search", value_name = "QUERY")]
+    skill_search: Option<String>,
+
     /// Disable ANSI color/emoji output. Also auto-disabled when stdout is
     /// not a TTY (piped/redirected) or when the NO_COLOR env var is set.
     #[arg(long = "no-color")]
@@ -171,6 +176,16 @@ async fn main() -> Result<()> {
         let _ = std::fs::create_dir_all(&skills_dir);
         if let Err(e) = skillfish::run_fetch(reference, &skills_dir).await {
             eprintln!("\x1b[31maish:\x1b[0m skill fetch failed: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    // `aish --skill-search <query>`: opt-in skill.fish catalog search. Like
+    // --skill-fetch it needs no backend or credentials — it queries the registry
+    // over HTTPS, prints the matches as a table, then exits. See src/skillfish.rs.
+    if let Some(query) = args.skill_search.as_deref() {
+        if let Err(e) = skillfish::run_search(query).await {
+            eprintln!("\x1b[31maish:\x1b[0m skill search failed: {e:#}");
             std::process::exit(1);
         }
         return Ok(());
