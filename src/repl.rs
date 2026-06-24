@@ -2097,21 +2097,26 @@ fn backfill_attached(run_id: &str, session: &Session) {
     let Some(job) = job else { return };
     let short = crate::batch::short_id(run_id);
     println!("{}", crate::worker::pane_replay_header(&short));
-    // The task is the coordinator's "input".
-    println!("{}", crate::worker::pane_row(run_id, "\u{b7}task", &job.task));
+    // The task is the coordinator's "input". The `\u{b7}task` marker is folded
+    // into the row text \u{2014} `pane_row` carries only `[label]` in its gutter now
+    // (the single-glyph convention; the source glyph rides inside the text).
+    println!("{}", crate::worker::pane_row(run_id, &format!("·task {}", job.task)));
     let rows = job.transcript_rows();
     if rows.is_empty() {
         println!(
             "{}",
             crate::worker::pane_row(
                 run_id,
-                "\u{b7}thinking",
-                "(no activity captured yet \u{2014} live output follows)",
+                "\u{b7}thinking (no activity captured yet \u{2014} live output follows)",
             )
         );
     } else {
+        // The transcript suffix is empty under the single-glyph convention\u{2014}
+        // the source glyph is already stamped in `text`. Fold any legacy suffix
+        // into the row text so the gutter stays a bare `[label]`.
         for (suffix, text) in rows {
-            println!("{}", crate::worker::pane_row(run_id, &suffix, &text));
+            let row = if suffix.is_empty() { text } else { format!("{suffix} {text}") };
+            println!("{}", crate::worker::pane_row(run_id, &row));
         }
     }
 }
@@ -2477,7 +2482,7 @@ async fn handle_colon(
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
                  :workers [all]                      list this session's background coordinators (all = every session)\n\
-                 :output [on|off]             stream background coordinators' activity (💭 thinking + 🔧 tool + ·standard/·batch lines) in a contained bordered pane; off (default) keeps them quiet\n\
+                 :output [on|off]             stream background coordinators' activity (💭 thinking + 🛠️/🔧 tool + 🚀 standard/🐌 batch lines) in a contained bordered pane; off (default) keeps them quiet\n\
                  \n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
@@ -2530,7 +2535,7 @@ async fn handle_colon(
             match target {
                 Some(true) => {
                     session.show_worker_output.store(true, Ordering::SeqCst);
-                    println!("worker output ON — background coordinators now stream their 💭 thinking, tool activity (⚙️ local · 🔧 MCP) and ·standard/·batch turn output, framed in a contained pane:");
+                    println!("worker output ON — background coordinators now stream their 💭 thinking, tool activity (🛠️ local · 🔧 MCP) and 🚀 standard/🐌 batch turn output, framed in a contained pane:");
                     // Open the contained pane: every streamed coordinator line
                     // is now rendered as a bordered row under this top frame
                     // (see worker::pane_row), so the activity reads as a
