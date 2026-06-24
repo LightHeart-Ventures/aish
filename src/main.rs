@@ -1,6 +1,7 @@
 mod autosuggest;
 mod backend;
 mod batch;
+mod container;
 mod context;
 mod coordinator;
 mod db;

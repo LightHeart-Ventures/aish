@@ -549,6 +549,16 @@ impl CoordinatorStore {
         // Back-compat: add session_name to a table created before it existed.
         // (session_id predates this; ignore the error when the column is present.)
         let _ = conn.execute("ALTER TABLE coordinator_runs ADD COLUMN session_name TEXT", []);
+        // S9.1: cross-reference the container backing a run (id + name + engine)
+        // so `:workers` / S9.5 discovery can map a run to its container. Additive
+        // `ADD COLUMN` — errors with "duplicate column name" once present, which
+        // is ignored so the migration is idempotent.
+        for col in ["container_id", "container_name", "runtime"] {
+            let _ = conn.execute(
+                &format!("ALTER TABLE coordinator_runs ADD COLUMN {col} TEXT"),
+                [],
+            );
+        }
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
