@@ -1525,6 +1525,12 @@ fn finalize_worktree(worktree: Option<&Worktree>) -> Option<String> {
 }
 
 /// Run a single coordinator subprocess to completion and return its stdout (the
+/// The stderr-stream label the background `:goal` loop runs under. The REPL
+/// `:attach goal` flow sets the shared `attached` handle to this exact string
+/// so each goal turn streams its activity live (see `should_forward`). Exposed
+/// as the single source of truth so the attach sentinel can't drift from it.
+pub const GOAL_STREAM_LABEL: &str = "goal";
+
 /// final answer). Unlike `spawn`, it doesn't register a tracked job or
 /// auto-deliver — the caller consumes the output. Used by the goal loop for each
 /// work step.
@@ -1543,7 +1549,7 @@ pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<Str
     let collect = tokio::spawn(async move {
         tokio::join!(
             read_capped(stdout, CAPTURE_CAP),
-            stream_stderr(stderr, "goal", show_output, attached, None)
+            stream_stderr(stderr, GOAL_STREAM_LABEL, show_output, attached, None)
         )
     });
     let status = match tokio::time::timeout(WORKER_TIMEOUT, child.wait()).await {
