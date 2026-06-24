@@ -23,12 +23,12 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Default registry origin. Override with `AISH_SKILLFISH_REGISTRY=scheme://host`
+/// Default registry origin. Override with `AISH_SKILL_REGISTRY=scheme://host`
 /// for self-hosted mirrors or tests (a loopback `http://` origin is allowed).
 const DEFAULT_REGISTRY: &str = "https://skill.fish";
 
 fn registry() -> String {
-    std::env::var("AISH_SKILLFISH_REGISTRY")
+    std::env::var("AISH_SKILL_REGISTRY")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.trim_end_matches('/').to_string())
@@ -116,12 +116,30 @@ fn http_client() -> Result<reqwest::Client> {
         .build()?)
 }
 
+/// Detect Vercel's bot-protection challenge. skill.fish sits behind Vercel,
+/// which answers automated requests with HTTP 429 plus an
+/// `x-vercel-mitigated: challenge` header instead of the real payload. That
+/// pairing is unmistakable, so we special-case it to give the user actionable
+/// guidance rather than a bare "HTTP 429".
+fn is_vercel_challenge(resp: &reqwest::Response) -> bool {
+    resp.status().as_u16() == 429
+        && resp
+            .headers()
+            .get("x-vercel-mitigated")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("challenge"))
+            .unwrap_or(false)
+}
+
 /// Low-level fetch of a raw SKILL.md from an absolute URL (no env lookup), so
 /// tests can point it at a loopback server without mutating process env.
 pub async fn fetch_url(url: &str) -> Result<String> {
     check_url(url)?;
     let client = http_client()?;
     let resp = client.get(url).send().await.with_context(|| format!("fetching {url}"))?;
+    if is_vercel_challenge(&resp) {
+        bail!("{}", vercel_challenge_message());
+    }
     if !resp.status().is_success() {
         bail!("skill.fish returned HTTP {} for {url}", resp.status().as_u16());
     }
@@ -232,6 +250,20 @@ fn search_url_with_base(base: &str, query: &str) -> String {
     )
 }
 
+/// A helpful, multi-line error for the Vercel bot-challenge: skill.fish's search
+/// endpoint sits behind Vercel's bot protection, which rejects automated clients
+/// with HTTP 429 + `x-vercel-mitigated: challenge`. There's nothing aish can do
+/// to clear the challenge from the CLI, so we point the user at the paths that
+/// *do* work instead of failing with an opaque status code.
+fn vercel_challenge_message() -> String {
+    "skill.fish is behind a bot challenge right now (HTTP 429, x-vercel-mitigated: challenge) \
+     and is refusing automated requests.\n\nTry one of these instead:\n  \
+     • aish --skill-fetch <owner/name>   fetch a skill directly if you know its name\n  \
+     • export AISH_SKILL_REGISTRY=<url>  point aish at a custom mirror of the registry\n  \
+     • open https://skill.fish           browse and search in a browser as a last resort"
+        .to_string()
+}
+
 /// Parse a search response body into a deduped list of results. Accepts either
 /// a bare JSON array or an object wrapping the array under `results`/`skills`/
 /// `data` (the registry shape isn't contractually fixed, so we're liberal).
@@ -268,6 +300,9 @@ async fn search_with_base(base: &str, query: &str) -> Result<Vec<SearchResult>> 
     check_url(&url)?;
     let client = http_client()?;
     let resp = client.get(&url).send().await.with_context(|| format!("searching {url}"))?;
+    if is_vercel_challenge(&resp) {
+        bail!("{}", vercel_challenge_message());
+    }
     if !resp.status().is_success() {
         bail!("skill.fish returned HTTP {} for {url}", resp.status().as_u16());
     }
@@ -437,17 +472,25 @@ mod tests {
     /// One-shot loopback HTTP server: serves `status_line` (e.g. "200 OK") with
     /// `body` once, then closes. Returns the bound port. Shared by the fetch and
     /// search integration tests so neither touches the public registry or env.
-    async fn serve_once(status_line: &str, body: String) -> u16 {
+    /// `extra_headers` are inserted verbatim into the response head (each must
+    /// already end with its own CRLF), letting a test simulate e.g. the Vercel
+    /// challenge header alongside a 429 status.
+    async fn serve_once_with_headers(
+        status_line: &str,
+        extra_headers: &str,
+        body: String,
+    ) -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let status_line = status_line.to_string();
+        let extra_headers = extra_headers.to_string();
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 2048];
             let _ = sock.read(&mut buf).await;
             let resp = format!(
-                "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{extra_headers}Connection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -455,6 +498,11 @@ mod tests {
             let _ = sock.flush().await;
         });
         port
+    }
+
+    /// Convenience wrapper: serve once with no extra headers.
+    async fn serve_once(status_line: &str, body: String) -> u16 {
+        serve_once_with_headers(status_line, "", body).await
     }
 
     #[tokio::test]
@@ -507,6 +555,36 @@ mod tests {
         let port = serve_once("500 Internal Server Error", "oops".to_string()).await;
         let base = format!("http://127.0.0.1:{port}");
         assert!(search_with_base(&base, "x").await.is_err());
+    }
+
+    // A 429 carrying Vercel's `x-vercel-mitigated: challenge` header is detected
+    // and surfaces the actionable guidance, not a bare HTTP status.
+    #[tokio::test]
+    async fn search_detects_vercel_challenge() {
+        let port = serve_once_with_headers(
+            "429 Too Many Requests",
+            "x-vercel-mitigated: challenge\r\n",
+            "blocked".to_string(),
+        )
+        .await;
+        let base = format!("http://127.0.0.1:{port}");
+        let err = search_with_base(&base, "github").await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("bot challenge"), "got: {msg}");
+        assert!(msg.contains("--skill-fetch"), "got: {msg}");
+        assert!(msg.contains("AISH_SKILL_REGISTRY"), "got: {msg}");
+        assert!(msg.contains("https://skill.fish"), "got: {msg}");
+    }
+
+    // A plain 429 without the Vercel header takes the generic HTTP error path.
+    #[tokio::test]
+    async fn search_plain_429_is_generic_error() {
+        let port = serve_once("429 Too Many Requests", "slow down".to_string()).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let err = search_with_base(&base, "x").await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("HTTP 429"), "got: {msg}");
+        assert!(!msg.contains("bot challenge"), "got: {msg}");
     }
 
     #[test]
