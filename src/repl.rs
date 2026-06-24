@@ -613,7 +613,7 @@ struct CmdCache {
 /// arms of `handle_colon` and the `:help` text.
 const COLON_COMMANDS: &[(&str, &str)] = &[
     ("allow", "list / revoke always-allowed tools & dir grants"),
-    ("attach", "watch + steer a running coordinator (input goes to it)"),
+    ("attach", "watch + steer a coordinator, or `goal` to watch the goal"),
     ("backend", "switch backend (claude|grok|local)"),
     ("batch", "background batch mode (on|off|status)"),
     ("compact", "compact history, offload to memory"),
@@ -2045,6 +2045,11 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
     }
 }
 
+/// Sentinel id `:attach goal` resolves to. Equal to the goal loop's live
+/// stderr-stream label so attaching makes each goal turn stream (see
+/// `worker::GOAL_STREAM_LABEL` / `should_forward`).
+const GOAL_ATTACH_ID: &str = crate::worker::GOAL_STREAM_LABEL;
+
 /// `:attach <id>` — attach the interactive session to a LIVE coordinator this
 /// session launched, so its activity streams live (per-worker, independent of the
 /// session-wide `:worker-output` toggle) and what you type is steered to it via
@@ -2053,9 +2058,27 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
 /// reported. `:detach` (or the worker finishing) ends it.
 fn attach_worker(id: Option<&str>, session: &mut Session) {
     let Some(id) = id else {
-        println!("usage: :attach <worker-id>   — watch + steer a coordinator (:detach to stop)");
+        println!("usage: :attach <worker-id>|goal   — watch + steer a running coordinator, or watch the goal (:detach to stop)");
         return;
     };
+    // `:attach goal` — watch the active background `:goal` loop. The goal
+    // worker streams its stderr under the `GOAL_ATTACH_ID` label, so pointing
+    // the shared `attached` handle at that sentinel forwards each goal turn's
+    // activity live, just like attaching to a coordinator by id. A goal has no
+    // operator mailbox, so it's watch-only (see `send_to_attached`).
+    if id == GOAL_ATTACH_ID {
+        match &session.goal {
+            Some(g) if g.is_active() => {
+                *session.attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
+                println!(
+                    "\x1b[1;33m⇄ attached to the goal\x1b[0m — streaming its turns live. \x1b[2mgoals are watch-only; :goal clear to stop it, :detach to stop watching.\x1b[0m"
+                );
+            }
+            Some(_) => println!("the goal has already finished — `:goal` for its final status"),
+            None => println!("no goal set — `:goal <condition>` to start one (requires :batch on)"),
+        }
+        return;
+    }
     let hit = |wid: &str| wid == id || wid.starts_with(id);
     // Collect every match in this session's workers, LIVE or terminal — a done/
     // failed coordinator is now attachable too (review + resume): a typed line
@@ -2179,6 +2202,19 @@ fn send_to_attached(run_id: &str, message: &str, session: &mut Session) {
     if message.is_empty() {
         return;
     }
+    // A goal is verifier-driven and has no operator mailbox — it can't be
+    // steered mid-flight. Say so rather than silently dropping the line into a
+    // coordinator-tell with no recipient.
+    if run_id == GOAL_ATTACH_ID {
+        println!(
+            "\x1b[2mthe goal is watch-only — it can't be steered. `:goal clear` to stop it, `:detach` to stop watching.\x1b[0m"
+        );
+        return;
+    }
+    // A TERMINAL (done/failed) coordinator has nothing to read a mailbox
+    // message, so a typed line RESUMES it instead (relaunch seeded with the
+    // prior context + this message; see `resume_coordinator`). A live one is
+    // steered via the `:tell` mailbox.
     let terminal = session
         .worker_jobs
         .lock()
@@ -2202,6 +2238,15 @@ fn auto_detach_finished(session: &mut Session) {
     let Some(run_id) = attached else {
         return;
     };
+    // The goal isn't a worker job — its liveness is the goal handle itself.
+    // Stay attached while the goal is active; detach once it finishes/clears.
+    if run_id == GOAL_ATTACH_ID {
+        if !session.goal.as_ref().is_some_and(|g| g.is_active()) {
+            *session.attached.lock().unwrap() = None;
+            println!("\x1b[2m⇄ goal finished — detached. `:goal` for its final status.\x1b[0m");
+        }
+        return;
+    }
     let still_live = session
         .worker_jobs
         .lock()
@@ -2728,7 +2773,7 @@ async fn handle_colon(
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
                  :tell <id> <message>                send instructions to an in-flight coordinator (folded in next round)\n\
-                 :attach <id>                        watch a running coordinator live + steer it (typed lines go to it)\n\
+                 :attach <id>|goal                   watch a running coordinator live + steer it (typed lines go to it); `goal` watches the active :goal\n\
                  :detach                             stop watching the attached coordinator (it keeps running)\n\
                  :skill <add|search|list|remove>     install, search, list, or remove skill.fish skills\n\
                  :rename <name>                      name the session (prefixes the prompt); auto-set to the repo name at startup, bare :rename clears\n\
@@ -4393,6 +4438,17 @@ mod tests {
         let fresult = t.find("Prior result body").unwrap();
         let ffollow = t.find("now also handle X").unwrap();
         assert!(ftask < fresult && fresult < ffollow, "ordering wrong: {t}");
+    }
+
+    #[test]
+    fn goal_attach_id_matches_worker_stream_label() {
+        // `:attach goal` works only because the sentinel equals the goal
+        // worker's live stderr-stream label — if they ever drift, attaching to
+        // the goal would silently stream nothing. Pin them together.
+        assert_eq!(GOAL_ATTACH_ID, crate::worker::GOAL_STREAM_LABEL);
+        assert_eq!(GOAL_ATTACH_ID, "goal");
+        // short_id leaves the bare sentinel intact for the ⇄ prompt badge.
+        assert_eq!(crate::batch::short_id(GOAL_ATTACH_ID), "goal");
     }
 
     #[test]
