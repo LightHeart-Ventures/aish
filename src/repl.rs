@@ -636,7 +636,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("rewrite", "AI-rewrite intent into a command (edit/accept before run)"),
     ("skill", "manage skills (add|search|list|remove)"),
     ("suggest", "AI-suggest the next command from context (edit/accept before run)"),
-    ("tell", "message an in-flight coordinator"),
+    ("tell", "message an in-flight coordinator (--any: cross-session)"),
     ("update", "upgrade aish to the latest release"),
     ("workers", "list this session's coordinators (all = every session)"),
     ("yolo", "toggle yolo mode"),
@@ -2283,7 +2283,7 @@ fn send_to_attached(run_id: &str, message: &str, session: &mut Session) {
     if terminal {
         resume_coordinator(run_id, message, session);
     } else {
-        tell_coordinator(Some(run_id), message, session);
+        tell_coordinator(Some(run_id), message, false, session);
     }
 }
 
@@ -2523,6 +2523,45 @@ fn cycle_worker(session: &mut Session) {
         backfill_attached(&run_id, session);
     }
 }
+/// AC7 (TASK-201 / S9.2) ownership decision for steering a coordinator that may
+/// belong to ANOTHER session. A coordinator is "owned" by the session that
+/// launched it — its durable `coordinator_runs.session_id`, or, for an in-memory
+/// worker, the live session by construction. By default only the owning session
+/// may steer it; `--any` is the explicit, audited cross-session override
+/// (multi-user safety). A run with no recorded owner (legacy pre-AC7 rows) is
+/// treated as own-session so the gate never strands an old run. Pure → unit-tested.
+#[derive(Debug, PartialEq, Eq)]
+enum OwnerGate {
+    Allow,
+    Forbidden,
+}
+
+/// Decide whether `my_session` may steer a coordinator owned by
+/// `target_session`, honoring the `--any` override. See [`OwnerGate`].
+fn owner_gate(target_session: Option<&str>, my_session: &str, any: bool) -> OwnerGate {
+    if any {
+        return OwnerGate::Allow;
+    }
+    match target_session {
+        Some(sid) if sid != my_session => OwnerGate::Forbidden,
+        _ => OwnerGate::Allow,
+    }
+}
+
+/// Pull a leading `--any` / `-a` ownership-override flag out of a `:tell`
+/// argument token list, returning `(any, remaining_tokens)`. The flag is only
+/// recognized in the FIRST position (`:tell --any <id> <msg>`); anywhere else it
+/// is left untouched as message text, so a literal `--any` can still be sent as
+/// part of a message after the id. Pure → unit-tested.
+fn take_any_flag<'a>(toks: &[&'a str]) -> (bool, Vec<&'a str>) {
+    if let Some((first, rest)) = toks.split_first() {
+        if *first == "--any" || *first == "-a" {
+            return (true, rest.to_vec());
+        }
+    }
+    (false, toks.to_vec())
+}
+
 /// Queue an operator message for an in-flight background coordinator — the
 /// `:tell` / SendMessage channel. The message lands in the durable
 /// `coordinator_messages` mailbox keyed by the run's id and is folded into the
@@ -2532,13 +2571,13 @@ fn cycle_worker(session: &mut Session) {
 /// against this session's live workers first, then every durable run, so the
 /// short ids shown by `:workers` work. A terminal (finished) run is refused —
 /// nothing would read the message — and an ambiguous prefix lists the matches.
-fn tell_coordinator(id: Option<&str>, message: &str, session: &mut Session) {
+fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Session) {
     let Some(id) = id else {
-        println!("usage: :tell <worker-id> <message>   — steer an in-flight coordinator");
+        println!("usage: :tell [--any] <worker-id> <message>   — steer an in-flight coordinator (--any: across sessions)");
         return;
     };
     if message.is_empty() {
-        println!("usage: :tell <worker-id> <message>   — steer an in-flight coordinator");
+        println!("usage: :tell [--any] <worker-id> <message>   — steer an in-flight coordinator (--any: across sessions)");
         return;
     }
     let Some(store) = session.coordinator_store.clone() else {
@@ -2551,23 +2590,52 @@ fn tell_coordinator(id: Option<&str>, message: &str, session: &mut Session) {
     // their run_id is known even before the child has written its store row, so a
     // message sent immediately after launch still lands — then durable runs from
     // any session (deduped on run_id).
-    let mut candidates: Vec<(String, bool)> = Vec::new();
+    let mut candidates: Vec<(String, bool, Option<String>)> = Vec::new();
     for w in session.worker_jobs.lock().unwrap().iter() {
         if hit(&w.id) {
-            candidates.push((w.id.clone(), matches!(w.status().as_str(), "done" | "failed")));
+            candidates.push((
+                w.id.clone(),
+                matches!(w.status().as_str(), "done" | "failed"),
+                Some(session.session_id.clone()),
+            ));
         }
     }
     if let Ok(rows) = store.load_all() {
         for r in rows {
-            if hit(&r.run_id) && !candidates.iter().any(|(rid, _)| rid == &r.run_id) {
-                candidates.push((r.run_id.clone(), matches!(r.phase.as_str(), "done" | "failed")));
+            if hit(&r.run_id) && !candidates.iter().any(|(rid, _, _)| rid == &r.run_id) {
+                candidates.push((
+                    r.run_id.clone(),
+                    matches!(r.phase.as_str(), "done" | "failed"),
+                    r.session_id.clone(),
+                ));
             }
         }
     }
 
-    match candidates.as_slice() {
-        [] => println!("no background coordinator matching '{id}' (see :workers)"),
-        [(run_id, terminal)] => {
+    // AC7 ownership gate: by default you may only steer coordinators your OWN
+    // session launched; `--any` opts into another session's coordinator. A
+    // foreign-only match without `--any` is refused with guidance rather than
+    // silently treated as "not found", so the run isn't invisibly reachable.
+    let owned: Vec<(String, bool, Option<String>)> = candidates
+        .iter()
+        .filter(|(_, _, owner)| {
+            matches!(owner_gate(owner.as_deref(), &session.session_id, any), OwnerGate::Allow)
+        })
+        .cloned()
+        .collect();
+    if owned.is_empty() {
+        if candidates.is_empty() {
+            println!("no background coordinator matching '{id}' (see :workers)");
+        } else {
+            println!(
+                "'{id}' matches a coordinator launched by another session — re-run as `:tell --any {id} <message>` to steer it"
+            );
+        }
+        return;
+    }
+
+    match owned.as_slice() {
+        [(run_id, terminal, _)] => {
             let short = crate::batch::short_id(run_id);
             if *terminal {
                 println!("coordinator {short} has already finished — message not queued (`:result {short}` to view its result)");
@@ -2585,7 +2653,7 @@ fn tell_coordinator(id: Option<&str>, message: &str, session: &mut Session) {
         }
         many => {
             println!("'{id}' matches {} coordinators — be more specific:", many.len());
-            for (rid, _) in many {
+            for (rid, _, _) in many {
                 println!("  {rid}");
             }
         }
@@ -2838,7 +2906,7 @@ async fn handle_colon(
                  \n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> + auto-attach (steer it; :detach to stop)\n\
-                 :tell <id> <message>                send instructions to an in-flight coordinator (folded in next round)\n\
+                 :tell [--any] <id> <message>        send instructions to an in-flight coordinator (folded in next round; --any steers another session's)\n\
                  :attach <id>|goal                   watch a running coordinator live + steer it (typed lines go to it); `goal` watches the active :goal\n\
                  :detach                             stop watching the attached coordinator (it keeps running)\n\
                  :skill <add|search|list|remove>     install, search, list, or remove skill.fish skills\n\
@@ -3081,9 +3149,13 @@ async fn handle_colon(
         Some("tell" | "msg" | "send") => {
             // Steer an in-flight coordinator: queue an operator message that the
             // running coordinator folds into its next round (see coordinator::drive).
-            let target = parts.next();
-            let message = parts.collect::<Vec<_>>().join(" ");
-            tell_coordinator(target, message.trim(), session);
+            // A leading `--any`/`-a` opts into steering another session's
+            // coordinator (AC7 cross-session ownership override).
+            let toks: Vec<&str> = parts.collect();
+            let (any, rest) = take_any_flag(&toks);
+            let target = rest.first().copied();
+            let message = rest.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
+            tell_coordinator(target, message.trim(), any, session);
         }
         Some("rename") => {
             let rest = parts.collect::<Vec<_>>().join(" ");
@@ -4504,6 +4576,37 @@ mod tests {
         let fresult = t.find("Prior result body").unwrap();
         let ffollow = t.find("now also handle X").unwrap();
         assert!(ftask < fresult && fresult < ffollow, "ordering wrong: {t}");
+    }
+
+    #[test]
+    fn owner_gate_enforces_session_ownership_with_any_override() {
+        // Own-session run -> always allowed.
+        assert_eq!(owner_gate(Some("sess-a"), "sess-a", false), OwnerGate::Allow);
+        // Foreign run without --any -> forbidden (multi-user safety, AC7).
+        assert_eq!(owner_gate(Some("sess-b"), "sess-a", false), OwnerGate::Forbidden);
+        // Foreign run WITH --any -> allowed (explicit cross-session override).
+        assert_eq!(owner_gate(Some("sess-b"), "sess-a", true), OwnerGate::Allow);
+        // Legacy row with no recorded owner -> treated as own-session (allow).
+        assert_eq!(owner_gate(None, "sess-a", false), OwnerGate::Allow);
+        // --any is a harmless no-op when the run is already yours.
+        assert_eq!(owner_gate(Some("sess-a"), "sess-a", true), OwnerGate::Allow);
+    }
+
+    #[test]
+    fn take_any_flag_only_strips_a_leading_flag() {
+        // Leading --any / -a is consumed; the rest is the (id, message...) tail.
+        assert_eq!(take_any_flag(&["--any", "w_x", "hello"]), (true, vec!["w_x", "hello"]));
+        assert_eq!(take_any_flag(&["-a", "w_x", "hello"]), (true, vec!["w_x", "hello"]));
+        // No flag -> unchanged.
+        assert_eq!(take_any_flag(&["w_x", "hello"]), (false, vec!["w_x", "hello"]));
+        // A --any AFTER the id is message text, not the flag.
+        assert_eq!(
+            take_any_flag(&["w_x", "--any", "hello"]),
+            (false, vec!["w_x", "--any", "hello"])
+        );
+        // Empty input -> no flag, empty tail.
+        let empty: Vec<&str> = Vec::new();
+        assert_eq!(take_any_flag(&[]), (false, empty));
     }
 
     #[test]
