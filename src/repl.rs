@@ -613,6 +613,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("rename", "rename this session"),
     ("result", "view a finished job's result"),
     ("rewrite", "AI-rewrite intent into a command (edit/accept before run)"),
+    ("skill", "manage skills (add|search|list|remove)"),
     ("suggest", "AI-suggest the next command from context (edit/accept before run)"),
     ("tell", "message an in-flight coordinator"),
     ("update", "upgrade aish to the latest release"),
@@ -2223,6 +2224,144 @@ fn handle_memories(sub: Option<&str>, session: &Session) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// :skill — install, search, list, remove skill.fish skills (Phase 2)
+// ---------------------------------------------------------------------------
+
+/// The local skills directory `~/.aish/skills` the `:skill` commands act on —
+/// the same path startup scans and `Session::reload_skills` refreshes.
+fn skills_dir_path() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".aish")
+        .join("skills")
+}
+
+/// A parsed `:skill` subcommand. Pure routing, so the dispatch decision is
+/// unit-testable without performing any network or filesystem work.
+#[derive(Debug, PartialEq)]
+enum SkillCmd {
+    /// `:skill add <owner/name[@version]>`
+    Add(String),
+    /// `:skill search <query…>`
+    Search(String),
+    /// `:skill list`
+    List,
+    /// `:skill remove <name>`
+    Remove(String),
+    /// Anything else → print usage.
+    Usage,
+}
+
+/// Route the whitespace-split args after `:skill` to a `SkillCmd`. `add`/`remove`
+/// require an operand; `search` requires a non-empty query; bare/unknown forms
+/// fall through to `Usage`.
+fn parse_skill_command(args: &[&str]) -> SkillCmd {
+    match args {
+        ["add", reference, ..] => SkillCmd::Add((*reference).to_string()),
+        ["search", rest @ ..] if !rest.is_empty() => SkillCmd::Search(rest.join(" ")),
+        ["list" | "ls"] => SkillCmd::List,
+        ["remove" | "rm" | "delete", name, ..] => SkillCmd::Remove((*name).to_string()),
+        _ => SkillCmd::Usage,
+    }
+}
+
+/// True when `name` is safe to use as a skill directory under `~/.aish/skills`:
+/// non-empty, not `.`/`..`, and free of path separators. The hard guard against
+/// `:skill remove ../something` escaping the skills dir.
+fn valid_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+}
+
+/// Write a fetched SKILL.md into `skills_dir` and reload the session's catalog
+/// from there, returning the imported skill's frontmatter name. The testable
+/// core of `:skill add` — no network, so the reload behavior is unit-tested
+/// directly.
+fn install_skill_text(text: &str, skills_dir: &Path, session: &mut Session) -> Result<String> {
+    crate::skillfish::import(text, skills_dir)?;
+    session.reload_skills_from(skills_dir);
+    let name = crate::skills::parse_frontmatter(text).map(|(n, _)| n).unwrap_or_default();
+    Ok(name)
+}
+
+/// `:skill <add|search|list|remove …>` — manage skill.fish skills interactively.
+/// Errors are returned for the REPL to print; nothing here exits the REPL.
+async fn handle_skill_command(args: &[&str], session: &mut Session) -> Result<()> {
+    match parse_skill_command(args) {
+        SkillCmd::Add(reference) => skill_add(&reference, session).await,
+        SkillCmd::Search(query) => skill_search(&query).await,
+        SkillCmd::List => {
+            skill_list();
+            Ok(())
+        }
+        SkillCmd::Remove(name) => skill_remove(&name, session),
+        SkillCmd::Usage => {
+            println!(
+                "usage: :skill add <owner/name[@version]> | search <query> | list | remove <name>"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// `:skill add <ref>` — fetch a SKILL.md from skill.fish, import it, and reload
+/// the catalog so the model can use it from the next turn.
+async fn skill_add(reference: &str, session: &mut Session) -> Result<()> {
+    let skills_dir = skills_dir_path();
+    let _ = std::fs::create_dir_all(&skills_dir);
+    let r = crate::skillfish::parse_ref(reference)?;
+    println!("\x1b[2mfetching {}/{} from skill.fish …\x1b[0m", r.owner, r.name);
+    let text = crate::skillfish::fetch(&r).await?;
+    let name = install_skill_text(&text, &skills_dir, session)?;
+    println!("\x1b[32m✓\x1b[0m added \x1b[1m{name}\x1b[0m; catalog reloaded.");
+    Ok(())
+}
+
+/// `:skill search <query>` — query the skill.fish catalog and print matches.
+async fn skill_search(query: &str) -> Result<()> {
+    let results = crate::skillfish::search(query).await?;
+    println!("{}", crate::skillfish::print_results_table(query, &results));
+    Ok(())
+}
+
+/// `:skill list` — list the locally installed skills (name + description).
+fn skill_list() {
+    let skills = crate::skills::load(&skills_dir_path());
+    if skills.is_empty() {
+        println!("No skills installed. `:skill search <query>` to find some.");
+        return;
+    }
+    for s in &skills {
+        if s.description.is_empty() {
+            println!("\x1b[1m{}\x1b[0m", s.name);
+        } else {
+            println!("\x1b[1m{}\x1b[0m — {}", s.name, s.description);
+        }
+    }
+}
+
+/// `:skill remove <name>` — delete an installed skill and reload the catalog.
+/// Validates `name` first (no traversal/separators), then removes the directory
+/// (handles both a file and a dir). A missing skill is reported, not an error.
+fn skill_remove(name: &str, session: &mut Session) -> Result<()> {
+    if !valid_skill_name(name) {
+        anyhow::bail!("invalid skill name: {name:?}");
+    }
+    let dir = skills_dir_path().join(name);
+    if !dir.exists() {
+        println!("no skill named \x1b[1m{name}\x1b[0m installed (see :skill list)");
+        return Ok(());
+    }
+    std::fs::remove_dir_all(&dir)
+        .map_err(|e| anyhow::anyhow!("removing {}: {e}", dir.display()))?;
+    session.reload_skills()?;
+    println!("\x1b[32m✓\x1b[0m removed \x1b[1m{name}\x1b[0m; catalog reloaded.");
+    Ok(())
+}
+
 /// Returns true when the REPL should exit.
 async fn handle_colon(
     cmd: &str,
@@ -2268,6 +2407,7 @@ async fn handle_colon(
                  :tell <id> <message>                send instructions to an in-flight coordinator (folded in next round)\n\
                  :attach <id>                        watch a running coordinator live + steer it (typed lines go to it)\n\
                  :detach                             stop watching the attached coordinator (it keeps running)\n\
+                 :skill <add|search|list|remove>     install, search, list, or remove skill.fish skills\n\
                  :rename <name>                      name the session (prefixes the prompt); auto-set to the repo name at startup, bare :rename clears\n\
                  :rewrite <intent>                   AI-rewrite intent into ONE command, prefilled to edit/accept before it runs (alias :rw)\n\
                  :suggest [hint]                     AI-suggest the next command from session context, prefilled to edit/accept before it runs (alias :sg)\n\
@@ -2684,6 +2824,12 @@ async fn handle_colon(
         Some("batch") => handle_batch(parts.next(), parts.next(), session),
         Some("update") => handle_update(pending_update, session).await,
         Some("mcp") => handle_mcp(parts.collect(), session).await,
+        Some("skill" | "skills") => {
+            let rest: Vec<&str> = parts.collect();
+            if let Err(e) = handle_skill_command(&rest, session).await {
+                eprintln!("\x1b[31maish:\x1b[0m {e:#}");
+            }
+        }
         Some("context") => handle_context(backend, session),
         Some("compact") => handle_compact(backend, session),
         Some("memories" | "memory") => handle_memories(parts.next(), session),
@@ -3865,6 +4011,68 @@ mod tests {
         assert!(mentions_troubleshoot("auto-troubleshooting the worker")); // substring
         assert!(!mentions_troubleshoot("trouble with the shooter"));
         assert!(!mentions_troubleshoot("ls -la"));
+    }
+
+    // ---- Phase 2: :skill commands ---------------------------------------
+    #[test]
+    fn dispatch_routes_subcommands() {
+        assert_eq!(parse_skill_command(&["add", "acme/git"]), SkillCmd::Add("acme/git".into()));
+        assert_eq!(
+            parse_skill_command(&["search", "git", "helper"]),
+            SkillCmd::Search("git helper".into())
+        );
+        assert_eq!(parse_skill_command(&["list"]), SkillCmd::List);
+        assert_eq!(parse_skill_command(&["ls"]), SkillCmd::List);
+        assert_eq!(parse_skill_command(&["remove", "demo"]), SkillCmd::Remove("demo".into()));
+        assert_eq!(parse_skill_command(&["rm", "demo"]), SkillCmd::Remove("demo".into()));
+    }
+
+    #[test]
+    fn dispatch_unknown_subcommand_is_usage() {
+        assert_eq!(parse_skill_command(&[]), SkillCmd::Usage);
+        assert_eq!(parse_skill_command(&["bogus"]), SkillCmd::Usage);
+        assert_eq!(parse_skill_command(&["add"]), SkillCmd::Usage); // missing ref
+        assert_eq!(parse_skill_command(&["search"]), SkillCmd::Usage); // empty query
+        assert_eq!(parse_skill_command(&["remove"]), SkillCmd::Usage); // missing name
+    }
+
+    #[test]
+    fn skill_remove_rejects_path_traversal() {
+        // SECURITY: traversal / separators / empty are rejected outright.
+        assert!(!valid_skill_name(""));
+        assert!(!valid_skill_name("."));
+        assert!(!valid_skill_name(".."));
+        assert!(!valid_skill_name("../etc"));
+        assert!(!valid_skill_name("a/b"));
+        assert!(!valid_skill_name("a\\b"));
+        assert!(valid_skill_name("git-helper"));
+        // The handler bails (Err) on a traversal name BEFORE touching disk.
+        let mut session = Session::new().unwrap();
+        assert!(skill_remove("../evil", &mut session).is_err());
+        assert!(skill_remove("a/b", &mut session).is_err());
+    }
+
+    #[test]
+    fn skill_add_reloads_catalog() {
+        // Installing a SKILL.md + reloading surfaces it in the prompt section
+        // (the testable core of `:skill add`, no network).
+        let mut session = Session::new().unwrap();
+        let tmp = std::env::temp_dir().join(format!("aish-skilladd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert_eq!(session.skills_prompt, "");
+        let md = "---\nname: installed\ndescription: Freshly added.\n---\nbody\n";
+        let name = install_skill_text(md, &tmp, &mut session).unwrap();
+        assert_eq!(name, "installed");
+        assert!(session.skills_prompt.contains("installed"), "{}", session.skills_prompt);
+        assert!(session.skills_prompt.contains("Freshly added."));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn skill_in_colon_catalog() {
+        // The catalog carries :skill so the palette + completion offer it.
+        assert!(colon_command_matches("sk").contains(&"skill"));
     }
 
     // ---- ISS-2045: :update running-job skew gate ------------------------
