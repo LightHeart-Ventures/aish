@@ -28,7 +28,7 @@ ref ──parse──▶ SkillRef ──raw_url──▶ HTTPS GET ──validat
 1. **Reference** — a full URL `https://skill.fish/<owner>/<name>[@<version>]`
    or the shorthand `<owner>/<name>[@<version>]`.
 2. **Discovery** — the registry origin defaults to `https://skill.fish` and is
-   overridable with `AISH_SKILLFISH_REGISTRY` (self-hosted mirrors, testing).
+   overridable with `AISH_SKILL_REGISTRY` (self-hosted mirrors, testing).
 3. **Fetch** — `GET {registry}/{owner}/{name}/raw[?version=…]` returns the raw
    `SKILL.md`. The request carries an `aish/<version>` user-agent and a 20s
    timeout.
@@ -80,19 +80,31 @@ in the same local catalog, so the two paths stay consistent.
   description, and on-disk path.
 - **Version pinning** — `<owner>/<name>@<version>` forwards `?version=` to the
   registry, so a pinned skill is reproducible.
-- **Search/discovery** — deferred to the skill.fish website for now: a user
-  browses the catalog there and pastes a reference. A future `aish --skill-search
-  <query>` can hit a registry search endpoint and print matches; the parsing and
-  fetch plumbing here is the foundation for it.
+- **Search/discovery** — `aish --skill-search <query>` hits the registry search
+  endpoint and prints matching `owner/name` references to paste into
+  `--skill-fetch`. The website remains a fallback for richer browsing.
 - **Where it lands** — `~/.aish/skills/<name>/SKILL.md`, the same place a
   hand-authored skill lives, so it participates in the catalog with zero extra
   wiring.
+
+## Bot-challenge handling (Vercel)
+
+skill.fish is served behind Vercel, whose bot protection sometimes answers an
+automated request with **HTTP 429 + `x-vercel-mitigated: challenge`** instead of
+the real payload — most visibly on `:skill search`. aish detects that exact
+pairing (`is_vercel_challenge`) and, rather than surfacing an opaque status
+code, prints actionable guidance with three paths forward:
+
+- `aish --skill-fetch <owner/name>` — fetch a known skill directly.
+- `export AISH_SKILL_REGISTRY=<url>` — point aish at a custom mirror.
+- open <https://skill.fish> — browse/search in a browser as a last resort.
 
 ## Implementation map
 
 | Piece | Location |
 | --- | --- |
 | Reference parsing, fetch, validation, import | `src/skillfish.rs` |
+| Vercel bot-challenge detection (`is_vercel_challenge`) | `src/skillfish.rs` |
 | Shared `SKILL.md` frontmatter parser | `src/skills.rs::parse_frontmatter` |
 | CLI flag `--skill-fetch` + dispatch | `src/main.rs` |
-| Tests (parse, url, security, fetch→import flow) | `src/skillfish.rs` `#[cfg(test)]` |
+| Tests (parse, url, security, fetch→import flow, challenge) | `src/skillfish.rs` `#[cfg(test)]` |
