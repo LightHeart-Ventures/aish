@@ -331,6 +331,9 @@ pub async fn run(
                                     println!("\x1b[33m^C\x1b[0m rewrite cancelled")
                                 }
                                 ReadOutcome::CtrlO => toggle_raw_output(&mut session),
+                                // Shift-Tab is a worker-cycle key, not meaningful
+                                // while editing a candidate — dismiss it.
+                                ReadOutcome::ShiftTab => {}
                                 ReadOutcome::Eof => break,
                                 ReadOutcome::Error(e) => eprintln!("aish: readline error: {e}"),
                             }
@@ -376,6 +379,9 @@ pub async fn run(
                                     println!("\x1b[33m^C\x1b[0m suggestion dismissed")
                                 }
                                 ReadOutcome::CtrlO => toggle_raw_output(&mut session),
+                                // Shift-Tab is a worker-cycle key, not meaningful
+                                // while editing a candidate — dismiss it.
+                                ReadOutcome::ShiftTab => {}
                                 ReadOutcome::Eof => break,
                                 ReadOutcome::Error(e) => eprintln!("aish: readline error: {e}"),
                             }
@@ -484,6 +490,12 @@ pub async fn run(
             ReadOutcome::CtrlO => {
                 // The Ctrl-O key handler requested a raw-output toggle; perform it.
                 toggle_raw_output(&mut session);
+                continue;
+            }
+            ReadOutcome::ShiftTab => {
+                // Shift-Tab cycles the attach cursor across this session's
+                // running coordinators (interactive → worker₁ → … → interactive).
+                cycle_worker(&mut session);
                 continue;
             }
             ReadOutcome::Interrupted => continue, // Ctrl-C: clear the line, loop
@@ -2089,6 +2101,81 @@ fn auto_detach_finished(session: &mut Session) {
     }
 }
 
+/// Pure index math for the Shift-Tab worker cycle (extracted from
+/// [`cycle_worker`] so it's testable without spawning coordinators). `running`
+/// is the ordered list of live coordinator ids; `current` is the
+/// currently-attached id (`None` = the interactive prompt). The cycle is
+/// `interactive(0) → running[0](1) → … → running[n-1](n) → interactive(0)`;
+/// the return is the NEXT slot, where 0 means "interactive" and any `k` in
+/// `1..=running.len()` means `running[k - 1]`. An unknown `current` (e.g. it
+/// just finished and was swept from `running`) restarts the cycle from
+/// interactive. Returns 0 when there is nothing running.
+fn next_attach_index(running: &[String], current: Option<&str>) -> usize {
+    if running.is_empty() {
+        return 0;
+    }
+    let cur_idx = match current {
+        None => 0,
+        Some(id) => running.iter().position(|w| w == id).map_or(0, |i| i + 1),
+    };
+    (cur_idx + 1) % (running.len() + 1)
+}
+
+/// `Shift-Tab` — cycle the interactive session's attach cursor across the
+/// coordinators it has running. The cycle is `interactive → worker₁ → worker₂
+/// → … → interactive`, in `:workers` listing order: each Shift-Tab advances
+/// to the next live coordinator (streaming its activity + steering input to it,
+/// exactly like `:attach`), and one more press past the last detaches back to
+/// the interactive prompt. With a single running worker it toggles attach/detach
+/// of that one; with none it's a no-op with a hint. Finished workers are first
+/// swept by `auto_detach_finished`, then excluded from the cycle so Shift-Tab
+/// never lands on a dead mailbox.
+fn cycle_worker(session: &mut Session) {
+    // Drop the attachment first if the currently-attached coordinator already
+    // finished, so the cursor advances from a clean "interactive" baseline.
+    auto_detach_finished(session);
+
+    // Live (non-terminal) coordinators in listing order — the cycle targets.
+    let running: Vec<String> = session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|w| !matches!(w.status().as_str(), "done" | "failed"))
+        .map(|w| w.id.clone())
+        .collect();
+    if running.is_empty() {
+        println!(
+            "\x1b[2m⇄ no running coordinators to cycle through — :dispatch <task> to launch one\x1b[0m"
+        );
+        return;
+    }
+
+    // The cycle is [interactive, running[0], running[1], …]; index 0 is the
+    // detached interactive prompt. The index math is factored into the pure,
+    // unit-tested `next_attach_index` so it stays verifiable without spawning
+    // real coordinators.
+    let current = session.attached.lock().unwrap().clone();
+    let next_idx = next_attach_index(&running, current.as_deref());
+
+    if next_idx == 0 {
+        // Wrapped past the last worker — back to the interactive prompt.
+        *session.attached.lock().unwrap() = None;
+        println!(
+            "\x1b[2m⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)\x1b[0m"
+        );
+    } else {
+        let run_id = running[next_idx - 1].clone();
+        *session.attached.lock().unwrap() = Some(run_id.clone());
+        let short = crate::batch::short_id(&run_id);
+        println!(
+            "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({}/{} · Shift-Tab to cycle, :detach to stop)\x1b[0m",
+            next_idx,
+            running.len()
+        );
+    }
+}
+
 /// Queue an operator message for an in-flight background coordinator — the
 /// `:tell` / SendMessage channel. The message lands in the durable
 /// `coordinator_messages` mailbox keyed by the run's id and is folded into the
@@ -2420,6 +2507,7 @@ async fn handle_colon(
                  a at a prompt                       always-allow this tool (see :allow)\n\
                  d at a read/write/delete prompt     allow that permission for the whole dir, recursively\n\
                  Ctrl-O                              toggle raw tool output (show/squelch tool results)\n\
+                 Shift-Tab                           cycle attach across running coordinators (interactive → each worker → back)\n\
                  :quit                               exit (also Ctrl-D or `exit`)"
             );
         }
@@ -4001,6 +4089,51 @@ mod tests {
     fn attach_detach_in_catalog() {
         assert_eq!(colon_command_matches("at"), vec!["attach"]);
         assert_eq!(colon_command_matches("det"), vec!["detach"]);
+    }
+
+    // ---- Shift-Tab worker cycle (next_attach_index) ---------------------
+    /// Build an ordered id list the way `cycle_worker` collects live workers.
+    fn ids(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cycle_advances_interactive_through_workers_and_back() {
+        let running = ids(&["w_a", "w_b", "w_c"]);
+        // interactive (None) -> first worker (slot 1)
+        assert_eq!(next_attach_index(&running, None), 1);
+        // w_a (slot 1) -> w_b (slot 2)
+        assert_eq!(next_attach_index(&running, Some("w_a")), 2);
+        // w_b (slot 2) -> w_c (slot 3)
+        assert_eq!(next_attach_index(&running, Some("w_b")), 3);
+        // last worker (slot 3) wraps back to interactive (slot 0)
+        assert_eq!(next_attach_index(&running, Some("w_c")), 0);
+    }
+
+    #[test]
+    fn cycle_single_worker_toggles_attach_detach() {
+        let running = ids(&["w_only"]);
+        // interactive -> the one worker
+        assert_eq!(next_attach_index(&running, None), 1);
+        // the one worker -> back to interactive
+        assert_eq!(next_attach_index(&running, Some("w_only")), 0);
+    }
+
+    #[test]
+    fn cycle_unknown_attachment_restarts_from_interactive() {
+        let running = ids(&["w_a", "w_b"]);
+        // An attachment that is no longer live (swept by auto_detach_finished)
+        // is treated as interactive, so the next press lands on the first
+        // running worker rather than panicking or skipping.
+        assert_eq!(next_attach_index(&running, Some("w_gone")), 1);
+    }
+
+    #[test]
+    fn cycle_with_no_running_workers_is_interactive() {
+        let running: Vec<String> = Vec::new();
+        // Nothing to cycle into — stays at interactive regardless of state.
+        assert_eq!(next_attach_index(&running, None), 0);
+        assert_eq!(next_attach_index(&running, Some("w_a")), 0);
     }
 
     #[test]
