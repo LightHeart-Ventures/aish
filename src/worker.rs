@@ -121,6 +121,18 @@ fn classify_event(line: &str) -> Option<Pulse> {
 /// tail rather than the whole thing.
 const STDERR_TAIL_LINES: usize = 20;
 
+/// Max number of forwardable activity lines retained per worker for an
+/// `:attach` backfill replay. Bounds the per-worker transcript so a chatty
+/// coordinator can't grow the PARENT's memory without limit (the same OOM
+/// discipline as `read_capped`). Paired with [`TRANSCRIPT_MAX_BYTES`];
+/// whichever cap trips first evicts the oldest rows.
+const TRANSCRIPT_MAX_LINES: usize = 1000;
+
+/// Byte budget for the retained per-worker transcript (see
+/// [`TRANSCRIPT_MAX_LINES`]). Oldest rows are evicted once the running total
+/// of `(suffix + text)` bytes exceeds this.
+const TRANSCRIPT_MAX_BYTES: usize = 256 * 1024;
+
 /// Decide whether a single raw coordinator-stderr line is worth forwarding to
 /// the user's terminal, and if so return the cleaned text to forward.
 ///
@@ -251,6 +263,15 @@ pub fn pane_close() -> String {
     "\x1b[36m┗━ coordinator output \x1b[0m\x1b[2m(:output off)\x1b[0m\x1b[36m ━━━━━━━━━━━━━━━\x1b[0m".to_string()
 }
 
+/// Header printed once above an `:attach` backfill: it brackets the
+/// "output to date" replay block that precedes the now-live coordinator
+/// stream. Pure — unit-tested.
+pub fn pane_replay_header(short: &str) -> String {
+    format!(
+        "\x1b[36m\u{250f}\u{2501} {short} \u{2014} output to date \x1b[0m\x1b[2m(replay; live activity follows)\x1b[0m\x1b[36m \u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\x1b[0m"
+    )
+}
+
 /// Stream a child's stderr line by line, forwarding the interesting lines to the
 /// user's terminal live via `announce`, and retaining only the last
 /// `STDERR_TAIL_LINES` raw lines as a bounded ring for the failure message.
@@ -296,21 +317,34 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                 None => {}
             }
         }
-        // Forward when the session-wide toggle is on OR this worker is the one
-        // `:attach`ed to (the per-worker `:attach` stream).
-        let attached_id = attached.lock().ok().and_then(|g| g.clone());
-        let on = should_forward(
-            show_output.load(Ordering::Relaxed),
-            attached_id.as_deref(),
-            label,
-        );
-        if let Some(text) = forward_decision(&line, on) {
-            // Frame each forwarded line as a row of the contained `:output`
-            // pane (a box-drawing left border + label gutter), so coordinator
-            // activity reads as a bordered column rather than blending into
-            // the user's shell scroll. `announce_raw` prints the pre-framed row
-            // (which carries its own colour) over the prompt.
-            crate::tools::announce_raw(&pane_row(label, &text));
+        // Capture the forwardable shape of this line (computed as if output
+        // were ON) so we can BOTH record it into this worker's transcript —
+        // for an `:attach` to replay the output-to-date — AND forward it live
+        // when the gate is open. Recording is independent of the gate, so a
+        // later `:attach` still shows the history even if `:worker-output`
+        // was off the whole time. The single source glyph is already stamped
+        // into `text` (engine::tool_glyph / the 🚀/🐌 narration prefix), so the
+        // transcript suffix is empty and the pane gutter is just `[label]`.
+        if let Some(text) = forward_decision(&line, true) {
+            if let Some(job) = &pulse {
+                job.record_activity("", &text);
+            }
+            // Forward when the session-wide toggle is on OR this worker is the
+            // one `:attach`ed to (the per-worker `:attach` stream).
+            let attached_id = attached.lock().ok().and_then(|g| g.clone());
+            let on = should_forward(
+                show_output.load(Ordering::Relaxed),
+                attached_id.as_deref(),
+                label,
+            );
+            if on {
+                // Frame each forwarded line as a row of the contained
+                // `:output` pane (a box-drawing left border + label gutter) so
+                // coordinator activity reads as a bordered column rather than
+                // blending into the user’s shell scroll. `announce_raw` prints
+                // the pre-framed row (which carries its own colour).
+                crate::tools::announce_raw(&pane_row(label, &text));
+            }
         }
         if tail.len() == STDERR_TAIL_LINES {
             tail.pop_front();
@@ -651,11 +685,73 @@ fn resolve_base_ref(src: &std::path::Path, base: &str) -> String {
     "HEAD".to_string()
 }
 
+/// Max attempts for `git worktree add` (1 initial try + 4 retries). A transient
+/// lock collision on the source repo's `.git` — a CONCURRENT coordinator's
+/// `worktree add`/`remove` holding the lock — clears within tens of ms, so a
+/// short bounded retry beats silently degrading to the shared cwd.
+const WORKTREE_ADD_MAX_ATTEMPTS: u32 = 5;
+
+/// Exponential backoff before retry `n` (1-indexed): `10·2^(n-1)` ms →
+/// 10, 20, 40, 80, 160 ms for n = 1..=5. Pure → unit-tested. No new dependency:
+/// just `Duration` (already imported) + integer math.
+fn worktree_add_backoff(retry: u32) -> Duration {
+    // Saturating shift keeps a pathological `retry` from overflowing/panicking.
+    let shift = retry.saturating_sub(1).min(20);
+    let ms = 10u64.saturating_mul(1u64 << shift);
+    Duration::from_millis(ms)
+}
+
+/// Whether a `git worktree add` stderr looks like a transient LOCK collision
+/// (another live agent / worktree holding the repo lock) rather than a fatal
+/// error (bad ref, branch already exists, …). Used only to enrich the retry log
+/// — the retry itself is attempted on any failure, a lock being the
+/// overwhelmingly common transient cause here. Pure → unit-tested.
+fn is_worktree_lock_error(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("another agent is live")
+        || s.contains("is already used by worktree")
+        || s.contains("cannot lock")
+        || s.contains("unable to lock")
+        || s.contains(".lock")
+}
+
+/// Drive an operation up to `max` attempts with exponential backoff between
+/// tries (see `worktree_add_backoff`), sleeping via the injected `sleep`.
+/// Returns `true` on the first success, `false` once all attempts are spent. No
+/// backoff is taken after the final attempt. The attempt closure and sleeper are
+/// injected so the retry policy is unit-testable without spawning git or really
+/// sleeping. Pure given its closures.
+fn retry_with_backoff<F, S>(max: u32, mut attempt: F, mut sleep: S) -> bool
+where
+    F: FnMut(u32) -> bool,
+    S: FnMut(Duration),
+{
+    for n in 0..max {
+        if attempt(n) {
+            return true;
+        }
+        if n + 1 < max {
+            sleep(worktree_add_backoff(n + 1));
+        }
+    }
+    false
+}
+
 /// Create a fresh worktree for worker `id`, branched from `base` (`"main"` for a
 /// clean trunk baseline, `"head"` to continue the current checkout — see
 /// `resolve_base_ref`). Best-effort: returns `None` (caller falls back to the
-/// shared `src` cwd) if `src` isn't a repo or `git worktree add` fails, so
-/// isolation never blocks a job.
+/// shared `src` cwd) if `src` isn't a repo or `git worktree add` fails.
+///
+/// Retry strategy: `git worktree add` can fail transiently when a CONCURRENT
+/// coordinator holds the source repo's lock (the "another agent is live in this
+/// same working tree" collision). Silently returning `None` there dropped the
+/// worker into the SHARED cwd — defeating the very isolation this provides and
+/// letting parallel coordinators clobber each other's tree. So the add is
+/// retried up to `WORKTREE_ADD_MAX_ATTEMPTS` (5) times with exponential backoff
+/// (10, 20, 40, 80, 160 ms via `worktree_add_backoff`); only after ALL attempts
+/// are exhausted do we fall back to the shared cwd. stderr is captured on each
+/// failure to log the cause (and distinguish a lock collision from a fatal
+/// error). No new dependencies — `Duration` + `std::thread::sleep` only.
 fn create_worktree(src: &std::path::Path, id: &str, base: &str) -> Option<Worktree> {
     if !is_git_repo(src) {
         return None;
@@ -680,18 +776,65 @@ fn create_worktree(src: &std::path::Path, id: &str, base: &str) -> Option<Worktr
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let ok = std::process::Command::new("git")
-        .arg("-C")
-        .arg(src)
-        .args(["worktree", "add", "-b", &branch])
-        .arg(&path)
-        .arg(&start_point)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
+    // Try `git worktree add`, retrying a transient lock collision with
+    // exponential backoff before giving up. stderr is captured per attempt so a
+    // failure can be logged (best-effort) and a lock collision distinguished
+    // from a fatal error. Only after all attempts are exhausted does the caller
+    // fall back to the shared cwd (see this fn's doc comment).
+    let mut last_stderr = String::new();
+    let added = retry_with_backoff(
+        WORKTREE_ADD_MAX_ATTEMPTS,
+        |attempt| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(src)
+                .args(["worktree", "add", "-b", &branch])
+                .arg(&path)
+                .arg(&start_point)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output();
+            match out {
+                Ok(o) if o.status.success() => true,
+                Ok(o) => {
+                    last_stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    // Best-effort retry log (never panics). The final failure is
+                    // reported by the caller alongside the shared-cwd fallback.
+                    if attempt + 1 < WORKTREE_ADD_MAX_ATTEMPTS {
+                        let kind = if is_worktree_lock_error(&last_stderr) {
+                            "lock collision"
+                        } else {
+                            "error"
+                        };
+                        eprintln!(
+                            "aish: git worktree add for {} failed ({kind}, attempt {}/{}); retrying after backoff: {}",
+                            path.display(),
+                            attempt + 1,
+                            WORKTREE_ADD_MAX_ATTEMPTS,
+                            last_stderr,
+                        );
+                    }
+                    false
+                }
+                Err(e) => {
+                    last_stderr = e.to_string();
+                    false
+                }
+            }
+        },
+        std::thread::sleep,
+    );
+    if !added {
+        // All retries exhausted — fall back to the shared cwd. Log the last
+        // cause best-effort so the degradation isn't silent.
+        if !last_stderr.is_empty() {
+            eprintln!(
+                "aish: git worktree add for {} failed after {} attempts; falling back to shared cwd: {}",
+                path.display(),
+                WORKTREE_ADD_MAX_ATTEMPTS,
+                last_stderr,
+            );
+        }
         return None;
     }
     // Pin the base commit for clean-up accounting (tip == base_sha ⇒ no commits).
@@ -1009,6 +1152,13 @@ struct JobInner {
     /// When the worker most recently emitted turn/narration text, for the
     /// magenta turn pulse. `None` until the first narration line.
     last_turn_completion: Option<Instant>,
+    /// Bounded transcript of forwardable activity lines (`(suffix, text)`)
+    /// captured from this worker's stderr REGARDLESS of the `:worker-output`
+    /// gate, so an `:attach` can replay the output-to-date before the live
+    /// stream resumes. Evicted oldest-first past the line/byte caps.
+    transcript: VecDeque<(String, String)>,
+    /// Running byte total of `transcript` entries, for the byte-budget cap.
+    transcript_bytes: usize,
 }
 
 pub type WorkerJobs = Arc<Mutex<Vec<Arc<WorkerJob>>>>;
@@ -1097,6 +1247,31 @@ impl WorkerJob {
     /// Record a turn/narration completion for the magenta turn pulse.
     fn record_turn_completion(&self) {
         self.inner.lock().unwrap().last_turn_completion = Some(Instant::now());
+    }
+    /// Append one forwardable activity line to this worker's bounded
+    /// transcript so an `:attach` can replay the output-to-date before the
+    /// live stream continues. Bounded by BOTH a line count and a byte budget
+    /// ([`TRANSCRIPT_MAX_LINES`]/[`TRANSCRIPT_MAX_BYTES`]) so a chatty
+    /// coordinator can't grow the parent's memory without limit — the oldest
+    /// rows are evicted first.
+    fn record_activity(&self, suffix: &str, text: &str) {
+        let mut i = self.inner.lock().unwrap();
+        i.transcript_bytes += suffix.len() + text.len();
+        i.transcript.push_back((suffix.to_string(), text.to_string()));
+        while i.transcript.len() > TRANSCRIPT_MAX_LINES
+            || i.transcript_bytes > TRANSCRIPT_MAX_BYTES
+        {
+            match i.transcript.pop_front() {
+                Some((s, t)) => i.transcript_bytes -= s.len() + t.len(),
+                None => break,
+            }
+        }
+    }
+
+    /// The retained transcript rows (`(suffix, text)`, oldest-first) captured
+    /// from this worker's activity — replayed on `:attach`.
+    pub fn transcript_rows(&self) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().transcript.iter().cloned().collect()
     }
     /// The most recent badge-pulse event on this worker (tool outcome vs turn
     /// completion — whichever happened later), paired with when it happened.
@@ -1223,6 +1398,8 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
             branch: None,
             last_tool_outcome: None,
             last_turn_completion: None,
+            transcript: VecDeque::new(),
+            transcript_bytes: 0,
         }),
     });
     guard.push(job.clone());
@@ -1574,6 +1751,8 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
+            transcript: VecDeque::new(),
+            transcript_bytes: 0,
             }),
         });
         assert!(job.fetch().contains("still running"));
@@ -1596,6 +1775,8 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
+            transcript: VecDeque::new(),
+            transcript_bytes: 0,
             }),
         });
         job.set_failed("boom".into());
@@ -1807,6 +1988,43 @@ mod tests {
     }
 
     #[test]
+    fn pane_replay_header_brackets_output_to_date() {
+        let h = pane_replay_header("w_a7k3m2pQ");
+        assert!(h.contains('\u{250f}'), "replay header has a top-left corner: {h}");
+        assert!(h.contains("w_a7k3m2pQ"), "replay header names the coordinator: {h}");
+        assert!(h.contains("output to date"), "replay header labels the block: {h}");
+    }
+
+    #[test]
+    fn transcript_records_and_bounds_oldest_first() {
+        let job = Arc::new(WorkerJob {
+            id: "w_tx".into(),
+            task: "t".into(),
+            inner: Mutex::new(JobInner {
+                status: "running".into(),
+                result: None,
+                error: None,
+                displayed: false,
+                branch: None,
+                last_tool_outcome: None,
+                last_turn_completion: None,
+                transcript: VecDeque::new(),
+                transcript_bytes: 0,
+            }),
+        });
+        // Record well past the line cap; the oldest rows are evicted.
+        for n in 0..(TRANSCRIPT_MAX_LINES + 50) {
+            job.record_activity("", &format!("line {n}"));
+        }
+        let rows = job.transcript_rows();
+        assert!(rows.len() <= TRANSCRIPT_MAX_LINES, "line cap enforced: {}", rows.len());
+        // The newest line is retained; the very first is gone.
+        let newest = format!("line {}", TRANSCRIPT_MAX_LINES + 49);
+        assert!(rows.last().unwrap().1.contains(&newest), "newest row kept");
+        assert!(!rows.iter().any(|(_, t)| t == "line 0"), "oldest row evicted");
+    }
+
+    #[test]
     fn worktree_layout_builds_branch_and_path() {
         let root = std::path::Path::new("/wt-root");
         let (branch, path) = worktree_layout(root, "LightHeart-Ventures--aish", "w_a7k3m2pQ");
@@ -1913,6 +2131,8 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
+            transcript: VecDeque::new(),
+            transcript_bytes: 0,
             }),
         });
         let lines = concat!(
@@ -1962,6 +2182,8 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
+            transcript: VecDeque::new(),
+            transcript_bytes: 0,
             }),
         });
         // No events yet.
@@ -1994,6 +2216,8 @@ mod tests {
                     branch: None,
                     last_tool_outcome: None,
                     last_turn_completion: None,
+            transcript: VecDeque::new(),
+            transcript_bytes: 0,
                 }),
             });
             jobs.lock().unwrap().push(j.clone());
@@ -2046,5 +2270,76 @@ mod tests {
         let msg = describe_failure(exited, "goal worker", "boom");
         assert!(msg.contains("exited unsuccessfully"), "got: {msg}");
         assert!(!msg.contains("killed by the OS"), "got: {msg}");
+    }
+
+    #[test]
+    fn worktree_add_backoff_is_exponential_10_to_160() {
+        // Exact schedule required by the fix: 10, 20, 40, 80, 160 ms.
+        let schedule: Vec<u64> =
+            (1..=5).map(|n| worktree_add_backoff(n).as_millis() as u64).collect();
+        assert_eq!(schedule, vec![10, 20, 40, 80, 160]);
+        // A pathological retry index saturates instead of overflowing/panicking.
+        let _ = worktree_add_backoff(1000);
+    }
+
+    #[test]
+    fn is_worktree_lock_error_detects_lock_collisions() {
+        assert!(is_worktree_lock_error(
+            "fatal: another agent is live in this same working tree"
+        ));
+        assert!(is_worktree_lock_error(
+            "fatal: 'wt' is already used by worktree at '/x'"
+        ));
+        assert!(is_worktree_lock_error("error: cannot lock ref"));
+        assert!(is_worktree_lock_error("Unable to lock the index.lock"));
+        // A genuinely fatal, non-lock error is NOT classified as a lock collision.
+        assert!(!is_worktree_lock_error("fatal: invalid reference: origin/nope"));
+        assert!(!is_worktree_lock_error(""));
+    }
+
+    #[test]
+    fn retry_with_backoff_succeeds_on_a_later_attempt() {
+        // Happy path: the operation fails the first two attempts (e.g. a lock
+        // collision) then succeeds on the third. The driver returns true, took
+        // exactly the backoff for the two failed tries (10 + 20 ms), and never
+        // sleeps after the success.
+        let mut attempts = 0u32;
+        let mut sleeps: Vec<u64> = Vec::new();
+        let ok = retry_with_backoff(
+            WORKTREE_ADD_MAX_ATTEMPTS,
+            |_n| {
+                attempts += 1;
+                attempts >= 3 // succeed on the 3rd attempt
+            },
+            |d| sleeps.push(d.as_millis() as u64),
+        );
+        assert!(ok, "must succeed once an attempt returns true");
+        assert_eq!(attempts, 3, "stopped trying as soon as it succeeded");
+        assert_eq!(sleeps, vec![10, 20], "backed off before each retry, not after success");
+    }
+
+    #[test]
+    fn retry_with_backoff_exhausts_then_falls_back() {
+        // Exhaustion path: every attempt fails (a persistent collision). The
+        // driver returns false after exactly MAX attempts, having slept the full
+        // 4-gap schedule (10, 20, 40, 80) — no sleep after the final attempt. A
+        // false return is what makes create_worktree fall back to the shared cwd.
+        let mut attempts = 0u32;
+        let mut sleeps: Vec<u64> = Vec::new();
+        let ok = retry_with_backoff(
+            WORKTREE_ADD_MAX_ATTEMPTS,
+            |_n| {
+                attempts += 1;
+                false // never succeeds
+            },
+            |d| sleeps.push(d.as_millis() as u64),
+        );
+        assert!(!ok, "all attempts failed → false (caller falls back to shared cwd)");
+        assert_eq!(attempts, WORKTREE_ADD_MAX_ATTEMPTS, "tried exactly the max attempts");
+        assert_eq!(
+            sleeps,
+            vec![10, 20, 40, 80],
+            "one backoff between each pair of attempts, none after the last"
+        );
     }
 }

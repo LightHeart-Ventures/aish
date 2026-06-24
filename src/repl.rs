@@ -130,9 +130,12 @@ pub async fn run(
             tokio::spawn(async move {
                 let refs: Vec<&Path> = mcp_config_paths.iter().map(|p| p.as_path()).collect();
                 let host = crate::mcp::McpHost::start(&refs).await;
+                // The interactive REPL is a light-touch router: advertise only
+                // the routing skills (interactive_mcp_skills), keeping the heavy
+                // code-work / agent-dispatch skills for background coordinators.
                 let skills_prompt = crate::skills::render_prompt_section(
                     &crate::skills::load(&skills_dir),
-                    &host.skills(),
+                    &crate::skills::interactive_mcp_skills(&host.skills()),
                 );
                 let _ = tx.send((host, skills_prompt));
             });
@@ -331,6 +334,9 @@ pub async fn run(
                                     println!("\x1b[33m^C\x1b[0m rewrite cancelled")
                                 }
                                 ReadOutcome::CtrlO => toggle_raw_output(&mut session),
+                                // Shift-Tab is a worker-cycle key, not meaningful
+                                // while editing a candidate — dismiss it.
+                                ReadOutcome::ShiftTab => {}
                                 ReadOutcome::Eof => break,
                                 ReadOutcome::Error(e) => eprintln!("aish: readline error: {e}"),
                             }
@@ -376,6 +382,9 @@ pub async fn run(
                                     println!("\x1b[33m^C\x1b[0m suggestion dismissed")
                                 }
                                 ReadOutcome::CtrlO => toggle_raw_output(&mut session),
+                                // Shift-Tab is a worker-cycle key, not meaningful
+                                // while editing a candidate — dismiss it.
+                                ReadOutcome::ShiftTab => {}
                                 ReadOutcome::Eof => break,
                                 ReadOutcome::Error(e) => eprintln!("aish: readline error: {e}"),
                             }
@@ -408,18 +417,6 @@ pub async fn run(
                     db.record("input", &session.cwd.to_string_lossy(), &line);
                 }
 
-                // Auto-offload: any prompt mentioning "troubleshoot" is pushed
-                // to a background coordinator instead of handled inline.
-                // Troubleshooting is open-ended, parallelizable diagnostic work
-                // that shouldn't tie up the prompt — so it always goes to a
-                // full-tool worker whose result auto-delivers. Skipped only when
-                // already inside a coordinator (no nested coordinators).
-                if mentions_troubleshoot(&line) && !session.nested {
-                    println!();
-                    println!("{}", dispatch_coordinator(&line, &mut session));
-                    continue;
-                }
-
                 // Explicit routing escape hatches: `!cmd` forces direct
                 // execution, `?text` forces the model.
                 let (line, route) = split_route(line);
@@ -436,6 +433,23 @@ pub async fn run(
                         Dispatch::Quit => break,
                         Dispatch::NotACommand => {}
                     }
+                }
+
+                // Auto-offload heavy work to a background coordinator. A
+                // model-bound line — one the shell-first dispatch above did NOT run
+                // as a real command, and that wasn't forced inline with `?` — that
+                // carries a troubleshooting or coding/work signal ("troubleshoot",
+                // "write", "refactor", "implement", "fix", "migrate", "setup",
+                // "build", …) is open-ended engineering that shouldn't tie up the
+                // prompt or run inline on the light-touch interactive agent. It
+                // goes to a full-tool worker whose result auto-delivers. Real
+                // commands (`cargo build`, `make`, …) were already peeled off by the
+                // dispatch above, so only genuine prose intent reaches here.
+                // Skipped inside a coordinator (no nested coordinators).
+                if route == Route::Auto && !session.nested && mentions_work_signal(&line) {
+                    println!();
+                    println!("{}", dispatch_coordinator(&line, &mut session));
+                    continue;
                 }
 
                 // Pick up a just-completed MCP connect so this turn has its tools.
@@ -484,6 +498,12 @@ pub async fn run(
             ReadOutcome::CtrlO => {
                 // The Ctrl-O key handler requested a raw-output toggle; perform it.
                 toggle_raw_output(&mut session);
+                continue;
+            }
+            ReadOutcome::ShiftTab => {
+                // Shift-Tab cycles the attach cursor across this session's
+                // running coordinators (interactive → worker₁ → … → interactive).
+                cycle_worker(&mut session);
                 continue;
             }
             ReadOutcome::Interrupted => continue, // Ctrl-C: clear the line, loop
@@ -1946,6 +1966,38 @@ fn mentions_troubleshoot(line: &str) -> bool {
     line.to_ascii_lowercase().contains("troubleshoot")
 }
 
+/// Coding/work signal stems that — like a "troubleshoot" line — mark a prompt as
+/// heavy, open-ended engineering work to auto-offload to a background
+/// coordinator. Matched as a token PREFIX (case-folded) so inflected forms are
+/// caught too: `build` → building/builds, `refactor` → refactoring/refactored,
+/// `migrate` → migrating/migration, `implement` → implementing/implementation,
+/// `fix` → fixing/fixes, `write` → writing/writes, `setup` → setups.
+///
+/// HEURISTIC STOPGAP, like AMBIGUOUS_COMMANDS: a hand-curated stem list, blunt by
+/// nature. It runs only on lines the shell-first dispatch already declined to run
+/// as a real command, so a command argument (`cargo build`, `git fixup`) can't
+/// trip it — only genuine prose intent reaches it. The durable fix is model-based
+/// route preview.
+const WORK_SIGNALS: &[&str] =
+    &["write", "refactor", "implement", "fix", "migrate", "setup", "build"];
+
+/// True when a model-bound line carries a troubleshooting or coding/work signal,
+/// marking it for auto-offload to a background coordinator (see the REPL call
+/// site). `troubleshoot` keeps its original substring match; the WORK_SIGNALS
+/// stems are matched as token prefixes so inflected forms count without
+/// false-matching a signal buried mid-word (`prefix`/`suffix` never START a
+/// token with a signal stem, so they don't match).
+fn mentions_work_signal(line: &str) -> bool {
+    if mentions_troubleshoot(line) {
+        return true;
+    }
+    let lower = line.to_ascii_lowercase();
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|tok| !tok.is_empty())
+        .any(|tok| WORK_SIGNALS.iter().any(|sig| tok.starts_with(sig)))
+}
+
 /// Launch a background coordinator for `task`, returning the status line to
 /// print. Shared by the `:dispatch` command and the automatic "troubleshoot"
 /// auto-offload so both spawn workers identically (full toolset, shared cwd,
@@ -2029,12 +2081,54 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
             println!(
                 "\x1b[1;33m⇄ attached to {short}\x1b[0m — streaming its activity live; what you type is steered to it. \x1b[2m:detach to stop.\x1b[0m"
             );
+            // Replay the input + activity captured so far, THEN the live
+            // stream continues (the worker's forwarder now sees this session
+            // as attached and forwards every subsequent line).
+            backfill_attached(run_id, session);
         }
         many => {
             println!("'{id}' matches {} live coordinators — be more specific:", many.len());
             for rid in many {
                 println!("  {rid}");
             }
+        }
+    }
+}
+
+/// On `:attach`, replay the attached coordinator's input + activity captured
+/// so far (its bounded transcript) so the operator sees the full context
+/// BEFORE the live stream continues. A no-op when the worker can't be found.
+fn backfill_attached(run_id: &str, session: &Session) {
+    let job = session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|w| w.id == *run_id)
+        .cloned();
+    let Some(job) = job else { return };
+    let short = crate::batch::short_id(run_id);
+    println!("{}", crate::worker::pane_replay_header(&short));
+    // The task is the coordinator's "input". The `\u{b7}task` marker is folded
+    // into the row text \u{2014} `pane_row` carries only `[label]` in its gutter now
+    // (the single-glyph convention; the source glyph rides inside the text).
+    println!("{}", crate::worker::pane_row(run_id, &format!("·task {}", job.task)));
+    let rows = job.transcript_rows();
+    if rows.is_empty() {
+        println!(
+            "{}",
+            crate::worker::pane_row(
+                run_id,
+                "\u{b7}thinking (no activity captured yet \u{2014} live output follows)",
+            )
+        );
+    } else {
+        // The transcript suffix is empty under the single-glyph convention\u{2014}
+        // the source glyph is already stamped in `text`. Fold any legacy suffix
+        // into the row text so the gutter stays a bare `[label]`.
+        for (suffix, text) in rows {
+            let row = if suffix.is_empty() { text } else { format!("{suffix} {text}") };
+            println!("{}", crate::worker::pane_row(run_id, &row));
         }
     }
 }
@@ -2085,6 +2179,81 @@ fn auto_detach_finished(session: &mut Session) {
         let short = crate::batch::short_id(&run_id);
         println!(
             "\x1b[2m⇄ {short} finished — detached. :result {short} to view its result.\x1b[0m"
+        );
+    }
+}
+
+/// Pure index math for the Shift-Tab worker cycle (extracted from
+/// [`cycle_worker`] so it's testable without spawning coordinators). `running`
+/// is the ordered list of live coordinator ids; `current` is the
+/// currently-attached id (`None` = the interactive prompt). The cycle is
+/// `interactive(0) → running[0](1) → … → running[n-1](n) → interactive(0)`;
+/// the return is the NEXT slot, where 0 means "interactive" and any `k` in
+/// `1..=running.len()` means `running[k - 1]`. An unknown `current` (e.g. it
+/// just finished and was swept from `running`) restarts the cycle from
+/// interactive. Returns 0 when there is nothing running.
+fn next_attach_index(running: &[String], current: Option<&str>) -> usize {
+    if running.is_empty() {
+        return 0;
+    }
+    let cur_idx = match current {
+        None => 0,
+        Some(id) => running.iter().position(|w| w == id).map_or(0, |i| i + 1),
+    };
+    (cur_idx + 1) % (running.len() + 1)
+}
+
+/// `Shift-Tab` — cycle the interactive session's attach cursor across the
+/// coordinators it has running. The cycle is `interactive → worker₁ → worker₂
+/// → … → interactive`, in `:workers` listing order: each Shift-Tab advances
+/// to the next live coordinator (streaming its activity + steering input to it,
+/// exactly like `:attach`), and one more press past the last detaches back to
+/// the interactive prompt. With a single running worker it toggles attach/detach
+/// of that one; with none it's a no-op with a hint. Finished workers are first
+/// swept by `auto_detach_finished`, then excluded from the cycle so Shift-Tab
+/// never lands on a dead mailbox.
+fn cycle_worker(session: &mut Session) {
+    // Drop the attachment first if the currently-attached coordinator already
+    // finished, so the cursor advances from a clean "interactive" baseline.
+    auto_detach_finished(session);
+
+    // Live (non-terminal) coordinators in listing order — the cycle targets.
+    let running: Vec<String> = session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|w| !matches!(w.status().as_str(), "done" | "failed"))
+        .map(|w| w.id.clone())
+        .collect();
+    if running.is_empty() {
+        println!(
+            "\x1b[2m⇄ no running coordinators to cycle through — :dispatch <task> to launch one\x1b[0m"
+        );
+        return;
+    }
+
+    // The cycle is [interactive, running[0], running[1], …]; index 0 is the
+    // detached interactive prompt. The index math is factored into the pure,
+    // unit-tested `next_attach_index` so it stays verifiable without spawning
+    // real coordinators.
+    let current = session.attached.lock().unwrap().clone();
+    let next_idx = next_attach_index(&running, current.as_deref());
+
+    if next_idx == 0 {
+        // Wrapped past the last worker — back to the interactive prompt.
+        *session.attached.lock().unwrap() = None;
+        println!(
+            "\x1b[2m⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)\x1b[0m"
+        );
+    } else {
+        let run_id = running[next_idx - 1].clone();
+        *session.attached.lock().unwrap() = Some(run_id.clone());
+        let short = crate::batch::short_id(&run_id);
+        println!(
+            "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({}/{} · Shift-Tab to cycle, :detach to stop)\x1b[0m",
+            next_idx,
+            running.len()
         );
     }
 }
@@ -2420,6 +2589,7 @@ async fn handle_colon(
                  a at a prompt                       always-allow this tool (see :allow)\n\
                  d at a read/write/delete prompt     allow that permission for the whole dir, recursively\n\
                  Ctrl-O                              toggle raw tool output (show/squelch tool results)\n\
+                 Shift-Tab                           cycle attach across running coordinators (interactive → each worker → back)\n\
                  :quit                               exit (also Ctrl-D or `exit`)"
             );
         }
@@ -4003,6 +4173,51 @@ mod tests {
         assert_eq!(colon_command_matches("det"), vec!["detach"]);
     }
 
+    // ---- Shift-Tab worker cycle (next_attach_index) ---------------------
+    /// Build an ordered id list the way `cycle_worker` collects live workers.
+    fn ids(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cycle_advances_interactive_through_workers_and_back() {
+        let running = ids(&["w_a", "w_b", "w_c"]);
+        // interactive (None) -> first worker (slot 1)
+        assert_eq!(next_attach_index(&running, None), 1);
+        // w_a (slot 1) -> w_b (slot 2)
+        assert_eq!(next_attach_index(&running, Some("w_a")), 2);
+        // w_b (slot 2) -> w_c (slot 3)
+        assert_eq!(next_attach_index(&running, Some("w_b")), 3);
+        // last worker (slot 3) wraps back to interactive (slot 0)
+        assert_eq!(next_attach_index(&running, Some("w_c")), 0);
+    }
+
+    #[test]
+    fn cycle_single_worker_toggles_attach_detach() {
+        let running = ids(&["w_only"]);
+        // interactive -> the one worker
+        assert_eq!(next_attach_index(&running, None), 1);
+        // the one worker -> back to interactive
+        assert_eq!(next_attach_index(&running, Some("w_only")), 0);
+    }
+
+    #[test]
+    fn cycle_unknown_attachment_restarts_from_interactive() {
+        let running = ids(&["w_a", "w_b"]);
+        // An attachment that is no longer live (swept by auto_detach_finished)
+        // is treated as interactive, so the next press lands on the first
+        // running worker rather than panicking or skipping.
+        assert_eq!(next_attach_index(&running, Some("w_gone")), 1);
+    }
+
+    #[test]
+    fn cycle_with_no_running_workers_is_interactive() {
+        let running: Vec<String> = Vec::new();
+        // Nothing to cycle into — stays at interactive regardless of state.
+        assert_eq!(next_attach_index(&running, None), 0);
+        assert_eq!(next_attach_index(&running, Some("w_a")), 0);
+    }
+
     #[test]
     fn mentions_troubleshoot_is_case_insensitive_substring() {
         assert!(mentions_troubleshoot("troubleshoot the build"));
@@ -4011,6 +4226,33 @@ mod tests {
         assert!(mentions_troubleshoot("auto-troubleshooting the worker")); // substring
         assert!(!mentions_troubleshoot("trouble with the shooter"));
         assert!(!mentions_troubleshoot("ls -la"));
+    }
+
+    #[test]
+    fn mentions_work_signal_matches_coding_intents() {
+        // The new coding/work signals, including inflected forms (token-prefix).
+        assert!(mentions_work_signal("write a parser for this grammar"));
+        assert!(mentions_work_signal("refactor the engine loop"));
+        assert!(mentions_work_signal("refactoring the engine loop"));
+        assert!(mentions_work_signal("implement the new routing"));
+        assert!(mentions_work_signal("fix the failing test"));
+        assert!(mentions_work_signal("fixing the flaky worker"));
+        assert!(mentions_work_signal("migrate the schema to v2"));
+        assert!(mentions_work_signal("setup the CI pipeline"));
+        assert!(mentions_work_signal("build me a login page"));
+        assert!(mentions_work_signal("building a small CLI"));
+        // troubleshoot is folded in, and matching is case-insensitive.
+        assert!(mentions_work_signal("troubleshoot the build"));
+        assert!(mentions_work_signal("FIX the bug"));
+    }
+
+    #[test]
+    fn mentions_work_signal_ignores_substrings_and_plain_prose() {
+        // A signal stem buried mid-word (not starting a token) does not match.
+        assert!(!mentions_work_signal("show me the prefix and suffix"));
+        assert!(!mentions_work_signal("what is the capital of texas"));
+        assert!(!mentions_work_signal("who is on this machine"));
+        assert!(!mentions_work_signal("ls -la"));
     }
 
     // ---- Phase 2: :skill commands ---------------------------------------
