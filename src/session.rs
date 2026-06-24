@@ -229,10 +229,11 @@ impl Session {
     /// Re-scan the on-disk skills directory and rebuild `skills_prompt` so a
     /// skill added or removed mid-session (via the `:skill` commands) is
     /// advertised to the model from the very next turn — no restart. The MCP
-    /// skills currently published by the connected servers are preserved (read
-    /// fresh from the live `McpHost`), so reloading the local catalog never drops
-    /// the MCP half of the prompt. Resolves the directory exactly like startup
-    /// does (`~/.aish/skills`); the heavy lifting is in `reload_skills_from`.
+    /// half is read fresh from the live `McpHost` and narrowed to the interactive
+    /// routing subset (`interactive_mcp_skills`), so reloading the local catalog
+    /// neither drops the MCP routing skills nor re-exposes the heavy code-work
+    /// skills the interactive agent must not see. Resolves the directory exactly
+    /// like startup does (`~/.aish/skills`); the work is in `reload_skills_from`.
     pub fn reload_skills(&mut self) -> Result<()> {
         self.reload_skills_from(&default_skills_dir());
         Ok(())
@@ -240,10 +241,18 @@ impl Session {
 
     /// `reload_skills` against an explicit directory — the testable core. Loads
     /// the local catalog from `skills_dir` and re-renders `skills_prompt`,
-    /// keeping the live MCP skills alongside it.
+    /// keeping the interactive routing subset of the live MCP skills alongside it.
     pub fn reload_skills_from(&mut self, skills_dir: &std::path::Path) {
         let local = crate::skills::load(skills_dir);
-        let mcp = self.mcp.skills();
+        // `reload_skills` is invoked ONLY from the interactive `:skill add` /
+        // `:skill remove` path — never by a background coordinator (which builds
+        // its skills_prompt once, from the full catalog, in `main`). So a reload
+        // must re-apply the SAME light-touch filter the initial interactive
+        // render does (`interactive_mcp_skills`, see repl::run): advertise only
+        // the routing skills and keep the heavy code-work / agent-dispatch skills
+        // for coordinators. Without this, a mid-session `:skill` reload would
+        // silently re-expose the full MCP catalog to the interactive agent.
+        let mcp = crate::skills::interactive_mcp_skills(&self.mcp.skills());
         self.skills_prompt = crate::skills::render_prompt_section(&local, &mcp);
     }
 
