@@ -2649,7 +2649,7 @@ fn valid_skill_name(name: &str) -> bool {
 /// core of `:skill add` — no network, so the reload behavior is unit-tested
 /// directly.
 fn install_skill_text(text: &str, skills_dir: &Path, session: &mut Session) -> Result<String> {
-    crate::skillfish::import(text, skills_dir)?;
+    crate::skill_provider::import(text, skills_dir)?;
     session.reload_skills_from(skills_dir);
     let name = crate::skills::parse_frontmatter(text).map(|(n, _)| n).unwrap_or_default();
     Ok(name)
@@ -2680,9 +2680,9 @@ async fn handle_skill_command(args: &[&str], session: &mut Session) -> Result<()
 async fn skill_add(reference: &str, session: &mut Session) -> Result<()> {
     let skills_dir = skills_dir_path();
     let _ = std::fs::create_dir_all(&skills_dir);
-    let r = crate::skillfish::parse_ref(reference)?;
+    let r = crate::skill_provider::parse_ref(reference)?;
     println!("\x1b[2mfetching {}/{} from skill.fish …\x1b[0m", r.owner, r.name);
-    let text = crate::skillfish::fetch(&r).await?;
+    let text = crate::skill_provider::fetch(&r).await?;
     let name = install_skill_text(&text, &skills_dir, session)?;
     println!("\x1b[32m✓\x1b[0m added \x1b[1m{name}\x1b[0m; catalog reloaded.");
     Ok(())
@@ -2690,8 +2690,8 @@ async fn skill_add(reference: &str, session: &mut Session) -> Result<()> {
 
 /// `:skill search <query>` — query the skill.fish catalog and print matches.
 async fn skill_search(query: &str) -> Result<()> {
-    let results = crate::skillfish::search(query).await?;
-    println!("{}", crate::skillfish::print_results_table(query, &results));
+    let results = crate::skill_provider::search(query).await?;
+    println!("{}", crate::skill_provider::print_results_table(query, &results));
     Ok(())
 }
 
