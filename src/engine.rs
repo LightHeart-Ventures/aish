@@ -774,11 +774,17 @@ fn describe_call(call: &crate::backend::ToolCall) -> String {
     let a = &call.args;
     match call.name.as_str() {
         "run_program" | "run_interactive" => {
-            let args: Vec<&str> = a["args"]
+            let program = a["program"].as_str().unwrap_or("?");
+            let mut args: Vec<&str> = a["args"]
                 .as_array()
                 .map(|v| v.iter().filter_map(|x| x.as_str()).collect())
                 .unwrap_or_default();
-            let argv = format!("{} {}", a["program"].as_str().unwrap_or("?"), args.join(" "));
+            // Mirror tools::dedup_program_argv so the activity line shows the
+            // command aish will actually run, not the model's doubled argv.
+            if args.first() == Some(&program) {
+                args.remove(0);
+            }
+            let argv = format!("{} {}", program, args.join(" "));
             if call.name == "run_interactive" {
                 format!("{} (interactive — your terminal)", argv.trim())
             } else {
