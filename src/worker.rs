@@ -262,8 +262,8 @@ fn decorate_activity_source(line: &str) -> String {
 /// `:worker-output on` opens the full live stream:
 /// - `💭` thinking notice (entered the model-reasoning phase) → `[label·thinking] …`
 /// - `🔧` tool activity (the `✓/✗ 🔧` RESULT line, once per call) → `[label] …`
-/// - `🗨` turn text (a standard model call) → `[label·standard] …`
-/// - `📦` batch fan-out notice → `[label·batch] …`
+/// - `🗨` turn text (a standard model call) → `[label🚀] …`
+/// - `📦` batch fan-out notice → `[label🐌] …`
 fn forward_decision(line: &str, show_output: bool) -> Option<(&'static str, String)> {
     if !show_output {
         // Default: keep background coordinators quiet. The job's liveness is
@@ -280,10 +280,10 @@ fn forward_decision(line: &str, show_output: bool) -> Option<(&'static str, Stri
         return Some(("·thinking", text));
     }
     if let Some(text) = strip_sentinel(line, "🗨") {
-        return Some(("·standard", text));
+        return Some(("🚀", text));
     }
     if let Some(text) = strip_sentinel(line, "📦") {
-        return Some(("·batch", text));
+        return Some(("🐌", text));
     }
     None
 }
@@ -1774,11 +1774,11 @@ mod tests {
         );
         assert_eq!(
             forward_decision(turn, true),
-            Some(("·standard", "planning the migration".to_string()))
+            Some(("🚀", "planning the migration".to_string()))
         );
         assert_eq!(
             forward_decision(batch, true),
-            Some(("·batch", "fanned 3 sub-task(s) out".to_string()))
+            Some(("🐌", "fanned 3 sub-task(s) out".to_string()))
         );
         // Noise (banner/blank) is dropped even when output is ON.
         assert_eq!(forward_decision(banner, true), None);
