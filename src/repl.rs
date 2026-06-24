@@ -2449,12 +2449,21 @@ fn cycle_worker(session: &mut Session) {
     } else {
         let run_id = running[next_idx - 1].clone();
         *session.attached.lock().unwrap() = Some(run_id.clone());
+        // Live worker: clear any stale review marker so a later finish is
+        // announced exactly once (mirrors `attach_worker`'s live branch).
+        *session.attach_review_announced.lock().unwrap() = None;
         let short = crate::batch::short_id(&run_id);
         println!(
             "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({}/{} · Shift-Tab to cycle, :detach to stop)\x1b[0m",
             next_idx,
             running.len()
         );
+        // Replay the input + activity captured so far, THEN the live stream
+        // continues — the same backfill `:attach` performs. The worker's
+        // forwarder now sees this session as attached and forwards every
+        // subsequent line, so the operator gets the full session transcript
+        // first and live output after, instead of only future output.
+        backfill_attached(&run_id, session);
     }
 }
 /// Queue an operator message for an in-flight background coordinator — the
