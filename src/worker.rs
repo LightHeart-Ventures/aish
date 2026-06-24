@@ -91,7 +91,7 @@ pub enum Pulse {
 /// status glyph) is the tool *beginning*, not an outcome → `None`. A `🗨` line is
 /// turn narration (`engine::emit_narration`) → a turn-completion pulse.
 fn classify_event(line: &str) -> Option<Pulse> {
-    if line.contains('🔧') || line.contains('⚙') {
+    if line.contains('🔧') || line.contains('🤝') {
         if line.contains('✓') {
             return Some(Pulse::ToolOk);
         }
@@ -128,7 +128,7 @@ const STDERR_TAIL_LINES: usize = 20;
 /// and the outer dim `\x1b[2m…\x1b[0m` wrapper, so `announce` (which re-wraps in
 /// dim) doesn't double-wrap.
 fn clean_activity_line(raw: &str) -> Option<String> {
-    if !raw.contains('🔧') && !raw.contains('⚙') {
+    if !raw.contains('🔧') && !raw.contains('🤝') {
         return None;
     }
     // Forward only the RESULT line (it carries the ✓/✗ outcome). The bare START
@@ -160,7 +160,7 @@ fn strip_sentinel(raw: &str, mark: &str) -> Option<String> {
 /// surfaced in the `:output on` activity stream. The tool name is normalised to
 /// lowercase, then resolved with EXACT matches first and a SUBSTRING fallback:
 ///
-///   * `escalate`                        → 🧠 (model escalation)
+///   * `escalate`                        → 🤝 (escalate consult / hand-off)
 ///   * `run_in_background`               → 🔄 (background coordinator)
 ///   * `read_file` / `write_file`        → 📄 (file read/write)
 ///   * `delete_file` / `remove_file`     → 🗑️ (file deletion)
@@ -184,7 +184,7 @@ fn source_emoji(tool_name: &str) -> &'static str {
     }
     // Exact matches first (normalised lowercase tool name).
     match n {
-        "escalate" => return "🧠",
+        "escalate" => return "🤝",
         "run_in_background" => return "🔄",
         "read_file" | "write_file" => return "📄",
         "delete_file" | "remove_file" => return "🗑️",
@@ -197,7 +197,7 @@ fn source_emoji(tool_name: &str) -> &'static str {
     // token a coordinator emits for a local read) still falls through to the
     // default gear rather than over-matching a short fragment.
     if n.contains("escalate") {
-        return "🧠";
+        return "🤝";
     }
     if n.contains("run_in_background") {
         return "🔄";
@@ -239,7 +239,7 @@ fn activity_tool_token(line: &str) -> &str {
 /// purely PREPENDED — backward-compatible visual sugar that carries no data.
 /// Only the `:output on` forwarding path calls this (see `forward_decision`), so
 /// the emoji appears solely when worker output is being streamed; a line that
-/// already carries its own source marker (the ⚙️ `escalate` gear, no wrench) is
+/// already carries its own source marker (the 🤝 `escalate` handshake, no wrench) is
 /// left untouched so it isn't double-marked.
 fn decorate_activity_source(line: &str) -> String {
     if !line.contains('🔧') {
@@ -1834,7 +1834,7 @@ mod tests {
         assert_eq!(source_emoji("mcp_atum_list_tools"), "🔧");
         assert_eq!(source_emoji("atum_get_project_task"), "🔧");
         // Per-tool local glyphs (exact, normalised matches).
-        assert_eq!(source_emoji("escalate"), "🧠");
+        assert_eq!(source_emoji("escalate"), "🤝");
         assert_eq!(source_emoji("run_in_background"), "🔄");
         assert_eq!(source_emoji("read_file"), "📄");
         assert_eq!(source_emoji("write_file"), "📄");
@@ -1894,11 +1894,11 @@ mod tests {
             decorate_activity_source("✗ 🔧 write x"),
             "⚙️ ✗ 🔧 write x"
         );
-        // A line with no wrench (e.g. an escalate ⚙️ line) is left untouched
+        // A line with no wrench (e.g. an escalate 🤝 line) is left untouched
         // so it isn't double-marked.
         assert_eq!(
-            decorate_activity_source("✓ ⚙️ escalate → stronger model: x"),
-            "✓ ⚙️ escalate → stronger model: x"
+            decorate_activity_source("✓ 🤝 escalate: x"),
+            "✓ 🤝 escalate: x"
         );
     }
 

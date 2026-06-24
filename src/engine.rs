@@ -241,15 +241,14 @@ pub async fn run_turn(
         // well-formed), then break the turn with a tagged `loop-detected` stop.
         let mut loop_break: Option<(String, usize)> = None;
         for call in &turn.tool_calls {
-            // Prefix the per-tool glyph (🔧 for most tools, ⚙️ for an `escalate`
-            // hand-off to the stronger model) so it travels with the desc through
-            // the running spinner, the finished ✓/✗ line, and the retroactive
-            // reveal — every place that renders the activity line. Flatten ONLY
-            // the description (collapses embedded newlines from e.g. a
-            // `gh pr create --body` payload); the glyph + its spacing is joined
-            // afterward so the gear's trailing space — its visual gap before the
-            // desc, since the gear renders narrow unlike the double-width wrench —
-            // isn't collapsed away by the flatten.
+            // Prefix the per-tool glyph (🔧 for most tools, 🤝 for an `escalate`
+            // consult) so it travels with the desc through the running spinner,
+            // the finished ✓/✗ line, and the retroactive reveal — every place
+            // that renders the activity line. Flatten ONLY the description
+            // (collapses embedded newlines from e.g. a `gh pr create --body`
+            // payload); the glyph is joined afterward with a single space, like
+            // the wrench, since the handshake is double-width and needs no extra
+            // spacer.
             let desc = format!("{} {}", tool_glyph(&call.name), flatten_ws(&describe_call(call)));
 
             // ── Same-call repeat guard (loop detection). A tool call whose exact
@@ -571,7 +570,7 @@ impl Drop for Spinner {
 /// Running-tool indicator: a braille spinner turning to the LEFT of a steady
 /// tool glyph while the tool executes — the tool-execution phase, distinct from
 /// the model's "thinking" spinner. The glyph stays put (it's *our* tool marker:
-/// 🔧 for most tools, ⚙️ for an `escalate` hand-off) and only the spinner to its
+/// 🔧 for most tools, 🤝 for an `escalate` consult) and only the spinner to its
 /// left animates, mirroring the look of the thinking icon (same braille frames,
 /// cyan glyph). Keeps the dim, two-space-indented style of the static line it
 /// replaces. TTY-gated; on `finish` the animation is erased and a static result
@@ -598,20 +597,16 @@ const TOOL_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦"
 const PREFIX_COLS: usize = 4;
 
 /// The steady glyph shown to the RIGHT of the animated braille spinner on a
-/// tool-activity line. Most tools use the 🔧 wrench; `escalate` uses a ⚙️ gear so
-/// a hand-off to the stronger model reads as its own distinct event — a static
-/// escalation marker with the live "thinking" spinner to its left — rather than
-/// looking like just another tool call. Baked into the desc at the call site so
-/// it travels through the running spinner, the ✓/✗ finish line, and the reveal.
-///
-/// The gear carries a TRAILING SPACE: it renders as a narrow (single-column)
-/// glyph in most terminals — unlike the double-width wrench — so without the
-/// extra space the desc crowds right up against it. The call site flattens only
-/// the description (not the glyph), so this space survives to give the gear a
-/// clear gap before the text.
+/// tool-activity line. Most tools use the 🔧 wrench; `escalate` uses a 🤝
+/// handshake so a consult reads as its own distinct event — a collaborative
+/// hand-off with the live "thinking" spinner to its left — rather than looking
+/// like just another tool call. Baked into the desc at the call site so it
+/// travels through the running spinner, the ✓/✗ finish line, and the reveal.
+/// The handshake is double-width like the wrench, so it needs no trailing-space
+/// spacer: the call site joins it to the desc with a single space.
 fn tool_glyph(tool_name: &str) -> &'static str {
     match tool_name {
-        "escalate" => "⚙\u{fe0f} ", // gear + VS16 emoji-presentation selector + spacer
+        "escalate" => "🤝", // handshake — a consult, distinct from the 🔧 wrench
         _ => "🔧",
     }
 }
@@ -807,7 +802,7 @@ fn describe_call(call: &crate::backend::ToolCall) -> String {
         ),
         "background_status" => "background status".to_string(),
         "escalate" => format!(
-            "escalate → stronger model: {}",
+            "escalate: {}",
             crate::batch::one_line(a["task"].as_str().unwrap_or("?"))
         ),
         other => other.to_string(),
@@ -868,23 +863,21 @@ mod tests {
     }
 
     #[test]
-    fn tool_glyph_escalate_is_gear_others_wrench() {
-        // The escalate hand-off gets the static gear (with VS16) plus a trailing
-        // spacer, distinct from the wrench every other tool shows — so it reads
-        // as its own event and the narrow gear keeps a clear gap before the desc.
-        assert_eq!(tool_glyph("escalate"), "⚙\u{fe0f} ");
+    fn tool_glyph_escalate_is_handshake_others_wrench() {
+        // The escalate consult gets the handshake, distinct from the wrench every
+        // other tool shows — so it reads as its own collaborative event.
+        assert_eq!(tool_glyph("escalate"), "🤝");
         assert_eq!(tool_glyph("run_program"), "🔧");
         assert_eq!(tool_glyph("read_file"), "🔧");
         assert_eq!(tool_glyph("mcp__atum__list_tools"), "🔧");
     }
 
     #[test]
-    fn escalate_activity_line_uses_gear_glyph() {
-        // The desc the spinner/finish/reveal all render carries the gear, and the
-        // finished line keeps the colorized status mark in front of it. The call
-        // site flattens only the description and joins the glyph with a separating
-        // space, so the gear's own trailing spacer survives → a clear gap (two
-        // spaces total) between the narrow gear and the text.
+    fn escalate_activity_line_uses_handshake_glyph() {
+        // The desc the spinner/finish/reveal all render carries the handshake, and
+        // the finished line keeps the colorized status mark in front of it. The
+        // handshake is double-width like the wrench, joined to the desc with a
+        // single space.
         let call = crate::backend::ToolCall {
             id: "t".into(),
             name: "escalate".into(),
@@ -892,13 +885,13 @@ mod tests {
         };
         let desc = format!("{} {}", tool_glyph(&call.name), flatten_ws(&describe_call(&call)));
         assert!(
-            desc.starts_with("⚙\u{fe0f}  escalate → stronger model:"),
-            "gear must keep a clear gap before the desc: {desc}"
+            desc.starts_with("🤝 escalate:"),
+            "escalate line must lead with the handshake: {desc}"
         );
         assert!(!desc.contains('🔧'), "escalate must not show the wrench: {desc}");
         let done = tool_result_line(&desc, false);
         assert!(done.contains("\x1b[32m✓\x1b[0m"), "done line should be green-checked: {done}");
-        assert!(done.contains("⚙\u{fe0f}"), "done line keeps the gear: {done}");
+        assert!(done.contains("🤝"), "done line keeps the handshake: {done}");
     }
 
     #[test]
