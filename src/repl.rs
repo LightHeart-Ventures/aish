@@ -449,7 +449,7 @@ pub async fn run(
                 // Skipped inside a coordinator (no nested coordinators).
                 if route == Route::Auto && !session.nested && mentions_work_signal(&line) {
                     println!();
-                    println!("{}", dispatch_coordinator(&line, &mut session));
+                    dispatch_and_attach(&line, &mut session);
                     continue;
                 }
 
@@ -619,7 +619,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("compact", "compact history, offload to memory"),
     ("context", "show context-window usage"),
     ("detach", "stop watching the attached coordinator"),
-    ("dispatch", "launch a background coordinator"),
+    ("dispatch", "launch a background coordinator + auto-attach"),
     ("goal", "pursue a goal in the background"),
     ("help", "show command help"),
     ("jobs", "list background jobs"),
@@ -2004,20 +2004,46 @@ fn mentions_work_signal(line: &str) -> bool {
 /// auto-offload so both spawn workers identically (full toolset, shared cwd,
 /// result auto-delivers). Guards: refuses an empty task, refuses to nest inside
 /// a coordinator, and refuses when the active backend has no credential.
-fn dispatch_coordinator(task: &str, session: &mut Session) -> String {
+/// The outcome of attempting to launch a background coordinator: the human
+/// message to print, plus the new coordinator id to auto-attach to when a child
+/// was actually spawned. A guard failure (empty task, nested, no credential,
+/// missing binary) carries `id: None` so the caller prints the message and does
+/// NOT attach.
+struct Dispatched {
+    /// `Some(run_id)` when a coordinator was spawned (the id to auto-attach to);
+    /// `None` on any guard / spawn failure.
+    id: Option<String>,
+    /// The line to print to the operator.
+    message: String,
+}
+
+impl Dispatched {
+    /// A guard failure / no-spawn outcome: just a message, nothing to attach to.
+    fn message_only(message: impl Into<String>) -> Self {
+        Self { id: None, message: message.into() }
+    }
+}
+
+fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
     let task = task.trim();
     if task.is_empty() {
-        return "usage: :dispatch <task>   — launch a background coordinator for <task>".to_string();
+        return Dispatched::message_only(
+            "usage: :dispatch <task>   — launch a background coordinator for <task>",
+        );
     }
     if session.nested {
-        return "can't dispatch from inside a coordinator (no nested coordinators)".to_string();
+        return Dispatched::message_only(
+            "can't dispatch from inside a coordinator (no nested coordinators)",
+        );
     }
     let no_credential = match session.backend_kind.as_str() {
         "grok" => !crate::backend::grok::credential_available(&session.env),
         _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
     };
     if no_credential {
-        return "no credential for the active backend — Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY".to_string();
+        return Dispatched::message_only(
+            "no credential for the active backend — Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY",
+        );
     }
     match std::env::current_exe() {
         Ok(exe) => {
@@ -2045,12 +2071,34 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> String {
                 attached: session.attached.clone(),
             };
             let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
-            format!(
+            let message = format!(
                 "\x1b[2mdispatched background coordinator {id} — runs here with the full \
 toolset; result auto-delivers. :workers to check.\x1b[0m"
-            )
+            );
+            Dispatched { id: Some(id), message }
         }
-        Err(e) => format!("can't locate the aish binary to launch the coordinator: {e}"),
+        Err(e) => Dispatched::message_only(format!(
+            "can't locate the aish binary to launch the coordinator: {e}"
+        )),
+    }
+}
+
+/// Launch a background coordinator for `task` and, when the spawn succeeds,
+/// auto-attach the interactive session to it. Auto-attach is what makes the
+/// interactive REPL behave like `:attach`: instead of locking the prompt for an
+/// inline model turn, the operator keeps a LIVE input prompt whose plain lines
+/// are queued/steered into the coordinator's next round (the `:tell` channel),
+/// while `:`-commands that aren't bound to the in-flight work — `:dispatch`,
+/// `:attach`, `:workers`, `:jobs`, … — still run immediately. `:detach` ends it
+/// and returns to the plain prompt; the coordinator keeps running.
+fn dispatch_and_attach(task: &str, session: &mut Session) {
+    let Dispatched { id, message } = dispatch_coordinator(task, session);
+    println!("{message}");
+    if let Some(id) = id {
+        // The worker is already in `session.worker_jobs` (spawn is synchronous),
+        // so `attach_worker` finds it, prints the live-attach banner, and starts
+        // forwarding its activity — reusing the proven attach path.
+        attach_worker(Some(&id), session);
     }
 }
 
@@ -2857,7 +2905,7 @@ async fn handle_colon(
                  :output [on|off]             stream background coordinators' activity (💭 thinking + 🛠️/🔧 tool + 🚀 standard/🐌 batch lines) in a contained bordered pane; off (default) keeps them quiet\n\
                  \n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
-                 :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
+                 :dispatch <task>                    launch a background coordinator for <task> + auto-attach (steer it; :detach to stop)\n\
                  :tell [--any] <id> <message>        send instructions to an in-flight coordinator (folded in next round; --any steers another session's)\n\
                  :attach <id>|goal                   watch a running coordinator live + steer it (typed lines go to it); `goal` watches the active :goal\n\
                  :detach                             stop watching the attached coordinator (it keeps running)\n\
@@ -3094,7 +3142,7 @@ async fn handle_colon(
             // the deterministic equivalent of the model calling run_in_background.
             // Shares dispatch_coordinator with the "troubleshoot" auto-offload.
             let task = parts.collect::<Vec<_>>().join(" ");
-            println!("{}", dispatch_coordinator(&task, session));
+            dispatch_and_attach(&task, session);
         }
         Some("attach") => attach_worker(parts.next(), session),
         Some("detach") => detach_worker(session),
@@ -4598,6 +4646,26 @@ mod tests {
         // troubleshoot is folded in, and matching is case-insensitive.
         assert!(mentions_work_signal("troubleshoot the build"));
         assert!(mentions_work_signal("FIX the bug"));
+    }
+
+    #[test]
+    fn dispatch_guard_failures_carry_no_attach_id() {
+        // A guard failure short-circuits BEFORE any child is spawned, so there
+        // is nothing to auto-attach to — `id` must be None and the message must
+        // explain why. (The happy path spawns a real coordinator process and so
+        // isn't unit-testable here; the guards are.)
+        let mut session = Session::new().unwrap();
+
+        // Empty task → usage message, no attach id.
+        let d = dispatch_coordinator("   ", &mut session);
+        assert!(d.id.is_none(), "empty task must not spawn");
+        assert!(d.message.contains("usage"), "{}", d.message);
+
+        // Inside a coordinator → refused (no nested coordinators), no attach id.
+        session.nested = true;
+        let d = dispatch_coordinator("fix the failing test", &mut session);
+        assert!(d.id.is_none(), "nested dispatch must not spawn");
+        assert!(d.message.contains("nested"), "{}", d.message);
     }
 
     #[test]
