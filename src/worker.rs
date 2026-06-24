@@ -761,11 +761,73 @@ fn resolve_base_ref(src: &std::path::Path, base: &str) -> String {
     "HEAD".to_string()
 }
 
+/// Max attempts for `git worktree add` (1 initial try + 4 retries). A transient
+/// lock collision on the source repo's `.git` — a CONCURRENT coordinator's
+/// `worktree add`/`remove` holding the lock — clears within tens of ms, so a
+/// short bounded retry beats silently degrading to the shared cwd.
+const WORKTREE_ADD_MAX_ATTEMPTS: u32 = 5;
+
+/// Exponential backoff before retry `n` (1-indexed): `10·2^(n-1)` ms →
+/// 10, 20, 40, 80, 160 ms for n = 1..=5. Pure → unit-tested. No new dependency:
+/// just `Duration` (already imported) + integer math.
+fn worktree_add_backoff(retry: u32) -> Duration {
+    // Saturating shift keeps a pathological `retry` from overflowing/panicking.
+    let shift = retry.saturating_sub(1).min(20);
+    let ms = 10u64.saturating_mul(1u64 << shift);
+    Duration::from_millis(ms)
+}
+
+/// Whether a `git worktree add` stderr looks like a transient LOCK collision
+/// (another live agent / worktree holding the repo lock) rather than a fatal
+/// error (bad ref, branch already exists, …). Used only to enrich the retry log
+/// — the retry itself is attempted on any failure, a lock being the
+/// overwhelmingly common transient cause here. Pure → unit-tested.
+fn is_worktree_lock_error(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("another agent is live")
+        || s.contains("is already used by worktree")
+        || s.contains("cannot lock")
+        || s.contains("unable to lock")
+        || s.contains(".lock")
+}
+
+/// Drive an operation up to `max` attempts with exponential backoff between
+/// tries (see `worktree_add_backoff`), sleeping via the injected `sleep`.
+/// Returns `true` on the first success, `false` once all attempts are spent. No
+/// backoff is taken after the final attempt. The attempt closure and sleeper are
+/// injected so the retry policy is unit-testable without spawning git or really
+/// sleeping. Pure given its closures.
+fn retry_with_backoff<F, S>(max: u32, mut attempt: F, mut sleep: S) -> bool
+where
+    F: FnMut(u32) -> bool,
+    S: FnMut(Duration),
+{
+    for n in 0..max {
+        if attempt(n) {
+            return true;
+        }
+        if n + 1 < max {
+            sleep(worktree_add_backoff(n + 1));
+        }
+    }
+    false
+}
+
 /// Create a fresh worktree for worker `id`, branched from `base` (`"main"` for a
 /// clean trunk baseline, `"head"` to continue the current checkout — see
 /// `resolve_base_ref`). Best-effort: returns `None` (caller falls back to the
-/// shared `src` cwd) if `src` isn't a repo or `git worktree add` fails, so
-/// isolation never blocks a job.
+/// shared `src` cwd) if `src` isn't a repo or `git worktree add` fails.
+///
+/// Retry strategy: `git worktree add` can fail transiently when a CONCURRENT
+/// coordinator holds the source repo's lock (the "another agent is live in this
+/// same working tree" collision). Silently returning `None` there dropped the
+/// worker into the SHARED cwd — defeating the very isolation this provides and
+/// letting parallel coordinators clobber each other's tree. So the add is
+/// retried up to `WORKTREE_ADD_MAX_ATTEMPTS` (5) times with exponential backoff
+/// (10, 20, 40, 80, 160 ms via `worktree_add_backoff`); only after ALL attempts
+/// are exhausted do we fall back to the shared cwd. stderr is captured on each
+/// failure to log the cause (and distinguish a lock collision from a fatal
+/// error). No new dependencies — `Duration` + `std::thread::sleep` only.
 fn create_worktree(src: &std::path::Path, id: &str, base: &str) -> Option<Worktree> {
     if !is_git_repo(src) {
         return None;
@@ -790,18 +852,65 @@ fn create_worktree(src: &std::path::Path, id: &str, base: &str) -> Option<Worktr
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let ok = std::process::Command::new("git")
-        .arg("-C")
-        .arg(src)
-        .args(["worktree", "add", "-b", &branch])
-        .arg(&path)
-        .arg(&start_point)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
+    // Try `git worktree add`, retrying a transient lock collision with
+    // exponential backoff before giving up. stderr is captured per attempt so a
+    // failure can be logged (best-effort) and a lock collision distinguished
+    // from a fatal error. Only after all attempts are exhausted does the caller
+    // fall back to the shared cwd (see this fn's doc comment).
+    let mut last_stderr = String::new();
+    let added = retry_with_backoff(
+        WORKTREE_ADD_MAX_ATTEMPTS,
+        |attempt| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(src)
+                .args(["worktree", "add", "-b", &branch])
+                .arg(&path)
+                .arg(&start_point)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output();
+            match out {
+                Ok(o) if o.status.success() => true,
+                Ok(o) => {
+                    last_stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    // Best-effort retry log (never panics). The final failure is
+                    // reported by the caller alongside the shared-cwd fallback.
+                    if attempt + 1 < WORKTREE_ADD_MAX_ATTEMPTS {
+                        let kind = if is_worktree_lock_error(&last_stderr) {
+                            "lock collision"
+                        } else {
+                            "error"
+                        };
+                        eprintln!(
+                            "aish: git worktree add for {} failed ({kind}, attempt {}/{}); retrying after backoff: {}",
+                            path.display(),
+                            attempt + 1,
+                            WORKTREE_ADD_MAX_ATTEMPTS,
+                            last_stderr,
+                        );
+                    }
+                    false
+                }
+                Err(e) => {
+                    last_stderr = e.to_string();
+                    false
+                }
+            }
+        },
+        std::thread::sleep,
+    );
+    if !added {
+        // All retries exhausted — fall back to the shared cwd. Log the last
+        // cause best-effort so the degradation isn't silent.
+        if !last_stderr.is_empty() {
+            eprintln!(
+                "aish: git worktree add for {} failed after {} attempts; falling back to shared cwd: {}",
+                path.display(),
+                WORKTREE_ADD_MAX_ATTEMPTS,
+                last_stderr,
+            );
+        }
         return None;
     }
     // Pin the base commit for clean-up accounting (tip == base_sha ⇒ no commits).
@@ -2309,5 +2418,76 @@ mod tests {
         let msg = describe_failure(exited, "goal worker", "boom");
         assert!(msg.contains("exited unsuccessfully"), "got: {msg}");
         assert!(!msg.contains("killed by the OS"), "got: {msg}");
+    }
+
+    #[test]
+    fn worktree_add_backoff_is_exponential_10_to_160() {
+        // Exact schedule required by the fix: 10, 20, 40, 80, 160 ms.
+        let schedule: Vec<u64> =
+            (1..=5).map(|n| worktree_add_backoff(n).as_millis() as u64).collect();
+        assert_eq!(schedule, vec![10, 20, 40, 80, 160]);
+        // A pathological retry index saturates instead of overflowing/panicking.
+        let _ = worktree_add_backoff(1000);
+    }
+
+    #[test]
+    fn is_worktree_lock_error_detects_lock_collisions() {
+        assert!(is_worktree_lock_error(
+            "fatal: another agent is live in this same working tree"
+        ));
+        assert!(is_worktree_lock_error(
+            "fatal: 'wt' is already used by worktree at '/x'"
+        ));
+        assert!(is_worktree_lock_error("error: cannot lock ref"));
+        assert!(is_worktree_lock_error("Unable to lock the index.lock"));
+        // A genuinely fatal, non-lock error is NOT classified as a lock collision.
+        assert!(!is_worktree_lock_error("fatal: invalid reference: origin/nope"));
+        assert!(!is_worktree_lock_error(""));
+    }
+
+    #[test]
+    fn retry_with_backoff_succeeds_on_a_later_attempt() {
+        // Happy path: the operation fails the first two attempts (e.g. a lock
+        // collision) then succeeds on the third. The driver returns true, took
+        // exactly the backoff for the two failed tries (10 + 20 ms), and never
+        // sleeps after the success.
+        let mut attempts = 0u32;
+        let mut sleeps: Vec<u64> = Vec::new();
+        let ok = retry_with_backoff(
+            WORKTREE_ADD_MAX_ATTEMPTS,
+            |_n| {
+                attempts += 1;
+                attempts >= 3 // succeed on the 3rd attempt
+            },
+            |d| sleeps.push(d.as_millis() as u64),
+        );
+        assert!(ok, "must succeed once an attempt returns true");
+        assert_eq!(attempts, 3, "stopped trying as soon as it succeeded");
+        assert_eq!(sleeps, vec![10, 20], "backed off before each retry, not after success");
+    }
+
+    #[test]
+    fn retry_with_backoff_exhausts_then_falls_back() {
+        // Exhaustion path: every attempt fails (a persistent collision). The
+        // driver returns false after exactly MAX attempts, having slept the full
+        // 4-gap schedule (10, 20, 40, 80) — no sleep after the final attempt. A
+        // false return is what makes create_worktree fall back to the shared cwd.
+        let mut attempts = 0u32;
+        let mut sleeps: Vec<u64> = Vec::new();
+        let ok = retry_with_backoff(
+            WORKTREE_ADD_MAX_ATTEMPTS,
+            |_n| {
+                attempts += 1;
+                false // never succeeds
+            },
+            |d| sleeps.push(d.as_millis() as u64),
+        );
+        assert!(!ok, "all attempts failed → false (caller falls back to shared cwd)");
+        assert_eq!(attempts, WORKTREE_ADD_MAX_ATTEMPTS, "tried exactly the max attempts");
+        assert_eq!(
+            sleeps,
+            vec![10, 20, 40, 80],
+            "one backoff between each pair of attempts, none after the last"
+        );
     }
 }
