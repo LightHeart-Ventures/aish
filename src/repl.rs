@@ -2400,7 +2400,7 @@ async fn handle_colon(
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
                  :workers [all]                      list this session's background coordinators (all = every session)\n\
-                 :output [on|off]             stream background coordinators' activity (💭 thinking + 🔧 tool + ·standard/·batch lines) in a contained bordered pane; off (default) keeps them quiet\n\
+                 :output [on|off]             stream background coordinators' activity (💭 thinking + 🛠️/🔧 tool + 🚀 standard/🐌 batch lines) in a contained bordered pane; off (default) keeps them quiet\n\
                  \n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (no model turn)\n\
@@ -2453,7 +2453,7 @@ async fn handle_colon(
             match target {
                 Some(true) => {
                     session.show_worker_output.store(true, Ordering::SeqCst);
-                    println!("worker output ON — background coordinators now stream their 💭 thinking, tool activity (⚙️ local · 🔧 MCP) and ·standard/·batch turn output, framed in a contained pane:");
+                    println!("worker output ON — background coordinators now stream their 💭 thinking, tool activity (🛠️ local · 🔧 MCP) and 🚀 standard/🐌 batch turn output, framed in a contained pane:");
                     // Open the contained pane: every streamed coordinator line
                     // is now rendered as a bordered row under this top frame
                     // (see worker::pane_row), so the activity reads as a

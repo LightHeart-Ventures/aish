@@ -241,8 +241,8 @@ pub async fn run_turn(
         // well-formed), then break the turn with a tagged `loop-detected` stop.
         let mut loop_break: Option<(String, usize)> = None;
         for call in &turn.tool_calls {
-            // Prefix the per-tool glyph (🔧 for most tools, 🤝 for an `escalate`
-            // consult) so it travels with the desc through the running spinner,
+            // Prefix the per-tool glyph (🛠️ local · 🔧 MCP · 🤝 escalate) so it
+            // travels with the desc through the running spinner,
             // the finished ✓/✗ line, and the retroactive reveal — every place
             // that renders the activity line. Flatten ONLY the description
             // (collapses embedded newlines from e.g. a `gh pr create --body`
@@ -457,7 +457,7 @@ fn emit_narration(session: &Session, text: &str) {
 /// Signal the start of the model-reasoning ("thinking") phase. An interactive
 /// session shows the live `Spinner` (TTY-only) instead, so this fires only in a
 /// background coordinator (`session.nested`), where it emits a `💭` sentinel the
-/// parent's worker stream recognizes and surfaces as `[label·thinking]` when
+/// parent's worker stream recognizes and surfaces as `[label] thinking…` when
 /// `:worker-output` is on. It lets the user see the agent is reasoning between
 /// tool calls, not just its `🔧` tool activity. One line per round; the
 /// interactive path is untouched (the `Spinner` still owns stderr there).
@@ -570,7 +570,7 @@ impl Drop for Spinner {
 /// Running-tool indicator: a braille spinner turning to the LEFT of a steady
 /// tool glyph while the tool executes — the tool-execution phase, distinct from
 /// the model's "thinking" spinner. The glyph stays put (it's *our* tool marker:
-/// 🔧 for most tools, 🤝 for an `escalate` consult) and only the spinner to its
+/// 🛠️ local · 🔧 MCP · 🤝 escalate) and only the spinner to its
 /// left animates, mirroring the look of the thinking icon (same braille frames,
 /// cyan glyph). Keeps the dim, two-space-indented style of the static line it
 /// replaces. TTY-gated; on `finish` the animation is erased and a static result
@@ -597,7 +597,8 @@ const TOOL_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦"
 const PREFIX_COLS: usize = 4;
 
 /// The steady glyph shown to the RIGHT of the animated braille spinner on a
-/// tool-activity line. Most tools use the 🔧 wrench; `escalate` uses a 🤝
+/// tool-activity line. Local tool/exe/script calls use the 🛠️ hammer-and-wrench;
+/// MCP calls use the 🔧 wrench; `escalate` uses a 🤝
 /// handshake so a consult reads as its own distinct event — a collaborative
 /// hand-off with the live "thinking" spinner to its left — rather than looking
 /// like just another tool call. Baked into the desc at the call site so it
@@ -605,10 +606,19 @@ const PREFIX_COLS: usize = 4;
 /// The handshake is double-width like the wrench, so it needs no trailing-space
 /// spacer: the call site joins it to the desc with a single space.
 fn tool_glyph(tool_name: &str) -> &'static str {
-    match tool_name {
-        "escalate" => "🤝", // handshake — a consult, distinct from the 🔧 wrench
-        _ => "🔧",
+    let n = tool_name.trim().to_ascii_lowercase();
+    // An `escalate` hand-off keeps its 🤝 handshake so a consult reads as its
+    // own collaborative event. MCP tool calls (`mcp__<server>__<tool>`, plus the
+    // bare `mcp_`/`atum_` shorthands) keep the 🔧 wrench. Every other local
+    // tool/exe/script call uses the 🛠️ hammer-and-wrench — exactly ONE source
+    // glyph per line, so an activity line never carries two.
+    if n == "escalate" {
+        return "🤝"; // handshake — a consult, distinct from the wrench
     }
+    if n.starts_with("mcp__") || n.starts_with("mcp_") || n.starts_with("atum_") {
+        return "🔧"; // MCP tool call — the wrench
+    }
+    "🛠️" // local tool/exe/script — hammer & wrench (VS16 emoji presentation)
 }
 
 /// Whether a tool's execution should be animated. Tools that hand the terminal
@@ -741,7 +751,7 @@ impl Drop for ToolSpinner {
 /// The static post-execution tool line: a ✓/✗ status glyph plus the (already
 /// glyph-prefixed) desc, kept dim like the rest of the activity stream. Shared
 /// by `ToolSpinner::finish` and the retroactive `reveal_last_turn`. The tool
-/// glyph (🔧/⚙️) is part of `desc`, so only the colorized status mark is added.
+/// glyph (🛠️/🔧/🤝) is part of `desc`, so only the colorized status mark is added.
 fn tool_result_line(desc: &str, is_error: bool) -> String {
     if is_error {
         format!("\x1b[31m✗\x1b[0m {desc}")  // red for error
@@ -863,12 +873,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_glyph_escalate_is_handshake_others_wrench() {
-        // The escalate consult gets the handshake, distinct from the wrench every
-        // other tool shows — so it reads as its own collaborative event.
+    fn tool_glyph_escalate_handshake_mcp_wrench_local_hammer() {
+        // The escalate consult keeps the 🤝 handshake; MCP tools keep the 🔧
+        // wrench; every other local tool/exe/script call gets the 🛠️
+        // hammer-and-wrench — exactly one source glyph, never two.
         assert_eq!(tool_glyph("escalate"), "🤝");
-        assert_eq!(tool_glyph("run_program"), "🔧");
-        assert_eq!(tool_glyph("read_file"), "🔧");
+        assert_eq!(tool_glyph("run_program"), "🛠️");
+        assert_eq!(tool_glyph("read_file"), "🛠️");
         assert_eq!(tool_glyph("mcp__atum__list_tools"), "🔧");
     }
 

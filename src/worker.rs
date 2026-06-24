@@ -82,6 +82,15 @@ pub enum Pulse {
     Turn,
 }
 
+/// True when a coordinator stderr line carries a tool-activity glyph: the 🔧
+/// wrench (MCP tool call), the 🛠️ hammer-and-wrench (local tool/exe/script), or
+/// the 🤝 handshake (an `escalate` model hand-off). These are the glyphs
+/// `engine::tool_glyph` stamps between the status icon and the desc, so a line
+/// carrying any of them is a tool line (start or result).
+fn has_tool_glyph(line: &str) -> bool {
+    line.contains('🔧') || line.contains('🛠') || line.contains('🤝')
+}
+
 /// Classify ONE raw coordinator-stderr line into a prompt-badge pulse event, or
 /// `None` when it carries no event. Pure, so it's unit-testable without a pipe.
 ///
@@ -91,7 +100,7 @@ pub enum Pulse {
 /// status glyph) is the tool *beginning*, not an outcome → `None`. A `🗨` line is
 /// turn narration (`engine::emit_narration`) → a turn-completion pulse.
 fn classify_event(line: &str) -> Option<Pulse> {
-    if line.contains('🔧') || line.contains('🤝') {
+    if has_tool_glyph(line) {
         if line.contains('✓') {
             return Some(Pulse::ToolOk);
         }
@@ -128,7 +137,7 @@ const STDERR_TAIL_LINES: usize = 20;
 /// and the outer dim `\x1b[2m…\x1b[0m` wrapper, so `announce` (which re-wraps in
 /// dim) doesn't double-wrap.
 fn clean_activity_line(raw: &str) -> Option<String> {
-    if !raw.contains('🔧') && !raw.contains('🤝') {
+    if !has_tool_glyph(raw) {
         return None;
     }
     // Forward only the RESULT line (it carries the ✓/✗ outcome). The bare START
@@ -156,134 +165,47 @@ fn strip_sentinel(raw: &str, mark: &str) -> Option<String> {
     (!rest.is_empty()).then(|| rest.to_string())
 }
 
-/// Source glyph for a tool, chosen by its NAME — the per-tool distinction
-/// surfaced in the `:output on` activity stream. The tool name is normalised to
-/// lowercase, then resolved with EXACT matches first and a SUBSTRING fallback:
-///
-///   * `escalate`                        → 🤝 (escalate consult / hand-off)
-///   * `run_in_background`               → 🔄 (background coordinator)
-///   * `read_file` / `write_file`        → 📄 (file read/write)
-///   * `delete_file` / `remove_file`     → 🗑️ (file deletion)
-///   * `run_script` / `bash` / `sh`      → 📜 (shell script)
-///   * `run_program` / `run_interactive` → 📦 (subprocess exec)
-///   * `mcp__*` / `mcp_*` / `atum_*`     → 🔧 (MCP tool call, unchanged)
-///   * anything else                     → ⚙️ (local execution, the default)
-///
-/// Pure + unit-tested — the single source of truth for the per-tool glyph, so it
-/// can be reused by any caller that has a tool name in hand.
-///
-/// Examples: `source_emoji("run_program")` → 📦, `source_emoji("read_file")` → 📄,
-/// `source_emoji("mcp__atum__atum_list_project_board")` → 🔧.
-fn source_emoji(tool_name: &str) -> &'static str {
-    let name = tool_name.trim().to_ascii_lowercase();
-    let n = name.as_str();
-    // MCP tool calls — `mcp__<server>__<tool>`, or the bare `mcp_`/`atum_`
-    // shorthands — keep the wrench, resolved ahead of the local matching below.
-    if n.starts_with("mcp__") || n.starts_with("mcp_") || n.starts_with("atum_") {
-        return "🔧"; // MCP tool call
-    }
-    // Exact matches first (normalised lowercase tool name).
-    match n {
-        "escalate" => return "🤝",
-        "run_in_background" => return "🔄",
-        "read_file" | "write_file" => return "📄",
-        "delete_file" | "remove_file" => return "🗑️",
-        "run_script" | "bash" | "sh" => return "📜",
-        "run_program" | "run_interactive" => return "📦",
-        _ => {}
-    }
-    // Substring fallback for fully-qualified / decorated variants. Uses the
-    // distinctive underscore forms so a bare descriptive verb (e.g. the `read`
-    // token a coordinator emits for a local read) still falls through to the
-    // default gear rather than over-matching a short fragment.
-    if n.contains("escalate") {
-        return "🤝";
-    }
-    if n.contains("run_in_background") {
-        return "🔄";
-    }
-    if n.contains("delete_file") || n.contains("remove_file") {
-        return "🗑️";
-    }
-    if n.contains("read_file") || n.contains("write_file") {
-        return "📄";
-    }
-    if n.contains("run_script") {
-        return "📜";
-    }
-    if n.contains("run_program") || n.contains("run_interactive") {
-        return "📦";
-    }
-    "⚙️" // local execution (gear + VS16 emoji-presentation selector)
-}
-
-/// Best-effort extraction of the identifying tool token from a forwarded
-/// activity line (`<status> 🔧 <token> …`): the first whitespace-delimited
-/// word after the 🔧 wrench. For an MCP tool the coordinator emits the raw
-/// catalog name as the desc (e.g. `mcp__atum__…`), so the token classifies
-/// correctly; for a local tool the desc is a human verb (`read`, `write`, a
-/// program name) that has no MCP prefix → the gear. A miss returns `""`, which
-/// `source_emoji` maps to the local gear (the safe, common-case default).
-fn activity_tool_token(line: &str) -> &str {
-    // No wrench → no token (the caller skips decoration in that case anyway).
-    match line.split_once('🔧') {
-        Some((_, after)) => after.split_whitespace().next().unwrap_or(""),
-        None => "",
-    }
-}
-
-/// Decorate a forwarded coordinator activity line with a source glyph that
-/// distinguishes a local-execution tool (⚙️) from an MCP tool call (🔧),
-/// classified from the tool descriptor via [`activity_tool_token`] +
-/// [`source_emoji`]. The original line is preserved VERBATIM and the glyph is
-/// purely PREPENDED — backward-compatible visual sugar that carries no data.
-/// Only the `:output on` forwarding path calls this (see `forward_decision`), so
-/// the emoji appears solely when worker output is being streamed; a line that
-/// already carries its own source marker (the 🤝 `escalate` handshake, no wrench) is
-/// left untouched so it isn't double-marked.
-fn decorate_activity_source(line: &str) -> String {
-    if !line.contains('🔧') {
-        return line.to_string();
-    }
-    format!("{} {}", source_emoji(activity_tool_token(line)), line)
-}
-
 /// Decide what (if anything) to forward to the user's terminal for ONE raw
-/// coordinator-stderr line, given whether `:worker-output` is on. Returns
-/// `(label_suffix, text)` to announce as `[label<suffix>] text`, or `None` to
-/// drop the line. Pure — the single source of truth for the suppression gate,
-/// so it's unit-testable without a live pipe.
+/// coordinator-stderr line, given whether `:worker-output` is on. Returns the
+/// cleaned text to announce as `[label] text`, or `None` to drop the line. Pure
+/// — the single source of truth for the suppression gate, so it's unit-testable
+/// without a live pipe.
 ///
 /// Suppression policy (the default): a background coordinator is QUIET. With
-/// `show_output` off NOTHING from its stderr is forwarded — not its `🔧`
-/// tool-activity, not its turn narration. The user still sees the job is alive
-/// via the prompt's `⟳N` pulse and its completion notice (both independent of
-/// this stream); they just don't get the firehose of every tool call. Flipping
+/// `show_output` off NOTHING from its stderr is forwarded — not its tool
+/// activity, not its turn narration. The user still sees the job is alive via the
+/// prompt's `⟳N` pulse and its completion notice (both independent of this
+/// stream); they just don't get the firehose of every tool call. Flipping
 /// `:worker-output on` opens the full live stream:
-/// - `💭` thinking notice (entered the model-reasoning phase) → `[label·thinking] …`
-/// - `🔧` tool activity (the `✓/✗ 🔧` RESULT line, once per call) → `[label] …`
-/// - `🗨` turn text (a standard model call) → `[label🚀] …`
-/// - `📦` batch fan-out notice → `[label🐌] …`
-fn forward_decision(line: &str, show_output: bool) -> Option<(&'static str, String)> {
+/// - `💭` thinking notice (entered the model-reasoning phase) → `[label] thinking…`
+/// - tool activity (the `✓/✗ <glyph>` RESULT line, once per call) → `[label] ✓ <glyph> …`
+/// - `🗨` turn text (a standard model call) → `[label] 🚀 …`
+/// - `📦` batch fan-out notice → `[label] 🐌 …`
+fn forward_decision(line: &str, show_output: bool) -> Option<String> {
     if !show_output {
         // Default: keep background coordinators quiet. The job's liveness is
         // shown by the ⟳N prompt pulse + completion notice, not this stream.
         return None;
     }
     if let Some(activity) = clean_activity_line(line) {
-        // Prepend a source glyph (⚙️ local execution / 🔧 MCP tool call) before the
-        // tool descriptor. Reached ONLY when show_output is true (:output on), so
-        // the emoji is applied solely while worker activity is being streamed.
-        return Some(("", decorate_activity_source(&activity)));
+        // The coordinator already stamped the single source glyph between the
+        // status icon and the desc (🔧 MCP · 🛠️ local · 🤝 escalate), so the
+        // RESULT line is forwarded VERBATIM — no extra decoration, so a line
+        // never carries two source glyphs.
+        return Some(activity);
     }
     if let Some(text) = strip_sentinel(line, "💭") {
-        return Some(("·thinking", text));
+        // Thinking notice: a plain `[label] thinking…` row — no ·thinking suffix.
+        return Some(text);
     }
     if let Some(text) = strip_sentinel(line, "🗨") {
-        return Some(("🚀", text));
+        // Turn narration: the 🚀 rocket rides AFTER the worker-id gutter, as a
+        // prefix to the text → `[label] 🚀 …`.
+        return Some(format!("🚀 {text}"));
     }
     if let Some(text) = strip_sentinel(line, "📦") {
-        return Some(("🐌", text));
+        // Batch fan-out: the 🐌 marker prefixes the text → `[label] 🐌 …`.
+        return Some(format!("🐌 {text}"));
     }
     None
 }
@@ -301,21 +223,21 @@ fn forward_decision(line: &str, show_output: bool) -> Option<(&'static str, Stri
 // row: a bordered side-column that visually groups the coordinator stream and
 // sets it apart from interactive output, with a top/bottom frame bracketing the
 // region when the pane is opened (`:output on`) and closed (`:output off`).
-// Every row self-identifies with its `[label·suffix]` gutter and lines up under
+// Every row self-identifies with its `[label]` gutter and lines up under
 // the one shared border, so interleaving stays readable.
 
 /// The cyan box-drawing left border every pane row carries — the pane's "wall".
 const PANE_BORDER: &str = "\x1b[36m┃\x1b[0m";
 
 /// Render one forwarded coordinator line as a row of the contained `:output`
-/// pane: `┃ [label·suffix] text`. The border + `[label·suffix]` gutter are
-/// chrome (cyan border, dim label); `text` is emitted verbatim so it keeps
-/// whatever inline colour the coordinator produced — the green `✓`/red `✗` on a
-/// tool RESULT line, the `⚙️`/`🔧` source glyph, the turn/batch narration. The
-/// shared left border on every row is what CONTAINS the stream as a bordered
-/// column distinct from the user's interleaved shell output. Pure — unit-tested.
-pub fn pane_row(label: &str, suffix: &str, text: &str) -> String {
-    format!("{PANE_BORDER} \x1b[2m[{label}{suffix}]\x1b[0m {text}")
+/// pane: `┃ [label] text`. The border + `[label]` gutter are chrome (cyan
+/// border, dim label); `text` is emitted verbatim so it keeps whatever inline
+/// colour the coordinator produced — the green `✓`/red `✗` on a tool RESULT
+/// line, the `🛠️`/`🔧` source glyph, the turn/batch narration. The shared left
+/// border on every row is what CONTAINS the stream as a bordered column distinct
+/// from the user's interleaved shell output. Pure — unit-tested.
+pub fn pane_row(label: &str, text: &str) -> String {
+    format!("{PANE_BORDER} \x1b[2m[{label}]\x1b[0m {text}")
 }
 
 /// The pane's TOP frame, printed once when `:output` is switched on so the rows
@@ -382,13 +304,13 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
             attached_id.as_deref(),
             label,
         );
-        if let Some((suffix, text)) = forward_decision(&line, on) {
+        if let Some(text) = forward_decision(&line, on) {
             // Frame each forwarded line as a row of the contained `:output`
             // pane (a box-drawing left border + label gutter), so coordinator
             // activity reads as a bordered column rather than blending into
             // the user's shell scroll. `announce_raw` prints the pre-framed row
             // (which carries its own colour) over the prompt.
-            crate::tools::announce_raw(&pane_row(label, suffix, &text));
+            crate::tools::announce_raw(&pane_row(label, &text));
         }
         if tail.len() == STDERR_TAIL_LINES {
             tail.pop_front();
@@ -1710,6 +1632,14 @@ mod tests {
             clean_activity_line("\x1b[2m  ✗ 🔧 write x\x1b[0m"),
             Some("✗ 🔧 write x".to_string())
         );
+        // RESULT line for a LOCAL tool — now carries the 🛠️ hammer-and-wrench
+        // (engine::tool_glyph); still forwarded verbatim.
+        assert_eq!(
+            clean_activity_line("\x1b[2m  ✓ 🛠️ read /etc/hosts\x1b[0m"),
+            Some("✓ 🛠️ read /etc/hosts".to_string())
+        );
+        // Bare START line for a local tool (🛠️, no ✓/✗) is the duplicate — DROPPED.
+        assert_eq!(clean_activity_line("\x1b[2m  🛠️ read /etc/hosts\x1b[0m"), None);
         // RESULT line with the real inner colour codes engine.rs emits — still
         // forwarded; the outer dim wrapper is stripped, inner colour preserved.
         assert_eq!(
@@ -1764,21 +1694,22 @@ mod tests {
         assert_eq!(forward_decision(batch, false), None);
         assert_eq!(forward_decision(banner, false), None);
 
-        // ON: the full live stream returns, each tagged with its label suffix —
-        // but the tool call is forwarded ONCE, via its RESULT line only.
+        // ON: the full live stream returns as `[label] …` rows — but the tool
+        // call is forwarded ONCE, via its RESULT line only, VERBATIM (the
+        // coordinator already stamped the single source glyph).
         assert_eq!(forward_decision(tool_start, true), None); // duplicate START — dropped
         assert_eq!(
             forward_decision(tool_result, true),
-            // A local tool (git) gets the ⚙️ gear prepended.
-            Some(("", "⚙️ ✓ 🔧 git status".to_string()))
+            Some("✓ 🔧 git status".to_string())
         );
         assert_eq!(
             forward_decision(turn, true),
-            Some(("🚀", "planning the migration".to_string()))
+            // Rocket prefixes the text (it sits after the [label] gutter).
+            Some("🚀 planning the migration".to_string())
         );
         assert_eq!(
             forward_decision(batch, true),
-            Some(("🐌", "fanned 3 sub-task(s) out".to_string()))
+            Some("🐌 fanned 3 sub-task(s) out".to_string())
         );
         // Noise (banner/blank) is dropped even when output is ON.
         assert_eq!(forward_decision(banner, true), None);
@@ -1789,15 +1720,15 @@ mod tests {
     fn forward_decision_surfaces_thinking_when_output_on() {
         // A coordinator emits a 💭 sentinel when it enters its model-reasoning
         // phase. Like every other coordinator line it is gated behind
-        // :worker-output: suppressed by default, and surfaced as a
-        // [label·thinking] line when the toggle is on.
+        // :worker-output: suppressed by default, and surfaced as a plain
+        // `[label] thinking…` row (no ·thinking suffix) when the toggle is on.
         let thinking = "💭 thinking…";
         // OFF (default): suppressed with everything else.
         assert_eq!(forward_decision(thinking, false), None);
-        // ON: forwarded with the ·thinking label suffix.
+        // ON: forwarded as plain text (no ·thinking suffix).
         assert_eq!(
             forward_decision(thinking, true),
-            Some(("·thinking", "thinking…".to_string()))
+            Some("thinking…".to_string())
         );
         // The 💭 sentinel is a turn-ish narration, not a 🔧 tool line, so it must
         // NOT be classified as a tool-activity line.
@@ -1816,131 +1747,50 @@ mod tests {
         ];
         let forwarded: Vec<String> = per_call
             .iter()
-            .filter_map(|l| forward_decision(l, true).map(|(_, t)| t))
+            .filter_map(|l| forward_decision(l, true))
             .collect();
         assert_eq!(
             forwarded,
-            // MCP tool → 🔧 wrench prepended; still exactly one forwarded line.
-            vec!["🔧 ✓ 🔧 mcp__atum__atum_get_project_task".to_string()],
+            // The RESULT line is forwarded verbatim (single wrench) — exactly once.
+            vec!["✓ 🔧 mcp__atum__atum_get_project_task".to_string()],
             "each tool call must forward exactly once (the RESULT line)"
         );
     }
 
     #[test]
-    fn source_emoji_picks_gear_for_local_wrench_for_mcp() {
-        // MCP tool calls — names prefixed `mcp__<server>__<tool>`, or the bare
-        // `mcp_`/`atum_` shorthands — get the 🔧 wrench.
-        assert_eq!(source_emoji("mcp__atum__atum_list_project_board"), "🔧");
-        assert_eq!(source_emoji("mcp_atum_list_tools"), "🔧");
-        assert_eq!(source_emoji("atum_get_project_task"), "🔧");
-        // Per-tool local glyphs (exact, normalised matches).
-        assert_eq!(source_emoji("escalate"), "🤝");
-        assert_eq!(source_emoji("run_in_background"), "🔄");
-        assert_eq!(source_emoji("read_file"), "📄");
-        assert_eq!(source_emoji("write_file"), "📄");
-        assert_eq!(source_emoji("delete_file"), "🗑️");
-        assert_eq!(source_emoji("remove_file"), "🗑️");
-        assert_eq!(source_emoji("run_script"), "📜");
-        assert_eq!(source_emoji("bash"), "📜");
-        assert_eq!(source_emoji("sh"), "📜");
-        assert_eq!(source_emoji("run_program"), "📦");
-        assert_eq!(source_emoji("run_interactive"), "📦");
-        // Normalisation: case-insensitive + whitespace-trimmed.
-        assert_eq!(source_emoji("READ_FILE"), "📄");
-        assert_eq!(source_emoji("  atum_foo "), "🔧");
-        // Substring fallback catches fully-qualified variants.
-        assert_eq!(source_emoji("aish_read_file_v2"), "📄");
-        // Local tools with no specific mapping get the ⚙️ gear default.
-        assert_eq!(source_emoji("list_dir"), "⚙️");
-        assert_eq!(source_emoji("change_dir"), "⚙️");
-        assert_eq!(source_emoji("remember"), "⚙️");
-        // Empty token falls back to the local gear (safe default).
-        assert_eq!(source_emoji(""), "⚙️");
-    }
-
-    #[test]
-    fn activity_tool_token_extracts_word_after_wrench() {
-        // The desc follows the 🔧 wrench; the first token after it identifies
-        // the tool source.
-        assert_eq!(activity_tool_token("✓ 🔧 read /etc/hosts"), "read");
-        assert_eq!(
-            activity_tool_token("✓ 🔧 mcp__atum__atum_list_project_board"),
-            "mcp__atum__atum_list_project_board"
-        );
-        // Inner colour codes around the status glyph don't disturb extraction.
-        assert_eq!(
-            activity_tool_token("\x1b[32m✓\x1b[0m 🔧 write x"),
-            "write"
-        );
-        // No wrench → empty token (decoration is skipped by the caller).
-        assert_eq!(activity_tool_token("no wrench here"), "");
-    }
-
-    #[test]
-    fn decorate_activity_source_prepends_gear_or_wrench() {
-        // A local tool result line gets the ⚙️ gear prepended; the original
-        // line is preserved verbatim after it (purely additive visual sugar).
-        assert_eq!(
-            decorate_activity_source("✓ 🔧 read /etc/hosts"),
-            "⚙️ ✓ 🔧 read /etc/hosts"
-        );
-        // An MCP tool result line gets the 🔧 wrench prepended.
-        assert_eq!(
-            decorate_activity_source("✓ 🔧 mcp__atum__atum_get_project_task"),
-            "🔧 ✓ 🔧 mcp__atum__atum_get_project_task"
-        );
-        // A failure line is decorated the same way (status glyph preserved).
-        assert_eq!(
-            decorate_activity_source("✗ 🔧 write x"),
-            "⚙️ ✗ 🔧 write x"
-        );
-        // A line with no wrench (e.g. an escalate 🤝 line) is left untouched
-        // so it isn't double-marked.
-        assert_eq!(
-            decorate_activity_source("✓ 🤝 escalate: x"),
-            "✓ 🤝 escalate: x"
-        );
-    }
-
-    #[test]
-    fn forward_decision_prepends_source_glyph_only_when_output_on() {
-        // The decoration is reached ONLY through forward_decision's activity
-        // branch, which short-circuits to None when output is OFF — so the emoji
-        // is applied solely while :output on is streaming. This holds for both
-        // the async background worker and the synchronous goal-loop stream, since
-        // both route every line through forward_decision.
-        let local = "\x1b[2m  ✓ 🔧 read /etc/hosts\x1b[0m";
+    fn forward_decision_forwards_result_line_verbatim_when_output_on() {
+        // The coordinator already stamped the single source glyph between the
+        // status icon and the desc, so forward_decision forwards the cleaned
+        // RESULT line VERBATIM — no extra wrench/gear is prepended. OFF → None.
+        let local = "\x1b[2m  ✓ 🛠️ read /etc/hosts\x1b[0m";
         let mcp = "\x1b[2m  ✓ 🔧 mcp__atum__atum_get_project_task\x1b[0m";
-        // OFF: nothing forwarded, so nothing is decorated.
         assert_eq!(forward_decision(local, false), None);
         assert_eq!(forward_decision(mcp, false), None);
-        // ON: local → gear, MCP → wrench, each prepended to the preserved line.
         assert_eq!(
             forward_decision(local, true),
-            Some(("", "⚙️ ✓ 🔧 read /etc/hosts".to_string()))
+            Some("✓ 🛠️ read /etc/hosts".to_string())
         );
         assert_eq!(
             forward_decision(mcp, true),
-            Some(("", "🔧 ✓ 🔧 mcp__atum__atum_get_project_task".to_string()))
+            Some("✓ 🔧 mcp__atum__atum_get_project_task".to_string())
         );
     }
 
     #[test]
     fn pane_row_frames_with_border_label_and_preserved_text() {
-        // A pane row carries the cyan box-drawing left border, the dim
-        // [label·suffix] gutter, then the text VERBATIM (so any inline colour
-        // the coordinator emitted survives). This is what visually contains
-        // the `:output` stream as a bordered side-column (w_sn1fHhd5).
-        let row = pane_row("w_a7k3m2pQ", "·thinking", "planning the migration");
+        // A pane row carries the cyan box-drawing left border, the dim [label]
+        // gutter (just the worker id), then the text VERBATIM (so any inline
+        // colour the coordinator emitted survives). This is what visually
+        // contains the `:output` stream as a bordered side-column (w_sn1fHhd5).
+        let row = pane_row("w_a7k3m2pQ", "🚀 planning the migration");
         assert!(row.starts_with(PANE_BORDER), "row must open with the pane border: {row}");
         assert!(row.contains("┃"), "border glyph present: {row}");
-        assert!(row.contains("[w_a7k3m2pQ·thinking]"), "gutter carries label+suffix: {row}");
-        assert!(row.ends_with("planning the migration"), "text preserved at the end: {row}");
+        assert!(row.contains("[w_a7k3m2pQ]"), "gutter carries just the worker id: {row}");
+        assert!(row.ends_with("🚀 planning the migration"), "text preserved at the end: {row}");
 
-        // An empty suffix (a tool-activity line) yields just [label]; the
-        // text's own colour codes are passed through untouched.
-        let colored = pane_row("w_a7k3m2pQ", "", "\x1b[32m✓\x1b[0m 🔧 read /etc/hosts");
-        assert!(colored.contains("[w_a7k3m2pQ]"), "empty suffix → bare label: {colored}");
+        // The text's own colour codes are passed through untouched.
+        let colored = pane_row("w_a7k3m2pQ", "\x1b[32m✓\x1b[0m 🔧 read /etc/hosts");
+        assert!(colored.contains("[w_a7k3m2pQ]"), "gutter is the bare label: {colored}");
         assert!(colored.contains("\x1b[32m✓\x1b[0m 🔧 read /etc/hosts"), "inline colour preserved: {colored}");
     }
 
