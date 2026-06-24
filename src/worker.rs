@@ -191,8 +191,8 @@ fn strip_sentinel(raw: &str, mark: &str) -> Option<String> {
 /// `:worker-output on` opens the full live stream:
 /// - `💭` thinking notice (entered the model-reasoning phase) → `[label] thinking…`
 /// - tool activity (the `✓/✗ <glyph>` RESULT line, once per call) → `[label] ✓ <glyph> …`
-/// - `🗨` turn text (a standard model call) → `[label] 🚀 …`
-/// - `📦` batch fan-out notice → `[label] 🐌 …`
+/// - `🗨` turn text (a standard model call) → `[label]   🚀 …` (glyph aligned under the tool glyph)
+/// - `📦` batch fan-out notice → `[label]   🐌 …` (glyph aligned under the tool glyph)
 fn forward_decision(line: &str, show_output: bool) -> Option<String> {
     if !show_output {
         // Default: keep background coordinators quiet. The job's liveness is
@@ -212,12 +212,15 @@ fn forward_decision(line: &str, show_output: bool) -> Option<String> {
     }
     if let Some(text) = strip_sentinel(line, "🗨") {
         // Turn narration: the 🚀 rocket rides AFTER the worker-id gutter, as a
-        // prefix to the text → `[label] 🚀 …`.
-        return Some(format!("🚀 {text}"));
+        // prefix to the text. The 2-col NARRATION_ALIGN_PAD stands in for the
+        // `✓ ` status mark on a tool RESULT line so the rocket lines up under
+        // the tool glyph → `[label]   🚀 …`.
+        return Some(format!("{NARRATION_ALIGN_PAD}🚀 {text}"));
     }
     if let Some(text) = strip_sentinel(line, "📦") {
-        // Batch fan-out: the 🐌 marker prefixes the text → `[label] 🐌 …`.
-        return Some(format!("🐌 {text}"));
+        // Batch fan-out: the 🐌 marker prefixes the text, padded by
+        // NARRATION_ALIGN_PAD so it aligns under the tool glyph → `[label]   🐌 …`.
+        return Some(format!("{NARRATION_ALIGN_PAD}🐌 {text}"));
     }
     None
 }
@@ -240,6 +243,14 @@ fn forward_decision(line: &str, show_output: bool) -> Option<String> {
 
 /// The cyan box-drawing left border every pane row carries — the pane's "wall".
 const PANE_BORDER: &str = "\x1b[36m┃\x1b[0m";
+
+/// Two-column pad that aligns a turn/batch narration glyph (🚀/🐌)
+/// under the tool glyph (🛠️/🔧) on the preceding RESULT lines. A tool
+/// RESULT line renders as `✓ <glyph> …` — a 1-column status mark plus a space (2
+/// columns) precede its glyph — whereas a narration line puts its glyph right
+/// after the `[label]` gutter. Prefixing narration with these two spaces lines
+/// the rocket/snail up in the same column as the tool glyph above it.
+const NARRATION_ALIGN_PAD: &str = "  ";
 
 /// Render one forwarded coordinator line as a row of the contained `:output`
 /// pane: `┃ [label] text`. The border + `[label]` gutter are chrome (cyan
@@ -1892,11 +1903,11 @@ mod tests {
         assert_eq!(
             forward_decision(turn, true),
             // Rocket prefixes the text (it sits after the [label] gutter).
-            Some("🚀 planning the migration".to_string())
+            Some("  🚀 planning the migration".to_string())
         );
         assert_eq!(
             forward_decision(batch, true),
-            Some("🐌 fanned 3 sub-task(s) out".to_string())
+            Some("  🐌 fanned 3 sub-task(s) out".to_string())
         );
         // Noise (banner/blank) is dropped even when output is ON.
         assert_eq!(forward_decision(banner, true), None);
