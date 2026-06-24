@@ -359,6 +359,10 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
 /// Override with `AISH_WORKER_MEM_MB`.
 const DEFAULT_WORKER_MEM_MB: u64 = 4096;
 
+/// Default PID cap for a worker CONTAINER (AC6), mapped to `--pids-limit`.
+/// Bounds fork-bomb blast radius. Override with `AISH_WORKER_PIDS`; 0 = no limit.
+const DEFAULT_WORKER_PIDS: u64 = 512;
+
 /// Default CPU-time cap for a worker child, in seconds. A backstop against a
 /// runaway busy-loop that the wall-clock timeout might not catch promptly.
 /// Override with `AISH_WORKER_CPU_SECS`.
@@ -384,21 +388,36 @@ fn parse_u64_or(raw: Option<&str>, default: u64) -> u64 {
 ///
 /// Resource limits are applied via a `pre_exec` hook (see `apply_rlimits`):
 /// they run in the forked child between fork and exec.
+/// The coordinator argv (everything AFTER the `aish` binary) for one task:
+/// `-c <task> --coordinator --run-id <id> --backend <b> --model <m>`. Factored
+/// out of `worker_command` so it is the SINGLE source of truth shared by BOTH
+/// execution vehicles (S9.1): the host path execs it directly via `Command`,
+/// and the container path passes the identical vector as the container's command
+/// (`container::ContainerSpec.argv`). Keeping one builder guarantees the
+/// in-container coordinator is invoked byte-for-byte the same as the host one —
+/// only the execution vehicle changes. Full parity: the coordinator runs on the
+/// SAME backend/model the interactive session uses (claude/grok), inheriting the
+/// relevant credential via the env it's spawned with. Pure → unit-tested.
+fn coordinator_argv(spec: &WorkerSpec, task: &str, run_id: &str) -> Vec<String> {
+    vec![
+        "-c".to_string(),
+        task.to_string(),
+        "--coordinator".to_string(),
+        "--run-id".to_string(),
+        run_id.to_string(),
+        "--backend".to_string(),
+        spec.backend.clone(),
+        "--model".to_string(),
+        spec.model.clone(),
+    ]
+}
+
 fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str, cwd: &std::path::Path) -> Command {
     let mut cmd = Command::new(&spec.exe);
-    cmd.arg("-c")
-        .arg(task)
-        .arg("--coordinator")
-        .arg("--run-id")
-        .arg(run_id)
-        // Full parity: the coordinator runs on the SAME backend the interactive
-        // session uses (claude/grok), not a hardcoded one. The child inherits the
-        // relevant credential (XAI_API_KEY / ANTHROPIC_API_KEY) via the env it's
-        // spawned with — see the note on WorkerSpec.env.
-        .arg("--backend")
-        .arg(&spec.backend)
-        .arg("--model")
-        .arg(&spec.model)
+    // The coordinator argv is the SINGLE source of truth shared with the
+    // container backend (see `coordinator_argv` / `container.rs`): the host path
+    // execs it directly, the container path passes it as the container command.
+    cmd.args(coordinator_argv(spec, task, run_id))
         // The effective run directory: `spec.cwd` normally, or the isolated
         // worktree path when isolation is on.
         .current_dir(cwd)
@@ -1225,6 +1244,18 @@ pub struct WorkerSpec {
     pub attached: Arc<Mutex<Option<String>>>,
 }
 
+impl WorkerSpec {
+    /// The per-worker state-dir leaf name — the run/worker id, sanitized to a
+    /// filesystem-safe token. Kept here so the volume dir and the container name
+    /// derive from the same id.
+    fn id_for_state(&self, run_id: &str) -> String {
+        run_id
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') { ch } else { '-' })
+            .collect()
+    }
+}
+
 impl WorkerJob {
     fn set_done(&self, result: String) {
         let mut i = self.inner.lock().unwrap();
@@ -1377,6 +1408,171 @@ fn new_worker_id() -> String {
     format!("w_{suffix}")
 }
 
+// ---------------------------------------------------------------------------
+// Container backend (S9.1) — launch a worker in a rootless container instead of
+// a host subprocess. Additive and behind a runtime selector; ANY failure here
+// degrades gracefully to the host path (AC9), so a missing image / down daemon
+// never blocks a job.
+// ---------------------------------------------------------------------------
+
+/// Root for per-worker state volumes (AC4): `$AISH_WORKER_STATE_DIR` when set,
+/// else `~/.aish/workers`, else a temp fallback. Each worker mounts
+/// `<root>/<id>` at `/aish/state`.
+fn worker_state_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("AISH_WORKER_STATE_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() {
+        return PathBuf::from(home).join(".aish").join("workers");
+    }
+    std::env::temp_dir().join("aish-workers")
+}
+
+/// A built container launch: the ready-to-spawn `run` command plus the 0600
+/// env-file to delete once the run finishes (secrets live there, never argv).
+struct ContainerLaunch {
+    cmd: Command,
+    env_file: PathBuf,
+}
+
+/// Process-env credential/config vars forwarded into the container via the
+/// secret env-file so the in-container coordinator authenticates exactly like
+/// the host path (which inherits the parent env). Kept out of argv/labels.
+const FORWARDED_SECRET_ENV: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "XAI_API_KEY",
+];
+
+/// RFC3339-ish UTC timestamp for the `aish.created_at` label, without pulling in
+/// a date crate: seconds since the epoch is stable, greppable, and sortable.
+fn now_label_ts() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}")
+}
+
+/// Write `pairs` to a fresh 0600 env-file under the worker's state dir (secrets
+/// never go in argv — they'd leak into `ps`/labels). Returns the path. Values
+/// are written verbatim as `KEY=VALUE` lines; a value with a newline is skipped
+/// defensively (env-file is line-oriented).
+fn write_env_file(dir: &std::path::Path, pairs: &[(String, String)]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(".worker.env");
+    let mut f = std::fs::File::create(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    for (k, v) in pairs {
+        if k.is_empty() || k.contains('\n') || v.contains('\n') {
+            continue;
+        }
+        writeln!(f, "{k}={v}")?;
+    }
+    Ok(path)
+}
+
+/// Build the container `run` Command for a worker, or `None` to fall back to the
+/// host path (AC9). Ensures the version-pinned image exists (build-on-first-use
+/// via `make worker-image`), creates the 0700 state dir (AC4), writes the 0600
+/// secret env-file, and assembles the launch via `container::run_argv`. Blocking
+/// IO (image probe/build, fs) — acceptable here, mirroring the blocking git in
+/// `create_worktree`.
+fn build_container_command(
+    rt: crate::container::Runtime,
+    spec: &WorkerSpec,
+    task: &str,
+    run_id: &str,
+    run_cwd: &std::path::Path,
+) -> Option<ContainerLaunch> {
+    use crate::container as c;
+
+    let tag = c::image_tag(crate::update::current_version());
+    // Build-on-first-use: a missing image triggers `make worker-image` in the
+    // repo root. A build failure → None (host fallback) with a diagnostic.
+    if !c::image_exists(rt, &tag) {
+        eprintln!(
+            "aish: worker image {tag} not found for {} — building via `make worker-image` (first use)…",
+            rt.bin()
+        );
+        let built = std::process::Command::new("make")
+            .arg("worker-image")
+            .current_dir(&spec.cwd)
+            .env("VERSION", crate::update::current_version())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !built || !c::image_exists(rt, &tag) {
+            eprintln!(
+                "aish: could not build/find worker image {tag}; falling back to host subprocess."
+            );
+            return None;
+        }
+    }
+
+    // Per-worker state dir (AC4), 0700.
+    let state_dir = worker_state_root().join(&spec.id_for_state(run_id));
+    ensure_dir_0700(&state_dir);
+
+    // Secret env-file (0600): the rc exports + forwarded process credentials.
+    let mut secret_pairs: Vec<(String, String)> = spec.env.clone();
+    for key in FORWARDED_SECRET_ENV {
+        if let Ok(val) = std::env::var(key) {
+            if !val.is_empty() {
+                secret_pairs.push(((*key).to_string(), val));
+            }
+        }
+    }
+    let env_file = match write_env_file(&state_dir, &secret_pairs) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("aish: couldn't write worker env-file: {e}; falling back to host subprocess.");
+            return None;
+        }
+    };
+
+    // Non-secret control env passed inline.
+    let mut env_inline = vec![
+        ("AISH_COORDINATOR".to_string(), "1".to_string()),
+        ("AISH_LAUNCH_SESSION_ID".to_string(), spec.launch_session_id.clone()),
+    ];
+    if let Some(name) = &spec.launch_session_name {
+        env_inline.push(("AISH_LAUNCH_SESSION_NAME".to_string(), name.clone()));
+    }
+
+    let repo_key = repo_key(&spec.cwd);
+    let cspec = c::ContainerSpec {
+        name: c::container_name(&spec.launch_session_id, run_id),
+        image: tag,
+        argv: coordinator_argv(spec, task, run_id),
+        labels: c::worker_labels(run_id, &spec.launch_session_id, &repo_key, None, &now_label_ts()),
+        state_volume_host: state_dir.clone(),
+        state_mount: c::STATE_MOUNT.to_string(),
+        work_volume_host: Some(run_cwd.to_path_buf()),
+        env_file: Some(env_file.clone()),
+        env_inline,
+        mem_mb: env_u64("AISH_WORKER_MEM_MB", DEFAULT_WORKER_MEM_MB),
+        cpus: std::env::var("AISH_WORKER_CPUS").ok().and_then(|v| v.trim().parse::<f64>().ok()),
+        pids_limit: Some(env_u64("AISH_WORKER_PIDS", DEFAULT_WORKER_PIDS)),
+        network: std::env::var("AISH_WORKER_NETWORK")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| c::default_network(rt, std::env::consts::OS).to_string()),
+        workdir: "/aish/work".to_string(),
+    };
+
+    let mut cmd = Command::new(rt.bin());
+    cmd.args(c::run_argv(&cspec))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    Some(ContainerLaunch { cmd, env_file })
+}
+
 /// Register a new background worker and start its run task. Returns the
 /// session-local job id. The spec is captured up front so the spawned task is
 /// self-contained.
@@ -1429,7 +1625,35 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
         None
     };
     let run_cwd = worktree.as_ref().map(|w| w.path.clone()).unwrap_or_else(|| spec.cwd.clone());
-    let mut cmd = worker_command(&spec, &task, &job.id, &run_cwd);
+
+    // Pick the execution vehicle (S9.1): a container backend when one is
+    // selected and engaged, else today's host subprocess. ANY container-setup
+    // failure degrades to the host path (AC9) so a missing image / down daemon
+    // never blocks a job. `none`/unset keep the host path byte-for-byte.
+    let selection = crate::container::resolve_selection(
+        crate::container::Runtime::parse_selector(
+            std::env::var("AISH_CONTAINER_RUNTIME").ok().as_deref(),
+        ),
+        crate::container::runtime_on_path(crate::container::Runtime::Podman),
+        crate::container::runtime_on_path(crate::container::Runtime::Docker),
+    );
+    let (mut cmd, env_file_cleanup) = match selection {
+        crate::container::Selection::Container(rt) => {
+            match build_container_command(rt, &spec, &task, &job.id, &run_cwd) {
+                Some(launch) => {
+                    crate::tools::announce(
+                        &format!("[{}]", job.id),
+                        &format!("running in a {} container", rt.bin()),
+                    );
+                    (launch.cmd, Some(launch.env_file))
+                }
+                None => (worker_command(&spec, &task, &job.id, &run_cwd), None),
+            }
+        }
+        crate::container::Selection::Host => {
+            (worker_command(&spec, &task, &job.id, &run_cwd), None)
+        }
+    };
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1479,6 +1703,10 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
     };
 
     let (out, err) = collect.await.unwrap_or_default();
+    // Container path: delete the 0600 secret env-file now the run is over.
+    if let Some(ef) = &env_file_cleanup {
+        let _ = std::fs::remove_file(ef);
+    }
     // Finalize the worktree (if any): a clean one (no changes, no new commits) is
     // removed so nothing is left behind; one with work is kept and its branch
     // surfaced so the parent can review/merge it. Returns the kept branch, if any.
