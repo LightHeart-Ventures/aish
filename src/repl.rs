@@ -255,9 +255,10 @@ pub async fn run(
             println!();
             needs_gap = false;
         }
-        // If the coordinator we're attached to has finished (or vanished), detach
-        // automatically and say so above the prompt.
-        auto_detach_finished(&mut session);
+        // If the coordinator we're attached to has reached a terminal state,
+        // announce it once and flip into review mode (stay attached so a typed
+        // line resumes it). See `announce_attach_review`.
+        announce_attach_review(&mut session);
         // Tab completion resolves against the session's cwd, which `cd` mutates.
         editor.set_cwd(&session.cwd);
         // We're about to idle at the prompt — let the presenter flush results.
@@ -2052,43 +2053,47 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
 /// reported. `:detach` (or the worker finishing) ends it.
 fn attach_worker(id: Option<&str>, session: &mut Session) {
     let Some(id) = id else {
-        println!("usage: :attach <worker-id>   — watch + steer a running coordinator (:detach to stop)");
+        println!("usage: :attach <worker-id>   — watch + steer a coordinator (:detach to stop)");
         return;
     };
     let hit = |wid: &str| wid == id || wid.starts_with(id);
-    let mut live: Vec<String> = Vec::new();
-    let mut saw_terminal = false;
+    // Collect every match in this session's workers, LIVE or terminal — a done/
+    // failed coordinator is now attachable too (review + resume): a typed line
+    // resumes it from its prior result. `(run_id, terminal)`.
+    let mut matches: Vec<(String, bool)> = Vec::new();
     for w in session.worker_jobs.lock().unwrap().iter() {
         if hit(&w.id) {
-            if matches!(w.status().as_str(), "done" | "failed") {
-                saw_terminal = true;
-            } else {
-                live.push(w.id.clone());
-            }
+            matches.push((w.id.clone(), matches!(w.status().as_str(), "done" | "failed")));
         }
     }
-    match live.as_slice() {
-        [] => {
-            if saw_terminal {
-                println!("coordinator '{id}' has already finished — `:result {id}` to view its result");
-            } else {
-                println!("no live coordinator in this session matching '{id}' (see :workers)");
-            }
-        }
-        [run_id] => {
+    match matches.as_slice() {
+        [] => println!("no coordinator in this session matching '{id}' (see :workers)"),
+        [(run_id, terminal)] => {
             *session.attached.lock().unwrap() = Some(run_id.clone());
             let short = crate::batch::short_id(run_id);
-            println!(
-                "\x1b[1;33m⇄ attached to {short}\x1b[0m — streaming its activity live; what you type is steered to it. \x1b[2m:detach to stop.\x1b[0m"
-            );
-            // Replay the input + activity captured so far, THEN the live
-            // stream continues (the worker's forwarder now sees this session
-            // as attached and forwards every subsequent line).
-            backfill_attached(run_id, session);
+            if *terminal {
+                // Pre-seed the review marker so `announce_attach_review` doesn't
+                // re-announce the same finish on the next loop tick.
+                *session.attach_review_announced.lock().unwrap() = Some(run_id.clone());
+                println!(
+                    "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m — review mode: replaying its work below. \x1b[2mType a message to resume it, or :detach to stop.\x1b[0m"
+                );
+                backfill_attached(run_id, session);
+                print_attached_result(run_id, session);
+            } else {
+                *session.attach_review_announced.lock().unwrap() = None;
+                println!(
+                    "\x1b[1;33m⇄ attached to {short}\x1b[0m — streaming its activity live; what you type is steered to it. \x1b[2m:detach to stop.\x1b[0m"
+                );
+                // Replay the input + activity captured so far, THEN the live
+                // stream continues (the worker's forwarder now sees this session
+                // as attached and forwards every subsequent line).
+                backfill_attached(run_id, session);
+            }
         }
         many => {
-            println!("'{id}' matches {} live coordinators — be more specific:", many.len());
-            for rid in many {
+            println!("'{id}' matches {} coordinators — be more specific:", many.len());
+            for (rid, _) in many {
                 println!("  {rid}");
             }
         }
@@ -2133,6 +2138,22 @@ fn backfill_attached(run_id: &str, session: &Session) {
     }
 }
 
+/// Print a finished coordinator's final result inside the attach pane, so an
+/// operator who `:attach`es a done/failed worker sees the work they're about to
+/// continue from. A no-op when the worker isn't in this session.
+fn print_attached_result(run_id: &str, session: &Session) {
+    let job = session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|w| w.id == *run_id)
+        .cloned();
+    if let Some(job) = job {
+        println!("{}", crate::worker::pane_row(run_id, &format!("·result {}", job.fetch())));
+    }
+}
+
 /// `:detach` — stop watching the attached coordinator. It keeps running in the
 /// background; its result still auto-delivers and shows in `:workers`.
 fn detach_worker(session: &mut Session) {
@@ -2147,17 +2168,30 @@ fn detach_worker(session: &mut Session) {
     }
 }
 
-/// Steer the attached coordinator: queue a typed operator line into its durable
-/// mailbox (the same `:tell` channel) so it's folded into the coordinator's next
-/// round. Called for every plain line typed while attached. Delegates to
-/// `tell_coordinator` so the candidate-resolution and enqueue logic stays in one
-/// place.
+/// Handle a typed operator line while attached. For a LIVE coordinator this
+/// queues the line into its durable mailbox (the `:tell` channel) to be folded
+/// into its next round. For a TERMINAL (done/failed) coordinator — nothing would
+/// read a mailbox message — it RESUMES the run instead (relaunch seeded with the
+/// prior context + this message; see `resume_coordinator`). Called for every
+/// plain line typed while attached.
 fn send_to_attached(run_id: &str, message: &str, session: &mut Session) {
     let message = message.trim();
     if message.is_empty() {
         return;
     }
-    tell_coordinator(Some(run_id), message, session);
+    let terminal = session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|w| w.id == *run_id)
+        .map(|w| matches!(w.status().as_str(), "done" | "failed"))
+        .unwrap_or(false);
+    if terminal {
+        resume_coordinator(run_id, message, session);
+    } else {
+        tell_coordinator(Some(run_id), message, session);
+    }
 }
 
 /// Auto-detach when the attached coordinator is no longer a live worker in this
@@ -2181,6 +2215,127 @@ fn auto_detach_finished(session: &mut Session) {
             "\x1b[2m⇄ {short} finished — detached. :result {short} to view its result.\x1b[0m"
         );
     }
+}
+
+/// When the attached coordinator reaches a terminal state, announce it ONCE and
+/// KEEP the attachment (review mode): the operator stays bound to the run so a
+/// typed line RESUMES it (see `send_to_attached` -> `resume_coordinator`) rather
+/// than being dropped. The one-shot notice is de-duped via
+/// `attach_review_announced`, which `:attach` pre-seeds when binding an
+/// already-finished worker. A live (or resumed) attachment clears the marker so
+/// a later finish re-announces. A no-op when not attached, or when the worker is
+/// no longer tracked in this session (left as-is rather than force-detached).
+fn announce_attach_review(session: &mut Session) {
+    let attached = session.attached.lock().unwrap().clone();
+    let Some(run_id) = attached else {
+        *session.attach_review_announced.lock().unwrap() = None;
+        return;
+    };
+    let status = session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|w| w.id == run_id)
+        .map(|w| w.status());
+    match status.as_deref() {
+        Some("done") | Some("failed") => {
+            let mut announced = session.attach_review_announced.lock().unwrap();
+            if announced.as_deref() != Some(run_id.as_str()) {
+                let short = crate::batch::short_id(&run_id);
+                println!(
+                    "\x1b[2m⇄ {short} finished — review mode: type a message to resume it, or :detach to return to your shell.\x1b[0m"
+                );
+                *announced = Some(run_id);
+            }
+        }
+        // Still live (or resumed into a new live state) — clear so a later finish
+        // re-announces.
+        Some(_) => *session.attach_review_announced.lock().unwrap() = None,
+        // Worker no longer tracked here — leave the attachment untouched.
+        None => {}
+    }
+}
+
+/// Resume a FINISHED coordinator interactively. Relaunch a fresh background
+/// coordinator seeded with the prior run's task + final result as context plus
+/// the operator's `message`, then attach to the new run so the conversation
+/// continues live and further typed lines steer/resume it in turn. This is what
+/// makes `:attach`-ing a done/failed worker a real "keep working with that
+/// agent" session instead of a dead end. Shared-cwd (like `:dispatch`) so the
+/// resumed agent iterates in the operator's working tree with full context.
+fn resume_coordinator(prev_run_id: &str, message: &str, session: &mut Session) {
+    if session.nested {
+        println!("can't resume a coordinator from inside a coordinator");
+        return;
+    }
+    // Pull the prior run's task + rendered result for context before relaunching.
+    let prior = session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|w| w.id == *prev_run_id)
+        .map(|w| (w.task.clone(), w.fetch()));
+    let Some((task, result)) = prior else {
+        println!("can't resume '{prev_run_id}' — its record is no longer in this session (see :workers)");
+        return;
+    };
+    let no_credential = match session.backend_kind.as_str() {
+        "grok" => !crate::backend::grok::credential_available(&session.env),
+        _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
+    };
+    if no_credential {
+        println!("no credential for the active backend — can't resume (Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY)");
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            println!("can't locate the aish binary to resume the coordinator: {e}");
+            return;
+        }
+    };
+    let prev_short = crate::batch::short_id(prev_run_id);
+    let resume_task = build_resume_task(&prev_short, &task, &result, message);
+    let spec = crate::worker::WorkerSpec {
+        exe,
+        cwd: session.cwd.clone(),
+        backend: session.backend_kind.clone(),
+        model: crate::worker::coordinator_model(&session.backend_kind, &session.batch_model),
+        env: session.env.clone(),
+        // Shared-cwd (no worktree), matching `:dispatch` — interactive iteration
+        // happens in the operator's live tree.
+        isolate: false,
+        base: "main".to_string(),
+        launch_session_id: session.session_id.clone(),
+        launch_session_name: session.name.clone(),
+        show_output: session.show_worker_output.clone(),
+        attached: session.attached.clone(),
+    };
+    let new_id = crate::worker::spawn(&session.worker_jobs, resume_task, spec);
+    // Hand the attachment to the resumed run so its activity streams here and the
+    // next typed line steers it.
+    *session.attached.lock().unwrap() = Some(new_id.clone());
+    *session.attach_review_announced.lock().unwrap() = None;
+    let new_short = crate::batch::short_id(&new_id);
+    println!(
+        "\x1b[1;33m↻ resuming {prev_short} as {new_short}\x1b[0m — folding in your message; its activity streams here. \x1b[2m:detach to stop.\x1b[0m"
+    );
+}
+
+/// Build the seed task for a resumed coordinator: the prior run's task + final
+/// result as context, then the operator's follow-up. Pure (string-only) so the
+/// framing is unit-tested without spawning a subprocess.
+fn build_resume_task(prev_short: &str, task: &str, result: &str, message: &str) -> String {
+    format!(
+        "You are resuming an earlier aish coordinator run ({prev_short}) that has already finished. \
+Continue working WITH the operator from where it left off — treat the prior result below as your \
+OWN prior work, not a fresh task, and build on it.\n\n\
+=== ORIGINAL TASK ===\n{task}\n\n\
+=== YOUR PRIOR RESULT ===\n{result}\n\n\
+=== OPERATOR'S FOLLOW-UP ===\n{message}"
+    )
 }
 
 /// Pure index math for the Shift-Tab worker cycle (extracted from
@@ -2257,7 +2412,6 @@ fn cycle_worker(session: &mut Session) {
         );
     }
 }
-
 /// Queue an operator message for an in-flight background coordinator — the
 /// `:tell` / SendMessage channel. The message lands in the durable
 /// `coordinator_messages` mailbox keyed by the run's id and is folded into the
@@ -4216,6 +4370,29 @@ mod tests {
         // Nothing to cycle into — stays at interactive regardless of state.
         assert_eq!(next_attach_index(&running, None), 0);
         assert_eq!(next_attach_index(&running, Some("w_a")), 0);
+    }
+
+    #[test]
+    fn resume_task_embeds_prior_context_and_followup() {
+        let t = build_resume_task(
+            "w_abc123",
+            "Original task text",
+            "Prior result body",
+            "now also handle X",
+        );
+        // The prior run id, original task, prior result, and the operator's
+        // follow-up must all survive into the seed so the resumed agent has
+        // continuity.
+        assert!(t.contains("w_abc123"), "{t}");
+        assert!(t.contains("Original task text"), "{t}");
+        assert!(t.contains("Prior result body"), "{t}");
+        assert!(t.contains("now also handle X"), "{t}");
+        // The follow-up comes last (after the prior context), so the model reads
+        // the new ask against the established background.
+        let ftask = t.find("Original task text").unwrap();
+        let fresult = t.find("Prior result body").unwrap();
+        let ffollow = t.find("now also handle X").unwrap();
+        assert!(ftask < fresult && fresult < ffollow, "ordering wrong: {t}");
     }
 
     #[test]

@@ -166,6 +166,12 @@ pub struct Session {
     /// `:worker-output` off, and read at the prompt to steer typed lines to it.
     /// Session-local, never persisted.
     pub attached: Arc<Mutex<Option<String>>>,
+    /// Review-mode bookkeeping for an attached coordinator that has reached a
+    /// terminal state. Holds the run-id whose "finished — review mode" notice has
+    /// already been shown, so the live->terminal transition is announced exactly
+    /// once and `:attach`-ing an already-finished worker does not double-announce.
+    /// Cleared when the attachment goes live again (e.g. on resume). Session-local.
+    pub attach_review_announced: Arc<Mutex<Option<String>>>,
 }
 
 impl Session {
@@ -203,6 +209,7 @@ impl Session {
             turn_audit: None,
             login: false,
             attached: Arc::new(Mutex::new(None)),
+            attach_review_announced: Arc::new(Mutex::new(None)),
         })
     }
 
