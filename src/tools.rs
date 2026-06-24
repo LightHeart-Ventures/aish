@@ -621,6 +621,24 @@ fn push_has_explicit_refspec(args: &[String]) -> bool {
 // Executors
 // ---------------------------------------------------------------------------
 
+/// Drop a model-emitted argv that repeats the program as its own first
+/// argument (`program="gh", args=["gh","pr","create"]` → the command
+/// `gh gh pr create`). Some models reliably echo the binary name into argv[0];
+/// left as-is that runs `gh gh …`, `git git …`, `brew brew …`, etc., which the
+/// underlying tool rejects as an unknown subcommand — surfacing to the user as
+/// doubled commands AND as a binary that looks "intercepted" because it never
+/// does what was asked. The de-dup is conservative: it strips ONLY when the
+/// first arg is byte-for-byte the program token (the exact string the model
+/// passed, path included), so a deliberate `echo echo hi` text payload is the
+/// one case it can touch — an acceptable trade for making every doubled
+/// `git`/`gh`/`brew`/… invocation work. Pure + unit-tested.
+pub(crate) fn dedup_program_argv(program: &str, mut args: Vec<String>) -> Vec<String> {
+    if args.first().map(String::as_str) == Some(program) {
+        args.remove(0);
+    }
+    args
+}
+
 /// Extract (program, args) from a tool call, enforcing the "no shell" invariant.
 fn parse_argv(call: &ToolCall) -> Result<(String, Vec<String>)> {
     let program = call.args["program"]
@@ -631,6 +649,10 @@ fn parse_argv(call: &ToolCall) -> Result<(String, Vec<String>)> {
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
+    // Defend against the model echoing the binary into argv[0] (see
+    // dedup_program_argv): `gh gh pr create` would otherwise fail as an unknown
+    // subcommand and read as aish "intercepting" the binary.
+    let args = dedup_program_argv(&program, args);
 
     // The "no shell" invariant: refuse to be a backdoor into one.
     let bin = Path::new(&program).file_name().and_then(|s| s.to_str()).unwrap_or(&program);
@@ -1902,6 +1924,38 @@ mod tests {
     #[tokio::test]
     async fn normal_command_unaffected() {
         let out = run(&call("echo", &["hi"], None)).await;
+        assert_eq!(out.trim(), "hi");
+    }
+
+    #[test]
+    fn dedup_program_argv_strips_echoed_binary() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // The reported bug: the model repeats the binary as argv[0].
+        assert_eq!(dedup_program_argv("gh", v(&["gh", "pr", "create"])), v(&["pr", "create"]));
+        assert_eq!(dedup_program_argv("ls", v(&["ls", "-la"])), v(&["-la"]));
+        assert_eq!(dedup_program_argv("grep", v(&["grep", "x", "f"])), v(&["x", "f"]));
+        // Absolute-path program with the same absolute path echoed.
+        assert_eq!(
+            dedup_program_argv("/opt/homebrew/bin/gh", v(&["/opt/homebrew/bin/gh", "--version"])),
+            v(&["--version"])
+        );
+        // Only ONE copy is stripped (a genuine repeated token survives).
+        assert_eq!(dedup_program_argv("gh", v(&["gh", "gh"])), v(&["gh"]));
+        // Untouched: normal argv, empty argv, and a first arg that only shares
+        // the basename (path differs) — too risky to strip on a partial match.
+        assert_eq!(dedup_program_argv("ls", v(&["-la"])), v(&["-la"]));
+        assert_eq!(dedup_program_argv("ls", v(&[])), Vec::<String>::new());
+        assert_eq!(
+            dedup_program_argv("/usr/bin/gh", v(&["gh", "pr"])),
+            v(&["gh", "pr"])
+        );
+    }
+
+    #[tokio::test]
+    async fn run_program_dedups_echoed_binary() {
+        // End-to-end: program="echo", args=["echo","hi"] must run `echo hi`,
+        // not `echo echo hi` — the execution-side proof of the de-dup.
+        let out = run(&call("echo", &["echo", "hi"], None)).await;
         assert_eq!(out.trim(), "hi");
     }
 
