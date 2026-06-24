@@ -246,9 +246,10 @@ pub async fn run_turn(
             // the finished ✓/✗ line, and the retroactive reveal — every place
             // that renders the activity line. Flatten ONLY the description
             // (collapses embedded newlines from e.g. a `gh pr create --body`
-            // payload); the glyph is joined afterward with a single space, like
-            // the wrench, since the handshake is double-width and needs no extra
-            // spacer.
+            // payload); the glyph is joined afterward with a single space. The
+            // double-width wrench/handshake need no more than that; the narrow
+            // 🛠️ hammer (U+1F6E0+VS16, width-1 in most terminals) carries its own
+            // trailing spacer in `tool_glyph` so it still reads `🛠️ <desc>`.
             let desc = format!("{} {}", tool_glyph(&call.name), flatten_ws(&describe_call(call)));
 
             // ── Same-call repeat guard (loop detection). A tool call whose exact
@@ -618,7 +619,9 @@ fn tool_glyph(tool_name: &str) -> &'static str {
     if n.starts_with("mcp__") || n.starts_with("mcp_") || n.starts_with("atum_") {
         return "🔧"; // MCP tool call — the wrench
     }
-    "🛠️" // local tool/exe/script — hammer & wrench (VS16 emoji presentation)
+    "🛠️ " // local tool/exe/script — hammer & wrench (VS16 emoji presentation)
+         // + a trailing spacer: U+1F6E0 renders width-1 in most terminals, so the
+         // single join-space looks swallowed; the extra space keeps a clear gap.
 }
 
 /// Whether a tool's execution should be animated. Tools that hand the terminal
@@ -878,8 +881,8 @@ mod tests {
         // wrench; every other local tool/exe/script call gets the 🛠️
         // hammer-and-wrench — exactly one source glyph, never two.
         assert_eq!(tool_glyph("escalate"), "🤝");
-        assert_eq!(tool_glyph("run_program"), "🛠️");
-        assert_eq!(tool_glyph("read_file"), "🛠️");
+        assert_eq!(tool_glyph("run_program"), "🛠️ ");
+        assert_eq!(tool_glyph("read_file"), "🛠️ ");
         assert_eq!(tool_glyph("mcp__atum__list_tools"), "🔧");
     }
 
