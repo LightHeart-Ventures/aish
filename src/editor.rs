@@ -32,6 +32,9 @@ pub enum ReadOutcome {
     Interrupted,
     /// Ctrl-O: the raw-tool-output toggle was requested.
     CtrlO,
+    /// Shift-Tab: cycle the interactive session through the running
+    /// coordinators (interactive → first worker → … → back to interactive).
+    ShiftTab,
     /// Ctrl-D on an empty line: exit the shell.
     Eof,
     /// A fatal editor error — the loop prints it and breaks.
@@ -86,6 +89,10 @@ pub struct RustylineEditor {
     /// Ctrl-O (raw-output toggle) from a plain Ctrl-C — both surface as
     /// rustyline's `Interrupted`.
     raw_toggle: Arc<AtomicBool>,
+    /// Raised by the Shift-Tab key handler, drained by `read_line` to
+    /// distinguish a worker-cycle request from a Ctrl-O / plain Ctrl-C — all
+    /// three surface as rustyline's `Interrupted`.
+    shift_tab: Arc<AtomicBool>,
 }
 
 impl RustylineEditor {
@@ -111,6 +118,21 @@ impl RustylineEditor {
             KeyEvent::ctrl('O'),
             EventHandler::Conditional(Box::new(CtrlOToggle {
                 pending: raw_toggle.clone(),
+            })),
+        );
+
+        // Shift-Tab cycles the interactive session through the running
+        // background coordinators (and back to interactive). Like Ctrl-O, the
+        // handler can't reach the Session, so it raises `shift_tab` and bails
+        // out of the line editor (Interrupt); `read_line` drains the flag and
+        // reports `ReadOutcome::ShiftTab`, leaving the REPL to advance the
+        // attach cursor. rustyline normalizes Shift-Tab to `BackTab`; binding it
+        // here overrides its default `CompleteBackward`.
+        let shift_tab = Arc::new(AtomicBool::new(false));
+        rl.bind_sequence(
+            KeyEvent(KeyCode::BackTab, Modifiers::NONE),
+            EventHandler::Conditional(Box::new(ShiftTabCycle {
+                pending: shift_tab.clone(),
             })),
         );
 
@@ -140,6 +162,7 @@ impl RustylineEditor {
             rl,
             history_path,
             raw_toggle,
+            shift_tab,
         })
     }
 
@@ -152,9 +175,13 @@ impl RustylineEditor {
         match res {
             Ok(line) => ReadOutcome::Line(line),
             Err(ReadlineError::Interrupted) => {
-                // Ctrl-O routes here too (handler returns Interrupt); the drained
-                // toggle flag distinguishes it from a plain Ctrl-C clear-line.
-                interrupt_outcome(self.raw_toggle.swap(false, Ordering::SeqCst))
+                // Ctrl-O and Shift-Tab route here too (each handler returns
+                // Interrupt); the drained flags distinguish them from a plain
+                // Ctrl-C clear-line. Both are drained unconditionally so a stale
+                // flag can never bleed into a later interrupt.
+                let shift_tab = self.shift_tab.swap(false, Ordering::SeqCst);
+                let raw_toggle = self.raw_toggle.swap(false, Ordering::SeqCst);
+                interrupt_outcome(shift_tab, raw_toggle)
             }
             Err(ReadlineError::Eof) => ReadOutcome::Eof,
             Err(e) => ReadOutcome::Error(e.to_string()),
@@ -198,15 +225,18 @@ impl LineEditor for RustylineEditor {
     }
 }
 
-/// Map a drained Ctrl-O toggle onto the editor-agnostic outcome. rustyline
-/// collapses BOTH Ctrl-O (the raw-output toggle, via `CtrlOToggle` →
-/// `Cmd::Interrupt`) and a plain Ctrl-C onto `ReadlineError::Interrupted`; the
-/// `raw_toggle` flag is what splits them back apart. Factored out as a pure fn
-/// so the disambiguation is unit-testable without a TTY (S5.5 / TASK-134): the
-/// caller passes the result of the read-and-clear `swap`, and a raised toggle
-/// becomes [`ReadOutcome::CtrlO`] while a clear flag is a [`ReadOutcome::Interrupted`].
-fn interrupt_outcome(raw_toggle_was_set: bool) -> ReadOutcome {
-    if raw_toggle_was_set {
+/// Map the drained Shift-Tab / Ctrl-O flags onto the editor-agnostic outcome.
+/// rustyline collapses Shift-Tab (`ShiftTabCycle`), Ctrl-O (`CtrlOToggle`), and
+/// a plain Ctrl-C all onto `ReadlineError::Interrupted` (the first two via
+/// `Cmd::Interrupt`); the two flags are what split them back apart. Factored out
+/// as a pure fn so the disambiguation is unit-testable without a TTY (S5.5 /
+/// TASK-134): the caller passes the result of each read-and-clear `swap`.
+/// Shift-Tab wins over Ctrl-O if both were somehow raised; a clear pair is a
+/// plain Ctrl-C clear-line.
+fn interrupt_outcome(shift_tab_was_set: bool, raw_toggle_was_set: bool) -> ReadOutcome {
+    if shift_tab_was_set {
+        ReadOutcome::ShiftTab
+    } else if raw_toggle_was_set {
         ReadOutcome::CtrlO
     } else {
         ReadOutcome::Interrupted
@@ -233,6 +263,21 @@ struct CtrlOToggle {
 }
 
 impl ConditionalEventHandler for CtrlOToggle {
+    fn handle(&self, _: &Event, _: RepeatCount, _: bool, _: &EventContext) -> Option<Cmd> {
+        self.pending.store(true, Ordering::SeqCst);
+        Some(Cmd::Interrupt)
+    }
+}
+
+/// Shift-Tab key handler: raise the worker-cycle flag and leave the line editor
+/// so the run loop can advance the attach cursor. Returns `Cmd::Interrupt` to
+/// discard the typed line without submitting it; `RustylineEditor::read_line`
+/// reads the flag and reports [`ReadOutcome::ShiftTab`].
+struct ShiftTabCycle {
+    pending: Arc<AtomicBool>,
+}
+
+impl ConditionalEventHandler for ShiftTabCycle {
     fn handle(&self, _: &Event, _: RepeatCount, _: bool, _: &EventContext) -> Option<Cmd> {
         self.pending.store(true, Ordering::SeqCst);
         Some(Cmd::Interrupt)
@@ -290,14 +335,26 @@ mod tests {
     /// toggle flag. This is the exact mapping `read_line` performs — a raised
     /// toggle is a raw-output request, a clear one is a plain clear-line.
     #[test]
-    fn interrupt_outcome_distinguishes_ctrl_o_from_ctrl_c() {
+    fn interrupt_outcome_distinguishes_shift_tab_ctrl_o_and_ctrl_c() {
+        // Shift-Tab (first flag) wins and surfaces as a worker-cycle request.
         assert!(
-            matches!(interrupt_outcome(true), ReadOutcome::CtrlO),
+            matches!(interrupt_outcome(true, false), ReadOutcome::ShiftTab),
+            "a drained Shift-Tab flag must surface as ShiftTab"
+        );
+        // Shift-Tab takes precedence even if Ctrl-O was also somehow raised.
+        assert!(
+            matches!(interrupt_outcome(true, true), ReadOutcome::ShiftTab),
+            "Shift-Tab wins over a co-raised Ctrl-O"
+        );
+        // Ctrl-O alone is the raw-output toggle.
+        assert!(
+            matches!(interrupt_outcome(false, true), ReadOutcome::CtrlO),
             "a drained Ctrl-O toggle must surface as CtrlO"
         );
+        // Neither flag is a plain Ctrl-C clear-line.
         assert!(
-            matches!(interrupt_outcome(false), ReadOutcome::Interrupted),
-            "a clear toggle is a plain Ctrl-C clear-line"
+            matches!(interrupt_outcome(false, false), ReadOutcome::Interrupted),
+            "a clear pair is a plain Ctrl-C clear-line"
         );
     }
 
