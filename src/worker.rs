@@ -341,7 +341,7 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                 // Frame each forwarded line as a row of the contained
                 // `:output` pane (a box-drawing left border + label gutter) so
                 // coordinator activity reads as a bordered column rather than
-                // blending into the user's shell scroll. `announce_raw` prints
+                // blending into the user’s shell scroll. `announce_raw` prints
                 // the pre-framed row (which carries its own colour).
                 crate::tools::announce_raw(&pane_row(label, &text));
             }
