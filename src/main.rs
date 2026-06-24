@@ -22,7 +22,7 @@ mod rewrite;
 mod scope;
 mod script;
 mod session;
-mod skillfish;
+mod skill_provider;
 mod skills;
 mod style;
 mod suggest;
@@ -62,12 +62,12 @@ struct Args {
     #[arg(long)]
     update: bool,
 
-    /// Fetch and import a skill from skill.fish (opt-in), then exit. Accepts a
-    /// URL (https://skill.fish/owner/name[@version]) or the owner/name shorthand.
+    /// Fetch and import a skill (opt-in), then exit. Accepts a URL or the
+    /// owner/name shorthand. Supports any skill provider (default: skill.fish).
     #[arg(long = "skill-fetch", value_name = "REF")]
     skill_fetch: Option<String>,
 
-    /// Search the skill.fish registry catalog and print matches, then exit. Each
+    /// Search the skill registry catalog and print matches, then exit. Each
     /// printed `owner/name` ref can be passed straight to --skill-fetch.
     #[arg(long = "skill-search", value_name = "QUERY")]
     skill_search: Option<String>,
@@ -169,23 +169,23 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    // `aish --skill-fetch <ref>`: opt-in skill.fish import. Runs WITHOUT a
-    // backend or credentials — it only fetches a SKILL.md over HTTPS and writes
-    // it into ~/.aish/skills/, then exits. See src/skillfish.rs.
+    // `aish --skill-fetch <ref>`: opt-in skill import. Runs WITHOUT a backend
+    // or credentials — it only fetches a SKILL.md over HTTPS and writes it into
+    // ~/.aish/skills/, then exits. See src/skill_provider.rs.
     if let Some(reference) = args.skill_fetch.as_deref() {
         let skills_dir = aish_dir().join("skills");
         let _ = std::fs::create_dir_all(&skills_dir);
-        if let Err(e) = skillfish::run_fetch(reference, &skills_dir).await {
+        if let Err(e) = skill_provider::run_fetch(reference, &skills_dir).await {
             eprintln!("\x1b[31maish:\x1b[0m skill fetch failed: {e:#}");
             std::process::exit(1);
         }
         return Ok(());
     }
-    // `aish --skill-search <query>`: opt-in skill.fish catalog search. Like
+    // `aish --skill-search <query>`: opt-in skill registry search. Like
     // --skill-fetch it needs no backend or credentials — it queries the registry
-    // over HTTPS, prints the matches as a table, then exits. See src/skillfish.rs.
+    // over HTTPS, prints the matches as a table, then exits. See src/skill_provider.rs.
     if let Some(query) = args.skill_search.as_deref() {
-        if let Err(e) = skillfish::run_search(query).await {
+        if let Err(e) = skill_provider::run_search(query).await {
             eprintln!("\x1b[31maish:\x1b[0m skill search failed: {e:#}");
             std::process::exit(1);
         }

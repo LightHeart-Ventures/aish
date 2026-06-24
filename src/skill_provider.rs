@@ -25,6 +25,7 @@ use std::time::Duration;
 
 /// Default registry origin. Override with `AISH_SKILL_REGISTRY=scheme://host`
 /// for self-hosted mirrors or tests (a loopback `http://` origin is allowed).
+/// Can also be a `file://` URI for a local mirror.
 const DEFAULT_REGISTRY: &str = "https://skill.fish";
 
 fn registry() -> String {
@@ -95,12 +96,15 @@ pub fn raw_url(r: &SkillRef) -> String {
 }
 
 /// Refuse anything but HTTPS, except a loopback origin (for self-hosted mirrors
-/// and the integration tests). A skill is fetched in the clear otherwise.
+/// and the integration tests) or a file:// URI (for local mirrors).
 fn check_url(url: &str) -> Result<()> {
     if url.starts_with("https://") {
         return Ok(());
     }
     if url.starts_with("http://localhost") || url.starts_with("http://127.0.0.1") {
+        return Ok(());
+    }
+    if url.starts_with("file://") {
         return Ok(());
     }
     bail!("refusing to fetch a skill over a non-HTTPS URL: {url}");
@@ -133,8 +137,22 @@ fn is_vercel_challenge(resp: &reqwest::Response) -> bool {
 
 /// Low-level fetch of a raw SKILL.md from an absolute URL (no env lookup), so
 /// tests can point it at a loopback server without mutating process env.
+/// Supports http://, https://, file://, and loopback origins.
 pub async fn fetch_url(url: &str) -> Result<String> {
     check_url(url)?;
+    
+    // Handle file:// URIs locally
+    if url.starts_with("file://") {
+        let path = url_to_path(url)?;
+        let body = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if body.trim().is_empty() {
+            bail!("file {url} is empty");
+        }
+        return Ok(body);
+    }
+    
+    // Handle http:// and https://
     let client = http_client()?;
     let resp = client.get(url).send().await.with_context(|| format!("fetching {url}"))?;
     if is_vercel_challenge(&resp) {
@@ -148,6 +166,16 @@ pub async fn fetch_url(url: &str) -> Result<String> {
         bail!("skill.fish returned an empty body for {url}");
     }
     Ok(body)
+}
+
+/// Convert a file:// URI to a safe local path.
+fn url_to_path(url: &str) -> Result<PathBuf> {
+    let path = url.strip_prefix("file://")
+        .context("not a file:// URI")?;
+    let decoded = urlencoding::decode(path)
+        .map(|s| s.into_owned())
+        .context("URL decoding failed")?;
+    Ok(PathBuf::from(decoded))
 }
 
 /// Fetch the raw SKILL.md for a parsed ref from the configured registry.
@@ -294,10 +322,21 @@ fn parse_search_body(body: &str) -> Result<Vec<SearchResult>> {
 }
 
 /// Search `base`'s registry catalog for `query` (no env lookup), so tests can
-/// point it at a loopback server without mutating process env.
+/// point it at a loopback server without mutating process env. Supports both
+/// HTTP(S) and file:// URIs.
 async fn search_with_base(base: &str, query: &str) -> Result<Vec<SearchResult>> {
     let url = search_url_with_base(base, query);
     check_url(&url)?;
+    
+    // Handle file:// URIs locally
+    if url.starts_with("file://") {
+        let path = url_to_path(&url)?;
+        let body = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        return parse_search_body(&body);
+    }
+    
+    // Handle http:// and https://
     let client = http_client()?;
     let resp = client.get(&url).send().await.with_context(|| format!("searching {url}"))?;
     if is_vercel_challenge(&resp) {
@@ -418,10 +457,11 @@ mod tests {
     }
 
     #[test]
-    fn check_url_enforces_https_except_loopback() {
+    fn check_url_enforces_https_except_loopback_and_file() {
         assert!(check_url("https://skill.fish/a/b/raw").is_ok());
         assert!(check_url("http://127.0.0.1:8080/a/b/raw").is_ok());
         assert!(check_url("http://localhost/a/b/raw").is_ok());
+        assert!(check_url("file:///tmp/index.json").is_ok());
         assert!(check_url("http://evil.example/a/b/raw").is_err());
         assert!(check_url("ftp://skill.fish/a/b").is_err());
     }

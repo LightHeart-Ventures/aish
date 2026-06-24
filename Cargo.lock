@@ -58,6 +58,7 @@ dependencies = [
  "sqlite-vec",
  "tokio",
  "unicode-width",
+ "urlencoding",
  "uuid 1.23.2",
 ]
 
