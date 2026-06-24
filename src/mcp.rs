@@ -78,6 +78,7 @@ struct McpPrompt {
 }
 
 /// One MCP-provided skill, flattened for the system-prompt catalog.
+#[derive(Clone)]
 pub struct McpSkill {
     pub server: String,
     pub name: String,
