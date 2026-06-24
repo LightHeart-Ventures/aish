@@ -2021,14 +2021,23 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> String {
     }
     match std::env::current_exe() {
         Ok(exe) => {
+            // Isolate a writing/building coordinator in its own git worktree +
+            // fresh branch when we're inside a repo, mirroring the
+            // `run_in_background` tool's smart-default (tools.rs). Without this an
+            // interactively-dispatched coordinator ran in the SHARED cwd and
+            // committed onto whatever branch the interactive session happened to
+            // be on — the headline worktree bug (e.g. TASK-200's commit landing on
+            // `fix/shift-tab-replay-history` instead of its own branch). Isolation
+            // is free for a no-change run: the worktree auto-removes on completion,
+            // and a job that does commit leaves its branch reported for review.
+            let isolate = crate::worker::is_git_repo(&session.cwd);
             let spec = crate::worker::WorkerSpec {
                 exe,
                 cwd: session.cwd.clone(),
                 backend: session.backend_kind.clone(),
                 model: crate::worker::coordinator_model(&session.backend_kind, &session.batch_model),
                 env: session.env.clone(),
-                // Shared-cwd behavior (no worktree), matching `:dispatch`.
-                isolate: false,
+                isolate,
                 base: "main".to_string(),
                 launch_session_id: session.session_id.clone(),
                 launch_session_name: session.name.clone(),
