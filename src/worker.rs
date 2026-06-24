@@ -121,6 +121,18 @@ fn classify_event(line: &str) -> Option<Pulse> {
 /// tail rather than the whole thing.
 const STDERR_TAIL_LINES: usize = 20;
 
+/// Max number of forwardable activity lines retained per worker for an
+/// `:attach` backfill replay. Bounds the per-worker transcript so a chatty
+/// coordinator can't grow the PARENT's memory without limit (the same OOM
+/// discipline as `read_capped`). Paired with [`TRANSCRIPT_MAX_BYTES`];
+/// whichever cap trips first evicts the oldest rows.
+const TRANSCRIPT_MAX_LINES: usize = 1000;
+
+/// Byte budget for the retained per-worker transcript (see
+/// [`TRANSCRIPT_MAX_LINES`]). Oldest rows are evicted once the running total
+/// of `(suffix + text)` bytes exceeds this.
+const TRANSCRIPT_MAX_BYTES: usize = 256 * 1024;
+
 /// Decide whether a single raw coordinator-stderr line is worth forwarding to
 /// the user's terminal, and if so return the cleaned text to forward.
 ///
@@ -251,6 +263,15 @@ pub fn pane_close() -> String {
     "\x1b[36m┗━ coordinator output \x1b[0m\x1b[2m(:output off)\x1b[0m\x1b[36m ━━━━━━━━━━━━━━━\x1b[0m".to_string()
 }
 
+/// Header printed once above an `:attach` backfill: it brackets the
+/// "output to date" replay block that precedes the now-live coordinator
+/// stream. Pure — unit-tested.
+pub fn pane_replay_header(short: &str) -> String {
+    format!(
+        "\x1b[36m\u{250f}\u{2501} {short} \u{2014} output to date \x1b[0m\x1b[2m(replay; live activity follows)\x1b[0m\x1b[36m \u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\x1b[0m"
+    )
+}
+
 /// Stream a child's stderr line by line, forwarding the interesting lines to the
 /// user's terminal live via `announce`, and retaining only the last
 /// `STDERR_TAIL_LINES` raw lines as a bounded ring for the failure message.
@@ -296,21 +317,34 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                 None => {}
             }
         }
-        // Forward when the session-wide toggle is on OR this worker is the one
-        // `:attach`ed to (the per-worker `:attach` stream).
-        let attached_id = attached.lock().ok().and_then(|g| g.clone());
-        let on = should_forward(
-            show_output.load(Ordering::Relaxed),
-            attached_id.as_deref(),
-            label,
-        );
-        if let Some(text) = forward_decision(&line, on) {
-            // Frame each forwarded line as a row of the contained `:output`
-            // pane (a box-drawing left border + label gutter), so coordinator
-            // activity reads as a bordered column rather than blending into
-            // the user's shell scroll. `announce_raw` prints the pre-framed row
-            // (which carries its own colour) over the prompt.
-            crate::tools::announce_raw(&pane_row(label, &text));
+        // Capture the forwardable shape of this line (computed as if output
+        // were ON) so we can BOTH record it into this worker's transcript —
+        // for an `:attach` to replay the output-to-date — AND forward it live
+        // when the gate is open. Recording is independent of the gate, so a
+        // later `:attach` still shows the history even if `:worker-output`
+        // was off the whole time. The single source glyph is already stamped
+        // into `text` (engine::tool_glyph / the 🚀/🐌 narration prefix), so the
+        // transcript suffix is empty and the pane gutter is just `[label]`.
+        if let Some(text) = forward_decision(&line, true) {
+            if let Some(job) = &pulse {
+                job.record_activity("", &text);
+            }
+            // Forward when the session-wide toggle is on OR this worker is the
+            // one `:attach`ed to (the per-worker `:attach` stream).
+            let attached_id = attached.lock().ok().and_then(|g| g.clone());
+            let on = should_forward(
+                show_output.load(Ordering::Relaxed),
+                attached_id.as_deref(),
+                label,
+            );
+            if on {
+                // Frame each forwarded line as a row of the contained
+                // `:output` pane (a box-drawing left border + label gutter) so
+                // coordinator activity reads as a bordered column rather than
+                // blending into the user's shell scroll. `announce_raw` prints
+                // the pre-framed row (which carries its own colour).
+                crate::tools::announce_raw(&pane_row(label, &text));
+            }
         }
         if tail.len() == STDERR_TAIL_LINES {
             tail.pop_front();
@@ -1009,6 +1043,13 @@ struct JobInner {
     /// When the worker most recently emitted turn/narration text, for the
     /// magenta turn pulse. `None` until the first narration line.
     last_turn_completion: Option<Instant>,
+    /// Bounded transcript of forwardable activity lines (`(suffix, text)`)
+    /// captured from this worker's stderr REGARDLESS of the `:worker-output`
+    /// gate, so an `:attach` can replay the output-to-date before the live
+    /// stream resumes. Evicted oldest-first past the line/byte caps.
+    transcript: VecDeque<(String, String)>,
+    /// Running byte total of `transcript` entries, for the byte-budget cap.
+    transcript_bytes: usize,
 }
 
 pub type WorkerJobs = Arc<Mutex<Vec<Arc<WorkerJob>>>>;
@@ -1097,6 +1138,31 @@ impl WorkerJob {
     /// Record a turn/narration completion for the magenta turn pulse.
     fn record_turn_completion(&self) {
         self.inner.lock().unwrap().last_turn_completion = Some(Instant::now());
+    }
+    /// Append one forwardable activity line to this worker's bounded
+    /// transcript so an `:attach` can replay the output-to-date before the
+    /// live stream continues. Bounded by BOTH a line count and a byte budget
+    /// ([`TRANSCRIPT_MAX_LINES`]/[`TRANSCRIPT_MAX_BYTES`]) so a chatty
+    /// coordinator can't grow the parent's memory without limit — the oldest
+    /// rows are evicted first.
+    fn record_activity(&self, suffix: &str, text: &str) {
+        let mut i = self.inner.lock().unwrap();
+        i.transcript_bytes += suffix.len() + text.len();
+        i.transcript.push_back((suffix.to_string(), text.to_string()));
+        while i.transcript.len() > TRANSCRIPT_MAX_LINES
+            || i.transcript_bytes > TRANSCRIPT_MAX_BYTES
+        {
+            match i.transcript.pop_front() {
+                Some((s, t)) => i.transcript_bytes -= s.len() + t.len(),
+                None => break,
+            }
+        }
+    }
+
+    /// The retained transcript rows (`(suffix, text)`, oldest-first) captured
+    /// from this worker's activity — replayed on `:attach`.
+    pub fn transcript_rows(&self) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().transcript.iter().cloned().collect()
     }
     /// The most recent badge-pulse event on this worker (tool outcome vs turn
     /// completion — whichever happened later), paired with when it happened.
@@ -1223,6 +1289,8 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
             branch: None,
             last_tool_outcome: None,
             last_turn_completion: None,
+            transcript: VecDeque::new(),
+            transcript_bytes: 0,
         }),
     });
     guard.push(job.clone());
@@ -1574,6 +1642,8 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
+            transcript: VecDeque::new(),
+            transcript_bytes: 0,
             }),
         });
         assert!(job.fetch().contains("still running"));
@@ -1596,6 +1666,8 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
+            transcript: VecDeque::new(),
+            transcript_bytes: 0,
             }),
         });
         job.set_failed("boom".into());
@@ -1807,6 +1879,43 @@ mod tests {
     }
 
     #[test]
+    fn pane_replay_header_brackets_output_to_date() {
+        let h = pane_replay_header("w_a7k3m2pQ");
+        assert!(h.contains('\u{250f}'), "replay header has a top-left corner: {h}");
+        assert!(h.contains("w_a7k3m2pQ"), "replay header names the coordinator: {h}");
+        assert!(h.contains("output to date"), "replay header labels the block: {h}");
+    }
+
+    #[test]
+    fn transcript_records_and_bounds_oldest_first() {
+        let job = Arc::new(WorkerJob {
+            id: "w_tx".into(),
+            task: "t".into(),
+            inner: Mutex::new(JobInner {
+                status: "running".into(),
+                result: None,
+                error: None,
+                displayed: false,
+                branch: None,
+                last_tool_outcome: None,
+                last_turn_completion: None,
+                transcript: VecDeque::new(),
+                transcript_bytes: 0,
+            }),
+        });
+        // Record well past the line cap; the oldest rows are evicted.
+        for n in 0..(TRANSCRIPT_MAX_LINES + 50) {
+            job.record_activity("", &format!("line {n}"));
+        }
+        let rows = job.transcript_rows();
+        assert!(rows.len() <= TRANSCRIPT_MAX_LINES, "line cap enforced: {}", rows.len());
+        // The newest line is retained; the very first is gone.
+        let newest = format!("line {}", TRANSCRIPT_MAX_LINES + 49);
+        assert!(rows.last().unwrap().1.contains(&newest), "newest row kept");
+        assert!(!rows.iter().any(|(_, t)| t == "line 0"), "oldest row evicted");
+    }
+
+    #[test]
     fn worktree_layout_builds_branch_and_path() {
         let root = std::path::Path::new("/wt-root");
         let (branch, path) = worktree_layout(root, "LightHeart-Ventures--aish", "w_a7k3m2pQ");
@@ -1913,6 +2022,8 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
+            transcript: VecDeque::new(),
+            transcript_bytes: 0,
             }),
         });
         let lines = concat!(
@@ -1962,6 +2073,8 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
+            transcript: VecDeque::new(),
+            transcript_bytes: 0,
             }),
         });
         // No events yet.
@@ -1994,6 +2107,8 @@ mod tests {
                     branch: None,
                     last_tool_outcome: None,
                     last_turn_completion: None,
+            transcript: VecDeque::new(),
+            transcript_bytes: 0,
                 }),
             });
             jobs.lock().unwrap().push(j.clone());

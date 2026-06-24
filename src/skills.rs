@@ -91,6 +91,24 @@ matches one, call get_skill {server, name, args} FIRST and follow what it return
     s
 }
 
+/// The MCP skills the INTERACTIVE shell is allowed to advertise — the routing /
+/// decision skills it uses to decide WHETHER to offload work, not the heavy
+/// code-work or agent-dispatch skills that actually do it. The interactive agent
+/// is a light-touch router: it keeps these two and hands every heavier task to a
+/// background coordinator (which sees the full catalog), so the heavy lifting
+/// never runs inline at the prompt.
+pub const INTERACTIVE_MCP_SKILLS: &[&str] = &["atum/should-i-hire-an-agent", "atum/pick-model"];
+
+/// Narrow a full MCP skill catalog down to the routing subset the interactive
+/// agent may see (`INTERACTIVE_MCP_SKILLS`). A background coordinator passes the
+/// catalog through unfiltered; only the interactive shell applies this.
+pub fn interactive_mcp_skills(all: &[crate::mcp::McpSkill]) -> Vec<crate::mcp::McpSkill> {
+    all.iter()
+        .filter(|s| INTERACTIVE_MCP_SKILLS.contains(&s.name.as_str()))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +144,29 @@ mod tests {
         assert!(render_prompt_section(&local, &[]).contains("deploy"));
         assert!(render_prompt_section(&[], &mcp).contains("get_skill"));
         assert_eq!(render_prompt_section(&[], &[]), "");
+    }
+
+    #[test]
+    fn interactive_filter_keeps_only_routing_skills() {
+        let mk = |name: &str| crate::mcp::McpSkill {
+            server: "atum".into(),
+            name: name.into(),
+            description: "d".into(),
+            args: vec![],
+        };
+        let all = vec![
+            mk("atum/should-i-hire-an-agent"),
+            mk("atum/pick-model"),
+            mk("atum/review-pr"),
+            mk("atum/build-agent"),
+            mk("atum/invoke-agent"),
+        ];
+        let kept: Vec<String> =
+            interactive_mcp_skills(&all).into_iter().map(|s| s.name).collect();
+        // Only the two routing skills survive; every heavy code-work / dispatch
+        // skill is hidden from the interactive agent.
+        assert_eq!(kept, vec!["atum/should-i-hire-an-agent", "atum/pick-model"]);
+        // Empty catalog stays empty.
+        assert!(interactive_mcp_skills(&[]).is_empty());
     }
 }
