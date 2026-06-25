@@ -54,6 +54,74 @@ pub struct DirtyDetails {
     pub sample: Vec<String>,
 }
 
+/// How one path differs from trunk. `Conflict` is reserved for paths reported by
+/// `git diff --diff-filter=U` (an in-progress conflicted merge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffStatus {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Conflict,
+}
+
+/// One file's diff vs the trunk merge-base. `insertions`/`deletions` are `0` for
+/// binary files (numstat reports `-`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiff {
+    pub path: String,
+    pub status: DiffStatus,
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+/// How a checkout differs from its resolved trunk — the observe-only answer to
+/// "is this branch ahead/behind, what changed, can it fast-forward?".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoDiff {
+    /// Resolved trunk (`git::trunk_branch`), never hard-coded `main`.
+    pub trunk: String,
+    /// Commits on HEAD not yet on trunk.
+    pub commits_ahead: usize,
+    /// Commits on trunk not on HEAD.
+    pub commits_behind: usize,
+    pub files_changed: Vec<FileDiff>,
+    /// Paths in an in-progress conflicted merge (`--diff-filter=U`).
+    pub conflicts: Vec<String>,
+    /// True when trunk is an ancestor of HEAD (HEAD fast-forwards onto trunk).
+    pub can_fastforward: bool,
+}
+
+/// A worktree's identity + diff-vs-trunk + cleanliness — one row of the
+/// `sync_all_worktrees` answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeStatus {
+    /// The `w_########` segment derived from the worktree path, when present.
+    pub worktree_id: Option<String>,
+    /// Worktree root.
+    pub root: PathBuf,
+    /// Checked-out branch; `None` on a detached HEAD.
+    pub branch: Option<String>,
+    pub diff: RepoDiff,
+    /// `git status --porcelain` empty.
+    pub is_clean: bool,
+}
+
+/// A persisted `worktree_state` row, returned by [`GitRepoCache::query_worktrees`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeRecord {
+    pub repo_key: String,
+    pub worktree_path: PathBuf,
+    pub worktree_id: Option<String>,
+    pub branch: Option<String>,
+    pub commits_ahead: usize,
+    pub commits_behind: usize,
+    pub is_clean: bool,
+    pub can_fastforward: bool,
+    pub conflict_count: usize,
+    pub synced_at: String,
+}
+
 /// Why a sync failed. Callers branch on the variant to react precisely.
 #[derive(Debug)]
 pub enum GitError {
@@ -158,6 +226,28 @@ pub(crate) fn evaluate_guard(
     Ok(())
 }
 
+/// Parse `git worktree list --porcelain` into the worktree root paths. Each
+/// stanza starts with a `worktree <path>` line; everything else (HEAD, branch,
+/// bare, detached, locked, …) is ignored here. Pure.
+pub(crate) fn parse_worktree_paths(s: &str) -> Vec<PathBuf> {
+    s.lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .map(|p| PathBuf::from(p.trim()))
+        .collect()
+}
+
+/// Derive the `w_########` worktree-id segment from a path, when one of its
+/// components looks like an aish worktree id (`w_` + alphanumerics). Pure.
+pub(crate) fn worktree_id_from_path(p: &Path) -> Option<String> {
+    p.components().rev().find_map(|c| {
+        let s = c.as_os_str().to_string_lossy();
+        let is_id = s.len() > 2
+            && s.starts_with("w_")
+            && s[2..].chars().all(|ch| ch.is_ascii_alphanumeric());
+        is_id.then(|| s.to_string())
+    })
+}
+
 /// Cached repo state, in its OWN SQLite connection (same pattern as
 /// `BatchStore` / `CoordinatorStore`): points at the same `aish.db`, WAL makes
 /// the concurrent connections safe, and a background task can sync without
@@ -183,9 +273,22 @@ impl GitRepoCache {
                  head_sha       TEXT NOT NULL,
                  dirty          INTEGER NOT NULL,
                  synced_at      TEXT NOT NULL DEFAULT current_timestamp
+             );
+             CREATE TABLE IF NOT EXISTS worktree_state (
+                 repo_key        TEXT NOT NULL,
+                 worktree_path   TEXT NOT NULL,
+                 worktree_id     TEXT,
+                 branch          TEXT,
+                 commits_ahead   INTEGER NOT NULL,
+                 commits_behind  INTEGER NOT NULL,
+                 is_clean        INTEGER NOT NULL,
+                 can_fastforward INTEGER NOT NULL,
+                 conflict_count  INTEGER NOT NULL,
+                 synced_at       TEXT NOT NULL DEFAULT current_timestamp,
+                 PRIMARY KEY (repo_key, worktree_path)
              );",
         )
-        .context("repo_state schema init failed")?;
+        .context("repo_state / worktree_state schema init failed")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -251,6 +354,97 @@ impl GitRepoCache {
         Ok(state)
     }
 
+    /// Compare `path`'s checkout to its resolved trunk — commits ahead/behind,
+    /// changed files (with status overlaid from `--name-status`), conflicted
+    /// paths, and fast-forward-ability. OBSERVE-only: never fetches/checks-out/
+    /// merges. The trunk is resolved via `git::trunk_branch` — never hard-coded.
+    pub fn compare_to_trunk(&self, path: &Path) -> Result<RepoDiff, GitError> {
+        if !git::is_git_repo(path) {
+            return Err(GitError::NotAGitRepo);
+        }
+        let trunk = git::trunk_branch(path);
+        let (commits_ahead, commits_behind) =
+            git::commits_ahead_behind(path, &trunk).unwrap_or((0, 0));
+
+        // numstat carries the counts; name-status carries the A/D/R/Conflict
+        // classification. Overlay the latter onto the former by path.
+        let mut files = git::diff_numstat(path, &trunk);
+        let status_by_path: std::collections::HashMap<String, DiffStatus> =
+            git::diff_name_status(path, &trunk)
+                .into_iter()
+                .map(|(status, path)| (path, status))
+                .collect();
+        for f in files.iter_mut() {
+            if let Some(s) = status_by_path.get(&f.path) {
+                f.status = *s;
+            }
+        }
+
+        let conflicts = git::conflicted_paths(path);
+        for f in files.iter_mut() {
+            if conflicts.iter().any(|c| c == &f.path) {
+                f.status = DiffStatus::Conflict;
+            }
+        }
+
+        let can_fastforward = git::can_fastforward(path, &trunk);
+        Ok(RepoDiff {
+            trunk,
+            commits_ahead,
+            commits_behind,
+            files_changed: files,
+            conflicts,
+            can_fastforward,
+        })
+    }
+
+    /// Resolve one worktree's [`WorktreeStatus`] (diff-vs-trunk + identity +
+    /// cleanliness) and persist it into `worktree_state`. OBSERVE-only.
+    pub fn worktree_status(&self, path: &Path) -> Result<WorktreeStatus, GitError> {
+        let diff = self.compare_to_trunk(path)?;
+        let root = git::toplevel(path)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.to_path_buf());
+        let branch = git::current_branch(path);
+        let is_clean = !git::is_dirty(path);
+        let worktree_id = worktree_id_from_path(&root);
+        let repo_key = git::repo_key(path);
+
+        let status = WorktreeStatus {
+            worktree_id,
+            root,
+            branch,
+            diff,
+            is_clean,
+        };
+        self.persist_worktree(&repo_key, &status).map_err(|e| {
+            GitError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
+        })?;
+        Ok(status)
+    }
+
+    /// Enumerate every worktree of `repo_root` via `git worktree list
+    /// --porcelain` (canonical — NOT by guessing `~/.aish/worktrees` paths) and
+    /// resolve+persist each one's [`WorktreeStatus`]. A worktree that can't be
+    /// read is skipped rather than failing the whole sweep. OBSERVE-only.
+    pub fn sync_all_worktrees(&self, repo_root: &Path) -> Result<Vec<WorktreeStatus>, GitError> {
+        if !git::is_git_repo(repo_root) {
+            return Err(GitError::NotAGitRepo);
+        }
+        let listing =
+            git::git_out(repo_root, &["worktree", "list", "--porcelain"]).unwrap_or_default();
+        let mut out = Vec::new();
+        for wt in parse_worktree_paths(&listing) {
+            if let Ok(status) = self.worktree_status(&wt) {
+                out.push(status);
+            }
+        }
+        Ok(out)
+    }
+
     /// Upsert the row and return the `synced_at` timestamp the DB stamped.
     fn persist(&self, s: &RepoState) -> Result<String> {
         let conn = self.conn.lock().unwrap();
@@ -285,6 +479,38 @@ impl GitRepoCache {
         )?)
     }
 
+    /// Upsert a `worktree_state` row keyed by `(repo_key, worktree_path)`.
+    fn persist_worktree(&self, repo_key: &str, s: &WorktreeStatus) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO worktree_state
+                 (repo_key, worktree_path, worktree_id, branch, commits_ahead, commits_behind,
+                  is_clean, can_fastforward, conflict_count, synced_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, current_timestamp)
+             ON CONFLICT(repo_key, worktree_path) DO UPDATE SET
+                 worktree_id     = excluded.worktree_id,
+                 branch          = excluded.branch,
+                 commits_ahead   = excluded.commits_ahead,
+                 commits_behind  = excluded.commits_behind,
+                 is_clean        = excluded.is_clean,
+                 can_fastforward = excluded.can_fastforward,
+                 conflict_count  = excluded.conflict_count,
+                 synced_at       = current_timestamp",
+            rusqlite::params![
+                repo_key,
+                s.root.to_string_lossy(),
+                s.worktree_id,
+                s.branch,
+                s.diff.commits_ahead as i64,
+                s.diff.commits_behind as i64,
+                s.is_clean as i64,
+                s.diff.can_fastforward as i64,
+                s.diff.conflicts.len() as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Last-synced state for a `repo_key`, or `None` if never synced.
     pub fn get(&self, repo_key: &str) -> Result<Option<RepoState>> {
         let conn = self.conn.lock().unwrap();
@@ -296,6 +522,18 @@ impl GitRepoCache {
                 row_to_state,
             )
             .optional()?)
+    }
+
+    /// Every persisted worktree row for a `repo_key`, ordered by path.
+    pub fn query_worktrees(&self, repo_key: &str) -> Result<Vec<WorktreeRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT repo_key, worktree_path, worktree_id, branch, commits_ahead, commits_behind,
+                    is_clean, can_fastforward, conflict_count, synced_at
+             FROM worktree_state WHERE repo_key = ?1 ORDER BY worktree_path",
+        )?;
+        let rows = stmt.query_map([repo_key], row_to_worktree)?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
     /// Every repo whose last sync observed it on its trunk (`on_trunk = 1`).
@@ -333,6 +571,22 @@ fn row_to_state(r: &rusqlite::Row<'_>) -> rusqlite::Result<RepoState> {
         head_sha: r.get(6)?,
         dirty: r.get::<_, i64>(7)? != 0,
         synced_at: r.get(8)?,
+    })
+}
+
+/// Materialize a `WorktreeRecord` from a `worktree_state` row.
+fn row_to_worktree(r: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeRecord> {
+    Ok(WorktreeRecord {
+        repo_key: r.get(0)?,
+        worktree_path: PathBuf::from(r.get::<_, String>(1)?),
+        worktree_id: r.get(2)?,
+        branch: r.get(3)?,
+        commits_ahead: r.get::<_, i64>(4)? as usize,
+        commits_behind: r.get::<_, i64>(5)? as usize,
+        is_clean: r.get::<_, i64>(6)? != 0,
+        can_fastforward: r.get::<_, i64>(7)? != 0,
+        conflict_count: r.get::<_, i64>(8)? as usize,
+        synced_at: r.get(9)?,
     })
 }
 
@@ -479,6 +733,49 @@ mod tests {
         ));
     }
 
+    // ---- pure worktree helpers ----
+
+    #[test]
+    fn parse_worktree_paths_extracts_roots() {
+        let porcelain = "\
+worktree /Users/me/projects/aish
+HEAD 1111111111111111111111111111111111111111
+branch refs/heads/main
+
+worktree /Users/me/.aish/worktrees/aish/w_Fo4BbfRo
+HEAD 2222222222222222222222222222222222222222
+branch refs/heads/feat/x
+
+worktree /Users/me/.aish/worktrees/aish/w_abcd1234
+HEAD 3333333333333333333333333333333333333333
+detached
+";
+        let got = parse_worktree_paths(porcelain);
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("/Users/me/projects/aish"),
+                PathBuf::from("/Users/me/.aish/worktrees/aish/w_Fo4BbfRo"),
+                PathBuf::from("/Users/me/.aish/worktrees/aish/w_abcd1234"),
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_id_from_path_finds_w_segment() {
+        assert_eq!(
+            worktree_id_from_path(Path::new("/home/me/.aish/worktrees/aish/w_Fo4BbfRo")).as_deref(),
+            Some("w_Fo4BbfRo")
+        );
+        // No w_ segment → None (a plain checkout root).
+        assert_eq!(
+            worktree_id_from_path(Path::new("/home/me/projects/aish")),
+            None
+        );
+        // `w_` without a suffix isn't an id.
+        assert_eq!(worktree_id_from_path(Path::new("/tmp/w_")), None);
+    }
+
     // ---- store round-trip ----
 
     fn temp_cache(name: &str) -> (GitRepoCache, PathBuf) {
@@ -499,6 +796,30 @@ mod tests {
             head_sha: "deadbeef".into(),
             dirty: false,
             synced_at: String::new(),
+        }
+    }
+
+    fn mk_worktree(
+        id: Option<&str>,
+        path: &str,
+        branch: Option<&str>,
+        ahead: usize,
+        behind: usize,
+        clean: bool,
+    ) -> WorktreeStatus {
+        WorktreeStatus {
+            worktree_id: id.map(String::from),
+            root: PathBuf::from(path),
+            branch: branch.map(String::from),
+            diff: RepoDiff {
+                trunk: "main".into(),
+                commits_ahead: ahead,
+                commits_behind: behind,
+                files_changed: vec![],
+                conflicts: vec![],
+                can_fastforward: behind == 0,
+            },
+            is_clean: clean,
         }
     }
 
@@ -560,6 +881,70 @@ mod tests {
         let reopened = GitRepoCache::open(&path).unwrap();
         assert_eq!(reopened.query_trunk_repos().unwrap().len(), 1);
         assert_eq!(reopened.query_off_trunk_repos().unwrap().len(), 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn worktree_state_upsert_query_and_reopen() {
+        let (cache, path) = temp_cache("worktree");
+        assert!(cache.query_worktrees("o--w").unwrap().is_empty());
+
+        // Two worktrees of the same repo_key.
+        cache
+            .persist_worktree(
+                "o--w",
+                &mk_worktree(None, "/repos/w", Some("main"), 0, 0, true),
+            )
+            .unwrap();
+        cache
+            .persist_worktree(
+                "o--w",
+                &mk_worktree(
+                    Some("w_aaaa1111"),
+                    "/wt/w_aaaa1111",
+                    Some("feat/x"),
+                    2,
+                    1,
+                    false,
+                ),
+            )
+            .unwrap();
+
+        let rows = cache.query_worktrees("o--w").unwrap();
+        assert_eq!(rows.len(), 2);
+        // Ordered by worktree_path: "/repos/w" < "/wt/...".
+        assert_eq!(rows[0].worktree_path, PathBuf::from("/repos/w"));
+        assert_eq!(rows[0].commits_ahead, 0);
+        assert!(rows[0].is_clean);
+        assert_eq!(rows[1].worktree_id.as_deref(), Some("w_aaaa1111"));
+        assert_eq!((rows[1].commits_ahead, rows[1].commits_behind), (2, 1));
+        assert!(!rows[1].is_clean);
+        assert!(!rows[1].can_fastforward);
+
+        // Upsert the same (repo_key, path) — replaces, no duplicate row.
+        cache
+            .persist_worktree(
+                "o--w",
+                &mk_worktree(
+                    Some("w_aaaa1111"),
+                    "/wt/w_aaaa1111",
+                    Some("feat/x"),
+                    5,
+                    0,
+                    true,
+                ),
+            )
+            .unwrap();
+        let rows = cache.query_worktrees("o--w").unwrap();
+        assert_eq!(rows.len(), 2, "upsert must not add a row");
+        assert_eq!(rows[1].commits_ahead, 5);
+        assert!(rows[1].can_fastforward);
+        assert!(rows[1].is_clean);
+
+        // Survives reopen.
+        let reopened = GitRepoCache::open(&path).unwrap();
+        assert_eq!(reopened.query_worktrees("o--w").unwrap().len(), 2);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -641,6 +1026,94 @@ mod tests {
             GitError::NotAGitRepo
         ));
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dbpath);
+    }
+
+    #[test]
+    fn compare_to_trunk_and_sync_all_worktrees_over_real_repo() {
+        let base = std::env::temp_dir().join(format!("aish_wt_int_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let main_dir = base.join("main");
+        std::fs::create_dir_all(&main_dir).unwrap();
+        if !git(&main_dir, &["init", "-b", "main"]) {
+            eprintln!("skipping: git unavailable");
+            return;
+        }
+        // Give it an origin remote so every linked worktree shares ONE repo_key
+        // (mirrors real usage; without a remote each worktree would hash to its
+        // own path-based key). No network is touched — the URL is only parsed.
+        assert!(git(
+            &main_dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/test/wt-repo.git"
+            ],
+        ));
+        std::fs::write(main_dir.join("f.txt"), b"one\n").unwrap();
+        assert!(git(&main_dir, &["add", "."]));
+        assert!(git(&main_dir, &["commit", "-m", "init"]));
+
+        // Feature branch with one extra commit changing a file.
+        assert!(git(&main_dir, &["checkout", "-b", "feat/work"]));
+        std::fs::write(main_dir.join("f.txt"), b"one\ntwo\n").unwrap();
+        std::fs::write(main_dir.join("g.txt"), b"new\n").unwrap();
+        assert!(git(&main_dir, &["add", "."]));
+        assert!(git(&main_dir, &["commit", "-m", "feat work"]));
+
+        let (cache, dbpath) = temp_cache("wt_integration");
+
+        // compare_to_trunk: one commit ahead, zero behind, both files changed.
+        let diff = cache.compare_to_trunk(&main_dir).expect("compare ok");
+        assert_eq!(diff.trunk, "main");
+        assert_eq!(diff.commits_ahead, 1);
+        assert_eq!(diff.commits_behind, 0);
+        assert!(diff.can_fastforward, "trunk is ancestor of HEAD");
+        let mut changed: Vec<&str> = diff.files_changed.iter().map(|f| f.path.as_str()).collect();
+        changed.sort();
+        assert_eq!(changed, vec!["f.txt", "g.txt"]);
+        let g = diff
+            .files_changed
+            .iter()
+            .find(|f| f.path == "g.txt")
+            .unwrap();
+        assert_eq!(g.status, DiffStatus::Added);
+
+        // Add a second worktree; sync_all_worktrees enumerates BOTH.
+        let wt2 = base.join("w_abcd1234");
+        assert!(git(
+            &main_dir,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat/second",
+                wt2.to_str().unwrap()
+            ],
+        ));
+
+        let statuses = cache.sync_all_worktrees(&main_dir).expect("sync all ok");
+        assert_eq!(statuses.len(), 2, "main + second worktree");
+        let roots: std::collections::HashSet<String> = statuses
+            .iter()
+            .map(|s| s.root.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(roots.contains("main"));
+        assert!(roots.contains("w_abcd1234"));
+        // The w_-named worktree got its id derived from the path.
+        let second = statuses
+            .iter()
+            .find(|s| s.root.ends_with("w_abcd1234"))
+            .unwrap();
+        assert_eq!(second.worktree_id.as_deref(), Some("w_abcd1234"));
+
+        // Persisted: query_worktrees returns the rows for this repo_key.
+        let repo_key = git::repo_key(&main_dir);
+        let rows = cache.query_worktrees(&repo_key).unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_file(&dbpath);
     }
 }
