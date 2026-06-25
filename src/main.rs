@@ -182,9 +182,16 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     // `aish --skill-search <query>`: opt-in skill registry search. Like
-    // --skill-fetch it needs no backend or credentials — it queries the registry
-    // over HTTPS, prints the matches as a table, then exits. See src/skill_provider.rs.
+    // --skill-fetch it needs no backend or credentials. By default it reads the
+    // curated, binary-embedded catalog from the local `file://` index at
+    // ~/.aish/registry/index.json (set up by skill_provider::initialize_registry
+    // on a normal launch); override AISH_SKILL_REGISTRY to query skill.fish or a
+    // self-hosted mirror over HTTPS instead. Prints the matches as a table, then
+    // exits. See src/skill_provider.rs.
     if let Some(query) = args.skill_search.as_deref() {
+        // Ensure the embedded index exists so the default file:// registry has a
+        // catalog to search even on the very first run (before a full startup).
+        let _ = skill_provider::initialize_registry(&aish_dir());
         if let Err(e) = skill_provider::run_search(query).await {
             eprintln!("\x1b[31maish:\x1b[0m skill search failed: {e:#}");
             std::process::exit(1);
@@ -255,6 +262,20 @@ async fn main() -> Result<()> {
     // it, so the coordinator and the jobs it spawns all attribute to the human's
     // original session, not the coordinator's throwaway uuid.
     session.set_var("AISH_SESSION_ID", session.session_id.clone());
+
+    // ~/.aish/ — config home. Create it and the skill-registry directory, then
+    // write the binary-embedded curated skill index to ~/.aish/registry/index.json
+    // (idempotent; refreshed every launch so it tracks this binary). This runs
+    // early — after aish_dir exists, before the backend is built — so the default
+    // `file://` skill registry always has a catalog to search, even fully offline.
+    let aish_dir = aish_dir();
+    let _ = std::fs::create_dir_all(&aish_dir);
+    let _ = std::fs::create_dir_all(aish_dir.join("registry"));
+    if let Err(e) = skill_provider::initialize_registry(&aish_dir) {
+        eprintln!("\x1b[33maish:\x1b[0m skill registry init failed: {e:#}");
+    }
+    timer.mark("registry init");
+
     let backend = match args.backend.as_str() {
         "claude" => {
             let cred = backend::claude::Credential::resolve(&session.env)?;
@@ -282,8 +303,7 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("unknown mode: {} (paranoid|careful|normal|yolo)", args.mode))?
     };
 
-    // ~/.aish/ — config home: .mcp.json (MCP servers) and skills/.
-    let aish_dir = aish_dir();
+    // ~/.aish/ — config home (created above): .mcp.json (MCP servers) and skills/.
     let _ = std::fs::create_dir_all(aish_dir.join("skills"));
     let skills_dir = aish_dir.join("skills");
     let mcp_config = aish_dir.join(".mcp.json");
