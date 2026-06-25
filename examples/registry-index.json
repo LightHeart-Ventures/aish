@@ -1,0 +1,25 @@
+{
+  "results": [
+    {
+      "name": "git-helper",
+      "author": "acme",
+      "description": "Assists with common git operations and workflow.",
+      "version": "1.0.0",
+      "reference": "acme/git-helper"
+    },
+    {
+      "name": "docker-lint",
+      "author": "cloudinero",
+      "description": "Lints and suggests improvements for Dockerfiles.",
+      "version": "2.1.0",
+      "reference": "cloudinero/docker-lint"
+    },
+    {
+      "name": "terraform-plan",
+      "author": "devops",
+      "description": "Analyzes Terraform plans and suggests optimizations.",
+      "version": "1.2.3",
+      "reference": "devops/terraform-plan"
+    }
+  ]
+}

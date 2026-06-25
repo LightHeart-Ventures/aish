@@ -1,0 +1,144 @@
+{
+  "results": [
+    {
+      "name": "github-pr",
+      "author": "anthropic",
+      "description": "Manage GitHub pull requests with gh CLI.",
+      "version": "1.0.0",
+      "reference": "anthropic/github-pr"
+    },
+    {
+      "name": "github-issue",
+      "author": "anthropic",
+      "description": "Manage GitHub issues with gh CLI.",
+      "version": "1.0.0",
+      "reference": "anthropic/github-issue"
+    },
+    {
+      "name": "aws-s3",
+      "author": "anthropic",
+      "description": "Interact with AWS S3 buckets.",
+      "version": "1.0.0",
+      "reference": "anthropic/aws-s3"
+    },
+    {
+      "name": "aws-lambda",
+      "author": "anthropic",
+      "description": "Deploy and manage AWS Lambda functions.",
+      "version": "1.0.0",
+      "reference": "anthropic/aws-lambda"
+    },
+    {
+      "name": "aws-dynamodb",
+      "author": "anthropic",
+      "description": "Query and manage DynamoDB tables.",
+      "version": "1.0.0",
+      "reference": "anthropic/aws-dynamodb"
+    },
+    {
+      "name": "aws-ec2",
+      "author": "anthropic",
+      "description": "Manage AWS EC2 instances.",
+      "version": "1.0.0",
+      "reference": "anthropic/aws-ec2"
+    },
+    {
+      "name": "terraform-plan",
+      "author": "anthropic",
+      "description": "Plan and apply Terraform infrastructure changes.",
+      "version": "1.0.0",
+      "reference": "anthropic/terraform-plan"
+    },
+    {
+      "name": "fly-deploy",
+      "author": "anthropic",
+      "description": "Deploy apps to Fly.io with Fly CLI.",
+      "version": "1.0.0",
+      "reference": "anthropic/fly-deploy"
+    },
+    {
+      "name": "postgres-query",
+      "author": "anthropic",
+      "description": "Query and manage PostgreSQL databases.",
+      "version": "1.0.0",
+      "reference": "anthropic/postgres-query"
+    },
+    {
+      "name": "sqlite-query",
+      "author": "anthropic",
+      "description": "Query and manage SQLite databases.",
+      "version": "1.0.0",
+      "reference": "anthropic/sqlite-query"
+    },
+    {
+      "name": "nodejs-build",
+      "author": "anthropic",
+      "description": "Build and package Node.js applications.",
+      "version": "1.0.0",
+      "reference": "anthropic/nodejs-build"
+    },
+    {
+      "name": "nodejs-test",
+      "author": "anthropic",
+      "description": "Run tests for Node.js projects with Jest/Mocha.",
+      "version": "1.0.0",
+      "reference": "anthropic/nodejs-test"
+    },
+    {
+      "name": "rust-build",
+      "author": "anthropic",
+      "description": "Build and package Rust applications with Cargo.",
+      "version": "1.0.0",
+      "reference": "anthropic/rust-build"
+    },
+    {
+      "name": "rust-test",
+      "author": "anthropic",
+      "description": "Run tests for Rust projects with Cargo.",
+      "version": "1.0.0",
+      "reference": "anthropic/rust-test"
+    },
+    {
+      "name": "docker-build",
+      "author": "anthropic",
+      "description": "Build and push Docker images.",
+      "version": "1.0.0",
+      "reference": "anthropic/docker-build"
+    },
+    {
+      "name": "git-commit",
+      "author": "anthropic",
+      "description": "Commit and push changes to git repositories.",
+      "version": "1.0.0",
+      "reference": "anthropic/git-commit"
+    },
+    {
+      "name": "git-rebase",
+      "author": "anthropic",
+      "description": "Rebase and squash git commits interactively.",
+      "version": "1.0.0",
+      "reference": "anthropic/git-rebase"
+    },
+    {
+      "name": "react-component",
+      "author": "anthropic",
+      "description": "Generate and scaffold React components.",
+      "version": "1.0.0",
+      "reference": "anthropic/react-component"
+    },
+    {
+      "name": "api-design",
+      "author": "anthropic",
+      "description": "Design REST APIs with OpenAPI spec.",
+      "version": "1.0.0",
+      "reference": "anthropic/api-design"
+    },
+    {
+      "name": "kubernetes-deploy",
+      "author": "anthropic",
+      "description": "Deploy applications to Kubernetes clusters.",
+      "version": "1.0.0",
+      "reference": "anthropic/kubernetes-deploy"
+    }
+  ]
+}
