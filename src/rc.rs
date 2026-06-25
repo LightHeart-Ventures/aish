@@ -150,7 +150,9 @@ fn split_assignment(s: &str) -> Option<(String, String)> {
     let (name, raw) = s.split_once('=')?;
     let name = name.trim();
     if name.is_empty()
-        || !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        || !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
     {
         return None;
     }
@@ -338,7 +340,9 @@ fn expand_dollar(
                 if matches!(c, '@' | '*' | '#') {
                     chars.next();
                     return match chars.next() {
-                        Some('}') => Some(Dollar::Expanded(lookup(&c.to_string()).unwrap_or_default())),
+                        Some('}') => {
+                            Some(Dollar::Expanded(lookup(&c.to_string()).unwrap_or_default()))
+                        }
                         _ => None, // ${@x} / unterminated → route to the model
                     };
                 }
@@ -473,11 +477,17 @@ mod tests {
         );
         assert_eq!(rc.aliases["ll"], vec!["ls", "-alF"]);
         assert_eq!(rc.aliases["grep"], vec!["grep", "--color=auto"]);
-        assert!(!rc.aliases.contains_key("bad"), "piped alias must be skipped");
+        assert!(
+            !rc.aliases.contains_key("bad"),
+            "piped alias must be skipped"
+        );
         assert!(rc.env.contains(&("EDITOR".into(), "vim".into())));
         assert!(rc.env.contains(&("GREETING".into(), "hello world".into())));
         // $-references now expand at load time instead of being skipped.
-        assert!(rc.env.contains(&("PATH".into(), "/usr/bin:/opt/bin".into())));
+        assert!(
+            rc.env
+                .contains(&("PATH".into(), "/usr/bin:/opt/bin".into()))
+        );
     }
 
     #[test]
@@ -490,7 +500,10 @@ mod tests {
              export D=plain\n",
         );
         assert!(rc.env.contains(&("A".into(), "/home/dev/bin".into())));
-        assert!(rc.env.contains(&("B".into(), "/home/dev/.local/bin".into())));
+        assert!(
+            rc.env
+                .contains(&("B".into(), "/home/dev/.local/bin".into()))
+        );
         // An undefined name expands to empty, as bash does.
         assert!(rc.env.contains(&("C".into(), ":/tail".into())));
         assert!(rc.env.contains(&("D".into(), "plain".into())));
@@ -505,7 +518,12 @@ mod tests {
         );
         // Each export sees the previous one, so all three dirs survive and the
         // last entry — the one `.envs()` keeps — holds the full PATH.
-        let last = rc.env.iter().rev().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone());
+        let last = rc
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone());
         assert_eq!(last, Some("/base:/a:/b".to_string()));
     }
 
@@ -535,7 +553,12 @@ mod tests {
              alias ll='ls -alF'\n",
             &mut rc,
         );
-        let path = rc.env.iter().rev().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone());
+        let path = rc
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone());
         assert_eq!(path, Some("/opt/tools/bin:/opt/tools/sbin".to_string()));
         assert_eq!(rc.aliases["ll"], vec!["ls", "-alF"]);
     }
@@ -551,7 +574,12 @@ mod tests {
         // The merge main performs: profile env first, rc env appended.
         let mut env = profiles.env.clone();
         env.extend(aishrc.env.clone());
-        let lookup = |k: &str| env.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        let lookup = |k: &str| {
+            env.iter()
+                .rev()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+        };
         assert_eq!(lookup("EDITOR"), Some("vim".to_string())); // ~/.aishrc wins
         assert_eq!(lookup("PAGER"), Some("less".to_string())); // profile-only survives
     }
@@ -594,7 +622,10 @@ mod tests {
         assert_eq!(tok("echo ${HOME}").unwrap(), vec!["echo", "/home/ada"]);
         // adjacent to text, on either side
         assert_eq!(tok("ls $HOME/bin").unwrap(), vec!["ls", "/home/ada/bin"]);
-        assert_eq!(tok("cat pre${HOME}post").unwrap(), vec!["cat", "pre/home/adapost"]);
+        assert_eq!(
+            tok("cat pre${HOME}post").unwrap(),
+            vec!["cat", "pre/home/adapost"]
+        );
         // PATH-extension scenario
         assert_eq!(
             tok("env PATH=$PATH:/opt/bin").unwrap(),
@@ -604,7 +635,10 @@ mod tests {
         assert_eq!(tok("echo $GREETING").unwrap(), vec!["echo", "hi there"]);
         // an expanded value is not re-scanned for metacharacters
         let pipey = |_: &str| Some("a|b".to_string());
-        assert_eq!(tokenize_with("echo $X", pipey).unwrap(), vec!["echo", "a|b"]);
+        assert_eq!(
+            tokenize_with("echo $X", pipey).unwrap(),
+            vec!["echo", "a|b"]
+        );
 
         // unset → empty; a standalone unquoted empty expansion drops the word
         assert_eq!(tok("grep $MISSING file").unwrap(), vec!["grep", "file"]);
@@ -614,7 +648,10 @@ mod tests {
         assert_eq!(tok("echo \"$MISSING\"").unwrap(), vec!["echo", ""]);
 
         // expansion happens inside double quotes; single quotes stay literal
-        assert_eq!(tok("echo \"$HOME/x\"").unwrap(), vec!["echo", "/home/ada/x"]);
+        assert_eq!(
+            tok("echo \"$HOME/x\"").unwrap(),
+            vec!["echo", "/home/ada/x"]
+        );
         assert_eq!(tok("echo '$HOME'").unwrap(), vec!["echo", "$HOME"]);
 
         // a lone `$`, or one before a non-name char, is a literal dollar sign
@@ -678,7 +715,10 @@ mod tests {
         assert_eq!(tok("echo $0").unwrap(), vec!["echo", "deploy.aish"]);
         // braced form, including the two-digit ${12} (one reference, not $1 then 2)
         let twelve = |name: &str| (name == "12").then(|| "twelfth".to_string());
-        assert_eq!(tokenize_with("echo ${12}", twelve).unwrap(), vec!["echo", "twelfth"]);
+        assert_eq!(
+            tokenize_with("echo ${12}", twelve).unwrap(),
+            vec!["echo", "twelfth"]
+        );
         // `$@`/`$*` expand to the space-joined args as ONE word (aish never
         // re-splits an expansion), and `$#` to the count.
         assert_eq!(tok("echo $@").unwrap(), vec!["echo", "staging v2"]);
@@ -697,14 +737,13 @@ mod tests {
     fn pipeline_splits_stages() {
         assert_eq!(
             tokenize_pipeline("ls -la | grep rs | wc -l").unwrap(),
-            vec![
-                vec!["ls", "-la"],
-                vec!["grep", "rs"],
-                vec!["wc", "-l"],
-            ],
+            vec![vec!["ls", "-la"], vec!["grep", "rs"], vec!["wc", "-l"],],
         );
         // single command is a one-stage pipeline
-        assert_eq!(tokenize_pipeline("ls -la").unwrap(), vec![vec!["ls", "-la"]]);
+        assert_eq!(
+            tokenize_pipeline("ls -la").unwrap(),
+            vec![vec!["ls", "-la"]]
+        );
         // pipes adjacent to arguments (no surrounding spaces)
         assert_eq!(
             tokenize_pipeline("a|b|c").unwrap(),

@@ -159,7 +159,11 @@ impl AutosuggestEngine {
             let text = source.suggest(q.clone()).await;
             // Best-effort: a closed receiver means the engine was dropped — there
             // is nothing to deliver to, so the send simply no-ops.
-            let _ = tx.send(Suggestion { generation, query: q, text });
+            let _ = tx.send(Suggestion {
+                generation,
+                query: q,
+                text,
+            });
         }));
         generation
     }
@@ -245,7 +249,10 @@ mod tests {
             elapsed < Duration::from_millis(50),
             "request blocked the keystroke loop for {elapsed:?}"
         );
-        assert!(engine.poll().is_none(), "a slow suggestion must not be ready yet");
+        assert!(
+            engine.poll().is_none(),
+            "a slow suggestion must not be ready yet"
+        );
     }
 
     /// AC2 — cancel-in-flight on keystroke. A slow request superseded by a fast

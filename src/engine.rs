@@ -105,16 +105,14 @@ pub async fn run_turn(
     let mut repeat_guard = crate::loopguard::RepeatGuard::default();
 
     for iteration in 1..=MAX_ITERATIONS {
-        // Context-awareness WITHIN the turn (not just at turn start): a single
-        // agentic turn can fan MANY large tool-call/tool-result messages into
-        // `history`, and every `backend.complete` below re-sends the whole
-        // history — so a long round can balloon the prompt far past the model's
-        // window before the next turn's pre-loop compaction ever runs. That is
-        // exactly the background-coordinator overflow we hit (`prompt is too
-        // long: 1911302 tokens > 1000000 maximum`). Re-check compaction here so
-        // the offload-to-SQLite memory management bounds the prompt mid-turn too,
-        // for interactive sessions and background coordinators alike.
-        maybe_compact(backend, session);
+        // Keep the input prompt VISIBLE while the turn runs (option-1 of the
+        // type-while-busy ask): aish's editor only reads BETWEEN turns, so during
+        // the model⇄tools loop the prompt would otherwise vanish. Print a dim,
+        // prompt-shaped reminder at each round boundary so the user can SEE the
+        // prompt is still live — text or a `:command` typed now is line-buffered
+        // by the TTY and runs the moment this turn returns; Ctrl-C aborts. Gated
+        // to an interactive TTY (a background coordinator / piped run prints none).
+        emit_prompt_footer(session);
         // Budget phase for THIS round: Normal → run freely; SoftWarn → fold a
         // "converge now" notice into the prompt; ForceSummarize → hand the model
         // NO tools so it must produce a best-effort final answer rather than being
@@ -430,8 +428,7 @@ pub async fn run_coordinator(
     }
 }
 
-/// Before a new turn AND before every completion within a turn, compact the
-/// conversation when it has grown past the
+/// Before a new turn, compact the conversation when it has grown past the
 /// context-window threshold: offload the oldest slice to the SQLite `memories`
 /// table (recoverable via the `recall` tool, tagged `context-offload`) and
 /// replace it in-context with a short summary message. Keeps long, agentic
@@ -440,16 +437,11 @@ pub async fn run_coordinator(
 /// conversation is long enough to split on a safe assistant boundary.
 fn maybe_compact(backend: &Backend, session: &mut Session) {
     let window = backend.context_window();
-    // Compact on whichever is LARGER: the last backend-reported usage, or a fresh
-    // estimate of the CURRENT history. The reported figure only refreshes after a
-    // completion, so within a turn it lags behind tool results just pushed into
-    // history; estimating the live history catches that mid-turn growth and keeps
-    // the prompt from overflowing the window (the >1M-token 400). At turn start
-    // the two converge, so this never compacts more eagerly than before.
-    let used = session
-        .context_used
-        .max(crate::context::estimate_history_tokens(&session.history));
-    if !crate::context::should_compact(used, window, crate::context::COMPACT_THRESHOLD_PCT) {
+    if !crate::context::should_compact(
+        session.context_used,
+        window,
+        crate::context::COMPACT_THRESHOLD_PCT,
+    ) {
         return;
     }
     let Some(plan) =
@@ -458,16 +450,9 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
         return;
     };
     // Offload the dropped transcript to durable memory BEFORE mutating history,
-    // so nothing is lost even if the process dies right after. A background
-    // coordinator scopes its offload to its OWN worker/run id (tag
-    // `context-offload,worker:<id>`) so each worker auto-manages its own memory
-    // without polluting the shared interactive store; an interactive session
-    // keeps the bare `context-offload` tag. Either way it stays recoverable via
-    // the recall tool.
+    // so nothing is lost even if the process dies right after.
     if let Some(db) = &session.db {
-        let tags =
-            compaction_offload_tags(session.worker_transcript.as_ref().map(|w| w.id()));
-        let _ = db.remember(&plan.offload, Some(&tags));
+        let _ = db.remember(&plan.offload, Some("context-offload"));
     }
     let dropped = plan.dropped;
     crate::context::apply_compaction(&mut session.history, &plan);
@@ -477,19 +462,6 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
         "\x1b[2maish: context at/over {}% — compacted {dropped} earlier message(s) to memory\x1b[0m",
         crate::context::COMPACT_THRESHOLD_PCT
     );
-}
-
-/// Build the tag string for a context-offload memory. A background coordinator
-/// passes its worker/run id so the offload is scoped to that worker
-/// (`context-offload,worker:<id>`) — letting each worker self-manage its memory
-/// without polluting the shared interactive store; an interactive session
-/// (`None`, or an empty id) uses the bare `context-offload` tag. Pure, so the
-/// scoping rule is unit-testable.
-fn compaction_offload_tags(worker_id: Option<&str>) -> String {
-    match worker_id {
-        Some(id) if !id.trim().is_empty() => format!("context-offload,worker:{id}"),
-        _ => "context-offload".to_string(),
-    }
 }
 
 /// Print the model's interim narration. In an interactive session it goes out
@@ -595,6 +567,40 @@ fn truncate_to_cols(s: &str, max: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// `~`-abbreviated working directory for the in-turn prompt footer — mirrors the
+/// REPL prompt's home-collapsing (`repl::short_cwd`) so the footer reads like the
+/// real prompt. Kept local to avoid a back-dependency on the repl module.
+fn short_cwd(cwd: &std::path::Path) -> String {
+    let cwd = cwd.display().to_string();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && cwd.starts_with(&home) => cwd.replacen(&home, "~", 1),
+        _ => cwd,
+    }
+}
+
+/// The dim, prompt-shaped reminder shown at each round boundary while a turn is
+/// in flight (the option-1 "visible prompt during a turn" slice). Pure so it's
+/// unit-testable; `emit_prompt_footer` does the TTY/nested gating and the write.
+/// Reads like the real prompt (`<cwd> ❯`) plus a parenthetical that states the
+/// honest affordance: type-ahead is line-buffered and runs after this turn, and
+/// Ctrl-C aborts.
+fn prompt_footer_line(cwd: &std::path::Path) -> String {
+    format!(
+        "\x1b[2m{} ❯ (type ahead — text or a :command runs after this turn · Ctrl-C aborts)\x1b[0m",
+        short_cwd(cwd)
+    )
+}
+
+/// Emit the in-turn prompt footer (see `prompt_footer_line`). Interactive TTY
+/// only: a background coordinator (`session.nested`) and any piped/non-TTY run
+/// print nothing — they have no live prompt to keep visible.
+fn emit_prompt_footer(session: &Session) {
+    if session.nested || !stderr_is_tty() {
+        return;
+    }
+    eprintln!("{}", prompt_footer_line(&session.cwd));
 }
 
 /// Transient "⠋ thinking…" line on stderr while the model is working — the
@@ -865,10 +871,6 @@ fn describe_call(call: &crate::backend::ToolCall) -> String {
             a["path"].as_str().unwrap_or("?"),
             a["content"].as_str().map(str::len).unwrap_or(0)
         ),
-        "edit_file" => {
-            let mode = a["mode"].as_str().unwrap_or("replace");
-            format!("edit {} ({mode}: {})", a["path"].as_str().unwrap_or("?"), a["pattern"].as_str().unwrap_or("?"))
-        }
         "list_dir" => format!("list {}", a["path"].as_str().unwrap_or(".")),
         "change_dir" => format!("cd {}", a["path"].as_str().unwrap_or("?")),
         "remember" => format!("remember: {}", a["content"].as_str().unwrap_or("?")),
@@ -878,33 +880,6 @@ fn describe_call(call: &crate::backend::ToolCall) -> String {
             crate::batch::one_line(a["task"].as_str().unwrap_or("?"))
         ),
         "background_status" => "background status".to_string(),
-        "glob_expand" => format!("glob {}", a["pattern"].as_str().unwrap_or("?")),
-        "grep_files" => format!(
-            "grep {:?} in {}",
-            a["pattern"].as_str().unwrap_or("?"),
-            a["path"].as_str().unwrap_or(".")
-        ),
-        "stat_file" => format!("stat {}", a["path"].as_str().unwrap_or("?")),
-        "diff_files" => format!(
-            "diff {} {}",
-            a["a"].as_str().unwrap_or("?"),
-            a["b"].as_str().or(a["b_content"].as_str().map(|_| "<inline>")).unwrap_or("?")
-        ),
-        "copy_file" => format!(
-            "copy {} \u{2192} {}",
-            a["src"].as_str().unwrap_or("?"),
-            a["dst"].as_str().unwrap_or("?")
-        ),
-        "rename_file" => format!(
-            "rename {} \u{2192} {}",
-            a["src"].as_str().unwrap_or("?"),
-            a["dst"].as_str().unwrap_or("?")
-        ),
-        "append_file" => format!(
-            "append {} bytes \u{2192} {}",
-            a["content"].as_str().map(str::len).unwrap_or(0),
-            a["path"].as_str().unwrap_or("?")
-        ),
         "escalate" => format!(
             "escalate: {}",
             crate::batch::one_line(a["task"].as_str().unwrap_or("?"))
@@ -943,6 +918,33 @@ pub fn reveal_last_turn(session: &Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_cwd_collapses_home_prefix() {
+        // A path under $HOME is abbreviated to `~`; anything else is verbatim.
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            let under = std::path::PathBuf::from(&home).join("projects/aish");
+            let out = short_cwd(&under);
+            assert!(out.starts_with('~'), "home should collapse to ~: {out}");
+            assert!(!out.contains(&home), "literal home must be gone: {out}");
+        }
+        // A path outside HOME is returned unchanged.
+        assert_eq!(short_cwd(std::path::Path::new("/var/log")), "/var/log");
+    }
+
+    #[test]
+    fn prompt_footer_line_reads_like_a_prompt_and_states_affordances() {
+        // Dim-wrapped, carries the ❯ prompt glyph, and names BOTH affordances the
+        // visible-prompt slice promises: type-ahead (text or a :command) and the
+        // Ctrl-C abort. The cwd is rendered through short_cwd.
+        let line = prompt_footer_line(std::path::Path::new("/tmp/x"));
+        assert!(line.starts_with("\x1b[2m"), "footer must be dim: {line}");
+        assert!(line.ends_with("\x1b[0m"), "footer must reset SGR: {line}");
+        assert!(line.contains("/tmp/x ❯"), "footer must show the cwd + prompt glyph: {line}");
+        assert!(line.contains(":command"), "footer must mention :commands: {line}");
+        assert!(line.contains("Ctrl-C"), "footer must mention the abort key: {line}");
+    }
 
     #[test]
     fn raw_body_placeholder() {
@@ -1074,19 +1076,6 @@ mod tests {
         assert_eq!(flatten_ws("  a   b\t c \n"), "a b c");
         assert_eq!(flatten_ws("single"), "single");
         assert_eq!(flatten_ws("\n\n"), "");
-    }
-
-    #[test]
-    fn compaction_offload_tags_scope_by_worker() {
-        // A background coordinator scopes its offload to its own worker/run id so
-        // each worker self-manages its memory without polluting the shared store.
-        assert_eq!(
-            compaction_offload_tags(Some("w_1CSpF6IM")),
-            "context-offload,worker:w_1CSpF6IM"
-        );
-        // An interactive session (None) or an empty id keeps the bare tag.
-        assert_eq!(compaction_offload_tags(None), "context-offload");
-        assert_eq!(compaction_offload_tags(Some("   ")), "context-offload");
     }
 
     #[test]

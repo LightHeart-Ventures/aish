@@ -7,7 +7,10 @@
 fn test_looks_like_prose_english_routes_to_model() {
     // "edit the README" should look like prose (English, not a command)
     // This test validates the heuristic's presence in repl.rs without importing internals
-    assert!(true, "edit the README should route to model (looks_like_prose)");
+    assert!(
+        true,
+        "edit the README should route to model (looks_like_prose)"
+    );
 }
 
 #[test]

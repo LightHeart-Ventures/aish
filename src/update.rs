@@ -311,8 +311,7 @@ pub async fn perform(info: &UpdateInfo) -> Result<()> {
     let dest_dir = current_exe
         .parent()
         .ok_or_else(|| anyhow!("can't determine the directory of {}", current_exe.display()))?;
-    writable_check(dest_dir)
-        .with_context(|| format!("{} is not writable", dest_dir.display()))?;
+    writable_check(dest_dir).with_context(|| format!("{} is not writable", dest_dir.display()))?;
 
     // Scratch dir for the download + extraction; auto-cleaned on drop via the
     // explicit remove at the end (best-effort).
@@ -350,7 +349,10 @@ pub async fn perform(info: &UpdateInfo) -> Result<()> {
             .context("running tar to unpack the release")?;
         if !untar.status.success() {
             let _ = std::fs::remove_dir_all(&work);
-            bail!("tar failed: {}", String::from_utf8_lossy(&untar.stderr).trim());
+            bail!(
+                "tar failed: {}",
+                String::from_utf8_lossy(&untar.stderr).trim()
+            );
         }
         match find_binary(&work, "aish") {
             Some(p) => p,
@@ -387,9 +389,8 @@ pub async fn perform(info: &UpdateInfo) -> Result<()> {
     // Atomic swap: rename the staged binary over the running one. On Unix the
     // running process keeps executing the old (now-unlinked) inode; the new
     // binary takes effect on the next launch.
-    std::fs::rename(&staged, &current_exe).with_context(|| {
-        format!("replacing {} with the new binary", current_exe.display())
-    })?;
+    std::fs::rename(&staged, &current_exe)
+        .with_context(|| format!("replacing {} with the new binary", current_exe.display()))?;
 
     let _ = std::fs::remove_dir_all(&work);
     println!(
@@ -766,8 +767,12 @@ mod tests {
     #[test]
     fn matches_asset_for_known_triples() {
         let assets = vec![
-            GhAsset { name: "aish-v0.3.0-x86_64-unknown-linux-gnu.tar.gz".into() },
-            GhAsset { name: "aish-v0.3.0-aarch64-apple-darwin.tar.gz".into() },
+            GhAsset {
+                name: "aish-v0.3.0-x86_64-unknown-linux-gnu.tar.gz".into(),
+            },
+            GhAsset {
+                name: "aish-v0.3.0-aarch64-apple-darwin.tar.gz".into(),
+            },
         ];
         // On any supported platform we either match one of these or (unknown
         // platform) match none — never panic, never a wrong-arch pick.
@@ -783,13 +788,27 @@ mod tests {
         // The current release format: raw per-platform binaries with no
         // extension, each accompanied by a `.sha256` sidecar.
         let assets = vec![
-            GhAsset { name: "aish-x86_64-unknown-linux-gnu".into() },
-            GhAsset { name: "aish-x86_64-unknown-linux-gnu.sha256".into() },
-            GhAsset { name: "aish-aarch64-apple-darwin".into() },
-            GhAsset { name: "aish-aarch64-apple-darwin.sha256".into() },
-            GhAsset { name: "aish-x86_64-apple-darwin".into() },
-            GhAsset { name: "aish-x86_64-apple-darwin.sha256".into() },
-            GhAsset { name: "SHA256SUMS".into() },
+            GhAsset {
+                name: "aish-x86_64-unknown-linux-gnu".into(),
+            },
+            GhAsset {
+                name: "aish-x86_64-unknown-linux-gnu.sha256".into(),
+            },
+            GhAsset {
+                name: "aish-aarch64-apple-darwin".into(),
+            },
+            GhAsset {
+                name: "aish-aarch64-apple-darwin.sha256".into(),
+            },
+            GhAsset {
+                name: "aish-x86_64-apple-darwin".into(),
+            },
+            GhAsset {
+                name: "aish-x86_64-apple-darwin.sha256".into(),
+            },
+            GhAsset {
+                name: "SHA256SUMS".into(),
+            },
         ];
         if let Some(name) = match_asset(&assets) {
             // Never pick a checksum sidecar, always a real per-platform binary.
@@ -821,7 +840,9 @@ mod tests {
 
     #[test]
     fn no_asset_when_none_match() {
-        let assets = vec![GhAsset { name: "aish-v0.3.0-sparc64-unknown-haiku.tar.gz".into() }];
+        let assets = vec![GhAsset {
+            name: "aish-v0.3.0-sparc64-unknown-haiku.tar.gz".into(),
+        }];
         assert!(match_asset(&assets).is_none());
     }
 

@@ -388,8 +388,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         {
-            let mut ed = RustylineEditor::new(temp_helper(), path.clone())
-                .expect("construct editor");
+            let mut ed =
+                RustylineEditor::new(temp_helper(), path.clone()).expect("construct editor");
             ed.add_history("echo alpha");
             ed.add_history("git status");
             ed.save_history();
@@ -397,8 +397,14 @@ mod tests {
 
         let saved =
             std::fs::read_to_string(&path).expect("save_history must write the history file");
-        assert!(saved.contains("echo alpha"), "history missing first entry: {saved:?}");
-        assert!(saved.contains("git status"), "history missing second entry: {saved:?}");
+        assert!(
+            saved.contains("echo alpha"),
+            "history missing first entry: {saved:?}"
+        );
+        assert!(
+            saved.contains("git status"),
+            "history missing second entry: {saved:?}"
+        );
 
         // A fresh editor loads the persisted file without error — the reload the
         // REPL performs at startup (`load_history` in `RustylineEditor::new`).

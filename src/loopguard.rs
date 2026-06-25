@@ -243,7 +243,9 @@ pub fn repeat_log_line(desc: &str, count: usize, action: RepeatAction) -> String
         RepeatAction::Break => {
             format!("loop-guard: repeated call ×{count} — breaking turn (re-plan failed): {desc}")
         }
-        _ => format!("loop-guard: blocked repeated call ×{count} — asking the model to re-plan: {desc}"),
+        _ => format!(
+            "loop-guard: blocked repeated call ×{count} — asking the model to re-plan: {desc}"
+        ),
     }
 }
 
@@ -293,10 +295,14 @@ impl ExitReason {
         match self {
             ExitReason::Completed => "completed normally".to_string(),
             ExitReason::ForcedSummarize { iterations } => {
-                format!("forced a summarize-exit after {iterations} tool-call round(s) to avoid losing the work")
+                format!(
+                    "forced a summarize-exit after {iterations} tool-call round(s) to avoid losing the work"
+                )
             }
             ExitReason::LoopDetected { call, count } => {
-                format!("detected a loop — the call `{call}` was repeated {count} times without progress")
+                format!(
+                    "detected a loop — the call `{call}` was repeated {count} times without progress"
+                )
             }
             ExitReason::BudgetExhausted { iterations } => {
                 format!("exhausted the {iterations}-round tool-call budget without a final answer")
@@ -349,7 +355,10 @@ impl ExitReason {
         match tag {
             "forced-summarize" => Some(ExitReason::ForcedSummarize { iterations: iters }),
             "budget-exhausted" => Some(ExitReason::BudgetExhausted { iterations: iters }),
-            "loop-detected" => Some(ExitReason::LoopDetected { call: String::new(), count }),
+            "loop-detected" => Some(ExitReason::LoopDetected {
+                call: String::new(),
+                count,
+            }),
             _ => None,
         }
     }
@@ -417,12 +426,18 @@ impl Disposition {
 ///   * a confirmed loop → `Nudge` (change approach, don't just resume the loop);
 ///   * an out-of-budget / forced-summarize stop → `Resume` (continue the work).
 /// Pure — the whole routing table is unit-tested.
-pub fn classify_disposition(reason: &ExitReason, auto_recoveries: usize, max_auto: usize) -> Disposition {
+pub fn classify_disposition(
+    reason: &ExitReason,
+    auto_recoveries: usize,
+    max_auto: usize,
+) -> Disposition {
     match reason {
         ExitReason::Completed => Disposition::None,
         _ if auto_recoveries >= max_auto => Disposition::FlagOperator,
         ExitReason::LoopDetected { .. } => Disposition::Nudge,
-        ExitReason::ForcedSummarize { .. } | ExitReason::BudgetExhausted { .. } => Disposition::Resume,
+        ExitReason::ForcedSummarize { .. } | ExitReason::BudgetExhausted { .. } => {
+            Disposition::Resume
+        }
     }
 }
 
@@ -479,7 +494,11 @@ mod tests {
         // Whatever the budget, the final iteration must force a summarize-exit so
         // the loop never reaches the hard cap empty-handed.
         for max in [1usize, 2, 7, 10, 50, 99] {
-            assert_eq!(budget_phase(max, max), BudgetPhase::ForceSummarize, "max={max}");
+            assert_eq!(
+                budget_phase(max, max),
+                BudgetPhase::ForceSummarize,
+                "max={max}"
+            );
         }
         // A degenerate zero budget forces immediately.
         assert_eq!(budget_phase(1, 0), BudgetPhase::ForceSummarize);
@@ -489,7 +508,11 @@ mod tests {
     fn budget_suffix_is_empty_only_when_normal() {
         assert_eq!(budget_suffix(BudgetPhase::Normal, 10), "");
         assert!(budget_suffix(BudgetPhase::SoftWarn, 7).contains("about 7"));
-        assert!(budget_suffix(BudgetPhase::SoftWarn, 7).to_lowercase().contains("converge"));
+        assert!(
+            budget_suffix(BudgetPhase::SoftWarn, 7)
+                .to_lowercase()
+                .contains("converge")
+        );
         let force = budget_suffix(BudgetPhase::ForceSummarize, 0);
         assert!(force.contains("NO tools"));
         assert!(force.to_lowercase().contains("final"));
@@ -536,7 +559,13 @@ mod tests {
         assert_eq!(ExitReason::Completed.tag(), "completed");
         assert!(!ExitReason::Completed.is_abnormal());
         assert!(ExitReason::ForcedSummarize { iterations: 9 }.is_abnormal());
-        assert!(ExitReason::LoopDetected { call: "x".into(), count: 4 }.is_abnormal());
+        assert!(
+            ExitReason::LoopDetected {
+                call: "x".into(),
+                count: 4
+            }
+            .is_abnormal()
+        );
         assert!(ExitReason::BudgetExhausted { iterations: 50 }.is_abnormal());
     }
 
@@ -545,7 +574,10 @@ mod tests {
         let cases = [
             ExitReason::ForcedSummarize { iterations: 45 },
             ExitReason::BudgetExhausted { iterations: 50 },
-            ExitReason::LoopDetected { call: "🔧 read a".into(), count: 4 },
+            ExitReason::LoopDetected {
+                call: "🔧 read a".into(),
+                count: 4,
+            },
         ];
         for r in cases {
             let parsed = ExitReason::parse_banner(&r.banner()).expect("must parse its own banner");
@@ -553,13 +585,22 @@ mod tests {
             // is not embedded in the banner, so compare on tag + count/iterations.
             assert_eq!(parsed.tag(), r.tag());
             match (&parsed, &r) {
-                (ExitReason::LoopDetected { count: a, .. }, ExitReason::LoopDetected { count: b, .. }) => {
+                (
+                    ExitReason::LoopDetected { count: a, .. },
+                    ExitReason::LoopDetected { count: b, .. },
+                ) => {
                     assert_eq!(a, b)
                 }
-                (ExitReason::ForcedSummarize { iterations: a }, ExitReason::ForcedSummarize { iterations: b }) => {
+                (
+                    ExitReason::ForcedSummarize { iterations: a },
+                    ExitReason::ForcedSummarize { iterations: b },
+                ) => {
                     assert_eq!(a, b)
                 }
-                (ExitReason::BudgetExhausted { iterations: a }, ExitReason::BudgetExhausted { iterations: b }) => {
+                (
+                    ExitReason::BudgetExhausted { iterations: a },
+                    ExitReason::BudgetExhausted { iterations: b },
+                ) => {
                     assert_eq!(a, b)
                 }
                 _ => panic!("variant mismatch: {parsed:?} vs {r:?}"),
@@ -572,7 +613,10 @@ mod tests {
         assert_eq!(ExitReason::parse_banner("here is your answer\nmore"), None);
         assert_eq!(ExitReason::parse_banner(""), None);
         // A stop-shaped line with an unknown tag is NOT misread as a stop.
-        assert_eq!(ExitReason::parse_banner("[aish-stop tag=mystery iterations=1 count=0] x"), None);
+        assert_eq!(
+            ExitReason::parse_banner("[aish-stop tag=mystery iterations=1 count=0] x"),
+            None
+        );
     }
 
     #[test]
@@ -585,7 +629,10 @@ mod tests {
         assert!(out.trim_end().ends_with("partial work"));
         // An empty body degrades to just the banner (still parseable).
         let empty = with_banner(&reason, "   ");
-        assert_eq!(ExitReason::parse_banner(&empty).unwrap().tag(), "forced-summarize");
+        assert_eq!(
+            ExitReason::parse_banner(&empty).unwrap().tag(),
+            "forced-summarize"
+        );
     }
 
     // ── disposition routing ───────────────────────────────────────────────
@@ -593,7 +640,10 @@ mod tests {
     fn disposition_routes_by_reason_and_budget() {
         let max = MAX_AUTO_RECOVERIES;
         // Normal completion → nothing to do, regardless of recoveries spent.
-        assert_eq!(classify_disposition(&ExitReason::Completed, 0, max), Disposition::None);
+        assert_eq!(
+            classify_disposition(&ExitReason::Completed, 0, max),
+            Disposition::None
+        );
         // Out-of-budget / forced-summarize → resume (continue the work).
         assert_eq!(
             classify_disposition(&ExitReason::ForcedSummarize { iterations: 45 }, 0, max),
@@ -605,7 +655,14 @@ mod tests {
         );
         // A loop → nudge (change approach), not a blind resume.
         assert_eq!(
-            classify_disposition(&ExitReason::LoopDetected { call: "x".into(), count: 4 }, 0, max),
+            classify_disposition(
+                &ExitReason::LoopDetected {
+                    call: "x".into(),
+                    count: 4
+                },
+                0,
+                max
+            ),
             Disposition::Nudge
         );
         // Once auto-recoveries are spent, ANY abnormal stop flags the operator.
@@ -614,14 +671,24 @@ mod tests {
             Disposition::FlagOperator
         );
         assert_eq!(
-            classify_disposition(&ExitReason::LoopDetected { call: "x".into(), count: 4 }, max, max),
+            classify_disposition(
+                &ExitReason::LoopDetected {
+                    call: "x".into(),
+                    count: 4
+                },
+                max,
+                max
+            ),
             Disposition::FlagOperator
         );
     }
 
     #[test]
     fn recovery_directive_matches_disposition() {
-        let loop_reason = ExitReason::LoopDetected { call: "🔧 read a".into(), count: 4 };
+        let loop_reason = ExitReason::LoopDetected {
+            call: "🔧 read a".into(),
+            count: 4,
+        };
         let nudge = recovery_directive(Disposition::Nudge, &loop_reason).unwrap();
         assert!(nudge.contains("[nudge]"));
         assert!(nudge.contains("read a"), "names the looping call: {nudge}");

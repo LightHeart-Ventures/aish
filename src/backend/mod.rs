@@ -82,10 +82,22 @@ pub struct Msg {
 
 impl Msg {
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: vec![], tool_results: vec![], raw: None }
+        Self {
+            role: Role::User,
+            text: text.into(),
+            tool_calls: vec![],
+            tool_results: vec![],
+            raw: None,
+        }
     }
     pub fn tool_results(results: Vec<ToolResult>) -> Self {
-        Self { role: Role::User, text: String::new(), tool_calls: vec![], tool_results: results, raw: None }
+        Self {
+            role: Role::User,
+            text: String::new(),
+            tool_calls: vec![],
+            tool_results: results,
+            raw: None,
+        }
     }
 }
 
@@ -169,7 +181,6 @@ impl Backend {
         }
     }
 
-
     /// Pre-turn hook: the local backend lazy-loads weights here — drawing a
     /// download progress line if needed — before the engine's "thinking"
     /// spinner starts overwriting stderr. No-op for Claude.
@@ -241,7 +252,9 @@ impl Backend {
             Backend::Grok(b) => b.model = model,
             #[cfg(feature = "local")]
             Backend::Local(_) => {
-                eprintln!("(:model on the local backend isn't wired — set AISH_LOCAL_MODEL_ID and restart, or use :backend claude)")
+                eprintln!(
+                    "(:model on the local backend isn't wired — set AISH_LOCAL_MODEL_ID and restart, or use :backend claude)"
+                )
             }
         }
     }
@@ -318,7 +331,6 @@ mod tests {
 
     #[test]
     fn escalation_policy() {
-
         let opus = "claude-opus-4-8";
         // Small Claude frontends escalate to the batch (strong) model.
         assert_eq!(
@@ -332,7 +344,10 @@ mod tests {
         // An Opus frontend is already frontier — no self-escalation.
         assert_eq!(resolve_escalation("claude", opus, opus, false), None);
         // Grok on its only model: nothing stronger to reach.
-        assert_eq!(resolve_escalation("grok", grok::DEFAULT_MODEL, opus, false), None);
+        assert_eq!(
+            resolve_escalation("grok", grok::DEFAULT_MODEL, opus, false),
+            None
+        );
         // Local escalates to Claude's strong model, but only with a credential.
         assert_eq!(
             resolve_escalation("local", "", opus, true),

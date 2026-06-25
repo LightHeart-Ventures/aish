@@ -1,6 +1,6 @@
 use super::{Msg, Role, ToolCall, ToolDef, Turn};
-use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -169,7 +169,9 @@ impl ClaudeBackend {
                     let (status, parsed) = match super::read_status_and_json(r).await {
                         Ok(p) => p,
                         Err(e) if !last => {
-                            eprintln!("\x1b[2m  network error reading body ({e}), retrying…\x1b[0m");
+                            eprintln!(
+                                "\x1b[2m  network error reading body ({e}), retrying…\x1b[0m"
+                            );
                             tokio::time::sleep(delay).await;
                             delay = (delay * 2).min(MAX_DELAY);
                             continue;
@@ -183,7 +185,9 @@ impl ClaudeBackend {
                             // failure (the API itself answers 4xx/5xx in JSON). Retry
                             // it like any other transient error rather than aborting.
                             if !last {
-                                eprintln!("\x1b[2m  api returned non-JSON ({status}), retrying…\x1b[0m");
+                                eprintln!(
+                                    "\x1b[2m  api returned non-JSON ({status}), retrying…\x1b[0m"
+                                );
                                 tokio::time::sleep(delay).await;
                                 delay = (delay * 2).min(MAX_DELAY);
                                 continue;
@@ -316,7 +320,14 @@ same oversized call.]",
             output_tokens: g("output_tokens"),
         }
     });
-    Ok(Turn { text, tool_calls, raw, truncated_tool_call, usage, truncated_text })
+    Ok(Turn {
+        text,
+        tool_calls,
+        raw,
+        truncated_tool_call,
+        usage,
+        truncated_text,
+    })
 }
 
 /// Render normalized history into Claude wire messages.
@@ -334,7 +345,11 @@ fn render_messages(history: &[Msg]) -> Vec<Value> {
                         // A trailing assistant message is a PREFILL the model
                         // resumes; the API rejects assistant content that ends
                         // with whitespace, so trim it on the last message only.
-                        let t = if i == last { msg.text.trim_end() } else { msg.text.as_str() };
+                        let t = if i == last {
+                            msg.text.trim_end()
+                        } else {
+                            msg.text.as_str()
+                        };
                         if !t.is_empty() {
                             blocks.push(json!({"type": "text", "text": t}));
                         }
@@ -389,7 +404,10 @@ mod tests {
         assert_eq!(turn.tool_calls.len(), 1);
         assert!(!turn.truncated_tool_call);
         assert!(!turn.truncated_text);
-        assert!(turn.raw.is_some(), "normal turns keep raw for thinking history");
+        assert!(
+            turn.raw.is_some(),
+            "normal turns keep raw for thinking history"
+        );
         assert_eq!(turn.text, "doing it");
     }
 
@@ -405,9 +423,15 @@ mod tests {
         });
         let turn = parse_response(&v).unwrap();
         // The partial tool call must NOT be surfaced for execution.
-        assert!(turn.tool_calls.is_empty(), "truncated tool call must not execute");
+        assert!(
+            turn.tool_calls.is_empty(),
+            "truncated tool call must not execute"
+        );
         assert!(turn.truncated_tool_call, "must flag so the loop continues");
-        assert!(!turn.truncated_text, "a dropped tool call is not a prose continuation");
+        assert!(
+            !turn.truncated_text,
+            "a dropped tool call is not a prose continuation"
+        );
         // raw is dropped so the broken/empty tool_use isn't re-fed to the API.
         assert!(turn.raw.is_none());
         // The model is told to retry smaller.
@@ -425,7 +449,10 @@ mod tests {
         let turn = parse_response(&v).unwrap();
         assert!(turn.tool_calls.is_empty());
         assert!(!turn.truncated_tool_call);
-        assert!(turn.truncated_text, "plain-text truncation drives the continuation loop");
+        assert!(
+            turn.truncated_text,
+            "plain-text truncation drives the continuation loop"
+        );
         // The partial answer is kept verbatim — NO in-band note that would
         // pollute the resumed answer — and raw is dropped so the prefill is
         // clean text (no thinking block).
@@ -447,9 +474,18 @@ mod tests {
         // thinking must be suppressed or the API rejects the request.
         let prefill = vec![
             Msg::user("hi"),
-            Msg { role: Role::Assistant, text: "partial answer".into(), tool_calls: vec![], tool_results: vec![], raw: None },
+            Msg {
+                role: Role::Assistant,
+                text: "partial answer".into(),
+                tool_calls: vec![],
+                tool_results: vec![],
+                raw: None,
+            },
         ];
-        assert!(!wants_thinking("claude-opus-4-8", &prefill), "no thinking on prefill");
+        assert!(
+            !wants_thinking("claude-opus-4-8", &prefill),
+            "no thinking on prefill"
+        );
     }
 
     #[test]
@@ -458,12 +494,21 @@ mod tests {
         // — the API rejects it. Trimming applies only to the LAST message.
         let hist = vec![
             Msg::user("hi"),
-            Msg { role: Role::Assistant, text: "resume me   \n".into(), tool_calls: vec![], tool_results: vec![], raw: None },
+            Msg {
+                role: Role::Assistant,
+                text: "resume me   \n".into(),
+                tool_calls: vec![],
+                tool_results: vec![],
+                raw: None,
+            },
         ];
         let msgs = render_messages(&hist);
         let last = msgs.last().unwrap();
         let text = last["content"][0]["text"].as_str().unwrap();
-        assert_eq!(text, "resume me", "trailing whitespace stripped on the prefill message");
+        assert_eq!(
+            text, "resume me",
+            "trailing whitespace stripped on the prefill message"
+        );
     }
 
     #[test]
@@ -490,10 +535,14 @@ mod tests {
     // Credentials. Built directly (not via resolve) so the tests never depend on
     // what's in the process environment.
     fn oauth() -> Credential {
-        Credential { auth: Auth::Oauth("sk-ant-oat-test".into()) }
+        Credential {
+            auth: Auth::Oauth("sk-ant-oat-test".into()),
+        }
     }
     fn api_key() -> Credential {
-        Credential { auth: Auth::ApiKey("sk-ant-test".into()) }
+        Credential {
+            auth: Auth::ApiKey("sk-ant-test".into()),
+        }
     }
 
     #[test]
@@ -511,7 +560,10 @@ mod tests {
     fn lookup_prefers_rc_export_over_process_env() {
         // A key present in the rc slice short-circuits before the process env.
         assert_eq!(
-            Credential::lookup(&[("ANTHROPIC_API_KEY".into(), "from-rc".into())], "ANTHROPIC_API_KEY"),
+            Credential::lookup(
+                &[("ANTHROPIC_API_KEY".into(), "from-rc".into())],
+                "ANTHROPIC_API_KEY"
+            ),
             Some("from-rc".to_string())
         );
         // Blank rc values don't count as set.
@@ -524,7 +576,9 @@ mod tests {
     #[test]
     fn oauth_system_prompt_prepends_claude_code_identity() {
         let v = oauth().system_value("REAL SYSTEM PROMPT");
-        let arr = v.as_array().expect("OAuth shapes system as an array of blocks");
+        let arr = v
+            .as_array()
+            .expect("OAuth shapes system as an array of blocks");
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["text"], CLAUDE_CODE_SPOOF);
         assert_eq!(arr[1]["text"], "REAL SYSTEM PROMPT");
@@ -532,6 +586,9 @@ mod tests {
 
     #[test]
     fn api_key_system_prompt_stays_a_plain_string() {
-        assert_eq!(api_key().system_value("REAL SYSTEM PROMPT"), json!("REAL SYSTEM PROMPT"));
+        assert_eq!(
+            api_key().system_value("REAL SYSTEM PROMPT"),
+            json!("REAL SYSTEM PROMPT")
+        );
     }
 }

@@ -12,7 +12,7 @@
 //! UNATTENDED in the background, we add a hard `MAX_TURNS` backstop so a
 //! misjudged loop can't spend forever.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -198,7 +198,9 @@ async fn run_goal(
             if i.turns >= MAX_TURNS {
                 i.status = Status::Failed;
                 drop(i);
-                announce(&format!("stopped — hit the {MAX_TURNS}-turn backstop without meeting the goal"));
+                announce(&format!(
+                    "stopped — hit the {MAX_TURNS}-turn backstop without meeting the goal"
+                ));
                 return;
             }
             i.turns += 1;
@@ -279,10 +281,10 @@ async fn judge(
         // Shaped per credential (OAuth needs the Claude Code identity block).
         "system": cred.system_value(
             "You are a strict completion judge for an autonomous agent. Decide whether the \
-GOAL is DEMONSTRABLY met by the WORK OUTPUT — judge only what the output shows as evidence (command \
-results, file contents, exit codes), never what is merely asserted without proof. If the goal \
-states a turn/time bound, honor it. Reply with ONLY a JSON object, no prose: \
-{\"met\": true|false, \"reason\": \"<one sentence>\"}.",
+    GOAL is DEMONSTRABLY met by the WORK OUTPUT — judge only what the output shows as evidence (command \
+    results, file contents, exit codes), never what is merely asserted without proof. If the goal \
+    states a turn/time bound, honor it. Reply with ONLY a JSON object, no prose: \
+    {\"met\": true|false, \"reason\": \"<one sentence>\"}.",
         ),
         "messages": [{
             "role": "user",
@@ -302,15 +304,23 @@ states a turn/time bound, honor it. Reply with ONLY a JSON object, no prose: \
         .send()
         .await
         .map_err(|e| format!("judge request failed: {e}"))?;
-    let v: Value = resp.json().await.map_err(|e| format!("judge returned non-JSON: {e}"))?;
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("judge returned non-JSON: {e}"))?;
     if let Some(msg) = v["error"]["message"].as_str() {
         return Err(format!("judge api error: {msg}"));
     }
     let text = v["content"]
         .as_array()
         .and_then(|a| {
-            a.iter()
-                .find_map(|b| if b["type"] == "text" { b["text"].as_str() } else { None })
+            a.iter().find_map(|b| {
+                if b["type"] == "text" {
+                    b["text"].as_str()
+                } else {
+                    None
+                }
+            })
         })
         .unwrap_or("")
         .trim();
@@ -324,7 +334,10 @@ states a turn/time bound, honor it. Reply with ONLY a JSON object, no prose: \
         })
         .map_err(|e| format!("couldn't parse judge verdict: {e} (got: {text})"))?;
     let met = parsed["met"].as_bool().unwrap_or(false);
-    let reason = parsed["reason"].as_str().unwrap_or("(no reason given)").to_string();
+    let reason = parsed["reason"]
+        .as_str()
+        .unwrap_or("(no reason given)")
+        .to_string();
     Ok((met, reason))
 }
 
@@ -359,7 +372,10 @@ mod tests {
         // seconds zero-padded within a minute
         assert_eq!(fmt_duration(Duration::from_secs(60 + 5)), "1m05s");
         // 1h03m — past an hour, seconds drop off, minutes zero-padded
-        assert_eq!(fmt_duration(Duration::from_secs(3600 + 3 * 60 + 9)), "1h03m");
+        assert_eq!(
+            fmt_duration(Duration::from_secs(3600 + 3 * 60 + 9)),
+            "1h03m"
+        );
         assert_eq!(fmt_duration(Duration::from_secs(3600)), "1h00m");
     }
 

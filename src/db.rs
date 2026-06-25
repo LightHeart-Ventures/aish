@@ -37,8 +37,8 @@ impl Db {
             let init: InitFn = std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ());
             rusqlite::ffi::sqlite3_auto_extension(Some(init));
         }
-        let conn = Connection::open(path)
-            .with_context(|| format!("can't open {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("can't open {}", path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS history (
@@ -81,7 +81,9 @@ impl Db {
     /// The sqlite-vec version string — proves vector support is actually loaded.
     #[cfg(test)]
     pub fn vec_version(&self) -> Result<String> {
-        Ok(self.conn.query_row("SELECT vec_version()", [], |r| r.get(0))?)
+        Ok(self
+            .conn
+            .query_row("SELECT vec_version()", [], |r| r.get(0))?)
     }
 
     pub fn record(&self, kind: &str, cwd: &str, content: &str) {
@@ -157,7 +159,9 @@ impl Db {
 
     /// Number of stored memories.
     pub fn memory_count(&self) -> Result<i64> {
-        Ok(self.conn.query_row("SELECT count(*) FROM memories", [], |r| r.get(0))?)
+        Ok(self
+            .conn
+            .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))?)
     }
 
     /// Every stored memory (id ascending) — the input to an organization pass.
@@ -166,17 +170,24 @@ impl Db {
             .conn
             .prepare("SELECT id, content, coalesce(tags, '') FROM memories ORDER BY id")?;
         let rows = stmt.query_map([], |r| {
-            Ok(MemoryRow { id: r.get(0)?, content: r.get(1)?, tags: r.get(2)? })
+            Ok(MemoryRow {
+                id: r.get(0)?,
+                content: r.get(1)?,
+                tags: r.get(2)?,
+            })
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
     /// Delete one memory (and any paired vector row) by id.
     pub fn delete_memory(&self, id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM memories WHERE id = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM memories WHERE id = ?1", [id])?;
         // The vec0 mirror is unused until an embedder is wired in, but keep the
         // delete paired so a future embedding never outlives its memory.
-        let _ = self.conn.execute("DELETE FROM vec_memories WHERE memory_id = ?1", [id]);
+        let _ = self
+            .conn
+            .execute("DELETE FROM vec_memories WHERE memory_id = ?1", [id]);
         Ok(())
     }
 
@@ -194,8 +205,10 @@ impl Db {
 
     /// Add a tool/command to the persistent always-allow list (idempotent).
     pub fn allow(&self, tool: &str) -> Result<()> {
-        self.conn
-            .execute("INSERT OR IGNORE INTO allowed_tools (tool) VALUES (?1)", [tool])?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO allowed_tools (tool) VALUES (?1)",
+            [tool],
+        )?;
         Ok(())
     }
 
@@ -203,7 +216,11 @@ impl Db {
     pub fn is_allowed(&self, tool: &str) -> Result<bool> {
         Ok(self
             .conn
-            .query_row("SELECT 1 FROM allowed_tools WHERE tool = ?1", [tool], |_| Ok(()))
+            .query_row(
+                "SELECT 1 FROM allowed_tools WHERE tool = ?1",
+                [tool],
+                |_| Ok(()),
+            )
             .optional()?
             .is_some())
     }
@@ -243,7 +260,9 @@ impl Db {
     /// `/a/b` grants `/a/b/c` but never `/a/bc`).
     pub fn is_dir_allowed(&self, perm: &str, path: &str) -> Result<bool> {
         let target = Path::new(path);
-        let mut stmt = self.conn.prepare("SELECT dir FROM allowed_dirs WHERE perm = ?1")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT dir FROM allowed_dirs WHERE perm = ?1")?;
         let dirs = stmt.query_map([perm], |r| r.get::<_, String>(0))?;
         for dir in dirs.filter_map(std::result::Result::ok) {
             if target.starts_with(&dir) {
@@ -289,7 +308,9 @@ impl Db {
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn
-            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
             .optional()?)
     }
 }
@@ -309,7 +330,10 @@ pub struct MemoryRow {
 /// collapse internal whitespace runs to a single space. So "User  Prefers Terse"
 /// and "user prefers terse" are recognized as the same memory.
 fn normalize_memory(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 /// Pure dedup plan: given memories in any order, return the ids to DELETE so each
@@ -388,7 +412,9 @@ impl BatchStore {
         for col in ["session_id", "session_name"] {
             let _ = conn.execute(&format!("ALTER TABLE batch_jobs ADD COLUMN {col} TEXT"), []);
         }
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     /// Register a freshly-queued job (no Anthropic id yet, status "running"),
@@ -420,10 +446,10 @@ impl BatchStore {
     }
 
     pub fn set_status(&self, local_id: &str, status: &str) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("UPDATE batch_jobs SET status = ?2 WHERE local_id = ?1", (local_id, status))?;
+        self.conn.lock().unwrap().execute(
+            "UPDATE batch_jobs SET status = ?2 WHERE local_id = ?1",
+            (local_id, status),
+        )?;
         Ok(())
     }
 
@@ -469,11 +495,10 @@ impl BatchStore {
 
     /// Drop terminal (done/failed) jobs. Returns how many rows were removed.
     pub fn clear_finished(&self) -> Result<usize> {
-        Ok(self
-            .conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM batch_jobs WHERE status IN ('done', 'failed')", [])?)
+        Ok(self.conn.lock().unwrap().execute(
+            "DELETE FROM batch_jobs WHERE status IN ('done', 'failed')",
+            [],
+        )?)
     }
 }
 
@@ -589,7 +614,10 @@ impl CoordinatorStore {
         .context("coordinator_runs schema init failed")?;
         // Back-compat: add session_name to a table created before it existed.
         // (session_id predates this; ignore the error when the column is present.)
-        let _ = conn.execute("ALTER TABLE coordinator_runs ADD COLUMN session_name TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE coordinator_runs ADD COLUMN session_name TEXT",
+            [],
+        );
         // S9.1: cross-reference the container backing a run (id + name + engine)
         // so `:workers` / S9.5 discovery can map a run to its container. Additive
         // `ADD COLUMN` — errors with "duplicate column name" once present, which
@@ -600,7 +628,9 @@ impl CoordinatorStore {
                 [],
             );
         }
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     /// Register a freshly-started run in the `coordinating` phase. Idempotent —
@@ -757,8 +787,9 @@ impl CoordinatorStore {
             let mut stmt = tx.prepare(
                 "SELECT id, message FROM coordinator_messages WHERE run_id = ?1 ORDER BY id",
             )?;
-            let rows = stmt
-                .query_map([run_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            let rows = stmt.query_map([run_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
             rows.filter_map(std::result::Result::ok).collect()
         };
         if let Some(max_id) = taken.last().map(|(id, _)| *id) {
@@ -912,11 +943,16 @@ mod tests {
         let db = temp_db("roundtrip");
         db.record("input", "/tmp", "ls -la");
         db.record("output", "/tmp", "total 0");
-        let n: i64 = db.conn.query_row("SELECT count(*) FROM history", [], |r| r.get(0)).unwrap();
+        let n: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM history", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 2);
 
-        db.remember("user prefers terse replies", Some("preference")).unwrap();
-        db.remember("project aios is a rust AI shell", Some("project")).unwrap();
+        db.remember("user prefers terse replies", Some("preference"))
+            .unwrap();
+        db.remember("project aios is a rust AI shell", Some("project"))
+            .unwrap();
         let hits = db.recall("terse", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].contains("terse replies"));
@@ -951,7 +987,11 @@ mod tests {
         // Chronological (oldest first), outputs excluded.
         assert_eq!(
             db.recent_inputs(10).unwrap(),
-            vec!["cd repo".to_string(), "git status".to_string(), "cargo test".to_string()]
+            vec![
+                "cd repo".to_string(),
+                "git status".to_string(),
+                "cargo test".to_string()
+            ]
         );
         // Cap keeps the NEWEST `limit`, still chronological.
         assert_eq!(
@@ -965,9 +1005,15 @@ mod tests {
         let db = temp_db("settings");
         assert_eq!(db.get_setting("batch_mode").unwrap(), None);
         db.set_setting("batch_mode", "true").unwrap();
-        assert_eq!(db.get_setting("batch_mode").unwrap().as_deref(), Some("true"));
+        assert_eq!(
+            db.get_setting("batch_mode").unwrap().as_deref(),
+            Some("true")
+        );
         db.set_setting("batch_mode", "false").unwrap(); // upsert
-        assert_eq!(db.get_setting("batch_mode").unwrap().as_deref(), Some("false"));
+        assert_eq!(
+            db.get_setting("batch_mode").unwrap().as_deref(),
+            Some("false")
+        );
     }
 
     #[test]
@@ -976,10 +1022,20 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = BatchStore::open(&path).unwrap();
 
-        store.insert("batch_1", "summarize logs", "claude-opus-4-8", "sess-a", Some("alpha")).unwrap();
+        store
+            .insert(
+                "batch_1",
+                "summarize logs",
+                "claude-opus-4-8",
+                "sess-a",
+                Some("alpha"),
+            )
+            .unwrap();
         store.set_anthropic_id("batch_1", "msgbatch_abc").unwrap();
         store.set_status("batch_1", "in_progress").unwrap();
-        store.insert("batch_2", "translate", "claude-opus-4-8", "sess-b", None).unwrap();
+        store
+            .insert("batch_2", "translate", "claude-opus-4-8", "sess-b", None)
+            .unwrap();
         store.set_done("batch_2", "the result").unwrap();
 
         // A fresh store over the same file sees both — this is the restart path.
@@ -1071,13 +1127,19 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = CoordinatorStore::open(&path).unwrap();
 
-        store.insert("run_1", "audit the repo", "sess-a", Some("alpha")).unwrap();
+        store
+            .insert("run_1", "audit the repo", "sess-a", Some("alpha"))
+            .unwrap();
         // Idempotent insert (resume path) must not clobber the existing row.
         store.set_phase("run_1", "awaiting_batch").unwrap();
-        store.insert("run_1", "audit the repo", "sess-a", Some("alpha")).unwrap();
+        store
+            .insert("run_1", "audit the repo", "sess-a", Some("alpha"))
+            .unwrap();
         store.heartbeat("run_1").unwrap();
 
-        store.insert("run_2", "draft release notes", "sess-b", None).unwrap();
+        store
+            .insert("run_2", "draft release notes", "sess-b", None)
+            .unwrap();
         store.set_done("run_2", "the notes").unwrap();
 
         // A fresh store over the same file sees both — the restart path.
@@ -1119,33 +1181,49 @@ mod tests {
         let path = std::env::temp_dir().join(format!("aish_coordmsg_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = CoordinatorStore::open(&path).unwrap();
-        store.insert("run_1", "audit the repo", "sess-a", Some("alpha")).unwrap();
+        store
+            .insert("run_1", "audit the repo", "sess-a", Some("alpha"))
+            .unwrap();
 
         // No messages yet.
         assert_eq!(store.pending_message_count("run_1").unwrap(), 0);
         assert!(store.drain_messages("run_1").unwrap().is_empty());
 
         // Enqueue two messages for run_1 and one for an unrelated run.
-        store.enqueue_message("run_1", "focus on the auth module first", Some("sess-b")).unwrap();
-        store.enqueue_message("run_1", "skip the e2e tests", None).unwrap();
-        store.enqueue_message("run_2", "different run", None).unwrap();
+        store
+            .enqueue_message("run_1", "focus on the auth module first", Some("sess-b"))
+            .unwrap();
+        store
+            .enqueue_message("run_1", "skip the e2e tests", None)
+            .unwrap();
+        store
+            .enqueue_message("run_2", "different run", None)
+            .unwrap();
         assert_eq!(store.pending_message_count("run_1").unwrap(), 2);
 
         // Drain run_1 — ordered oldest-first, scoped to run_1, delete-on-read.
         let drained = store.drain_messages("run_1").unwrap();
-        assert_eq!(drained, vec![
-            "focus on the auth module first".to_string(),
-            "skip the e2e tests".to_string(),
-        ]);
+        assert_eq!(
+            drained,
+            vec![
+                "focus on the auth module first".to_string(),
+                "skip the e2e tests".to_string(),
+            ]
+        );
         // Second drain is empty (delete-on-read), and run_2's message is untouched.
         assert!(store.drain_messages("run_1").unwrap().is_empty());
         assert_eq!(store.pending_message_count("run_1").unwrap(), 0);
         assert_eq!(store.pending_message_count("run_2").unwrap(), 1);
 
         // A message survives across a process restart (fresh connection).
-        store.enqueue_message("run_1", "one more note", None).unwrap();
+        store
+            .enqueue_message("run_1", "one more note", None)
+            .unwrap();
         let reopened = CoordinatorStore::open(&path).unwrap();
-        assert_eq!(reopened.drain_messages("run_1").unwrap(), vec!["one more note".to_string()]);
+        assert_eq!(
+            reopened.drain_messages("run_1").unwrap(),
+            vec!["one more note".to_string()]
+        );
 
         // clear_finished purges orphaned messages (run_2 was never inserted as a
         // run, so its queued message has no owning run row → purged).
@@ -1158,10 +1236,22 @@ mod tests {
     #[test]
     fn dedup_plan_keeps_newest_of_each_duplicate() {
         let rows = vec![
-            MemoryRow { id: 1, content: "user prefers terse replies".into(), tags: "".into() },
+            MemoryRow {
+                id: 1,
+                content: "user prefers terse replies".into(),
+                tags: "".into(),
+            },
             // Same content modulo case + whitespace → a duplicate of #1.
-            MemoryRow { id: 2, content: "User Prefers  Terse Replies".into(), tags: "pref".into() },
-            MemoryRow { id: 3, content: "project is a rust shell".into(), tags: "".into() },
+            MemoryRow {
+                id: 2,
+                content: "User Prefers  Terse Replies".into(),
+                tags: "pref".into(),
+            },
+            MemoryRow {
+                id: 3,
+                content: "project is a rust shell".into(),
+                tags: "".into(),
+            },
         ];
         // Keeps the newest of the dup pair (id 2) + the distinct id 3; deletes id 1.
         assert_eq!(dedup_plan(&rows), vec![1]);
@@ -1170,8 +1260,16 @@ mod tests {
         assert!(dedup_plan(&survivors).is_empty());
         // No duplicates → empty plan.
         let distinct = vec![
-            MemoryRow { id: 1, content: "a".into(), tags: "".into() },
-            MemoryRow { id: 2, content: "b".into(), tags: "".into() },
+            MemoryRow {
+                id: 1,
+                content: "a".into(),
+                tags: "".into(),
+            },
+            MemoryRow {
+                id: 2,
+                content: "b".into(),
+                tags: "".into(),
+            },
         ];
         assert!(dedup_plan(&distinct).is_empty());
     }
@@ -1245,7 +1343,9 @@ mod tests {
         db.allow_dir("write", "/tmp/other").unwrap();
         let dirs = db.allowed_dirs().unwrap();
         assert_eq!(
-            dirs.iter().map(|(p, d, _)| (p.as_str(), d.as_str())).collect::<Vec<_>>(),
+            dirs.iter()
+                .map(|(p, d, _)| (p.as_str(), d.as_str()))
+                .collect::<Vec<_>>(),
             vec![("read", "/tmp/proj"), ("write", "/tmp/other")]
         );
         assert!(db.revoke_dir("read", "/tmp/proj").unwrap());
@@ -1262,7 +1362,11 @@ mod tests {
         db.allow("npm").unwrap();
         assert!(db.is_allowed("git").unwrap());
         let names = |db: &Db| {
-            db.allowed_tools().unwrap().into_iter().map(|(t, _)| t).collect::<Vec<_>>()
+            db.allowed_tools()
+                .unwrap()
+                .into_iter()
+                .map(|(t, _)| t)
+                .collect::<Vec<_>>()
         };
         assert_eq!(names(&db), vec!["git", "npm"]);
         assert!(db.revoke("git").unwrap());

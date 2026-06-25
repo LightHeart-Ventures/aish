@@ -64,9 +64,7 @@ pub fn render(text: &str, base: &str) -> String {
 /// `|---|:--:|---:|` — only pipes, dashes, colons, and spaces.
 fn is_separator_row(line: &str) -> bool {
     let t = line.trim();
-    t.starts_with('|')
-        && t.contains('-')
-        && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+    t.starts_with('|') && t.contains('-') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
 }
 
 #[derive(Clone, Copy)]
@@ -90,7 +88,12 @@ fn render_table(block: &[&str], indent: &str, base: &str, out: &mut Vec<String>)
         .collect();
     let rows: Vec<Vec<String>> = block[2..].iter().map(|l| split_row(l)).collect();
 
-    let ncols = rows.iter().map(Vec::len).chain([header.len()]).max().unwrap_or(0);
+    let ncols = rows
+        .iter()
+        .map(Vec::len)
+        .chain([header.len()])
+        .max()
+        .unwrap_or(0);
     let mut natural = vec![0usize; ncols];
     for row in std::iter::once(&header).chain(rows.iter()) {
         for (c, cell) in row.iter().enumerate() {
@@ -122,7 +125,10 @@ fn render_table(block: &[&str], indent: &str, base: &str, out: &mut Vec<String>)
                     .map(|c| {
                         let raw = wrapped[c].get(li).map(String::as_str).unwrap_or("");
                         let rendered = if bold {
-                            format!("\x1b[1m{}\x1b[22m{base}", inline(raw, &format!("{base}\x1b[1m")))
+                            format!(
+                                "\x1b[1m{}\x1b[22m{base}",
+                                inline(raw, &format!("{base}\x1b[1m"))
+                            )
                         } else {
                             inline(raw, base)
                         };
@@ -162,7 +168,10 @@ fn term_width() -> usize {
             }
         }
     }
-    std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(usize::MAX)
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(usize::MAX)
 }
 
 /// Shrink natural column widths to fit `avail` total display columns, taking from
@@ -197,7 +206,11 @@ fn wrap_cell(raw: &str, width: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut cur = String::new();
     for word in raw.split_whitespace() {
-        let candidate = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
+        let candidate = if cur.is_empty() {
+            word.to_string()
+        } else {
+            format!("{cur} {word}")
+        };
         if visible_width(&candidate) <= width {
             cur = candidate;
         } else {
@@ -366,8 +379,12 @@ mod tests {
         assert!(lines.len() > 1);
         assert!(lines.iter().all(|l| visible_width(l) <= 10));
         // Reassembling the words round-trips (wrapping only inserts breaks).
-        assert_eq!(lines.join(" ").split_whitespace().collect::<Vec<_>>(),
-                   "the quick brown fox jumps".split_whitespace().collect::<Vec<_>>());
+        assert_eq!(
+            lines.join(" ").split_whitespace().collect::<Vec<_>>(),
+            "the quick brown fox jumps"
+                .split_whitespace()
+                .collect::<Vec<_>>()
+        );
         // A short cell stays one line.
         assert_eq!(wrap_cell("short", 10), vec!["short"]);
         // A single over-long word is hard-broken, never dropped.
@@ -396,7 +413,10 @@ mod tests {
             render("it's **09:18:48 AM** in *New York*", ""),
             "it's \x1b[1m09:18:48 AM\x1b[22m in \x1b[3mNew York\x1b[23m"
         );
-        assert_eq!(render("run `ls -la` now", ""), "run \x1b[36mls -la\x1b[39m now");
+        assert_eq!(
+            render("run `ls -la` now", ""),
+            "run \x1b[36mls -la\x1b[39m now"
+        );
     }
 
     #[test]
@@ -410,21 +430,33 @@ mod tests {
     fn blocks() {
         assert_eq!(render("# Title", ""), "\x1b[1mTitle\x1b[22m");
         assert_eq!(render("- item", ""), "• item");
-        assert_eq!(render("```\n**raw**\n```", ""), "\x1b[2m```\x1b[22m\n**raw**\n\x1b[2m```\x1b[22m");
+        assert_eq!(
+            render("```\n**raw**\n```", ""),
+            "\x1b[2m```\x1b[22m\n**raw**\n\x1b[2m```\x1b[22m"
+        );
     }
 
     #[test]
     fn dim_base_reasserted_after_bold() {
-        assert_eq!(render("a **b** c", "\x1b[2m"), "a \x1b[1mb\x1b[22m\x1b[2m c");
+        assert_eq!(
+            render("a **b** c", "\x1b[2m"),
+            "a \x1b[1mb\x1b[22m\x1b[2m c"
+        );
     }
 
     #[test]
     fn table_aligns_columns() {
-        let out = render("| Sprint | Pts |\n|---|---:|\n| SPR-036 | 16 |\n| **S2** | 5 |", "");
+        let out = render(
+            "| Sprint | Pts |\n|---|---:|\n| SPR-036 | 16 |\n| **S2** | 5 |",
+            "",
+        );
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 4);
         // header bold, dim │ separator
-        assert_eq!(lines[0], "\x1b[1mSprint\x1b[22m  \x1b[2m│\x1b[22m \x1b[1mPts\x1b[22m");
+        assert_eq!(
+            lines[0],
+            "\x1b[1mSprint\x1b[22m  \x1b[2m│\x1b[22m \x1b[1mPts\x1b[22m"
+        );
         assert_eq!(lines[1], "\x1b[2m────────┼────\x1b[22m");
         // all rows have equal visible width: pad by marker-stripped cell text
         let w = |l: &str| super::strip_ansi(l).chars().count();

@@ -2,8 +2,8 @@ use crate::backend::{Msg, ToolResult};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 /// How much the safety gate asks before acting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -277,7 +277,9 @@ impl Session {
     /// report it.
     pub fn set_last_status(&mut self, status: &std::process::ExitStatus) {
         use std::os::unix::process::ExitStatusExt;
-        self.last_status = status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+        self.last_status = status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     }
 
     /// The most recent recorded output (a model/agent reply), truncated per the
@@ -294,7 +296,10 @@ impl Session {
     /// store → only the session set applies.
     pub fn is_tool_allowed(&self, key: &str) -> bool {
         self.session_allows.contains(key)
-            || self.db.as_ref().is_some_and(|db| db.is_allowed(key).unwrap_or(false))
+            || self
+                .db
+                .as_ref()
+                .is_some_and(|db| db.is_allowed(key).unwrap_or(false))
     }
 
     /// Always-allow `key`. Always recorded in the session set so it holds for
@@ -321,9 +326,10 @@ impl Session {
         {
             return true;
         }
-        self.db
-            .as_ref()
-            .is_some_and(|db| db.is_dir_allowed(perm, &path.to_string_lossy()).unwrap_or(false))
+        self.db.as_ref().is_some_and(|db| {
+            db.is_dir_allowed(perm, &path.to_string_lossy())
+                .unwrap_or(false)
+        })
     }
 
     /// Grant `perm` recursively for everything under `dir` — the 'd' answer.
@@ -396,7 +402,11 @@ the moment there are several items to compare. No markdown headers.{skills}{batc
             cwd = self.cwd.display(),
             skills = self.skills_prompt,
             batch = if self.batch_mode { BATCH_NUDGE } else { "" },
-            escalate = if escalate_available { ESCALATE_NUDGE } else { "" },
+            escalate = if escalate_available {
+                ESCALATE_NUDGE
+            } else {
+                ""
+            },
         )
     }
 }
@@ -477,9 +487,11 @@ fn host_info() -> String {
     let os = std::fs::read_to_string("/etc/os-release")
         .ok()
         .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("PRETTY_NAME="))
-                .map(|l| l.trim_start_matches("PRETTY_NAME=").trim_matches('"').to_string())
+            s.lines().find(|l| l.starts_with("PRETTY_NAME=")).map(|l| {
+                l.trim_start_matches("PRETTY_NAME=")
+                    .trim_matches('"')
+                    .to_string()
+            })
         })
         .unwrap_or_else(|| "Linux".into());
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
@@ -502,7 +514,11 @@ mod tests {
     fn truncate_last_caps_large_output_with_marker() {
         let big = "y".repeat(LAST_OUTPUT_LIMIT * 2);
         let out = truncate_last(big);
-        assert!(out.ends_with("…[truncated]"), "missing marker: {}", &out[out.len() - 20..]);
+        assert!(
+            out.ends_with("…[truncated]"),
+            "missing marker: {}",
+            &out[out.len() - 20..]
+        );
         // head kept up to the limit; marker is the only addition
         assert!(out.starts_with(&"y".repeat(LAST_OUTPUT_LIMIT)));
         assert_eq!(out.len(), LAST_OUTPUT_LIMIT + "\n…[truncated]".len());
@@ -568,8 +584,11 @@ mod tests {
     fn write_skill(dir: &std::path::Path, name: &str, desc: &str) {
         let d = dir.join(name);
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("SKILL.md"), format!("---\nname: {name}\ndescription: {desc}\n---\nbody\n"))
-            .unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {desc}\n---\nbody\n"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -584,7 +603,11 @@ mod tests {
         // Add a skill on disk → reload advertises it.
         write_skill(&tmp, "demo", "Demo skill.");
         session.reload_skills_from(&tmp);
-        assert!(session.skills_prompt.contains("demo"), "{}", session.skills_prompt);
+        assert!(
+            session.skills_prompt.contains("demo"),
+            "{}",
+            session.skills_prompt
+        );
         assert!(session.skills_prompt.contains("Demo skill."));
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -600,7 +623,11 @@ mod tests {
         // Remove the skill dir → reload no longer advertises it.
         std::fs::remove_dir_all(tmp.join("gone")).unwrap();
         session.reload_skills_from(&tmp);
-        assert!(!session.skills_prompt.contains("gone"), "{}", session.skills_prompt);
+        assert!(
+            !session.skills_prompt.contains("gone"),
+            "{}",
+            session.skills_prompt
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

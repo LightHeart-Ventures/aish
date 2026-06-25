@@ -165,7 +165,10 @@ mod tests {
         assert_eq!(parse_invocation(":suggest"), Some(""));
         assert_eq!(parse_invocation(":sg"), Some(""));
         // an optional trailing hint is captured + trimmed
-        assert_eq!(parse_invocation(":suggest run the tests"), Some("run the tests"));
+        assert_eq!(
+            parse_invocation(":suggest run the tests"),
+            Some("run the tests")
+        );
         assert_eq!(parse_invocation(":sg   now push  "), Some("now push"));
         // leading/trailing whitespace around the whole line is tolerated
         assert_eq!(parse_invocation("  :sg  "), Some(""));
@@ -236,7 +239,10 @@ mod tests {
     #[test]
     fn suggestions_share_the_rewrite_sanitiser() {
         assert_eq!(sanitize_candidate("git push"), Some("git push".to_string()));
-        assert_eq!(sanitize_candidate("```sh\ncargo test\n```"), Some("cargo test".to_string()));
+        assert_eq!(
+            sanitize_candidate("```sh\ncargo test\n```"),
+            Some("cargo test".to_string())
+        );
         assert_eq!(sanitize_candidate("NONE"), None);
         assert_eq!(sanitize_candidate(""), None);
     }

@@ -104,7 +104,12 @@ fn max_rounds() -> usize {
 /// The effective failed-attempt circuit-breaker threshold (env override,
 /// clamped, else default). `0` means the gate is disabled.
 fn max_failed_attempts() -> usize {
-    env_usize("AISH_COORDINATOR_MAX_FAILED_ATTEMPTS", DEFAULT_MAX_FAILED_ATTEMPTS, 0, 1000)
+    env_usize(
+        "AISH_COORDINATOR_MAX_FAILED_ATTEMPTS",
+        DEFAULT_MAX_FAILED_ATTEMPTS,
+        0,
+        1000,
+    )
 }
 
 /// Bounded retention for terminal `failed` runs (coordinator-lifecycle bug #129
@@ -120,7 +125,12 @@ const DEFAULT_FAILED_RETENTION_MAX_AGE_DAYS: usize = 14;
 /// Effective keep-recent bound for `failed` rows (env override, clamped). `0`
 /// keeps none (every failed row is eligible to be reaped by count).
 fn failed_retention_keep() -> usize {
-    env_usize("AISH_COORDINATOR_FAILED_KEEP", DEFAULT_FAILED_RETENTION_KEEP, 0, 100_000)
+    env_usize(
+        "AISH_COORDINATOR_FAILED_KEEP",
+        DEFAULT_FAILED_RETENTION_KEEP,
+        0,
+        100_000,
+    )
 }
 
 /// Effective max age (in seconds) for a retained `failed` row (env override is
@@ -201,7 +211,12 @@ fn reap_failed_runs_with(
     let failed: Vec<(String, Option<i64>)> = rows
         .into_iter()
         .filter(|r| Phase::parse(&r.phase) == Phase::Failed)
-        .map(|r| (r.run_id, r.created_at.as_deref().and_then(parse_sqlite_timestamp)))
+        .map(|r| {
+            (
+                r.run_id,
+                r.created_at.as_deref().and_then(parse_sqlite_timestamp),
+            )
+        })
         .collect();
     let plan = failed_retention_plan(&failed, now_secs, keep_recent, max_age_secs);
     store.delete_runs(&plan).unwrap_or(0)
@@ -327,22 +342,15 @@ work; where they conflict with an earlier assumption, the interjection wins:]\n{
 /// count folded so callers can emit a notice. A no-op (returns 0) when there's no
 /// store or nothing queued. Best-effort: a store error is swallowed (the run must
 /// not die because the mailbox read hiccuped).
-fn fold_operator_messages(store: Option<&CoordinatorStore>, run_id: &str, next_input: &mut String) -> usize {
+fn fold_operator_messages(
+    store: Option<&CoordinatorStore>,
+    run_id: &str,
+    next_input: &mut String,
+) -> usize {
     let Some(s) = store else {
         return 0;
     };
-    let mut msgs = s.drain_messages(run_id).unwrap_or_default();
-    // S9.4: a `:update --drain` places the checkpoint sentinel on this same
-    // mailbox to tell the run to flush its S9.3 state at a round boundary and
-    // (if attached) detach. It is an internal control token, NOT an operator
-    // instruction — strip it so it never reaches the model as text. Reaching
-    // this round boundary at all IS the checkpoint (phase + transcript are
-    // already persisted), so recognising it is the no-op-but-quiesce we need.
-    let checkpointed = msgs.iter().any(|m| m == crate::update::CHECKPOINT_SENTINEL);
-    msgs.retain(|m| m != crate::update::CHECKPOINT_SENTINEL);
-    if checkpointed {
-        eprintln!("\x1b[2m[checkpoint] flushed at round boundary for :update --drain\x1b[0m");
-    }
+    let msgs = s.drain_messages(run_id).unwrap_or_default();
     if msgs.is_empty() {
         return 0;
     }
@@ -374,11 +382,6 @@ pub async fn drive(
         // session.session_id/name were adopted from the LAUNCHING session at
         // startup (see main.rs), so the row attributes to who asked for the work.
         let _ = s.insert(run_id, &input, &session.session_id, session.name.as_deref());
-        // TASK-205: bind the alias->run_id mapping ONCE, transactionally, at run
-        // start so `:result <alias>` can resolve to THIS run's own result by
-        // run_id. For aish the worker alias IS the run_id; the binding is still
-        // recorded (immutably) so resolution never depends on in-memory state.
-        let _ = s.bind_alias(run_id, run_id, None);
     }
 
     // ── Pre-dispatch circuit breaker (loop guard, per the loop-exhaustion
@@ -502,7 +505,12 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
                 let _ = s.set_failed(run_id, &error);
             }
             finalize_worker_store(run_id, "failed", None);
-            return Outcome { phase: Phase::Failed, result: None, error: Some(error), rounds };
+            return Outcome {
+                phase: Phase::Failed,
+                result: None,
+                error: Some(error),
+                rounds,
+            };
         }
 
         // Liveness: beat the run's heartbeat at EVERY round boundary, not only
@@ -539,7 +547,12 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
                     let _ = s.set_failed(run_id, &error);
                 }
                 finalize_worker_store(run_id, "failed", None);
-                return Outcome { phase: Phase::Failed, result: None, error: Some(error), rounds };
+                return Outcome {
+                    phase: Phase::Failed,
+                    result: None,
+                    error: Some(error),
+                    rounds,
+                };
             }
         };
 
@@ -598,7 +611,12 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
                 let _ = s.set_failed(run_id, &error);
             }
             finalize_worker_store(run_id, "failed", Some(&answer));
-            return Outcome { phase: Phase::Failed, result: Some(answer), error: Some(error), rounds };
+            return Outcome {
+                phase: Phase::Failed,
+                result: Some(answer),
+                error: Some(error),
+                rounds,
+            };
         }
 
         // ── awaiting_batch: did this round fan work out to the Batches API? ──
@@ -620,9 +638,10 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
             // the next round so the model can reduce over it. The results were
             // surfaced inline; this round-trips the coordinator back to
             // `coordinating` to assemble/continue.
-            next_input = "The background sub-tasks you offloaded have completed (their results were \
+            next_input =
+                "The background sub-tasks you offloaded have completed (their results were \
 delivered above). Fold them into your work: continue the task, or give the final answer if done."
-                .to_string();
+                    .to_string();
             continue;
         }
 
@@ -644,7 +663,12 @@ delivered above). Fold them into your work: continue the task, or give the final
             let _ = s.set_done(run_id, &answer);
         }
         finalize_worker_store(run_id, "done", Some(&answer));
-        return Outcome { phase: Phase::Done, result: Some(answer), error: None, rounds };
+        return Outcome {
+            phase: Phase::Done,
+            result: Some(answer),
+            error: None,
+            rounds,
+        };
     }
 }
 
@@ -811,7 +835,11 @@ fn salvage_orphaned_worktrees(
             w.path.display(),
         );
         if store
-            .insert_salvaged(&w.id, &format!("(salvaged orphan worktree {})", w.id), &error)
+            .insert_salvaged(
+                &w.id,
+                &format!("(salvaged orphan worktree {})", w.id),
+                &error,
+            )
             .is_ok()
         {
             eprintln!(
@@ -968,7 +996,12 @@ mod tests {
 
     #[test]
     fn phase_string_roundtrip_is_total() {
-        for p in [Phase::Coordinating, Phase::AwaitingBatch, Phase::Done, Phase::Failed] {
+        for p in [
+            Phase::Coordinating,
+            Phase::AwaitingBatch,
+            Phase::Done,
+            Phase::Failed,
+        ] {
             assert_eq!(Phase::parse(p.as_str()), p);
         }
         // Unknown/legacy phase strings are treated as a dead run.
@@ -1014,18 +1047,26 @@ mod tests {
         assert_eq!(input, "continue the task");
 
         // One message → folded, prepended ahead of the existing input, drained.
-        store.enqueue_message("run_x", "use the staging DB", None).unwrap();
+        store
+            .enqueue_message("run_x", "use the staging DB", None)
+            .unwrap();
         let mut input = "continue the task".to_string();
         let n = fold_operator_messages(Some(&store), "run_x", &mut input);
         assert_eq!(n, 1);
         assert!(input.contains("use the staging DB"));
-        assert!(input.trim_end().ends_with("continue the task"), "original input kept after the interjection");
+        assert!(
+            input.trim_end().ends_with("continue the task"),
+            "original input kept after the interjection"
+        );
         let interj = input.find("Operator interjection").unwrap();
         let cont = input.find("continue the task").unwrap();
         assert!(interj < cont, "interjection is prepended");
         // Delete-on-read: a second fold sees nothing.
         let mut input2 = "next".to_string();
-        assert_eq!(fold_operator_messages(Some(&store), "run_x", &mut input2), 0);
+        assert_eq!(
+            fold_operator_messages(Some(&store), "run_x", &mut input2),
+            0
+        );
         assert_eq!(input2, "next");
 
         // No store → no-op.
@@ -1040,9 +1081,15 @@ mod tests {
         // 1970-01-01 00:00:00 is the unix epoch.
         assert_eq!(parse_sqlite_timestamp("1970-01-01 00:00:00"), Some(0));
         // A known instant: 2021-01-01 00:00:00 UTC = 1609459200.
-        assert_eq!(parse_sqlite_timestamp("2021-01-01 00:00:00"), Some(1_609_459_200));
+        assert_eq!(
+            parse_sqlite_timestamp("2021-01-01 00:00:00"),
+            Some(1_609_459_200)
+        );
         // Leap-year day handled by the civil algorithm.
-        assert_eq!(parse_sqlite_timestamp("2020-02-29 12:00:00"), Some(1_582_977_600));
+        assert_eq!(
+            parse_sqlite_timestamp("2020-02-29 12:00:00"),
+            Some(1_582_977_600)
+        );
         // Malformed → None.
         assert_eq!(parse_sqlite_timestamp("not a timestamp"), None);
         assert_eq!(parse_sqlite_timestamp("2021-13"), None);
@@ -1078,8 +1125,14 @@ mod tests {
 
         // keep_recent = 1 keeps only the single most-recent fresh row (r_new1).
         let plan = failed_retention_plan(&rows, now, 1, 14 * day);
-        assert!(!plan.contains(&"r_new1".to_string()), "newest survives the count bound");
-        assert!(plan.contains(&"r_new2".to_string()), "older fresh row trimmed by count");
+        assert!(
+            !plan.contains(&"r_new1".to_string()),
+            "newest survives the count bound"
+        );
+        assert!(
+            plan.contains(&"r_new2".to_string()),
+            "older fresh row trimmed by count"
+        );
         assert!(plan.contains(&"r_old".to_string()));
         assert!(plan.contains(&"r_none".to_string()));
     }
@@ -1098,7 +1151,10 @@ mod tests {
         assert_eq!(plan, vec!["c".to_string()]);
         let mut shuffled = rows.clone();
         shuffled.reverse();
-        assert_eq!(failed_retention_plan(&shuffled, now, 2, 100 * day), vec!["c".to_string()]);
+        assert_eq!(
+            failed_retention_plan(&shuffled, now, 2, 100 * day),
+            vec!["c".to_string()]
+        );
         // Re-running on the survivors removes nothing (idempotent).
         let survivors: Vec<_> = rows.into_iter().filter(|(id, _)| id != "c").collect();
         assert!(failed_retention_plan(&survivors, now, 2, 100 * day).is_empty());
@@ -1122,8 +1178,16 @@ mod tests {
         assert_eq!(reap_failed_runs_with(&store, 10, 100 * 86_400, now), 0);
         // keep=0 reaps every failed row, but leaves done + coordinating intact.
         assert_eq!(reap_failed_runs_with(&store, 0, 100 * 86_400, now), 2);
-        let ids: Vec<String> = store.load_all().unwrap().into_iter().map(|r| r.run_id).collect();
-        assert!(ids.contains(&"ok".to_string()), "done row is clear_finished's job, not the reaper's");
+        let ids: Vec<String> = store
+            .load_all()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect();
+        assert!(
+            ids.contains(&"ok".to_string()),
+            "done row is clear_finished's job, not the reaper's"
+        );
         assert!(ids.contains(&"live".to_string()), "non-terminal untouched");
         assert!(!ids.contains(&"f1".to_string()));
         assert!(!ids.contains(&"f2".to_string()));
@@ -1156,19 +1220,27 @@ mod tests {
         let store = CoordinatorStore::open(&path).unwrap();
 
         // A goal-loop generator turn (other-session/durable-only) — coordinating.
-        store.insert("goal-abc", "pursue goal", "sess-a", None).unwrap();
+        store
+            .insert("goal-abc", "pursue goal", "sess-a", None)
+            .unwrap();
         // A run awaiting a batch — also active.
-        store.insert("run_await", "fan out", "sess-b", None).unwrap();
+        store
+            .insert("run_await", "fan out", "sess-b", None)
+            .unwrap();
         store.set_phase("run_await", "awaiting_batch").unwrap();
         // A finished run — terminal, must NOT count.
-        store.insert("run_done", "done work", "sess-c", None).unwrap();
+        store
+            .insert("run_done", "done work", "sess-c", None)
+            .unwrap();
         store.set_done("run_done", "result").unwrap();
         // A failed run — terminal, must NOT count.
         store.insert("run_failed", "broke", "sess-d", None).unwrap();
         store.set_failed("run_failed", "boom").unwrap();
         // This session's own worker, ALSO tracked in-memory (deduped out so it
         // isn't double-counted against worker::running_count).
-        store.insert("worker_7", "my worker", "sess-me", None).unwrap();
+        store
+            .insert("worker_7", "my worker", "sess-me", None)
+            .unwrap();
 
         let in_memory: HashSet<String> = ["worker_7".to_string()].into_iter().collect();
         // goal-abc + run_await = 2 active; run_done/run_failed terminal; worker_7 deduped.

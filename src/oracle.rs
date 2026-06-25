@@ -53,7 +53,9 @@ struct Case {
 /// terminated by a signal — matching bash and `Session::set_last_status`.
 fn code_of(status: &std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
-    status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+    status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
 }
 
 /// The session's effective PATH: rc exports first, then the process PATH —
@@ -72,7 +74,10 @@ fn path_var(session: &Session) -> String {
 /// A fresh session whose `env` carries the case's exported variables.
 fn session_with_env(env: &[(&str, &str)]) -> Session {
     let mut session = Session::new().expect("session");
-    session.env = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    session.env = env
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
     session
 }
 
@@ -86,16 +91,20 @@ async fn run_native(line: &str, session: &Session) -> Native {
 
     // 1. Native pipeline path — the real parser + the real executor.
     if let Some(stages) = pipeline::parse(line) {
-        let all_real = stages
-            .iter()
-            .all(|s| s.first().is_some_and(|p| resolve_program(p, &session.cwd, &path).is_some()));
+        let all_real = stages.iter().all(|s| {
+            s.first()
+                .is_some_and(|p| resolve_program(p, &session.cwd, &path).is_some())
+        });
         if !all_real {
             return Native::NotNative;
         }
         let (status, stdout) = pipeline::run_captured(&stages, session)
             .await
             .expect("pipeline execution failed");
-        return Native::Ran(Outcome { stdout, code: code_of(&status) });
+        return Native::Ran(Outcome {
+            stdout,
+            code: code_of(&status),
+        });
     }
 
     // 2. Direct-dispatch path — the real tokenizer, then a captured spawn of the
@@ -156,19 +165,71 @@ async fn run_bash(line: &str, session: &Session) -> Outcome {
 /// the same external binaries, so the only divergence source is aish's parsing
 /// vs bash's — which is exactly what this suite pins down.
 const CASES: &[Case] = &[
-    Case { name: "echo_simple", line: "echo hello", env: &[] },
-    Case { name: "echo_double_quoted_spaces", line: "echo \"a  b\"", env: &[] },
-    Case { name: "echo_single_quoted_pipe_literal", line: "echo 'a|b'", env: &[] },
-    Case { name: "printf_newlines", line: "printf 'a\\nb\\nc\\n'", env: &[] },
-    Case { name: "true_exit_zero", line: "true", env: &[] },
-    Case { name: "false_exit_one", line: "false", env: &[] },
-    Case { name: "var_in_double_quotes", line: "printf '%s' \"$WORD\"", env: &[("WORD", "solid")] },
-    Case { name: "seq_grep_wc_pipeline", line: "seq 1 100 | grep 5 | wc -l", env: &[] },
-    Case { name: "printf_sort_pipeline", line: "printf 'c\\na\\nb\\n' | sort", env: &[] },
-    Case { name: "echo_tr_pipeline", line: "echo hi | tr a-z A-Z", env: &[] },
-    Case { name: "pipeline_exit_last_stage_ok", line: "false | true", env: &[] },
-    Case { name: "pipeline_exit_last_stage_fail", line: "true | false", env: &[] },
-    Case { name: "yes_head_wc_pipeline", line: "yes | head -n 3 | wc -l", env: &[] },
+    Case {
+        name: "echo_simple",
+        line: "echo hello",
+        env: &[],
+    },
+    Case {
+        name: "echo_double_quoted_spaces",
+        line: "echo \"a  b\"",
+        env: &[],
+    },
+    Case {
+        name: "echo_single_quoted_pipe_literal",
+        line: "echo 'a|b'",
+        env: &[],
+    },
+    Case {
+        name: "printf_newlines",
+        line: "printf 'a\\nb\\nc\\n'",
+        env: &[],
+    },
+    Case {
+        name: "true_exit_zero",
+        line: "true",
+        env: &[],
+    },
+    Case {
+        name: "false_exit_one",
+        line: "false",
+        env: &[],
+    },
+    Case {
+        name: "var_in_double_quotes",
+        line: "printf '%s' \"$WORD\"",
+        env: &[("WORD", "solid")],
+    },
+    Case {
+        name: "seq_grep_wc_pipeline",
+        line: "seq 1 100 | grep 5 | wc -l",
+        env: &[],
+    },
+    Case {
+        name: "printf_sort_pipeline",
+        line: "printf 'c\\na\\nb\\n' | sort",
+        env: &[],
+    },
+    Case {
+        name: "echo_tr_pipeline",
+        line: "echo hi | tr a-z A-Z",
+        env: &[],
+    },
+    Case {
+        name: "pipeline_exit_last_stage_ok",
+        line: "false | true",
+        env: &[],
+    },
+    Case {
+        name: "pipeline_exit_last_stage_fail",
+        line: "true | false",
+        env: &[],
+    },
+    Case {
+        name: "yes_head_wc_pipeline",
+        line: "yes | head -n 3 | wc -l",
+        env: &[],
+    },
 ];
 
 /// AC1: every declarative case runs through aish's native path and matches bash
@@ -196,7 +257,11 @@ async fn declarative_cases_match_bash() {
             ));
         }
     }
-    assert!(failures.is_empty(), "oracle divergences:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "oracle divergences:\n{}",
+        failures.join("\n")
+    );
 }
 
 /// AC2: a deliberate divergence from bash must be *caught* by the harness.

@@ -50,7 +50,7 @@
 //! cost is only a less‑complete audit trail, never a crash.
 
 use crate::backend::ToolResult;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -183,7 +183,10 @@ impl TurnAudit {
                 let entry = self.replay.pop_front().expect("front exists");
                 self.replayed += 1;
                 self.position = entry.turn + 1;
-                return Step::Replay { output: entry.output, is_error: entry.is_error };
+                return Step::Replay {
+                    output: entry.output,
+                    is_error: entry.is_error,
+                };
             }
             // Divergence: the model took a different path than last time. The
             // remaining recorded turns are stale — drop them and go live.
@@ -268,7 +271,9 @@ impl TurnAudit {
     /// Append one record as a single JSON line. Best‑effort: a write error is
     /// swallowed (and disables further writes) so journaling never sinks a run.
     fn write_record(&mut self, record: Value) {
-        let Some(file) = self.file.as_mut() else { return };
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
         let mut line = record.to_string();
         line.push('\n');
         if file.write_all(line.as_bytes()).is_err() {
@@ -304,7 +309,11 @@ fn load_completed(path: &Path) -> Vec<Replay> {
         let Some(turn) = v.get("turn").and_then(Value::as_u64) else {
             continue;
         };
-        let tool = v.get("tool").and_then(Value::as_str).unwrap_or("").to_string();
+        let tool = v
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         match status {
             "pending" => {
                 // Remember the input keyed by turn so the terminal record (which
@@ -322,7 +331,11 @@ fn load_completed(path: &Path) -> Vec<Replay> {
                 finalize(&mut completed, turn, &tool, output, false);
             }
             "failed" => {
-                let output = v.get("error").and_then(Value::as_str).unwrap_or("").to_string();
+                let output = v
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 finalize(&mut completed, turn, &tool, output, true);
             }
             _ => {}
@@ -420,8 +433,17 @@ fn redact_value(v: &Value, under_env: bool) -> Value {
 /// Whether an input key name looks like it holds a credential.
 fn is_secret_key(key: &str) -> bool {
     let k = key.to_ascii_lowercase();
-    const NEEDLES: &[&str] =
-        &["token", "secret", "password", "passwd", "apikey", "api_key", "auth", "credential", "private_key"];
+    const NEEDLES: &[&str] = &[
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "apikey",
+        "api_key",
+        "auth",
+        "credential",
+        "private_key",
+    ];
     NEEDLES.iter().any(|n| k.contains(n))
 }
 
@@ -435,7 +457,11 @@ fn truncate(s: &str, max: usize) -> String {
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…[truncated {} chars]", &s[..end], s.chars().count() - s[..end].chars().count())
+    format!(
+        "{}…[truncated {} chars]",
+        &s[..end],
+        s.chars().count() - s[..end].chars().count()
+    )
 }
 
 /// Current UTC time as an ISO‑8601 / RFC‑3339 string (`YYYY-MM-DDTHH:MM:SSZ`),
@@ -473,10 +499,18 @@ mod tests {
     }
 
     fn ok_result(content: &str) -> ToolResult {
-        ToolResult { id: "t".into(), content: content.into(), is_error: false }
+        ToolResult {
+            id: "t".into(),
+            content: content.into(),
+            is_error: false,
+        }
     }
     fn err_result(content: &str) -> ToolResult {
-        ToolResult { id: "t".into(), content: content.into(), is_error: true }
+        ToolResult {
+            id: "t".into(),
+            content: content.into(),
+            is_error: true,
+        }
     }
 
     #[test]
@@ -505,7 +539,12 @@ mod tests {
         let complete: Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(complete["status"], "complete");
         assert_eq!(complete["output"]["is_error"], false);
-        assert!(complete["output"]["content"].as_str().unwrap().contains("package"));
+        assert!(
+            complete["output"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("package")
+        );
     }
 
     #[test]
@@ -531,7 +570,11 @@ mod tests {
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
             .filter(|v| v["status"] == "synthesis")
             .collect();
-        assert_eq!(synth.len(), 1, "exactly one synthesis record (the empty one skipped)");
+        assert_eq!(
+            synth.len(),
+            1,
+            "exactly one synthesis record (the empty one skipped)"
+        );
         assert_eq!(synth[0]["round"], 0);
         assert!(synth[0]["text"].as_str().unwrap().contains("found the bug"));
 
@@ -539,8 +582,14 @@ mod tests {
         // only the one real tool turn is recovered, so the resume contract holds.
         let mut audit = TurnAudit::attach(&dir, "run_s");
         assert_eq!(audit.recovered, 1);
-        assert!(matches!(audit.begin("read_file", &json!({"path": "a"})), Step::Replay { .. }));
-        assert!(matches!(audit.begin("list_dir", &json!({})), Step::Execute { .. }));
+        assert!(matches!(
+            audit.begin("read_file", &json!({"path": "a"})),
+            Step::Replay { .. }
+        ));
+        assert!(matches!(
+            audit.begin("list_dir", &json!({})),
+            Step::Execute { .. }
+        ));
     }
 
     #[test]
@@ -550,7 +599,11 @@ mod tests {
         let Step::Execute { turn } = audit.begin("run_program", &json!({"program": "nope"})) else {
             panic!("expected execute");
         };
-        audit.complete(turn, "run_program", &err_result("error: failed to exec nope"));
+        audit.complete(
+            turn,
+            "run_program",
+            &err_result("error: failed to exec nope"),
+        );
         let raw = std::fs::read_to_string(dir.join(".atum/run-run_f.jsonl")).unwrap();
         let last: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
         assert_eq!(last["status"], "failed");
@@ -582,7 +635,12 @@ mod tests {
         let mut audit = TurnAudit::attach(&dir, "run_r");
         assert!(audit.is_resuming());
         assert_eq!(audit.recovered, 2);
-        assert!(audit.resume_summary().unwrap().contains("resuming from turn 2"));
+        assert!(
+            audit
+                .resume_summary()
+                .unwrap()
+                .contains("resuming from turn 2")
+        );
 
         // The model re‑issues the same first call → replayed, NOT executed.
         match audit.begin("read_file", &json!({"path": "a.txt"})) {
@@ -623,10 +681,16 @@ mod tests {
         let mut audit = TurnAudit::attach(&dir, "run_d");
         assert_eq!(audit.recovered, 2);
         // First call matches → replay.
-        assert!(matches!(audit.begin("read_file", &json!({"path": "a.txt"})), Step::Replay { .. }));
+        assert!(matches!(
+            audit.begin("read_file", &json!({"path": "a.txt"})),
+            Step::Replay { .. }
+        ));
         // Second call DIVERGES (different path) → the replay queue is drained and
         // this becomes a live turn, keeping the sequential index.
-        match audit.begin("run_program", &json!({"program": "cargo", "args": ["test"]})) {
+        match audit.begin(
+            "run_program",
+            &json!({"program": "cargo", "args": ["test"]}),
+        ) {
             Step::Execute { turn } => assert_eq!(turn, 1),
             Step::Replay { .. } => panic!("divergent call must go live"),
         }
@@ -652,7 +716,10 @@ mod tests {
         // 1, pending‑only) is NOT replayed — it must re‑execute so its result is
         // real, not assumed.
         assert_eq!(audit.recovered, 1);
-        assert!(matches!(audit.begin("read_file", &json!({"path": "a"})), Step::Replay { .. }));
+        assert!(matches!(
+            audit.begin("read_file", &json!({"path": "a"})),
+            Step::Replay { .. }
+        ));
         // The git push re‑executes (live), the critical no‑silent‑skip guarantee.
         match audit.begin("run_program", &json!({"program": "git", "args": ["push"]})) {
             Step::Execute { turn } => assert_eq!(turn, 1),
@@ -677,9 +744,15 @@ not json at all
         let mut audit = TurnAudit::attach(&dir, "run_c");
         // Exactly one clean completed turn survives the corruption.
         assert_eq!(audit.recovered, 1);
-        assert!(matches!(audit.begin("read_file", &json!({"path": "a"})), Step::Replay { .. }));
+        assert!(matches!(
+            audit.begin("read_file", &json!({"path": "a"})),
+            Step::Replay { .. }
+        ));
         // Everything after is fresh.
-        assert!(matches!(audit.begin("list_dir", &json!({})), Step::Execute { .. }));
+        assert!(matches!(
+            audit.begin("list_dir", &json!({})),
+            Step::Execute { .. }
+        ));
     }
 
     #[test]
@@ -709,7 +782,9 @@ not json at all
         {
             let mut audit = TurnAudit::attach(&dir, "run_rm");
             let input = json!({"program": "curl", "env": {"TOKEN": "secret"}});
-            let Step::Execute { turn } = audit.begin("run_program", &input) else { panic!() };
+            let Step::Execute { turn } = audit.begin("run_program", &input) else {
+                panic!()
+            };
             audit.complete(turn, "run_program", &ok_result("ok"));
         }
         let mut audit = TurnAudit::attach(&dir, "run_rm");
@@ -720,7 +795,10 @@ not json at all
         );
         // And the secret never hit disk.
         let raw = std::fs::read_to_string(dir.join(".atum/run-run_rm.jsonl")).unwrap();
-        assert!(!raw.contains("secret"), "the journal must not contain the secret value");
+        assert!(
+            !raw.contains("secret"),
+            "the journal must not contain the secret value"
+        );
     }
 
     #[test]

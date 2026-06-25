@@ -221,13 +221,21 @@ mod tests {
         Msg {
             role: Role::Assistant,
             text: text.into(),
-            tool_calls: vec![ToolCall { id: "t1".into(), name: tool.into(), args: json!({}) }],
+            tool_calls: vec![ToolCall {
+                id: "t1".into(),
+                name: tool.into(),
+                args: json!({}),
+            }],
             tool_results: vec![],
             raw: None,
         }
     }
     fn tool_results(content: &str) -> Msg {
-        Msg::tool_results(vec![ToolResult { id: "t1".into(), content: content.into(), is_error: false }])
+        Msg::tool_results(vec![ToolResult {
+            id: "t1".into(),
+            content: content.into(),
+            is_error: false,
+        }])
     }
 
     #[test]
@@ -272,11 +280,23 @@ mod tests {
             Msg::user("first prompt"),
             assistant_call("calling", "read_file"),
             tool_results("file body"),
-            Msg { role: Role::Assistant, text: "done".into(), tool_calls: vec![], tool_results: vec![], raw: None },
+            Msg {
+                role: Role::Assistant,
+                text: "done".into(),
+                tool_calls: vec![],
+                tool_results: vec![],
+                raw: None,
+            },
         ];
         for i in 0..14 {
             h.push(Msg::user(format!("q{i}")));
-            h.push(Msg { role: Role::Assistant, text: format!("a{i}"), tool_calls: vec![], tool_results: vec![], raw: None });
+            h.push(Msg {
+                role: Role::Assistant,
+                text: format!("a{i}"),
+                tool_calls: vec![],
+                tool_results: vec![],
+                raw: None,
+            });
         }
         let split = compaction_split(&h, 12).expect("should compact a long history");
         // Keeps at least keep_recent messages.
@@ -291,11 +311,23 @@ mod tests {
             Msg::user("how do I build this"),
             assistant_call("let me look", "read_file"),
             tool_results("Cargo.toml contents"),
-            Msg { role: Role::Assistant, text: "use cargo build".into(), tool_calls: vec![], tool_results: vec![], raw: None },
+            Msg {
+                role: Role::Assistant,
+                text: "use cargo build".into(),
+                tool_calls: vec![],
+                tool_results: vec![],
+                raw: None,
+            },
         ];
         for i in 0..14 {
             h.push(Msg::user(format!("q{i}")));
-            h.push(Msg { role: Role::Assistant, text: format!("a{i}"), tool_calls: vec![], tool_results: vec![], raw: None });
+            h.push(Msg {
+                role: Role::Assistant,
+                text: format!("a{i}"),
+                tool_calls: vec![],
+                tool_results: vec![],
+                raw: None,
+            });
         }
         let before = h.len();
         let plan = plan_compaction(&h, 12).expect("plan");

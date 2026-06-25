@@ -28,11 +28,6 @@
 //! writer. The DETACHED, shell-survival lifecycle (write the answer to the
 //! volume, read it back after `wait`) is S9.4's concern and layers on top of
 //! this abstraction without changing it.
-//!
-//! S9.5 (discovery + `:forget`) adds the lifecycle-management side: [`list`]
-//! enriched to carry each container's labels (so a worker is matched to its
-//! `meta.json` by `aish.worker_id`), [`rm`] to delete an exited container, and
-//! [`forget_container`] which ties the two together for the `:forget` command.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -104,6 +99,7 @@ pub fn runtime_on_path(rt: Runtime) -> bool {
 /// Auto-detect the preferred runtime on PATH per AC1: prefer **podman** (rootless,
 /// daemonless), else **docker**, else `None` (no engine → host path). Honors an
 /// explicit `AISH_CONTAINER_RUNTIME=none` by short-circuiting to `None`.
+#[allow(dead_code)] // AC1 auto-detect entry point; the engaged cutover uses resolve_selection.
 pub fn detect_runtime() -> Option<Runtime> {
     match Runtime::parse_selector(std::env::var("AISH_CONTAINER_RUNTIME").ok().as_deref()) {
         SelectorPref::Force(rt) => runtime_on_path(rt).then_some(rt),
@@ -141,10 +137,18 @@ pub fn resolve_selection(
     match pref {
         SelectorPref::Host => Selection::Host,
         SelectorPref::Force(Runtime::Podman) => {
-            if podman_present { Selection::Container(Runtime::Podman) } else { Selection::Host }
+            if podman_present {
+                Selection::Container(Runtime::Podman)
+            } else {
+                Selection::Host
+            }
         }
         SelectorPref::Force(Runtime::Docker) => {
-            if docker_present { Selection::Container(Runtime::Docker) } else { Selection::Host }
+            if docker_present {
+                Selection::Container(Runtime::Docker)
+            } else {
+                Selection::Host
+            }
         }
         // Auto: report-only (host execution) until the cutover is enabled — see
         // the `engaged` note above. The auto-preference order itself lives in
@@ -152,25 +156,6 @@ pub fn resolve_selection(
         // engine doesn't hijack the default path before S9.3/S9.4.
         SelectorPref::Auto => Selection::Host,
     }
-}
-
-/// The live execution vehicle a worker WOULD use right now, resolved from the
-/// same inputs `run_worker` feeds `resolve_selection`: the `AISH_CONTAINER_RUNTIME`
-/// selector plus which engines are on PATH. `:update --drain` reads this to know
-/// whether background workers are containerized (and so survive a shell restart)
-/// or host subprocesses (which die on restart, gating the AC8 confirmation).
-pub fn current_selection() -> Selection {
-    resolve_selection(
-        Runtime::parse_selector(std::env::var("AISH_CONTAINER_RUNTIME").ok().as_deref()),
-        runtime_on_path(Runtime::Podman),
-        runtime_on_path(Runtime::Docker),
-    )
-}
-
-/// True when background workers run in a container (and thus keep running across
-/// a `:update --drain` shell restart); false for the host-subprocess path.
-pub fn current_backend_is_container() -> bool {
-    matches!(current_selection(), Selection::Container(_))
 }
 
 /// The image tag for a worker, pinned to the running aish version so a new build
@@ -184,14 +169,24 @@ pub fn image_tag(version: &str) -> String {
 /// tokens; we still sanitize defensively so a stray char can't produce an
 /// invalid container name. Pure → unit-tested.
 pub fn container_name(session_id: &str, worker_id: &str) -> String {
-    format!("aish-{}-{}", sanitize_token(session_id), sanitize_token(worker_id))
+    format!(
+        "aish-{}-{}",
+        sanitize_token(session_id),
+        sanitize_token(worker_id)
+    )
 }
 
 /// Sanitize an id into the `[A-Za-z0-9_.-]` set container engines accept in a
 /// `--name`, collapsing anything else to `-`. Pure.
 fn sanitize_token(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -301,7 +296,12 @@ pub const STATE_MOUNT: &str = "/aish/state";
 /// `--rm` is set: S9.1 runs attached and finalizes here; the detached,
 /// keep-on-changes lifecycle is S9.4.
 pub fn run_argv(spec: &ContainerSpec) -> Vec<String> {
-    let mut a: Vec<String> = vec!["run".into(), "--rm".into(), "--name".into(), spec.name.clone()];
+    let mut a: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "--name".into(),
+        spec.name.clone(),
+    ];
     // Identity labels.
     for (k, v) in &spec.labels {
         a.push("--label".into());
@@ -325,7 +325,11 @@ pub fn run_argv(spec: &ContainerSpec) -> Vec<String> {
     }
     // Persistent state volume (AC4).
     a.push("-v".into());
-    a.push(format!("{}:{}", spec.state_volume_host.display(), spec.state_mount));
+    a.push(format!(
+        "{}:{}",
+        spec.state_volume_host.display(),
+        spec.state_mount
+    ));
     // Project tree (the worktree / cwd) bind-mounted at the workdir, so the
     // coordinator runs against the same files the host path would.
     if let Some(work) = &spec.work_volume_host {
@@ -361,7 +365,9 @@ pub fn describe_exit(code: i32) -> Option<String> {
              and runtime (docker/podman) availability."
                 .to_string(),
         ),
-        n => Some(format!("worker container exited unsuccessfully (exit {n}).")),
+        n => Some(format!(
+            "worker container exited unsuccessfully (exit {n})."
+        )),
     }
 }
 
@@ -381,74 +387,20 @@ pub fn image_exists(rt: Runtime, tag: &str) -> bool {
 /// A discovered worker container — the unit S9.5 discovery scans by label, and
 /// what `list` returns.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // labels + accessors feed the S9.5 discovery follow-up.
+#[allow(dead_code)] // S9.5 discovery scans containers by label into these.
 pub struct ContainerHandle {
     pub id: String,
     pub name: String,
     pub labels: HashMap<String, String>,
 }
 
-#[allow(dead_code)] // join-key accessors for the S9.5 discovery follow-up.
-impl ContainerHandle {
-    /// The worker id this container belongs to (`aish.worker_id` label), if any.
-    /// This is discovery's idempotency + meta.json join key (AC1).
-    pub fn worker_id(&self) -> Option<&str> {
-        self.labels.get("aish.worker_id").map(String::as_str)
-    }
-
-    /// The owning session id (`aish.session_id` label), if any — the scope key
-    /// discovery filters on (AC4).
-    pub fn session_id(&self) -> Option<&str> {
-        self.labels.get("aish.session_id").map(String::as_str)
-    }
-
-    /// The label-schema version (`aish.schema`), if present. Discovery skips a
-    /// container whose schema it doesn't understand rather than crash (AC edge).
-    pub fn schema(&self) -> Option<&str> {
-        self.labels.get("aish.schema").map(String::as_str)
-    }
-}
-
-/// Parse a `{{.Labels}}` field (the engine renders it as a comma-joined
-/// `key=value` list, e.g. `aish.schema=1,aish.worker_id=w_x`) into a map.
-/// Tolerant: blank entries and entries without an `=` are skipped. Pure → tested.
-fn parse_labels_field(field: &str) -> HashMap<String, String> {
-    field
-        .split(',')
-        .filter_map(|kv| {
-            let kv = kv.trim();
-            if kv.is_empty() {
-                return None;
-            }
-            let (k, v) = kv.split_once('=')?;
-            let k = k.trim();
-            (!k.is_empty()).then(|| (k.to_string(), v.trim().to_string()))
-        })
-        .collect()
-}
-
-/// Parse one `{{.ID}}\t{{.Names}}\t{{.Labels}}` line into a [`ContainerHandle`].
-/// `None` when the id field is empty. Pure → unit-tested without a daemon.
-fn parse_ps_line(line: &str) -> Option<ContainerHandle> {
-    let mut it = line.splitn(3, '\t');
-    let id = it.next()?.trim().to_string();
-    if id.is_empty() {
-        return None;
-    }
-    let name = it.next().unwrap_or("").trim().to_string();
-    let labels = parse_labels_field(it.next().unwrap_or(""));
-    Some(ContainerHandle { id, name, labels })
-}
-
 /// List containers carrying ALL of `label_filter` (AND semantics, via repeated
-/// `--filter label=k=v`). Each handle carries its full label set (parsed from
-/// the `{{.Labels}}` column), so S9.5 discovery can join a container to its
-/// on-disk `meta.json` by `aish.worker_id` and scope by `aish.session_id`.
-/// Best-effort — empty on any error (no runtime, daemon down, …) so a missing
-/// engine reads cleanly as "no containers" rather than failing.
+/// `--filter label=k=v`). Best-effort — empty on any error. Used by S9.5 to
+/// rediscover workers the shell can't reap, and by the AC3 uniqueness probe.
+#[allow(dead_code)] // S9.5 label-based worker rediscovery / AC3 uniqueness probe.
 pub fn list(rt: Runtime, label_filter: &[(&str, &str)]) -> Vec<ContainerHandle> {
     let mut cmd = std::process::Command::new(rt.bin());
-    cmd.args(["ps", "-a", "--format", "{{.ID}}\t{{.Names}}\t{{.Labels}}"]);
+    cmd.args(["ps", "-a", "--format", "{{.ID}}\t{{.Names}}"]);
     for (k, v) in label_filter {
         cmd.arg("--filter");
         cmd.arg(format!("label={k}={v}"));
@@ -457,49 +409,19 @@ pub fn list(rt: Runtime, label_filter: &[(&str, &str)]) -> Vec<ContainerHandle> 
         Ok(o) if o.status.success() => o.stdout,
         _ => return Vec::new(),
     };
-    String::from_utf8_lossy(&out).lines().filter_map(parse_ps_line).collect()
-}
-
-/// Remove a container by id/name. `force` adds `-f` (the engine SIGKILLs a
-/// running container before removing it); without it, an engine REFUSES to
-/// remove a still-running container — which is exactly the guard `:forget` wants
-/// so it can never reap a live worker's container (AC5a). Best-effort: returns
-/// `true` only on a clean removal, `false` on any error (no runtime, already
-/// gone, still running without force). Quiet — stdout/stderr are suppressed.
-pub fn rm(rt: Runtime, id: &str, force: bool) -> bool {
-    let mut cmd = std::process::Command::new(rt.bin());
-    cmd.arg("rm");
-    if force {
-        cmd.arg("-f");
-    }
-    cmd.arg(id)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// `:forget` (S9.5) container cleanup: find the worker's container by its
-/// `aish.worker_id` label and remove it WITHOUT force, so a still-running
-/// container is left intact (the engine refuses a no-force `rm` on a live
-/// container). Honors `AISH_CONTAINER_RUNTIME` for engine selection and is a
-/// no-op (returns `false`) when no runtime is available — the common case today,
-/// since the default backend is the host subprocess. Returns `true` when a
-/// container was actually removed.
-pub fn forget_container(worker_id: &str) -> bool {
-    let Some(rt) = detect_runtime() else {
-        return false;
-    };
-    let mut removed = false;
-    for h in list(rt, &[("aish.worker_id", worker_id)]) {
-        // Prefer the stable name when present, else the id — both resolve.
-        let target = if h.name.is_empty() { &h.id } else { &h.name };
-        if rm(rt, target, false) {
-            removed = true;
-        }
-    }
-    removed
+    String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|line| {
+            let mut it = line.splitn(2, '\t');
+            let id = it.next()?.trim().to_string();
+            let name = it.next().unwrap_or("").trim().to_string();
+            (!id.is_empty()).then_some(ContainerHandle {
+                id,
+                name,
+                labels: HashMap::new(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -508,22 +430,37 @@ mod tests {
 
     #[test]
     fn selector_parsing_covers_all_values() {
-        assert_eq!(Runtime::parse_selector(Some("podman")), SelectorPref::Force(Runtime::Podman));
-        assert_eq!(Runtime::parse_selector(Some("docker")), SelectorPref::Force(Runtime::Docker));
+        assert_eq!(
+            Runtime::parse_selector(Some("podman")),
+            SelectorPref::Force(Runtime::Podman)
+        );
+        assert_eq!(
+            Runtime::parse_selector(Some("docker")),
+            SelectorPref::Force(Runtime::Docker)
+        );
         // Case + whitespace tolerant.
-        assert_eq!(Runtime::parse_selector(Some("  DOCKER ")), SelectorPref::Force(Runtime::Docker));
+        assert_eq!(
+            Runtime::parse_selector(Some("  DOCKER ")),
+            SelectorPref::Force(Runtime::Docker)
+        );
         assert_eq!(Runtime::parse_selector(Some("none")), SelectorPref::Host);
         assert_eq!(Runtime::parse_selector(Some("host")), SelectorPref::Host);
         // Unset / empty / garbage → auto-detect.
         assert_eq!(Runtime::parse_selector(None), SelectorPref::Auto);
         assert_eq!(Runtime::parse_selector(Some("")), SelectorPref::Auto);
-        assert_eq!(Runtime::parse_selector(Some("kubernetes")), SelectorPref::Auto);
+        assert_eq!(
+            Runtime::parse_selector(Some("kubernetes")),
+            SelectorPref::Auto
+        );
     }
 
     #[test]
     fn resolve_selection_matches_ac1_precedence() {
         // none/host → always host, regardless of what's installed.
-        assert_eq!(resolve_selection(SelectorPref::Host, true, true), Selection::Host);
+        assert_eq!(
+            resolve_selection(SelectorPref::Host, true, true),
+            Selection::Host
+        );
         // Explicit podman → podman when present, else host (graceful fallback, AC9).
         assert_eq!(
             resolve_selection(SelectorPref::Force(Runtime::Podman), true, false),
@@ -544,7 +481,10 @@ mod tests {
         );
         // Auto stays on the host path (report-only until S9.3/S9.4 cutover), even
         // with both engines present — installing Docker can't hijack the default.
-        assert_eq!(resolve_selection(SelectorPref::Auto, true, true), Selection::Host);
+        assert_eq!(
+            resolve_selection(SelectorPref::Auto, true, true),
+            Selection::Host
+        );
     }
 
     #[test]
@@ -555,7 +495,10 @@ mod tests {
 
     #[test]
     fn container_name_is_deterministic_and_sanitized() {
-        assert_eq!(container_name("sess-abc", "w_a7k3m2pQ"), "aish-sess-abc-w_a7k3m2pQ");
+        assert_eq!(
+            container_name("sess-abc", "w_a7k3m2pQ"),
+            "aish-sess-abc-w_a7k3m2pQ"
+        );
         // Same inputs → same name (deterministic, AC3).
         assert_eq!(
             container_name("sess-abc", "w_a7k3m2pQ"),
@@ -567,14 +510,32 @@ mod tests {
 
     #[test]
     fn worker_labels_carry_identity_and_optional_card() {
-        let l = worker_labels("w_1", "sess-a", "owner--repo", Some("card_9"), "2026-06-22T00:00:00Z");
+        let l = worker_labels(
+            "w_1",
+            "sess-a",
+            "owner--repo",
+            Some("card_9"),
+            "2026-06-22T00:00:00Z",
+        );
         let map: HashMap<_, _> = l.iter().cloned().collect();
         assert_eq!(map.get("aish.schema").map(String::as_str), Some("1"));
         assert_eq!(map.get("aish.worker_id").map(String::as_str), Some("w_1"));
-        assert_eq!(map.get("aish.session_id").map(String::as_str), Some("sess-a"));
-        assert_eq!(map.get("aish.repo_key").map(String::as_str), Some("owner--repo"));
-        assert_eq!(map.get("aish.created_at").map(String::as_str), Some("2026-06-22T00:00:00Z"));
-        assert_eq!(map.get("aish.task_card_id").map(String::as_str), Some("card_9"));
+        assert_eq!(
+            map.get("aish.session_id").map(String::as_str),
+            Some("sess-a")
+        );
+        assert_eq!(
+            map.get("aish.repo_key").map(String::as_str),
+            Some("owner--repo")
+        );
+        assert_eq!(
+            map.get("aish.created_at").map(String::as_str),
+            Some("2026-06-22T00:00:00Z")
+        );
+        assert_eq!(
+            map.get("aish.task_card_id").map(String::as_str),
+            Some("card_9")
+        );
         // An absent / empty card id omits the label entirely.
         let l2 = worker_labels("w_1", "sess-a", "owner--repo", None, "ts");
         assert!(!l2.iter().any(|(k, _)| k == "aish.task_card_id"));
@@ -637,28 +598,48 @@ mod tests {
         let argv = run_argv(&sample_spec());
         // Starts with `run --rm --name <name>`.
         assert_eq!(&argv[0..2], &["run", "--rm"]);
-        assert!(argv.windows(2).any(|w| w[0] == "--name" && w[1] == "aish-sess-w1"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--name" && w[1] == "aish-sess-w1")
+        );
         // Carries the identity labels.
-        assert!(argv.windows(2).any(|w| w[0] == "--label" && w[1] == "aish.worker_id=w1"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--label" && w[1] == "aish.worker_id=w1")
+        );
         // Resource caps present (mem + pids; cpus omitted as None).
-        assert!(argv.windows(2).any(|w| w[0] == "--memory" && w[1] == "4096m"));
-        assert!(argv.windows(2).any(|w| w[0] == "--pids-limit" && w[1] == "512"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--memory" && w[1] == "4096m")
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--pids-limit" && w[1] == "512")
+        );
         assert!(!argv.iter().any(|s| s == "--cpus"));
         // Hardened: cap-drop, never privileged.
         assert!(argv.iter().any(|s| s == "--cap-drop=ALL"));
         assert!(!argv.iter().any(|s| s == "--privileged"));
         // Secrets via env-file (kept out of argv/ps).
-        assert!(argv.windows(2).any(|w| w[0] == "--env-file" && w[1] == "/tmp/w1.env"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--env-file" && w[1] == "/tmp/w1.env")
+        );
         // State volume mounted at the fixed path (AC4).
-        assert!(argv
-            .windows(2)
-            .any(|w| w[0] == "-v" && w[1] == "/home/me/.aish/workers/w1:/aish/state"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-v" && w[1] == "/home/me/.aish/workers/w1:/aish/state")
+        );
         // Project tree bind-mounted at the workdir.
-        assert!(argv
-            .windows(2)
-            .any(|w| w[0] == "-v" && w[1] == "/home/me/proj:/aish/work"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-v" && w[1] == "/home/me/proj:/aish/work")
+        );
         // Network set.
-        assert!(argv.windows(2).any(|w| w[0] == "--network" && w[1] == "host"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--network" && w[1] == "host")
+        );
         // The image precedes the coordinator argv, which is preserved verbatim
         // and in order at the tail.
         let img = argv.iter().position(|s| s == "aish-worker:0.9.3").unwrap();
@@ -684,41 +665,5 @@ mod tests {
     fn runtime_bin_names() {
         assert_eq!(Runtime::Podman.bin(), "podman");
         assert_eq!(Runtime::Docker.bin(), "docker");
-    }
-
-    #[test]
-    fn parse_labels_field_splits_kv_pairs_and_skips_junk() {
-        let m = parse_labels_field("aish.schema=1,aish.worker_id=w_x,aish.session_id=sess-a");
-        assert_eq!(m.get("aish.schema").map(String::as_str), Some("1"));
-        assert_eq!(m.get("aish.worker_id").map(String::as_str), Some("w_x"));
-        assert_eq!(m.get("aish.session_id").map(String::as_str), Some("sess-a"));
-        // Blank field → empty map (no labels, e.g. a non-aish container).
-        assert!(parse_labels_field("").is_empty());
-        // Entries without an `=`, or with an empty key, are skipped.
-        let m2 = parse_labels_field("bogus,,=novalue,k=v");
-        assert_eq!(m2.len(), 1);
-        assert_eq!(m2.get("k").map(String::as_str), Some("v"));
-        // A value that itself contains `=` keeps everything after the first `=`.
-        let m3 = parse_labels_field("k=a=b=c");
-        assert_eq!(m3.get("k").map(String::as_str), Some("a=b=c"));
-    }
-
-    #[test]
-    fn parse_ps_line_builds_handle_with_labels() {
-        let h = parse_ps_line("abc123\taish-sess-w_x\taish.schema=1,aish.worker_id=w_x,aish.session_id=sess-a")
-            .expect("a well-formed line parses");
-        assert_eq!(h.id, "abc123");
-        assert_eq!(h.name, "aish-sess-w_x");
-        assert_eq!(h.worker_id(), Some("w_x"));
-        assert_eq!(h.session_id(), Some("sess-a"));
-        assert_eq!(h.schema(), Some("1"));
-        // No labels column → handle with an empty label map (accessors None).
-        let bare = parse_ps_line("def456\tsome-name\t").expect("bare line parses");
-        assert_eq!(bare.id, "def456");
-        assert!(bare.worker_id().is_none());
-        assert!(bare.schema().is_none());
-        // Empty id → no handle (a blank ps line is dropped).
-        assert!(parse_ps_line("").is_none());
-        assert!(parse_ps_line("\t\t").is_none());
     }
 }

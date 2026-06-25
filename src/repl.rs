@@ -1,11 +1,11 @@
 use crate::backend::Backend;
+use crate::editor::{LineEditor, ReadOutcome};
 use crate::engine;
 use crate::pipeline;
 use crate::rc;
 use crate::session::Session;
 use crate::tools;
 use anyhow::Result;
-use crate::editor::{LineEditor, ReadOutcome};
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::Hinter;
@@ -284,7 +284,10 @@ pub async fn run(
             Some(run_id) => format!("\x1b[1;33m⇄{} \x1b[0m", crate::batch::short_id(run_id)),
             None => String::new(),
         };
-        let prompt = format!("{name}{attach}{badge}\x1b[36m{}\x1b[0m ❯ ", short_cwd(&session));
+        let prompt = format!(
+            "{name}{attach}{badge}\x1b[36m{}\x1b[0m ❯ ",
+            short_cwd(&session)
+        );
         // Consume an accepted-rewrite line before falling back to the editor.
         let outcome = match injected.take() {
             Some(l) => ReadOutcome::Line(l),
@@ -309,7 +312,9 @@ pub async fn run(
                 if let Some(intent) = crate::rewrite::parse_invocation(&line) {
                     let intent = intent.to_string();
                     if intent.is_empty() {
-                        println!("\x1b[2musage: :rewrite <what you want to do>  (alias :rw)\x1b[0m");
+                        println!(
+                            "\x1b[2musage: :rewrite <what you want to do>  (alias :rw)\x1b[0m"
+                        );
                         continue;
                     }
                     print!("\x1b[2m  ⚙ rewriting…\x1b[0m");
@@ -429,7 +434,15 @@ pub async fn run(
                 // builtin/alias), run it directly on the terminal like any
                 // shell would. Everything else routes to the model.
                 if route != Route::Model {
-                    match dispatch(&line, route == Route::Direct, &mut session, &aliases, &mut prev_dir).await {
+                    match dispatch(
+                        &line,
+                        route == Route::Direct,
+                        &mut session,
+                        &aliases,
+                        &mut prev_dir,
+                    )
+                    .await
+                    {
                         Dispatch::Handled => continue,
                         Dispatch::Quit => break,
                         Dispatch::NotACommand => {}
@@ -449,7 +462,7 @@ pub async fn run(
                 // Skipped inside a coordinator (no nested coordinators).
                 if route == Route::Auto && !session.nested && mentions_work_signal(&line) {
                     println!();
-                    dispatch_worker(&line, &mut session);
+                    dispatch_and_attach(&line, &mut session);
                     continue;
                 }
 
@@ -588,8 +601,8 @@ impl AishHelper {
 
 /// Builtins aish handles itself — always offered as command-name completions.
 const BUILTINS: &[&str] = &[
-    "cd", "exit", "logout", "jobs", "fg", "bg", "wait", "pwd", "unset", "set", "umask",
-    "source", ".", "exec",
+    "cd", "exit", "logout", "jobs", "fg", "bg", "wait", "pwd", "unset", "set", "umask", "source",
+    ".", "exec",
 ];
 
 /// How long a PATH scan stays cached before it's re-scanned (picks up newly
@@ -613,14 +626,16 @@ struct CmdCache {
 /// arms of `handle_colon` and the `:help` text.
 const COLON_COMMANDS: &[(&str, &str)] = &[
     ("allow", "list / revoke always-allowed tools & dir grants"),
-    ("attach", "watch + steer a coordinator, or `goal` to watch the goal"),
+    (
+        "attach",
+        "watch + steer a coordinator, or `goal` to watch the goal",
+    ),
     ("backend", "switch backend (claude|grok|local)"),
     ("batch", "background batch mode (on|off|status)"),
     ("compact", "compact history, offload to memory"),
     ("context", "show context-window usage"),
     ("detach", "stop watching the attached coordinator"),
-    ("dispatch", "launch a background coordinator (background; :attach to watch)"),
-    ("forget", "remove an exited worker (--all-exited: every exited one)"),
+    ("dispatch", "launch a background coordinator + auto-attach"),
     ("goal", "pursue a goal in the background"),
     ("help", "show command help"),
     ("jobs", "list background jobs"),
@@ -634,12 +649,24 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("quit", "exit aish"),
     ("rename", "rename this session"),
     ("result", "view a finished job's result"),
-    ("rewrite", "AI-rewrite intent into a command (edit/accept before run)"),
+    (
+        "rewrite",
+        "AI-rewrite intent into a command (edit/accept before run)",
+    ),
     ("skill", "manage skills (add|search|list|remove)"),
-    ("suggest", "AI-suggest the next command from context (edit/accept before run)"),
-    ("tell", "message an in-flight coordinator (--any: cross-session)"),
+    (
+        "suggest",
+        "AI-suggest the next command from context (edit/accept before run)",
+    ),
+    (
+        "tell",
+        "message an in-flight coordinator (--any: cross-session)",
+    ),
     ("update", "upgrade aish to the latest release"),
-    ("workers", "list this session's coordinators (all = every session)"),
+    (
+        "workers",
+        "list this session's coordinators (all = every session)",
+    ),
     ("yolo", "toggle yolo mode"),
 ];
 
@@ -732,7 +759,12 @@ impl rustyline::hint::Hint for AishHint {
 
 impl Completer for AishHelper {
     type Candidate = Pair;
-    fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
         // Colon command palette (explicit TAB). When the buffer is a
         // `:`-prefixed token we complete against the command catalog, not
         // PATH/paths. The live, as-you-type menu is rendered separately by the
@@ -743,7 +775,10 @@ impl Completer for AishHelper {
                 return Ok(complete_colon(after));
             }
         }
-        let start = line[..pos].rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+        let start = line[..pos]
+            .rfind(char::is_whitespace)
+            .map(|i| i + 1)
+            .unwrap_or(0);
         // Word one (the command position): everything before the cursor's word is
         // blank. Complete against PATH binaries + builtins + aliases. Later words
         // get flag/subcommand completion for known commands, falling back to
@@ -773,7 +808,10 @@ impl AishHelper {
         let pairs: Vec<Pair> = names
             .into_iter()
             .filter(|n| n.starts_with(prefix))
-            .map(|n| Pair { display: n.clone(), replacement: n })
+            .map(|n| Pair {
+                display: n.clone(),
+                replacement: n,
+            })
             .collect();
         (start, pairs)
     }
@@ -888,7 +926,10 @@ impl Hinter for AishHelper {
     /// keystroke and redraws the hint in place.
     fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<AishHint> {
         if let Some(menu) = palette_hint(line, pos) {
-            return Some(AishHint { display: menu, completion: None });
+            return Some(AishHint {
+                display: menu,
+                completion: None,
+            });
         }
         let suffix = history_suggestion(line, pos, ctx.history())?;
         Some(AishHint {
@@ -922,10 +963,10 @@ impl Preview {
     /// or an empty line keeps the terminal's default color.
     fn ansi(self) -> Option<&'static str> {
         match self {
-            Preview::Direct => Some("\x1b[32m"),   // green — runs as a shell command
-            Preview::Model => Some("\x1b[36m"),    // cyan  — handed to the model
+            Preview::Direct => Some("\x1b[32m"), // green — runs as a shell command
+            Preview::Model => Some("\x1b[36m"),  // cyan  — handed to the model
             Preview::Ambiguous => Some("\x1b[2m"), // dim   — real binary that's also English
-            Preview::Plain => None,                // uncolored — `:`-command / empty
+            Preview::Plain => None,              // uncolored — `:`-command / empty
         }
     }
 }
@@ -933,7 +974,12 @@ impl Preview {
 /// Classify a line the way `dispatch` will route it, using only what the
 /// completer already holds (cwd, PATH, aliases). `$VAR` isn't expanded here — a
 /// preview approximation — but every other decision mirrors `dispatch`.
-fn route_preview(line: &str, cwd: &Path, path: &str, aliases: &HashMap<String, Vec<String>>) -> Preview {
+fn route_preview(
+    line: &str,
+    cwd: &Path,
+    path: &str,
+    aliases: &HashMap<String, Vec<String>>,
+) -> Preview {
     let l = line.trim();
     if l.is_empty() || l.starts_with(':') {
         return Preview::Plain;
@@ -946,9 +992,10 @@ fn route_preview(line: &str, cwd: &Path, path: &str, aliases: &HashMap<String, V
     }
     // A pipeline runs directly only when every stage resolves to a program.
     if let Some(stages) = pipeline::parse(l) {
-        let all = stages
-            .iter()
-            .all(|s| s.first().is_some_and(|p| resolve_program(p, cwd, path).is_some()));
+        let all = stages.iter().all(|s| {
+            s.first()
+                .is_some_and(|p| resolve_program(p, cwd, path).is_some())
+        });
         return if all { Preview::Direct } else { Preview::Model };
     }
     // Shell machinery / apostrophes don't tokenize → model.
@@ -973,7 +1020,8 @@ fn route_preview(line: &str, cwd: &Path, path: &str, aliases: &HashMap<String, V
         return Preview::Model;
     }
     let lead = first.to_ascii_lowercase();
-    if AMBIGUOUS_COMMANDS.contains(&lead.as_str()) || COMMAND_ARG_COMMANDS.contains(&lead.as_str()) {
+    if AMBIGUOUS_COMMANDS.contains(&lead.as_str()) || COMMAND_ARG_COMMANDS.contains(&lead.as_str())
+    {
         Preview::Ambiguous
     } else {
         Preview::Direct
@@ -1060,50 +1108,138 @@ fn command_spec(cmd: &str) -> Option<CmdSpec> {
     let spec = match cmd {
         "git" => CmdSpec {
             subcommands: &[
-                "add", "branch", "checkout", "cherry", "cherry-pick", "clone",
-                "commit", "config", "diff", "fetch", "init", "log", "merge",
-                "mv", "pull", "push", "rebase", "remote", "reset", "restore",
-                "revert", "rm", "show", "stash", "status", "switch", "tag",
+                "add",
+                "branch",
+                "checkout",
+                "cherry",
+                "cherry-pick",
+                "clone",
+                "commit",
+                "config",
+                "diff",
+                "fetch",
+                "init",
+                "log",
+                "merge",
+                "mv",
+                "pull",
+                "push",
+                "rebase",
+                "remote",
+                "reset",
+                "restore",
+                "revert",
+                "rm",
+                "show",
+                "stash",
+                "status",
+                "switch",
+                "tag",
             ],
             flags: &[
-                "--help", "--version", "--bare", "--git-dir", "--work-tree",
-                "--paginate", "--no-pager",
+                "--help",
+                "--version",
+                "--bare",
+                "--git-dir",
+                "--work-tree",
+                "--paginate",
+                "--no-pager",
             ],
         },
         "cargo" => CmdSpec {
             subcommands: &[
-                "add", "bench", "build", "check", "clean", "clippy", "doc",
-                "fetch", "fix", "fmt", "init", "install", "new", "publish",
-                "remove", "run", "search", "test", "tree", "update", "vendor",
+                "add", "bench", "build", "check", "clean", "clippy", "doc", "fetch", "fix", "fmt",
+                "init", "install", "new", "publish", "remove", "run", "search", "test", "tree",
+                "update", "vendor",
             ],
             flags: &[
-                "--help", "--version", "--release", "--verbose", "--quiet",
-                "--offline", "--locked", "--frozen", "--all-features",
-                "--no-default-features", "--features", "--target",
+                "--help",
+                "--version",
+                "--release",
+                "--verbose",
+                "--quiet",
+                "--offline",
+                "--locked",
+                "--frozen",
+                "--all-features",
+                "--no-default-features",
+                "--features",
+                "--target",
                 "--manifest-path",
             ],
         },
         "docker" => CmdSpec {
             subcommands: &[
-                "attach", "build", "commit", "container", "cp", "create",
-                "exec", "image", "images", "info", "inspect", "kill", "logs",
-                "network", "pause", "ps", "pull", "push", "rename", "restart",
-                "rm", "rmi", "run", "start", "stop", "system", "tag", "top",
-                "unpause", "version", "volume",
+                "attach",
+                "build",
+                "commit",
+                "container",
+                "cp",
+                "create",
+                "exec",
+                "image",
+                "images",
+                "info",
+                "inspect",
+                "kill",
+                "logs",
+                "network",
+                "pause",
+                "ps",
+                "pull",
+                "push",
+                "rename",
+                "restart",
+                "rm",
+                "rmi",
+                "run",
+                "start",
+                "stop",
+                "system",
+                "tag",
+                "top",
+                "unpause",
+                "version",
+                "volume",
             ],
             flags: &["--help", "--version", "--config", "--log-level"],
         },
         "kubectl" => CmdSpec {
             subcommands: &[
-                "apply", "attach", "config", "cordon", "cp", "create",
-                "delete", "describe", "drain", "edit", "exec", "explain",
-                "expose", "get", "logs", "patch", "port-forward", "proxy",
-                "rollout", "run", "scale", "set", "top", "uncordon", "version",
+                "apply",
+                "attach",
+                "config",
+                "cordon",
+                "cp",
+                "create",
+                "delete",
+                "describe",
+                "drain",
+                "edit",
+                "exec",
+                "explain",
+                "expose",
+                "get",
+                "logs",
+                "patch",
+                "port-forward",
+                "proxy",
+                "rollout",
+                "run",
+                "scale",
+                "set",
+                "top",
+                "uncordon",
+                "version",
                 "wait",
             ],
             flags: &[
-                "--help", "--namespace", "--context", "--kubeconfig",
-                "--output", "--all-namespaces",
+                "--help",
+                "--namespace",
+                "--context",
+                "--kubeconfig",
+                "--output",
+                "--all-namespaces",
             ],
         },
         _ => return None,
@@ -1116,7 +1252,10 @@ fn matches(candidates: &[&str], prefix: &str) -> Vec<Pair> {
     candidates
         .iter()
         .filter(|c| c.starts_with(prefix))
-        .map(|c| Pair { display: (*c).to_string(), replacement: (*c).to_string() })
+        .map(|c| Pair {
+            display: (*c).to_string(),
+            replacement: (*c).to_string(),
+        })
         .collect()
 }
 
@@ -1124,7 +1263,10 @@ fn matches(candidates: &[&str], prefix: &str) -> Vec<Pair> {
 /// commands at word 2+, and falls back to path completion everywhere else
 /// (word 1, unknown commands, and any known-command slot with no table match).
 fn complete_line(line: &str, pos: usize, cwd: &Path) -> (usize, Vec<Pair>) {
-    let start = line[..pos].rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+    let start = line[..pos]
+        .rfind(char::is_whitespace)
+        .map(|i| i + 1)
+        .unwrap_or(0);
     let word = &line[start..pos];
 
     // First whitespace-delimited token on the line is the command name.
@@ -1163,7 +1305,10 @@ fn complete_line(line: &str, pos: usize, cwd: &Path) -> (usize, Vec<Pair>) {
 /// a trailing `/`; names containing whitespace come back double-quoted so the
 /// tokenizer can re-read them.
 fn complete_path(line: &str, pos: usize, cwd: &Path) -> (usize, Vec<Pair>) {
-    let start = line[..pos].rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+    let start = line[..pos]
+        .rfind(char::is_whitespace)
+        .map(|i| i + 1)
+        .unwrap_or(0);
     let word = &line[start..pos];
 
     let (dir_part, prefix) = match word.rfind('/') {
@@ -1191,7 +1336,11 @@ fn complete_path(line: &str, pos: usize, cwd: &Path) -> (usize, Vec<Pair>) {
                 return None;
             }
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            let display = if is_dir { format!("{name}/") } else { name.clone() };
+            let display = if is_dir {
+                format!("{name}/")
+            } else {
+                name.clone()
+            };
             let mut replacement = format!("{dir_part}{name}");
             if replacement.contains(char::is_whitespace) {
                 replacement = format!("\"{replacement}\"");
@@ -1199,7 +1348,10 @@ fn complete_path(line: &str, pos: usize, cwd: &Path) -> (usize, Vec<Pair>) {
             if is_dir {
                 replacement.push('/');
             }
-            Some(Pair { display, replacement })
+            Some(Pair {
+                display,
+                replacement,
+            })
         })
         .collect();
     pairs.sort_by(|a, b| a.display.cmp(&b.display));
@@ -1255,9 +1407,9 @@ fn split_route(line: String) -> (String, Route) {
 /// (`say`, `touch`, `file`, `link`, `paste`, `join`, `mail`, `banner`, …) are
 /// intentionally excluded to avoid swallowing real usage.
 const AMBIGUOUS_COMMANDS: &[&str] = &[
-    "who", "w", "find", "time", "test", "yes", "look", "last", "watch", "date",
-    "which", "what", "whatis", "finger", "write", "wall", "users", "top", "more",
-    "head", "tail", "make", "cat", "kill", "pr", "wait",
+    "who", "w", "find", "time", "test", "yes", "look", "last", "watch", "date", "which", "what",
+    "whatis", "finger", "write", "wall", "users", "top", "more", "head", "tail", "make", "cat",
+    "kill", "pr", "wait",
     // clear/open: real use is bare (`clear`) or carries a path/dot/flag
     // (`open file.txt`, `open .`, `open -a App`); a bare-word sentence
     // starting with either ("clear the pointer so it reflects green",
@@ -1277,8 +1429,9 @@ const AMBIGUOUS_COMMANDS: &[&str] = &[
 /// be read as part of an English sentence (see the digit relaxation below).
 /// `pr` is deliberately absent: `pr` takes filenames, never a bare PID/line
 /// count, so "PR 22 merged" has no command reading.
-const NUMERIC_ARG_COMMANDS: &[&str] =
-    &["kill", "head", "tail", "top", "w", "nice", "renice", "fold", "split"];
+const NUMERIC_ARG_COMMANDS: &[&str] = &[
+    "kill", "head", "tail", "top", "w", "nice", "renice", "fold", "split",
+];
 
 fn looks_like_prose(line: &str, words: &[String]) -> bool {
     // The membership check is case-insensitive: on a case-insensitive
@@ -1301,7 +1454,10 @@ fn looks_like_prose(line: &str, words: &[String]) -> bool {
     // Classify each token (trailing sentence punctuation forgiven): is it a
     // plain alphabetic English word, a bare run of digits, or "other" (a flag
     // `-n`, a path `a/b`, a filename `file.txt`, a version `1.2`, …)?
-    let trim = |w: &str| w.trim_end_matches([',', '.', '!', '?', ';', ':']).to_string();
+    let trim = |w: &str| {
+        w.trim_end_matches([',', '.', '!', '?', ';', ':'])
+            .to_string()
+    };
     let is_alpha = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphabetic());
     let is_digits = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit());
 
@@ -1396,7 +1552,13 @@ fn var_lookup(session: &Session) -> impl Fn(&str) -> Option<String> + '_ {
             // correct without a stored env entry.
             return Some(std::process::id().to_string());
         }
-        if let Some(v) = session.env.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.clone()) {
+        if let Some(v) = session
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+        {
             return Some(v);
         }
         if matches!(name, "LAST" | "_") {
@@ -1429,7 +1591,8 @@ async fn dispatch(
             .or_else(|| std::env::var("PATH").ok())
             .unwrap_or_default();
         if stages.iter().all(|s| {
-            s.first().is_some_and(|p| resolve_program(p, &session.cwd, &path_var).is_some())
+            s.first()
+                .is_some_and(|p| resolve_program(p, &session.cwd, &path_var).is_some())
         }) {
             match pipeline::run(&stages, session).await {
                 Ok(status) => {
@@ -1457,7 +1620,9 @@ async fn dispatch(
     // environment — matching what the spawned program would see.
     let Some(mut words) = rc::tokenize_with(line, var_lookup(session)) else {
         if force {
-            eprintln!("aish: can't run that directly — it uses shell syntax aish doesn't implement");
+            eprintln!(
+                "aish: can't run that directly — it uses shell syntax aish doesn't implement"
+            );
             return Dispatch::Handled;
         }
         return Dispatch::NotACommand;
@@ -1660,7 +1825,11 @@ fn builtin_source(args: &[String], session: &mut Session) {
     };
     let resolved = {
         let p = std::path::Path::new(path);
-        if p.is_absolute() { p.to_path_buf() } else { session.cwd.join(p) }
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            session.cwd.join(p)
+        }
     };
     let text = match std::fs::read_to_string(&resolved) {
         Ok(t) => t,
@@ -1897,7 +2066,11 @@ async fn builtin_wait(arg: Option<&str>, session: &mut Session) {
             // Snapshot the active (not done, not stopped) jobs, then block on each.
             let active: Vec<Arc<tools::Job>> = {
                 let table = session.jobs.lock().unwrap();
-                table.iter().filter(|j| !j.is_done() && !j.is_stopped()).cloned().collect()
+                table
+                    .iter()
+                    .filter(|j| !j.is_done() && !j.is_stopped())
+                    .cloned()
+                    .collect()
             };
             for job in &active {
                 await_job(job).await;
@@ -1934,10 +2107,17 @@ fn job_exit_code(summary: &str) -> i32 {
 pub(crate) fn resolve_program(cmd: &str, cwd: &Path, path_var: &str) -> Option<PathBuf> {
     fn is_exec(p: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
-        p.is_file() && p.metadata().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+        p.is_file()
+            && p.metadata()
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
     }
     if cmd.contains('/') {
-        let p = if Path::new(cmd).is_absolute() { PathBuf::from(cmd) } else { cwd.join(cmd) };
+        let p = if Path::new(cmd).is_absolute() {
+            PathBuf::from(cmd)
+        } else {
+            cwd.join(cmd)
+        };
         return is_exec(&p).then_some(p);
     }
     for dir in path_var.split(':').filter(|d| !d.is_empty()) {
@@ -1980,8 +2160,15 @@ fn mentions_troubleshoot(line: &str) -> bool {
 /// as a real command, so a command argument (`cargo build`, `git fixup`) can't
 /// trip it — only genuine prose intent reaches it. The durable fix is model-based
 /// route preview.
-const WORK_SIGNALS: &[&str] =
-    &["write", "refactor", "implement", "fix", "migrate", "setup", "build"];
+const WORK_SIGNALS: &[&str] = &[
+    "write",
+    "refactor",
+    "implement",
+    "fix",
+    "migrate",
+    "setup",
+    "build",
+];
 
 /// True when a model-bound line carries a troubleshooting or coding/work signal,
 /// marking it for auto-offload to a background coordinator (see the REPL call
@@ -2011,12 +2198,8 @@ fn mentions_work_signal(line: &str) -> bool {
 /// missing binary) carries `id: None` so the caller prints the message and does
 /// NOT attach.
 struct Dispatched {
-    /// `Some(run_id)` when a coordinator was spawned; `None` on any guard /
-    /// spawn failure. Dispatch no longer auto-attaches, so the happy path
-    /// ignores this (the printed message carries the id + `:attach` hint); it is
-    /// retained for the guard-failure tests and any future caller that wants the
-    /// spawned id.
-    #[allow(dead_code)]
+    /// `Some(run_id)` when a coordinator was spawned (the id to auto-attach to);
+    /// `None` on any guard / spawn failure.
     id: Option<String>,
     /// The line to print to the operator.
     message: String,
@@ -2025,7 +2208,10 @@ struct Dispatched {
 impl Dispatched {
     /// A guard failure / no-spawn outcome: just a message, nothing to attach to.
     fn message_only(message: impl Into<String>) -> Self {
-        Self { id: None, message: message.into() }
+        Self {
+            id: None,
+            message: message.into(),
+        }
     }
 }
 
@@ -2066,7 +2252,10 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
                 exe,
                 cwd: session.cwd.clone(),
                 backend: session.backend_kind.clone(),
-                model: crate::worker::coordinator_model(&session.backend_kind, &session.batch_model),
+                model: crate::worker::coordinator_model(
+                    &session.backend_kind,
+                    &session.batch_model,
+                ),
                 env: session.env.clone(),
                 isolate,
                 base: "main".to_string(),
@@ -2076,12 +2265,14 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
                 attached: session.attached.clone(),
             };
             let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
-            let short = crate::batch::short_id(&id);
             let message = format!(
                 "\x1b[2mdispatched background coordinator {id} — runs here with the full \
-toolset; result auto-delivers. :attach {short} to watch & steer \u{b7} :workers to check.\x1b[0m"
+toolset; result auto-delivers. :workers to check.\x1b[0m"
             );
-            Dispatched { id: Some(id), message }
+            Dispatched {
+                id: Some(id),
+                message,
+            }
         }
         Err(e) => Dispatched::message_only(format!(
             "can't locate the aish binary to launch the coordinator: {e}"
@@ -2089,14 +2280,23 @@ toolset; result auto-delivers. :attach {short} to watch & steer \u{b7} :workers 
     }
 }
 
-/// Launch a background coordinator for `task` WITHOUT attaching to it. A
-/// dispatched worker runs in the background with the full toolset and its result
-/// auto-delivers; the interactive prompt stays free for other work. The operator
-/// opts in to watching/steering a worker with `:attach <id>` (the printed message
-/// carries the id + hint) — attach is no longer automatic on dispatch.
-fn dispatch_worker(task: &str, session: &mut Session) {
-    let Dispatched { id: _, message } = dispatch_coordinator(task, session);
+/// Launch a background coordinator for `task` and, when the spawn succeeds,
+/// auto-attach the interactive session to it. Auto-attach is what makes the
+/// interactive REPL behave like `:attach`: instead of locking the prompt for an
+/// inline model turn, the operator keeps a LIVE input prompt whose plain lines
+/// are queued/steered into the coordinator's next round (the `:tell` channel),
+/// while `:`-commands that aren't bound to the in-flight work — `:dispatch`,
+/// `:attach`, `:workers`, `:jobs`, … — still run immediately. `:detach` ends it
+/// and returns to the plain prompt; the coordinator keeps running.
+fn dispatch_and_attach(task: &str, session: &mut Session) {
+    let Dispatched { id, message } = dispatch_coordinator(task, session);
     println!("{message}");
+    if let Some(id) = id {
+        // The worker is already in `session.worker_jobs` (spawn is synchronous),
+        // so `attach_worker` finds it, prints the live-attach banner, and starts
+        // forwarding its activity — reusing the proven attach path.
+        attach_worker(Some(&id), session);
+    }
 }
 
 /// Sentinel id `:attach goal` resolves to. Equal to the goal loop's live
@@ -2112,7 +2312,9 @@ const GOAL_ATTACH_ID: &str = crate::worker::GOAL_STREAM_LABEL;
 /// reported. `:detach` (or the worker finishing) ends it.
 fn attach_worker(id: Option<&str>, session: &mut Session) {
     let Some(id) = id else {
-        println!("usage: :attach <worker-id>|goal   — watch + steer a running coordinator, or watch the goal (:detach to stop)");
+        println!(
+            "usage: :attach <worker-id>|goal   — watch + steer a running coordinator, or watch the goal (:detach to stop)"
+        );
         return;
     };
     // `:attach goal` — watch the active background `:goal` loop. The goal
@@ -2140,7 +2342,10 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
     let mut matches: Vec<(String, bool)> = Vec::new();
     for w in session.worker_jobs.lock().unwrap().iter() {
         if hit(&w.id) {
-            matches.push((w.id.clone(), matches!(w.status().as_str(), "done" | "failed")));
+            matches.push((
+                w.id.clone(),
+                matches!(w.status().as_str(), "done" | "failed"),
+            ));
         }
     }
     match matches.as_slice() {
@@ -2169,7 +2374,10 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
             }
         }
         many => {
-            println!("'{id}' matches {} coordinators — be more specific:", many.len());
+            println!(
+                "'{id}' matches {} coordinators — be more specific:",
+                many.len()
+            );
             for (rid, _) in many {
                 println!("  {rid}");
             }
@@ -2194,7 +2402,10 @@ fn backfill_attached(run_id: &str, session: &Session) {
     // The task is the coordinator's "input". The `\u{b7}task` marker is folded
     // into the row text \u{2014} `pane_row` carries only `[label]` in its gutter now
     // (the single-glyph convention; the source glyph rides inside the text).
-    println!("{}", crate::worker::pane_row(run_id, &format!("·task {}", job.task)));
+    println!(
+        "{}",
+        crate::worker::pane_row(run_id, &format!("·task {}", job.task))
+    );
     let rows = job.transcript_rows();
     if rows.is_empty() {
         println!(
@@ -2209,7 +2420,11 @@ fn backfill_attached(run_id: &str, session: &Session) {
         // the source glyph is already stamped in `text`. Fold any legacy suffix
         // into the row text so the gutter stays a bare `[label]`.
         for (suffix, text) in rows {
-            let row = if suffix.is_empty() { text } else { format!("{suffix} {text}") };
+            let row = if suffix.is_empty() {
+                text
+            } else {
+                format!("{suffix} {text}")
+            };
             println!("{}", crate::worker::pane_row(run_id, &row));
         }
     }
@@ -2227,7 +2442,10 @@ fn print_attached_result(run_id: &str, session: &Session) {
         .find(|w| w.id == *run_id)
         .cloned();
     if let Some(job) = job {
-        println!("{}", crate::worker::pane_row(run_id, &format!("·result {}", job.fetch())));
+        println!(
+            "{}",
+            crate::worker::pane_row(run_id, &format!("·result {}", job.fetch()))
+        );
     }
 }
 
@@ -2243,168 +2461,6 @@ fn detach_worker(session: &mut Session) {
         }
         None => println!("not attached to any coordinator"),
     }
-}
-
-/// What a `:forget` invocation resolved to. Pure shaping (parsed from the
-/// command tail) so the handler's IO stays thin and the parse is unit-testable.
-#[derive(Debug, PartialEq)]
-enum ForgetCmd {
-    /// No argument (or an unrecognized one) -> print usage.
-    Usage,
-    /// `--all-exited` / `--all` -> bulk-forget every exited, owned worker (AC6).
-    AllExited,
-    /// `<id>` (full id or prefix) -> forget that one worker (AC5).
-    One(String),
-}
-
-/// Parse the whitespace-split tail of `:forget` into a [`ForgetCmd`]. Pure ->
-/// unit-tested. Exactly one token is accepted (an id, or the bulk flag);
-/// anything else is usage.
-fn parse_forget_cmd(parts: &[&str]) -> ForgetCmd {
-    match parts {
-        [] => ForgetCmd::Usage,
-        [flag] if *flag == "--all-exited" || *flag == "--all" => ForgetCmd::AllExited,
-        [id] if !id.is_empty() && !id.starts_with("--") => ForgetCmd::One((*id).to_string()),
-        _ => ForgetCmd::Usage,
-    }
-}
-
-/// Whether a worker/coordinator `status` (an in-memory `WorkerJob::status` or a
-/// durable `coordinator_runs.phase`) means it is STILL LIVE. `:forget` refuses a
-/// live worker (AC5a) so it can never reap work in flight. Unknown/terminal
-/// states (`done`/`failed`, or a stale label whose container is gone) are
-/// forgettable. Pure -> unit-tested.
-fn forget_status_is_live(status: &str) -> bool {
-    matches!(status.trim(), "running" | "coordinating" | "awaiting_batch")
-}
-
-/// Remove every durable trace of one (already-confirmed-exited) worker: its
-/// container (if a runtime is engaged, AC5b), its on-disk state dir
-/// (`~/.aish/workers/<id>/`, S9.3, AC5c), its durable `coordinator_runs` row, and
-/// its in-memory job entry (AC5d). Best-effort per component; returns a one-line
-/// human summary of what was reclaimed.
-fn do_forget(full_id: &str, session: &mut Session) -> String {
-    let short = crate::batch::short_id(full_id);
-    let dir_path = crate::worker_store::worker_dir(full_id);
-    let had_dir = dir_path.exists();
-    let container_removed = crate::container::forget_container(full_id);
-    let dir_removed = match crate::worker_store::forget(full_id) {
-        Ok(()) => had_dir && !dir_path.exists(),
-        Err(_) => false,
-    };
-    let row_removed = session
-        .coordinator_store
-        .as_ref()
-        .and_then(|s| s.delete_runs(&[full_id.to_string()]).ok())
-        .unwrap_or(0)
-        > 0;
-    // Drop from the in-memory list so it leaves :workers and the wheel-N badge.
-    let mem_removed = {
-        let mut jobs = session.worker_jobs.lock().unwrap();
-        let before = jobs.len();
-        jobs.retain(|w| w.id != full_id);
-        jobs.len() != before
-    };
-    let mut parts: Vec<&str> = Vec::new();
-    if container_removed {
-        parts.push("container");
-    }
-    if dir_removed {
-        parts.push("state dir");
-    }
-    if row_removed {
-        parts.push("run record");
-    }
-    if mem_removed {
-        parts.push("job entry");
-    }
-    if parts.is_empty() {
-        format!("\x1b[2m\u{2713} forgot {short} (nothing left to remove)\x1b[0m")
-    } else {
-        format!("\x1b[32m\u{2713}\x1b[0m forgot {short} \u{2014} removed {}", parts.join(", "))
-    }
-}
-
-/// `:forget <id>` (S9.5 AC5) - remove an EXITED worker''s footprint. Resolves
-/// `id` as a full id or prefix across this session''s in-memory workers (live
-/// status) and the durable coordinator store, refuses a still-running worker with
-/// guidance (AC5a), reports an unknown or ambiguous id, and otherwise reclaims
-/// the container + state dir + run record + job entry via [`do_forget`].
-fn forget_worker(id: &str, session: &mut Session) {
-    let id = id.trim();
-    if id.is_empty() {
-        println!("usage: :forget <id>   (or :forget --all-exited)");
-        return;
-    }
-    let hit = |jid: &str| jid == id || jid.starts_with(id);
-    // (full_id, status) candidates: in-memory first (live status), then the
-    // durable store (skipping ids already collected in-memory).
-    let mut found: Vec<(String, String)> = Vec::new();
-    for w in session.worker_jobs.lock().unwrap().iter() {
-        if hit(&w.id) {
-            found.push((w.id.clone(), w.status()));
-        }
-    }
-    if let Some(store) = &session.coordinator_store {
-        if let Ok(rows) = store.load_all() {
-            for r in rows.iter().filter(|r| hit(&r.run_id)) {
-                if !found.iter().any(|(mid, _)| mid == &r.run_id) {
-                    found.push((r.run_id.clone(), r.phase.clone()));
-                }
-            }
-        }
-    }
-    match found.as_slice() {
-        [] => println!("no background worker matching ''{id}'' (see :workers)"),
-        [(full_id, status)] => {
-            if forget_status_is_live(status) {
-                let short = crate::batch::short_id(full_id);
-                println!(
-                    "\x1b[33m\u{2717}\x1b[0m {short} is still running \u{2014} :attach {short} and stop it (or wait) before :forget"
-                );
-                return;
-            }
-            println!("{}", do_forget(full_id, session));
-        }
-        many => {
-            println!("''{id}'' is ambiguous \u{2014} matches {} workers:", many.len());
-            for (mid, status) in many {
-                println!("  {} ({status})", crate::batch::short_id(mid));
-            }
-            println!("disambiguate with a longer id prefix");
-        }
-    }
-}
-
-/// `:forget --all-exited` (S9.5 AC6) - bulk-remove every exited worker OWNED by
-/// this session: terminal in-memory workers (always owned) plus terminal durable
-/// rows whose `session_id` matches. Running workers are left untouched.
-fn forget_all_exited(session: &mut Session) {
-    let mut victims: Vec<String> = Vec::new();
-    for w in session.worker_jobs.lock().unwrap().iter() {
-        if !forget_status_is_live(&w.status()) {
-            victims.push(w.id.clone());
-        }
-    }
-    if let Some(store) = &session.coordinator_store {
-        if let Ok(rows) = store.load_all() {
-            for r in rows.iter() {
-                let mine = r.session_id.as_deref() == Some(session.session_id.as_str());
-                if mine && !forget_status_is_live(&r.phase) && !victims.contains(&r.run_id) {
-                    victims.push(r.run_id.clone());
-                }
-            }
-        }
-    }
-    if victims.is_empty() {
-        println!("no exited workers to forget");
-        return;
-    }
-    let n = victims.len();
-    for id in &victims {
-        println!("{}", do_forget(id, session));
-    }
-    println!("\x1b[2mforgot {n} exited worker(s)\x1b[0m");
 }
 
 /// Handle a typed operator line while attached. For a LIVE coordinator this
@@ -2539,7 +2595,9 @@ fn resume_coordinator(prev_run_id: &str, message: &str, session: &mut Session) {
         .find(|w| w.id == *prev_run_id)
         .map(|w| (w.task.clone(), w.fetch()));
     let Some((task, result)) = prior else {
-        println!("can't resume '{prev_run_id}' — its record is no longer in this session (see :workers)");
+        println!(
+            "can't resume '{prev_run_id}' — its record is no longer in this session (see :workers)"
+        );
         return;
     };
     let no_credential = match session.backend_kind.as_str() {
@@ -2547,7 +2605,9 @@ fn resume_coordinator(prev_run_id: &str, message: &str, session: &mut Session) {
         _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
     };
     if no_credential {
-        println!("no credential for the active backend — can't resume (Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY)");
+        println!(
+            "no credential for the active backend — can't resume (Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY)"
+        );
         return;
     }
     let exe = match std::env::current_exe() {
@@ -2732,11 +2792,15 @@ fn take_any_flag<'a>(toks: &[&'a str]) -> (bool, Vec<&'a str>) {
 /// nothing would read the message — and an ambiguous prefix lists the matches.
 fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Session) {
     let Some(id) = id else {
-        println!("usage: :tell [--any] <worker-id> <message>   — steer an in-flight coordinator (--any: across sessions)");
+        println!(
+            "usage: :tell [--any] <worker-id> <message>   — steer an in-flight coordinator (--any: across sessions)"
+        );
         return;
     };
     if message.is_empty() {
-        println!("usage: :tell [--any] <worker-id> <message>   — steer an in-flight coordinator (--any: across sessions)");
+        println!(
+            "usage: :tell [--any] <worker-id> <message>   — steer an in-flight coordinator (--any: across sessions)"
+        );
         return;
     }
     let Some(store) = session.coordinator_store.clone() else {
@@ -2778,7 +2842,10 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
     let owned: Vec<(String, bool, Option<String>)> = candidates
         .iter()
         .filter(|(_, _, owner)| {
-            matches!(owner_gate(owner.as_deref(), &session.session_id, any), OwnerGate::Allow)
+            matches!(
+                owner_gate(owner.as_deref(), &session.session_id, any),
+                OwnerGate::Allow
+            )
         })
         .cloned()
         .collect();
@@ -2797,7 +2864,9 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
         [(run_id, terminal, _)] => {
             let short = crate::batch::short_id(run_id);
             if *terminal {
-                println!("coordinator {short} has already finished — message not queued (`:result {short}` to view its result)");
+                println!(
+                    "coordinator {short} has already finished — message not queued (`:result {short}` to view its result)"
+                );
                 return;
             }
             match store.enqueue_message(run_id, message, Some(&session.session_id)) {
@@ -2811,7 +2880,10 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
             }
         }
         many => {
-            println!("'{id}' matches {} coordinators — be more specific:", many.len());
+            println!(
+                "'{id}' matches {} coordinators — be more specific:",
+                many.len()
+            );
             for (rid, _, _) in many {
                 println!("  {rid}");
             }
@@ -2826,7 +2898,11 @@ fn handle_context(backend: &Backend, session: &Session) {
     let window = backend.context_window();
     let used = session.context_used;
     let pct = if window > 0 { used * 100 / window } else { 0 };
-    let mem = session.db.as_ref().and_then(|d| d.memory_count().ok()).unwrap_or(0);
+    let mem = session
+        .db
+        .as_ref()
+        .and_then(|d| d.memory_count().ok())
+        .unwrap_or(0);
     println!(
         "context: {used} / {window} tokens ({pct}%) · {} message(s) in history · {mem} stored memories",
         session.history.len()
@@ -2854,7 +2930,11 @@ fn handle_compact(backend: &Backend, session: &mut Session) {
             crate::context::apply_compaction(&mut session.history, &plan);
             session.context_used = crate::context::estimate_history_tokens(&session.history);
             let window = backend.context_window();
-            let pct = if window > 0 { session.context_used * 100 / window } else { 0 };
+            let pct = if window > 0 {
+                session.context_used * 100 / window
+            } else {
+                0
+            };
             println!(
                 "compacted — {dropped} message(s) offloaded to memory (recall \"context-offload\"); context now ~{pct}%"
             );
@@ -2930,11 +3010,7 @@ fn parse_skill_command(args: &[&str]) -> SkillCmd {
 /// non-empty, not `.`/`..`, and free of path separators. The hard guard against
 /// `:skill remove ../something` escaping the skills dir.
 fn valid_skill_name(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\')
 }
 
 /// Write a fetched SKILL.md into `skills_dir` and reload the session's catalog
@@ -2944,7 +3020,9 @@ fn valid_skill_name(name: &str) -> bool {
 fn install_skill_text(text: &str, skills_dir: &Path, session: &mut Session) -> Result<String> {
     crate::skill_provider::import(text, skills_dir)?;
     session.reload_skills_from(skills_dir);
-    let name = crate::skills::parse_frontmatter(text).map(|(n, _)| n).unwrap_or_default();
+    let name = crate::skills::parse_frontmatter(text)
+        .map(|(n, _)| n)
+        .unwrap_or_default();
     Ok(name)
 }
 
@@ -2974,7 +3052,10 @@ async fn skill_add(reference: &str, session: &mut Session) -> Result<()> {
     let skills_dir = skills_dir_path();
     let _ = std::fs::create_dir_all(&skills_dir);
     let r = crate::skill_provider::parse_ref(reference)?;
-    println!("\x1b[2mfetching {}/{} from skill.fish …\x1b[0m", r.owner, r.name);
+    println!(
+        "\x1b[2mfetching {}/{} from skill.fish …\x1b[0m",
+        r.owner, r.name
+    );
     let text = crate::skill_provider::fetch(&r).await?;
     let name = install_skill_text(&text, &skills_dir, session)?;
     println!("\x1b[32m✓\x1b[0m added \x1b[1m{name}\x1b[0m; catalog reloaded.");
@@ -2984,7 +3065,10 @@ async fn skill_add(reference: &str, session: &mut Session) -> Result<()> {
 /// `:skill search <query>` — query the skill.fish catalog and print matches.
 async fn skill_search(query: &str) -> Result<()> {
     let results = crate::skill_provider::search(query).await?;
-    println!("{}", crate::skill_provider::print_results_table(query, &results));
+    println!(
+        "{}",
+        crate::skill_provider::print_results_table(query, &results)
+    );
     Ok(())
 }
 
@@ -3023,41 +3107,6 @@ fn skill_remove(name: &str, session: &mut Session) -> Result<()> {
     Ok(())
 }
 
-/// The outcome of resolving a `:result <id>` lookup (TASK-205).
-enum ResultOutcome {
-    /// A single run's rendered result.
-    Found(String),
-    /// The query (a prefix) matched 2+ jobs — reject rather than guess.
-    Ambiguous(Vec<String>),
-    /// Nothing matched.
-    NotFound,
-}
-
-/// How a `:result` query matches a set of in-memory job ids by prefix (TASK-205).
-#[derive(Debug, PartialEq)]
-enum PrefixMatch {
-    One(String),
-    Many(Vec<String>),
-    None,
-}
-
-/// Classify how `query` matches `ids` by prefix (TASK-205). An exact id present
-/// in the set wins outright; otherwise a single prefix hit is `One`, 2+ are
-/// `Many` (ambiguous — the caller must reject rather than silently return the
-/// first, which under concurrent completions could be the WRONG worker's
-/// result), and zero is `None`. Pure + unit-tested.
-fn prefix_match(ids: &[String], query: &str) -> PrefixMatch {
-    if ids.iter().any(|i| i == query) {
-        return PrefixMatch::One(query.to_string());
-    }
-    let hits: Vec<String> = ids.iter().filter(|i| i.starts_with(query)).cloned().collect();
-    match hits.len() {
-        0 => PrefixMatch::None,
-        1 => PrefixMatch::One(hits.into_iter().next().unwrap()),
-        _ => PrefixMatch::Many(hits),
-    }
-}
-
 /// Returns true when the REPL should exit.
 async fn handle_colon(
     cmd: &str,
@@ -3089,7 +3138,6 @@ async fn handle_colon(
                  :compact                            offload older history to long-term memory now\n\
                  :memories [organize]                list stored memories, or dedup them\n\
                  :update                             check GitHub for a newer release and upgrade\n\
-                 :update --drain                     quiesce in-flight workers (checkpoint+detach), swap the binary, then restart the shell\n\
                  :batch <on|off|status|clear>        interactive batch mode: agent offloads deferrable\n\
                                                      work to background Anthropic batches (Opus, ~50%\n\
                                                      cheaper); jobs persist + reattach across restarts\n\
@@ -3100,11 +3148,10 @@ async fn handle_colon(
                  :output [on|off]             stream background coordinators' activity (💭 thinking + 🛠️/🔧 tool + 🚀 standard/🐌 batch lines) in a contained bordered pane; off (default) keeps them quiet\n\
                  \n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
-                 :dispatch <task>                    launch a background coordinator for <task> in the background (:attach <id> to watch/steer)\n\
+                 :dispatch <task>                    launch a background coordinator for <task> + auto-attach (steer it; :detach to stop)\n\
                  :tell [--any] <id> <message>        send instructions to an in-flight coordinator (folded in next round; --any steers another session's)\n\
                  :attach <id>|goal                   watch a running coordinator live + steer it (typed lines go to it); `goal` watches the active :goal\n\
                  :detach                             stop watching the attached coordinator (it keeps running)\n\
-                 :forget <id>|--all-exited           remove an exited workers container + state dir + run record (refuses a running one)\n\
                  :skill <add|search|list|remove>     install, search, list, or remove skill.fish skills\n\
                  :rename <name>                      name the session (prefixes the prompt); auto-set to the repo name at startup, bare :rename clears\n\
                  :rewrite <intent>                   AI-rewrite intent into ONE command, prefilled to edit/accept before it runs (alias :rw)\n\
@@ -3152,7 +3199,9 @@ async fn handle_colon(
             match target {
                 Some(true) => {
                     session.show_worker_output.store(true, Ordering::SeqCst);
-                    println!("worker output ON — background coordinators now stream their 💭 thinking, tool activity (🛠️ local · 🔧 MCP) and 🚀 standard/🐌 batch turn output, framed in a contained pane:");
+                    println!(
+                        "worker output ON — background coordinators now stream their 💭 thinking, tool activity (🛠️ local · 🔧 MCP) and 🚀 standard/🐌 batch turn output, framed in a contained pane:"
+                    );
                     // Open the contained pane: every streamed coordinator line
                     // is now rendered as a bordered row under this top frame
                     // (see worker::pane_row), so the activity reads as a
@@ -3164,7 +3213,9 @@ async fn handle_colon(
                     session.show_worker_output.store(false, Ordering::SeqCst);
                     // Close the contained pane, then report the quiet default.
                     println!("{}", crate::worker::pane_close());
-                    println!("worker output OFF — background coordinators run quietly (only the ⟳N pulse + completion notice show)");
+                    println!(
+                        "worker output OFF — background coordinators run quietly (only the ⟳N pulse + completion notice show)"
+                    );
                 }
                 None => println!("usage: :output [on|off]"),
             }
@@ -3191,8 +3242,9 @@ async fn handle_colon(
                 .clone()
                 .unwrap_or_else(|| crate::batch::short_id(&session.session_id).to_string());
 
-            let mut table =
-                String::from("| Worker | Session | Status | Doing | Result |\n|---|---|---|---|---|\n");
+            let mut table = String::from(
+                "| Worker | Session | Status | Doing | Result |\n|---|---|---|---|---|\n",
+            );
             let mut any = false;
             let mut seen = std::collections::HashSet::new();
             // In-memory coordinators launched by THIS session (live status).
@@ -3217,8 +3269,7 @@ async fn handle_colon(
                     for r in rows.iter().filter(|r| {
                         !seen.contains(&r.run_id)
                             && (show_all
-                                || r.session_id.as_deref()
-                                    == Some(session.session_id.as_str()))
+                                || r.session_id.as_deref() == Some(session.session_id.as_str()))
                     }) {
                         any = true;
                         let is_me = r.session_id.as_deref() == Some(session.session_id.as_str());
@@ -3226,20 +3277,28 @@ async fn handle_colon(
                             .session_name
                             .clone()
                             .or_else(|| {
-                                r.session_id.as_deref().map(|s| crate::batch::short_id(s).to_string())
+                                r.session_id
+                                    .as_deref()
+                                    .map(|s| crate::batch::short_id(s).to_string())
                             })
                             .unwrap_or_else(|| "—".into());
                         let session_cell = if is_me { format!("{label} *") } else { label };
                         let result_cell = match (r.result.as_deref(), r.error.as_deref()) {
                             (Some(res), None) => {
-                                if let Some(pr) = res.split_whitespace().find(|s| s.starts_with('#')) {
+                                if let Some(pr) =
+                                    res.split_whitespace().find(|s| s.starts_with('#'))
+                                {
                                     format!("✓ {pr}")
                                 } else {
                                     "✓ success".to_string()
                                 }
                             }
                             (None, Some(e)) => {
-                                let t = if e.len() > 40 { format!("{}…", &e[..40]) } else { e.to_string() };
+                                let t = if e.len() > 40 {
+                                    format!("{}…", &e[..40])
+                                } else {
+                                    e.to_string()
+                                };
                                 format!("✗ {t}")
                             }
                             _ => "—".to_string(),
@@ -3277,76 +3336,33 @@ async fn handle_colon(
             }
         }
         Some("result") => {
-            // View a finished background job's full result on demand. Resolution
-            // is strictly per-run (TASK-205): an exact id wins; an unmatched id
-            // is then read by run_id from the durable coordinator store (never a
-            // shared/global cache); and a prefix that matches 2+ jobs is REJECTED
-            // rather than silently returning the first — which, under concurrent
-            // worker completions, could be a different worker's result.
+            // View a finished background job's full result on demand.
             let Some(&id) = parts.next().as_ref() else {
-                println!("usage: :result <job>   (id or prefix from a completion notice / :results)");
+                println!(
+                    "usage: :result <job>   (id or prefix from a completion notice / :results)"
+                );
                 return false;
             };
-            // Snapshot the in-memory job ids (workers + batches) for matching,
-            // then fetch a chosen job's result by EXACT id.
-            let worker_ids: Vec<String> =
-                session.worker_jobs.lock().unwrap().iter().map(|j| j.id.clone()).collect();
-            let batch_ids: Vec<String> =
-                session.batch_jobs.lock().unwrap().iter().map(|j| j.id.clone()).collect();
-            let fetch_worker = |jid: &str| {
-                session.worker_jobs.lock().unwrap().iter().find(|j| j.id == jid).map(|j| j.fetch())
-            };
-            let fetch_batch = |jid: &str| {
-                session.batch_jobs.lock().unwrap().iter().find(|j| j.id == jid).map(|j| j.fetch())
-            };
-            // 1) Exact in-memory match (worker first, then batch) — per-job, so
-            //    a concurrent completion can never swap one job's result for
-            //    another's.
-            let exact = if worker_ids.iter().any(|w| w.as_str() == id) {
-                fetch_worker(id)
-            } else if batch_ids.iter().any(|b| b.as_str() == id) {
-                fetch_batch(id)
-            } else {
-                None
-            };
-            // 2) Durable, run_id-scoped read from the coordinator store (covers
-            //    cross-session and post-restart, where the in-memory jobs are
-            //    gone). result_for_alias resolves alias->run_id->result by exact
-            //    key, never a shared slot.
-            let durable = || {
-                session
-                    .coordinator_store
-                    .as_ref()
-                    .and_then(|s| s.result_for_alias(id).ok().flatten())
-                    .map(|r| r.rendered())
-            };
-            // 3) Unique-prefix in memory (ambiguity rejected).
-            let resolved = if let Some(r) = exact {
-                ResultOutcome::Found(r)
-            } else if let Some(r) = durable() {
-                ResultOutcome::Found(r)
-            } else {
-                let mut all = worker_ids.clone();
-                all.extend(batch_ids.clone());
-                match prefix_match(&all, id) {
-                    PrefixMatch::One(jid) => match fetch_worker(&jid).or_else(|| fetch_batch(&jid)) {
-                        Some(r) => ResultOutcome::Found(r),
-                        None => ResultOutcome::NotFound,
-                    },
-                    PrefixMatch::Many(ids) => ResultOutcome::Ambiguous(ids),
-                    PrefixMatch::None => ResultOutcome::NotFound,
-                }
-            };
-            match resolved {
-                ResultOutcome::Found(r) => println!("{}", crate::md::render_stdout(r.trim())),
-                ResultOutcome::Ambiguous(ids) => println!(
-                    "'{id}' matches {} jobs — use a full id to disambiguate: {} (see :workers)",
-                    ids.len(),
-                    ids.join(", ")
-                ),
-                ResultOutcome::NotFound => {
-                    println!("no background job matching '{id}' (see :workers)")
-                }
+            let hit = |jid: &str| jid == id || jid.starts_with(id);
+            let found = session
+                .worker_jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|j| hit(&j.id))
+                .map(|j| j.fetch())
+                .or_else(|| {
+                    session
+                        .batch_jobs
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|j| hit(&j.id))
+                        .map(|j| j.fetch())
+                });
+            match found {
+                Some(r) => println!("{}", crate::md::render_stdout(r.trim())),
+                None => println!("no background job matching '{id}' (see :workers)"),
             }
         }
         Some("results") => {
@@ -3383,20 +3399,10 @@ async fn handle_colon(
             // the deterministic equivalent of the model calling run_in_background.
             // Shares dispatch_coordinator with the "troubleshoot" auto-offload.
             let task = parts.collect::<Vec<_>>().join(" ");
-            dispatch_worker(&task, session);
+            dispatch_and_attach(&task, session);
         }
         Some("attach") => attach_worker(parts.next(), session),
         Some("detach") => detach_worker(session),
-        Some("forget") => {
-            let toks: Vec<&str> = parts.collect();
-            match parse_forget_cmd(&toks) {
-                ForgetCmd::Usage => println!(
-                    "usage: :forget <id>            remove an EXITED worker''s container + state dir + record\n       :forget --all-exited    remove every exited worker in this session"
-                ),
-                ForgetCmd::AllExited => forget_all_exited(session),
-                ForgetCmd::One(id) => forget_worker(&id, session),
-            }
-        }
         Some("tell" | "msg" | "send") => {
             // Steer an in-flight coordinator: queue an operator message that the
             // running coordinator folds into its next round (see coordinator::drive).
@@ -3428,9 +3434,12 @@ async fn handle_colon(
             match rest {
                 "" => match &session.goal {
                     Some(g) => println!("{}", g.status_line()),
-                    None => println!("no goal set — `:goal <condition>` to set one (requires :batch on)"),
+                    None => println!(
+                        "no goal set — `:goal <condition>` to set one (requires :batch on)"
+                    ),
                 },
-                "clear" | "stop" | "off" | "reset" | "none" | "cancel" => match session.goal.take() {
+                "clear" | "stop" | "off" | "reset" | "none" | "cancel" => match session.goal.take()
+                {
                     Some(g) => {
                         g.clear();
                         println!("goal cleared");
@@ -3439,9 +3448,13 @@ async fn handle_colon(
                 },
                 cond => {
                     if !session.batch_mode {
-                        println!("`:goal` runs as background batch work — enable it first with `:batch on`");
+                        println!(
+                            "`:goal` runs as background batch work — enable it first with `:batch on`"
+                        );
                     } else if session.goal.as_ref().is_some_and(|g| g.is_active()) {
-                        println!("a goal is already active (one per session) — `:goal clear` it first");
+                        println!(
+                            "a goal is already active (one per session) — `:goal clear` it first"
+                        );
                     } else {
                         match (
                             crate::backend::claude::Credential::resolve(&session.env),
@@ -3478,10 +3491,14 @@ async fn handle_colon(
                                     cred,
                                 );
                                 session.goal = Some(g);
-                                println!("\x1b[2mgoal set — pursuing it in the background; progress and the result appear here. `:goal` for status, `:goal clear` to stop.\x1b[0m");
+                                println!(
+                                    "\x1b[2mgoal set — pursuing it in the background; progress and the result appear here. `:goal` for status, `:goal clear` to stop.\x1b[0m"
+                                );
                             }
                             (Err(_), _) => {
-                                println!("no Claude credential — set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY")
+                                println!(
+                                    "no Claude credential — set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY"
+                                )
                             }
                             (_, Err(e)) => {
                                 println!("can't locate the aish binary to run goal workers: {e}")
@@ -3552,7 +3569,9 @@ async fn handle_colon(
                 }
             }
             #[cfg(not(feature = "local"))]
-            Some("local") => println!("built without the local feature (cargo build --features local)"),
+            Some("local") => {
+                println!("built without the local feature (cargo build --features local)")
+            }
             _ => println!("usage: :backend <claude|grok|local>"),
         },
         Some("mode") => match parts.next().and_then(crate::session::Mode::parse) {
@@ -3580,12 +3599,7 @@ async fn handle_colon(
         }
         Some("allow") => handle_allow(parts.next(), parts.next(), session),
         Some("batch") => handle_batch(parts.next(), parts.next(), session),
-        Some("update") => {
-            // `:update --drain` runs the staged graceful-shutdown path (quiesce
-            // → swap → restart, S9.4); bare `:update` is today's swap+advise.
-            let drain = parts.any(|t| t == "--drain");
-            handle_update(pending_update, session, drain).await
-        }
+        Some("update") => handle_update(pending_update, session).await,
         Some("mcp") => handle_mcp(parts.collect(), session).await,
         Some("skill" | "skills") => {
             let rest: Vec<&str> = parts.collect();
@@ -3652,11 +3666,7 @@ fn update_confirm_prompt(running: usize, version: &str) -> String {
     }
 }
 
-async fn handle_update(
-    pending_update: &mut Option<crate::update::UpdateInfo>,
-    session: &Session,
-    drain: bool,
-) {
+async fn handle_update(pending_update: &mut Option<crate::update::UpdateInfo>, session: &Session) {
     if !crate::update::gh_available() {
         println!("update needs the GitHub CLI (`gh`) on PATH — see https://cli.github.com");
         return;
@@ -3700,76 +3710,7 @@ async fn handle_update(
         *pending_update = Some(info); // keep it so the next :update needn't re-check
         return;
     }
-    if drain {
-        // S9.4 — staged graceful shutdown. AC8 host-subprocess gate first: host
-        // workers are children of the shell and DIE on restart, so when any is in
-        // flight on the host backend, require an explicit confirmation that work
-        // will be lost (containerized workers survive — S9.1 — and skip this).
-        let backend_is_container = crate::container::current_backend_is_container();
-        if !backend_is_container
-            && running > 0
-            && session.mode != crate::session::Mode::Yolo
-            && !matches!(
-                confirm_tty(&crate::update::host_drain_warning(running)),
-                tools::Decision::AllowOnce
-                    | tools::Decision::AlwaysAllow
-                    | tools::Decision::AllowDir
-            )
-        {
-            println!("update cancelled — workers left running, no swap.");
-            *pending_update = Some(info);
-            return;
-        }
-        println!(
-            "\x1b[2mdraining background work (timeout {:?})…\x1b[0m",
-            crate::update::drain_timeout()
-        );
-        let ctx = crate::update::DrainCtx {
-            store: session.coordinator_store.as_ref(),
-            worker_jobs: &session.worker_jobs,
-            batch_jobs: &session.batch_jobs,
-            session_id: &session.session_id,
-            backend_is_container,
-            timeout: crate::update::drain_timeout(),
-        };
-        // Strict gated sequence: quiesce → (gate) swap → (gate) restart.
-        // `perform_with_drain` returns Err ONLY on a pre-flight or swap failure
-        // (in which case the restart never runs — AC5, no half-updated restart).
-        match crate::update::perform_with_drain(&info, &ctx).await {
-            Ok(outcome) => {
-                // The only way Ok is returned is that the swap SUCCEEDED but the
-                // post-swap re-exec FAILED (a successful exec replaces the image
-                // and never returns). Report the drain, then advise a manual
-                // restart with the new binary already in place.
-                if !outcome.report.checkpointed.is_empty() {
-                    println!(
-                        "\x1b[2mcheckpointed {} background job(s) before swap\x1b[0m",
-                        outcome.report.checkpointed.len()
-                    );
-                }
-                if !outcome.report.left_mid_flight.is_empty() {
-                    println!(
-                        "\x1b[33mnote:\x1b[0m {} job(s) left mid-flight past the drain timeout (safe if containerized + persisted): {}",
-                        outcome.report.left_mid_flight.len(),
-                        outcome.report.left_mid_flight.join(", ")
-                    );
-                }
-                if let Some(err) = outcome.restart_error {
-                    println!(
-                        "\x1b[33mupgraded to {}, but auto-restart failed:\x1b[0m {err} — the new binary is in place; restart aish manually.",
-                        info.version
-                    );
-                }
-            }
-            Err(e) => {
-                println!("\x1b[31mupdate failed (no restart):\x1b[0m {e:#}");
-                *pending_update = Some(info);
-            }
-        }
-        return;
-    }
     if let Err(e) = crate::update::perform(&info).await {
-
         println!("\x1b[31mupdate failed:\x1b[0m {e:#}");
         *pending_update = Some(info);
         return;
@@ -3873,7 +3814,9 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
                 Ok((false, _)) => println!("no connected server {name}"),
                 Ok((true, true)) => println!("disconnected and unsaved {name}"),
                 Ok((true, false)) => {
-                    println!("disconnected {name} (defined in project .mcp.json — it returns on restart)")
+                    println!(
+                        "disconnected {name} (defined in project .mcp.json — it returns on restart)"
+                    )
                 }
                 Err(e) => println!("mcp remove {name}: {e:#}"),
             }
@@ -3901,7 +3844,9 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
             }
         }
         Some((other, _)) => {
-            println!("unknown :mcp subcommand '{other}' — usage: :mcp [list|reconnect|add|remove|tools]")
+            println!(
+                "unknown :mcp subcommand '{other}' — usage: :mcp [list|reconnect|add|remove|tools]"
+            )
         }
     }
 }
@@ -3917,7 +3862,9 @@ fn handle_allow(sub: Option<&str>, arg: Option<&str>, session: &Session) {
         None => {
             match db.allowed_tools() {
                 Ok(tools) if tools.is_empty() => {
-                    println!("no always-allowed tools — press 'a' at a confirmation prompt to add one")
+                    println!(
+                        "no always-allowed tools — press 'a' at a confirmation prompt to add one"
+                    )
                 }
                 Ok(tools) => {
                     println!("always-allowed tools:");
@@ -3972,7 +3919,10 @@ fn handle_allow(sub: Option<&str>, arg: Option<&str>, session: &Session) {
 fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
     let persist = |session: &Session| {
         if let Some(db) = session.db.as_ref() {
-            let _ = db.set_setting("batch_mode", if session.batch_mode { "true" } else { "false" });
+            let _ = db.set_setting(
+                "batch_mode",
+                if session.batch_mode { "true" } else { "false" },
+            );
         }
     };
     match sub {
@@ -4000,7 +3950,10 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
                 session.batch_model = id.to_string();
                 println!("batch model → {}", session.batch_model);
             }
-            None => println!("batch model: {}\nusage: :batch model <opus|sonnet|haiku|full-id>", session.batch_model),
+            None => println!(
+                "batch model: {}\nusage: :batch model <opus|sonnet|haiku|full-id>",
+                session.batch_model
+            ),
         },
         Some("clear") => {
             // Drop finished (done/failed) jobs from both the store and memory.
@@ -4034,7 +3987,9 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
             }
         }
         Some(other) => {
-            println!("unknown :batch subcommand '{other}' — usage: :batch [on|off|status|clear|model <id>]")
+            println!(
+                "unknown :batch subcommand '{other}' — usage: :batch [on|off|status|clear|model <id>]"
+            )
         }
     }
 }
@@ -4076,7 +4031,11 @@ mod tests {
 
         builtin_source(&[path.to_string_lossy().into_owned()], &mut session);
         let get = |s: &Session, k: &str| {
-            s.env.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+            s.env
+                .iter()
+                .rev()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
         };
         assert_eq!(get(&session, "FOO"), Some("bar".into()));
         assert_eq!(get(&session, "BAZ"), Some("qux".into()));
@@ -4174,7 +4133,10 @@ mod tests {
         std::fs::write(dir.join("README"), "").unwrap(); // non-exec: excluded
 
         let mut aliases = HashMap::new();
-        aliases.insert("gs".to_string(), vec!["git".to_string(), "status".to_string()]);
+        aliases.insert(
+            "gs".to_string(),
+            vec!["git".to_string(), "status".to_string()],
+        );
         let helper = helper_for(&dir, aliases);
 
         // AC1: car<TAB> at the command position offers cargo
@@ -4185,11 +4147,17 @@ mod tests {
 
         // builtins are offered as command names
         let (_, pairs) = helper.complete_command("ex", 2, 0);
-        assert!(pairs.iter().any(|p| p.replacement == "exit"), "exit missing");
+        assert!(
+            pairs.iter().any(|p| p.replacement == "exit"),
+            "exit missing"
+        );
 
         // aliases are offered as command names
         let (_, pairs) = helper.complete_command("g", 1, 0);
-        assert!(pairs.iter().any(|p| p.replacement == "gs"), "alias gs missing");
+        assert!(
+            pairs.iter().any(|p| p.replacement == "gs"),
+            "alias gs missing"
+        );
 
         // non-executable files are not offered. (rustyline's Pair has no Debug;
         // report the replacement strings — `{pairs:?}` broke main's test build.)
@@ -4342,7 +4310,9 @@ mod tests {
         assert!(!prose("cat \"my file\" backup")); // quotes signal shell intent
 
         // sentence punctuation is prose evidence, not command evidence
-        assert!(prose("watch for events from atum, let me know about activity in this sprint"));
+        assert!(prose(
+            "watch for events from atum, let me know about activity in this sprint"
+        ));
         assert!(prose("find big files, oldest first"));
         // `?` is a glob metachar: tokenize already rejects it → model
         assert!(rc::tokenize("who is on this machine right now?").is_none());
@@ -4447,7 +4417,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aish_hl_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        make_exec(&dir.join("tool"));  // a plain resolvable binary
+        make_exec(&dir.join("tool")); // a plain resolvable binary
         make_exec(&dir.join("clear")); // resolvable AND an everyday English word
         let helper = helper_for(&dir, HashMap::new());
         let paint = |line: &str| helper.highlight(line, 0).to_string();
@@ -4457,12 +4427,18 @@ mod tests {
         // green = direct: a resolvable, non-ambiguous command.
         assert_eq!(paint("tool --flag"), format!("{green}tool --flag{reset}"));
         // cyan = model: prose, and an unresolvable lead word.
-        assert_eq!(paint("what is the capital of texas"), format!("{cyan}what is the capital of texas{reset}"));
+        assert_eq!(
+            paint("what is the capital of texas"),
+            format!("{cyan}what is the capital of texas{reset}")
+        );
         assert_eq!(paint("toolnope"), format!("{cyan}toolnope{reset}"));
         // dim = ambiguous: resolves but is also an English word.
         assert_eq!(paint("clear"), format!("{dim}clear{reset}"));
         // Forced `!`/`?` prefixes win over the heuristics.
-        assert_eq!(paint("!clear the screen for me"), format!("{green}!clear the screen for me{reset}"));
+        assert_eq!(
+            paint("!clear the screen for me"),
+            format!("{green}!clear the screen for me{reset}")
+        );
         assert_eq!(paint("?tool --flag"), format!("{cyan}?tool --flag{reset}"));
         // Plain: a `:`-command and an empty buffer stay the terminal default (untouched).
         assert_eq!(paint(":help"), ":help");
@@ -4491,16 +4467,26 @@ mod tests {
         // Cached answer equals the direct classifier for each route class.
         let oracle = |l: &str| route_preview(l, &helper.cwd, &helper.path, &helper.aliases);
         for line in ["tool --flag", "what is the capital of texas", ":help", ""] {
-            assert_eq!(helper.cached_preview(line), oracle(line), "mismatch for {line:?}");
+            assert_eq!(
+                helper.cached_preview(line),
+                oracle(line),
+                "mismatch for {line:?}"
+            );
         }
         assert_eq!(helper.cached_preview("tool --flag"), Preview::Direct);
-        assert_eq!(helper.cached_preview("what is the capital of texas"), Preview::Model);
+        assert_eq!(
+            helper.cached_preview("what is the capital of texas"),
+            Preview::Model
+        );
 
         // Repeated paints of the SAME buffer return the same decision (memo hit),
         // and interleaving a different line never corrupts the prior answer.
         let direct = helper.cached_preview("tool --flag");
         assert_eq!(helper.cached_preview("tool --flag"), direct);
-        assert_eq!(helper.cached_preview("what is the capital of texas"), Preview::Model);
+        assert_eq!(
+            helper.cached_preview("what is the capital of texas"),
+            Preview::Model
+        );
         assert_eq!(helper.cached_preview("tool --flag"), direct);
 
         // A `cd` (new cwd) invalidates the memo: the same lead word now resolves
@@ -4539,11 +4525,20 @@ mod tests {
         session.db = Some(db);
 
         // Both $LAST and $_ resolve to the most recent recorded output.
-        assert_eq!(rc::tokenize_with("echo $LAST", var_lookup(&session)).unwrap(), vec!["echo", "hello from last"]);
-        assert_eq!(rc::tokenize_with("echo $_", var_lookup(&session)).unwrap(), vec!["echo", "hello from last"]);
+        assert_eq!(
+            rc::tokenize_with("echo $LAST", var_lookup(&session)).unwrap(),
+            vec!["echo", "hello from last"]
+        );
+        assert_eq!(
+            rc::tokenize_with("echo $_", var_lookup(&session)).unwrap(),
+            vec!["echo", "hello from last"]
+        );
         // An explicit session export shadows the binding.
         session.env.push(("LAST".into(), "override".into()));
-        assert_eq!(rc::tokenize_with("echo $LAST", var_lookup(&session)).unwrap(), vec!["echo", "override"]);
+        assert_eq!(
+            rc::tokenize_with("echo $LAST", var_lookup(&session)).unwrap(),
+            vec!["echo", "override"]
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -4551,7 +4546,13 @@ mod tests {
     #[test]
     fn set_and_unset_mutate_session_env() {
         let mut session = Session::new().unwrap();
-        let get = |s: &Session, k: &str| s.env.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        let get = |s: &Session, k: &str| {
+            s.env
+                .iter()
+                .rev()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+        };
 
         builtin_set(&["FOO=bar".into(), "BAZ=qux".into()], &mut session);
         assert_eq!(get(&session, "FOO"), Some("bar".into()));
@@ -4614,18 +4615,30 @@ mod tests {
         let (a, b) = (a.canonicalize().unwrap(), b.canonicalize().unwrap());
         session.cwd = a.clone();
         let mut prev = None;
-        let var = |s: &Session, k: &str| s.env.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        let var = |s: &Session, k: &str| {
+            s.env
+                .iter()
+                .rev()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+        };
 
         builtin_cd(b.to_str(), &mut session, &mut prev);
         assert_eq!(session.cwd, b);
         assert_eq!(var(&session, "PWD"), Some(b.to_string_lossy().into_owned()));
-        assert_eq!(var(&session, "OLDPWD"), Some(a.to_string_lossy().into_owned()));
+        assert_eq!(
+            var(&session, "OLDPWD"),
+            Some(a.to_string_lossy().into_owned())
+        );
 
         // `cd -` swaps back, and PWD/OLDPWD swap with it.
         builtin_cd(Some("-"), &mut session, &mut prev);
         assert_eq!(session.cwd, a);
         assert_eq!(var(&session, "PWD"), Some(a.to_string_lossy().into_owned()));
-        assert_eq!(var(&session, "OLDPWD"), Some(b.to_string_lossy().into_owned()));
+        assert_eq!(
+            var(&session, "OLDPWD"),
+            Some(b.to_string_lossy().into_owned())
+        );
 
         // set_var keeps exactly one entry per key — no stale duplicates accrue.
         assert_eq!(session.env.iter().filter(|(k, _)| k == "PWD").count(), 1);
@@ -4651,7 +4664,11 @@ mod tests {
         assert_eq!(names, sorted, "COLON_COMMANDS must stay alphabetical");
         let mut dedup = sorted.clone();
         dedup.dedup();
-        assert_eq!(dedup.len(), names.len(), "COLON_COMMANDS has a duplicate name");
+        assert_eq!(
+            dedup.len(),
+            names.len(),
+            "COLON_COMMANDS has a duplicate name"
+        );
         assert!(!COLON_COMMANDS.is_empty());
     }
 
@@ -4709,7 +4726,10 @@ mod tests {
         let (start, all) = complete_colon("");
         assert_eq!(start, 0);
         assert_eq!(all.len(), COLON_COMMANDS.len());
-        assert!(all.iter().all(|p| p.replacement.starts_with(':') && p.replacement.ends_with(' ')));
+        assert!(
+            all.iter()
+                .all(|p| p.replacement.starts_with(':') && p.replacement.ends_with(' '))
+        );
 
         // Every catalog command's replacement, stripped of `:` and trailing space,
         // is a name `handle_colon` can route (guards against catalog/replacement drift).
@@ -4725,7 +4745,10 @@ mod tests {
         // command), each row carrying its name and description.
         let full = palette_hint(":", 1).expect("bare `:` yields the palette");
         assert_eq!(full.matches('\n').count(), COLON_COMMANDS.len());
-        assert!(full.starts_with('\n'), "hint drops onto its own line below the input");
+        assert!(
+            full.starts_with('\n'),
+            "hint drops onto its own line below the input"
+        );
         assert!(full.contains(":mode"));
         assert!(full.contains("confirmation"));
 
@@ -4750,9 +4773,18 @@ mod tests {
     #[test]
     fn ghost_suffix_only_for_strict_prefix() {
         // A strict prefix yields just the trailing remainder.
-        assert_eq!(ghost_suffix("git", "git status").as_deref(), Some(" status"));
-        assert_eq!(ghost_suffix("git ", "git status").as_deref(), Some("status"));
-        assert_eq!(ghost_suffix("cargo b", "cargo build").as_deref(), Some("uild"));
+        assert_eq!(
+            ghost_suffix("git", "git status").as_deref(),
+            Some(" status")
+        );
+        assert_eq!(
+            ghost_suffix("git ", "git status").as_deref(),
+            Some("status")
+        );
+        assert_eq!(
+            ghost_suffix("cargo b", "cargo build").as_deref(),
+            Some("uild")
+        );
         // An exact match leaves nothing to suggest.
         assert_eq!(ghost_suffix("git status", "git status"), None);
         // Empty line never suggests (fish shows nothing on a blank prompt).
@@ -4817,14 +4849,20 @@ mod tests {
         // completion (→/Ctrl-F must not insert it).
         let palette = helper.hint(":m", 2, &ctx).expect("palette hint");
         assert!(palette.display().contains(":mode"));
-        assert!(palette.completion().is_none(), "palette must not be acceptable");
+        assert!(
+            palette.completion().is_none(),
+            "palette must not be acceptable"
+        );
 
         // A history-extending line yields gray ghost text whose completion is the
         // plain trailing remainder (what →/Ctrl-F insert).
         let ghost = helper.hint("git", 3, &ctx).expect("ghost hint");
         assert_eq!(ghost.completion(), Some(" status"));
         assert!(ghost.display().contains(" status"));
-        assert!(ghost.display().starts_with(GHOST_COLOR), "ghost text is gray");
+        assert!(
+            ghost.display().starts_with(GHOST_COLOR),
+            "ghost text is gray"
+        );
 
         // No palette, no history match — no hint at all.
         assert!(helper.hint("nomatch-xyz", 11, &ctx).is_none());
@@ -4907,9 +4945,15 @@ mod tests {
     #[test]
     fn owner_gate_enforces_session_ownership_with_any_override() {
         // Own-session run -> always allowed.
-        assert_eq!(owner_gate(Some("sess-a"), "sess-a", false), OwnerGate::Allow);
+        assert_eq!(
+            owner_gate(Some("sess-a"), "sess-a", false),
+            OwnerGate::Allow
+        );
         // Foreign run without --any -> forbidden (multi-user safety, AC7).
-        assert_eq!(owner_gate(Some("sess-b"), "sess-a", false), OwnerGate::Forbidden);
+        assert_eq!(
+            owner_gate(Some("sess-b"), "sess-a", false),
+            OwnerGate::Forbidden
+        );
         // Foreign run WITH --any -> allowed (explicit cross-session override).
         assert_eq!(owner_gate(Some("sess-b"), "sess-a", true), OwnerGate::Allow);
         // Legacy row with no recorded owner -> treated as own-session (allow).
@@ -4921,10 +4965,19 @@ mod tests {
     #[test]
     fn take_any_flag_only_strips_a_leading_flag() {
         // Leading --any / -a is consumed; the rest is the (id, message...) tail.
-        assert_eq!(take_any_flag(&["--any", "w_x", "hello"]), (true, vec!["w_x", "hello"]));
-        assert_eq!(take_any_flag(&["-a", "w_x", "hello"]), (true, vec!["w_x", "hello"]));
+        assert_eq!(
+            take_any_flag(&["--any", "w_x", "hello"]),
+            (true, vec!["w_x", "hello"])
+        );
+        assert_eq!(
+            take_any_flag(&["-a", "w_x", "hello"]),
+            (true, vec!["w_x", "hello"])
+        );
         // No flag -> unchanged.
-        assert_eq!(take_any_flag(&["w_x", "hello"]), (false, vec!["w_x", "hello"]));
+        assert_eq!(
+            take_any_flag(&["w_x", "hello"]),
+            (false, vec!["w_x", "hello"])
+        );
         // A --any AFTER the id is message text, not the flag.
         assert_eq!(
             take_any_flag(&["w_x", "--any", "hello"]),
@@ -4933,41 +4986,6 @@ mod tests {
         // Empty input -> no flag, empty tail.
         let empty: Vec<&str> = Vec::new();
         assert_eq!(take_any_flag(&[]), (false, empty));
-    }
-
-    #[test]
-    fn forget_cmd_parses_id_flag_and_usage() {
-        assert_eq!(parse_forget_cmd(&[]), ForgetCmd::Usage);
-        assert_eq!(parse_forget_cmd(&["--all-exited"]), ForgetCmd::AllExited);
-        assert_eq!(parse_forget_cmd(&["--all"]), ForgetCmd::AllExited);
-        assert_eq!(parse_forget_cmd(&["w_abc"]), ForgetCmd::One("w_abc".to_string()));
-        // A card-id / prefix is just an id.
-        assert_eq!(parse_forget_cmd(&["card_9"]), ForgetCmd::One("card_9".to_string()));
-        // Extra tokens, or an unknown flag, are usage (no silent guess).
-        assert_eq!(parse_forget_cmd(&["w_abc", "extra"]), ForgetCmd::Usage);
-        assert_eq!(parse_forget_cmd(&["--bogus"]), ForgetCmd::Usage);
-    }
-
-    #[test]
-    fn forget_status_live_vs_terminal() {
-        // Live phases/statuses are refused by :forget (AC5a).
-        assert!(forget_status_is_live("running"));
-        assert!(forget_status_is_live("coordinating"));
-        assert!(forget_status_is_live("awaiting_batch"));
-        assert!(forget_status_is_live("  running  ")); // trimmed
-        // Terminal states are forgettable.
-        assert!(!forget_status_is_live("done"));
-        assert!(!forget_status_is_live("failed"));
-        // An unknown/stale status (e.g. container gone) is treated as terminal
-        // so an orphan dir can still be reclaimed (AC edge).
-        assert!(!forget_status_is_live(""));
-        assert!(!forget_status_is_live("zombie"));
-    }
-
-    #[test]
-    fn forget_in_colon_catalog() {
-        // The catalog carries :forget so the palette + completion offer it.
-        assert!(colon_command_matches("for").contains(&"forget"));
     }
 
     #[test]
@@ -5041,15 +5059,24 @@ mod tests {
     // ---- Phase 2: :skill commands ---------------------------------------
     #[test]
     fn dispatch_routes_subcommands() {
-        assert_eq!(parse_skill_command(&["add", "acme/git"]), SkillCmd::Add("acme/git".into()));
+        assert_eq!(
+            parse_skill_command(&["add", "acme/git"]),
+            SkillCmd::Add("acme/git".into())
+        );
         assert_eq!(
             parse_skill_command(&["search", "git", "helper"]),
             SkillCmd::Search("git helper".into())
         );
         assert_eq!(parse_skill_command(&["list"]), SkillCmd::List);
         assert_eq!(parse_skill_command(&["ls"]), SkillCmd::List);
-        assert_eq!(parse_skill_command(&["remove", "demo"]), SkillCmd::Remove("demo".into()));
-        assert_eq!(parse_skill_command(&["rm", "demo"]), SkillCmd::Remove("demo".into()));
+        assert_eq!(
+            parse_skill_command(&["remove", "demo"]),
+            SkillCmd::Remove("demo".into())
+        );
+        assert_eq!(
+            parse_skill_command(&["rm", "demo"]),
+            SkillCmd::Remove("demo".into())
+        );
     }
 
     #[test]
@@ -5089,31 +5116,13 @@ mod tests {
         let md = "---\nname: installed\ndescription: Freshly added.\n---\nbody\n";
         let name = install_skill_text(md, &tmp, &mut session).unwrap();
         assert_eq!(name, "installed");
-        assert!(session.skills_prompt.contains("installed"), "{}", session.skills_prompt);
+        assert!(
+            session.skills_prompt.contains("installed"),
+            "{}",
+            session.skills_prompt
+        );
         assert!(session.skills_prompt.contains("Freshly added."));
         let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn prefix_match_classifies_exact_unique_and_ambiguous() {
-        // TASK-205: the symptom ids — an exact full id must resolve to ITSELF,
-        // an ambiguous prefix must NOT silently pick the first match.
-        let ids = vec![
-            "w_4Fyg9pko".to_string(),
-            "w_ftUTR8m2".to_string(),
-            "w_4abc0000".to_string(),
-        ];
-        // Exact id wins.
-        assert_eq!(prefix_match(&ids, "w_4Fyg9pko"), PrefixMatch::One("w_4Fyg9pko".to_string()));
-        // A unique prefix resolves.
-        assert_eq!(prefix_match(&ids, "w_ft"), PrefixMatch::One("w_ftUTR8m2".to_string()));
-        // An ambiguous prefix is reported, never silently resolved to the first.
-        match prefix_match(&ids, "w_4") {
-            PrefixMatch::Many(hits) => assert_eq!(hits.len(), 2),
-            other => panic!("expected ambiguous, got {other:?}"),
-        }
-        // No match.
-        assert_eq!(prefix_match(&ids, "zzz"), PrefixMatch::None);
     }
 
     #[test]
@@ -5145,7 +5154,10 @@ mod tests {
         // consequence (AC2/AC4), and still carries the version.
         let warn = update_confirm_prompt(3, "0.5.0");
         assert!(warn.contains('3'), "warning must name the count: {warn}");
-        assert!(warn.contains("version skew"), "warning must name the consequence: {warn}");
+        assert!(
+            warn.contains("version skew"),
+            "warning must name the consequence: {warn}"
+        );
         assert!(warn.to_lowercase().contains("old"));
         assert!(warn.contains("0.5.0"));
         // Mentions every job class so batches are counted for skew (AC5).
@@ -5250,7 +5262,10 @@ mod tests {
             }
         }
 
-        let golden_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/routing_decisions.snap");
+        let golden_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/golden/routing_decisions.snap"
+        );
         if std::env::var("UPDATE_GOLDEN").is_ok() {
             std::fs::write(golden_path, &snap).expect("write golden snapshot");
             return;
@@ -5360,8 +5375,8 @@ mod tests {
         let corpus = [
             "echo hello world",
             "seq 1 20",
-            "seq 5 1",        // descending with the default step → empty output
-            "seq 1 2 9",      // strided: 1 3 5 7 9
+            "seq 5 1",   // descending with the default step → empty output
+            "seq 1 2 9", // strided: 1 3 5 7 9
             "printf %s+%s 3 4",
             "expr 6 + 7",
             "basename /usr/local/bin/aish",
@@ -5399,7 +5414,10 @@ mod tests {
         for cmd in corpus {
             let got = aish_direct_code(cmd, &session).await;
             let want = bash_code(cmd, &session.cwd);
-            assert_eq!(got, want, "aish direct-dispatch exit status diverged from bash for `{cmd}`");
+            assert_eq!(
+                got, want,
+                "aish direct-dispatch exit status diverged from bash for `{cmd}`"
+            );
         }
     }
 

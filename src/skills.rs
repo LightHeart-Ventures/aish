@@ -31,7 +31,11 @@ pub fn load(dir: &Path) -> Vec<Skill> {
             continue;
         };
         if let Some((name, description)) = parse_frontmatter(&text) {
-            skills.push(Skill { name, description, path: skill_md });
+            skills.push(Skill {
+                name,
+                description,
+                path: skill_md,
+            });
         }
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -65,7 +69,12 @@ pub fn render_prompt_section(skills: &[Skill], mcp_skills: &[crate::mcp::McpSkil
 with read_file FIRST and follow it (it may reference further files next to it):\n",
         );
         for sk in skills {
-            s.push_str(&format!("- {} ({}): {}\n", sk.name, sk.path.display(), sk.description));
+            s.push_str(&format!(
+                "- {} ({}): {}\n",
+                sk.name,
+                sk.path.display(),
+                sk.description
+            ));
         }
     }
     if !mcp_skills.is_empty() {
@@ -85,7 +94,10 @@ matches one, call get_skill {server, name, args} FIRST and follow what it return
                     .collect();
                 format!(" (args: {})", list.join(", "))
             };
-            s.push_str(&format!("- {} (server: {}){}: {}\n", sk.name, sk.server, args, sk.description));
+            s.push_str(&format!(
+                "- {} (server: {}){}: {}\n",
+                sk.name, sk.server, args, sk.description
+            ));
         }
     }
     s
@@ -115,9 +127,10 @@ mod tests {
 
     #[test]
     fn frontmatter_parses() {
-        let (n, d) =
-            parse_frontmatter("---\nname: my-skill\ndescription: Does things.\nextra: x\n---\nbody")
-                .unwrap();
+        let (n, d) = parse_frontmatter(
+            "---\nname: my-skill\ndescription: Does things.\nextra: x\n---\nbody",
+        )
+        .unwrap();
         assert_eq!(n, "my-skill");
         assert_eq!(d, "Does things.");
         assert!(parse_frontmatter("no frontmatter here").is_none());
@@ -139,7 +152,9 @@ mod tests {
         }];
         let s = render_prompt_section(&local, &mcp);
         assert!(s.contains("- deploy (/s/deploy/SKILL.md): Ship it."));
-        assert!(s.contains("- atum/sprint-status (server: atum) (args: sprintId, hours?): Summarize the sprint."));
+        assert!(s.contains(
+            "- atum/sprint-status (server: atum) (args: sprintId, hours?): Summarize the sprint."
+        ));
         // either source alone still renders; neither → empty
         assert!(render_prompt_section(&local, &[]).contains("deploy"));
         assert!(render_prompt_section(&[], &mcp).contains("get_skill"));
@@ -161,8 +176,10 @@ mod tests {
             mk("atum/build-agent"),
             mk("atum/invoke-agent"),
         ];
-        let kept: Vec<String> =
-            interactive_mcp_skills(&all).into_iter().map(|s| s.name).collect();
+        let kept: Vec<String> = interactive_mcp_skills(&all)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
         // Only the two routing skills survive; every heavy code-work / dispatch
         // skill is hidden from the interactive agent.
         assert_eq!(kept, vec!["atum/should-i-hire-an-agent", "atum/pick-model"]);

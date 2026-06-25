@@ -36,7 +36,12 @@ impl LocalBackend {
             env("AISH_LOCAL_MODEL_FILE"),
             env("AISH_LOCAL_TOK_ID"),
         );
-        Self { model_id, file, tok_model_id, model: OnceCell::new() }
+        Self {
+            model_id,
+            file,
+            tok_model_id,
+            model: OnceCell::new(),
+        }
     }
 
     /// Force the lazy load now. The engine calls this before its "thinking"
@@ -133,7 +138,9 @@ impl LocalBackend {
                 }
             }
         }
-        req = req.set_tools(render_tools(tools)?).set_tool_choice(ToolChoice::Auto);
+        req = req
+            .set_tools(render_tools(tools)?)
+            .set_tool_choice(ToolChoice::Auto);
 
         let response = model
             .send_chat_request(req)
@@ -159,7 +166,14 @@ impl LocalBackend {
             })
             .collect();
 
-        Ok(Turn { text, tool_calls, raw: None, truncated_tool_call: false, usage: None, truncated_text: false })
+        Ok(Turn {
+            text,
+            tool_calls,
+            raw: None,
+            truncated_tool_call: false,
+            usage: None,
+            truncated_text: false,
+        })
     }
 }
 
@@ -176,10 +190,17 @@ fn resolve(
     // unset — the default repo's only quant is Q8_0, not the derived Q4_K_M.
     let default_repo = model_id.as_deref().is_none_or(|m| m == DEFAULT_MODEL_ID);
     let model_id = model_id.unwrap_or_else(|| DEFAULT_MODEL_ID.into());
-    let base = model_id.strip_suffix("-GGUF").unwrap_or(&model_id).to_string();
+    let base = model_id
+        .strip_suffix("-GGUF")
+        .unwrap_or(&model_id)
+        .to_string();
     let name = base.rsplit('/').next().unwrap_or(&base);
     let file = file.unwrap_or_else(|| {
-        if default_repo { DEFAULT_FILE.into() } else { format!("{name}-Q4_K_M.gguf") }
+        if default_repo {
+            DEFAULT_FILE.into()
+        } else {
+            format!("{name}-Q4_K_M.gguf")
+        }
     });
     (model_id, file, tok.unwrap_or(base))
 }
@@ -277,7 +298,9 @@ fn render_tools(tools: &[ToolDef]) -> Result<Vec<Tool>> {
 /// it into message.tool_calls — drop both.
 fn strip_think(s: &str) -> String {
     let s = strip_tag(s, "<think>", "</think>");
-    strip_tag(&s, "<tool_call>", "</tool_call>").trim().to_string()
+    strip_tag(&s, "<tool_call>", "</tool_call>")
+        .trim()
+        .to_string()
 }
 
 fn strip_tag(s: &str, open: &str, close: &str) -> String {
@@ -324,7 +347,10 @@ mod tests {
             Some("other-Q8_0.gguf".into()),
             Some("org/other-tok".into()),
         );
-        assert_eq!((m.as_str(), f.as_str(), t.as_str()), ("org/other", "other-Q8_0.gguf", "org/other-tok"));
+        assert_eq!(
+            (m.as_str(), f.as_str(), t.as_str()),
+            ("org/other", "other-Q8_0.gguf", "org/other-tok")
+        );
         // Non-GGUF-suffixed repo: tokenizer falls back to the repo itself.
         let (_, f, t) = resolve(Some("org/plain".into()), None, None);
         assert_eq!((f.as_str(), t.as_str()), ("plain-Q4_K_M.gguf", "org/plain"));
@@ -347,7 +373,10 @@ mod tests {
     #[ignore]
     async fn download_bar_fetches_and_caches() {
         let repo = Repo::with_revision("Qwen/Qwen3-4B".into(), RepoType::Model, "main".into());
-        let api = ApiBuilder::from_cache(Cache::default()).with_progress(false).build().unwrap();
+        let api = ApiBuilder::from_cache(Cache::default())
+            .with_progress(false)
+            .build()
+            .unwrap();
         let path = api
             .repo(repo.clone())
             .download_with_progress("config.json", DownloadBar::new("config.json"))
