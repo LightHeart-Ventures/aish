@@ -874,6 +874,33 @@ fn describe_call(call: &crate::backend::ToolCall) -> String {
             crate::batch::one_line(a["task"].as_str().unwrap_or("?"))
         ),
         "background_status" => "background status".to_string(),
+        "glob_expand" => format!("glob {}", a["pattern"].as_str().unwrap_or("?")),
+        "grep_files" => format!(
+            "grep {:?} in {}",
+            a["pattern"].as_str().unwrap_or("?"),
+            a["path"].as_str().unwrap_or(".")
+        ),
+        "stat_file" => format!("stat {}", a["path"].as_str().unwrap_or("?")),
+        "diff_files" => format!(
+            "diff {} {}",
+            a["a"].as_str().unwrap_or("?"),
+            a["b"].as_str().or(a["b_content"].as_str().map(|_| "<inline>")).unwrap_or("?")
+        ),
+        "copy_file" => format!(
+            "copy {} \u{2192} {}",
+            a["src"].as_str().unwrap_or("?"),
+            a["dst"].as_str().unwrap_or("?")
+        ),
+        "rename_file" => format!(
+            "rename {} \u{2192} {}",
+            a["src"].as_str().unwrap_or("?"),
+            a["dst"].as_str().unwrap_or("?")
+        ),
+        "append_file" => format!(
+            "append {} bytes \u{2192} {}",
+            a["content"].as_str().map(str::len).unwrap_or(0),
+            a["path"].as_str().unwrap_or("?")
+        ),
         "escalate" => format!(
             "escalate: {}",
             crate::batch::one_line(a["task"].as_str().unwrap_or("?"))
