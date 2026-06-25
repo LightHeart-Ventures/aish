@@ -105,6 +105,14 @@ pub async fn run_turn(
     let mut repeat_guard = crate::loopguard::RepeatGuard::default();
 
     for iteration in 1..=MAX_ITERATIONS {
+        // Keep the input prompt VISIBLE while the turn runs (option-1 of the
+        // type-while-busy ask): aish's editor only reads BETWEEN turns, so during
+        // the model⇄tools loop the prompt would otherwise vanish. Print a dim,
+        // prompt-shaped reminder at each round boundary so the user can SEE the
+        // prompt is still live — text or a `:command` typed now is line-buffered
+        // by the TTY and runs the moment this turn returns; Ctrl-C aborts. Gated
+        // to an interactive TTY (a background coordinator / piped run prints none).
+        emit_prompt_footer(session);
         // Budget phase for THIS round: Normal → run freely; SoftWarn → fold a
         // "converge now" notice into the prompt; ForceSummarize → hand the model
         // NO tools so it must produce a best-effort final answer rather than being
@@ -561,6 +569,40 @@ fn truncate_to_cols(s: &str, max: usize) -> String {
     out
 }
 
+/// `~`-abbreviated working directory for the in-turn prompt footer — mirrors the
+/// REPL prompt's home-collapsing (`repl::short_cwd`) so the footer reads like the
+/// real prompt. Kept local to avoid a back-dependency on the repl module.
+fn short_cwd(cwd: &std::path::Path) -> String {
+    let cwd = cwd.display().to_string();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && cwd.starts_with(&home) => cwd.replacen(&home, "~", 1),
+        _ => cwd,
+    }
+}
+
+/// The dim, prompt-shaped reminder shown at each round boundary while a turn is
+/// in flight (the option-1 "visible prompt during a turn" slice). Pure so it's
+/// unit-testable; `emit_prompt_footer` does the TTY/nested gating and the write.
+/// Reads like the real prompt (`<cwd> ❯`) plus a parenthetical that states the
+/// honest affordance: type-ahead is line-buffered and runs after this turn, and
+/// Ctrl-C aborts.
+fn prompt_footer_line(cwd: &std::path::Path) -> String {
+    format!(
+        "\x1b[2m{} ❯ (type ahead — text or a :command runs after this turn · Ctrl-C aborts)\x1b[0m",
+        short_cwd(cwd)
+    )
+}
+
+/// Emit the in-turn prompt footer (see `prompt_footer_line`). Interactive TTY
+/// only: a background coordinator (`session.nested`) and any piped/non-TTY run
+/// print nothing — they have no live prompt to keep visible.
+fn emit_prompt_footer(session: &Session) {
+    if session.nested || !stderr_is_tty() {
+        return;
+    }
+    eprintln!("{}", prompt_footer_line(&session.cwd));
+}
+
 /// Transient "⠋ thinking…" line on stderr while the model is working — the
 /// model-reasoning phase indicator. TTY-gated; erased on drop (first token,
 /// tool call, or turn abort).
@@ -876,6 +918,33 @@ pub fn reveal_last_turn(session: &Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_cwd_collapses_home_prefix() {
+        // A path under $HOME is abbreviated to `~`; anything else is verbatim.
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            let under = std::path::PathBuf::from(&home).join("projects/aish");
+            let out = short_cwd(&under);
+            assert!(out.starts_with('~'), "home should collapse to ~: {out}");
+            assert!(!out.contains(&home), "literal home must be gone: {out}");
+        }
+        // A path outside HOME is returned unchanged.
+        assert_eq!(short_cwd(std::path::Path::new("/var/log")), "/var/log");
+    }
+
+    #[test]
+    fn prompt_footer_line_reads_like_a_prompt_and_states_affordances() {
+        // Dim-wrapped, carries the ❯ prompt glyph, and names BOTH affordances the
+        // visible-prompt slice promises: type-ahead (text or a :command) and the
+        // Ctrl-C abort. The cwd is rendered through short_cwd.
+        let line = prompt_footer_line(std::path::Path::new("/tmp/x"));
+        assert!(line.starts_with("\x1b[2m"), "footer must be dim: {line}");
+        assert!(line.ends_with("\x1b[0m"), "footer must reset SGR: {line}");
+        assert!(line.contains("/tmp/x ❯"), "footer must show the cwd + prompt glyph: {line}");
+        assert!(line.contains(":command"), "footer must mention :commands: {line}");
+        assert!(line.contains("Ctrl-C"), "footer must mention the abort key: {line}");
+    }
 
     #[test]
     fn raw_body_placeholder() {
