@@ -407,6 +407,29 @@ pub async fn drive(
     }
     session.turn_audit = Some(audit);
 
+    // S9.3: per-worker conversation store. Record a `running` meta.json and
+    // attach the transcript WRITER so `engine::run_turn` persists each turn-event
+    // (user message, tool call/result, narration) and this loop each round’s
+    // synthesis to ~/.aish/workers/<run_id>/. The store is keyed by the run id —
+    // the SAME host path worker.rs mounts at /aish/state — so the host reader and
+    // an in-container writer share one dir. On a RESUME the writer continues the
+    // seq past what is already on disk. Best-effort throughout: a write error is
+    // swallowed so the store never sinks a live worker.
+    {
+        let mut meta = crate::worker_store::WorkerMeta::new(
+            run_id,
+            &session.session_id,
+            &input,
+            &worker_store_repo_key(&session.cwd),
+            backend.kind(),
+            &backend.model(),
+            run_id,
+        );
+        meta.branch = current_worktree_branch(&session.cwd);
+        let _ = crate::worker_store::write_meta_atomic(&meta);
+    }
+    session.worker_transcript = Some(crate::worker_store::TranscriptWriter::attach(run_id));
+
     let mut rounds = 0usize;
     // How many times we've auto-recovered (resume/nudge) a worker that ended
     // abnormally this run. Bounded by `loopguard::MAX_AUTO_RECOVERIES` so the
@@ -462,6 +485,7 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
             if let Some(s) = store {
                 let _ = s.set_failed(run_id, &error);
             }
+            finalize_worker_store(run_id, "failed", None);
             return Outcome { phase: Phase::Failed, result: None, error: Some(error), rounds };
         }
 
@@ -498,6 +522,7 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
                 if let Some(s) = store {
                     let _ = s.set_failed(run_id, &error);
                 }
+                finalize_worker_store(run_id, "failed", None);
                 return Outcome { phase: Phase::Failed, result: None, error: Some(error), rounds };
             }
         };
@@ -509,6 +534,11 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
         // bare tool log alone can hide that. Best-effort; empty text is skipped.
         if let Some(a) = session.turn_audit.as_mut() {
             a.synthesis(rounds as u64, &answer);
+        }
+        // S9.3: mirror the round synthesis into the per-worker transcript so a
+        // replay shows each round’s final narrative answer, not just the tool turns.
+        if let Some(w) = session.worker_transcript.as_mut() {
+            w.record_message("assistant", "synthesis", &answer);
         }
 
         // ── Worker-exit evaluation: did this round's turn end abnormally? The
@@ -551,6 +581,7 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
             if let Some(s) = store {
                 let _ = s.set_failed(run_id, &error);
             }
+            finalize_worker_store(run_id, "failed", Some(&answer));
             return Outcome { phase: Phase::Failed, result: Some(answer), error: Some(error), rounds };
         }
 
@@ -596,6 +627,7 @@ delivered above). Fold them into your work: continue the task, or give the final
         if let Some(s) = store {
             let _ = s.set_done(run_id, &answer);
         }
+        finalize_worker_store(run_id, "done", Some(&answer));
         return Outcome { phase: Phase::Done, result: Some(answer), error: None, rounds };
     }
 }
@@ -647,6 +679,10 @@ pub fn rehydrate(session: &mut Session) {
     // sweeper NEVER removes a dirty or commits-ahead worktree (operator's work).
     crate::worker::prune_worktrees(&session.cwd);
     crate::worker::sweep_worktrees(&session.cwd);
+    // S9.3: age out finished per-worker conversation-store dirs under the state
+    // root, mirroring the worktree sweep above. Never reclaims a running or
+    // work-bearing (kept-branch) worker dir (worker_store::should_sweep_worker).
+    let _ = crate::worker_store::sweep_worker_dirs();
 
     // A coordinator CHILD (`AISH_COORDINATOR=1`) runs the full `main()` startup
     // before it reaches `run_coordinator`. Without this guard EVERY spawned
@@ -869,6 +905,45 @@ fn civil_to_unix(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64)
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     days * 86_400 + hour * 3_600 + min * 60 + sec
+}
+
+/// Finalize the S9.3 per-worker conversation store at a terminal phase: write
+/// the final answer to `result.txt` (the cross-container-boundary result
+/// channel) when one is present, then flip `meta.json.status` to `done`/`failed`
+/// via an atomic rewrite. Best-effort — a missing store or write error is
+/// swallowed so finalizing the transcript never changes the run’s outcome.
+fn finalize_worker_store(run_id: &str, status: &str, result: Option<&str>) {
+    if let Some(r) = result {
+        let _ = crate::worker_store::write_result(run_id, r);
+    }
+    let _ = crate::worker_store::set_status(run_id, status);
+}
+
+/// Best-effort current git branch of `dir`, recorded in the worker `meta.json`
+/// so retention never reclaims a dir whose worktree still holds kept work on an
+/// `aish/<id>` branch (AC7). `None` outside a repo, on a detached HEAD, or when
+/// the branch isn’t an aish worktree branch (the trunk carries no kept work).
+fn current_worktree_branch(dir: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    branch.starts_with("aish/").then_some(branch)
+}
+
+/// A filesystem-safe repo key for the worker `meta.json` (informational): the
+/// run directory’s basename. Kept lightweight (no extra git probe) — the
+/// authoritative cross-reference is `meta.run_id` ↔ the SQLite run row (AC3).
+fn worker_store_repo_key(dir: &std::path::Path) -> String {
+    dir.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "repo".to_string())
 }
 
 #[cfg(test)]

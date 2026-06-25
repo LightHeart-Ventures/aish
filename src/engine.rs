@@ -76,6 +76,12 @@ pub async fn run_turn(
     // SQLite memories table and replacing it with a short in-context summary.
     maybe_compact(backend, session);
     let input = seed_context(session.history.is_empty(), session.last_output(), input);
+    // S9.3: persist the turn input to the per-worker transcript (coordinator
+    // run only — None/no-op interactively), so `:attach`/resume can replay the
+    // user/system messages, not just the tool turns the audit journal records.
+    if let Some(w) = session.worker_transcript.as_mut() {
+        w.record_message("user", "text", &input);
+    }
     session.history.push(Msg::user(input));
     session.last_turn_tools.clear();
 
@@ -274,6 +280,10 @@ pub async fn run_turn(
                 if session.raw_tool_output {
                     print_raw_result(&result);
                 }
+                if let Some(w) = session.worker_transcript.as_mut() {
+                    w.record_tool_call(&call.id, &call.name, &call.args);
+                    w.record_tool_result(&call.id, &call.name, &result.content, result.is_error);
+                }
                 session.last_turn_tools.push((desc.clone(), result.clone()));
                 results.push(result);
                 if matches!(repeat, crate::loopguard::RepeatAction::Break) {
@@ -332,6 +342,14 @@ pub async fn run_turn(
             };
             if session.raw_tool_output {
                 print_raw_result(&result);
+            }
+            // S9.3: persist this tool turn (call + result) to the per-worker
+            // transcript so :attach/resume can replay the full turn-by-turn
+            // history (coordinator run only — None/no-op interactively). The
+            // input is redacted inside record_tool_call (AC8).
+            if let Some(w) = session.worker_transcript.as_mut() {
+                w.record_tool_call(&call.id, &call.name, &call.args);
+                w.record_tool_result(&call.id, &call.name, &result.content, result.is_error);
             }
             session.last_turn_tools.push((desc, result.clone()));
             results.push(result);
@@ -444,7 +462,7 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
 /// output (vs `🔧` tool lines) and forward it only when `:worker-output` is on.
 /// A coordinator turn is always a standard (Messages API) model call, hence the
 /// `[standard]` label the parent attaches; batch fan-out is announced separately.
-fn emit_narration(session: &Session, text: &str) {
+fn emit_narration(session: &mut Session, text: &str) {
     let rendered = crate::md::render(text.trim(), "");
     if session.nested {
         for line in rendered.lines() {
@@ -452,6 +470,12 @@ fn emit_narration(session: &Session, text: &str) {
         }
     } else {
         eprintln!("{rendered}");
+    }
+    // S9.3: persist the model’s interim reasoning to the per-worker
+    // transcript (coordinator run only — None/no-op interactively) so a replay
+    // shows what the agent SAID between tool calls, not just what it did.
+    if let Some(w) = session.worker_transcript.as_mut() {
+        w.record_message("assistant", "narration", text);
     }
 }
 

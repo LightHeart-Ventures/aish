@@ -30,6 +30,7 @@ mod tools;
 mod turn_audit;
 mod update;
 mod worker;
+mod worker_store;
 
 use anyhow::Result;
 use clap::Parser;

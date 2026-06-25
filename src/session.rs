@@ -159,6 +159,14 @@ pub struct Session {
     /// each tool call (and replay completed turns on a resume). Always `None` for
     /// an interactive session — no journaling there.
     pub turn_audit: Option<crate::turn_audit::TurnAudit>,
+    /// S9.3 per-worker conversation-store WRITER (see `crate::worker_store`).
+    /// `Some` only for a headless `--coordinator` run, where `coordinator::drive`
+    /// attaches it so `engine::run_turn` persists each turn-event (user message,
+    /// tool call/result, narration) and `drive` each round’s synthesis to the
+    /// per-worker `transcript.jsonl` for `:attach` replay / resume. Always `None`
+    /// for an interactive session — no per-worker store there (mirrors
+    /// `turn_audit`).
+    pub worker_transcript: Option<crate::worker_store::TranscriptWriter>,
     /// Shared "attached coordinator" handle (`:attach`/`:detach`). Holds the
     /// run-id of the background coordinator this interactive session is currently
     /// attached to, or `None`. Cloned into every `WorkerSpec` so the live stderr
@@ -207,6 +215,7 @@ impl Session {
             show_worker_output: Arc::new(AtomicBool::new(false)),
             escalation: None,
             turn_audit: None,
+            worker_transcript: None,
             login: false,
             attached: Arc::new(Mutex::new(None)),
             attach_review_announced: Arc::new(Mutex::new(None)),

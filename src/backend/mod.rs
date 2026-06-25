@@ -157,6 +157,19 @@ impl Backend {
         Backend::Local(local::LocalBackend::new())
     }
 
+    /// The active model id (e.g. `claude-opus-4-8`, `grok-…`). Used to stamp
+    /// the per-worker `meta.json` (S9.3) so a persisted worker session records
+    /// which model produced it. `"local"` for the in-process backend.
+    pub fn model(&self) -> String {
+        match self {
+            Backend::Claude(b) => b.model.clone(),
+            Backend::Grok(b) => b.model.clone(),
+            #[cfg(feature = "local")]
+            Backend::Local(_) => "local".to_string(),
+        }
+    }
+
+
     /// Pre-turn hook: the local backend lazy-loads weights here — drawing a
     /// download progress line if needed — before the engine's "thinking"
     /// spinner starts overwriting stderr. No-op for Claude.

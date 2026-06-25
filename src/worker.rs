@@ -1540,7 +1540,7 @@ fn new_worker_id() -> String {
 /// Root for per-worker state volumes (AC4): `$AISH_WORKER_STATE_DIR` when set,
 /// else `~/.aish/workers`, else a temp fallback. Each worker mounts
 /// `<root>/<id>` at `/aish/state`.
-fn worker_state_root() -> PathBuf {
+pub(crate) fn worker_state_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("AISH_WORKER_STATE_DIR") {
         if !dir.is_empty() {
             return PathBuf::from(dir);
