@@ -11,6 +11,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 hf-hub = { version = "0.4.3", optional = true, default-features = false, features = ["tokio", "rustls-tls"] }
 libc = "0.2"
 mistralrs = { version = "0.8.1", optional = true }
+regex = "1.12.3"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "http2"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustyline = "18.0.0"
