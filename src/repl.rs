@@ -2860,6 +2860,41 @@ fn skill_remove(name: &str, session: &mut Session) -> Result<()> {
     Ok(())
 }
 
+/// The outcome of resolving a `:result <id>` lookup (TASK-205).
+enum ResultOutcome {
+    /// A single run's rendered result.
+    Found(String),
+    /// The query (a prefix) matched 2+ jobs — reject rather than guess.
+    Ambiguous(Vec<String>),
+    /// Nothing matched.
+    NotFound,
+}
+
+/// How a `:result` query matches a set of in-memory job ids by prefix (TASK-205).
+#[derive(Debug, PartialEq)]
+enum PrefixMatch {
+    One(String),
+    Many(Vec<String>),
+    None,
+}
+
+/// Classify how `query` matches `ids` by prefix (TASK-205). An exact id present
+/// in the set wins outright; otherwise a single prefix hit is `One`, 2+ are
+/// `Many` (ambiguous — the caller must reject rather than silently return the
+/// first, which under concurrent completions could be the WRONG worker's
+/// result), and zero is `None`. Pure + unit-tested.
+fn prefix_match(ids: &[String], query: &str) -> PrefixMatch {
+    if ids.iter().any(|i| i == query) {
+        return PrefixMatch::One(query.to_string());
+    }
+    let hits: Vec<String> = ids.iter().filter(|i| i.starts_with(query)).cloned().collect();
+    match hits.len() {
+        0 => PrefixMatch::None,
+        1 => PrefixMatch::One(hits.into_iter().next().unwrap()),
+        _ => PrefixMatch::Many(hits),
+    }
+}
+
 /// Returns true when the REPL should exit.
 async fn handle_colon(
     cmd: &str,
@@ -3078,31 +3113,76 @@ async fn handle_colon(
             }
         }
         Some("result") => {
-            // View a finished background job's full result on demand.
+            // View a finished background job's full result on demand. Resolution
+            // is strictly per-run (TASK-205): an exact id wins; an unmatched id
+            // is then read by run_id from the durable coordinator store (never a
+            // shared/global cache); and a prefix that matches 2+ jobs is REJECTED
+            // rather than silently returning the first — which, under concurrent
+            // worker completions, could be a different worker's result.
             let Some(&id) = parts.next().as_ref() else {
                 println!("usage: :result <job>   (id or prefix from a completion notice / :results)");
                 return false;
             };
-            let hit = |jid: &str| jid == id || jid.starts_with(id);
-            let found = session
-                .worker_jobs
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|j| hit(&j.id))
-                .map(|j| j.fetch())
-                .or_else(|| {
-                    session
-                        .batch_jobs
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .find(|j| hit(&j.id))
-                        .map(|j| j.fetch())
-                });
-            match found {
-                Some(r) => println!("{}", crate::md::render_stdout(r.trim())),
-                None => println!("no background job matching '{id}' (see :workers)"),
+            // Snapshot the in-memory job ids (workers + batches) for matching,
+            // then fetch a chosen job's result by EXACT id.
+            let worker_ids: Vec<String> =
+                session.worker_jobs.lock().unwrap().iter().map(|j| j.id.clone()).collect();
+            let batch_ids: Vec<String> =
+                session.batch_jobs.lock().unwrap().iter().map(|j| j.id.clone()).collect();
+            let fetch_worker = |jid: &str| {
+                session.worker_jobs.lock().unwrap().iter().find(|j| j.id == jid).map(|j| j.fetch())
+            };
+            let fetch_batch = |jid: &str| {
+                session.batch_jobs.lock().unwrap().iter().find(|j| j.id == jid).map(|j| j.fetch())
+            };
+            // 1) Exact in-memory match (worker first, then batch) — per-job, so
+            //    a concurrent completion can never swap one job's result for
+            //    another's.
+            let exact = if worker_ids.iter().any(|w| w.as_str() == id) {
+                fetch_worker(id)
+            } else if batch_ids.iter().any(|b| b.as_str() == id) {
+                fetch_batch(id)
+            } else {
+                None
+            };
+            // 2) Durable, run_id-scoped read from the coordinator store (covers
+            //    cross-session and post-restart, where the in-memory jobs are
+            //    gone). result_for_alias resolves alias->run_id->result by exact
+            //    key, never a shared slot.
+            let durable = || {
+                session
+                    .coordinator_store
+                    .as_ref()
+                    .and_then(|s| s.result_for_alias(id).ok().flatten())
+                    .map(|r| r.rendered())
+            };
+            // 3) Unique-prefix in memory (ambiguity rejected).
+            let resolved = if let Some(r) = exact {
+                ResultOutcome::Found(r)
+            } else if let Some(r) = durable() {
+                ResultOutcome::Found(r)
+            } else {
+                let mut all = worker_ids.clone();
+                all.extend(batch_ids.clone());
+                match prefix_match(&all, id) {
+                    PrefixMatch::One(jid) => match fetch_worker(&jid).or_else(|| fetch_batch(&jid)) {
+                        Some(r) => ResultOutcome::Found(r),
+                        None => ResultOutcome::NotFound,
+                    },
+                    PrefixMatch::Many(ids) => ResultOutcome::Ambiguous(ids),
+                    PrefixMatch::None => ResultOutcome::NotFound,
+                }
+            };
+            match resolved {
+                ResultOutcome::Found(r) => println!("{}", crate::md::render_stdout(r.trim())),
+                ResultOutcome::Ambiguous(ids) => println!(
+                    "'{id}' matches {} jobs — use a full id to disambiguate: {} (see :workers)",
+                    ids.len(),
+                    ids.join(", ")
+                ),
+                ResultOutcome::NotFound => {
+                    println!("no background job matching '{id}' (see :workers)")
+                }
             }
         }
         Some("results") => {
@@ -4803,6 +4883,28 @@ mod tests {
         assert!(session.skills_prompt.contains("installed"), "{}", session.skills_prompt);
         assert!(session.skills_prompt.contains("Freshly added."));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn prefix_match_classifies_exact_unique_and_ambiguous() {
+        // TASK-205: the symptom ids — an exact full id must resolve to ITSELF,
+        // an ambiguous prefix must NOT silently pick the first match.
+        let ids = vec![
+            "w_4Fyg9pko".to_string(),
+            "w_ftUTR8m2".to_string(),
+            "w_4abc0000".to_string(),
+        ];
+        // Exact id wins.
+        assert_eq!(prefix_match(&ids, "w_4Fyg9pko"), PrefixMatch::One("w_4Fyg9pko".to_string()));
+        // A unique prefix resolves.
+        assert_eq!(prefix_match(&ids, "w_ft"), PrefixMatch::One("w_ftUTR8m2".to_string()));
+        // An ambiguous prefix is reported, never silently resolved to the first.
+        match prefix_match(&ids, "w_4") {
+            PrefixMatch::Many(hits) => assert_eq!(hits.len(), 2),
+            other => panic!("expected ambiguous, got {other:?}"),
+        }
+        // No match.
+        assert_eq!(prefix_match(&ids, "zzz"), PrefixMatch::None);
     }
 
     #[test]

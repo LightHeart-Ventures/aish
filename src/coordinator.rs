@@ -374,6 +374,11 @@ pub async fn drive(
         // session.session_id/name were adopted from the LAUNCHING session at
         // startup (see main.rs), so the row attributes to who asked for the work.
         let _ = s.insert(run_id, &input, &session.session_id, session.name.as_deref());
+        // TASK-205: bind the alias->run_id mapping ONCE, transactionally, at run
+        // start so `:result <alias>` can resolve to THIS run's own result by
+        // run_id. For aish the worker alias IS the run_id; the binding is still
+        // recorded (immutably) so resolution never depends on in-memory state.
+        let _ = s.bind_alias(run_id, run_id, None);
     }
 
     // ── Pre-dispatch circuit breaker (loop guard, per the loop-exhaustion
