@@ -2895,6 +2895,7 @@ async fn handle_colon(
                  :compact                            offload older history to long-term memory now\n\
                  :memories [organize]                list stored memories, or dedup them\n\
                  :update                             check GitHub for a newer release and upgrade\n\
+                 :update --drain                     quiesce in-flight workers (checkpoint+detach), swap the binary, then restart the shell\n\
                  :batch <on|off|status|clear>        interactive batch mode: agent offloads deferrable\n\
                                                      work to background Anthropic batches (Opus, ~50%\n\
                                                      cheaper); jobs persist + reattach across restarts\n\
@@ -3329,7 +3330,12 @@ async fn handle_colon(
         }
         Some("allow") => handle_allow(parts.next(), parts.next(), session),
         Some("batch") => handle_batch(parts.next(), parts.next(), session),
-        Some("update") => handle_update(pending_update, session).await,
+        Some("update") => {
+            // `:update --drain` runs the staged graceful-shutdown path (quiesce
+            // → swap → restart, S9.4); bare `:update` is today's swap+advise.
+            let drain = parts.any(|t| t == "--drain");
+            handle_update(pending_update, session, drain).await
+        }
         Some("mcp") => handle_mcp(parts.collect(), session).await,
         Some("skill" | "skills") => {
             let rest: Vec<&str> = parts.collect();
@@ -3399,6 +3405,7 @@ fn update_confirm_prompt(running: usize, version: &str) -> String {
 async fn handle_update(
     pending_update: &mut Option<crate::update::UpdateInfo>,
     session: &Session,
+    drain: bool,
 ) {
     if !crate::update::gh_available() {
         println!("update needs the GitHub CLI (`gh`) on PATH — see https://cli.github.com");
@@ -3443,7 +3450,76 @@ async fn handle_update(
         *pending_update = Some(info); // keep it so the next :update needn't re-check
         return;
     }
+    if drain {
+        // S9.4 — staged graceful shutdown. AC8 host-subprocess gate first: host
+        // workers are children of the shell and DIE on restart, so when any is in
+        // flight on the host backend, require an explicit confirmation that work
+        // will be lost (containerized workers survive — S9.1 — and skip this).
+        let backend_is_container = crate::container::current_backend_is_container();
+        if !backend_is_container
+            && running > 0
+            && session.mode != crate::session::Mode::Yolo
+            && !matches!(
+                confirm_tty(&crate::update::host_drain_warning(running)),
+                tools::Decision::AllowOnce
+                    | tools::Decision::AlwaysAllow
+                    | tools::Decision::AllowDir
+            )
+        {
+            println!("update cancelled — workers left running, no swap.");
+            *pending_update = Some(info);
+            return;
+        }
+        println!(
+            "\x1b[2mdraining background work (timeout {:?})…\x1b[0m",
+            crate::update::drain_timeout()
+        );
+        let ctx = crate::update::DrainCtx {
+            store: session.coordinator_store.as_ref(),
+            worker_jobs: &session.worker_jobs,
+            batch_jobs: &session.batch_jobs,
+            session_id: &session.session_id,
+            backend_is_container,
+            timeout: crate::update::drain_timeout(),
+        };
+        // Strict gated sequence: quiesce → (gate) swap → (gate) restart.
+        // `perform_with_drain` returns Err ONLY on a pre-flight or swap failure
+        // (in which case the restart never runs — AC5, no half-updated restart).
+        match crate::update::perform_with_drain(&info, &ctx).await {
+            Ok(outcome) => {
+                // The only way Ok is returned is that the swap SUCCEEDED but the
+                // post-swap re-exec FAILED (a successful exec replaces the image
+                // and never returns). Report the drain, then advise a manual
+                // restart with the new binary already in place.
+                if !outcome.report.checkpointed.is_empty() {
+                    println!(
+                        "\x1b[2mcheckpointed {} background job(s) before swap\x1b[0m",
+                        outcome.report.checkpointed.len()
+                    );
+                }
+                if !outcome.report.left_mid_flight.is_empty() {
+                    println!(
+                        "\x1b[33mnote:\x1b[0m {} job(s) left mid-flight past the drain timeout (safe if containerized + persisted): {}",
+                        outcome.report.left_mid_flight.len(),
+                        outcome.report.left_mid_flight.join(", ")
+                    );
+                }
+                if let Some(err) = outcome.restart_error {
+                    println!(
+                        "\x1b[33mupgraded to {}, but auto-restart failed:\x1b[0m {err} — the new binary is in place; restart aish manually.",
+                        info.version
+                    );
+                }
+            }
+            Err(e) => {
+                println!("\x1b[31mupdate failed (no restart):\x1b[0m {e:#}");
+                *pending_update = Some(info);
+            }
+        }
+        return;
+    }
     if let Err(e) = crate::update::perform(&info).await {
+
         println!("\x1b[31mupdate failed:\x1b[0m {e:#}");
         *pending_update = Some(info);
         return;

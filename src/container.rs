@@ -150,6 +150,25 @@ pub fn resolve_selection(
     }
 }
 
+/// The live execution vehicle a worker WOULD use right now, resolved from the
+/// same inputs `run_worker` feeds `resolve_selection`: the `AISH_CONTAINER_RUNTIME`
+/// selector plus which engines are on PATH. `:update --drain` reads this to know
+/// whether background workers are containerized (and so survive a shell restart)
+/// or host subprocesses (which die on restart, gating the AC8 confirmation).
+pub fn current_selection() -> Selection {
+    resolve_selection(
+        Runtime::parse_selector(std::env::var("AISH_CONTAINER_RUNTIME").ok().as_deref()),
+        runtime_on_path(Runtime::Podman),
+        runtime_on_path(Runtime::Docker),
+    )
+}
+
+/// True when background workers run in a container (and thus keep running across
+/// a `:update --drain` shell restart); false for the host-subprocess path.
+pub fn current_backend_is_container() -> bool {
+    matches!(current_selection(), Selection::Container(_))
+}
+
 /// The image tag for a worker, pinned to the running aish version so a new build
 /// rebuilds the image (`current_version()` from `update.rs`). Pure.
 pub fn image_tag(version: &str) -> String {

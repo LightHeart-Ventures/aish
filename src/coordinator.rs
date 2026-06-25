@@ -331,7 +331,18 @@ fn fold_operator_messages(store: Option<&CoordinatorStore>, run_id: &str, next_i
     let Some(s) = store else {
         return 0;
     };
-    let msgs = s.drain_messages(run_id).unwrap_or_default();
+    let mut msgs = s.drain_messages(run_id).unwrap_or_default();
+    // S9.4: a `:update --drain` places the checkpoint sentinel on this same
+    // mailbox to tell the run to flush its S9.3 state at a round boundary and
+    // (if attached) detach. It is an internal control token, NOT an operator
+    // instruction — strip it so it never reaches the model as text. Reaching
+    // this round boundary at all IS the checkpoint (phase + transcript are
+    // already persisted), so recognising it is the no-op-but-quiesce we need.
+    let checkpointed = msgs.iter().any(|m| m == crate::update::CHECKPOINT_SENTINEL);
+    msgs.retain(|m| m != crate::update::CHECKPOINT_SENTINEL);
+    if checkpointed {
+        eprintln!("\x1b[2m[checkpoint] flushed at round boundary for :update --drain\x1b[0m");
+    }
     if msgs.is_empty() {
         return 0;
     }
