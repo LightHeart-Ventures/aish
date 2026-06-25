@@ -105,6 +105,16 @@ pub async fn run_turn(
     let mut repeat_guard = crate::loopguard::RepeatGuard::default();
 
     for iteration in 1..=MAX_ITERATIONS {
+        // Context-awareness WITHIN the turn (not just at turn start): a single
+        // agentic turn can fan MANY large tool-call/tool-result messages into
+        // `history`, and every `backend.complete` below re-sends the whole
+        // history — so a long round can balloon the prompt far past the model's
+        // window before the next turn's pre-loop compaction ever runs. That is
+        // exactly the background-coordinator overflow we hit (`prompt is too
+        // long: 1911302 tokens > 1000000 maximum`). Re-check compaction here so
+        // the offload-to-SQLite memory management bounds the prompt mid-turn too,
+        // for interactive sessions and background coordinators alike.
+        maybe_compact(backend, session);
         // Budget phase for THIS round: Normal → run freely; SoftWarn → fold a
         // "converge now" notice into the prompt; ForceSummarize → hand the model
         // NO tools so it must produce a best-effort final answer rather than being
@@ -420,7 +430,8 @@ pub async fn run_coordinator(
     }
 }
 
-/// Before a new turn, compact the conversation when it has grown past the
+/// Before a new turn AND before every completion within a turn, compact the
+/// conversation when it has grown past the
 /// context-window threshold: offload the oldest slice to the SQLite `memories`
 /// table (recoverable via the `recall` tool, tagged `context-offload`) and
 /// replace it in-context with a short summary message. Keeps long, agentic
@@ -429,11 +440,16 @@ pub async fn run_coordinator(
 /// conversation is long enough to split on a safe assistant boundary.
 fn maybe_compact(backend: &Backend, session: &mut Session) {
     let window = backend.context_window();
-    if !crate::context::should_compact(
-        session.context_used,
-        window,
-        crate::context::COMPACT_THRESHOLD_PCT,
-    ) {
+    // Compact on whichever is LARGER: the last backend-reported usage, or a fresh
+    // estimate of the CURRENT history. The reported figure only refreshes after a
+    // completion, so within a turn it lags behind tool results just pushed into
+    // history; estimating the live history catches that mid-turn growth and keeps
+    // the prompt from overflowing the window (the >1M-token 400). At turn start
+    // the two converge, so this never compacts more eagerly than before.
+    let used = session
+        .context_used
+        .max(crate::context::estimate_history_tokens(&session.history));
+    if !crate::context::should_compact(used, window, crate::context::COMPACT_THRESHOLD_PCT) {
         return;
     }
     let Some(plan) =
@@ -442,9 +458,16 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
         return;
     };
     // Offload the dropped transcript to durable memory BEFORE mutating history,
-    // so nothing is lost even if the process dies right after.
+    // so nothing is lost even if the process dies right after. A background
+    // coordinator scopes its offload to its OWN worker/run id (tag
+    // `context-offload,worker:<id>`) so each worker auto-manages its own memory
+    // without polluting the shared interactive store; an interactive session
+    // keeps the bare `context-offload` tag. Either way it stays recoverable via
+    // the recall tool.
     if let Some(db) = &session.db {
-        let _ = db.remember(&plan.offload, Some("context-offload"));
+        let tags =
+            compaction_offload_tags(session.worker_transcript.as_ref().map(|w| w.id()));
+        let _ = db.remember(&plan.offload, Some(&tags));
     }
     let dropped = plan.dropped;
     crate::context::apply_compaction(&mut session.history, &plan);
@@ -454,6 +477,19 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
         "\x1b[2maish: context at/over {}% — compacted {dropped} earlier message(s) to memory\x1b[0m",
         crate::context::COMPACT_THRESHOLD_PCT
     );
+}
+
+/// Build the tag string for a context-offload memory. A background coordinator
+/// passes its worker/run id so the offload is scoped to that worker
+/// (`context-offload,worker:<id>`) — letting each worker self-manage its memory
+/// without polluting the shared interactive store; an interactive session
+/// (`None`, or an empty id) uses the bare `context-offload` tag. Pure, so the
+/// scoping rule is unit-testable.
+fn compaction_offload_tags(worker_id: Option<&str>) -> String {
+    match worker_id {
+        Some(id) if !id.trim().is_empty() => format!("context-offload,worker:{id}"),
+        _ => "context-offload".to_string(),
+    }
 }
 
 /// Print the model's interim narration. In an interactive session it goes out
@@ -1007,6 +1043,19 @@ mod tests {
         assert_eq!(flatten_ws("  a   b\t c \n"), "a b c");
         assert_eq!(flatten_ws("single"), "single");
         assert_eq!(flatten_ws("\n\n"), "");
+    }
+
+    #[test]
+    fn compaction_offload_tags_scope_by_worker() {
+        // A background coordinator scopes its offload to its own worker/run id so
+        // each worker self-manages its memory without polluting the shared store.
+        assert_eq!(
+            compaction_offload_tags(Some("w_1CSpF6IM")),
+            "context-offload,worker:w_1CSpF6IM"
+        );
+        // An interactive session (None) or an empty id keeps the bare tag.
+        assert_eq!(compaction_offload_tags(None), "context-offload");
+        assert_eq!(compaction_offload_tags(Some("   ")), "context-offload");
     }
 
     #[test]
