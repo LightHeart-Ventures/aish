@@ -13,8 +13,8 @@
 //! needs a metered `ANTHROPIC_API_KEY` (a Claude subscription OAuth token won't
 //! reach it).
 
-use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -96,7 +96,10 @@ impl BatchJob {
 
     /// Done or failed — no longer running.
     fn is_terminal(&self) -> bool {
-        matches!(self.inner.lock().unwrap().status.as_str(), "done" | "failed")
+        matches!(
+            self.inner.lock().unwrap().status.as_str(),
+            "done" | "failed"
+        )
     }
 
     fn is_displayed(&self) -> bool {
@@ -172,7 +175,12 @@ pub fn spawn(
     let job = Arc::new(BatchJob {
         id: id.clone(),
         task: task.clone(),
-        inner: Mutex::new(JobInner { status: "running".into(), result: None, error: None, displayed: false }),
+        inner: Mutex::new(JobInner {
+            status: "running".into(),
+            result: None,
+            error: None,
+            displayed: false,
+        }),
         store,
     });
     jobs.lock().unwrap().push(job.clone());
@@ -242,19 +250,29 @@ pub fn rehydrate(session: &mut crate::session::Session) {
                 resumed += 1;
             }
             // Crashed between registering and submitting — unrecoverable.
-            (None, _) => job.set_failed("interrupted before submission (no Anthropic batch id)".into()),
+            (None, _) => {
+                job.set_failed("interrupted before submission (no Anthropic batch id)".into())
+            }
             // No key this run: leave it running so a later start can reattach.
             (Some(_), None) => {}
         }
     }
     if resumed > 0 {
-        eprintln!("\x1b[2maish: reattached {resumed} background batch job(s) from a previous session\x1b[0m");
+        eprintln!(
+            "\x1b[2maish: reattached {resumed} background batch job(s) from a previous session\x1b[0m"
+        );
     }
 }
 
 /// The poll task: submit one batch request, poll to completion, retrieve and
 /// render the result, then surface it.
-async fn run_batch(jobs: BatchJobs, job: Arc<BatchJob>, task: String, model: String, api_key: String) {
+async fn run_batch(
+    jobs: BatchJobs,
+    job: Arc<BatchJob>,
+    task: String,
+    model: String,
+    api_key: String,
+) {
     let client = BatchClient::new(api_key);
     match client.run(&task, &model, &job).await {
         Ok(summary) => job.set_done(summary),
@@ -301,7 +319,10 @@ fn on_complete(jobs: &BatchJobs, finished: &Arc<BatchJob>) {
     if !all_terminal {
         crate::tools::announce(
             &format!("[{}]", finished.id),
-            &format!("{} — {remaining} batch job(s) still running", finished.status()),
+            &format!(
+                "{} — {remaining} batch job(s) still running",
+                finished.status()
+            ),
         );
         return;
     }
@@ -314,12 +335,19 @@ fn on_complete(jobs: &BatchJobs, finished: &Arc<BatchJob>) {
 pub fn drain_pending(jobs: &BatchJobs) -> Vec<String> {
     let pending: Vec<Arc<BatchJob>> = {
         let g = jobs.lock().unwrap();
-        g.iter().filter(|j| j.is_terminal() && !j.is_displayed()).cloned().collect()
+        g.iter()
+            .filter(|j| j.is_terminal() && !j.is_displayed())
+            .cloned()
+            .collect()
     };
     pending
         .iter()
         .map(|job| {
-            let label = if job.status() == "failed" { "failed" } else { "complete" };
+            let label = if job.status() == "failed" {
+                "failed"
+            } else {
+                "complete"
+            };
             job.mark_displayed();
             format!(
                 "\x1b[2m── batch {} {label} ──\x1b[0m\n{}",
@@ -348,12 +376,19 @@ pub fn one_line(task: &str) -> String {
 pub fn notify_pending(jobs: &BatchJobs) -> Vec<String> {
     let pending: Vec<Arc<BatchJob>> = {
         let g = jobs.lock().unwrap();
-        g.iter().filter(|j| j.is_terminal() && !j.is_displayed()).cloned().collect()
+        g.iter()
+            .filter(|j| j.is_terminal() && !j.is_displayed())
+            .cloned()
+            .collect()
     };
     pending
         .iter()
         .map(|job| {
-            let (icon, what) = if job.status() == "failed" { ("✗", "failed") } else { ("✓", "done") };
+            let (icon, what) = if job.status() == "failed" {
+                ("✗", "failed")
+            } else {
+                ("✓", "done")
+            };
             job.mark_displayed();
             let sid = short_id(&job.id);
             format!(
@@ -366,7 +401,11 @@ pub fn notify_pending(jobs: &BatchJobs) -> Vec<String> {
 
 /// Count of batch jobs still running — for the prompt's `⟳N` indicator.
 pub fn running_count(jobs: &BatchJobs) -> usize {
-    jobs.lock().unwrap().iter().filter(|j| !j.is_terminal()).count()
+    jobs.lock()
+        .unwrap()
+        .iter()
+        .filter(|j| !j.is_terminal())
+        .count()
 }
 
 /// Headless inline flush (no presenter): print every drained block to stdout.
@@ -457,7 +496,9 @@ impl BatchClient {
                 return Ok(v);
             }
             if tokio::time::Instant::now() >= deadline {
-                bail!("batch {batch_id} did not complete within the time cap (last status: {status})");
+                bail!(
+                    "batch {batch_id} did not complete within the time cap (last status: {status})"
+                );
             }
             tokio::time::sleep(interval).await;
             interval = (interval * 2).min(POLL_MAX);
@@ -495,7 +536,12 @@ impl BatchClient {
         self.request(reqwest::Method::GET, url, None).await
     }
 
-    async fn request(&self, method: reqwest::Method, url: &str, body: Option<&Value>) -> Result<Value> {
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<&Value>,
+    ) -> Result<Value> {
         let mut delay = Duration::from_secs(2);
         for attempt in 0..3 {
             let mut req = self
@@ -576,7 +622,11 @@ fn flatten(v: &Value) -> BatchResult {
             text = Some(s);
         }
     }
-    BatchResult { custom_id, kind, text }
+    BatchResult {
+        custom_id,
+        kind,
+        text,
+    }
 }
 
 /// Render results for the model. A single-request offload returns just the text;
@@ -633,21 +683,37 @@ mod tests {
 
     #[test]
     fn render_single_succeeded_is_bare_text() {
-        let rs = vec![BatchResult { custom_id: "task".into(), kind: "succeeded".into(), text: Some("answer".into()) }];
+        let rs = vec![BatchResult {
+            custom_id: "task".into(),
+            kind: "succeeded".into(),
+            text: Some("answer".into()),
+        }];
         assert_eq!(render_results(&rs), "answer");
     }
 
     #[test]
     fn render_single_failure_names_the_type() {
-        let rs = vec![BatchResult { custom_id: "task".into(), kind: "expired".into(), text: None }];
+        let rs = vec![BatchResult {
+            custom_id: "task".into(),
+            kind: "expired".into(),
+            text: None,
+        }];
         assert_eq!(render_results(&rs), "batch request expired");
     }
 
     #[test]
     fn render_multiple_groups_by_custom_id() {
         let rs = vec![
-            BatchResult { custom_id: "a".into(), kind: "succeeded".into(), text: Some("A".into()) },
-            BatchResult { custom_id: "b".into(), kind: "errored".into(), text: None },
+            BatchResult {
+                custom_id: "a".into(),
+                kind: "succeeded".into(),
+                text: Some("A".into()),
+            },
+            BatchResult {
+                custom_id: "b".into(),
+                kind: "errored".into(),
+                text: None,
+            },
         ];
         let out = render_results(&rs);
         assert!(out.contains("### a\nA"));
@@ -665,7 +731,12 @@ mod tests {
         let job = Arc::new(BatchJob {
             id: "a1b2c3d4-0000".into(),
             task: "summarize".into(),
-            inner: Mutex::new(JobInner { status: "running".into(), result: None, error: None, displayed: false }),
+            inner: Mutex::new(JobInner {
+                status: "running".into(),
+                result: None,
+                error: None,
+                displayed: false,
+            }),
             store: None,
         });
         assert!(job.fetch().contains("still running"));

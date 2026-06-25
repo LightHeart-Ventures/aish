@@ -26,7 +26,7 @@
 //! over HTTP, echoing the server's `mcp-session-id`).
 
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -140,7 +140,10 @@ impl McpHost {
             let config: Value = match serde_json::from_str(&text) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("\x1b[33maish:\x1b[0m {} is not valid JSON: {e}", path.display());
+                    eprintln!(
+                        "\x1b[33maish:\x1b[0m {} is not valid JSON: {e}",
+                        path.display()
+                    );
                     continue;
                 }
             };
@@ -204,13 +207,29 @@ impl McpHost {
                 let (kind, detail) = if s.spec["command"].is_string() {
                     let args = s.spec["args"]
                         .as_array()
-                        .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
                         .unwrap_or_default();
-                    ("stdio", format!("{} {args}", s.spec["command"].as_str().unwrap_or("")).trim().to_string())
+                    (
+                        "stdio",
+                        format!("{} {args}", s.spec["command"].as_str().unwrap_or(""))
+                            .trim()
+                            .to_string(),
+                    )
                 } else {
                     ("http", s.spec["url"].as_str().unwrap_or("").to_string())
                 };
-                McpStatus { name: s.name.clone(), kind, detail, tools: s.tools.len(), prompts: s.prompts.len() }
+                McpStatus {
+                    name: s.name.clone(),
+                    kind,
+                    detail,
+                    tools: s.tools.len(),
+                    prompts: s.prompts.len(),
+                }
             })
             .collect()
     }
@@ -222,10 +241,12 @@ impl McpHost {
 
     /// `(tool name, read_only)` for one server, or None if it isn't connected.
     pub fn tools_of(&self, name: &str) -> Option<Vec<(String, bool)>> {
-        self.servers
-            .iter()
-            .find(|s| s.name == name)
-            .map(|s| s.tools.iter().map(|t| (t.name.clone(), t.read_only)).collect())
+        self.servers.iter().find(|s| s.name == name).map(|s| {
+            s.tools
+                .iter()
+                .map(|t| (t.name.clone(), t.read_only))
+                .collect()
+        })
     }
 
     /// Restart one server from its stored spec (drops the old one — its child is
@@ -332,7 +353,12 @@ impl McpHost {
     }
 
     /// Expand one skill via `prompts/get`, flattening its messages to text.
-    pub async fn get_skill(&mut self, server_name: &str, name: &str, args: &Value) -> Result<String> {
+    pub async fn get_skill(
+        &mut self,
+        server_name: &str,
+        name: &str,
+        args: &Value,
+    ) -> Result<String> {
         let server = self
             .servers
             .iter_mut()
@@ -342,10 +368,18 @@ impl McpHost {
             anyhow::bail!("server {server_name} has no skill named {name}");
         }
         let result = server
-            .request("prompts/get", json!({"name": name, "arguments": args}), CALL_TIMEOUT)
+            .request(
+                "prompts/get",
+                json!({"name": name, "arguments": args}),
+                CALL_TIMEOUT,
+            )
             .await?;
         let mut out = String::new();
-        for m in result["messages"].as_array().map(|a| a.as_slice()).unwrap_or_default() {
+        for m in result["messages"]
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or_default()
+        {
             // `content` is one block or an array of blocks; text blocks only.
             let one = std::slice::from_ref(&m["content"]);
             let blocks = m["content"].as_array().map(|a| a.as_slice()).unwrap_or(one);
@@ -366,8 +400,9 @@ impl McpHost {
 
     /// True when the server annotated this tool read-only (`readOnlyHint`).
     pub fn is_read_only(&self, qualified: &str) -> bool {
-        let Some((server_name, tool)) =
-            qualified.strip_prefix("mcp__").and_then(|r| r.split_once("__"))
+        let Some((server_name, tool)) = qualified
+            .strip_prefix("mcp__")
+            .and_then(|r| r.split_once("__"))
         else {
             return false;
         };
@@ -401,7 +436,11 @@ impl McpHost {
             .await?;
 
         let mut out = String::new();
-        for block in result["content"].as_array().map(|a| a.as_slice()).unwrap_or_default() {
+        for block in result["content"]
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or_default()
+        {
             match block["type"].as_str() {
                 Some("text") => {
                     if !out.is_empty() {
@@ -414,9 +453,20 @@ impl McpHost {
             }
         }
         if result["isError"].as_bool() == Some(true) {
-            anyhow::bail!("{}", if out.is_empty() { "tool reported an error" } else { &out });
+            anyhow::bail!(
+                "{}",
+                if out.is_empty() {
+                    "tool reported an error"
+                } else {
+                    &out
+                }
+            );
         }
-        Ok(if out.is_empty() { "[no content]".into() } else { out })
+        Ok(if out.is_empty() {
+            "[no content]".into()
+        } else {
+            out
+        })
     }
 }
 
@@ -515,7 +565,11 @@ impl McpServer {
             .request("tools/list", json!({}), STARTUP_TIMEOUT)
             .await
             .context("tools/list failed")?;
-        for t in listed["tools"].as_array().map(|a| a.as_slice()).unwrap_or_default() {
+        for t in listed["tools"]
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or_default()
+        {
             if let Some(tool_name) = t["name"].as_str() {
                 server.tools.push(McpTool {
                     name: tool_name.to_string(),
@@ -531,7 +585,13 @@ impl McpServer {
         // pushes (e.g. atum_subscribe_events deliveries) surface on the
         // user's terminal instead of vanishing. Servers without GET support
         // are detected on the first attempt and left alone.
-        if let Transport::Http { url, headers, session, .. } = &server.transport {
+        if let Transport::Http {
+            url,
+            headers,
+            session,
+            ..
+        } = &server.transport
+        {
             tokio::spawn(notification_stream(
                 server.name.clone(),
                 url.clone(),
@@ -544,8 +604,15 @@ impl McpServer {
         // when the server advertises the capability; a failure here must not
         // take the server down — its tools still work.
         if init["capabilities"]["prompts"].is_object() {
-            if let Ok(listed) = server.request("prompts/list", json!({}), STARTUP_TIMEOUT).await {
-                for p in listed["prompts"].as_array().map(|a| a.as_slice()).unwrap_or_default() {
+            if let Ok(listed) = server
+                .request("prompts/list", json!({}), STARTUP_TIMEOUT)
+                .await
+            {
+                for p in listed["prompts"]
+                    .as_array()
+                    .map(|a| a.as_slice())
+                    .unwrap_or_default()
+                {
                     if let Some(prompt_name) = p["name"].as_str() {
                         let args = p["arguments"]
                             .as_array()
@@ -553,7 +620,10 @@ impl McpServer {
                                 a.iter()
                                     .filter_map(|arg| {
                                         arg["name"].as_str().map(|n| {
-                                            (n.to_string(), arg["required"].as_bool().unwrap_or(false))
+                                            (
+                                                n.to_string(),
+                                                arg["required"].as_bool().unwrap_or(false),
+                                            )
                                         })
                                     })
                                     .collect()
@@ -591,16 +661,25 @@ impl McpServer {
                 }
             }
         }
-        let mut child = cmd.spawn().with_context(|| format!("failed to spawn {command}"))?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("failed to spawn {command}"))?;
         let stdin = child.stdin.take().expect("piped");
         let lines = BufReader::new(child.stdout.take().expect("piped")).lines();
-        Ok(Transport::Stdio { _child: child, stdin, lines })
+        Ok(Transport::Stdio {
+            _child: child,
+            stdin,
+            lines,
+        })
     }
 
     fn start_http(spec: &Value) -> Result<Transport> {
         // Secrets come from the referenced credentials profile (or env) via
         // ${NAME} interpolation — never from the config file itself.
-        let vars = match (spec["credentials"]["file"].as_str(), spec["credentials"]["profile"].as_str()) {
+        let vars = match (
+            spec["credentials"]["file"].as_str(),
+            spec["credentials"]["profile"].as_str(),
+        ) {
             (Some(file), Some(profile)) => {
                 let vars = load_profile(file, profile);
                 if vars.is_empty() {
@@ -638,19 +717,28 @@ impl McpServer {
             }
             Transport::Http { .. } => {
                 // fire-and-forget JSON-RPC notification over HTTP
-                self.http_post(msg, Duration::from_secs(10)).await.map(|_| ())
+                self.http_post(msg, Duration::from_secs(10))
+                    .await
+                    .map(|_| ())
             }
         }
     }
 
     async fn notify(&mut self, method: &str) -> Result<()> {
-        self.send(&json!({"jsonrpc": "2.0", "method": method})).await
+        self.send(&json!({"jsonrpc": "2.0", "method": method}))
+            .await
     }
 
     /// POST one JSON-RPC message; returns the response body (possibly empty
     /// for notifications) and tracks the server's `mcp-session-id`.
     async fn http_post(&mut self, msg: &Value, timeout: Duration) -> Result<String> {
-        let Transport::Http { client, url, headers, session } = &mut self.transport else {
+        let Transport::Http {
+            client,
+            url,
+            headers,
+            session,
+        } = &mut self.transport
+        else {
             unreachable!("http_post on stdio transport");
         };
         let mut req = client
@@ -665,13 +753,20 @@ impl McpServer {
             req = req.header("mcp-session-id", s);
         }
         let resp = req.send().await.context("http request failed")?;
-        if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+        if let Some(sid) = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
             *session = Some(sid.to_string());
         }
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            anyhow::bail!("http {status}: {}", body.chars().take(200).collect::<String>());
+            anyhow::bail!(
+                "http {status}: {}",
+                body.chars().take(200).collect::<String>()
+            );
         }
         Ok(body)
     }
@@ -692,7 +787,9 @@ impl McpServer {
                     if !candidate["error"].is_null() {
                         anyhow::bail!(
                             "{method}: {}",
-                            candidate["error"]["message"].as_str().unwrap_or("unknown error")
+                            candidate["error"]["message"]
+                                .as_str()
+                                .unwrap_or("unknown error")
                         );
                     }
                     return Ok(candidate["result"].clone());
@@ -886,14 +983,20 @@ for line in sys.stdin:
             Err(e) if format!("{e:#}").contains("failed to spawn") => return, // no python3 on host
             Err(e) => panic!("handshake failed: {e:#}"),
         };
-        let mut host = McpHost { servers: vec![server], ..Default::default() };
+        let mut host = McpHost {
+            servers: vec![server],
+            ..Default::default()
+        };
 
         let defs = host.tool_defs();
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "mcp__mock__add");
         assert_eq!(defs[0].description, "Add two numbers");
 
-        let out = host.call("mcp__mock__add", &json!({"a": 2, "b": 3})).await.unwrap();
+        let out = host
+            .call("mcp__mock__add", &json!({"a": 2, "b": 3}))
+            .await
+            .unwrap();
         assert_eq!(out, "5");
 
         // prompts/list became the skills catalog…
@@ -901,10 +1004,16 @@ for line in sys.stdin:
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].server, "mock");
         assert_eq!(skills[0].name, "greet");
-        assert_eq!(skills[0].args, vec![("who".into(), true), ("tone".into(), false)]);
+        assert_eq!(
+            skills[0].args,
+            vec![("who".into(), true), ("tone".into(), false)]
+        );
 
         // …and prompts/get expands one to text
-        let body = host.get_skill("mock", "greet", &json!({"who": "world"})).await.unwrap();
+        let body = host
+            .get_skill("mock", "greet", &json!({"who": "world"}))
+            .await
+            .unwrap();
         assert_eq!(body, "Hello world");
         assert!(host.get_skill("mock", "nope", &json!({})).await.is_err());
     }
@@ -912,13 +1021,20 @@ for line in sys.stdin:
     #[test]
     fn interpolation_and_profiles() {
         let creds = std::env::temp_dir().join(format!("aish_creds_{}", std::process::id()));
-        std::fs::write(&creds, "[other]\nKEY = nope\n[aish]\nKEY = k123\nTENANT=t_1\n").unwrap();
+        std::fs::write(
+            &creds,
+            "[other]\nKEY = nope\n[aish]\nKEY = k123\nTENANT=t_1\n",
+        )
+        .unwrap();
         let vars = load_profile(creds.to_str().unwrap(), "aish");
         assert_eq!(vars["KEY"], "k123");
         assert_eq!(vars["TENANT"], "t_1");
         assert!(load_profile(creds.to_str().unwrap(), "missing").is_empty());
 
-        assert_eq!(interpolate("https://h/${TENANT}/mcp", &vars), "https://h/t_1/mcp");
+        assert_eq!(
+            interpolate("https://h/${TENANT}/mcp", &vars),
+            "https://h/t_1/mcp"
+        );
         assert_eq!(interpolate("${KEY}", &vars), "k123");
         assert_eq!(interpolate("${UNSET_XYZ}", &vars), "${UNSET_XYZ}"); // left for the server to reject
         let _ = std::fs::remove_file(&creds);

@@ -1,6 +1,6 @@
 use super::{Msg, Role, ToolCall, ToolDef, Turn};
-use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -102,8 +102,11 @@ impl GrokOAuthStore {
 
     /// Pure parse (no IO) for unit-testability.
     fn parse(path: &Path, contents: &str) -> Result<Self> {
-        let v: Value = serde_json::from_str(contents).context("~/.grok/auth.json is not valid JSON")?;
-        let obj = v.as_object().context("~/.grok/auth.json: expected a JSON object of logins")?;
+        let v: Value =
+            serde_json::from_str(contents).context("~/.grok/auth.json is not valid JSON")?;
+        let obj = v
+            .as_object()
+            .context("~/.grok/auth.json: expected a JSON object of logins")?;
         let (entry_key, entry) = obj
             .iter()
             .next()
@@ -147,7 +150,10 @@ re-run the Grok CLI login"
             .await
             .context("grok token refresh request failed")?;
         let status = resp.status().as_u16();
-        let v: Value = resp.json().await.context("grok token endpoint returned non-JSON")?;
+        let v: Value = resp
+            .json()
+            .await
+            .context("grok token endpoint returned non-JSON")?;
         if status != 200 {
             let msg = v["error_description"]
                 .as_str()
@@ -173,10 +179,16 @@ re-run the Grok CLI login"
     /// Persist refreshed credentials back into auth.json, preserving every other
     /// field, atomically (temp + rename) and 0600 so a partial/loose write can't
     /// corrupt or expose the token store.
-    fn write_back(&self, access: &str, refresh: Option<&str>, expires_at: Option<&str>) -> Result<()> {
+    fn write_back(
+        &self,
+        access: &str,
+        refresh: Option<&str>,
+        expires_at: Option<&str>,
+    ) -> Result<()> {
         let contents = std::fs::read_to_string(&self.path)
             .with_context(|| format!("re-reading {} for write-back", self.path.display()))?;
-        let mut v: Value = serde_json::from_str(&contents).context("auth.json became invalid JSON")?;
+        let mut v: Value =
+            serde_json::from_str(&contents).context("auth.json became invalid JSON")?;
         apply_refresh_to_entry(&mut v, &self.entry_key, access, refresh, expires_at)?;
         let pretty = serde_json::to_string_pretty(&v).context("serializing refreshed auth.json")?;
         atomic_write_0600(&self.path, &pretty)
@@ -214,7 +226,9 @@ fn form_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -223,7 +237,10 @@ fn form_encode(s: &str) -> String {
 
 /// Seconds since the Unix epoch (0 if the clock is before it — never panics).
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Format Unix seconds as a UTC RFC 3339 timestamp (`YYYY-MM-DDTHH:MM:SSZ`), so
@@ -249,7 +266,10 @@ fn unix_to_rfc3339(secs: u64) -> String {
 /// chmod 0600, then rename over the target (rename is atomic on the same fs).
 fn atomic_write_0600(path: &Path, contents: &str) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("auth.json");
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("auth.json");
     let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, contents)
         .with_context(|| format!("writing temp token file {}", tmp.display()))?;
@@ -375,7 +395,9 @@ impl GrokBackend {
                     let (status, parsed) = match super::read_status_and_json(r).await {
                         Ok(p) => p,
                         Err(e) if !last => {
-                            eprintln!("\x1b[2m  network error reading body ({e}), retrying…\x1b[0m");
+                            eprintln!(
+                                "\x1b[2m  network error reading body ({e}), retrying…\x1b[0m"
+                            );
                             tokio::time::sleep(delay).await;
                             delay = (delay * 2).min(MAX_DELAY);
                             continue;
@@ -386,7 +408,9 @@ impl GrokBackend {
                         Ok(v) => v,
                         Err(snippet) => {
                             if !last {
-                                eprintln!("\x1b[2m  api returned non-JSON ({status}), retrying…\x1b[0m");
+                                eprintln!(
+                                    "\x1b[2m  api returned non-JSON ({status}), retrying…\x1b[0m"
+                                );
                                 tokio::time::sleep(delay).await;
                                 delay = (delay * 2).min(MAX_DELAY);
                                 continue;
@@ -514,7 +538,10 @@ fn parse_response(v: &Value) -> Result<Turn> {
     if let Some(calls) = message["tool_calls"].as_array() {
         for tc in calls {
             let id = tc["id"].as_str().unwrap_or_default().to_string();
-            let name = tc["function"]["name"].as_str().unwrap_or_default().to_string();
+            let name = tc["function"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
             // `arguments` is a STRINGIFIED JSON object (OpenAI convention), not an
             // object — parse it back into a Value, defaulting to {} on failure.
             let args = tc["function"]["arguments"]
@@ -549,7 +576,14 @@ same oversized call.]",
 
     // raw=None always — OpenAI carries no thinking-block echo requirement, so
     // rebuild-from-normalized in render_messages is correct.
-    Ok(Turn { text, tool_calls, raw: None, truncated_tool_call, usage: None, truncated_text: false })
+    Ok(Turn {
+        text,
+        tool_calls,
+        raw: None,
+        truncated_tool_call,
+        usage: None,
+        truncated_text: false,
+    })
 }
 
 /// Render normalized history into OpenAI chat-completions messages. The system
@@ -667,14 +701,25 @@ mod tests {
             raw: None,
         };
         let msgs = render_messages(&[msg]);
-        assert!(msgs[0]["content"].is_null(), "empty assistant text → null content");
+        assert!(
+            msgs[0]["content"].is_null(),
+            "empty assistant text → null content"
+        );
     }
 
     #[test]
     fn render_tool_results_expand_to_one_message_each() {
         let msg = Msg::tool_results(vec![
-            ToolResult { id: "call_1".into(), content: "out1".into(), is_error: false },
-            ToolResult { id: "call_2".into(), content: "out2".into(), is_error: true },
+            ToolResult {
+                id: "call_1".into(),
+                content: "out1".into(),
+                is_error: false,
+            },
+            ToolResult {
+                id: "call_2".into(),
+                content: "out2".into(),
+                is_error: true,
+            },
         ]);
         let msgs = render_messages(&[msg]);
         // One Msg → TWO role:"tool" messages.
@@ -755,7 +800,10 @@ mod tests {
             }]
         });
         let turn = parse_response(&v).unwrap();
-        assert!(turn.tool_calls.is_empty(), "truncated tool call must not execute");
+        assert!(
+            turn.tool_calls.is_empty(),
+            "truncated tool call must not execute"
+        );
         assert!(turn.truncated_tool_call, "must flag so the loop continues");
         assert!(turn.raw.is_none());
         assert!(turn.text.contains("cut off mid-tool-call"));
@@ -772,7 +820,10 @@ mod tests {
         });
         let turn = parse_response(&v).unwrap();
         assert!(turn.tool_calls.is_empty());
-        assert!(!turn.truncated_tool_call, "plain-text truncation isn't a dropped tool call");
+        assert!(
+            !turn.truncated_tool_call,
+            "plain-text truncation isn't a dropped tool call"
+        );
         assert!(turn.text.contains("response truncated"));
     }
 
@@ -798,7 +849,10 @@ mod tests {
                 "expires_at": "2026-06-16T11:26:09.947367Z"
             }
         }"#;
-        assert_eq!(token_from_auth_json(contents).unwrap(), "eyJ0eXAiOiJKV1Qif.payload.sig");
+        assert_eq!(
+            token_from_auth_json(contents).unwrap(),
+            "eyJ0eXAiOiJKV1Qif.payload.sig"
+        );
     }
 
     #[test]
@@ -842,7 +896,14 @@ mod tests {
             r#"{"iss::cid": {"key": "old", "refresh_token": "old_rt", "expires_at": "old_exp", "email": "x@y.z", "user_id": "u1"}}"#,
         )
         .unwrap();
-        apply_refresh_to_entry(&mut v, "iss::cid", "new_access", Some("new_rt"), Some("new_exp")).unwrap();
+        apply_refresh_to_entry(
+            &mut v,
+            "iss::cid",
+            "new_access",
+            Some("new_rt"),
+            Some("new_exp"),
+        )
+        .unwrap();
         let e = &v["iss::cid"];
         assert_eq!(e["key"], "new_access");
         assert_eq!(e["refresh_token"], "new_rt");
@@ -855,10 +916,14 @@ mod tests {
     #[test]
     fn apply_refresh_keeps_old_refresh_token_when_none_returned() {
         let mut v: Value =
-            serde_json::from_str(r#"{"iss::cid": {"key": "old", "refresh_token": "old_rt"}}"#).unwrap();
+            serde_json::from_str(r#"{"iss::cid": {"key": "old", "refresh_token": "old_rt"}}"#)
+                .unwrap();
         apply_refresh_to_entry(&mut v, "iss::cid", "new_access", None, None).unwrap();
         assert_eq!(v["iss::cid"]["key"], "new_access");
-        assert_eq!(v["iss::cid"]["refresh_token"], "old_rt", "no rotation → keep the old token");
+        assert_eq!(
+            v["iss::cid"]["refresh_token"], "old_rt",
+            "no rotation → keep the old token"
+        );
     }
 
     #[test]
@@ -869,7 +934,9 @@ mod tests {
 
     #[test]
     fn sanitize_strips_top_level_schema_key() {
-        let s = sanitize_schema(&json!({"$schema": "http://json-schema.org/draft-07/schema#", "type": "object", "properties": {}}));
+        let s = sanitize_schema(
+            &json!({"$schema": "http://json-schema.org/draft-07/schema#", "type": "object", "properties": {}}),
+        );
         assert!(s.get("$schema").is_none());
         assert_eq!(s["type"], "object");
     }

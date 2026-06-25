@@ -114,10 +114,19 @@ mod tests {
 
     #[test]
     fn parse_invocation_recognises_the_family() {
-        assert_eq!(parse_invocation(":rewrite delete tmp files"), Some("delete tmp files"));
-        assert_eq!(parse_invocation(":rw delete tmp files"), Some("delete tmp files"));
+        assert_eq!(
+            parse_invocation(":rewrite delete tmp files"),
+            Some("delete tmp files")
+        );
+        assert_eq!(
+            parse_invocation(":rw delete tmp files"),
+            Some("delete tmp files")
+        );
         // leading/trailing whitespace around the whole line and the intent is trimmed
-        assert_eq!(parse_invocation("  :rw   find big files  "), Some("find big files"));
+        assert_eq!(
+            parse_invocation("  :rw   find big files  "),
+            Some("find big files")
+        );
         // bare invocation → Some("") so the caller can print usage
         assert_eq!(parse_invocation(":rewrite"), Some(""));
         assert_eq!(parse_invocation(":rw"), Some(""));
@@ -136,7 +145,10 @@ mod tests {
     #[test]
     fn sanitize_takes_first_meaningful_line() {
         assert_eq!(sanitize_candidate("ls -la"), Some("ls -la".to_string()));
-        assert_eq!(sanitize_candidate("  \n\n  ls -la  \n"), Some("ls -la".to_string()));
+        assert_eq!(
+            sanitize_candidate("  \n\n  ls -la  \n"),
+            Some("ls -la".to_string())
+        );
         // first non-empty line wins (defends against a stray trailing note)
         assert_eq!(
             sanitize_candidate("find . -name '*.tmp' -delete\n# done"),
@@ -154,7 +166,10 @@ mod tests {
             sanitize_candidate("```\ndu -sh *\n```"),
             Some("du -sh *".to_string())
         );
-        assert_eq!(sanitize_candidate("$ git status"), Some("git status".to_string()));
+        assert_eq!(
+            sanitize_candidate("$ git status"),
+            Some("git status".to_string())
+        );
         assert_eq!(sanitize_candidate("% pwd"), Some("pwd".to_string()));
     }
 
@@ -174,6 +189,9 @@ mod tests {
         let p = build_user_prompt(&PathBuf::from("/tmp/work"), "  list files  ");
         assert!(p.contains("Current directory: /tmp/work"));
         assert!(p.contains("Host OS:"));
-        assert!(p.contains("Intent: list files"), "intent trimmed + present: {p}");
+        assert!(
+            p.contains("Intent: list files"),
+            "intent trimmed + present: {p}"
+        );
     }
 }

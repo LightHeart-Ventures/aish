@@ -53,7 +53,12 @@ enum Step {
 /// (TASK-18). Returns the exit status of the last executed line (`$?`), matching
 /// `sh script`. A read error is surfaced as an `Err` so `main` can report it and
 /// exit non-zero.
-pub async fn run(backend: &Backend, session: &mut Session, path: &Path, args: &[String]) -> Result<i32> {
+pub async fn run(
+    backend: &Backend,
+    session: &mut Session,
+    path: &Path,
+    args: &[String],
+) -> Result<i32> {
     let src = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("aish: cannot read script {}: {e}", path.display()))?;
     // Positional parameters: params[0] = $0 (the script path), params[1..] = $1…
@@ -83,7 +88,15 @@ pub async fn run(backend: &Backend, session: &mut Session, path: &Path, args: &[
             continue;
         }
         if route != Route::Model {
-            match run_directly(&line, route == Route::Direct, session, &params, &mut prev_dir).await {
+            match run_directly(
+                &line,
+                route == Route::Direct,
+                session,
+                &params,
+                &mut prev_dir,
+            )
+            .await
+            {
                 Step::Ran => continue,
                 Step::Quit => break,
                 Step::NotACommand => {}
@@ -158,9 +171,10 @@ async fn run_directly(
     // A pipeline `a | b | c` runs directly only when every stage is a real
     // program; otherwise it routes to the model (matching the REPL).
     if let Some(stages) = pipeline::parse(line) {
-        let all_resolve = stages
-            .iter()
-            .all(|s| s.first().is_some_and(|p| resolve_program(p, &session.cwd, &path_var).is_some()));
+        let all_resolve = stages.iter().all(|s| {
+            s.first()
+                .is_some_and(|p| resolve_program(p, &session.cwd, &path_var).is_some())
+        });
         if all_resolve {
             match pipeline::run(&stages, session).await {
                 Ok(status) => {
@@ -187,7 +201,9 @@ async fn run_directly(
     // process environment — what the spawned program would see.
     let Some(mut words) = rc::tokenize_with(line, var_lookup(session, params)) else {
         if force {
-            eprintln!("aish: can't run that directly — it uses shell syntax aish doesn't implement");
+            eprintln!(
+                "aish: can't run that directly — it uses shell syntax aish doesn't implement"
+            );
             session.last_status = 1;
             return Step::Ran;
         }
@@ -324,7 +340,10 @@ fn positional(name: &str, params: &[String]) -> Option<String> {
 /// Resolution order: `$?` (last exit status) and `$$` (shell pid) first, then
 /// the script's positional parameters (`$0`/`$1`/`$#`/`$@`/…), then session
 /// exports (a user override wins), then the process environment.
-fn var_lookup<'a>(session: &'a Session, params: &'a [String]) -> impl Fn(&str) -> Option<String> + 'a {
+fn var_lookup<'a>(
+    session: &'a Session,
+    params: &'a [String],
+) -> impl Fn(&str) -> Option<String> + 'a {
     move |name: &str| {
         if name == "?" {
             return Some(session.last_status.to_string());
@@ -412,7 +431,10 @@ mod tests {
         assert_eq!(positional("#", &params).as_deref(), Some("0"));
         assert_eq!(positional("@", &params).as_deref(), Some(""));
         assert_eq!(positional("1", &params).as_deref(), Some(""));
-        assert_eq!(positional("0", &params).as_deref(), Some("/tmp/noargs.aish"));
+        assert_eq!(
+            positional("0", &params).as_deref(),
+            Some("/tmp/noargs.aish")
+        );
     }
 
     #[test]
@@ -430,7 +452,10 @@ mod tests {
         assert_eq!(lookup("@").as_deref(), Some("world"));
         // Specials: `$?` is the last status, `$$` the live pid.
         assert_eq!(lookup("?").as_deref(), Some("7"));
-        assert_eq!(lookup("$").as_deref(), Some(&*std::process::id().to_string()));
+        assert_eq!(
+            lookup("$").as_deref(),
+            Some(&*std::process::id().to_string())
+        );
         // Session exports still resolve (and aren't shadowed by positionals).
         assert_eq!(lookup("GREETING").as_deref(), Some("hello"));
         // An unknown name is None (var_lookup falls through to the env, which
@@ -448,9 +473,15 @@ mod tests {
             "staging".to_string(),
             "v2".to_string(),
         ];
-        let words = rc::tokenize_with("echo deploying $1 $2 count $#", var_lookup(&session, &params))
-            .expect("line tokenizes");
-        assert_eq!(words, vec!["echo", "deploying", "staging", "v2", "count", "2"]);
+        let words = rc::tokenize_with(
+            "echo deploying $1 $2 count $#",
+            var_lookup(&session, &params),
+        )
+        .expect("line tokenizes");
+        assert_eq!(
+            words,
+            vec!["echo", "deploying", "staging", "v2", "count", "2"]
+        );
 
         // `$@` expands to the args space-joined as a SINGLE word — aish never
         // re-splits an expansion (a variable can't smuggle extra argv words).

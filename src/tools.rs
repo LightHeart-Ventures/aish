@@ -135,7 +135,9 @@ fn gate_delete(
         .collect();
     if session.is_tool_allowed(bin)
         || (!paths.is_empty()
-            && paths.iter().all(|p| session.is_path_allowed(Perm::Delete.as_str(), p)))
+            && paths
+                .iter()
+                .all(|p| session.is_path_allowed(Perm::Delete.as_str(), p)))
     {
         return true;
     }
@@ -218,7 +220,8 @@ whenever you need the output."
         ToolDef {
             name: "read_file".into(),
             description: "Read a file's contents. Call this instead of running cat/head/tail. \
-Relative paths resolve against the shell's current directory.".into(),
+Relative paths resolve against the shell's current directory."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -227,8 +230,10 @@ Relative paths resolve against the shell's current directory.".into(),
         },
         ToolDef {
             name: "write_file".into(),
-            description: "Create or overwrite a file with the given content. Call this whenever the \
-user wants a file created or changed — never try echo/tee tricks.".into(),
+            description:
+                "Create or overwrite a file with the given content. Call this whenever the \
+user wants a file created or changed — never try echo/tee tricks."
+                    .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -241,7 +246,8 @@ user wants a file created or changed — never try echo/tee tricks.".into(),
         ToolDef {
             name: "list_dir".into(),
             description: "List a directory's entries (name, type, size). Call this instead of ls, \
-and to expand wildcards since globs don't exist here. Defaults to the current directory.".into(),
+and to expand wildcards since globs don't exist here. Defaults to the current directory."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {"path": {"type": "string", "description": "Optional; defaults to cwd"}}
@@ -251,7 +257,8 @@ and to expand wildcards since globs don't exist here. Defaults to the current di
             name: "remember".into(),
             description: "Save one durable memory (user preference, project fact, lesson learned) \
 to aish's persistent store — it survives across sessions. Keep each memory a single \
-self-contained sentence.".into(),
+self-contained sentence."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -264,7 +271,8 @@ self-contained sentence.".into(),
         ToolDef {
             name: "recall".into(),
             description: "Search persistent memories by keyword (empty query → most recent). \
-Check here when past context might matter: preferences, project facts, prior decisions.".into(),
+Check here when past context might matter: preferences, project facts, prior decisions."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -275,8 +283,10 @@ Check here when past context might matter: preferences, project facts, prior dec
         },
         ToolDef {
             name: "change_dir".into(),
-            description: "Change the shell's working directory for all subsequent operations. Call \
-this whenever the user says cd / go to / work in some directory.".into(),
+            description:
+                "Change the shell's working directory for all subsequent operations. Call \
+this whenever the user says cd / go to / work in some directory."
+                    .into(),
             schema: json!({
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -287,7 +297,8 @@ this whenever the user says cd / go to / work in some directory.".into(),
             name: "job_output".into(),
             description: "Read a background job's accumulated output and status (started via \
 run_program with background:true). Use this to check on watchers/listeners you started earlier — \
-their output does NOT reach you by push, only the user's terminal sees it live.".into(),
+their output does NOT reach you by push, only the user's terminal sees it live."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -299,7 +310,8 @@ their output does NOT reach you by push, only the user's terminal sees it live."
         ToolDef {
             name: "get_skill".into(),
             description: "Fetch an MCP-published skill playbook (the system prompt lists them \
-under 'MCP skills'). Returns the expanded instructions — read them, then follow them.".into(),
+under 'MCP skills'). Returns the expanded instructions — read them, then follow them."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -335,11 +347,12 @@ a backend or worry about batches — just describe the task and offload it."
         });
         defs.push(ToolDef {
             name: "background_status".into(),
-            description: "List ALL background jobs and their LIVE status — background coordinators \
+            description:
+                "List ALL background jobs and their LIVE status — background coordinators \
 (running in this session) and durable coordinator runs / Anthropic batch jobs (shared across \
 sessions). Call this to answer \"what's running?\" / \"status\" instead of guessing or inventing \
 your own tracking. Returns a table: id, kind, owner, status, task, result."
-                .into(),
+                    .into(),
             schema: json!({ "type": "object", "properties": {} }),
         });
         // The agent-facing side of the `:tell` channel (the human types `:tell`;
@@ -388,7 +401,11 @@ Escalating beats guessing."
 }
 
 /// Execute one tool call, routing mutating actions through the safety gate.
-pub async fn execute(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> ToolResult {
+pub async fn execute(
+    call: &ToolCall,
+    session: &mut Session,
+    confirm: &mut Confirm<'_>,
+) -> ToolResult {
     // Paranoid mode confirms everything once, centrally; the per-tool gates
     // below then stand down (see exec_needs_confirm and friends).
     // read_file/write_file and run_program/run_interactive run their OWN gates
@@ -401,7 +418,12 @@ pub async fn execute(call: &ToolCall, session: &mut Session, confirm: &mut Confi
         )
     {
         let args = truncate_middle(serde_json::to_string(&call.args).unwrap_or_default(), 200);
-        if !gate(session, &allow_key(call), &format!("{} {args}", call.name), confirm) {
+        if !gate(
+            session,
+            &allow_key(call),
+            &format!("{} {args}", call.name),
+            confirm,
+        ) {
             return ToolResult {
                 id: call.id.clone(),
                 content: "user declined this tool call".into(),
@@ -429,8 +451,16 @@ pub async fn execute(call: &ToolCall, session: &mut Session, confirm: &mut Confi
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
     };
     match result {
-        Ok(content) => ToolResult { id: call.id.clone(), content, is_error: false },
-        Err(e) => ToolResult { id: call.id.clone(), content: format!("error: {e:#}"), is_error: true },
+        Ok(content) => ToolResult {
+            id: call.id.clone(),
+            content,
+            is_error: false,
+        },
+        Err(e) => ToolResult {
+            id: call.id.clone(),
+            content: format!("error: {e:#}"),
+            is_error: true,
+        },
     }
 }
 
@@ -452,39 +482,128 @@ fn resolve(session: &Session, path: &str) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 const READ_ONLY_PROGRAMS: &[&str] = &[
-    "ls", "cat", "pwd", "grep", "rg", "find", "fd", "head", "tail", "wc", "which",
-    "whereis", "ps", "df", "du", "stat", "file", "env", "printenv", "date", "whoami",
-    "id", "uname", "free", "uptime", "hostname", "tree", "realpath", "readlink",
-    "basename", "dirname", "echo", "sort", "uniq", "cut", "less", "more", "lsblk",
-    "lscpu", "lsusb", "lspci", "uptime", "cal", "type", "md5sum", "sha256sum", "diff",
+    "ls",
+    "cat",
+    "pwd",
+    "grep",
+    "rg",
+    "find",
+    "fd",
+    "head",
+    "tail",
+    "wc",
+    "which",
+    "whereis",
+    "ps",
+    "df",
+    "du",
+    "stat",
+    "file",
+    "env",
+    "printenv",
+    "date",
+    "whoami",
+    "id",
+    "uname",
+    "free",
+    "uptime",
+    "hostname",
+    "tree",
+    "realpath",
+    "readlink",
+    "basename",
+    "dirname",
+    "echo",
+    "sort",
+    "uniq",
+    "cut",
+    "less",
+    "more",
+    "lsblk",
+    "lscpu",
+    "lsusb",
+    "lspci",
+    "uptime",
+    "cal",
+    "type",
+    "md5sum",
+    "sha256sum",
+    "diff",
 ];
 
 const GIT_READ_ONLY: &[&str] = &[
-    "status", "log", "diff", "show", "branch", "remote", "ls-files", "blame",
-    "shortlog", "describe", "rev-parse", "config", "stash",
+    "status",
+    "log",
+    "diff",
+    "show",
+    "branch",
+    "remote",
+    "ls-files",
+    "blame",
+    "shortlog",
+    "describe",
+    "rev-parse",
+    "config",
+    "stash",
 ];
 
 /// Programs whose whole purpose is to mutate — always confirm.
 const DESTRUCTIVE_PROGRAMS: &[&str] = &[
-    "rm", "rmdir", "unlink", "mv", "cp", "dd", "shred", "truncate", "mkdir", "touch",
-    "ln", "chmod", "chown", "chgrp", "tee", "kill", "pkill", "killall", "mkfs",
-    "fdisk", "parted", "mount", "umount", "reboot", "shutdown", "poweroff", "halt",
-    "useradd", "userdel", "usermod", "groupadd", "groupdel", "passwd",
+    "rm", "rmdir", "unlink", "mv", "cp", "dd", "shred", "truncate", "mkdir", "touch", "ln",
+    "chmod", "chown", "chgrp", "tee", "kill", "pkill", "killall", "mkfs", "fdisk", "parted",
+    "mount", "umount", "reboot", "shutdown", "poweroff", "halt", "useradd", "userdel", "usermod",
+    "groupadd", "groupdel", "passwd",
 ];
 
 /// Mutating subcommand verbs for multi-tools (aws, kubectl, docker, npm, …).
 /// Matched against each arg exactly or as a `verb-…`/`verb_…` prefix, so
 /// `aws s3 rm`, `s3api delete-bucket`, and `ec2 terminate-instances` all hit.
 const DESTRUCTIVE_VERBS: &[&str] = &[
-    "rm", "rb", "delete", "del", "remove", "destroy", "drop", "purge", "prune",
-    "terminate", "uninstall", "reset", "revert", "rollback", "kill",
-    "create", "mb", "put", "push", "apply", "set", "update", "upgrade", "install",
-    "add", "write", "import", "restore", "sync", "cp", "mv", "deploy", "publish", "new",
-    "format", "chmod", "chown", "exec",
+    "rm",
+    "rb",
+    "delete",
+    "del",
+    "remove",
+    "destroy",
+    "drop",
+    "purge",
+    "prune",
+    "terminate",
+    "uninstall",
+    "reset",
+    "revert",
+    "rollback",
+    "kill",
+    "create",
+    "mb",
+    "put",
+    "push",
+    "apply",
+    "set",
+    "update",
+    "upgrade",
+    "install",
+    "add",
+    "write",
+    "import",
+    "restore",
+    "sync",
+    "cp",
+    "mv",
+    "deploy",
+    "publish",
+    "new",
+    "format",
+    "chmod",
+    "chown",
+    "exec",
 ];
 
 fn bin_name(program: &str) -> &str {
-    Path::new(program).file_name().and_then(|s| s.to_str()).unwrap_or(program)
+    Path::new(program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program)
 }
 
 fn git_is_read_only(args: &[String]) -> bool {
@@ -647,7 +766,11 @@ fn parse_argv(call: &ToolCall) -> Result<(String, Vec<String>)> {
         .to_string();
     let args: Vec<String> = call.args["args"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     // Defend against the model echoing the binary into argv[0] (see
     // dedup_program_argv): `gh gh pr create` would otherwise fail as an unknown
@@ -655,14 +778,21 @@ fn parse_argv(call: &ToolCall) -> Result<(String, Vec<String>)> {
     let args = dedup_program_argv(&program, args);
 
     // The "no shell" invariant: refuse to be a backdoor into one.
-    let bin = Path::new(&program).file_name().and_then(|s| s.to_str()).unwrap_or(&program);
+    let bin = Path::new(&program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&program);
     if matches!(bin, "sh" | "bash" | "zsh" | "dash" | "fish" | "ksh") {
         anyhow::bail!("aish does not invoke shells — call the underlying program directly");
     }
     Ok((program, args))
 }
 
-async fn run_program(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
+async fn run_program(
+    call: &ToolCall,
+    session: &mut Session,
+    confirm: &mut Confirm<'_>,
+) -> Result<String> {
     let (program, args) = parse_argv(call)?;
 
     // Default-branch guard: never let an agent commit on / push the default
@@ -740,8 +870,14 @@ branch, and open a pull request (gh pr create) instead."
     // a full pipe, and so a timed-out kill still returns what it printed.
     // Half the budget per stream: the combined result must fit under MAX_OUTPUT
     // or the final truncate_middle would eat the capture's own drop markers.
-    let mut out_task = tokio::spawn(drain_capped(child.stdout.take().expect("piped"), MAX_OUTPUT / 2));
-    let mut err_task = tokio::spawn(drain_capped(child.stderr.take().expect("piped"), MAX_OUTPUT / 2));
+    let mut out_task = tokio::spawn(drain_capped(
+        child.stdout.take().expect("piped"),
+        MAX_OUTPUT / 2,
+    ));
+    let mut err_task = tokio::spawn(drain_capped(
+        child.stderr.take().expect("piped"),
+        MAX_OUTPUT / 2,
+    ));
 
     let mut timed_out = false;
     let status = tokio::select! {
@@ -915,7 +1051,10 @@ fn spawn_background(
             Err(e) => format!("wait failed: {e}"),
         };
         waiter_job.finish(summary.clone());
-        announce(&format!("[job {}]", waiter_job.id), &format!("{summary} — {}", waiter_job.desc));
+        announce(
+            &format!("[job {}]", waiter_job.id),
+            &format!("{summary} — {}", waiter_job.desc),
+        );
     });
 
     jobs.push(job);
@@ -942,7 +1081,9 @@ where
 }
 
 fn job_output(call: &ToolCall, session: &Session) -> Result<String> {
-    let id = call.args["job"].as_u64().ok_or_else(|| anyhow::anyhow!("missing job id"))? as usize;
+    let id = call.args["job"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("missing job id"))? as usize;
     let jobs = session.jobs.lock().unwrap();
     let job = jobs
         .iter()
@@ -953,7 +1094,11 @@ fn job_output(call: &ToolCall, session: &Session) -> Result<String> {
         "[job {id}: {}] {}\n{}",
         job.status(),
         job.desc,
-        if buf.is_empty() { "(no output yet)" } else { buf.as_str() }
+        if buf.is_empty() {
+            "(no output yet)"
+        } else {
+            buf.as_str()
+        }
     ))
 }
 
@@ -1071,9 +1216,11 @@ ANTHROPIC_API_KEY — a Claude subscription token (CLAUDE_CODE_OAUTH_TOKEN) can'
             session.session_id.clone(),
             session.name.clone(),
         );
-        return Ok("Queued in the background. Now reply with one short, natural sentence that \
+        return Ok(
+            "Queued in the background. Now reply with one short, natural sentence that \
 you're working on it and the answer will appear here when ready — no job id, no restating the task."
-            .to_string());
+                .to_string(),
+        );
     }
 
     let exe = std::env::current_exe()
@@ -1146,13 +1293,19 @@ fn tell(call: &ToolCall, session: &Session) -> Result<String> {
     let mut candidates: Vec<(String, bool)> = Vec::new();
     for w in session.worker_jobs.lock().unwrap().iter() {
         if hit(&w.id) {
-            candidates.push((w.id.clone(), matches!(w.status().as_str(), "done" | "failed")));
+            candidates.push((
+                w.id.clone(),
+                matches!(w.status().as_str(), "done" | "failed"),
+            ));
         }
     }
     if let Ok(rows) = store.load_all() {
         for r in rows {
             if hit(&r.run_id) && !candidates.iter().any(|(rid, _)| rid == &r.run_id) {
-                candidates.push((r.run_id.clone(), matches!(r.phase.as_str(), "done" | "failed")));
+                candidates.push((
+                    r.run_id.clone(),
+                    matches!(r.phase.as_str(), "done" | "failed"),
+                ));
             }
         }
     }
@@ -1197,7 +1350,7 @@ fn background_status(session: &Session) -> Result<String> {
             t
         }
     };
-    
+
     let format_result = |result: Option<&String>, error: Option<&String>| -> String {
         match (result, error) {
             (Some(r), None) => {
@@ -1220,9 +1373,10 @@ fn background_status(session: &Session) -> Result<String> {
             _ => "—".to_string(),
         }
     };
-    
-    let mut out =
-        String::from("| ID | Kind | Owner | Status | Since | Task | Result |\n|---|---|---|---|---|---|---|\n");
+
+    let mut out = String::from(
+        "| ID | Kind | Owner | Status | Since | Task | Result |\n|---|---|---|---|---|---|---|\n",
+    );
     let mut any = false;
 
     // This session's full-tool background coordinators (in memory; the live
@@ -1247,7 +1401,11 @@ fn background_status(session: &Session) -> Result<String> {
                 } else {
                     r.session_name
                         .clone()
-                        .or_else(|| r.session_id.as_deref().map(|s| crate::batch::short_id(s).to_string()))
+                        .or_else(|| {
+                            r.session_id
+                                .as_deref()
+                                .map(|s| crate::batch::short_id(s).to_string())
+                        })
                         .unwrap_or_else(|| "—".into())
                 };
                 let result = format_result(r.result.as_ref(), r.error.as_ref());
@@ -1272,7 +1430,11 @@ fn background_status(session: &Session) -> Result<String> {
                 let owner = r
                     .session_name
                     .clone()
-                    .or_else(|| r.session_id.as_deref().map(|s| crate::batch::short_id(s).to_string()))
+                    .or_else(|| {
+                        r.session_id
+                            .as_deref()
+                            .map(|s| crate::batch::short_id(s).to_string())
+                    })
                     .unwrap_or_else(|| "—".into());
                 let owner = if r.session_id.as_deref() == Some(session.session_id.as_str()) {
                     format!("{owner} (you)")
@@ -1312,10 +1474,22 @@ fn batch_result(call: &ToolCall, session: &Session) -> Result<String> {
 
     // Full-tool workers auto-deliver, but the model sometimes reflexively fetches
     // one — so check worker_jobs too rather than reporting "no such job".
-    if let Some(w) = session.worker_jobs.lock().unwrap().iter().find(|j| hit(&j.id)) {
+    if let Some(w) = session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|j| hit(&j.id))
+    {
         return Ok(w.fetch());
     }
-    if let Some(j) = session.batch_jobs.lock().unwrap().iter().find(|j| hit(&j.id)) {
+    if let Some(j) = session
+        .batch_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|j| hit(&j.id))
+    {
         return Ok(j.fetch());
     }
     anyhow::bail!(
@@ -1335,10 +1509,14 @@ fn resolve_env(call: &ToolCall, session: &Session) -> Vec<(String, String)> {
     let Some(map) = call.args["env"].as_object() else {
         return Vec::new();
     };
-    let creds = format!("{}/.atum/credentials", std::env::var("HOME").unwrap_or_default());
+    let creds = format!(
+        "{}/.atum/credentials",
+        std::env::var("HOME").unwrap_or_default()
+    );
     map.iter()
         .filter_map(|(k, v)| {
-            v.as_str().map(|v| (k.clone(), resolve_env_value(v, &session.env, &creds)))
+            v.as_str()
+                .map(|v| (k.clone(), resolve_env_value(v, &session.env, &creds)))
         })
         .collect()
 }
@@ -1355,7 +1533,9 @@ fn resolve_env_value(raw: &str, session_env: &[(String, String)], creds_file: &s
         };
         let name = &after[..end];
         let resolved = if let Some((profile, key)) = name.split_once(':') {
-            crate::mcp::load_profile(creds_file, profile).get(key).cloned()
+            crate::mcp::load_profile(creds_file, profile)
+                .get(key)
+                .cloned()
         } else {
             session_env
                 .iter()
@@ -1431,7 +1611,11 @@ async fn await_capture(task: &mut tokio::task::JoinHandle<(Vec<u8>, Vec<u8>, u64
     }
 }
 
-async fn run_interactive(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
+async fn run_interactive(
+    call: &ToolCall,
+    session: &mut Session,
+    confirm: &mut Confirm<'_>,
+) -> Result<String> {
     let (program, args) = parse_argv(call)?;
     let env = resolve_env(call, session);
 
@@ -1553,7 +1737,11 @@ fn reap_foreground(pid: libc::pid_t) -> Result<Option<std::process::ExitStatus>>
     loop {
         let mut status: libc::c_int = 0;
         let r = unsafe {
-            libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED)
+            libc::waitpid(
+                pid,
+                &mut status,
+                libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED,
+            )
         };
         if r == 0 {
             return Ok(None); // no state change for our child yet
@@ -1695,21 +1883,37 @@ impl Drop for TtyGuard {
 /// MCP tools come from outside the safety gate's knowledge — confirm them in
 /// careful/normal mode unless the server declared the tool read-only
 /// (the MCP `readOnlyHint` annotation).
-async fn mcp_call(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
-    let gated = matches!(session.mode, crate::session::Mode::Careful | crate::session::Mode::Normal)
-        && !session.mcp.is_read_only(&call.name);
+async fn mcp_call(
+    call: &ToolCall,
+    session: &mut Session,
+    confirm: &mut Confirm<'_>,
+) -> Result<String> {
+    let gated = matches!(
+        session.mode,
+        crate::session::Mode::Careful | crate::session::Mode::Normal
+    ) && !session.mcp.is_read_only(&call.name);
     if gated {
         let args = serde_json::to_string(&call.args).unwrap_or_default();
         let args = truncate_middle(args, 200);
-        if !gate(session, &call.name, &format!("{} {args}", call.name), confirm) {
+        if !gate(
+            session,
+            &call.name,
+            &format!("{} {args}", call.name),
+            confirm,
+        ) {
             return Ok("user declined this tool call".into());
         }
     }
-    Ok(truncate_middle(session.mcp.call(&call.name, &call.args).await?, MAX_OUTPUT))
+    Ok(truncate_middle(
+        session.mcp.call(&call.name, &call.args).await?,
+        MAX_OUTPUT,
+    ))
 }
 
 fn read_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
-    let path = call.args["path"].as_str().ok_or_else(|| anyhow::anyhow!("missing path"))?;
+    let path = call.args["path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing path"))?;
     let full = resolve(session, path);
     // Reads run free except in paranoid mode, where they confirm — with the 'd'
     // option to allow every read under the file's directory recursively.
@@ -1719,14 +1923,18 @@ fn read_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) 
             return Ok("user declined the read".into());
         }
     }
-    let content = std::fs::read_to_string(&full)
-        .map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
+    let content =
+        std::fs::read_to_string(&full).map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
     Ok(truncate_middle(content, MAX_FILE_READ))
 }
 
 fn write_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
-    let path = call.args["path"].as_str().ok_or_else(|| anyhow::anyhow!("missing path"))?;
-    let content = call.args["content"].as_str().ok_or_else(|| anyhow::anyhow!("missing content"))?;
+    let path = call.args["path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing path"))?;
+    let content = call.args["content"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing content"))?;
     let full = resolve(session, path);
 
     // A write is destructive in every mode short of yolo. The 'd' option allows
@@ -1734,9 +1942,17 @@ fn write_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>)
     if !matches!(session.mode, crate::session::Mode::Yolo) {
         let preview: String = content.lines().take(5).collect::<Vec<_>>().join("\n  │ ");
         let more = content.lines().count().saturating_sub(5);
-        let suffix = if more > 0 { format!("\n  │ … +{more} lines") } else { String::new() };
+        let suffix = if more > 0 {
+            format!("\n  │ … +{more} lines")
+        } else {
+            String::new()
+        };
         let action = if full.exists() { "overwrite" } else { "write" };
-        let prompt = format!("{action} {} ({} bytes)\n  │ {preview}{suffix}\n ", full.display(), content.len());
+        let prompt = format!(
+            "{action} {} ({} bytes)\n  │ {preview}{suffix}\n ",
+            full.display(),
+            content.len()
+        );
         if !gate_path(session, Perm::Write, &full, "write_file", &prompt, confirm) {
             return Ok("user declined the write".into());
         }
@@ -1746,7 +1962,11 @@ fn write_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>)
         std::fs::create_dir_all(parent).ok();
     }
     std::fs::write(&full, content).map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
-    Ok(format!("wrote {} bytes to {}", content.len(), full.display()))
+    Ok(format!(
+        "wrote {} bytes to {}",
+        content.len(),
+        full.display()
+    ))
 }
 
 fn list_dir(call: &ToolCall, session: &Session) -> Result<String> {
@@ -1756,9 +1976,22 @@ fn list_dir(call: &ToolCall, session: &Session) -> Result<String> {
     for entry in std::fs::read_dir(&full).map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))? {
         let entry = entry?;
         let meta = entry.metadata()?;
-        let kind = if meta.is_dir() { "dir " } else if meta.is_symlink() { "link" } else { "file" };
-        let size = if meta.is_file() { format!(" {}", meta.len()) } else { String::new() };
-        entries.push(format!("{kind} {}{size}", entry.file_name().to_string_lossy()));
+        let kind = if meta.is_dir() {
+            "dir "
+        } else if meta.is_symlink() {
+            "link"
+        } else {
+            "file"
+        };
+        let size = if meta.is_file() {
+            format!(" {}", meta.len())
+        } else {
+            String::new()
+        };
+        entries.push(format!(
+            "{kind} {}{size}",
+            entry.file_name().to_string_lossy()
+        ));
     }
     entries.sort();
     if entries.is_empty() {
@@ -1768,29 +2001,51 @@ fn list_dir(call: &ToolCall, session: &Session) -> Result<String> {
 }
 
 fn remember(call: &ToolCall, session: &Session) -> Result<String> {
-    let db = session.db.as_ref().ok_or_else(|| anyhow::anyhow!("memory store unavailable"))?;
-    let content = call.args["content"].as_str().ok_or_else(|| anyhow::anyhow!("missing content"))?;
+    let db = session
+        .db
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("memory store unavailable"))?;
+    let content = call.args["content"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing content"))?;
     let id = db.remember(content, call.args["tags"].as_str())?;
     Ok(format!("remembered (#{id})"))
 }
 
 fn recall(call: &ToolCall, session: &Session) -> Result<String> {
-    let db = session.db.as_ref().ok_or_else(|| anyhow::anyhow!("memory store unavailable"))?;
+    let db = session
+        .db
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("memory store unavailable"))?;
     let query = call.args["query"].as_str().unwrap_or("");
     let limit = call.args["limit"].as_u64().unwrap_or(8) as usize;
     let hits = db.recall(query, limit)?;
-    Ok(if hits.is_empty() { "no memories match".into() } else { hits.join("\n") })
+    Ok(if hits.is_empty() {
+        "no memories match".into()
+    } else {
+        hits.join("\n")
+    })
 }
 
 async fn get_skill(call: &ToolCall, session: &mut Session) -> Result<String> {
-    let server = call.args["server"].as_str().ok_or_else(|| anyhow::anyhow!("missing server"))?;
-    let name = call.args["name"].as_str().ok_or_else(|| anyhow::anyhow!("missing name"))?;
-    let args = if call.args["args"].is_object() { call.args["args"].clone() } else { json!({}) };
+    let server = call.args["server"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing server"))?;
+    let name = call.args["name"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing name"))?;
+    let args = if call.args["args"].is_object() {
+        call.args["args"].clone()
+    } else {
+        json!({})
+    };
     session.mcp.get_skill(server, name, &args).await
 }
 
 fn change_dir(call: &ToolCall, session: &mut Session) -> Result<String> {
-    let path = call.args["path"].as_str().ok_or_else(|| anyhow::anyhow!("missing path"))?;
+    let path = call.args["path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing path"))?;
     let full = resolve(session, path);
     let canonical = full
         .canonicalize()
@@ -1799,7 +2054,10 @@ fn change_dir(call: &ToolCall, session: &mut Session) -> Result<String> {
         anyhow::bail!("{} is not a directory", canonical.display());
     }
     session.cwd = canonical;
-    Ok(format!("working directory is now {}", session.cwd.display()))
+    Ok(format!(
+        "working directory is now {}",
+        session.cwd.display()
+    ))
 }
 
 /// Keep head + tail when output exceeds the cap; the middle is least useful.
@@ -1886,19 +2144,38 @@ mod tests {
     #[test]
     fn env_value_resolution() {
         let creds = std::env::temp_dir().join(format!("aish_env_creds_{}", std::process::id()));
-        std::fs::write(&creds, "[aish]\nATUM_API_KEY = sk_secret\n[other]\nATUM_API_KEY = nope\n").unwrap();
+        std::fs::write(
+            &creds,
+            "[aish]\nATUM_API_KEY = sk_secret\n[other]\nATUM_API_KEY = nope\n",
+        )
+        .unwrap();
         let creds = creds.to_str().unwrap().to_string();
         let session_env = vec![("FOO".to_string(), "from_session".to_string())];
 
         // session exports win; ${profile:KEY} reads the right INI section
-        assert_eq!(resolve_env_value("${FOO}", &session_env, &creds), "from_session");
-        assert_eq!(resolve_env_value("${aish:ATUM_API_KEY}", &session_env, &creds), "sk_secret");
+        assert_eq!(
+            resolve_env_value("${FOO}", &session_env, &creds),
+            "from_session"
+        );
+        assert_eq!(
+            resolve_env_value("${aish:ATUM_API_KEY}", &session_env, &creds),
+            "sk_secret"
+        );
         // composition with literal text
-        assert_eq!(resolve_env_value("Bearer ${aish:ATUM_API_KEY}!", &session_env, &creds), "Bearer sk_secret!");
+        assert_eq!(
+            resolve_env_value("Bearer ${aish:ATUM_API_KEY}!", &session_env, &creds),
+            "Bearer sk_secret!"
+        );
         // process env fallback (PATH is always set), unresolved kept verbatim
         assert_ne!(resolve_env_value("${PATH}", &[], &creds), "${PATH}");
-        assert_eq!(resolve_env_value("${NO_SUCH_VAR_XYZ}", &[], &creds), "${NO_SUCH_VAR_XYZ}");
-        assert_eq!(resolve_env_value("${missing:KEY}", &[], &creds), "${missing:KEY}");
+        assert_eq!(
+            resolve_env_value("${NO_SUCH_VAR_XYZ}", &[], &creds),
+            "${NO_SUCH_VAR_XYZ}"
+        );
+        assert_eq!(
+            resolve_env_value("${missing:KEY}", &[], &creds),
+            "${missing:KEY}"
+        );
         // no references: passthrough
         assert_eq!(resolve_env_value("plain", &[], &creds), "plain");
         let _ = std::fs::remove_file(&creds);
@@ -1909,7 +2186,11 @@ mod tests {
         if let Some(t) = timeout_secs {
             a["timeout_secs"] = json!(t);
         }
-        ToolCall { id: "t1".into(), name: "run_program".into(), args: a }
+        ToolCall {
+            id: "t1".into(),
+            name: "run_program".into(),
+            args: a,
+        }
     }
 
     async fn run(c: &ToolCall) -> String {
@@ -1931,12 +2212,21 @@ mod tests {
     fn dedup_program_argv_strips_echoed_binary() {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         // The reported bug: the model repeats the binary as argv[0].
-        assert_eq!(dedup_program_argv("gh", v(&["gh", "pr", "create"])), v(&["pr", "create"]));
+        assert_eq!(
+            dedup_program_argv("gh", v(&["gh", "pr", "create"])),
+            v(&["pr", "create"])
+        );
         assert_eq!(dedup_program_argv("ls", v(&["ls", "-la"])), v(&["-la"]));
-        assert_eq!(dedup_program_argv("grep", v(&["grep", "x", "f"])), v(&["x", "f"]));
+        assert_eq!(
+            dedup_program_argv("grep", v(&["grep", "x", "f"])),
+            v(&["x", "f"])
+        );
         // Absolute-path program with the same absolute path echoed.
         assert_eq!(
-            dedup_program_argv("/opt/homebrew/bin/gh", v(&["/opt/homebrew/bin/gh", "--version"])),
+            dedup_program_argv(
+                "/opt/homebrew/bin/gh",
+                v(&["/opt/homebrew/bin/gh", "--version"])
+            ),
             v(&["--version"])
         );
         // Only ONE copy is stripped (a genuine repeated token survives).
@@ -1963,16 +2253,31 @@ mod tests {
     async fn never_exiting_command_is_killed_at_timeout() {
         let start = std::time::Instant::now();
         let out = run(&call("sleep", &["300"], Some(1))).await;
-        assert!(start.elapsed() < Duration::from_secs(10), "took {:?}", start.elapsed());
-        assert!(out.contains("killed: still running after the 1s timeout"), "got: {out}");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            out.contains("killed: still running after the 1s timeout"),
+            "got: {out}"
+        );
     }
 
     #[tokio::test]
     async fn timed_out_command_returns_partial_output() {
         // `yes` floods stdout forever: exercises the cap, the drop marker, and the kill.
         let out = run(&call("yes", &[], Some(1))).await;
-        assert!(out.starts_with("y\ny\n"), "got: {}", &out[..out.len().min(40)]);
-        assert!(out.contains("dropped"), "expected drop marker, got tail: {}", &out[out.len() - 200..]);
+        assert!(
+            out.starts_with("y\ny\n"),
+            "got: {}",
+            &out[..out.len().min(40)]
+        );
+        assert!(
+            out.contains("dropped"),
+            "expected drop marker, got tail: {}",
+            &out[out.len() - 200..]
+        );
         assert!(out.contains("killed: still running after the 1s timeout"));
     }
 
@@ -2072,7 +2377,11 @@ mod tests {
 
         reset_job_control_signals();
         for &sig in &JOB_CONTROL_SIGNALS {
-            assert_eq!(disposition(sig), libc::SIG_DFL, "signal {sig} not reset to default");
+            assert_eq!(
+                disposition(sig),
+                libc::SIG_DFL,
+                "signal {sig} not reset to default"
+            );
         }
 
         // SAFETY: restoring each signal's captured prior disposition.
@@ -2129,7 +2438,10 @@ mod tests {
         let mut st2: libc::c_int = 0;
         let r2 = unsafe { libc::waitpid(pid, &mut st2, 0) };
         assert_eq!(r2, pid, "failed to reap probe");
-        assert!(libc::WIFSIGNALED(st2), "probe was not terminated by a signal");
+        assert!(
+            libc::WIFSIGNALED(st2),
+            "probe was not terminated by a signal"
+        );
         assert_eq!(
             libc::WTERMSIG(st2),
             libc::SIGHUP,
@@ -2146,7 +2458,10 @@ mod tests {
 
         // A foreground child spawned the same way run_on_tty does — std::process,
         // deliberately not awaited here.
-        let fg = std::process::Command::new("sleep").arg("0.3").spawn().unwrap();
+        let fg = std::process::Command::new("sleep")
+            .arg("0.3")
+            .spawn()
+            .unwrap();
         let fg_pid = fg.id() as libc::pid_t;
         std::mem::forget(fg); // we own the wait; don't let std reap it
 
@@ -2160,7 +2475,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(600)).await;
         let mut wstatus: libc::c_int = 0;
         let r = unsafe { libc::waitpid(fg_pid, &mut wstatus, 0) };
-        assert_eq!(r, fg_pid, "tokio's reaper stole the foreground pid via waitpid(-1)");
+        assert_eq!(
+            r, fg_pid,
+            "tokio's reaper stole the foreground pid via waitpid(-1)"
+        );
         assert!(std::process::ExitStatus::from_raw(wstatus).success());
     }
 
@@ -2211,11 +2529,20 @@ mod tests {
             args,
         };
         assert_eq!(
-            allow_key(&c("run_program", json!({"program": "/usr/bin/git", "args": ["push"]}))),
+            allow_key(&c(
+                "run_program",
+                json!({"program": "/usr/bin/git", "args": ["push"]})
+            )),
             "git"
         );
-        assert_eq!(allow_key(&c("run_interactive", json!({"program": "vim"}))), "vim");
-        assert_eq!(allow_key(&c("write_file", json!({"path": "/x"}))), "write_file");
+        assert_eq!(
+            allow_key(&c("run_interactive", json!({"program": "vim"}))),
+            "vim"
+        );
+        assert_eq!(
+            allow_key(&c("write_file", json!({"path": "/x"}))),
+            "write_file"
+        );
         assert_eq!(allow_key(&c("mcp__srv__do", json!({}))), "mcp__srv__do");
     }
 
@@ -2235,11 +2562,23 @@ mod tests {
                 calls.set(calls.get() + 1);
                 Decision::AlwaysAllow
             };
-            let r = execute(&call("rm", &["aish_no_such_file_a"], None), &mut session, &mut confirm).await;
-            assert!(!r.content.contains("declined"), "gate should have passed: {}", r.content);
+            let r = execute(
+                &call("rm", &["aish_no_such_file_a"], None),
+                &mut session,
+                &mut confirm,
+            )
+            .await;
+            assert!(
+                !r.content.contains("declined"),
+                "gate should have passed: {}",
+                r.content
+            );
         }
         assert_eq!(calls.get(), 1);
-        assert!(session.is_tool_allowed("rm"), "rm should be persisted on the allow-list");
+        assert!(
+            session.is_tool_allowed("rm"),
+            "rm should be persisted on the allow-list"
+        );
 
         // Second destructive call: confirm must NOT be consulted (would Deny).
         {
@@ -2247,8 +2586,17 @@ mod tests {
                 calls.set(calls.get() + 1);
                 Decision::Deny
             };
-            let r = execute(&call("rm", &["aish_no_such_file_b"], None), &mut session, &mut confirm).await;
-            assert!(!r.content.contains("declined to run"), "should be auto-allowed: {}", r.content);
+            let r = execute(
+                &call("rm", &["aish_no_such_file_b"], None),
+                &mut session,
+                &mut confirm,
+            )
+            .await;
+            assert!(
+                !r.content.contains("declined to run"),
+                "should be auto-allowed: {}",
+                r.content
+            );
         }
         assert_eq!(calls.get(), 1, "second rm should have skipped the prompt");
         let _ = std::fs::remove_file(&path);
@@ -2266,7 +2614,8 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(dir.join("Cargo.toml"), b"[package]").unwrap();
         std::fs::write(sub.join("main.rs"), b"fn main() {}").unwrap();
-        let outside = std::env::temp_dir().join(format!("aish_allowdir_out_{}.txt", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("aish_allowdir_out_{}.txt", std::process::id()));
         std::fs::write(&outside, b"x").unwrap();
 
         let mut session = Session::new().unwrap();
@@ -2289,7 +2638,11 @@ mod tests {
                 Decision::AllowDir
             };
             let r = execute(&rd(&dir.join("Cargo.toml")), &mut session, &mut confirm).await;
-            assert!(!r.is_error && !r.content.contains("declined"), "got: {}", r.content);
+            assert!(
+                !r.is_error && !r.content.contains("declined"),
+                "got: {}",
+                r.content
+            );
         }
         assert_eq!(calls.get(), 1);
         assert!(session.is_path_allowed("read", &sub.join("main.rs")));
@@ -2301,9 +2654,17 @@ mod tests {
                 Decision::Deny
             };
             let r = execute(&rd(&sub.join("main.rs")), &mut session, &mut confirm).await;
-            assert!(!r.is_error && !r.content.contains("declined"), "got: {}", r.content);
+            assert!(
+                !r.is_error && !r.content.contains("declined"),
+                "got: {}",
+                r.content
+            );
         }
-        assert_eq!(calls.get(), 1, "sibling read under the granted dir must skip the prompt");
+        assert_eq!(
+            calls.get(),
+            1,
+            "sibling read under the granted dir must skip the prompt"
+        );
 
         // A read OUTSIDE the granted dir still prompts (here: denied).
         {
@@ -2312,7 +2673,11 @@ mod tests {
                 Decision::Deny
             };
             let r = execute(&rd(&outside), &mut session, &mut confirm).await;
-            assert!(r.content.contains("declined"), "outside read should prompt+deny: {}", r.content);
+            assert!(
+                r.content.contains("declined"),
+                "outside read should prompt+deny: {}",
+                r.content
+            );
         }
         assert_eq!(calls.get(), 2, "read outside the granted dir must prompt");
 
@@ -2345,10 +2710,21 @@ mod tests {
         unsafe { libc::setpgid(pid, pid) }; // close the spawn race (EACCES after exec is fine)
 
         // Suspend the whole group, then confirm the kernel reports it stopped.
-        assert_eq!(unsafe { libc::kill(-pid, libc::SIGSTOP) }, 0, "SIGSTOP: {}", std::io::Error::last_os_error());
+        assert_eq!(
+            unsafe { libc::kill(-pid, libc::SIGSTOP) },
+            0,
+            "SIGSTOP: {}",
+            std::io::Error::last_os_error()
+        );
         let mut status: libc::c_int = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) }, pid);
-        assert!(unsafe { libc::WIFSTOPPED(status) }, "child should be stopped");
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+            pid
+        );
+        assert!(
+            unsafe { libc::WIFSTOPPED(status) },
+            "child should be stopped"
+        );
 
         // Build the matching Job and resume it.
         let (job, _kill_rx) = Job::background(1, "sleep 30".into());
@@ -2362,7 +2738,10 @@ mod tests {
             unsafe { libc::waitpid(pid, &mut status, libc::WCONTINUED | libc::WUNTRACED) },
             pid
         );
-        assert!(unsafe { libc::WIFCONTINUED(status) }, "child should have been continued by SIGCONT");
+        assert!(
+            unsafe { libc::WIFCONTINUED(status) },
+            "child should have been continued by SIGCONT"
+        );
 
         // Cleanup: kill the group and reap.
         unsafe {

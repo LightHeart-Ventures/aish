@@ -108,7 +108,11 @@ pub fn parse_ref(input: &str) -> Result<SkillRef> {
     };
     validate_segment(owner).context("invalid owner")?;
     validate_segment(name).context("invalid skill name")?;
-    Ok(SkillRef { owner: owner.to_string(), name: name.to_string(), version })
+    Ok(SkillRef {
+        owner: owner.to_string(),
+        name: name.to_string(),
+        version,
+    })
 }
 
 /// Reject path segments that could escape the skills dir or carry odd chars —
@@ -118,7 +122,10 @@ fn validate_segment(s: &str) -> Result<()> {
     if s.is_empty() || s == "." || s == ".." || s.contains('/') || s.contains('\\') {
         bail!("unsafe path segment: {s:?}");
     }
-    if !s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
         bail!("only [A-Za-z0-9._-] allowed, got: {s:?}");
     }
     Ok(())
@@ -184,7 +191,7 @@ fn is_vercel_challenge(resp: &reqwest::Response) -> bool {
 /// Supports http://, https://, file://, and loopback origins.
 pub async fn fetch_url(url: &str) -> Result<String> {
     check_url(url)?;
-    
+
     // Handle file:// URIs locally
     if url.starts_with("file://") {
         let path = url_to_path(url)?;
@@ -195,15 +202,22 @@ pub async fn fetch_url(url: &str) -> Result<String> {
         }
         return Ok(body);
     }
-    
+
     // Handle http:// and https://
     let client = http_client()?;
-    let resp = client.get(url).send().await.with_context(|| format!("fetching {url}"))?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("fetching {url}"))?;
     if is_vercel_challenge(&resp) {
         bail!("{}", vercel_challenge_message());
     }
     if !resp.status().is_success() {
-        bail!("skill.fish returned HTTP {} for {url}", resp.status().as_u16());
+        bail!(
+            "skill.fish returned HTTP {} for {url}",
+            resp.status().as_u16()
+        );
     }
     let body = resp.text().await.context("reading the skill body")?;
     if body.trim().is_empty() {
@@ -214,8 +228,7 @@ pub async fn fetch_url(url: &str) -> Result<String> {
 
 /// Convert a file:// URI to a safe local path.
 fn url_to_path(url: &str) -> Result<PathBuf> {
-    let path = url.strip_prefix("file://")
-        .context("not a file:// URI")?;
+    let path = url.strip_prefix("file://").context("not a file:// URI")?;
     let decoded = urlencoding::decode(path)
         .map(|s| s.into_owned())
         .context("URL decoding failed")?;
@@ -245,13 +258,25 @@ pub fn import(text: &str, skills_dir: &Path) -> Result<PathBuf> {
 /// CLI entry point for `aish --skill-fetch <ref>`: parse, fetch, import, report.
 pub async fn run_fetch(input: &str, skills_dir: &Path) -> Result<()> {
     let r = parse_ref(input)?;
-    let ver = r.version.as_deref().map(|v| format!("@{v}")).unwrap_or_default();
-    println!("\x1b[2mfetching {}/{}{ver} from {} …\x1b[0m", r.owner, r.name, registry());
+    let ver = r
+        .version
+        .as_deref()
+        .map(|v| format!("@{v}"))
+        .unwrap_or_default();
+    println!(
+        "\x1b[2mfetching {}/{}{ver} from {} …\x1b[0m",
+        r.owner,
+        r.name,
+        registry()
+    );
     let text = fetch(&r).await?;
     let path = import(&text, skills_dir)?;
     let (name, desc) =
         crate::skills::parse_frontmatter(&text).unwrap_or((r.name.clone(), String::new()));
-    println!("\x1b[32m✓\x1b[0m imported skill \x1b[1m{name}\x1b[0m → {}", path.display());
+    println!(
+        "\x1b[32m✓\x1b[0m imported skill \x1b[1m{name}\x1b[0m → {}",
+        path.display()
+    );
     if !desc.is_empty() {
         println!("  \x1b[2m{desc}\x1b[0m");
     }
@@ -405,12 +430,19 @@ async fn search_with_base(base: &str, query: &str) -> Result<Vec<SearchResult>> 
 
     // Handle http:// and https://
     let client = http_client()?;
-    let resp = client.get(&url).send().await.with_context(|| format!("searching {url}"))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("searching {url}"))?;
     if is_vercel_challenge(&resp) {
         bail!("{}", vercel_challenge_message());
     }
     if !resp.status().is_success() {
-        bail!("skill.fish returned HTTP {} for {url}", resp.status().as_u16());
+        bail!(
+            "skill.fish returned HTTP {} for {url}",
+            resp.status().as_u16()
+        );
     }
     let body = resp.text().await.context("reading the search response")?;
     parse_search_body(&body)
@@ -433,9 +465,18 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
     let refs: Vec<String> = results.iter().map(|r| r.ref_or_synth()).collect();
     let vers: Vec<String> = results
         .iter()
-        .map(|r| if r.version.trim().is_empty() { "-".to_string() } else { r.version.clone() })
+        .map(|r| {
+            if r.version.trim().is_empty() {
+                "-".to_string()
+            } else {
+                r.version.clone()
+            }
+        })
         .collect();
-    let descs: Vec<String> = results.iter().map(|r| truncate(&r.description, DESC_MAX)).collect();
+    let descs: Vec<String> = results
+        .iter()
+        .map(|r| truncate(&r.description, DESC_MAX))
+        .collect();
 
     let ref_w = refs
         .iter()
@@ -451,9 +492,15 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
         .unwrap_or(7);
 
     let mut out = String::new();
-    out.push_str(&format!("{:<ref_w$}  {:<ver_w$}  {}\n", "SKILL", "VERSION", "DESCRIPTION"));
+    out.push_str(&format!(
+        "{:<ref_w$}  {:<ver_w$}  {}\n",
+        "SKILL", "VERSION", "DESCRIPTION"
+    ));
     for i in 0..results.len() {
-        out.push_str(&format!("{:<ref_w$}  {:<ver_w$}  {}\n", refs[i], vers[i], descs[i]));
+        out.push_str(&format!(
+            "{:<ref_w$}  {:<ver_w$}  {}\n",
+            refs[i], vers[i], descs[i]
+        ));
     }
     out.push_str(&format!(
         "\n{} result(s) — fetch one with `aish --skill-fetch <skill>` or `:skill add <skill>`",
@@ -491,11 +538,21 @@ mod tests {
 
     #[test]
     fn parses_url_and_shorthand() {
-        let want = SkillRef { owner: "acme".into(), name: "git-helper".into(), version: None };
-        assert_eq!(parse_ref("https://skill.fish/acme/git-helper").unwrap(), want);
+        let want = SkillRef {
+            owner: "acme".into(),
+            name: "git-helper".into(),
+            version: None,
+        };
+        assert_eq!(
+            parse_ref("https://skill.fish/acme/git-helper").unwrap(),
+            want
+        );
         assert_eq!(parse_ref("skill.fish/acme/git-helper").unwrap(), want);
         assert_eq!(parse_ref("acme/git-helper").unwrap(), want);
-        assert_eq!(parse_ref("https://skill.fish/acme/git-helper/raw").unwrap(), want);
+        assert_eq!(
+            parse_ref("https://skill.fish/acme/git-helper/raw").unwrap(),
+            want
+        );
     }
 
     #[test]
@@ -519,12 +576,29 @@ mod tests {
     fn raw_url_includes_version_query() {
         // Test the pure `raw_url_on` against a fixed base so the assertion is
         // independent of the (now file://) default registry — no env mutation.
-        let r = SkillRef { owner: "a".into(), name: "b".into(), version: Some("2".into()) };
-        assert_eq!(raw_url_on("https://skill.fish", &r), "https://skill.fish/a/b/raw?version=2");
-        let r2 = SkillRef { owner: "a".into(), name: "b".into(), version: None };
-        assert_eq!(raw_url_on("https://skill.fish", &r2), "https://skill.fish/a/b/raw");
+        let r = SkillRef {
+            owner: "a".into(),
+            name: "b".into(),
+            version: Some("2".into()),
+        };
+        assert_eq!(
+            raw_url_on("https://skill.fish", &r),
+            "https://skill.fish/a/b/raw?version=2"
+        );
+        let r2 = SkillRef {
+            owner: "a".into(),
+            name: "b".into(),
+            version: None,
+        };
+        assert_eq!(
+            raw_url_on("https://skill.fish", &r2),
+            "https://skill.fish/a/b/raw"
+        );
         // A trailing slash on the base is normalized away.
-        assert_eq!(raw_url_on("https://skill.fish/", &r2), "https://skill.fish/a/b/raw");
+        assert_eq!(
+            raw_url_on("https://skill.fish/", &r2),
+            "https://skill.fish/a/b/raw"
+        );
     }
 
     #[test]
@@ -633,11 +707,7 @@ mod tests {
     /// `extra_headers` are inserted verbatim into the response head (each must
     /// already end with its own CRLF), letting a test simulate e.g. the Vercel
     /// challenge header alongside a 429 status.
-    async fn serve_once_with_headers(
-        status_line: &str,
-        extra_headers: &str,
-        body: String,
-    ) -> u16 {
+    async fn serve_once_with_headers(status_line: &str, extra_headers: &str, body: String) -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -748,7 +818,10 @@ mod tests {
     #[test]
     fn search_query_is_url_encoded() {
         let u = search_url_with_base("https://skill.fish", "git helper & more/v2");
-        assert!(u.starts_with("https://skill.fish/api/v1/search?q="), "got {u}");
+        assert!(
+            u.starts_with("https://skill.fish/api/v1/search?q="),
+            "got {u}"
+        );
         assert!(u.contains("git%20helper"), "space not encoded: {u}");
         assert!(u.contains("%26"), "& not encoded: {u}");
         assert!(u.contains("%2F"), "/ not encoded: {u}");
@@ -762,7 +835,10 @@ mod tests {
 
     #[test]
     fn print_results_table_handles_empty() {
-        assert_eq!(print_results_table("foo", &[]), "No skills found for \"foo\".");
+        assert_eq!(
+            print_results_table("foo", &[]),
+            "No skills found for \"foo\"."
+        );
     }
 
     #[test]

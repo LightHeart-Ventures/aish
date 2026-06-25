@@ -297,7 +297,10 @@ impl TranscriptWriter {
             .max()
             .map(|m| m + 1)
             .unwrap_or(0);
-        Self { id: id.to_string(), seq: next }
+        Self {
+            id: id.to_string(),
+            seq: next,
+        }
     }
 
     /// The worker id this writer appends for.
@@ -332,7 +335,10 @@ impl TranscriptWriter {
     /// [`crate::turn_audit::redact_input`] so secrets never hit disk (AC8).
     pub fn record_tool_call(&mut self, call_id: &str, name: &str, input: &serde_json::Value) {
         let seq = self.next_seq();
-        let _ = append_record(&self.id, &TranscriptRecord::tool_call(seq, call_id, name, input));
+        let _ = append_record(
+            &self.id,
+            &TranscriptRecord::tool_call(seq, call_id, name, input),
+        );
     }
 
     /// Record a tool-call result. `output` is capped head-first inside the ctor.
@@ -376,7 +382,13 @@ pub fn result_path(id: &str) -> PathBuf {
 /// `WorkerSpec::id_for_state` / container name sanitization). Pure.
 fn sanitize_id(id: &str) -> String {
     id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -402,8 +414,7 @@ fn set_0700(path: &Path) {
 /// (the caller treats an error as "history unavailable", AC edge).
 pub fn load_meta(id: &str) -> std::io::Result<WorkerMeta> {
     let raw = std::fs::read_to_string(meta_path(id))?;
-    serde_json::from_str(&raw)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    serde_json::from_str(&raw).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// Write `meta` atomically (temp + rename, AC technical‑approach): a reader sees
@@ -529,7 +540,9 @@ fn rotate_transcript(path: &Path) {
         id: None,
         name: None,
         input: None,
-        output: Some(format!("dropped {dropped} oldest record(s) at transcript cap")),
+        output: Some(format!(
+            "dropped {dropped} oldest record(s) at transcript cap"
+        )),
         is_error: false,
         tokens: None,
         dropped: Some(dropped),
@@ -718,7 +731,12 @@ fn retention_days() -> u64 {
 /// age. Otherwise eligible once it is at least `max_age_days` old. A `None`
 /// status (unreadable/absent meta) is treated as not‑running, so an orphaned dir
 /// with no meta still ages out. Unit‑tested in isolation from any IO.
-fn should_sweep_worker(status: Option<&str>, has_branch: bool, age_days: u64, max_age_days: u64) -> bool {
+fn should_sweep_worker(
+    status: Option<&str>,
+    has_branch: bool,
+    age_days: u64,
+    max_age_days: u64,
+) -> bool {
     if status == Some("running") || has_branch {
         return false;
     }
@@ -798,7 +816,11 @@ fn truncate(s: &str, max: usize) -> String {
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…[truncated {} chars]", &s[..end], s.chars().count() - s[..end].chars().count())
+    format!(
+        "{}…[truncated {} chars]",
+        &s[..end],
+        s.chars().count() - s[..end].chars().count()
+    )
 }
 
 /// Current UTC time as an ISO‑8601 / RFC‑3339 string (`YYYY-MM-DDTHH:MM:SSZ`),
@@ -864,13 +886,24 @@ mod tests {
             std::env::remove_var("AISH_WORKER_TRANSCRIPT_CAP");
             std::env::remove_var("AISH_WORKER_RETENTION_DAYS");
         }
-        Sandbox { _guard: guard, root }
+        Sandbox {
+            _guard: guard,
+            root,
+        }
     }
 
     #[test]
     fn meta_roundtrips_atomically() {
         let _sb = sandbox("meta");
-        let meta = WorkerMeta::new("w_meta1", "sess-a", "do the thing", "owner--repo", "claude", "opus", "run_1");
+        let meta = WorkerMeta::new(
+            "w_meta1",
+            "sess-a",
+            "do the thing",
+            "owner--repo",
+            "claude",
+            "opus",
+            "run_1",
+        );
         write_meta_atomic(&meta).unwrap();
         // The temp file is gone (renamed), only meta.json remains.
         assert!(meta_path("w_meta1").exists());
@@ -890,17 +923,36 @@ mod tests {
         let _sb = sandbox("perms");
         let meta = WorkerMeta::new("w_perm", "s", "t", "r", "claude", "m", "run_p");
         write_meta_atomic(&meta).unwrap();
-        let mode = std::fs::metadata(worker_dir("w_perm")).unwrap().permissions().mode();
+        let mode = std::fs::metadata(worker_dir("w_perm"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o700, "worker dir must be owner‑only (AC8)");
     }
 
     #[test]
     fn transcript_appends_and_reads_in_order() {
         let _sb = sandbox("tx");
-        append_record("w_tx", &TranscriptRecord::text(0, "user", "text", "the task")).unwrap();
-        append_record("w_tx", &TranscriptRecord::tool_call(1, "c1", "read_file", &json!({"path": "Cargo.toml"}))).unwrap();
-        append_record("w_tx", &TranscriptRecord::tool_result(2, "c1", "read_file", "[package]", false)).unwrap();
-        append_record("w_tx", &TranscriptRecord::text(3, "assistant", "synthesis", "done reading")).unwrap();
+        append_record(
+            "w_tx",
+            &TranscriptRecord::text(0, "user", "text", "the task"),
+        )
+        .unwrap();
+        append_record(
+            "w_tx",
+            &TranscriptRecord::tool_call(1, "c1", "read_file", &json!({"path": "Cargo.toml"})),
+        )
+        .unwrap();
+        append_record(
+            "w_tx",
+            &TranscriptRecord::tool_result(2, "c1", "read_file", "[package]", false),
+        )
+        .unwrap();
+        append_record(
+            "w_tx",
+            &TranscriptRecord::text(3, "assistant", "synthesis", "done reading"),
+        )
+        .unwrap();
 
         let recs = iter_transcript("w_tx");
         assert_eq!(recs.len(), 4);
@@ -921,10 +973,20 @@ mod tests {
     fn secrets_are_redacted_in_tool_call_input() {
         let _sb = sandbox("redact");
         let input = json!({"program": "deploy", "env": {"API_KEY": "sk-supersecret"}, "auth_token": "Bearer xyz"});
-        append_record("w_red", &TranscriptRecord::tool_call(0, "c0", "run_program", &input)).unwrap();
+        append_record(
+            "w_red",
+            &TranscriptRecord::tool_call(0, "c0", "run_program", &input),
+        )
+        .unwrap();
         let raw = std::fs::read_to_string(transcript_path("w_red")).unwrap();
-        assert!(!raw.contains("sk-supersecret"), "secret env value must never hit disk (AC8)");
-        assert!(!raw.contains("Bearer xyz"), "secret‑named key must be redacted (AC8)");
+        assert!(
+            !raw.contains("sk-supersecret"),
+            "secret env value must never hit disk (AC8)"
+        );
+        assert!(
+            !raw.contains("Bearer xyz"),
+            "secret‑named key must be redacted (AC8)"
+        );
         assert!(raw.contains("[redacted]"));
     }
 
@@ -932,8 +994,10 @@ mod tests {
     fn corrupt_and_torn_lines_are_skipped_on_read() {
         let _sb = sandbox("corrupt");
         ensure_worker_dir("w_c").unwrap();
-        let good0 = serde_json::to_string(&TranscriptRecord::text(0, "user", "text", "hi")).unwrap();
-        let good1 = serde_json::to_string(&TranscriptRecord::text(1, "assistant", "text", "yo")).unwrap();
+        let good0 =
+            serde_json::to_string(&TranscriptRecord::text(0, "user", "text", "hi")).unwrap();
+        let good1 =
+            serde_json::to_string(&TranscriptRecord::text(1, "assistant", "text", "yo")).unwrap();
         // garbage line, a good line, then a torn (incomplete) trailing line.
         let body = format!("not json at all\n{good0}\n{good1}\n{{\"seq\":2,\"kind\":\"te");
         std::fs::write(transcript_path("w_c"), body).unwrap();
@@ -955,7 +1019,11 @@ mod tests {
         assert!(none.is_empty());
         assert_eq!(off1, off2);
         // After another append, the tail picks up exactly the new record.
-        append_record("w_t", &TranscriptRecord::text(1, "assistant", "text", "two")).unwrap();
+        append_record(
+            "w_t",
+            &TranscriptRecord::text(1, "assistant", "text", "two"),
+        )
+        .unwrap();
         let (second, _off3) = tail_transcript("w_t", off2);
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].output.as_deref(), Some("two"));
@@ -1003,19 +1071,42 @@ mod tests {
         // Tiny cap so a handful of records trips rotation.
         unsafe { std::env::set_var("AISH_WORKER_TRANSCRIPT_CAP", "600") };
         for n in 0..40u64 {
-            append_record("w_rot", &TranscriptRecord::text(n, "assistant", "text", &format!("record number {n} padding padding"))).unwrap();
+            append_record(
+                "w_rot",
+                &TranscriptRecord::text(
+                    n,
+                    "assistant",
+                    "text",
+                    &format!("record number {n} padding padding"),
+                ),
+            )
+            .unwrap();
         }
         let recs = iter_transcript("w_rot");
         // The file was bounded — far fewer than 40 records survive.
-        assert!(recs.len() < 40, "rotation must drop oldest records: kept {}", recs.len());
+        assert!(
+            recs.len() < 40,
+            "rotation must drop oldest records: kept {}",
+            recs.len()
+        );
         // A truncation marker is present and reports a positive drop count.
         let marker = recs.iter().find(|r| r.kind == "truncation");
-        assert!(marker.is_some(), "a truncation marker must be written on rotation");
+        assert!(
+            marker.is_some(),
+            "a truncation marker must be written on rotation"
+        );
         assert!(marker.unwrap().dropped.unwrap_or(0) > 0);
         // The newest record is retained.
-        assert!(recs.iter().any(|r| r.output.as_deref() == Some("record number 39 padding padding")));
+        assert!(
+            recs.iter()
+                .any(|r| r.output.as_deref() == Some("record number 39 padding padding"))
+        );
         // The very oldest is gone.
-        assert!(!recs.iter().any(|r| r.output.as_deref() == Some("record number 0 padding padding")));
+        assert!(
+            !recs
+                .iter()
+                .any(|r| r.output.as_deref() == Some("record number 0 padding padding"))
+        );
     }
 
     #[test]
@@ -1027,7 +1118,10 @@ mod tests {
         let huge = "x".repeat(RESULT_CAP + 5000);
         write_result("w_res", &huge).unwrap();
         let back = read_result("w_res").unwrap();
-        assert!(back.len() <= RESULT_CAP + 64, "result.txt capped at CAPTURE_CAP (AC6)");
+        assert!(
+            back.len() <= RESULT_CAP + 64,
+            "result.txt capped at CAPTURE_CAP (AC6)"
+        );
         assert!(back.contains("…[truncated"));
     }
 
@@ -1067,16 +1161,25 @@ mod tests {
         write_meta_atomic(&done).unwrap();
 
         let reclaimed = sweep_worker_dirs();
-        assert_eq!(reclaimed, 1, "only the aged, branchless, finished dir is swept");
+        assert_eq!(
+            reclaimed, 1,
+            "only the aged, branchless, finished dir is swept"
+        );
         assert!(worker_dir("w_run").exists(), "running dir spared");
         assert!(worker_dir("w_keep").exists(), "kept‑branch dir spared");
-        assert!(!worker_dir("w_done").exists(), "finished branchless dir reclaimed");
+        assert!(
+            !worker_dir("w_done").exists(),
+            "finished branchless dir reclaimed"
+        );
     }
 
     #[test]
     fn forget_removes_immediately_and_is_idempotent() {
         let _sb = sandbox("forget");
-        write_meta_atomic(&WorkerMeta::new("w_f", "s", "t", "r", "claude", "m", "run_f")).unwrap();
+        write_meta_atomic(&WorkerMeta::new(
+            "w_f", "s", "t", "r", "claude", "m", "run_f",
+        ))
+        .unwrap();
         assert!(worker_dir("w_f").exists());
         forget("w_f").unwrap();
         assert!(!worker_dir("w_f").exists());
@@ -1118,7 +1221,10 @@ mod tests {
         let recs = iter_transcript("w_w1");
         assert_eq!(recs.len(), 4, "empty message skipped");
         // seqs are 0..3 in order.
-        assert_eq!(recs.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            recs.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
         assert_eq!(recs[0].role, "user");
         assert_eq!(recs[1].kind, "tool_call");
         assert_eq!(recs[2].kind, "tool_result");
@@ -1140,7 +1246,10 @@ mod tests {
         w.record_message("assistant", "synthesis", "resumed answer");
         let recs = iter_transcript("w_w2");
         assert_eq!(recs.len(), 3);
-        assert_eq!(recs.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(
+            recs.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
         assert_eq!(recs[2].output.as_deref(), Some("resumed answer"));
     }
 
@@ -1166,9 +1275,16 @@ mod tests {
     fn writer_redacts_secret_tool_args() {
         let _sb = sandbox("writer_redact");
         let mut w = TranscriptWriter::attach("w_w4");
-        w.record_tool_call("c0", "run_program", &json!({"env": {"API_KEY": "sk-supersecret"}}));
+        w.record_tool_call(
+            "c0",
+            "run_program",
+            &json!({"env": {"API_KEY": "sk-supersecret"}}),
+        );
         let raw = std::fs::read_to_string(transcript_path("w_w4")).unwrap();
-        assert!(!raw.contains("sk-supersecret"), "writer must redact secrets (AC8)");
+        assert!(
+            !raw.contains("sk-supersecret"),
+            "writer must redact secrets (AC8)"
+        );
         assert!(raw.contains("[redacted]"));
     }
 

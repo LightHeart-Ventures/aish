@@ -213,17 +213,25 @@ mod tests {
         let session = Session::new().unwrap();
         let stages = parse("yes | head -n 3 | wc -l | grep -q 3").unwrap();
         let status = run(&stages, &session).await.unwrap();
-        assert_eq!(status.code(), Some(0), "stdout did not reach the next stage");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "stdout did not reach the next stage"
+        );
     }
 
     #[tokio::test]
     async fn exit_status_is_the_last_stage() {
         let session = Session::new().unwrap();
         // an earlier failure must NOT mask the last stage's success …
-        let ok = run(&parse("false | false | true").unwrap(), &session).await.unwrap();
+        let ok = run(&parse("false | false | true").unwrap(), &session)
+            .await
+            .unwrap();
         assert_eq!(ok.code(), Some(0));
         // … and the last stage's failure must surface.
-        let bad = run(&parse("true | true | false").unwrap(), &session).await.unwrap();
+        let bad = run(&parse("true | true | false").unwrap(), &session)
+            .await
+            .unwrap();
         assert_eq!(bad.code(), Some(1));
     }
 
@@ -234,7 +242,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut body = String::new();
         for i in 0..1000 {
-            body.push_str(if i % 3 == 0 { "ERROR boom\n" } else { "info fine\n" });
+            body.push_str(if i % 3 == 0 {
+                "ERROR boom\n"
+            } else {
+                "info fine\n"
+            });
         }
         std::fs::write(dir.join("big.log"), &body).unwrap();
         let expected = body.lines().filter(|l| l.contains("ERROR")).count();
@@ -247,7 +259,11 @@ mod tests {
         let status = run(&parse(&cmd).unwrap(), &session).await.unwrap();
         assert!(status.success());
 
-        let got: usize = std::fs::read_to_string(&out).unwrap().trim().parse().unwrap();
+        let got: usize = std::fs::read_to_string(&out)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         assert_eq!(got, expected);
         let _ = std::fs::remove_dir_all(&dir);
     }

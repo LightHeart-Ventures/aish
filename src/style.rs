@@ -95,8 +95,9 @@ pub fn classify_status(status: &str) -> (&'static str, Color) {
         | "ok" => ("✅", Color::Green),
         "failed" | "error" | "errored" | "cancelled" | "canceled" | "aborted" | "timeout"
         | "timed_out" => ("❌", Color::Red),
-        "running" | "working" | "in_progress" | "in-progress" | "active" | "executing"
-        | "busy" => ("🔄", Color::Yellow),
+        "running" | "working" | "in_progress" | "in-progress" | "active" | "executing" | "busy" => {
+            ("🔄", Color::Yellow)
+        }
         "queued" | "pending" | "dispatched" | "starting" | "waiting" | "scheduled" | "new" => {
             ("⏳", Color::Blue)
         }
@@ -104,8 +105,17 @@ pub fn classify_status(status: &str) -> (&'static str, Color) {
             // Coordinator phase strings are free-form; treat anything that reads
             // like active work as running, otherwise a neutral dim bullet.
             const ACTIVE: &[&str] = &[
-                "plan", "review", "push", "build", "test", "implement", "fix", "research",
-                "writ", "edit", "run",
+                "plan",
+                "review",
+                "push",
+                "build",
+                "test",
+                "implement",
+                "fix",
+                "research",
+                "writ",
+                "edit",
+                "run",
             ];
             if ACTIVE.iter().any(|k| s.contains(k)) {
                 ("🔄", Color::Yellow)
@@ -214,7 +224,10 @@ mod tests {
     #[test]
     fn styled_result_by_glyph() {
         assert_eq!(styled_result_with("✓ #42", true), "\x1b[32m✓ #42\x1b[0m");
-        assert_eq!(styled_result_with("✗ broke", true), "\x1b[31m✗ broke\x1b[0m");
+        assert_eq!(
+            styled_result_with("✗ broke", true),
+            "\x1b[31m✗ broke\x1b[0m"
+        );
         assert_eq!(styled_result_with("—", true), "\x1b[2m—\x1b[0m");
         assert_eq!(styled_result_with("", true), "\x1b[2m—\x1b[0m");
         // Plain mode strips the color but keeps the glyph + text.

@@ -501,7 +501,8 @@ fn env_u64(var: &str, default: u64) -> u64 {
 /// threads). `None`/empty/unparseable → `default`; otherwise the parsed value
 /// (including a legitimate `0`, which callers read as "no limit").
 fn parse_u64_or(raw: Option<&str>, default: u64) -> u64 {
-    raw.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 /// Build the `tokio::process::Command` that re-execs aish in `--coordinator`
@@ -690,7 +691,13 @@ fn repo_key_from_remote(url: &str) -> Option<String> {
 fn sanitize_repo_key(s: &str) -> String {
     s.replace('/', "--")
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -707,7 +714,11 @@ fn fallback_repo_key(src: &std::path::Path) -> String {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    format!("{}-{:08x}", sanitize_repo_key(&base), (hash & 0xffff_ffff) as u32)
+    format!(
+        "{}-{:08x}",
+        sanitize_repo_key(&base),
+        (hash & 0xffff_ffff) as u32
+    )
 }
 
 /// Resolve the `{repo-key}` for `src` (IO — reads the git `origin` remote):
@@ -763,7 +774,12 @@ fn worktree_layout(root: &std::path::Path, repo_key: &str, id: &str) -> (String,
 
 /// Run a git command in `src`, returning trimmed stdout on success.
 fn git_out(src: &std::path::Path, args: &[&str]) -> Option<String> {
-    let o = std::process::Command::new("git").arg("-C").arg(src).args(args).output().ok()?;
+    let o = std::process::Command::new("git")
+        .arg("-C")
+        .arg(src)
+        .args(args)
+        .output()
+        .ok()?;
     o.status
         .success()
         .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -785,7 +801,10 @@ fn git_ok(src: &std::path::Path, args: &[&str]) -> bool {
 /// The repo's trunk branch name — `origin/HEAD` when set (e.g. `main`/`master`),
 /// else whichever of `main`/`master` exists locally or on the remote, else `main`.
 fn trunk_branch(src: &std::path::Path) -> String {
-    if let Some(s) = git_out(src, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
+    if let Some(s) = git_out(
+        src,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    ) {
         if let Some(name) = s.strip_prefix("origin/") {
             if !name.is_empty() {
                 return name.to_string();
@@ -793,9 +812,23 @@ fn trunk_branch(src: &std::path::Path) -> String {
         }
     }
     for cand in ["main", "master"] {
-        if git_ok(src, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{cand}")])
-            || git_ok(src, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/origin/{cand}")])
-        {
+        if git_ok(
+            src,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{cand}"),
+            ],
+        ) || git_ok(
+            src,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/remotes/origin/{cand}"),
+            ],
+        ) {
             return cand.to_string();
         }
     }
@@ -820,7 +853,15 @@ fn resolve_base_ref(src: &std::path::Path, base: &str) -> String {
             return remote_ref;
         }
     }
-    if git_ok(src, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{trunk}")]) {
+    if git_ok(
+        src,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{trunk}"),
+        ],
+    ) {
         return trunk;
     }
     "HEAD".to_string()
@@ -980,7 +1021,12 @@ fn create_worktree(src: &std::path::Path, id: &str, base: &str) -> Option<Worktr
     }
     // Pin the base commit for clean-up accounting (tip == base_sha ⇒ no commits).
     let base_sha = git_head(&path).unwrap_or_default();
-    Some(Worktree { path, branch, src: src.to_path_buf(), base_sha })
+    Some(Worktree {
+        path,
+        branch,
+        src: src.to_path_buf(),
+        base_sha,
+    })
 }
 
 /// True when the worktree has neither uncommitted changes nor commits ahead of
@@ -1052,7 +1098,13 @@ const DEFAULT_WORKTREE_MAX_AGE_DAYS: u64 = 7;
 /// the same conservative rule as `worktree_is_clean`. A clean, not-ahead leaf is
 /// swept when its git registration is gone (`orphaned`) OR it is at least
 /// `max_age_days` old. Unit-tested in isolation from any IO.
-fn should_sweep(dirty: bool, ahead: bool, orphaned: bool, age_days: u64, max_age_days: u64) -> bool {
+fn should_sweep(
+    dirty: bool,
+    ahead: bool,
+    orphaned: bool,
+    age_days: u64,
+    max_age_days: u64,
+) -> bool {
     if dirty || ahead {
         return false; // never delete work left for the operator
     }
@@ -1065,9 +1117,25 @@ fn worktree_commits_ahead(leaf: &std::path::Path) -> bool {
     let trunk = trunk_branch(leaf);
     // Prefer the remote trunk ref (what isolated workers branch from), falling
     // back to the local trunk; if neither resolves we can't compare → keep.
-    let base = if git_ok(leaf, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/origin/{trunk}")]) {
+    let base = if git_ok(
+        leaf,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/origin/{trunk}"),
+        ],
+    ) {
         format!("origin/{trunk}")
-    } else if git_ok(leaf, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{trunk}")]) {
+    } else if git_ok(
+        leaf,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{trunk}"),
+        ],
+    ) {
         trunk
     } else {
         return true;
@@ -1373,7 +1441,13 @@ impl WorkerSpec {
     fn id_for_state(&self, run_id: &str) -> String {
         run_id
             .chars()
-            .map(|ch| if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') { ch } else { '-' })
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                    ch
+                } else {
+                    '-'
+                }
+            })
             .collect()
     }
 }
@@ -1410,9 +1484,9 @@ impl WorkerJob {
     fn record_activity(&self, suffix: &str, text: &str) {
         let mut i = self.inner.lock().unwrap();
         i.transcript_bytes += suffix.len() + text.len();
-        i.transcript.push_back((suffix.to_string(), text.to_string()));
-        while i.transcript.len() > TRANSCRIPT_MAX_LINES
-            || i.transcript_bytes > TRANSCRIPT_MAX_BYTES
+        i.transcript
+            .push_back((suffix.to_string(), text.to_string()));
+        while i.transcript.len() > TRANSCRIPT_MAX_LINES || i.transcript_bytes > TRANSCRIPT_MAX_BYTES
         {
             match i.transcript.pop_front() {
                 Some((s, t)) => i.transcript_bytes -= s.len() + t.len(),
@@ -1424,7 +1498,13 @@ impl WorkerJob {
     /// The retained transcript rows (`(suffix, text)`, oldest-first) captured
     /// from this worker's activity — replayed on `:attach`.
     pub fn transcript_rows(&self) -> Vec<(String, String)> {
-        self.inner.lock().unwrap().transcript.iter().cloned().collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .transcript
+            .iter()
+            .cloned()
+            .collect()
     }
     /// The most recent badge-pulse event on this worker (tool outcome vs turn
     /// completion — whichever happened later), paired with when it happened.
@@ -1452,7 +1532,10 @@ impl WorkerJob {
         self.inner.lock().unwrap().status.clone()
     }
     fn is_terminal(&self) -> bool {
-        matches!(self.inner.lock().unwrap().status.as_str(), "done" | "failed")
+        matches!(
+            self.inner.lock().unwrap().status.as_str(),
+            "done" | "failed"
+        )
     }
     fn is_displayed(&self) -> bool {
         self.inner.lock().unwrap().displayed
@@ -1494,7 +1577,11 @@ impl WorkerJob {
             }
             "failed" => {
                 let e = i.error.as_deref().unwrap_or("unknown error");
-                let truncated = if e.len() > 40 { format!("{}…", &e[..40]) } else { e.to_string() };
+                let truncated = if e.len() > 40 {
+                    format!("{}…", &e[..40])
+                } else {
+                    e.to_string()
+                };
                 format!("✗ {truncated}")
             }
             _ => "—".to_string(),
@@ -1517,8 +1604,7 @@ impl WorkerJob {
 /// used (only ever compared / `starts_with`-matched, never parsed), so older
 /// `worker_<uuid>`-format ids keep displaying and matching correctly.
 fn new_worker_id() -> String {
-    const ALPHABET: &[u8; 62] =
-        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const ALPHABET: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     // Consume a UUIDv4's 122 random bits, peeling off one base62 digit at a
     // time. The modulo bias against 2^128 is astronomically small at 8 digits.
     let mut n = Uuid::new_v4().as_u128();
@@ -1652,7 +1738,9 @@ fn build_container_command(
     let env_file = match write_env_file(&state_dir, &secret_pairs) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("aish: couldn't write worker env-file: {e}; falling back to host subprocess.");
+            eprintln!(
+                "aish: couldn't write worker env-file: {e}; falling back to host subprocess."
+            );
             return None;
         }
     };
@@ -1660,7 +1748,10 @@ fn build_container_command(
     // Non-secret control env passed inline.
     let mut env_inline = vec![
         ("AISH_COORDINATOR".to_string(), "1".to_string()),
-        ("AISH_LAUNCH_SESSION_ID".to_string(), spec.launch_session_id.clone()),
+        (
+            "AISH_LAUNCH_SESSION_ID".to_string(),
+            spec.launch_session_id.clone(),
+        ),
     ];
     if let Some(name) = &spec.launch_session_name {
         env_inline.push(("AISH_LAUNCH_SESSION_NAME".to_string(), name.clone()));
@@ -1671,14 +1762,22 @@ fn build_container_command(
         name: c::container_name(&spec.launch_session_id, run_id),
         image: tag,
         argv: coordinator_argv(spec, task, run_id),
-        labels: c::worker_labels(run_id, &spec.launch_session_id, &repo_key, None, &now_label_ts()),
+        labels: c::worker_labels(
+            run_id,
+            &spec.launch_session_id,
+            &repo_key,
+            None,
+            &now_label_ts(),
+        ),
         state_volume_host: state_dir.clone(),
         state_mount: c::STATE_MOUNT.to_string(),
         work_volume_host: Some(run_cwd.to_path_buf()),
         env_file: Some(env_file.clone()),
         env_inline,
         mem_mb: env_u64("AISH_WORKER_MEM_MB", DEFAULT_WORKER_MEM_MB),
-        cpus: std::env::var("AISH_WORKER_CPUS").ok().and_then(|v| v.trim().parse::<f64>().ok()),
+        cpus: std::env::var("AISH_WORKER_CPUS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok()),
         pids_limit: Some(env_u64("AISH_WORKER_PIDS", DEFAULT_WORKER_PIDS)),
         network: std::env::var("AISH_WORKER_NETWORK")
             .ok()
@@ -1746,7 +1845,10 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
     } else {
         None
     };
-    let run_cwd = worktree.as_ref().map(|w| w.path.clone()).unwrap_or_else(|| spec.cwd.clone());
+    let run_cwd = worktree
+        .as_ref()
+        .map(|w| w.path.clone())
+        .unwrap_or_else(|| spec.cwd.clone());
 
     // Pick the execution vehicle (S9.1): a container backend when one is
     // selected and engaged, else today's host subprocess. ANY container-setup
@@ -1839,7 +1941,11 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
     match status {
         Some(s) if s.success() => {
             let t = out.trim();
-            let mut result = if t.is_empty() { "(no output)".to_string() } else { t.to_string() };
+            let mut result = if t.is_empty() {
+                "(no output)".to_string()
+            } else {
+                t.to_string()
+            };
             if let Some(wt) = worktree.as_ref() {
                 if let Some(branch) = &kept_branch {
                     result.push_str(&format!(
@@ -1888,7 +1994,9 @@ pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<Str
     // The goal loop never isolates (it iterates in the user's live cwd), so we
     // run in `spec.cwd` directly.
     let mut cmd = worker_command(spec, task, run_id, &spec.cwd);
-    let mut child = cmd.spawn().map_err(|e| format!("couldn't launch goal worker: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("couldn't launch goal worker: {e}"))?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     // stdout is the result (capped capture, unchanged). stderr is streamed live
@@ -1911,7 +2019,10 @@ pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<Str
         Err(_) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            return Err(format!("goal worker timed out after {}s", WORKER_TIMEOUT.as_secs()));
+            return Err(format!(
+                "goal worker timed out after {}s",
+                WORKER_TIMEOUT.as_secs()
+            ));
         }
     };
     let (out, err) = collect.await.unwrap_or_default();
@@ -1938,7 +2049,10 @@ fn on_complete(jobs: &WorkerJobs, finished: &Arc<WorkerJob>) {
     if !all_terminal {
         crate::tools::announce(
             &format!("[{}]", finished.id),
-            &format!("{} — {remaining} worker(s) still running", finished.status()),
+            &format!(
+                "{} — {remaining} worker(s) still running",
+                finished.status()
+            ),
         );
         return;
     }
@@ -1950,12 +2064,19 @@ fn on_complete(jobs: &WorkerJobs, finished: &Arc<WorkerJob>) {
 pub fn drain_pending(jobs: &WorkerJobs) -> Vec<String> {
     let pending: Vec<Arc<WorkerJob>> = {
         let g = jobs.lock().unwrap();
-        g.iter().filter(|j| j.is_terminal() && !j.is_displayed()).cloned().collect()
+        g.iter()
+            .filter(|j| j.is_terminal() && !j.is_displayed())
+            .cloned()
+            .collect()
     };
     pending
         .iter()
         .map(|job| {
-            let label = if job.status() == "failed" { "failed" } else { "complete" };
+            let label = if job.status() == "failed" {
+                "failed"
+            } else {
+                "complete"
+            };
             job.mark_displayed();
             format!(
                 "\x1b[2m── worker {} {label} ──\x1b[0m\n{}",
@@ -1972,16 +2093,26 @@ pub fn drain_pending(jobs: &WorkerJobs) -> Vec<String> {
 pub fn notify_pending(jobs: &WorkerJobs) -> Vec<String> {
     let pending: Vec<Arc<WorkerJob>> = {
         let g = jobs.lock().unwrap();
-        g.iter().filter(|j| j.is_terminal() && !j.is_displayed()).cloned().collect()
+        g.iter()
+            .filter(|j| j.is_terminal() && !j.is_displayed())
+            .cloned()
+            .collect()
     };
     pending
         .iter()
         .map(|job| {
-            let (icon, what) = if job.status() == "failed" { ("✗", "failed") } else { ("✓", "done") };
+            let (icon, what) = if job.status() == "failed" {
+                ("✗", "failed")
+            } else {
+                ("✓", "done")
+            };
             job.mark_displayed();
             // Surface the branch an isolated worker left changes on, so the parent
             // knows where to review/merge without opening the full result.
-            let branch = job.branch().map(|b| format!(" · branch `{b}`")).unwrap_or_default();
+            let branch = job
+                .branch()
+                .map(|b| format!(" · branch `{b}`"))
+                .unwrap_or_default();
             format!(
                 "\x1b[2m{icon} {} {what} — `:result {}` to view · {}{branch}\x1b[0m",
                 job.id,
@@ -1994,7 +2125,11 @@ pub fn notify_pending(jobs: &WorkerJobs) -> Vec<String> {
 
 /// Count of workers still running — for the prompt's `⟳N` indicator.
 pub fn running_count(jobs: &WorkerJobs) -> usize {
-    jobs.lock().unwrap().iter().filter(|j| !j.is_terminal()).count()
+    jobs.lock()
+        .unwrap()
+        .iter()
+        .filter(|j| !j.is_terminal())
+        .count()
 }
 
 /// The most recent still-fresh badge pulse across ALL workers (most-recent
@@ -2089,7 +2224,10 @@ mod tests {
                 suffix.chars().all(|c| c.is_ascii_alphanumeric()),
                 "suffix must be alphanumeric (a-z, A-Z, 0-9): {id}"
             );
-            assert!(seen.insert(id.clone()), "collision generating 10k ids: {id}");
+            assert!(
+                seen.insert(id.clone()),
+                "collision generating 10k ids: {id}"
+            );
         }
         assert_eq!(seen.len(), 10_000, "all 10k generated ids must be distinct");
     }
@@ -2107,8 +2245,8 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
-            transcript: VecDeque::new(),
-            transcript_bytes: 0,
+                transcript: VecDeque::new(),
+                transcript_bytes: 0,
             }),
         });
         assert!(job.fetch().contains("still running"));
@@ -2131,8 +2269,8 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
-            transcript: VecDeque::new(),
-            transcript_bytes: 0,
+                transcript: VecDeque::new(),
+                transcript_bytes: 0,
             }),
         });
         job.set_failed("boom".into());
@@ -2142,13 +2280,22 @@ mod tests {
     #[test]
     fn mem_limit_env_parsing() {
         // Unset → default.
-        assert_eq!(parse_u64_or(None, DEFAULT_WORKER_MEM_MB), DEFAULT_WORKER_MEM_MB);
+        assert_eq!(
+            parse_u64_or(None, DEFAULT_WORKER_MEM_MB),
+            DEFAULT_WORKER_MEM_MB
+        );
         // Valid override (with surrounding whitespace) parses.
         assert_eq!(parse_u64_or(Some(" 1024 "), DEFAULT_WORKER_MEM_MB), 1024);
         // Garbage → default.
-        assert_eq!(parse_u64_or(Some("not-a-number"), DEFAULT_WORKER_MEM_MB), DEFAULT_WORKER_MEM_MB);
+        assert_eq!(
+            parse_u64_or(Some("not-a-number"), DEFAULT_WORKER_MEM_MB),
+            DEFAULT_WORKER_MEM_MB
+        );
         // Empty → default.
-        assert_eq!(parse_u64_or(Some(""), DEFAULT_WORKER_MEM_MB), DEFAULT_WORKER_MEM_MB);
+        assert_eq!(
+            parse_u64_or(Some(""), DEFAULT_WORKER_MEM_MB),
+            DEFAULT_WORKER_MEM_MB
+        );
         // 0 is a legal "no limit" value and must round-trip, not fall back.
         assert_eq!(parse_u64_or(Some("0"), DEFAULT_WORKER_CPU_SECS), 0);
     }
@@ -2176,7 +2323,10 @@ mod tests {
             Some("✓ 🛠️ read /etc/hosts".to_string())
         );
         // Bare START line for a local tool (🛠️, no ✓/✗) is the duplicate — DROPPED.
-        assert_eq!(clean_activity_line("\x1b[2m  🛠️ read /etc/hosts\x1b[0m"), None);
+        assert_eq!(
+            clean_activity_line("\x1b[2m  🛠️ read /etc/hosts\x1b[0m"),
+            None
+        );
         // RESULT line with the real inner colour codes engine.rs emits — still
         // forwarded; the outer dim wrapper is stripped, inner colour preserved.
         assert_eq!(
@@ -2185,7 +2335,10 @@ mod tests {
         );
         // Bare START lines (wrench, no ✓/✗) are the duplicate — DROPPED now.
         assert_eq!(clean_activity_line("\x1b[2m  🔧 git status\x1b[0m"), None);
-        assert_eq!(clean_activity_line("\x1b[2m  🔧 mcp__atum__list_tools\x1b[0m"), None);
+        assert_eq!(
+            clean_activity_line("\x1b[2m  🔧 mcp__atum__list_tools\x1b[0m"),
+            None
+        );
         assert_eq!(clean_activity_line("🔧 ls"), None);
         // Lines without the wrench are dropped (banner, blanks, prose).
         assert_eq!(clean_activity_line("coordinator run abc starting"), None);
@@ -2333,15 +2486,30 @@ mod tests {
         // colour the coordinator emitted survives). This is what visually
         // contains the `:output` stream as a bordered side-column (w_sn1fHhd5).
         let row = pane_row("w_a7k3m2pQ", "🚀 planning the migration");
-        assert!(row.starts_with(PANE_BORDER), "row must open with the pane border: {row}");
+        assert!(
+            row.starts_with(PANE_BORDER),
+            "row must open with the pane border: {row}"
+        );
         assert!(row.contains("┃"), "border glyph present: {row}");
-        assert!(row.contains("[w_a7k3m2pQ]"), "gutter carries just the worker id: {row}");
-        assert!(row.ends_with("🚀 planning the migration"), "text preserved at the end: {row}");
+        assert!(
+            row.contains("[w_a7k3m2pQ]"),
+            "gutter carries just the worker id: {row}"
+        );
+        assert!(
+            row.ends_with("🚀 planning the migration"),
+            "text preserved at the end: {row}"
+        );
 
         // The text's own colour codes are passed through untouched.
         let colored = pane_row("w_a7k3m2pQ", "\x1b[32m✓\x1b[0m 🔧 read /etc/hosts");
-        assert!(colored.contains("[w_a7k3m2pQ]"), "gutter is the bare label: {colored}");
-        assert!(colored.contains("\x1b[32m✓\x1b[0m 🔧 read /etc/hosts"), "inline colour preserved: {colored}");
+        assert!(
+            colored.contains("[w_a7k3m2pQ]"),
+            "gutter is the bare label: {colored}"
+        );
+        assert!(
+            colored.contains("\x1b[32m✓\x1b[0m 🔧 read /etc/hosts"),
+            "inline colour preserved: {colored}"
+        );
     }
 
     #[test]
@@ -2350,18 +2518,39 @@ mod tests {
         // Both carry the cyan border-drawing characters and name the pane.
         let open = pane_open();
         let close = pane_close();
-        assert!(open.contains("┏"), "open frame has a top-left corner: {open}");
-        assert!(open.contains("coordinator output"), "open frame names the pane: {open}");
-        assert!(close.contains("┗"), "close frame has a bottom-left corner: {close}");
-        assert!(close.contains("coordinator output"), "close frame names the pane: {close}");
+        assert!(
+            open.contains("┏"),
+            "open frame has a top-left corner: {open}"
+        );
+        assert!(
+            open.contains("coordinator output"),
+            "open frame names the pane: {open}"
+        );
+        assert!(
+            close.contains("┗"),
+            "close frame has a bottom-left corner: {close}"
+        );
+        assert!(
+            close.contains("coordinator output"),
+            "close frame names the pane: {close}"
+        );
     }
 
     #[test]
     fn pane_replay_header_brackets_output_to_date() {
         let h = pane_replay_header("w_a7k3m2pQ");
-        assert!(h.contains('\u{250f}'), "replay header has a top-left corner: {h}");
-        assert!(h.contains("w_a7k3m2pQ"), "replay header names the coordinator: {h}");
-        assert!(h.contains("output to date"), "replay header labels the block: {h}");
+        assert!(
+            h.contains('\u{250f}'),
+            "replay header has a top-left corner: {h}"
+        );
+        assert!(
+            h.contains("w_a7k3m2pQ"),
+            "replay header names the coordinator: {h}"
+        );
+        assert!(
+            h.contains("output to date"),
+            "replay header labels the block: {h}"
+        );
     }
 
     #[test]
@@ -2386,11 +2575,18 @@ mod tests {
             job.record_activity("", &format!("line {n}"));
         }
         let rows = job.transcript_rows();
-        assert!(rows.len() <= TRANSCRIPT_MAX_LINES, "line cap enforced: {}", rows.len());
+        assert!(
+            rows.len() <= TRANSCRIPT_MAX_LINES,
+            "line cap enforced: {}",
+            rows.len()
+        );
         // The newest line is retained; the very first is gone.
         let newest = format!("line {}", TRANSCRIPT_MAX_LINES + 49);
         assert!(rows.last().unwrap().1.contains(&newest), "newest row kept");
-        assert!(!rows.iter().any(|(_, t)| t == "line 0"), "oldest row evicted");
+        assert!(
+            !rows.iter().any(|(_, t)| t == "line 0"),
+            "oldest row evicted"
+        );
     }
 
     #[test]
@@ -2400,7 +2596,10 @@ mod tests {
         // Branch is just `aish/{id}` — the id is globally unique, no session prefix.
         assert_eq!(branch, "aish/w_a7k3m2pQ");
         // Path = {root}/{repo-key}/{id}; the leaf is exactly the worker id.
-        assert_eq!(path, root.join("LightHeart-Ventures--aish").join("w_a7k3m2pQ"));
+        assert_eq!(
+            path,
+            root.join("LightHeart-Ventures--aish").join("w_a7k3m2pQ")
+        );
         assert!(path.ends_with("w_a7k3m2pQ"), "got: {}", path.display());
         // Distinct ids never collide on path or branch.
         let (b2, p2) = worktree_layout(root, "LightHeart-Ventures--aish", "w_ZZ00ay12");
@@ -2438,8 +2637,14 @@ mod tests {
             Some("owner--repo")
         );
         // Non-GitHub / unparseable → None (caller falls back to basename+hash).
-        assert_eq!(repo_key_from_remote("https://gitlab.com/owner/repo.git"), None);
-        assert_eq!(repo_key_from_remote("git@bitbucket.org:owner/repo.git"), None);
+        assert_eq!(
+            repo_key_from_remote("https://gitlab.com/owner/repo.git"),
+            None
+        );
+        assert_eq!(
+            repo_key_from_remote("git@bitbucket.org:owner/repo.git"),
+            None
+        );
         assert_eq!(repo_key_from_remote("not a url"), None);
         assert_eq!(repo_key_from_remote("https://github.com/owner"), None); // no repo segment
     }
@@ -2500,8 +2705,8 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
-            transcript: VecDeque::new(),
-            transcript_bytes: 0,
+                transcript: VecDeque::new(),
+                transcript_bytes: 0,
             }),
         });
         let lines = concat!(
@@ -2519,18 +2724,30 @@ mod tests {
         assert_eq!(job.latest_pulse().map(|(p, _)| p), Some(Pulse::ToolErr));
         // And it is fresh, so the aggregate badge is the red-cross variant.
         let jobs: WorkerJobs = Arc::new(Mutex::new(vec![job]));
-        assert_eq!(pulse_badge(1, fresh_pulse(&jobs)), "\x1b[31m\u{2717}1\x1b[0m ");
+        assert_eq!(
+            pulse_badge(1, fresh_pulse(&jobs)),
+            "\x1b[31m\u{2717}1\x1b[0m "
+        );
     }
 
     #[test]
     fn classify_event_maps_tool_and_turn_lines() {
         // Coordinator non-TTY result lines carry a status glyph beside the wrench.
-        assert_eq!(classify_event("\x1b[2m  ✓ 🔧 read /etc/hosts\x1b[0m"), Some(Pulse::ToolOk));
-        assert_eq!(classify_event("\x1b[2m  ✗ 🔧 write x\x1b[0m"), Some(Pulse::ToolErr));
+        assert_eq!(
+            classify_event("\x1b[2m  ✓ 🔧 read /etc/hosts\x1b[0m"),
+            Some(Pulse::ToolOk)
+        );
+        assert_eq!(
+            classify_event("\x1b[2m  ✗ 🔧 write x\x1b[0m"),
+            Some(Pulse::ToolErr)
+        );
         // A bare start line (no ✓/✗) is the tool beginning, not an outcome.
         assert_eq!(classify_event("\x1b[2m  🔧 git status\x1b[0m"), None);
         // Turn narration carries the speech sentinel.
-        assert_eq!(classify_event("🗨 planning the migration"), Some(Pulse::Turn));
+        assert_eq!(
+            classify_event("🗨 planning the migration"),
+            Some(Pulse::Turn)
+        );
         // Noise lines carry nothing.
         assert_eq!(classify_event("coordinator run abc starting"), None);
         assert_eq!(classify_event(""), None);
@@ -2551,8 +2768,8 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
-            transcript: VecDeque::new(),
-            transcript_bytes: 0,
+                transcript: VecDeque::new(),
+                transcript_bytes: 0,
             }),
         });
         // No events yet.
@@ -2585,8 +2802,8 @@ mod tests {
                     branch: None,
                     last_tool_outcome: None,
                     last_turn_completion: None,
-            transcript: VecDeque::new(),
-            transcript_bytes: 0,
+                    transcript: VecDeque::new(),
+                    transcript_bytes: 0,
                 }),
             });
             jobs.lock().unwrap().push(j.clone());
@@ -2602,11 +2819,17 @@ mod tests {
         // A stale event (older than PULSE_FADE) fades out of the aggregate.
         {
             let mut i = b.inner.lock().unwrap();
-            i.last_tool_outcome = Some((false, Instant::now() - PULSE_FADE - Duration::from_millis(50)));
+            i.last_tool_outcome = Some((
+                false,
+                Instant::now() - PULSE_FADE - Duration::from_millis(50),
+            ));
         }
         {
             let mut i = a.inner.lock().unwrap();
-            i.last_tool_outcome = Some((true, Instant::now() - PULSE_FADE - Duration::from_millis(50)));
+            i.last_tool_outcome = Some((
+                true,
+                Instant::now() - PULSE_FADE - Duration::from_millis(50),
+            ));
         }
         assert_eq!(fresh_pulse(&jobs), None);
     }
@@ -2644,8 +2867,9 @@ mod tests {
     #[test]
     fn worktree_add_backoff_is_exponential_10_to_160() {
         // Exact schedule required by the fix: 10, 20, 40, 80, 160 ms.
-        let schedule: Vec<u64> =
-            (1..=5).map(|n| worktree_add_backoff(n).as_millis() as u64).collect();
+        let schedule: Vec<u64> = (1..=5)
+            .map(|n| worktree_add_backoff(n).as_millis() as u64)
+            .collect();
         assert_eq!(schedule, vec![10, 20, 40, 80, 160]);
         // A pathological retry index saturates instead of overflowing/panicking.
         let _ = worktree_add_backoff(1000);
@@ -2662,7 +2886,9 @@ mod tests {
         assert!(is_worktree_lock_error("error: cannot lock ref"));
         assert!(is_worktree_lock_error("Unable to lock the index.lock"));
         // A genuinely fatal, non-lock error is NOT classified as a lock collision.
-        assert!(!is_worktree_lock_error("fatal: invalid reference: origin/nope"));
+        assert!(!is_worktree_lock_error(
+            "fatal: invalid reference: origin/nope"
+        ));
         assert!(!is_worktree_lock_error(""));
     }
 
@@ -2684,7 +2910,11 @@ mod tests {
         );
         assert!(ok, "must succeed once an attempt returns true");
         assert_eq!(attempts, 3, "stopped trying as soon as it succeeded");
-        assert_eq!(sleeps, vec![10, 20], "backed off before each retry, not after success");
+        assert_eq!(
+            sleeps,
+            vec![10, 20],
+            "backed off before each retry, not after success"
+        );
     }
 
     #[test]
@@ -2703,8 +2933,14 @@ mod tests {
             },
             |d| sleeps.push(d.as_millis() as u64),
         );
-        assert!(!ok, "all attempts failed → false (caller falls back to shared cwd)");
-        assert_eq!(attempts, WORKTREE_ADD_MAX_ATTEMPTS, "tried exactly the max attempts");
+        assert!(
+            !ok,
+            "all attempts failed → false (caller falls back to shared cwd)"
+        );
+        assert_eq!(
+            attempts, WORKTREE_ADD_MAX_ATTEMPTS,
+            "tried exactly the max attempts"
+        );
         assert_eq!(
             sleeps,
             vec![10, 20, 40, 80],

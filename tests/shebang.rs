@@ -33,7 +33,11 @@ fn nanos() -> u128 {
 /// A fresh, empty scratch dir that doubles as `HOME` and the working directory.
 fn scratch(tag: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("aish-shebang-{tag}-{}-{}", std::process::id(), nanos()));
+    p.push(format!(
+        "aish-shebang-{tag}-{}-{}",
+        std::process::id(),
+        nanos()
+    ));
     fs::create_dir_all(&p).expect("create scratch dir");
     p
 }

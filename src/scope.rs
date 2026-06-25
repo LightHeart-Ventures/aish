@@ -104,7 +104,9 @@ fn looks_like_job_id(token: &str) -> bool {
 /// Case-insensitive substring test (ASCII). Lets `status of aish` match a
 /// `LightHeart-Ventures--aish` repo-key without forcing an exact equality.
 fn contains_ci(haystack: &str, needle: &str) -> bool {
-    haystack.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
+    haystack
+        .to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -112,7 +114,11 @@ mod tests {
     use super::*;
 
     fn job<'a>(owner: Option<&'a str>, repo: Option<&'a str>, id: &'a str) -> JobRef<'a> {
-        JobRef { owner_session_id: owner, repo_key: repo, id }
+        JobRef {
+            owner_session_id: owner,
+            repo_key: repo,
+            id,
+        }
     }
 
     #[test]
@@ -134,13 +140,28 @@ mod tests {
 
     #[test]
     fn parse_routes_job_ids_and_prefixes() {
-        assert_eq!(JobScope::parse(Some("w_a7k3m2pQ")), JobScope::Job("w_a7k3m2pQ".into()));
-        assert_eq!(JobScope::parse(Some("worker_123")), JobScope::Job("worker_123".into()));
-        assert_eq!(JobScope::parse(Some("run_abc")), JobScope::Job("run_abc".into()));
+        assert_eq!(
+            JobScope::parse(Some("w_a7k3m2pQ")),
+            JobScope::Job("w_a7k3m2pQ".into())
+        );
+        assert_eq!(
+            JobScope::parse(Some("worker_123")),
+            JobScope::Job("worker_123".into())
+        );
+        assert_eq!(
+            JobScope::parse(Some("run_abc")),
+            JobScope::Job("run_abc".into())
+        );
         // Explicit job: prefix wins, payload trimmed.
-        assert_eq!(JobScope::parse(Some("job: w_xy ")), JobScope::Job("w_xy".into()));
+        assert_eq!(
+            JobScope::parse(Some("job: w_xy ")),
+            JobScope::Job("w_xy".into())
+        );
         // Explicit repo: prefix forces a repo scope even for a job-shaped token.
-        assert_eq!(JobScope::parse(Some("repo:w_xy")), JobScope::Repo("w_xy".into()));
+        assert_eq!(
+            JobScope::parse(Some("repo:w_xy")),
+            JobScope::Repo("w_xy".into())
+        );
     }
 
     #[test]
@@ -184,7 +205,10 @@ mod tests {
     fn matches_repo_scope_ci_eq_contains_and_legacy_null() {
         let r = JobScope::Repo("aish".into());
         // Substring, case-insensitive.
-        assert!(r.matches(&job(Some("A"), Some("LightHeart-Ventures--aish"), "w_1"), "A"));
+        assert!(r.matches(
+            &job(Some("A"), Some("LightHeart-Ventures--aish"), "w_1"),
+            "A"
+        ));
         // Exact, case-insensitive.
         assert!(JobScope::Repo("AISH".into()).matches(&job(None, Some("aish"), "w_2"), "A"));
         // Unrelated repo → no.

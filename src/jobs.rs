@@ -169,7 +169,11 @@ impl Job {
     /// Ask the background waiter to kill the child. Returns false when there is
     /// no live kill channel (already signalled, or a foreground job).
     pub fn kill(&self) -> bool {
-        self.kill.lock().unwrap().take().is_some_and(|tx| tx.send(()).is_ok())
+        self.kill
+            .lock()
+            .unwrap()
+            .take()
+            .is_some_and(|tx| tx.send(()).is_ok())
     }
 }
 
@@ -313,7 +317,9 @@ mod tests {
     fn background_output_buffer_is_capped() {
         let (job, _kill_rx) = Job::background(1, "noisy".into());
         for i in 0..5000 {
-            job.push_line(&format!("line {i} ........................................"));
+            job.push_line(&format!(
+                "line {i} ........................................"
+            ));
         }
         assert!(job.output().len() <= JOB_BUFFER_CAP);
         assert!(job.output().contains("line 4999"));

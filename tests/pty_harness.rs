@@ -49,9 +49,23 @@ use std::time::Duration;
 fn open_pty_master() -> (libc::c_int, std::ffi::CString) {
     unsafe {
         let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-        assert!(master >= 0, "posix_openpt: {}", std::io::Error::last_os_error());
-        assert_eq!(libc::grantpt(master), 0, "grantpt: {}", std::io::Error::last_os_error());
-        assert_eq!(libc::unlockpt(master), 0, "unlockpt: {}", std::io::Error::last_os_error());
+        assert!(
+            master >= 0,
+            "posix_openpt: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::grantpt(master),
+            0,
+            "grantpt: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::unlockpt(master),
+            0,
+            "unlockpt: {}",
+            std::io::Error::last_os_error()
+        );
         let slave_path = slave_device_name(master);
         (master, slave_path)
     }
@@ -66,7 +80,11 @@ fn slave_device_name(master_fd: libc::c_int) -> std::ffi::CString {
     {
         let mut buf = [0u8; 64];
         let rc = unsafe {
-            libc::ptsname_r(master_fd, buf.as_mut_ptr().cast::<libc::c_char>(), buf.len())
+            libc::ptsname_r(
+                master_fd,
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+            )
         };
         assert_eq!(rc, 0, "ptsname_r: {}", std::io::Error::last_os_error());
         let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
@@ -179,14 +197,24 @@ fn ctrl_c_kills_child_not_shell() {
     // The shell's process group is in a different session and is not affected.
     let ctrl_c = [0x03u8];
     let n = unsafe { libc::write(master_fd, ctrl_c.as_ptr().cast(), ctrl_c.len()) };
-    assert_eq!(n, 1, "write Ctrl-C to PTY master: {}", std::io::Error::last_os_error());
+    assert_eq!(
+        n,
+        1,
+        "write Ctrl-C to PTY master: {}",
+        std::io::Error::last_os_error()
+    );
 
     // ── 5. Wait for child ───────────────────────────────────────────────────
     // Use raw waitpid to inspect WIFSIGNALED / WTERMSIG without going through
     // Rust's ExitStatus abstraction.
     let mut raw_status: libc::c_int = 0;
     let waited = unsafe { libc::waitpid(child_pid, &mut raw_status, 0) };
-    assert_eq!(waited, child_pid, "waitpid: {}", std::io::Error::last_os_error());
+    assert_eq!(
+        waited,
+        child_pid,
+        "waitpid: {}",
+        std::io::Error::last_os_error()
+    );
 
     // ── 6. Assert: child died from SIGINT ────────────────────────────────────
     assert!(
@@ -258,12 +286,22 @@ fn sigint_to_child_pgrp_does_not_kill_shell() {
     // Send SIGINT to the child's process group only.
     // kill(-pgid, sig) delivers the signal to every process in the group.
     let r = unsafe { libc::kill(-child_pid, libc::SIGINT) };
-    assert_eq!(r, 0, "kill(-child_pgid, SIGINT): {}", std::io::Error::last_os_error());
+    assert_eq!(
+        r,
+        0,
+        "kill(-child_pgid, SIGINT): {}",
+        std::io::Error::last_os_error()
+    );
 
     // Wait and assert the child was killed by SIGINT.
     let mut status: libc::c_int = 0;
     let waited = unsafe { libc::waitpid(child_pid, &mut status, 0) };
-    assert_eq!(waited, child_pid, "waitpid: {}", std::io::Error::last_os_error());
+    assert_eq!(
+        waited,
+        child_pid,
+        "waitpid: {}",
+        std::io::Error::last_os_error()
+    );
 
     assert!(
         unsafe { libc::WIFSIGNALED(status) },
@@ -353,7 +391,10 @@ fn run_handoff_shell() -> ShellOutcome {
             if job == 0 {
                 libc::setpgid(0, 0);
                 // Bounded block: the shell kills us first; self-terminate if leaked.
-                let ts = libc::timespec { tv_sec: 5, tv_nsec: 0 };
+                let ts = libc::timespec {
+                    tv_sec: 5,
+                    tv_nsec: 0,
+                };
                 libc::nanosleep(&ts, std::ptr::null_mut());
                 libc::_exit(0);
             }
@@ -399,7 +440,12 @@ fn run_handoff_shell() -> ShellOutcome {
     // ── Parent: keep the master open (PTY stays alive) and reap the shell ────
     let mut status: libc::c_int = 0;
     let waited = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
-    assert_eq!(waited, pid, "waitpid(shell): {}", std::io::Error::last_os_error());
+    assert_eq!(
+        waited,
+        pid,
+        "waitpid(shell): {}",
+        std::io::Error::last_os_error()
+    );
 
     let stopped = unsafe { libc::WIFSTOPPED(status) };
     if stopped {
@@ -420,7 +466,11 @@ fn run_handoff_shell() -> ShellOutcome {
             -1
         },
         stopped,
-        stop_signal: if stopped { unsafe { libc::WSTOPSIG(status) } } else { 0 },
+        stop_signal: if stopped {
+            unsafe { libc::WSTOPSIG(status) }
+        } else {
+            0
+        },
     }
 }
 

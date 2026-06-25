@@ -137,10 +137,18 @@ pub fn resolve_selection(
     match pref {
         SelectorPref::Host => Selection::Host,
         SelectorPref::Force(Runtime::Podman) => {
-            if podman_present { Selection::Container(Runtime::Podman) } else { Selection::Host }
+            if podman_present {
+                Selection::Container(Runtime::Podman)
+            } else {
+                Selection::Host
+            }
         }
         SelectorPref::Force(Runtime::Docker) => {
-            if docker_present { Selection::Container(Runtime::Docker) } else { Selection::Host }
+            if docker_present {
+                Selection::Container(Runtime::Docker)
+            } else {
+                Selection::Host
+            }
         }
         // Auto: report-only (host execution) until the cutover is enabled — see
         // the `engaged` note above. The auto-preference order itself lives in
@@ -161,14 +169,24 @@ pub fn image_tag(version: &str) -> String {
 /// tokens; we still sanitize defensively so a stray char can't produce an
 /// invalid container name. Pure → unit-tested.
 pub fn container_name(session_id: &str, worker_id: &str) -> String {
-    format!("aish-{}-{}", sanitize_token(session_id), sanitize_token(worker_id))
+    format!(
+        "aish-{}-{}",
+        sanitize_token(session_id),
+        sanitize_token(worker_id)
+    )
 }
 
 /// Sanitize an id into the `[A-Za-z0-9_.-]` set container engines accept in a
 /// `--name`, collapsing anything else to `-`. Pure.
 fn sanitize_token(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -278,7 +296,12 @@ pub const STATE_MOUNT: &str = "/aish/state";
 /// `--rm` is set: S9.1 runs attached and finalizes here; the detached,
 /// keep-on-changes lifecycle is S9.4.
 pub fn run_argv(spec: &ContainerSpec) -> Vec<String> {
-    let mut a: Vec<String> = vec!["run".into(), "--rm".into(), "--name".into(), spec.name.clone()];
+    let mut a: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "--name".into(),
+        spec.name.clone(),
+    ];
     // Identity labels.
     for (k, v) in &spec.labels {
         a.push("--label".into());
@@ -302,7 +325,11 @@ pub fn run_argv(spec: &ContainerSpec) -> Vec<String> {
     }
     // Persistent state volume (AC4).
     a.push("-v".into());
-    a.push(format!("{}:{}", spec.state_volume_host.display(), spec.state_mount));
+    a.push(format!(
+        "{}:{}",
+        spec.state_volume_host.display(),
+        spec.state_mount
+    ));
     // Project tree (the worktree / cwd) bind-mounted at the workdir, so the
     // coordinator runs against the same files the host path would.
     if let Some(work) = &spec.work_volume_host {
@@ -338,7 +365,9 @@ pub fn describe_exit(code: i32) -> Option<String> {
              and runtime (docker/podman) availability."
                 .to_string(),
         ),
-        n => Some(format!("worker container exited unsuccessfully (exit {n}).")),
+        n => Some(format!(
+            "worker container exited unsuccessfully (exit {n})."
+        )),
     }
 }
 
@@ -386,7 +415,11 @@ pub fn list(rt: Runtime, label_filter: &[(&str, &str)]) -> Vec<ContainerHandle> 
             let mut it = line.splitn(2, '\t');
             let id = it.next()?.trim().to_string();
             let name = it.next().unwrap_or("").trim().to_string();
-            (!id.is_empty()).then_some(ContainerHandle { id, name, labels: HashMap::new() })
+            (!id.is_empty()).then_some(ContainerHandle {
+                id,
+                name,
+                labels: HashMap::new(),
+            })
         })
         .collect()
 }
@@ -397,22 +430,37 @@ mod tests {
 
     #[test]
     fn selector_parsing_covers_all_values() {
-        assert_eq!(Runtime::parse_selector(Some("podman")), SelectorPref::Force(Runtime::Podman));
-        assert_eq!(Runtime::parse_selector(Some("docker")), SelectorPref::Force(Runtime::Docker));
+        assert_eq!(
+            Runtime::parse_selector(Some("podman")),
+            SelectorPref::Force(Runtime::Podman)
+        );
+        assert_eq!(
+            Runtime::parse_selector(Some("docker")),
+            SelectorPref::Force(Runtime::Docker)
+        );
         // Case + whitespace tolerant.
-        assert_eq!(Runtime::parse_selector(Some("  DOCKER ")), SelectorPref::Force(Runtime::Docker));
+        assert_eq!(
+            Runtime::parse_selector(Some("  DOCKER ")),
+            SelectorPref::Force(Runtime::Docker)
+        );
         assert_eq!(Runtime::parse_selector(Some("none")), SelectorPref::Host);
         assert_eq!(Runtime::parse_selector(Some("host")), SelectorPref::Host);
         // Unset / empty / garbage → auto-detect.
         assert_eq!(Runtime::parse_selector(None), SelectorPref::Auto);
         assert_eq!(Runtime::parse_selector(Some("")), SelectorPref::Auto);
-        assert_eq!(Runtime::parse_selector(Some("kubernetes")), SelectorPref::Auto);
+        assert_eq!(
+            Runtime::parse_selector(Some("kubernetes")),
+            SelectorPref::Auto
+        );
     }
 
     #[test]
     fn resolve_selection_matches_ac1_precedence() {
         // none/host → always host, regardless of what's installed.
-        assert_eq!(resolve_selection(SelectorPref::Host, true, true), Selection::Host);
+        assert_eq!(
+            resolve_selection(SelectorPref::Host, true, true),
+            Selection::Host
+        );
         // Explicit podman → podman when present, else host (graceful fallback, AC9).
         assert_eq!(
             resolve_selection(SelectorPref::Force(Runtime::Podman), true, false),
@@ -433,7 +481,10 @@ mod tests {
         );
         // Auto stays on the host path (report-only until S9.3/S9.4 cutover), even
         // with both engines present — installing Docker can't hijack the default.
-        assert_eq!(resolve_selection(SelectorPref::Auto, true, true), Selection::Host);
+        assert_eq!(
+            resolve_selection(SelectorPref::Auto, true, true),
+            Selection::Host
+        );
     }
 
     #[test]
@@ -444,7 +495,10 @@ mod tests {
 
     #[test]
     fn container_name_is_deterministic_and_sanitized() {
-        assert_eq!(container_name("sess-abc", "w_a7k3m2pQ"), "aish-sess-abc-w_a7k3m2pQ");
+        assert_eq!(
+            container_name("sess-abc", "w_a7k3m2pQ"),
+            "aish-sess-abc-w_a7k3m2pQ"
+        );
         // Same inputs → same name (deterministic, AC3).
         assert_eq!(
             container_name("sess-abc", "w_a7k3m2pQ"),
@@ -456,14 +510,32 @@ mod tests {
 
     #[test]
     fn worker_labels_carry_identity_and_optional_card() {
-        let l = worker_labels("w_1", "sess-a", "owner--repo", Some("card_9"), "2026-06-22T00:00:00Z");
+        let l = worker_labels(
+            "w_1",
+            "sess-a",
+            "owner--repo",
+            Some("card_9"),
+            "2026-06-22T00:00:00Z",
+        );
         let map: HashMap<_, _> = l.iter().cloned().collect();
         assert_eq!(map.get("aish.schema").map(String::as_str), Some("1"));
         assert_eq!(map.get("aish.worker_id").map(String::as_str), Some("w_1"));
-        assert_eq!(map.get("aish.session_id").map(String::as_str), Some("sess-a"));
-        assert_eq!(map.get("aish.repo_key").map(String::as_str), Some("owner--repo"));
-        assert_eq!(map.get("aish.created_at").map(String::as_str), Some("2026-06-22T00:00:00Z"));
-        assert_eq!(map.get("aish.task_card_id").map(String::as_str), Some("card_9"));
+        assert_eq!(
+            map.get("aish.session_id").map(String::as_str),
+            Some("sess-a")
+        );
+        assert_eq!(
+            map.get("aish.repo_key").map(String::as_str),
+            Some("owner--repo")
+        );
+        assert_eq!(
+            map.get("aish.created_at").map(String::as_str),
+            Some("2026-06-22T00:00:00Z")
+        );
+        assert_eq!(
+            map.get("aish.task_card_id").map(String::as_str),
+            Some("card_9")
+        );
         // An absent / empty card id omits the label entirely.
         let l2 = worker_labels("w_1", "sess-a", "owner--repo", None, "ts");
         assert!(!l2.iter().any(|(k, _)| k == "aish.task_card_id"));
@@ -526,28 +598,48 @@ mod tests {
         let argv = run_argv(&sample_spec());
         // Starts with `run --rm --name <name>`.
         assert_eq!(&argv[0..2], &["run", "--rm"]);
-        assert!(argv.windows(2).any(|w| w[0] == "--name" && w[1] == "aish-sess-w1"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--name" && w[1] == "aish-sess-w1")
+        );
         // Carries the identity labels.
-        assert!(argv.windows(2).any(|w| w[0] == "--label" && w[1] == "aish.worker_id=w1"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--label" && w[1] == "aish.worker_id=w1")
+        );
         // Resource caps present (mem + pids; cpus omitted as None).
-        assert!(argv.windows(2).any(|w| w[0] == "--memory" && w[1] == "4096m"));
-        assert!(argv.windows(2).any(|w| w[0] == "--pids-limit" && w[1] == "512"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--memory" && w[1] == "4096m")
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--pids-limit" && w[1] == "512")
+        );
         assert!(!argv.iter().any(|s| s == "--cpus"));
         // Hardened: cap-drop, never privileged.
         assert!(argv.iter().any(|s| s == "--cap-drop=ALL"));
         assert!(!argv.iter().any(|s| s == "--privileged"));
         // Secrets via env-file (kept out of argv/ps).
-        assert!(argv.windows(2).any(|w| w[0] == "--env-file" && w[1] == "/tmp/w1.env"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--env-file" && w[1] == "/tmp/w1.env")
+        );
         // State volume mounted at the fixed path (AC4).
-        assert!(argv
-            .windows(2)
-            .any(|w| w[0] == "-v" && w[1] == "/home/me/.aish/workers/w1:/aish/state"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-v" && w[1] == "/home/me/.aish/workers/w1:/aish/state")
+        );
         // Project tree bind-mounted at the workdir.
-        assert!(argv
-            .windows(2)
-            .any(|w| w[0] == "-v" && w[1] == "/home/me/proj:/aish/work"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-v" && w[1] == "/home/me/proj:/aish/work")
+        );
         // Network set.
-        assert!(argv.windows(2).any(|w| w[0] == "--network" && w[1] == "host"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--network" && w[1] == "host")
+        );
         // The image precedes the coordinator argv, which is preserved verbatim
         // and in order at the tail.
         let img = argv.iter().position(|s| s == "aish-worker:0.9.3").unwrap();
