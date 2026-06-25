@@ -7,11 +7,13 @@ mod coordinator;
 mod db;
 mod editor;
 mod engine;
+mod git;
+mod git_repo;
 mod goal;
 mod jobs;
 mod loopguard;
-mod md;
 mod mcp;
+mod md;
 #[cfg(test)]
 mod oracle;
 mod pipeline;
@@ -105,7 +107,11 @@ struct Args {
     /// `-c` is given. `trailing_var_arg` + `allow_hyphen_values` collect the
     /// operands verbatim so a script's own `-flag` args aren't parsed as aish
     /// flags.
-    #[arg(value_name = "SCRIPT [ARGS…]", trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(
+        value_name = "SCRIPT [ARGS…]",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
     script_argv: Vec<String>,
 }
 
@@ -123,7 +129,9 @@ impl StartupTimer {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Self {
-            on: std::env::var("AISH_TIME_STARTUP").map(|v| v != "0" && !v.is_empty()).unwrap_or(false),
+            on: std::env::var("AISH_TIME_STARTUP")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false),
             t0: now,
             last: now,
         }
@@ -223,7 +231,9 @@ async fn main() -> Result<()> {
         // group leader (the common case under a normal exec) — ignore that and
         // never abort startup on failure.
         // SAFETY: setsid() takes no arguments and only affects this process.
-        unsafe { libc::setsid(); }
+        unsafe {
+            libc::setsid();
+        }
         // Profile sourcing (S4.5 / TASK-128): source /etc/profile then ~/.profile
         // BENEATH ~/.aishrc. Profiles are the base layer; ~/.aishrc is overlaid on
         // top, so a name set in both resolves to the ~/.aishrc value — the
@@ -286,7 +296,8 @@ async fn main() -> Result<()> {
             )?
         }
         "grok" => backend::Backend::new_grok(
-            args.model.unwrap_or_else(|| backend::grok::DEFAULT_MODEL.into()),
+            args.model
+                .unwrap_or_else(|| backend::grok::DEFAULT_MODEL.into()),
             &session.env,
         )?,
         #[cfg(feature = "local")]
@@ -300,8 +311,9 @@ async fn main() -> Result<()> {
     session.mode = if args.yolo {
         session::Mode::Yolo
     } else {
-        session::Mode::parse(&args.mode)
-            .ok_or_else(|| anyhow::anyhow!("unknown mode: {} (paranoid|careful|normal|yolo)", args.mode))?
+        session::Mode::parse(&args.mode).ok_or_else(|| {
+            anyhow::anyhow!("unknown mode: {} (paranoid|careful|normal|yolo)", args.mode)
+        })?
     };
 
     // ~/.aish/ — config home (created above): .mcp.json (MCP servers) and skills/.
@@ -309,10 +321,7 @@ async fn main() -> Result<()> {
     let skills_dir = aish_dir.join("skills");
     let mcp_config = aish_dir.join(".mcp.json");
     if !mcp_config.exists() {
-        let _ = std::fs::write(
-            &mcp_config,
-            "{\n  \"mcpServers\": {\n  }\n}\n",
-        );
+        let _ = std::fs::write(&mcp_config, "{\n  \"mcpServers\": {\n  }\n}\n");
     }
     // Project-scope .mcp.json (cwd) outranks the user-scope one on name clashes.
     let project_mcp = session.cwd.join(".mcp.json");
@@ -335,16 +344,12 @@ async fn main() -> Result<()> {
     //     install them into later.
     let interactive = args.command.is_none() && args.script_argv.is_empty();
     if interactive {
-        session.skills_prompt =
-            skills::render_prompt_section(&skills::load(&skills_dir), &[]);
+        session.skills_prompt = skills::render_prompt_section(&skills::load(&skills_dir), &[]);
     } else {
-        session.mcp =
-            mcp::McpHost::start(&[project_mcp.as_path(), mcp_config.as_path()]).await;
+        session.mcp = mcp::McpHost::start(&[project_mcp.as_path(), mcp_config.as_path()]).await;
         timer.mark("MCP connect");
-        session.skills_prompt = skills::render_prompt_section(
-            &skills::load(&skills_dir),
-            &session.mcp.skills(),
-        );
+        session.skills_prompt =
+            skills::render_prompt_section(&skills::load(&skills_dir), &session.mcp.skills());
     }
     timer.mark("skills render");
     session.db = match db::Db::open(&aish_dir.join("aish.db")) {
