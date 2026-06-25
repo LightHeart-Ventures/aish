@@ -502,6 +502,34 @@ pub struct CoordinatorRow {
     pub heartbeat_at: Option<String>,
 }
 
+/// One run's terminal payload, read STRICTLY by `run_id` (TASK-205). A single
+/// keyed row read with no shared/global "last result" slot, so a concurrent
+/// completion of another run can never bleed into this lookup.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunResult {
+    pub run_id: String,
+    /// 'coordinating' | 'awaiting_batch' | 'done' | 'failed'.
+    pub phase: String,
+    pub result: Option<String>,
+    pub error: Option<String>,
+}
+
+impl RunResult {
+    /// Render the run's own result for display — the done answer, a failure
+    /// note, or a still-running status. Mirrors `worker::WorkerJob::fetch`.
+    pub fn rendered(&self) -> String {
+        match self.phase.as_str() {
+            "done" => self.result.clone().unwrap_or_else(|| "(empty result)".into()),
+            "failed" => format!(
+                "run {} failed: {}",
+                self.run_id,
+                self.error.clone().unwrap_or_else(|| "unknown error".into())
+            ),
+            other => format!("run {} is still running (phase: {other}).", self.run_id),
+        }
+    }
+}
+
 /// Durable store for background coordinator runs — the resumable equivalent of
 /// `BatchStore`, ported from atum_cli's batch-controller store. Kept in its own
 /// connection (the coordinator drives turns + batch waits off the main thread)
@@ -543,7 +571,20 @@ impl CoordinatorStore {
                  created_at   TEXT NOT NULL DEFAULT current_timestamp
              );
              CREATE INDEX IF NOT EXISTS idx_coord_msg_run
-                 ON coordinator_messages (run_id);",
+                 ON coordinator_messages (run_id);
+             -- TASK-205: immutable alias->run_id binding, written ONCE at run
+             -- start. `:result <alias>` resolves alias->run_id then reads that
+             -- run's own result strictly by run_id -- never a shared/global
+             -- result slot -- so concurrent worker completions can't corrupt a
+             -- lookup. The alias row is never mutated after creation.
+             CREATE TABLE IF NOT EXISTS run_aliases (
+                 alias      TEXT PRIMARY KEY,
+                 run_id     TEXT NOT NULL,
+                 pr         TEXT,
+                 created_at TEXT NOT NULL DEFAULT current_timestamp
+             );
+             CREATE INDEX IF NOT EXISTS idx_run_aliases_run
+                 ON run_aliases (run_id);",
         )
         .context("coordinator_runs schema init failed")?;
         // Back-compat: add session_name to a table created before it existed.
@@ -742,6 +783,68 @@ impl CoordinatorStore {
         )?)
     }
 
+    /// Bind `alias`->`run_id` ONCE at run creation (TASK-205 AC1). The write is
+    /// immutable: a second bind for the same alias is a no-op
+    /// (`ON CONFLICT(alias) DO NOTHING`), so the mapping captured at run start
+    /// can never be mutated by a later — possibly racing — writer. `pr` records
+    /// the opened pull request when known; it is informational and never affects
+    /// resolution. Idempotent, so it is safe to call again on a resume.
+    pub fn bind_alias(&self, alias: &str, run_id: &str, pr: Option<&str>) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO run_aliases (alias, run_id, pr) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(alias) DO NOTHING",
+            (alias, run_id, pr),
+        )?;
+        Ok(())
+    }
+
+    /// Resolve an alias to its immutably-bound `run_id` (TASK-205 AC2). `None`
+    /// when the alias was never bound. A single keyed read — no shared state.
+    pub fn resolve_alias(&self, alias: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT run_id FROM run_aliases WHERE alias = ?1", [alias], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Read ONE run's terminal payload strictly by `run_id` (TASK-205 AC2/AC3).
+    /// A single keyed row lookup against `coordinator_runs` — there is no
+    /// global/shared "last result" slot, so a concurrent completion of a
+    /// different run can never corrupt this read. `None` when the run is unknown.
+    pub fn result_for_run(&self, run_id: &str) -> Result<Option<RunResult>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT run_id, phase, result, error FROM coordinator_runs WHERE run_id = ?1",
+                [run_id],
+                |r| {
+                    Ok(RunResult {
+                        run_id: r.get(0)?,
+                        phase: r.get(1)?,
+                        result: r.get(2)?,
+                        error: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Resolve `alias`->`run_id`->that run's own result (TASK-205 AC2). The alias
+    /// binding and the result read are each a single exact-key lookup, so the
+    /// whole path is free of any shared/global cache a racing completion could
+    /// clobber. Tries `alias` as a bound alias first, then falls back to treating
+    /// it as a literal `run_id` (the two coincide for an aish worker).
+    pub fn result_for_alias(&self, alias: &str) -> Result<Option<RunResult>> {
+        if let Some(run_id) = self.resolve_alias(alias)? {
+            return self.result_for_run(&run_id);
+        }
+        self.result_for_run(alias)
+    }
+
     /// Drop terminal `done` runs (a delivered/surfaced result needs no further
     /// retention). `failed` runs are intentionally RETAINED so a reaped orphan
     /// or errored run stays inspectable in `background_status` / `:workers`
@@ -896,6 +999,69 @@ mod tests {
         store.set_failed("batch_1", "timeout").unwrap();
         assert_eq!(reopened.clear_finished().unwrap(), 2); // both terminal now
         assert!(reopened.load_all().unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn run_aliases_are_immutable_and_resolve_by_run_id() {
+        let path = std::env::temp_dir().join(format!("aish_alias_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+
+        store.insert("run_a", "task a", "s", None).unwrap();
+        store.bind_alias("w_a", "run_a", Some("#75")).unwrap();
+        // Immutable: a second bind for the same alias is a no-op (AC1).
+        store.bind_alias("w_a", "run_OTHER", Some("#999")).unwrap();
+        assert_eq!(store.resolve_alias("w_a").unwrap().as_deref(), Some("run_a"));
+
+        store.set_done("run_a", "PR #75 opened").unwrap();
+        let r = store.result_for_alias("w_a").unwrap().unwrap();
+        assert_eq!(r.run_id, "run_a");
+        assert_eq!(r.phase, "done");
+        assert_eq!(r.result.as_deref(), Some("PR #75 opened"));
+        // An unbound alias falls back to a literal run_id lookup.
+        assert_eq!(
+            store.result_for_alias("run_a").unwrap().unwrap().result.as_deref(),
+            Some("PR #75 opened")
+        );
+        // An unknown alias resolves to nothing (not someone else's result).
+        assert!(store.result_for_alias("nope").unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn concurrent_worker_completions_do_not_corrupt_result_lookup() {
+        // TASK-205 regression: complete N workers in parallel, then assert each
+        // `:result <alias>` returns its OWN run's data — no shared slot a racing
+        // completion can overwrite.
+        use std::thread;
+        let path =
+            std::env::temp_dir().join(format!("aish_alias_conc_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+
+        const N: usize = 12;
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let store = store.clone();
+            handles.push(thread::spawn(move || {
+                let run_id = format!("run_{i}");
+                let alias = format!("w_{i}");
+                let result = format!("PR #{} done", 100 + i);
+                store.insert(&run_id, "parallel work", "s", None).unwrap();
+                store.bind_alias(&alias, &run_id, None).unwrap();
+                store.set_done(&run_id, &result).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Every alias resolves to exactly its own run's result.
+        for i in 0..N {
+            let r = store.result_for_alias(&format!("w_{i}")).unwrap().unwrap();
+            assert_eq!(r.run_id, format!("run_{i}"));
+            assert_eq!(r.result.as_deref(), Some(format!("PR #{} done", 100 + i).as_str()));
+        }
         let _ = std::fs::remove_file(&path);
     }
 
