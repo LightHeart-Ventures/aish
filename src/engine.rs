@@ -865,6 +865,10 @@ fn describe_call(call: &crate::backend::ToolCall) -> String {
             a["path"].as_str().unwrap_or("?"),
             a["content"].as_str().map(str::len).unwrap_or(0)
         ),
+        "edit_file" => {
+            let mode = a["mode"].as_str().unwrap_or("replace");
+            format!("edit {} ({mode}: {})", a["path"].as_str().unwrap_or("?"), a["pattern"].as_str().unwrap_or("?"))
+        }
         "list_dir" => format!("list {}", a["path"].as_str().unwrap_or(".")),
         "change_dir" => format!("cd {}", a["path"].as_str().unwrap_or("?")),
         "remember" => format!("remember: {}", a["content"].as_str().unwrap_or("?")),

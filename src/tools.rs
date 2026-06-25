@@ -1,6 +1,7 @@
 use crate::backend::{ToolCall, ToolDef, ToolResult};
 use crate::session::Session;
 use anyhow::Result;
+use regex::Regex;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -236,6 +237,24 @@ user wants a file created or changed — never try echo/tee tricks.".into(),
                     "content": {"type": "string"}
                 },
                 "required": ["path", "content"]
+            }),
+        },
+        ToolDef {
+            name: "edit_file".into(),
+            description: "Surgically edit a file in place by pattern — change specific lines without rewriting the whole file. Finds `pattern` (a literal substring, or a regular expression when `regex` is true) and either REPLACES each match with `replacement` (default), or INSERTS `replacement` as a new line before/after each matching line (`mode`). Scope the edit with `count` (change at most the first N matches; 0 = all) and/or `line_start`/`line_end` (1-based inclusive — only act on matches within that line range). With `regex`, `replacement` may reference capture groups (`$1`, `${name}`). Returns how many changes were made; reports \"no matches\" and leaves the file untouched when nothing matched. Prefer this over read_file+write_file for targeted edits to large files.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File to edit (relative paths resolve against the cwd)"},
+                    "pattern": {"type": "string", "description": "Text to find — a literal substring, or a regular expression when `regex` is true"},
+                    "replacement": {"type": "string", "description": "Replacement text (replace mode), or the line to insert (insert modes). Defaults to empty string, so replace mode with no replacement deletes the matches. With `regex`, may reference capture groups via $1 / ${name}."},
+                    "regex": {"type": "boolean", "description": "Treat `pattern` as a regular expression (default false → literal match)"},
+                    "mode": {"type": "string", "enum": ["replace", "insert_before", "insert_after"], "description": "replace (default) substitutes each match; insert_before / insert_after add `replacement` as a new line before/after each line that matches"},
+                    "count": {"type": "integer", "description": "Change at most the first N matches (0 or omitted = all matches)"},
+                    "line_start": {"type": "integer", "description": "Optional 1-based first line to act on — matches before this line are ignored"},
+                    "line_end": {"type": "integer", "description": "Optional 1-based last line (inclusive) to act on — matches after this line are ignored"}
+                },
+                "required": ["path", "pattern"]
             }),
         },
         ToolDef {
@@ -509,7 +528,7 @@ pub async fn execute(call: &ToolCall, session: &mut Session, confirm: &mut Confi
     if session.mode == crate::session::Mode::Paranoid
         && !matches!(
             call.name.as_str(),
-            "read_file" | "write_file" | "run_program" | "run_interactive"
+            "read_file" | "write_file" | "edit_file" | "run_program" | "run_interactive"
                 | "copy_file" | "rename_file" | "append_file"
         )
     {
@@ -527,6 +546,7 @@ pub async fn execute(call: &ToolCall, session: &mut Session, confirm: &mut Confi
         "run_interactive" => run_interactive(call, session, confirm).await,
         "read_file" => read_file(call, session, confirm),
         "write_file" => write_file(call, session, confirm),
+        "edit_file" => edit_file(call, session, confirm),
         "list_dir" => list_dir(call, session),
         "glob_expand" => glob_expand(call, session),
         "grep_files" => grep_files(call, session),
@@ -1869,6 +1889,207 @@ fn write_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>)
     Ok(format!("wrote {} bytes to {}", content.len(), full.display()))
 }
 
+// ---------------------------------------------------------------------------
+// edit_file — surgical, pattern-based in-place edits so the model can change
+// specific lines/ranges of a large file without round-tripping the whole thing
+// through read_file + write_file. Pure logic lives in `apply_edit` (unit-tested);
+// `edit_file` is the IO + safety-gate wrapper.
+// ---------------------------------------------------------------------------
+
+/// What an edit does at each match site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditMode {
+    /// Substitute the matched text with the replacement.
+    Replace,
+    /// Insert the replacement as a new line BEFORE each matching line.
+    InsertBefore,
+    /// Insert the replacement as a new line AFTER each matching line.
+    InsertAfter,
+}
+
+/// A fully-parsed edit request (decoupled from the JSON call for testing).
+struct EditSpec<'a> {
+    pattern: &'a str,
+    replacement: &'a str,
+    is_regex: bool,
+    mode: EditMode,
+    /// Max matches to act on; 0 means unlimited.
+    count: usize,
+    /// 1-based inclusive line window the edit is restricted to (None = open).
+    line_start: Option<usize>,
+    line_end: Option<usize>,
+}
+
+/// 1-based line number of a byte offset into `content`.
+fn line_of_offset(content: &str, off: usize) -> usize {
+    content.as_bytes()[..off].iter().filter(|&&b| b == b'\n').count() + 1
+}
+
+/// Is `line` inside the (optional, 1-based inclusive) window?
+fn within_window(line: usize, start: Option<usize>, end: Option<usize>) -> bool {
+    start.map_or(true, |s| line >= s) && end.map_or(true, |e| line <= e)
+}
+
+/// Apply an edit to `content`, returning `(new_content, changes_made)`. Pure —
+/// no IO — so the edit semantics (literal vs regex, replace vs insert, count and
+/// line-range scoping, `$1` capture expansion) are unit-testable in isolation.
+fn apply_edit(content: &str, spec: &EditSpec) -> Result<(String, usize)> {
+    if spec.pattern.is_empty() {
+        anyhow::bail!("pattern must not be empty");
+    }
+    let limit = if spec.count == 0 { usize::MAX } else { spec.count };
+
+    match spec.mode {
+        EditMode::Replace if spec.is_regex => {
+            let re = Regex::new(spec.pattern)
+                .map_err(|e| anyhow::anyhow!("invalid regex: {e}"))?;
+            let mut out = String::with_capacity(content.len());
+            let mut last = 0usize;
+            let mut n = 0usize;
+            for caps in re.captures_iter(content) {
+                if n >= limit {
+                    break;
+                }
+                let m = caps.get(0).expect("group 0 always present");
+                if !within_window(line_of_offset(content, m.start()), spec.line_start, spec.line_end) {
+                    continue;
+                }
+                out.push_str(&content[last..m.start()]);
+                caps.expand(spec.replacement, &mut out);
+                last = m.end();
+                n += 1;
+            }
+            out.push_str(&content[last..]);
+            Ok((out, n))
+        }
+        EditMode::Replace => {
+            // Literal substring replacement.
+            let pat = spec.pattern;
+            let mut out = String::with_capacity(content.len());
+            let mut last = 0usize;
+            let mut search_from = 0usize;
+            let mut n = 0usize;
+            while n < limit {
+                let Some(rel) = content[search_from..].find(pat) else { break };
+                let start = search_from + rel;
+                let end = start + pat.len();
+                if within_window(line_of_offset(content, start), spec.line_start, spec.line_end) {
+                    out.push_str(&content[last..start]);
+                    out.push_str(spec.replacement);
+                    last = end;
+                    n += 1;
+                }
+                // Advance past this match (even when skipped) to find the next.
+                // Guard against a zero-width literal (shouldn't happen — empty
+                // pattern is rejected above).
+                search_from = end.max(start + 1);
+            }
+            out.push_str(&content[last..]);
+            Ok((out, n))
+        }
+        EditMode::InsertBefore | EditMode::InsertAfter => {
+            // Line-oriented: insert `replacement` as a new line before/after each
+            // line that matches. Splitting on '\n' and re-joining preserves the
+            // file's trailing-newline shape (a trailing '\n' yields a final ""
+            // element that round-trips).
+            let re = if spec.is_regex {
+                Some(Regex::new(spec.pattern).map_err(|e| anyhow::anyhow!("invalid regex: {e}"))?)
+            } else {
+                None
+            };
+            let line_matches = |line: &str| match &re {
+                Some(re) => re.is_match(line),
+                None => line.contains(spec.pattern),
+            };
+            let mut out: Vec<&str> = Vec::new();
+            let mut n = 0usize;
+            for (i, line) in content.split('\n').enumerate() {
+                let hit = n < limit
+                    && within_window(i + 1, spec.line_start, spec.line_end)
+                    && line_matches(line);
+                if hit && spec.mode == EditMode::InsertBefore {
+                    out.push(spec.replacement);
+                    n += 1;
+                }
+                out.push(line);
+                if hit && spec.mode == EditMode::InsertAfter {
+                    out.push(spec.replacement);
+                    n += 1;
+                }
+            }
+            Ok((out.join("\n"), n))
+        }
+    }
+}
+
+fn edit_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
+    let path = call.args["path"].as_str().ok_or_else(|| anyhow::anyhow!("missing path"))?;
+    let pattern = call.args["pattern"].as_str().ok_or_else(|| anyhow::anyhow!("missing pattern"))?;
+    let replacement = call.args["replacement"].as_str().unwrap_or("");
+    let is_regex = call.args["regex"].as_bool().unwrap_or(false);
+    let mode = match call.args["mode"].as_str().unwrap_or("replace") {
+        "replace" => EditMode::Replace,
+        "insert_before" => EditMode::InsertBefore,
+        "insert_after" => EditMode::InsertAfter,
+        other => anyhow::bail!("unknown mode '{other}' — use replace, insert_before, or insert_after"),
+    };
+    let count = call.args["count"].as_u64().unwrap_or(0) as usize;
+    let line_start = call.args["line_start"].as_u64().map(|n| n as usize);
+    let line_end = call.args["line_end"].as_u64().map(|n| n as usize);
+    let full = resolve(session, path);
+
+    let content = std::fs::read_to_string(&full)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
+
+    let spec = EditSpec {
+        pattern,
+        replacement,
+        is_regex,
+        mode,
+        count,
+        line_start,
+        line_end,
+    };
+    // Compute the result first — a bad regex or a no-op match reports cleanly
+    // without prompting or touching the file.
+    let (new_content, changes) = apply_edit(&content, &spec)?;
+    if changes == 0 {
+        return Ok(format!(
+            "no matches for {} {} in {} — file unchanged",
+            if is_regex { "regex" } else { "pattern" },
+            serde_json::to_string(pattern).unwrap_or_else(|_| format!("{pattern:?}")),
+            full.display()
+        ));
+    }
+
+    // An edit is a write: it's destructive in every mode short of yolo. The 'd'
+    // option allows every write under the file's directory recursively.
+    if !matches!(session.mode, crate::session::Mode::Yolo) {
+        let verb = match mode {
+            EditMode::Replace => "replace",
+            EditMode::InsertBefore => "insert before",
+            EditMode::InsertAfter => "insert after",
+        };
+        let prompt = format!(
+            "edit {} — {verb} {changes} match(es), {} → {} bytes\n  │ pattern: {}\n ",
+            full.display(),
+            content.len(),
+            new_content.len(),
+            truncate_middle(pattern.to_string(), 120)
+        );
+        if !gate_path(session, Perm::Write, &full, "edit_file", &prompt, confirm) {
+            return Ok("user declined the edit".into());
+        }
+    }
+
+    std::fs::write(&full, &new_content).map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
+    Ok(format!(
+        "edited {}: {changes} change(s), {} bytes",
+        full.display(),
+        new_content.len()
+    ))
+}
+
 fn list_dir(call: &ToolCall, session: &Session) -> Result<String> {
     let path = call.args["path"].as_str().unwrap_or(".");
     let full = resolve(session, path);
@@ -2578,6 +2799,154 @@ fn char_ceil(s: &str, mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spec<'a>(
+        pattern: &'a str,
+        replacement: &'a str,
+        is_regex: bool,
+        mode: EditMode,
+        count: usize,
+        line_start: Option<usize>,
+        line_end: Option<usize>,
+    ) -> EditSpec<'a> {
+        EditSpec { pattern, replacement, is_regex, mode, count, line_start, line_end }
+    }
+
+    #[test]
+    fn edit_literal_replace_all_and_count() {
+        let c = "foo bar foo baz foo";
+        // All occurrences.
+        let (out, n) = apply_edit(c, &spec("foo", "X", false, EditMode::Replace, 0, None, None)).unwrap();
+        assert_eq!(out, "X bar X baz X");
+        assert_eq!(n, 3);
+        // First N only.
+        let (out, n) = apply_edit(c, &spec("foo", "X", false, EditMode::Replace, 2, None, None)).unwrap();
+        assert_eq!(out, "X bar X baz foo");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn edit_literal_replace_empty_deletes() {
+        let (out, n) = apply_edit("a-b-c", &spec("-", "", false, EditMode::Replace, 0, None, None)).unwrap();
+        assert_eq!(out, "abc");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn edit_no_match_reports_zero() {
+        let (out, n) = apply_edit("hello", &spec("xyz", "Q", false, EditMode::Replace, 0, None, None)).unwrap();
+        assert_eq!(out, "hello");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn edit_replace_in_line_range_only() {
+        let c = "foo\nfoo\nfoo\nfoo";
+        // Restrict to lines 2..=3 — only those two `foo`s change.
+        let (out, n) = apply_edit(c, &spec("foo", "X", false, EditMode::Replace, 0, Some(2), Some(3))).unwrap();
+        assert_eq!(out, "foo\nX\nX\nfoo");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn edit_regex_replace_with_capture_groups() {
+        let c = "name: alice\nname: bob";
+        let (out, n) = apply_edit(
+            c,
+            &spec(r"name: (\w+)", "user=$1", true, EditMode::Replace, 0, None, None),
+        )
+        .unwrap();
+        assert_eq!(out, "user=alice\nuser=bob");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn edit_regex_replace_multiline_anchors() {
+        // Default regex is single-line; `.` doesn't cross newlines unless asked.
+        let c = "a1\nb2\nc3";
+        let (out, n) = apply_edit(c, &spec(r"\d", "#", true, EditMode::Replace, 0, None, None)).unwrap();
+        assert_eq!(out, "a#\nb#\nc#");
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn edit_insert_after_matching_line() {
+        let c = "alpha\nbeta\ngamma";
+        let (out, n) = apply_edit(c, &spec("beta", "INSERTED", false, EditMode::InsertAfter, 0, None, None)).unwrap();
+        assert_eq!(out, "alpha\nbeta\nINSERTED\ngamma");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn edit_insert_before_matching_line() {
+        let c = "alpha\nbeta\ngamma";
+        let (out, n) = apply_edit(c, &spec("gamma", "// note", false, EditMode::InsertBefore, 0, None, None)).unwrap();
+        assert_eq!(out, "alpha\nbeta\n// note\ngamma");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn edit_preserves_trailing_newline_on_insert() {
+        let c = "x\ny\n";
+        let (out, n) = apply_edit(c, &spec("x", "z", false, EditMode::InsertAfter, 0, None, None)).unwrap();
+        assert_eq!(out, "x\nz\ny\n");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn edit_empty_pattern_rejected() {
+        assert!(apply_edit("abc", &spec("", "x", false, EditMode::Replace, 0, None, None)).is_err());
+    }
+
+    #[test]
+    fn edit_bad_regex_rejected() {
+        assert!(apply_edit("abc", &spec("(", "x", true, EditMode::Replace, 0, None, None)).is_err());
+    }
+
+    #[tokio::test]
+    async fn edit_file_end_to_end_replace() {
+        let dir = std::env::temp_dir().join(format!("aish_edit_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sample.txt");
+        std::fs::write(&file, "line1\nTARGET\nline3\n").unwrap();
+
+        let mut session = Session::new().unwrap();
+        session.mode = crate::session::Mode::Yolo; // skip the gate in the test
+        let mut confirm = |_: &str| Decision::AllowOnce;
+
+        let call = ToolCall {
+            id: "t".into(),
+            name: "edit_file".into(),
+            args: json!({
+                "path": file.to_string_lossy(),
+                "pattern": "TARGET",
+                "replacement": "REPLACED",
+            }),
+        };
+        let r = execute(&call, &mut session, &mut confirm).await;
+        assert!(!r.is_error, "got: {}", r.content);
+        assert!(r.content.contains("1 change"), "got: {}", r.content);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "line1\nREPLACED\nline3\n");
+
+        // A no-match edit leaves the file untouched and says so.
+        let miss = ToolCall {
+            id: "t2".into(),
+            name: "edit_file".into(),
+            args: json!({ "path": file.to_string_lossy(), "pattern": "NOPE", "replacement": "x" }),
+        };
+        let r = execute(&miss, &mut session, &mut confirm).await;
+        assert!(!r.is_error);
+        assert!(r.content.contains("no matches"), "got: {}", r.content);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "line1\nREPLACED\nline3\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_file_tool_is_offered() {
+        let defs = tool_defs(false, false);
+        assert!(defs.iter().any(|d| d.name == "edit_file"), "edit_file must be in the tool set");
+    }
 
     #[test]
     fn escalate_tool_gated_on_availability() {
