@@ -462,7 +462,7 @@ pub async fn run(
                 // Skipped inside a coordinator (no nested coordinators).
                 if route == Route::Auto && !session.nested && mentions_work_signal(&line) {
                     println!();
-                    dispatch_and_attach(&line, &mut session);
+                    dispatch_background(&line, &mut session);
                     continue;
                 }
 
@@ -635,7 +635,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("compact", "compact history, offload to memory"),
     ("context", "show context-window usage"),
     ("detach", "stop watching the attached coordinator"),
-    ("dispatch", "launch a background coordinator + auto-attach"),
+    ("dispatch", "launch a background coordinator"),
     ("goal", "pursue a goal in the background"),
     ("help", "show command help"),
     ("jobs", "list background jobs"),
@@ -2280,22 +2280,23 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
     }
 }
 
-/// Launch a background coordinator for `task` and, when the spawn succeeds,
-/// auto-attach the interactive session to it. Auto-attach is what makes the
-/// interactive REPL behave like `:attach`: instead of locking the prompt for an
-/// inline model turn, the operator keeps a LIVE input prompt whose plain lines
-/// are queued/steered into the coordinator's next round (the `:tell` channel),
-/// while `:`-commands that aren't bound to the in-flight work — `:dispatch`,
-/// `:attach`, `:workers`, `:jobs`, … — still run immediately. `:detach` ends it
-/// and returns to the plain prompt; the coordinator keeps running.
-fn dispatch_and_attach(task: &str, session: &mut Session) {
+/// Launch a background coordinator for `task` and report it — WITHOUT
+/// auto-attaching. The coordinator runs quietly in the background (its result
+/// auto-delivers); the interactive session keeps its plain prompt and the
+/// `:output` stream is NOT turned on. This mirrors the `run_in_background`
+/// tool's fire-and-forget contract: dispatching does not commandeer the prompt
+/// or start streaming the worker's activity. Use `:attach <id>` afterwards to
+/// watch + steer it, or `:output on` to stream every coordinator's activity.
+fn dispatch_background(task: &str, session: &mut Session) {
     let Dispatched { id, message } = dispatch_coordinator(task, session);
     println!("{message}");
     if let Some(id) = id {
-        // The worker is already in `session.worker_jobs` (spawn is synchronous),
-        // so `attach_worker` finds it, prints the live-attach banner, and starts
-        // forwarding its activity — reusing the proven attach path.
-        attach_worker(Some(&id), session);
+        // Fire-and-forget: unlike the old behaviour we do NOT auto-attach or
+        // turn `:output` on — surface how to opt into watching/steering instead.
+        let short = crate::batch::short_id(&id);
+        println!(
+            "\x1b[2m:attach {short} to watch + steer it · :output on to stream coordinator activity\x1b[0m"
+        );
     }
 }
 
@@ -3148,7 +3149,7 @@ async fn handle_colon(
                  :output [on|off]             stream background coordinators' activity (💭 thinking + 🛠️/🔧 tool + 🚀 standard/🐌 batch lines) in a contained bordered pane; off (default) keeps them quiet\n\
                  \n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
-                 :dispatch <task>                    launch a background coordinator for <task> + auto-attach (steer it; :detach to stop)\n\
+                 :dispatch <task>                    launch a background coordinator for <task> (runs quietly; :attach <id> to watch/steer)\n\
                  :tell [--any] <id> <message>        send instructions to an in-flight coordinator (folded in next round; --any steers another session's)\n\
                  :attach <id>|goal                   watch a running coordinator live + steer it (typed lines go to it); `goal` watches the active :goal\n\
                  :detach                             stop watching the attached coordinator (it keeps running)\n\
@@ -3399,7 +3400,7 @@ async fn handle_colon(
             // the deterministic equivalent of the model calling run_in_background.
             // Shares dispatch_coordinator with the "troubleshoot" auto-offload.
             let task = parts.collect::<Vec<_>>().join(" ");
-            dispatch_and_attach(&task, session);
+            dispatch_background(&task, session);
         }
         Some("attach") => attach_worker(parts.next(), session),
         Some("detach") => detach_worker(session),
