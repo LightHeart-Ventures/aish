@@ -647,6 +647,10 @@ pub fn rehydrate(session: &mut Session) {
     // sweeper NEVER removes a dirty or commits-ahead worktree (operator's work).
     crate::worker::prune_worktrees(&session.cwd);
     crate::worker::sweep_worktrees(&session.cwd);
+    // S9.3: age out finished per-worker conversation-store dirs under the state
+    // root, mirroring the worktree sweep above. Never reclaims a running or
+    // work-bearing (kept-branch) worker dir (worker_store::should_sweep_worker).
+    let _ = crate::worker_store::sweep_worker_dirs();
 
     // A coordinator CHILD (`AISH_COORDINATOR=1`) runs the full `main()` startup
     // before it reaches `run_coordinator`. Without this guard EVERY spawned
