@@ -28,11 +28,15 @@
 //!   result channel a detached run is read back from.
 //!
 //! ## Relationship to the rest of the codebase
-//! - The **writer** reuses [`crate::turn_audit::redact_input`] verbatim so
-//!   secrets in tool inputs never hit disk (AC8); [`append_record`] is the
-//!   canonical crash‑safe transcript appender. (Repointing `turn_audit`'s
-//!   base_dir at this volume + adding role/text record kinds is the follow‑up
-//!   writer‑wiring step — see the module note on the writer surface below.)
+//! - The **writer** is [`TranscriptWriter`] (held on the
+//!   [`crate::session::Session`] for a coordinator run): it emits one
+//!   [`TranscriptRecord`] per turn-event from the engine’s tool-call /
+//!   narration sites and the coordinator’s per-round synthesis, via the
+//!   crash-safe [`append_record`] appender, reusing
+//!   [`crate::turn_audit::redact_input`] verbatim so secrets in tool inputs
+//!   never hit disk (AC8). `meta.json` is written `running` at coordinator start
+//!   and flipped to `done`/`failed` at exit, with `result.txt` carrying the
+//!   final answer (the cross-boundary result channel).
 //! - The **DB** ([`crate::db`] `coordinator_runs`) stays the durable run‑status
 //!   store; `meta.run_id` cross‑references it. Files own the streamable
 //!   transcript optimized for replay/tail across the container boundary; the DB
@@ -47,12 +51,14 @@
 //! mount) is swallowed so the store can never sink a live worker — the cost is
 //! only a less‑complete transcript, never a crash.
 
-// The reader/writer/meta API below is the foundation S9.3 lands; its consumers
-// are the dependent cards (S9.2 `:attach` replay/resume, S9.4 detached
-// read-back, S9.5 `:forget`/discovery). `sweep_worker_dirs` is wired at startup
-// now; the rest is the stable surface those cards call, so allow the not-yet-
-// wired items (mirrors the per-item `allow(dead_code)` S9.x notes in
-// `container.rs`).
+// S9.3 lands the full store. The WRITER side (`TranscriptWriter`,
+// `write_meta_atomic`/`set_status`, `write_result`, `append_record`) is wired
+// live into `coordinator::drive` + `engine::run_turn`, and `sweep_worker_dirs`
+// at startup. The READER side (`iter_transcript`, `tail_transcript`,
+// `to_engine_history`, `read_result`, `meta_path`/`result_path`) is the stable
+// surface the dependent cards consume (S9.2 `:attach` replay/resume, S9.4
+// detached read-back, S9.5 `:forget`/discovery); allow it until those land
+// (mirrors the per-item `allow(dead_code)` S9.x notes in `container.rs`).
 #![allow(dead_code)]
 
 use crate::backend::{Msg, Role, ToolCall, ToolResult};
@@ -254,6 +260,88 @@ impl TranscriptRecord {
             tokens: None,
             dropped: None,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// transcript WRITER (live wiring, AC2)
+// ---------------------------------------------------------------------------
+
+/// Append-only transcript WRITER for one worker run — the live wiring (AC2) that
+/// emits a [`TranscriptRecord`] per turn-event into `transcript.jsonl`. Held on
+/// the [`crate::session::Session`] (as `worker_transcript`) for a headless
+/// coordinator run so [`crate::engine::run_turn`] can record each user message,
+/// tool call, tool result, and narration, and [`crate::coordinator::drive`] each
+/// round’s synthesis. `None` for an interactive session (no per-worker store
+/// there) — exactly the same `Some`-only-for-a-coordinator shape as
+/// [`crate::turn_audit::TurnAudit`].
+///
+/// Owns a monotonic `seq`; on a RESUME [`TranscriptWriter::attach`] seeds it
+/// past the highest seq already on disk so numbering stays monotonic across the
+/// restart boundary (mirrors `turn_audit`’s `position`). Every append is
+/// best-effort via [`append_record`] — a write error is swallowed so the store
+/// never sinks a live worker.
+pub struct TranscriptWriter {
+    id: String,
+    seq: u64,
+}
+
+impl TranscriptWriter {
+    /// A writer for worker `id`, continuing the seq sequence past any records an
+    /// earlier (crashed) run already wrote — so a resumed run never reuses a seq
+    /// and `:attach`/replay sees one ordered stream across the restart.
+    pub fn attach(id: &str) -> Self {
+        let next = read_records(&transcript_path(id))
+            .iter()
+            .map(|r| r.seq)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        Self { id: id.to_string(), seq: next }
+    }
+
+    /// The worker id this writer appends for.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The next seq this writer would assign (also == count of records it has
+    /// written this process when starting fresh). Exposed for tests/observability.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        let s = self.seq;
+        self.seq += 1;
+        s
+    }
+
+    /// Record a plain text turn-event: a user/assistant/system message, model
+    /// `narration`, or round `synthesis`. Empty/whitespace text is skipped (no
+    /// empty record), mirroring `turn_audit::synthesis`.
+    pub fn record_message(&mut self, role: &str, kind: &str, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let seq = self.next_seq();
+        let _ = append_record(&self.id, &TranscriptRecord::text(seq, role, kind, text));
+    }
+
+    /// Record a tool-call request. `input` is redacted inside the record ctor via
+    /// [`crate::turn_audit::redact_input`] so secrets never hit disk (AC8).
+    pub fn record_tool_call(&mut self, call_id: &str, name: &str, input: &serde_json::Value) {
+        let seq = self.next_seq();
+        let _ = append_record(&self.id, &TranscriptRecord::tool_call(seq, call_id, name, input));
+    }
+
+    /// Record a tool-call result. `output` is capped head-first inside the ctor.
+    pub fn record_tool_result(&mut self, call_id: &str, name: &str, output: &str, is_error: bool) {
+        let seq = self.next_seq();
+        let _ = append_record(
+            &self.id,
+            &TranscriptRecord::tool_result(seq, call_id, name, output, is_error),
+        );
     }
 }
 
@@ -1014,6 +1102,74 @@ mod tests {
         assert_eq!(sanitize_id("w_a7k3m2pQ"), "w_a7k3m2pQ");
         assert_eq!(sanitize_id("se/ss:1"), "se-ss-1");
         assert_eq!(sanitize_id("run.123-x"), "run.123-x");
+    }
+
+    #[test]
+    fn writer_appends_records_with_monotonic_seq() {
+        let _sb = sandbox("writer_seq");
+        let mut w = TranscriptWriter::attach("w_w1");
+        assert_eq!(w.seq(), 0, "fresh writer starts at seq 0");
+        w.record_message("user", "text", "the task");
+        w.record_tool_call("c1", "read_file", &json!({"path": "Cargo.toml"}));
+        w.record_tool_result("c1", "read_file", "[package]", false);
+        w.record_message("assistant", "synthesis", "done");
+        // An empty message is dropped (no record written).
+        w.record_message("assistant", "narration", "   ");
+        let recs = iter_transcript("w_w1");
+        assert_eq!(recs.len(), 4, "empty message skipped");
+        // seqs are 0..3 in order.
+        assert_eq!(recs.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(recs[0].role, "user");
+        assert_eq!(recs[1].kind, "tool_call");
+        assert_eq!(recs[2].kind, "tool_result");
+        assert_eq!(recs[3].kind, "synthesis");
+    }
+
+    #[test]
+    fn writer_attach_continues_seq_across_resume() {
+        let _sb = sandbox("writer_resume");
+        {
+            let mut w = TranscriptWriter::attach("w_w2");
+            w.record_message("user", "text", "first");
+            w.record_tool_call("c1", "list_dir", &json!({"path": "."}));
+            // process “crashes” — writer dropped after 2 records (seq 0,1).
+        }
+        // A fresh attach (the resume) must continue at seq 2, not reuse 0.
+        let mut w = TranscriptWriter::attach("w_w2");
+        assert_eq!(w.seq(), 2, "resume continues past the highest on-disk seq");
+        w.record_message("assistant", "synthesis", "resumed answer");
+        let recs = iter_transcript("w_w2");
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(recs[2].output.as_deref(), Some("resumed answer"));
+    }
+
+    #[test]
+    fn writer_output_round_trips_to_engine_history() {
+        // End-to-end (AC2+AC5): records emitted by the WRITER deserialize back
+        // into engine history with tool-call structure intact.
+        let _sb = sandbox("writer_rt");
+        let mut w = TranscriptWriter::attach("w_w3");
+        w.record_message("user", "text", "fix the bug");
+        w.record_tool_call("c1", "read_file", &json!({"path": "a.rs"}));
+        w.record_tool_result("c1", "read_file", "fn main() {}", false);
+        w.record_message("assistant", "synthesis", "patched it");
+        let history = to_engine_history("w_w3");
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[0].role, Role::User);
+        assert_eq!(history[1].tool_calls[0].name, "read_file");
+        assert_eq!(history[2].tool_results[0].id, "c1");
+        assert_eq!(history[3].text, "patched it");
+    }
+
+    #[test]
+    fn writer_redacts_secret_tool_args() {
+        let _sb = sandbox("writer_redact");
+        let mut w = TranscriptWriter::attach("w_w4");
+        w.record_tool_call("c0", "run_program", &json!({"env": {"API_KEY": "sk-supersecret"}}));
+        let raw = std::fs::read_to_string(transcript_path("w_w4")).unwrap();
+        assert!(!raw.contains("sk-supersecret"), "writer must redact secrets (AC8)");
+        assert!(raw.contains("[redacted]"));
     }
 
     #[test]
