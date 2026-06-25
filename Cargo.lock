@@ -50,6 +50,7 @@ dependencies = [
  "hf-hub",
  "libc",
  "mistralrs",
+ "regex",
  "reqwest 0.13.4",
  "rusqlite",
  "rustyline",
