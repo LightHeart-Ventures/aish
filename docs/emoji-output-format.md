@@ -6,7 +6,7 @@ When background-coordinator activity is streamed to the terminal via
 
 | Glyph | Source | Meaning |
 | ----- | ------ | ------- |
-| ⚙️ | **local execution** | A tool aish runs in-process on this host — `run_program`, `run_interactive`, `read_file`, `write_file`, `list_dir`, `change_dir`, `remember`, `recall`, … |
+| ⚙️ | **local execution** | A tool aish runs in-process on this host — `run_program`, `run_interactive`, `read_file`, `write_file`, `edit_file`, `list_dir`, `change_dir`, `remember`, `recall`, … |
 | 🔧 | **MCP tool call** | A tool served by a connected MCP server — catalog names prefixed `mcp__<server>__<tool>`, or the bare `mcp_…` / `atum_…` shorthands |
 
 ## Examples

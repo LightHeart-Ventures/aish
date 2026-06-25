@@ -1,6 +1,7 @@
 use crate::backend::{ToolCall, ToolDef, ToolResult};
 use crate::session::Session;
 use anyhow::Result;
+use regex::Regex;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -244,6 +245,24 @@ user wants a file created or changed — never try echo/tee tricks."
             }),
         },
         ToolDef {
+            name: "edit_file".into(),
+            description: "Surgically edit a file in place by pattern — change specific lines without rewriting the whole file. Finds `pattern` (a literal substring, or a regular expression when `regex` is true) and either REPLACES each match with `replacement` (default), or INSERTS `replacement` as a new line before/after each matching line (`mode`). Scope the edit with `count` (change at most the first N matches; 0 = all) and/or `line_start`/`line_end` (1-based inclusive — only act on matches within that line range). With `regex`, `replacement` may reference capture groups (`$1`, `${name}`). Returns how many changes were made; reports \"no matches\" and leaves the file untouched when nothing matched. Prefer this over read_file+write_file for targeted edits to large files.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File to edit (relative paths resolve against the cwd)"},
+                    "pattern": {"type": "string", "description": "Text to find — a literal substring, or a regular expression when `regex` is true"},
+                    "replacement": {"type": "string", "description": "Replacement text (replace mode), or the line to insert (insert modes). Defaults to empty string, so replace mode with no replacement deletes the matches. With `regex`, may reference capture groups via $1 / ${name}."},
+                    "regex": {"type": "boolean", "description": "Treat `pattern` as a regular expression (default false → literal match)"},
+                    "mode": {"type": "string", "enum": ["replace", "insert_before", "insert_after"], "description": "replace (default) substitutes each match; insert_before / insert_after add `replacement` as a new line before/after each line that matches"},
+                    "count": {"type": "integer", "description": "Change at most the first N matches (0 or omitted = all matches)"},
+                    "line_start": {"type": "integer", "description": "Optional 1-based first line to act on — matches before this line are ignored"},
+                    "line_end": {"type": "integer", "description": "Optional 1-based last line (inclusive) to act on — matches after this line are ignored"}
+                },
+                "required": ["path", "pattern"]
+            }),
+        },
+        ToolDef {
             name: "list_dir".into(),
             description: "List a directory's entries (name, type, size). Call this instead of ls, \
 and to expand wildcards since globs don't exist here. Defaults to the current directory."
@@ -251,6 +270,118 @@ and to expand wildcards since globs don't exist here. Defaults to the current di
             schema: json!({
                 "type": "object",
                 "properties": {"path": {"type": "string", "description": "Optional; defaults to cwd"}}
+            }),
+        },
+        ToolDef {
+            name: "glob_expand".into(),
+            description: "Expand a glob pattern to the list of matching paths (structured: type + \
+size per entry). Supports `*`, `?`, `[...]` character classes, and `**` for recursive directory \
+descent (e.g. `src/**/*.rs`). Call this instead of shelling out to find/ls with wildcards — globs \
+don't exist in run_program."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob pattern, e.g. \"*.toml\" or \"src/**/*.rs\". A relative pattern resolves against `path` (or cwd); an absolute pattern (leading /) matches from the filesystem root."},
+                    "path": {"type": "string", "description": "Base directory to expand a relative pattern against (default: cwd)."},
+                    "type": {"type": "string", "enum": ["file", "dir", "any"], "description": "Filter results by entry type (default: any)."},
+                    "max": {"type": "integer", "description": "Max results to return (default 1000)."}
+                },
+                "required": ["pattern"]
+            }),
+        },
+        ToolDef {
+            name: "grep_files".into(),
+            description: "Search file contents for a substring and return structured matches \
+(path:line: text). Recurses into directories (skipping .git), skips binary files, and can be \
+scoped to files matching a glob. Call this instead of shelling out to grep/rg."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Substring to search for."},
+                    "path": {"type": "string", "description": "File or directory to search (default: cwd). Directories are searched recursively."},
+                    "glob": {"type": "string", "description": "Only search files whose name matches this glob (e.g. \"*.rs\")."},
+                    "ignore_case": {"type": "boolean", "description": "Case-insensitive match (default false)."},
+                    "context": {"type": "integer", "description": "Lines of context to show before and after each match (default 0)."},
+                    "max": {"type": "integer", "description": "Max matches to return (default 500)."}
+                },
+                "required": ["pattern"]
+            }),
+        },
+        ToolDef {
+            name: "stat_file".into(),
+            description: "Return structured metadata for a path: type, size, permissions (octal), \
+uid/gid, link count, modified time, and symlink target. Call this instead of shelling out to stat."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        },
+        ToolDef {
+            name: "diff_files".into(),
+            description: "Compute a unified diff between two text files (or a file and inline \
+content). Returns the diff with @@ hunk headers and +/- lines. Use it to verify an edit or show \
+what changed before committing."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "a": {"type": "string", "description": "Path to the original (left) file."},
+                    "b": {"type": "string", "description": "Path to the new (right) file. Omit when `b_content` is given."},
+                    "b_content": {"type": "string", "description": "Inline text to diff against `a` instead of a second file."},
+                    "context": {"type": "integer", "description": "Context lines around each hunk (default 3)."}
+                },
+                "required": ["a"]
+            }),
+        },
+        ToolDef {
+            name: "copy_file".into(),
+            description: "Copy a file (or directory tree) to a new path. Refuses to overwrite an \
+existing destination unless `overwrite` is true. If the destination is an existing directory, the \
+source is copied into it under its own name. Clear collision errors — prefer this over run_program cp."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "src": {"type": "string"},
+                    "dst": {"type": "string"},
+                    "overwrite": {"type": "boolean", "description": "Allow replacing an existing destination (default false)."}
+                },
+                "required": ["src", "dst"]
+            }),
+        },
+        ToolDef {
+            name: "rename_file".into(),
+            description: "Rename or move a file/directory. Refuses to overwrite an existing \
+destination unless `overwrite` is true. Falls back to copy+remove across filesystems. Prefer this \
+over run_program mv."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "src": {"type": "string"},
+                    "dst": {"type": "string"},
+                    "overwrite": {"type": "boolean", "description": "Allow replacing an existing destination (default false)."}
+                },
+                "required": ["src", "dst"]
+            }),
+        },
+        ToolDef {
+            name: "append_file".into(),
+            description: "Append text to a file (creating it if missing) without reading it back — \
+crash-safe for logs, transcripts, and audit trails. Prefer this over run_program tee/echo."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "newline": {"type": "boolean", "description": "Ensure the appended content ends with a trailing newline (default false)."}
+                },
+                "required": ["path", "content"]
             }),
         },
         ToolDef {
@@ -414,7 +545,8 @@ pub async fn execute(
     if session.mode == crate::session::Mode::Paranoid
         && !matches!(
             call.name.as_str(),
-            "read_file" | "write_file" | "run_program" | "run_interactive"
+            "read_file" | "write_file" | "edit_file" | "run_program" | "run_interactive"
+                | "copy_file" | "rename_file" | "append_file"
         )
     {
         let args = truncate_middle(serde_json::to_string(&call.args).unwrap_or_default(), 200);
@@ -436,7 +568,15 @@ pub async fn execute(
         "run_interactive" => run_interactive(call, session, confirm).await,
         "read_file" => read_file(call, session, confirm),
         "write_file" => write_file(call, session, confirm),
+        "edit_file" => edit_file(call, session, confirm),
         "list_dir" => list_dir(call, session),
+        "glob_expand" => glob_expand(call, session),
+        "grep_files" => grep_files(call, session),
+        "stat_file" => stat_file(call, session),
+        "diff_files" => diff_files(call, session),
+        "copy_file" => copy_file(call, session, confirm),
+        "rename_file" => rename_file(call, session, confirm),
+        "append_file" => append_file(call, session, confirm),
         "change_dir" => change_dir(call, session),
         "remember" => remember(call, session),
         "recall" => recall(call, session),
@@ -1969,6 +2109,207 @@ fn write_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>)
     ))
 }
 
+// ---------------------------------------------------------------------------
+// edit_file — surgical, pattern-based in-place edits so the model can change
+// specific lines/ranges of a large file without round-tripping the whole thing
+// through read_file + write_file. Pure logic lives in `apply_edit` (unit-tested);
+// `edit_file` is the IO + safety-gate wrapper.
+// ---------------------------------------------------------------------------
+
+/// What an edit does at each match site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditMode {
+    /// Substitute the matched text with the replacement.
+    Replace,
+    /// Insert the replacement as a new line BEFORE each matching line.
+    InsertBefore,
+    /// Insert the replacement as a new line AFTER each matching line.
+    InsertAfter,
+}
+
+/// A fully-parsed edit request (decoupled from the JSON call for testing).
+struct EditSpec<'a> {
+    pattern: &'a str,
+    replacement: &'a str,
+    is_regex: bool,
+    mode: EditMode,
+    /// Max matches to act on; 0 means unlimited.
+    count: usize,
+    /// 1-based inclusive line window the edit is restricted to (None = open).
+    line_start: Option<usize>,
+    line_end: Option<usize>,
+}
+
+/// 1-based line number of a byte offset into `content`.
+fn line_of_offset(content: &str, off: usize) -> usize {
+    content.as_bytes()[..off].iter().filter(|&&b| b == b'\n').count() + 1
+}
+
+/// Is `line` inside the (optional, 1-based inclusive) window?
+fn within_window(line: usize, start: Option<usize>, end: Option<usize>) -> bool {
+    start.map_or(true, |s| line >= s) && end.map_or(true, |e| line <= e)
+}
+
+/// Apply an edit to `content`, returning `(new_content, changes_made)`. Pure —
+/// no IO — so the edit semantics (literal vs regex, replace vs insert, count and
+/// line-range scoping, `$1` capture expansion) are unit-testable in isolation.
+fn apply_edit(content: &str, spec: &EditSpec) -> Result<(String, usize)> {
+    if spec.pattern.is_empty() {
+        anyhow::bail!("pattern must not be empty");
+    }
+    let limit = if spec.count == 0 { usize::MAX } else { spec.count };
+
+    match spec.mode {
+        EditMode::Replace if spec.is_regex => {
+            let re = Regex::new(spec.pattern)
+                .map_err(|e| anyhow::anyhow!("invalid regex: {e}"))?;
+            let mut out = String::with_capacity(content.len());
+            let mut last = 0usize;
+            let mut n = 0usize;
+            for caps in re.captures_iter(content) {
+                if n >= limit {
+                    break;
+                }
+                let m = caps.get(0).expect("group 0 always present");
+                if !within_window(line_of_offset(content, m.start()), spec.line_start, spec.line_end) {
+                    continue;
+                }
+                out.push_str(&content[last..m.start()]);
+                caps.expand(spec.replacement, &mut out);
+                last = m.end();
+                n += 1;
+            }
+            out.push_str(&content[last..]);
+            Ok((out, n))
+        }
+        EditMode::Replace => {
+            // Literal substring replacement.
+            let pat = spec.pattern;
+            let mut out = String::with_capacity(content.len());
+            let mut last = 0usize;
+            let mut search_from = 0usize;
+            let mut n = 0usize;
+            while n < limit {
+                let Some(rel) = content[search_from..].find(pat) else { break };
+                let start = search_from + rel;
+                let end = start + pat.len();
+                if within_window(line_of_offset(content, start), spec.line_start, spec.line_end) {
+                    out.push_str(&content[last..start]);
+                    out.push_str(spec.replacement);
+                    last = end;
+                    n += 1;
+                }
+                // Advance past this match (even when skipped) to find the next.
+                // Guard against a zero-width literal (shouldn't happen — empty
+                // pattern is rejected above).
+                search_from = end.max(start + 1);
+            }
+            out.push_str(&content[last..]);
+            Ok((out, n))
+        }
+        EditMode::InsertBefore | EditMode::InsertAfter => {
+            // Line-oriented: insert `replacement` as a new line before/after each
+            // line that matches. Splitting on '\n' and re-joining preserves the
+            // file's trailing-newline shape (a trailing '\n' yields a final ""
+            // element that round-trips).
+            let re = if spec.is_regex {
+                Some(Regex::new(spec.pattern).map_err(|e| anyhow::anyhow!("invalid regex: {e}"))?)
+            } else {
+                None
+            };
+            let line_matches = |line: &str| match &re {
+                Some(re) => re.is_match(line),
+                None => line.contains(spec.pattern),
+            };
+            let mut out: Vec<&str> = Vec::new();
+            let mut n = 0usize;
+            for (i, line) in content.split('\n').enumerate() {
+                let hit = n < limit
+                    && within_window(i + 1, spec.line_start, spec.line_end)
+                    && line_matches(line);
+                if hit && spec.mode == EditMode::InsertBefore {
+                    out.push(spec.replacement);
+                    n += 1;
+                }
+                out.push(line);
+                if hit && spec.mode == EditMode::InsertAfter {
+                    out.push(spec.replacement);
+                    n += 1;
+                }
+            }
+            Ok((out.join("\n"), n))
+        }
+    }
+}
+
+fn edit_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
+    let path = call.args["path"].as_str().ok_or_else(|| anyhow::anyhow!("missing path"))?;
+    let pattern = call.args["pattern"].as_str().ok_or_else(|| anyhow::anyhow!("missing pattern"))?;
+    let replacement = call.args["replacement"].as_str().unwrap_or("");
+    let is_regex = call.args["regex"].as_bool().unwrap_or(false);
+    let mode = match call.args["mode"].as_str().unwrap_or("replace") {
+        "replace" => EditMode::Replace,
+        "insert_before" => EditMode::InsertBefore,
+        "insert_after" => EditMode::InsertAfter,
+        other => anyhow::bail!("unknown mode '{other}' — use replace, insert_before, or insert_after"),
+    };
+    let count = call.args["count"].as_u64().unwrap_or(0) as usize;
+    let line_start = call.args["line_start"].as_u64().map(|n| n as usize);
+    let line_end = call.args["line_end"].as_u64().map(|n| n as usize);
+    let full = resolve(session, path);
+
+    let content = std::fs::read_to_string(&full)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
+
+    let spec = EditSpec {
+        pattern,
+        replacement,
+        is_regex,
+        mode,
+        count,
+        line_start,
+        line_end,
+    };
+    // Compute the result first — a bad regex or a no-op match reports cleanly
+    // without prompting or touching the file.
+    let (new_content, changes) = apply_edit(&content, &spec)?;
+    if changes == 0 {
+        return Ok(format!(
+            "no matches for {} {} in {} — file unchanged",
+            if is_regex { "regex" } else { "pattern" },
+            serde_json::to_string(pattern).unwrap_or_else(|_| format!("{pattern:?}")),
+            full.display()
+        ));
+    }
+
+    // An edit is a write: it's destructive in every mode short of yolo. The 'd'
+    // option allows every write under the file's directory recursively.
+    if !matches!(session.mode, crate::session::Mode::Yolo) {
+        let verb = match mode {
+            EditMode::Replace => "replace",
+            EditMode::InsertBefore => "insert before",
+            EditMode::InsertAfter => "insert after",
+        };
+        let prompt = format!(
+            "edit {} — {verb} {changes} match(es), {} → {} bytes\n  │ pattern: {}\n ",
+            full.display(),
+            content.len(),
+            new_content.len(),
+            truncate_middle(pattern.to_string(), 120)
+        );
+        if !gate_path(session, Perm::Write, &full, "edit_file", &prompt, confirm) {
+            return Ok("user declined the edit".into());
+        }
+    }
+
+    std::fs::write(&full, &new_content).map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
+    Ok(format!(
+        "edited {}: {changes} change(s), {} bytes",
+        full.display(),
+        new_content.len()
+    ))
+}
+
 fn list_dir(call: &ToolCall, session: &Session) -> Result<String> {
     let path = call.args["path"].as_str().unwrap_or(".");
     let full = resolve(session, path);
@@ -1998,6 +2339,630 @@ fn list_dir(call: &ToolCall, session: &Session) -> Result<String> {
         return Ok("[empty directory]".into());
     }
     Ok(truncate_middle(entries.join("\n"), MAX_OUTPUT))
+}
+
+// ---------------------------------------------------------------------------
+// Native file-operation tools: glob_expand, grep_files, stat_file, diff_files,
+// copy_file, rename_file, append_file. Structured returns, explicit collision /
+// not-found semantics, and write-gating that mirrors write_file (free in yolo,
+// otherwise the path-aware gate offering the 'd' recursive-directory grant).
+// ---------------------------------------------------------------------------
+
+/// Gate a write-class file op (copy/rename/append) on its destination path,
+/// mirroring write_file: free in yolo, otherwise prompt with the path-aware
+/// gate (offering the 'd' recursive-directory grant).
+fn gate_write_op(
+    session: &mut Session,
+    dst: &Path,
+    action: &str,
+    tool_key: &str,
+    confirm: &mut Confirm<'_>,
+) -> bool {
+    if matches!(session.mode, crate::session::Mode::Yolo) {
+        return true;
+    }
+    let prompt = format!("{action} {}", dst.display());
+    gate_path(session, Perm::Write, dst, tool_key, &prompt, confirm)
+}
+
+/// Match one path segment (containing no '/') against a glob segment supporting
+/// `*` (zero+ chars), `?` (one char), and `[...]` character classes. Recursive;
+/// fine for typical filename lengths.
+fn glob_segment_match(pat: &[char], text: &[char]) -> bool {
+    match pat.first() {
+        None => text.is_empty(),
+        Some('*') => {
+            glob_segment_match(&pat[1..], text)
+                || (!text.is_empty() && glob_segment_match(pat, &text[1..]))
+        }
+        Some('?') => !text.is_empty() && glob_segment_match(&pat[1..], &text[1..]),
+        Some('[') => {
+            if let Some(end) = glob_class_end(pat) {
+                !text.is_empty()
+                    && class_matches(&pat[1..end - 1], text[0])
+                    && glob_segment_match(&pat[end..], &text[1..])
+            } else {
+                // Unterminated class → treat '[' literally.
+                !text.is_empty() && text[0] == '[' && glob_segment_match(&pat[1..], &text[1..])
+            }
+        }
+        Some(&c) => !text.is_empty() && text[0] == c && glob_segment_match(&pat[1..], &text[1..]),
+    }
+}
+
+/// If `pat` opens a `[...]` character class, return the index one past its
+/// closing ']' (handling a leading '!'/'^' negation and a ']' as first member).
+/// None when unterminated.
+fn glob_class_end(pat: &[char]) -> Option<usize> {
+    let mut i = 1; // skip '['
+    if i < pat.len() && (pat[i] == '!' || pat[i] == '^') {
+        i += 1;
+    }
+    if i < pat.len() && pat[i] == ']' {
+        i += 1; // a ']' immediately after '['/'^' is a literal member
+    }
+    while i < pat.len() && pat[i] != ']' {
+        i += 1;
+    }
+    (i < pat.len() && pat[i] == ']').then_some(i + 1)
+}
+
+/// Does `c` satisfy a class body (the chars between the brackets)? A leading
+/// '!' or '^' negates; `a-z` ranges are supported.
+fn class_matches(body: &[char], c: char) -> bool {
+    let (neg, body) = match body.first() {
+        Some('!') | Some('^') => (true, &body[1..]),
+        _ => (false, body),
+    };
+    let mut i = 0;
+    let mut found = false;
+    while i < body.len() {
+        if i + 2 < body.len() && body[i + 1] == '-' {
+            if body[i] <= c && c <= body[i + 2] {
+                found = true;
+            }
+            i += 3;
+        } else {
+            if body[i] == c {
+                found = true;
+            }
+            i += 1;
+        }
+    }
+    found ^ neg
+}
+
+/// Match a slash-separated path against a slash-separated glob, where a `**`
+/// segment matches zero or more whole path segments.
+fn glob_path_match(pat_segs: &[&str], path_segs: &[&str]) -> bool {
+    match pat_segs.split_first() {
+        None => path_segs.is_empty(),
+        Some((&"**", rest)) => {
+            glob_path_match(rest, path_segs)
+                || (!path_segs.is_empty() && glob_path_match(pat_segs, &path_segs[1..]))
+        }
+        Some((seg, rest)) => {
+            if path_segs.is_empty() {
+                return false;
+            }
+            let p: Vec<char> = seg.chars().collect();
+            let t: Vec<char> = path_segs[0].chars().collect();
+            glob_segment_match(&p, &t) && glob_path_match(rest, &path_segs[1..])
+        }
+    }
+}
+
+fn glob_expand(call: &ToolCall, session: &Session) -> Result<String> {
+    let pattern = call.args["pattern"].as_str().ok_or_else(|| anyhow::anyhow!("missing pattern"))?;
+    let type_filter = call.args["type"].as_str().unwrap_or("any");
+    let max = call.args["max"].as_u64().unwrap_or(1000) as usize;
+
+    // An absolute pattern matches from the filesystem root; otherwise expand
+    // against `path` (or cwd).
+    let (base, pat) = if let Some(rest) = pattern.strip_prefix('/') {
+        (PathBuf::from("/"), rest.to_string())
+    } else {
+        let base = call
+            .args["path"]
+            .as_str()
+            .map(|p| resolve(session, p))
+            .unwrap_or_else(|| session.cwd.clone());
+        (base, pattern.to_string())
+    };
+    let pat_segs: Vec<&str> = pat.split('/').filter(|s| !s.is_empty()).collect();
+    if pat_segs.is_empty() {
+        anyhow::bail!("empty pattern");
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut visited = 0usize;
+    let mut truncated = false;
+    // Iterative DFS over the base tree, carrying each dir's path segments
+    // relative to base.
+    let mut stack: Vec<(PathBuf, Vec<String>)> = vec![(base.clone(), Vec::new())];
+    'walk: while let Some((dir, segs)) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for entry in rd.flatten() {
+            visited += 1;
+            if visited > 200_000 {
+                truncated = true;
+                break 'walk;
+            }
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let mut rel = segs.clone();
+            rel.push(name);
+            let rel_refs: Vec<&str> = rel.iter().map(String::as_str).collect();
+            if glob_path_match(&pat_segs, &rel_refs) {
+                let type_ok = match type_filter {
+                    "file" => ft.is_file(),
+                    "dir" => ft.is_dir(),
+                    _ => true,
+                };
+                if type_ok {
+                    let kind = if ft.is_dir() {
+                        "dir "
+                    } else if ft.is_symlink() {
+                        "link"
+                    } else {
+                        "file"
+                    };
+                    let size = if ft.is_file() {
+                        entry.metadata().map(|m| format!(" {}", m.len())).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    out.push(format!("{kind} {}{size}", rel.join("/")));
+                    if out.len() >= max {
+                        truncated = true;
+                        break 'walk;
+                    }
+                }
+            }
+            // Descend into real subdirectories (never follow symlinked dirs — avoids cycles).
+            if ft.is_dir() && !ft.is_symlink() {
+                stack.push((entry.path(), rel));
+            }
+        }
+    }
+    out.sort();
+    if out.is_empty() {
+        return Ok(format!("[no matches for {pattern}]"));
+    }
+    let mut res = out.join("\n");
+    if truncated {
+        res.push_str("\n…[results truncated]");
+    }
+    Ok(truncate_middle(res, MAX_OUTPUT))
+}
+
+fn grep_files(call: &ToolCall, session: &Session) -> Result<String> {
+    let pattern = call.args["pattern"].as_str().ok_or_else(|| anyhow::anyhow!("missing pattern"))?;
+    if pattern.is_empty() {
+        anyhow::bail!("empty pattern");
+    }
+    let ignore_case = call.args["ignore_case"].as_bool().unwrap_or(false);
+    let context = call.args["context"].as_u64().unwrap_or(0) as usize;
+    let max = call.args["max"].as_u64().unwrap_or(500) as usize;
+    let glob_seg: Option<Vec<char>> =
+        call.args["glob"].as_str().map(|g| g.chars().collect());
+    let base = call
+        .args["path"]
+        .as_str()
+        .map(|p| resolve(session, p))
+        .unwrap_or_else(|| session.cwd.clone());
+
+    let needle = if ignore_case { pattern.to_lowercase() } else { pattern.to_string() };
+
+    // Gather candidate files (a single file, or a recursive directory walk).
+    let mut files: Vec<PathBuf> = Vec::new();
+    let scope_is_file = base.is_file();
+    if scope_is_file {
+        files.push(base.clone());
+    } else if base.is_dir() {
+        let mut stack = vec![base.clone()];
+        let mut visited = 0usize;
+        while let Some(dir) = stack.pop() {
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            for entry in rd.flatten() {
+                visited += 1;
+                if visited > 200_000 {
+                    break;
+                }
+                let ft = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                if ft.is_dir() && !ft.is_symlink() {
+                    if entry.file_name() == ".git" {
+                        continue;
+                    }
+                    stack.push(entry.path());
+                } else if ft.is_file() {
+                    if let Some(ref g) = glob_seg {
+                        let name: Vec<char> =
+                            entry.file_name().to_string_lossy().chars().collect();
+                        if !glob_segment_match(g, &name) {
+                            continue;
+                        }
+                    }
+                    files.push(entry.path());
+                }
+            }
+        }
+    } else {
+        anyhow::bail!("{}: not found", base.display());
+    }
+    files.sort();
+
+    let mut out: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    'outer: for f in &files {
+        let bytes = match std::fs::read(f) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if bytes.contains(&0u8) {
+            continue; // skip binary files
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        let display = if scope_is_file {
+            f.display().to_string()
+        } else {
+            f.strip_prefix(&base).unwrap_or(f).display().to_string()
+        };
+        for (i, line) in lines.iter().enumerate() {
+            let hay = if ignore_case { line.to_lowercase() } else { (*line).to_string() };
+            if hay.contains(&needle) {
+                if context > 0 {
+                    let lo = i.saturating_sub(context);
+                    let hi = (i + context + 1).min(lines.len());
+                    for j in lo..hi {
+                        let marker = if j == i { ":" } else { "-" };
+                        out.push(format!("{display}:{}{marker} {}", j + 1, lines[j]));
+                    }
+                    out.push("--".into());
+                } else {
+                    out.push(format!("{display}:{}: {}", i + 1, line));
+                }
+                total += 1;
+                if total >= max {
+                    out.push("…[matches truncated]".into());
+                    break 'outer;
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        return Ok(format!("[no matches for \"{pattern}\"]"));
+    }
+    Ok(truncate_middle(out.join("\n"), MAX_OUTPUT))
+}
+
+fn human_age(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else if s < 86_400 {
+        format!("{}h", s / 3600)
+    } else {
+        format!("{}d", s / 86_400)
+    }
+}
+
+fn stat_file(call: &ToolCall, session: &Session) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    let path = call.args["path"].as_str().ok_or_else(|| anyhow::anyhow!("missing path"))?;
+    let full = resolve(session, path);
+    // symlink_metadata so a symlink reports as a symlink rather than its target.
+    let meta = std::fs::symlink_metadata(&full)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
+    let ft = meta.file_type();
+    let kind = if ft.is_dir() {
+        "dir"
+    } else if ft.is_symlink() {
+        "symlink"
+    } else if ft.is_file() {
+        "file"
+    } else {
+        "other"
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut lines = vec![
+        format!("path: {}", full.display()),
+        format!("type: {kind}"),
+        format!("size: {} bytes", meta.len()),
+        format!("perms: {:o}", meta.permissions().mode() & 0o7777),
+        format!("uid/gid: {}/{}", meta.uid(), meta.gid()),
+        format!("nlink: {}", meta.nlink()),
+        format!("modified: {} (epoch), {} ago", meta.mtime(), human_age(now - meta.mtime())),
+    ];
+    if ft.is_symlink() {
+        if let Ok(target) = std::fs::read_link(&full) {
+            lines.push(format!("symlink_target: {}", target.display()));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+fn diff_files(call: &ToolCall, session: &Session) -> Result<String> {
+    let a_path = call.args["a"].as_str().ok_or_else(|| anyhow::anyhow!("missing a"))?;
+    let full_a = resolve(session, a_path);
+    let a_text = std::fs::read_to_string(&full_a)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", full_a.display()))?;
+    let (b_text, b_label) = if let Some(bc) = call.args["b_content"].as_str() {
+        (bc.to_string(), "<b_content>".to_string())
+    } else if let Some(bp) = call.args["b"].as_str() {
+        let full_b = resolve(session, bp);
+        let t = std::fs::read_to_string(&full_b)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", full_b.display()))?;
+        (t, full_b.display().to_string())
+    } else {
+        anyhow::bail!("provide either `b` (path) or `b_content` (inline text)");
+    };
+    let context = call.args["context"].as_u64().unwrap_or(3) as usize;
+    let diff = unified_diff(&a_text, &b_text, &full_a.display().to_string(), &b_label, context);
+    if diff.trim().is_empty() {
+        return Ok("[files are identical]".into());
+    }
+    Ok(truncate_middle(diff, MAX_OUTPUT))
+}
+
+#[derive(PartialEq)]
+enum DiffOp {
+    Eq,
+    Del,
+    Add,
+}
+
+/// Produce a unified diff of two texts via an LCS line alignment. O(n*m) time
+/// and memory — guarded so a huge pair falls back to a note rather than OOM.
+fn unified_diff(a: &str, b: &str, a_name: &str, b_name: &str, context: usize) -> String {
+    let al: Vec<&str> = a.lines().collect();
+    let bl: Vec<&str> = b.lines().collect();
+    let (n, m) = (al.len(), bl.len());
+    if (n as u64 + 1) * (m as u64 + 1) > 8_000_000 {
+        return format!(
+            "--- {a_name}\n+++ {b_name}\n[files too large for inline diff: {n} vs {m} lines — use run_program diff]\n"
+        );
+    }
+    // LCS length DP.
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if al[i] == bl[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    // Backtrack into an edit script.
+    let mut ops: Vec<(DiffOp, &str)> = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if al[i] == bl[j] {
+            ops.push((DiffOp::Eq, al[i]));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            ops.push((DiffOp::Del, al[i]));
+            i += 1;
+        } else {
+            ops.push((DiffOp::Add, bl[j]));
+            j += 1;
+        }
+    }
+    while i < n {
+        ops.push((DiffOp::Del, al[i]));
+        i += 1;
+    }
+    while j < m {
+        ops.push((DiffOp::Add, bl[j]));
+        j += 1;
+    }
+
+    let changed: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, (o, _))| *o != DiffOp::Eq)
+        .map(|(k, _)| k)
+        .collect();
+    if changed.is_empty() {
+        return String::new();
+    }
+
+    // Coalesce changed positions into hunks padded by `context`.
+    let mut hunks: Vec<(usize, usize)> = Vec::new();
+    let mut start = changed[0].saturating_sub(context);
+    let mut end = (changed[0] + context + 1).min(ops.len());
+    for &c in &changed[1..] {
+        let s = c.saturating_sub(context);
+        if s <= end {
+            end = (c + context + 1).min(ops.len());
+        } else {
+            hunks.push((start, end));
+            start = s;
+            end = (c + context + 1).min(ops.len());
+        }
+    }
+    hunks.push((start, end));
+
+    let mut out = format!("--- {a_name}\n+++ {b_name}\n");
+    for (s, e) in hunks {
+        // 1-based start line numbers at the hunk's first op.
+        let (mut a_ln, mut b_ln) = (1usize, 1usize);
+        for (o, _) in &ops[..s] {
+            match o {
+                DiffOp::Eq => {
+                    a_ln += 1;
+                    b_ln += 1;
+                }
+                DiffOp::Del => a_ln += 1,
+                DiffOp::Add => b_ln += 1,
+            }
+        }
+        let (mut a_cnt, mut b_cnt) = (0usize, 0usize);
+        for (o, _) in &ops[s..e] {
+            match o {
+                DiffOp::Eq => {
+                    a_cnt += 1;
+                    b_cnt += 1;
+                }
+                DiffOp::Del => a_cnt += 1,
+                DiffOp::Add => b_cnt += 1,
+            }
+        }
+        out.push_str(&format!("@@ -{a_ln},{a_cnt} +{b_ln},{b_cnt} @@\n"));
+        for (o, line) in &ops[s..e] {
+            let prefix = match o {
+                DiffOp::Eq => ' ',
+                DiffOp::Del => '-',
+                DiffOp::Add => '+',
+            };
+            out.push(prefix);
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Recursively copy a directory tree, returning total bytes copied.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<u64> {
+    std::fs::create_dir_all(dst)?;
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ft.is_dir() {
+            total += copy_dir_recursive(&from, &to)?;
+        } else if ft.is_file() {
+            total += std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(total)
+}
+
+/// Resolve a destination that may be an existing directory into a concrete
+/// target path (dir → dir/<src-filename>), the shared cp/mv "into a directory"
+/// convenience.
+fn resolve_dest(full_src: &Path, mut full_dst: PathBuf) -> PathBuf {
+    if full_dst.is_dir() {
+        if let Some(name) = full_src.file_name() {
+            full_dst = full_dst.join(name);
+        }
+    }
+    full_dst
+}
+
+fn copy_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
+    let src = call.args["src"].as_str().ok_or_else(|| anyhow::anyhow!("missing src"))?;
+    let dst = call.args["dst"].as_str().ok_or_else(|| anyhow::anyhow!("missing dst"))?;
+    let overwrite = call.args["overwrite"].as_bool().unwrap_or(false);
+    let full_src = resolve(session, src);
+    if !full_src.exists() {
+        anyhow::bail!("{}: source not found", full_src.display());
+    }
+    let full_dst = resolve_dest(&full_src, resolve(session, dst));
+    if full_dst.exists() && !overwrite {
+        anyhow::bail!(
+            "{}: destination exists (pass overwrite:true to replace)",
+            full_dst.display()
+        );
+    }
+    if !gate_write_op(session, &full_dst, "copy to", "copy_file", confirm) {
+        return Ok("user declined the copy".into());
+    }
+    if let Some(parent) = full_dst.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let bytes = if full_src.is_dir() {
+        copy_dir_recursive(&full_src, &full_dst)?
+    } else {
+        std::fs::copy(&full_src, &full_dst).map_err(|e| anyhow::anyhow!("{}: {e}", full_dst.display()))?
+    };
+    Ok(format!("copied {} → {} ({bytes} bytes)", full_src.display(), full_dst.display()))
+}
+
+fn rename_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
+    let src = call.args["src"].as_str().ok_or_else(|| anyhow::anyhow!("missing src"))?;
+    let dst = call.args["dst"].as_str().ok_or_else(|| anyhow::anyhow!("missing dst"))?;
+    let overwrite = call.args["overwrite"].as_bool().unwrap_or(false);
+    let full_src = resolve(session, src);
+    if !full_src.exists() {
+        anyhow::bail!("{}: source not found", full_src.display());
+    }
+    let full_dst = resolve_dest(&full_src, resolve(session, dst));
+    if full_dst.exists() && !overwrite {
+        anyhow::bail!(
+            "{}: destination exists (pass overwrite:true to replace)",
+            full_dst.display()
+        );
+    }
+    if !gate_write_op(session, &full_dst, "rename to", "rename_file", confirm) {
+        return Ok("user declined the rename".into());
+    }
+    if let Some(parent) = full_dst.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    // rename(2) is atomic within a filesystem; on EXDEV fall back to copy+remove.
+    if std::fs::rename(&full_src, &full_dst).is_err() {
+        if full_src.is_dir() {
+            copy_dir_recursive(&full_src, &full_dst)?;
+            std::fs::remove_dir_all(&full_src)?;
+        } else {
+            std::fs::copy(&full_src, &full_dst)?;
+            std::fs::remove_file(&full_src)?;
+        }
+    }
+    Ok(format!("renamed {} → {}", full_src.display(), full_dst.display()))
+}
+
+fn append_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
+    use std::io::Write;
+    let path = call.args["path"].as_str().ok_or_else(|| anyhow::anyhow!("missing path"))?;
+    let mut content = call
+        .args["content"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing content"))?
+        .to_string();
+    if call.args["newline"].as_bool().unwrap_or(false) && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    let full = resolve(session, path);
+    if !gate_write_op(session, &full, "append to", "append_file", confirm) {
+        return Ok("user declined the append".into());
+    }
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&full)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
+    f.write_all(content.as_bytes()).map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
+    f.flush().ok();
+    Ok(format!("appended {} bytes to {}", content.len(), full.display()))
 }
 
 fn remember(call: &ToolCall, session: &Session) -> Result<String> {
@@ -2092,6 +3057,154 @@ fn char_ceil(s: &str, mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spec<'a>(
+        pattern: &'a str,
+        replacement: &'a str,
+        is_regex: bool,
+        mode: EditMode,
+        count: usize,
+        line_start: Option<usize>,
+        line_end: Option<usize>,
+    ) -> EditSpec<'a> {
+        EditSpec { pattern, replacement, is_regex, mode, count, line_start, line_end }
+    }
+
+    #[test]
+    fn edit_literal_replace_all_and_count() {
+        let c = "foo bar foo baz foo";
+        // All occurrences.
+        let (out, n) = apply_edit(c, &spec("foo", "X", false, EditMode::Replace, 0, None, None)).unwrap();
+        assert_eq!(out, "X bar X baz X");
+        assert_eq!(n, 3);
+        // First N only.
+        let (out, n) = apply_edit(c, &spec("foo", "X", false, EditMode::Replace, 2, None, None)).unwrap();
+        assert_eq!(out, "X bar X baz foo");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn edit_literal_replace_empty_deletes() {
+        let (out, n) = apply_edit("a-b-c", &spec("-", "", false, EditMode::Replace, 0, None, None)).unwrap();
+        assert_eq!(out, "abc");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn edit_no_match_reports_zero() {
+        let (out, n) = apply_edit("hello", &spec("xyz", "Q", false, EditMode::Replace, 0, None, None)).unwrap();
+        assert_eq!(out, "hello");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn edit_replace_in_line_range_only() {
+        let c = "foo\nfoo\nfoo\nfoo";
+        // Restrict to lines 2..=3 — only those two `foo`s change.
+        let (out, n) = apply_edit(c, &spec("foo", "X", false, EditMode::Replace, 0, Some(2), Some(3))).unwrap();
+        assert_eq!(out, "foo\nX\nX\nfoo");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn edit_regex_replace_with_capture_groups() {
+        let c = "name: alice\nname: bob";
+        let (out, n) = apply_edit(
+            c,
+            &spec(r"name: (\w+)", "user=$1", true, EditMode::Replace, 0, None, None),
+        )
+        .unwrap();
+        assert_eq!(out, "user=alice\nuser=bob");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn edit_regex_replace_multiline_anchors() {
+        // Default regex is single-line; `.` doesn't cross newlines unless asked.
+        let c = "a1\nb2\nc3";
+        let (out, n) = apply_edit(c, &spec(r"\d", "#", true, EditMode::Replace, 0, None, None)).unwrap();
+        assert_eq!(out, "a#\nb#\nc#");
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn edit_insert_after_matching_line() {
+        let c = "alpha\nbeta\ngamma";
+        let (out, n) = apply_edit(c, &spec("beta", "INSERTED", false, EditMode::InsertAfter, 0, None, None)).unwrap();
+        assert_eq!(out, "alpha\nbeta\nINSERTED\ngamma");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn edit_insert_before_matching_line() {
+        let c = "alpha\nbeta\ngamma";
+        let (out, n) = apply_edit(c, &spec("gamma", "// note", false, EditMode::InsertBefore, 0, None, None)).unwrap();
+        assert_eq!(out, "alpha\nbeta\n// note\ngamma");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn edit_preserves_trailing_newline_on_insert() {
+        let c = "x\ny\n";
+        let (out, n) = apply_edit(c, &spec("x", "z", false, EditMode::InsertAfter, 0, None, None)).unwrap();
+        assert_eq!(out, "x\nz\ny\n");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn edit_empty_pattern_rejected() {
+        assert!(apply_edit("abc", &spec("", "x", false, EditMode::Replace, 0, None, None)).is_err());
+    }
+
+    #[test]
+    fn edit_bad_regex_rejected() {
+        assert!(apply_edit("abc", &spec("(", "x", true, EditMode::Replace, 0, None, None)).is_err());
+    }
+
+    #[tokio::test]
+    async fn edit_file_end_to_end_replace() {
+        let dir = std::env::temp_dir().join(format!("aish_edit_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sample.txt");
+        std::fs::write(&file, "line1\nTARGET\nline3\n").unwrap();
+
+        let mut session = Session::new().unwrap();
+        session.mode = crate::session::Mode::Yolo; // skip the gate in the test
+        let mut confirm = |_: &str| Decision::AllowOnce;
+
+        let call = ToolCall {
+            id: "t".into(),
+            name: "edit_file".into(),
+            args: json!({
+                "path": file.to_string_lossy(),
+                "pattern": "TARGET",
+                "replacement": "REPLACED",
+            }),
+        };
+        let r = execute(&call, &mut session, &mut confirm).await;
+        assert!(!r.is_error, "got: {}", r.content);
+        assert!(r.content.contains("1 change"), "got: {}", r.content);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "line1\nREPLACED\nline3\n");
+
+        // A no-match edit leaves the file untouched and says so.
+        let miss = ToolCall {
+            id: "t2".into(),
+            name: "edit_file".into(),
+            args: json!({ "path": file.to_string_lossy(), "pattern": "NOPE", "replacement": "x" }),
+        };
+        let r = execute(&miss, &mut session, &mut confirm).await;
+        assert!(!r.is_error);
+        assert!(r.content.contains("no matches"), "got: {}", r.content);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "line1\nREPLACED\nline3\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_file_tool_is_offered() {
+        let defs = tool_defs(false, false);
+        assert!(defs.iter().any(|d| d.name == "edit_file"), "edit_file must be in the tool set");
+    }
 
     #[test]
     fn escalate_tool_gated_on_availability() {
@@ -2747,6 +3860,175 @@ mod tests {
         unsafe {
             libc::kill(-pid, libc::SIGKILL);
             libc::waitpid(pid, &mut status, 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod fileops_tests {
+    use super::*;
+    use crate::session::{Mode, Session};
+
+    fn yolo_session(cwd: &std::path::Path) -> Session {
+        let mut s = Session::new().unwrap();
+        s.mode = Mode::Yolo;
+        s.cwd = cwd.to_path_buf();
+        s
+    }
+
+    async fn run(session: &mut Session, name: &str, args: serde_json::Value) -> ToolResult {
+        let call = ToolCall { id: "t".into(), name: name.into(), args };
+        let mut confirm = |_: &str| Decision::AllowOnce;
+        execute(&call, session, &mut confirm).await
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("aish_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn glob_segment_and_class() {
+        let m = |p: &str, t: &str| {
+            glob_segment_match(&p.chars().collect::<Vec<_>>(), &t.chars().collect::<Vec<_>>())
+        };
+        assert!(m("*.rs", "main.rs"));
+        assert!(!m("*.rs", "main.toml"));
+        assert!(m("foo?", "foob"));
+        assert!(!m("foo?", "foobb"));
+        assert!(m("[a-c]at", "bat"));
+        assert!(!m("[a-c]at", "zat"));
+        assert!(m("[!0-9]x", "ax"));
+        assert!(!m("[!0-9]x", "5x"));
+    }
+
+    #[test]
+    fn glob_path_doublestar() {
+        fn split(s: &str) -> Vec<&str> { s.split('/').filter(|x| !x.is_empty()).collect() }
+        assert!(glob_path_match(&split("src/**/*.rs"), &split("src/a/b/main.rs")));
+        assert!(glob_path_match(&split("src/**/*.rs"), &split("src/main.rs")));
+        assert!(!glob_path_match(&split("src/**/*.rs"), &split("tests/main.rs")));
+        assert!(glob_path_match(&split("*.toml"), &split("Cargo.toml")));
+        assert!(!glob_path_match(&split("*.toml"), &split("src/Cargo.toml")));
+    }
+
+    #[tokio::test]
+    async fn glob_expand_finds_files() {
+        let dir = tmp("glob");
+        std::fs::create_dir_all(dir.join("src/inner")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), b"x").unwrap();
+        std::fs::write(dir.join("src/inner/b.rs"), b"yy").unwrap();
+        std::fs::write(dir.join("src/c.txt"), b"z").unwrap();
+        let mut s = yolo_session(&dir);
+        let r = run(&mut s, "glob_expand", json!({"pattern": "src/**/*.rs"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("src/a.rs"), "{}", r.content);
+        assert!(r.content.contains("src/inner/b.rs"), "{}", r.content);
+        assert!(!r.content.contains("c.txt"), "{}", r.content);
+        // type filter
+        let d = run(&mut s, "glob_expand", json!({"pattern": "src/**", "type": "dir"})).await;
+        assert!(d.content.contains("src/inner"), "{}", d.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_files_matches_and_case() {
+        let dir = tmp("grep");
+        std::fs::write(dir.join("a.txt"), b"hello world\nfoo bar\nHELLO again\n").unwrap();
+        let mut s = yolo_session(&dir);
+        let r = run(&mut s, "grep_files", json!({"pattern": "hello"})).await;
+        assert!(r.content.contains("a.txt:1:"), "{}", r.content);
+        assert!(!r.content.contains("a.txt:3:"), "{}", r.content);
+        let r2 = run(&mut s, "grep_files", json!({"pattern": "hello", "ignore_case": true})).await;
+        assert!(r2.content.contains("a.txt:3:"), "{}", r2.content);
+        // glob scoping excludes non-matching files
+        std::fs::write(dir.join("b.rs"), b"hello rust\n").unwrap();
+        let r3 = run(&mut s, "grep_files", json!({"pattern": "hello", "glob": "*.rs"})).await;
+        assert!(r3.content.contains("b.rs:1:"), "{}", r3.content);
+        assert!(!r3.content.contains("a.txt"), "{}", r3.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stat_file_reports_metadata() {
+        let dir = tmp("stat");
+        std::fs::write(dir.join("f"), b"12345").unwrap();
+        let mut s = yolo_session(&dir);
+        let r = run(&mut s, "stat_file", json!({"path": "f"})).await;
+        assert!(r.content.contains("type: file"), "{}", r.content);
+        assert!(r.content.contains("size: 5 bytes"), "{}", r.content);
+        assert!(r.content.contains("perms:"), "{}", r.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn copy_rename_append_roundtrip() {
+        let dir = tmp("crp");
+        std::fs::write(dir.join("a"), b"orig").unwrap();
+        let mut s = yolo_session(&dir);
+
+        let r = run(&mut s, "copy_file", json!({"src": "a", "dst": "b"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "orig");
+
+        // refuse overwrite without the flag
+        let r = run(&mut s, "copy_file", json!({"src": "a", "dst": "b"})).await;
+        assert!(r.content.contains("destination exists"), "{}", r.content);
+
+        let r = run(&mut s, "append_file", json!({"path": "b", "content": "+more"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "orig+more");
+
+        let r = run(&mut s, "rename_file", json!({"src": "b", "dst": "c"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(!dir.join("b").exists());
+        assert_eq!(std::fs::read_to_string(dir.join("c")).unwrap(), "orig+more");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn append_creates_missing_and_newline() {
+        let dir = tmp("append");
+        let mut s = yolo_session(&dir);
+        let r = run(&mut s, "append_file", json!({"path": "log", "content": "line", "newline": true})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(std::fs::read_to_string(dir.join("log")).unwrap(), "line\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn diff_files_unified() {
+        let dir = tmp("diff");
+        std::fs::write(dir.join("a"), b"one\ntwo\nthree\n").unwrap();
+        std::fs::write(dir.join("b"), b"one\n2\nthree\n").unwrap();
+        let mut s = yolo_session(&dir);
+        let r = run(&mut s, "diff_files", json!({"a": "a", "b": "b"})).await;
+        assert!(r.content.contains("@@"), "{}", r.content);
+        assert!(r.content.contains("-two"), "{}", r.content);
+        assert!(r.content.contains("+2"), "{}", r.content);
+        let same = run(&mut s, "diff_files", json!({"a": "a", "b": "a"})).await;
+        assert!(same.content.contains("identical"), "{}", same.content);
+        // inline b_content
+        let ic = run(&mut s, "diff_files", json!({"a": "a", "b_content": "one\ntwo\nthree\n"})).await;
+        assert!(ic.content.contains("identical"), "{}", ic.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn new_tools_are_registered() {
+        let defs = tool_defs(false, false);
+        for t in [
+            "glob_expand",
+            "grep_files",
+            "stat_file",
+            "diff_files",
+            "copy_file",
+            "rename_file",
+            "append_file",
+        ] {
+            assert!(defs.iter().any(|d| d.name == t), "missing tool def: {t}");
         }
     }
 }

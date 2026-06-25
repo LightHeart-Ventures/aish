@@ -436,6 +436,308 @@ fn find_binary(root: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// S9.4 — `:update --drain` (graceful shutdown + shell restart)
+// ---------------------------------------------------------------------------
+//
+// `:update` (today's path) swaps the binary and advises a manual restart. The
+// drain path adds a strict, gated shutdown so a self-update can happen mid-
+// session without losing in-flight work:
+//
+//     quiesce (checkpoint + detach attached work, await background to a
+//              turn-boundary up to AISH_DRAIN_TIMEOUT)
+//        └─ (gate) ─▶ swap (update::perform — the pure atomic binary swap)
+//                        └─ (gate) ─▶ restart (re-exec the new binary in place)
+//
+// The two gates are the headline safety invariant (AC5): the swap is reached
+// ONLY after quiesce returns, and the restart is reached ONLY after a
+// successful swap — a swap failure NEVER restarts (no half-updated restart).
+//
+// Containers (S9.1) have their own PID 1 and a detached lifecycle, so the shell
+// exiting/re-execing leaves them running (AC3) — drain only checkpoints the
+// interactive/attached + host-side work, it never babysits containers. Post-
+// restart rediscovery of surviving container workers (AC6) is S9.5's job; this
+// module ends at the re-exec.
+
+/// The internal checkpoint signal placed on a live coordinator's
+/// `coordinator_messages` mailbox (the same authenticated channel `:tell`
+/// uses). A coordinator that recognises this sentinel at its round boundary
+/// flushes its S9.3 transcript and, if attached, detaches — so a restart can't
+/// sever it mid-turn. A fixed internal token, not user-forgeable into code.
+pub const CHECKPOINT_SENTINEL: &str = "__aish_checkpoint_detach__";
+
+/// Default bound on how long `drain` awaits background jobs reaching a turn-
+/// boundary checkpoint before proceeding (AC4). Overridable per-invocation via
+/// `AISH_DRAIN_TIMEOUT` (whole seconds).
+pub const DEFAULT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The drain await bound, read from `AISH_DRAIN_TIMEOUT` (seconds). Falls back
+/// to [`DEFAULT_DRAIN_TIMEOUT`] when the var is unset, unparseable, or zero.
+pub fn drain_timeout() -> std::time::Duration {
+    std::env::var("AISH_DRAIN_TIMEOUT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(DEFAULT_DRAIN_TIMEOUT)
+}
+
+/// Everything `drain` / `perform_with_drain` need to quiesce background work,
+/// captured up front so the orchestration is decoupled from `Session`. The
+/// caller (the `:update --drain` handler) fills it from the live session.
+pub struct DrainCtx<'a> {
+    /// The durable coordinator store — the source of truth for which runs are
+    /// live (goal-loop turns, other-session runs, reattached runs). `None` when
+    /// the session has no DB (the in-memory tallies are still awaited).
+    pub store: Option<&'a crate::db::CoordinatorStore>,
+    /// This session's in-memory re-exec'd workers (`:dispatch` / run_in_background).
+    pub worker_jobs: &'a crate::worker::WorkerJobs,
+    /// This session's in-memory Anthropic batch jobs.
+    pub batch_jobs: &'a crate::batch::BatchJobs,
+    /// The signalling session id, recorded as the message sender for provenance.
+    pub session_id: &'a str,
+    /// Whether background workers are containerized (S9.1). True ⇒ they survive
+    /// the restart; false (host subprocesses, the default today) ⇒ they would
+    /// die, which the AC8 confirmation gate covers BEFORE drain runs.
+    pub backend_is_container: bool,
+    /// The bounded await for background quiescence (AC4).
+    pub timeout: std::time::Duration,
+}
+
+/// What `drain` observed: which attached runs were signalled to checkpoint+
+/// detach, which reached a quiescent checkpoint within the timeout, and which
+/// were left mid-flight at the deadline (safe once containerized + persisted;
+/// recorded for S9.5 rediscovery). A transient, in-memory summary (no schema).
+#[derive(Debug, Default, Clone)]
+pub struct DrainReport {
+    /// Run ids handed a checkpoint+detach signal (AC2).
+    pub attached_detached: Vec<String>,
+    /// Run ids that quiesced (became terminal) before the deadline.
+    pub checkpointed: Vec<String>,
+    /// Run ids still active at the deadline — proceeded past, recorded (AC4).
+    pub left_mid_flight: Vec<String>,
+}
+
+/// The terminal outcome a staged drain reaches. Pure so the gate ordering
+/// (AC5) is unit-testable without a real swap or re-exec.
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // pure AC5 gate model; exercised by drain_tests + documents the invariant
+pub enum StagedOutcome {
+    /// Quiesce stage returned an error — swap NEVER ran.
+    QuiesceFailed(String),
+    /// Quiesce ok, but the binary swap failed — restart NEVER ran (AC5).
+    SwapFailed(String),
+    /// Swap ok, but the re-exec returned (failure) — binary already in place.
+    RestartFailed(String),
+    /// Swap ok and the re-exec replaced the process image (normally unreachable
+    /// — `exec` doesn't return on success; modelled for completeness/tests).
+    Restarted,
+}
+
+/// Drive the strict gated sequence quiesce → swap → restart. Each stage is a
+/// closure returning `Result<(), String>`; the swap closure runs ONLY when
+/// quiesce returns `Ok`, and restart runs ONLY when swap returns `Ok` — the
+/// headline ordering invariant (AC5). Pure over its closures so the gate can be
+/// asserted with stage stubs (a failing quiesce must leave swap/restart
+/// untouched; a failing swap must leave restart untouched).
+#[allow(dead_code)] // pure AC5 gate model; exercised by drain_tests
+pub fn run_staged<Q, S, R>(quiesce: Q, swap: S, restart: R) -> StagedOutcome
+where
+    Q: FnOnce() -> Result<(), String>,
+    S: FnOnce() -> Result<(), String>,
+    R: FnOnce() -> Result<(), String>,
+{
+    match quiesce() {
+        Err(e) => StagedOutcome::QuiesceFailed(e),
+        Ok(()) => match swap() {
+            Err(e) => StagedOutcome::SwapFailed(e),
+            Ok(()) => match restart() {
+                Err(e) => StagedOutcome::RestartFailed(e),
+                Ok(()) => StagedOutcome::Restarted,
+            },
+        },
+    }
+}
+
+/// Partition the set of signalled run ids into those that quiesced (NOT in the
+/// still-active set at the deadline) and those left mid-flight (still active).
+/// Pure → unit-tested for the AC4 report split.
+pub fn partition_drain(
+    signalled: &[String],
+    still_active: &std::collections::HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut checkpointed = Vec::new();
+    let mut left = Vec::new();
+    for id in signalled {
+        if still_active.contains(id) {
+            left.push(id.clone());
+        } else {
+            checkpointed.push(id.clone());
+        }
+    }
+    (checkpointed, left)
+}
+
+/// The AC8 host-subprocess confirmation prompt: with host workers in flight, a
+/// restart WILL lose them (they're children of the shell), so the user must
+/// confirm explicitly. Pure over the count for unit-testing.
+pub fn host_drain_warning(running: usize) -> String {
+    let plural = if running == 1 { "" } else { "s" };
+    format!(
+        "\u{26a0} {running} background job{plural} run as HOST subprocesses (no container backend) and WILL be terminated by the restart. Checkpoint what we can and restart anyway?"
+    )
+}
+
+/// The set of live (non-terminal) coordinator run ids in the durable store,
+/// per [`crate::coordinator::Phase`]. Empty on no store / read error (best-
+/// effort: a store hiccup must never wedge a drain).
+fn live_run_ids(ctx: &DrainCtx<'_>) -> Vec<String> {
+    let Some(store) = ctx.store else {
+        return Vec::new();
+    };
+    store
+        .load_all()
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|r| {
+                    matches!(
+                        crate::coordinator::Phase::parse(&r.phase),
+                        crate::coordinator::Phase::Coordinating
+                            | crate::coordinator::Phase::AwaitingBatch
+                    )
+                })
+                .map(|r| r.run_id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Total background work still tied to THIS binary: in-memory batches + workers
+/// + durable coordinator runs the in-memory tallies miss. Mirrors the prompt's
+/// ⟳N tally; the quiesce loop polls this to zero (or the timeout).
+fn drain_running_count(ctx: &DrainCtx<'_>) -> usize {
+    let batches = crate::batch::running_count(ctx.batch_jobs);
+    let workers = crate::worker::running_count(ctx.worker_jobs);
+    let coordinators = ctx.store.map_or(0, |store| {
+        let in_memory: std::collections::HashSet<String> = ctx
+            .worker_jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|w| w.id.clone())
+            .collect();
+        crate::coordinator::active_store_count(store, &in_memory)
+    });
+    batches + workers + coordinators
+}
+
+/// Quiesce interactive + background work (stages 1–2 of the drain, AC2/AC4):
+///   1. Broadcast the [`CHECKPOINT_SENTINEL`] to every live coordinator run via
+///      its `coordinator_messages` mailbox so it flushes S9.3 state and detaches.
+///   2. Poll the combined background tally to zero, bounded by `ctx.timeout` at
+///      a 200ms cadence. On timeout, the still-active runs are recorded as
+///      `left_mid_flight` (safe once containerized + persisted) and we proceed.
+/// Always returns a report — drain is best-effort; a store error degrades to an
+/// empty signal set rather than failing the update.
+pub async fn drain(ctx: &DrainCtx<'_>) -> DrainReport {
+    let mut report = DrainReport::default();
+
+    // Stage 1 — broadcast the checkpoint+detach signal to every live run.
+    let signalled = live_run_ids(ctx);
+    if let Some(store) = ctx.store {
+        for run_id in &signalled {
+            // Best-effort: a mailbox write failure for one run must not abort
+            // the whole drain (the others still need signalling).
+            let _ = store.enqueue_message(run_id, CHECKPOINT_SENTINEL, Some(ctx.session_id));
+        }
+    }
+    report.attached_detached = signalled.clone();
+
+    // Stage 2 — bounded await for a quiescent (turn-boundary) state. Container-
+    // backed workers (S9.1) have their own PID 1 and survive the restart, so we
+    // do NOT block on them (AC3/AC4) — only host-subprocess work, which would die
+    // on restart, is awaited to a checkpoint up to the timeout.
+    if !ctx.backend_is_container {
+        let deadline = std::time::Instant::now() + ctx.timeout;
+        loop {
+            if drain_running_count(ctx) == 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    // Partition the signalled runs by what's still active at the deadline.
+    let still_active: std::collections::HashSet<String> = live_run_ids(ctx).into_iter().collect();
+    let (checkpointed, left) = partition_drain(&signalled, &still_active);
+    report.checkpointed = checkpointed;
+    report.left_mid_flight = left;
+    report
+}
+
+/// Re-exec the (freshly-swapped) current binary in place, preserving argv and
+/// the controlling terminal — the cheapest restart that keeps the user's
+/// session on the same TTY. Resolves `current_exe` AFTER the swap (canonicalized,
+/// as `perform` does) so it picks up the NEW on-disk inode, never a stale path.
+/// On success `exec` replaces the process image and NEVER returns; it returns an
+/// `io::Error` ONLY when the re-exec fails (the caller then falls back to the
+/// manual-restart advice — the binary is already in place, not lost).
+#[cfg(unix)]
+pub fn restart_in_place() -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    let exe = match std::env::current_exe() {
+        Ok(p) => std::fs::canonicalize(&p).unwrap_or(p),
+        Err(e) => return e,
+    };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `exec` only returns on failure.
+    std::process::Command::new(exe).args(args).exec()
+}
+
+/// The full staged drain-update: pre-flight → quiesce → (gate) swap → (gate)
+/// restart. The `?` after [`perform`] is the AC5 gate — a swap failure returns
+/// the error and the restart below is UNREACHABLE (no half-updated restart).
+/// `drain` is best-effort and always returns a report, so the only `Err` this
+/// produces is a pre-flight (`writable_check`) or swap failure. On a successful
+/// swap it calls [`restart_in_place`], which returns ONLY if the re-exec failed
+/// — surfaced as `restart_error` so the caller can advise a manual restart with
+/// the new binary already in place.
+pub async fn perform_with_drain(info: &UpdateInfo, ctx: &DrainCtx<'_>) -> Result<DrainOutcome> {
+    // Pre-flight: fail fast if the destination isn't writable, BEFORE quiescing
+    // for nothing (edge case — don't tear down interactive work then bail).
+    let current_exe = std::env::current_exe().context("locating the running aish binary")?;
+    let current_exe = std::fs::canonicalize(&current_exe).unwrap_or(current_exe);
+    let dest_dir = current_exe
+        .parent()
+        .ok_or_else(|| anyhow!("can't determine the directory of {}", current_exe.display()))?;
+    writable_check(dest_dir)
+        .with_context(|| format!("{} is not writable", dest_dir.display()))?;
+
+    // Stage 1 — quiesce (always returns a report).
+    let report = drain(ctx).await;
+
+    // Stage 2 — swap. The `?` is the AC5 gate: on ANY swap error we return here
+    // and the restart below never runs.
+    perform(info).await?;
+
+    // Stage 3 — restart (reached ONLY after a successful swap). `restart_in_place`
+    // returns only on re-exec failure.
+    let restart_error = Some(restart_in_place());
+    Ok(DrainOutcome { report, restart_error })
+}
+
+/// The result of a [`perform_with_drain`] that got past the swap. `restart_error`
+/// is `Some` only when the post-swap re-exec FAILED (the new binary is in place;
+/// advise a manual restart). On a successful re-exec the process image is
+/// replaced and this value is never constructed.
+pub struct DrainOutcome {
+    pub report: DrainReport,
+    pub restart_error: Option<std::io::Error>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,5 +868,110 @@ mod tests {
             "Cargo.toml version '{}' is not valid semver — ensure it matches the release tag",
             v
         );
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn run_staged_swap_unreachable_unless_quiesce_ok() {
+        // A failing quiesce must short-circuit: swap and restart never run.
+        let swap_ran = std::cell::Cell::new(false);
+        let restart_ran = std::cell::Cell::new(false);
+        let out = run_staged(
+            || Err("nope".to_string()),
+            || {
+                swap_ran.set(true);
+                Ok(())
+            },
+            || {
+                restart_ran.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(out, StagedOutcome::QuiesceFailed("nope".into()));
+        assert!(!swap_ran.get(), "swap must not run when quiesce fails (AC5)");
+        assert!(!restart_ran.get(), "restart must not run when quiesce fails");
+    }
+
+    #[test]
+    fn run_staged_restart_unreachable_unless_swap_ok() {
+        // Quiesce ok, swap fails → restart NEVER runs (the no-half-update gate).
+        let restart_ran = std::cell::Cell::new(false);
+        let out = run_staged(
+            || Ok(()),
+            || Err("swap blew up".to_string()),
+            || {
+                restart_ran.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(out, StagedOutcome::SwapFailed("swap blew up".into()));
+        assert!(!restart_ran.get(), "restart must not run when swap fails (AC5)");
+    }
+
+    #[test]
+    fn run_staged_reaches_restart_only_after_both_gates() {
+        // A re-exec that "returns" (failure) surfaces as RestartFailed; both
+        // earlier stages must have passed to get here.
+        let out = run_staged(|| Ok(()), || Ok(()), || Err("exec returned".to_string()));
+        assert_eq!(out, StagedOutcome::RestartFailed("exec returned".into()));
+        // The (normally-unreachable) success path is modelled too.
+        let ok = run_staged(|| Ok(()), || Ok(()), || Ok(()));
+        assert_eq!(ok, StagedOutcome::Restarted);
+    }
+
+    #[test]
+    fn partition_drain_splits_checkpointed_from_mid_flight() {
+        let signalled = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        // b is still active at the deadline; a and c quiesced.
+        let mut active = HashSet::new();
+        active.insert("b".to_string());
+        let (checkpointed, left) = partition_drain(&signalled, &active);
+        assert_eq!(checkpointed, vec!["a".to_string(), "c".to_string()]);
+        assert_eq!(left, vec!["b".to_string()]);
+
+        // Nothing active → everything checkpointed, nothing left.
+        let (ck, lf) = partition_drain(&signalled, &HashSet::new());
+        assert_eq!(ck, signalled);
+        assert!(lf.is_empty());
+    }
+
+    #[test]
+    fn drain_timeout_reads_env_with_sane_fallback() {
+        // Unset / zero / garbage all fall back to the 120s default; a positive
+        // integer is honoured. Serialise via the process env (test owns the var).
+        // SAFETY: single-threaded test mutation of a process env var.
+        unsafe { std::env::remove_var("AISH_DRAIN_TIMEOUT") };
+        assert_eq!(drain_timeout(), DEFAULT_DRAIN_TIMEOUT);
+        unsafe { std::env::set_var("AISH_DRAIN_TIMEOUT", "0") };
+        assert_eq!(drain_timeout(), DEFAULT_DRAIN_TIMEOUT);
+        unsafe { std::env::set_var("AISH_DRAIN_TIMEOUT", "notanumber") };
+        assert_eq!(drain_timeout(), DEFAULT_DRAIN_TIMEOUT);
+        unsafe { std::env::set_var("AISH_DRAIN_TIMEOUT", "45") };
+        assert_eq!(drain_timeout(), std::time::Duration::from_secs(45));
+        unsafe { std::env::remove_var("AISH_DRAIN_TIMEOUT") };
+    }
+
+    #[test]
+    fn checkpoint_sentinel_is_a_fixed_internal_token() {
+        // The signal coordinators recognise at their round boundary. Pinned so a
+        // rename here and in coordinator::drive can't silently drift apart.
+        assert_eq!(CHECKPOINT_SENTINEL, "__aish_checkpoint_detach__");
+    }
+
+    #[test]
+    fn host_drain_warning_names_count_and_consequence() {
+        let one = host_drain_warning(1);
+        assert!(one.contains('1'));
+        assert!(one.contains("HOST"));
+        assert!(one.contains("terminated"));
+        assert!(one.contains("job ")); // singular
+        let many = host_drain_warning(3);
+        assert!(many.contains('3'));
+        assert!(many.contains("jobs ")); // plural
     }
 }

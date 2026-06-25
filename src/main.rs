@@ -7,6 +7,8 @@ mod coordinator;
 mod db;
 mod editor;
 mod engine;
+mod git;
+mod git_repo;
 mod goal;
 mod jobs;
 mod loopguard;
