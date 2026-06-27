@@ -661,13 +661,15 @@ fn mcpmarket_search_url(base: &str, query: &str, limit: usize) -> String {
     )
 }
 
+/// Retry delays in milliseconds, matching skillfish's exponential backoff.
+const MCPMARKET_RETRY_DELAYS_MS: &[u64] = &[1000, 2000, 4000];
+
 /// Query a specific mcpmarket `base` (no env lookup), so tests can point it at a
 /// loopback server. Reuses [`parse_search_body`] — mcpmarket's per-skill fields
 /// (`name`, `publisher`/`namespace`, `summary`, `full_name`/`slug`, …) are folded
 /// onto [`SearchResult`] via the serde aliases on that struct.
 ///
-/// Uses wreq (browser-impersonating HTTP client) to bypass Vercel's bot protection
-/// on mcpmarket.com. wreq spoofs TLS + HTTP/2 fingerprints to appear as a real browser.
+/// Retries with exponential backoff on 429 responses (matching skillfish's behavior).
 async fn search_mcpmarket_with_base(
     base: &str,
     query: &str,
@@ -676,29 +678,70 @@ async fn search_mcpmarket_with_base(
     let url = mcpmarket_search_url(base, query, limit);
     check_url(&url)?;
     
-    // Use wreq with explicit Chrome browser emulation to bypass Vercel's bot protection
-    // Chrome fingerprints are most commonly whitelisted by CDN/WAF systems
     let client = http_client()?;
-
+    let mut last_error: Option<anyhow::Error> = None;
     
-    let resp = client
-        .get(&url)
-        .header("Referer", "https://mcpmarket.com/")
-        .header("Accept", "application/json")
-        .header("User-Agent", "skillfish-cli")
-        .send()
-        .await
-        .with_context(|| format!("searching mcpmarket {url}"))?;
-    
-    if !resp.status().is_success() {
-        bail!("mcpmarket returned HTTP {} for {url}", resp.status().as_u16());
+    // Retry up to 3 times with exponential backoff (matching skillfish)
+    for attempt in 0..3 {
+        eprintln!("[mcpmarket] attempt {} of 3...", attempt + 1);
+        let resp = match client
+            .get(&url)
+            .header("Referer", "https://mcpmarket.com/")
+            .header("Accept", "application/json")
+            .header("User-Agent", "skillfish-cli")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[mcpmarket] request failed: {e}");
+                last_error = Some(e.into());
+                if attempt < 2 {
+                    eprintln!("[mcpmarket] sleeping {}ms before retry...", MCPMARKET_RETRY_DELAYS_MS[attempt]);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        MCPMARKET_RETRY_DELAYS_MS[attempt],
+                    ))
+                    .await;
+                    continue;
+                }
+                return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("request failed")));
+            }
+        };
+        
+        eprintln!("[mcpmarket] got response: {}", resp.status());
+        // 429 (Vercel challenge) → retry with backoff
+        if resp.status().as_u16() == 429 {
+            if attempt < 2 {
+                eprintln!("[mcpmarket] 429 on attempt {}, retrying in {}ms...", attempt + 1, MCPMARKET_RETRY_DELAYS_MS[attempt]);
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    MCPMARKET_RETRY_DELAYS_MS[attempt],
+                ))
+                .await;
+                continue;
+            }
+            // Last attempt failed with 429
+            eprintln!("[mcpmarket] 429 on final attempt {}", attempt + 1);
+            last_error = Some(anyhow::anyhow!("HTTP 429 after retries"));
+            continue;
+        }
+        
+        // Other success or client error → return immediately
+        if !resp.status().is_success() {
+            bail!("mcpmarket returned HTTP {} for {url}", resp.status().as_u16());
+        }
+        
+        let body = resp
+            .text()
+            .await
+            .context("reading the mcpmarket search response")?;
+        return parse_search_body(&body);
     }
     
-    let body = resp
-        .text()
-        .await
-        .context("reading the mcpmarket search response")?;
-    parse_search_body(&body)
+    // All retries exhausted
+    if let Some(e) = last_error {
+        return Err(e);
+    }
+    bail!("mcpmarket search failed after retries")
 }
 
 /// Query mcpmarket's public skills API for `query`.
