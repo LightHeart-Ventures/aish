@@ -3016,8 +3016,10 @@ fn valid_skill_name(name: &str) -> bool {
 
 /// Write a fetched SKILL.md into `skills_dir` and reload the session's catalog
 /// from there, returning the imported skill's frontmatter name. The testable
-/// core of `:skill add` — no network, so the reload behavior is unit-tested
-/// directly.
+/// core of `:skill add`'s reload step — no network, so the reload behavior is
+/// unit-tested directly. (Test-only: production `:skill add` goes through
+/// `skill_provider::add`, which handles both skill.fish and GitHub sources.)
+#[cfg(test)]
 fn install_skill_text(text: &str, skills_dir: &Path, session: &mut Session) -> Result<String> {
     crate::skill_provider::import(text, skills_dir)?;
     session.reload_skills_from(skills_dir);
@@ -3040,26 +3042,37 @@ async fn handle_skill_command(args: &[&str], session: &mut Session) -> Result<()
         SkillCmd::Remove(name) => skill_remove(&name, session),
         SkillCmd::Usage => {
             println!(
-                "usage: :skill add <owner/name[@version]> | search <query> | list | remove <name>"
+                "usage: :skill add <owner/name[@version] | github:owner/repo[/path][@ref]> | search <query> | list | remove <name>"
             );
             Ok(())
         }
     }
 }
 
-/// `:skill add <ref>` — fetch a SKILL.md from skill.fish, import it, and reload
-/// the catalog so the model can use it from the next turn.
+/// `:skill add <ref>` — fetch a SKILL.md (from skill.fish or GitHub), import it,
+/// and reload the catalog so the model can use it from the next turn. A GitHub
+/// repo spec (`github:owner/repo`) may import several skills at once.
 async fn skill_add(reference: &str, session: &mut Session) -> Result<()> {
     let skills_dir = skills_dir_path();
     let _ = std::fs::create_dir_all(&skills_dir);
-    let r = crate::skill_provider::parse_ref(reference)?;
+    println!("\x1b[2mfetching {reference} …\x1b[0m");
+    let imported = crate::skill_provider::add(reference, &skills_dir).await?;
+    session.reload_skills_from(&skills_dir);
+    for sk in &imported {
+        if sk.description.is_empty() {
+            println!("\x1b[32m✓\x1b[0m added \x1b[1m{}\x1b[0m", sk.name);
+        } else {
+            println!(
+                "\x1b[32m✓\x1b[0m added \x1b[1m{}\x1b[0m — \x1b[2m{}\x1b[0m",
+                sk.name, sk.description
+            );
+        }
+    }
+    let n = imported.len();
     println!(
-        "\x1b[2mfetching {}/{} from skill.fish …\x1b[0m",
-        r.owner, r.name
+        "  catalog reloaded ({n} skill{}).",
+        if n == 1 { "" } else { "s" }
     );
-    let text = crate::skill_provider::fetch(&r).await?;
-    let name = install_skill_text(&text, &skills_dir, session)?;
-    println!("\x1b[32m✓\x1b[0m added \x1b[1m{name}\x1b[0m; catalog reloaded.");
     Ok(())
 }
 

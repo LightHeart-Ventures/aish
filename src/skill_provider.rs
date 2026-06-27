@@ -53,14 +53,21 @@ fn default_registry() -> String {
     format!("file://{}", local_registry_path().display())
 }
 
-/// Resolve the active registry: the `AISH_SKILL_REGISTRY` override when set and
-/// non-empty, else the local `file://` index default.
-fn registry() -> String {
+/// The `AISH_SKILL_REGISTRY` override, when set and non-empty (trailing slash
+/// trimmed). `None` means "no override" — the caller picks the default source.
+/// Search treats a present override as authoritative: it skips the dynamic
+/// mcpmarket lookup and queries exactly what the user pointed it at.
+fn registry_override() -> Option<String> {
     std::env::var("AISH_SKILL_REGISTRY")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.trim_end_matches('/').to_string())
-        .unwrap_or_else(default_registry)
+}
+
+/// Resolve the active registry: the `AISH_SKILL_REGISTRY` override when set and
+/// non-empty, else the local `file://` index default.
+fn registry() -> String {
+    registry_override().unwrap_or_else(default_registry)
 }
 
 /// Write the curated, binary-embedded registry index to
@@ -256,32 +263,63 @@ pub fn import(text: &str, skills_dir: &Path) -> Result<PathBuf> {
 }
 
 /// CLI entry point for `aish --skill-fetch <ref>`: parse, fetch, import, report.
+/// Accepts a skill.fish `owner/name[@version]` ref, a `github:owner/repo[/path]`
+/// spec, or a `https://github.com/...` URL. A GitHub spec that points at a repo
+/// (rather than a single skill) imports every SKILL.md discovered under it.
 pub async fn run_fetch(input: &str, skills_dir: &Path) -> Result<()> {
-    let r = parse_ref(input)?;
-    let ver = r
-        .version
-        .as_deref()
-        .map(|v| format!("@{v}"))
-        .unwrap_or_default();
+    let imported = add(input, skills_dir).await?;
+    if imported.is_empty() {
+        bail!("no SKILL.md found for {input:?}");
+    }
+    for sk in &imported {
+        println!(
+            "\x1b[32m✓\x1b[0m imported skill \x1b[1m{}\x1b[0m → {}",
+            sk.name,
+            sk.path.display()
+        );
+        if !sk.description.is_empty() {
+            println!("  \x1b[2m{}\x1b[0m", sk.description);
+        }
+    }
+    let n = imported.len();
     println!(
-        "\x1b[2mfetching {}/{}{ver} from {} …\x1b[0m",
-        r.owner,
-        r.name,
-        registry()
+        "  {} skill{} in your catalog now — aish will use {} when a task matches.",
+        n,
+        if n == 1 { "" } else { "s" },
+        if n == 1 { "it" } else { "them" }
     );
+    Ok(())
+}
+
+/// A skill that was fetched and written to disk by [`add`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedSkill {
+    pub name: String,
+    pub description: String,
+    pub path: PathBuf,
+}
+
+/// Unified import entry point used by both the CLI (`--skill-fetch`) and the
+/// interactive `:skill add`. Detects the source from `input`:
+///   * a `github:owner/repo[/path][@ref]` spec or `https://github.com/...` URL
+///     → GitHub path resolution + (possibly multi-skill) discovery & import;
+///   * anything else → a skill.fish `owner/name[@version]` ref, fetched and
+///     imported as a single skill.
+/// Returns every skill written, so the caller can reload its catalog and report.
+pub async fn add(input: &str, skills_dir: &Path) -> Result<Vec<ImportedSkill>> {
+    if let Some(gh) = parse_github_ref(input) {
+        return add_github(&gh, skills_dir).await;
+    }
+    let r = parse_ref(input)?;
     let text = fetch(&r).await?;
     let path = import(&text, skills_dir)?;
-    let (name, desc) =
+    let (name, description) =
         crate::skills::parse_frontmatter(&text).unwrap_or((r.name.clone(), String::new()));
-    println!(
-        "\x1b[32m✓\x1b[0m imported skill \x1b[1m{name}\x1b[0m → {}",
-        path.display()
-    );
-    if !desc.is_empty() {
-        println!("  \x1b[2m{desc}\x1b[0m");
-    }
-    println!("  It's in your skills catalog now — aish will use it when a task matches.");
-    Ok(())
+    Ok(vec![ImportedSkill {
+        name,
+        description,
+        path,
+    }])
 }
 
 // ---------------------------------------------------------------------------
@@ -296,13 +334,20 @@ pub async fn run_fetch(input: &str, skills_dir: &Path) -> Result<()> {
 pub struct SearchResult {
     #[serde(default)]
     pub name: String,
-    #[serde(default, alias = "owner")]
+    #[serde(default, alias = "owner", alias = "publisher", alias = "namespace")]
     pub author: String,
-    #[serde(default)]
+    #[serde(default, alias = "summary", alias = "tagline")]
     pub description: String,
     #[serde(default)]
     pub version: String,
-    #[serde(default, alias = "ref", alias = "slug")]
+    #[serde(
+        default,
+        alias = "ref",
+        alias = "slug",
+        alias = "full_name",
+        alias = "fullName",
+        alias = "id"
+    )]
     pub reference: String,
 }
 
@@ -393,6 +438,8 @@ fn parse_search_body(body: &str) -> Result<Vec<SearchResult>> {
         .get("results")
         .or_else(|| v.get("skills"))
         .or_else(|| v.get("data"))
+        .or_else(|| v.get("items"))
+        .or_else(|| v.get("hits"))
         .and_then(|x| x.as_array())
         .cloned()
         .or_else(|| v.as_array().cloned())
@@ -448,10 +495,51 @@ async fn search_with_base(base: &str, query: &str) -> Result<Vec<SearchResult>> 
     parse_search_body(&body)
 }
 
-/// Search the configured registry catalog for `query`. An empty result list is
-/// returned as `Ok(vec![])`, not an error.
+/// Search for `query` across the available skill sources.
+///
+/// Source precedence (mirrors skillfish's `:skill search`):
+///   1. An explicit `AISH_SKILL_REGISTRY` override always wins — when the user
+///      points aish at a specific mirror we honor it exactly and do not
+///      second-guess it with mcpmarket.
+///   2. Otherwise, query mcpmarket.com's live skills API (the dynamic, primary
+///      source). Non-empty results are merged with the curated, binary-embedded
+///      index so the built-in catalog is always discoverable too.
+///   3. If mcpmarket is unreachable or returns nothing, fall back to the local
+///      embedded index alone — search keeps working fully offline.
+///
+/// An empty result list is returned as `Ok(vec![])`, never an error.
 pub async fn search(query: &str) -> Result<Vec<SearchResult>> {
-    search_with_base(&registry(), query).await
+    // (1) An explicit registry override is authoritative.
+    if let Some(base) = registry_override() {
+        return search_with_base(&base, query).await;
+    }
+
+    // (3, prepared) The offline fallback: the curated, binary-embedded index.
+    let local = search_with_base(&default_registry(), query)
+        .await
+        .unwrap_or_default();
+
+    // (2) mcpmarket is the dynamic primary source. On any failure we degrade
+    // gracefully to the embedded index rather than surfacing a network error.
+    match search_mcpmarket(query, MCPMARKET_LIMIT).await {
+        Ok(remote) if !remote.is_empty() => Ok(merge_results(remote, local)),
+        _ => Ok(local),
+    }
+}
+
+/// Merge two result lists, preferring `primary` order and dropping any
+/// `fallback` entry whose `owner/name` reference already appeared in `primary`.
+/// Keeps the dynamic mcpmarket hits first, then appends embedded-index entries
+/// the live search didn't already cover.
+fn merge_results(primary: Vec<SearchResult>, fallback: Vec<SearchResult>) -> Vec<SearchResult> {
+    let mut seen: HashSet<String> = primary.iter().map(|r| r.ref_or_synth()).collect();
+    let mut out = primary;
+    for r in fallback {
+        if seen.insert(r.ref_or_synth()) {
+            out.push(r);
+        }
+    }
+    out
 }
 
 /// Render search results as a plain, aligned text table (returned, not printed,
@@ -530,6 +618,480 @@ pub async fn run_search(query: &str) -> Result<()> {
     let results = search(query).await?;
     println!("{}", print_results_table(query, &results));
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// mcpmarket.com — the dynamic, primary search source (Phase 3)
+// ---------------------------------------------------------------------------
+//
+// mcpmarket.com publishes a live, growing catalog of skills. We query it as the
+// PRIMARY source for `:skill search` / `--skill-search`, merging its hits over
+// the curated, binary-embedded index so the built-in catalog is still
+// discoverable and search keeps working offline (see `search`).
+
+/// The mcpmarket origin. Override with `AISH_MCPMARKET_BASE` (used by the tests
+/// to point at a loopback server, and available as an escape hatch for a mirror).
+const MCPMARKET_BASE: &str = "https://mcpmarket.com";
+
+/// How many skills to ask mcpmarket for. Matches the registry's own `limit=50`.
+const MCPMARKET_LIMIT: usize = 50;
+
+/// The active mcpmarket base: the `AISH_MCPMARKET_BASE` override when set and
+/// non-empty (trailing slash trimmed), else the public origin.
+fn mcpmarket_base() -> String {
+    std::env::var("AISH_MCPMARKET_BASE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| MCPMARKET_BASE.to_string())
+}
+
+/// The mcpmarket skills-search endpoint URL on `base` for `query`:
+/// `GET {base}/api/search?q=<query>&type=skills&limit=<limit>`.
+fn mcpmarket_search_url(base: &str, query: &str, limit: usize) -> String {
+    format!(
+        "{}/api/search?q={}&type=skills&limit={}",
+        base.trim_end_matches('/'),
+        encode_query(query),
+        limit
+    )
+}
+
+/// Query a specific mcpmarket `base` (no env lookup), so tests can point it at a
+/// loopback server. Reuses [`parse_search_body`] — mcpmarket's per-skill fields
+/// (`name`, `publisher`/`namespace`, `summary`, `full_name`/`slug`, …) are folded
+/// onto [`SearchResult`] via the serde aliases on that struct.
+async fn search_mcpmarket_with_base(
+    base: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    let url = mcpmarket_search_url(base, query, limit);
+    check_url(&url)?;
+    let client = http_client()?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("searching mcpmarket {url}"))?;
+    if !resp.status().is_success() {
+        bail!("mcpmarket returned HTTP {} for {url}", resp.status().as_u16());
+    }
+    let body = resp
+        .text()
+        .await
+        .context("reading the mcpmarket search response")?;
+    parse_search_body(&body)
+}
+
+/// Query mcpmarket's public skills API for `query`.
+async fn search_mcpmarket(query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    search_mcpmarket_with_base(&mcpmarket_base(), query, limit).await
+}
+
+// ---------------------------------------------------------------------------
+// GitHub — fetch a SKILL.md (or discover many) from a repo (Phase 3)
+// ---------------------------------------------------------------------------
+//
+// skillfish-style GitHub support. A `github:owner/repo[/path][@ref]` spec — or a
+// plain `https://github.com/owner/repo[/tree/<ref>/path]` URL — resolves to one
+// or more SKILL.md files:
+//   * a spec that names a single SKILL.md (or a directory containing one) imports
+//     that one skill;
+//   * a spec that names a repo (or a sub-tree) is expanded via the GitHub trees
+//     API into EVERY SKILL.md beneath it (multi-skill repos), each imported.
+// Private repos work when `GITHUB_TOKEN` (or `GH_TOKEN`) is set — it's sent as a
+// Bearer token on both the API and raw.githubusercontent.com requests.
+
+/// The GitHub REST API origin (trees API). Override with `AISH_GITHUB_API_BASE`.
+const GITHUB_API: &str = "https://api.github.com";
+
+/// The raw file origin. Override with `AISH_GITHUB_RAW_BASE`.
+const GITHUB_RAW: &str = "https://raw.githubusercontent.com";
+
+/// The git ref used when a spec doesn't pin one. `HEAD` resolves to the repo's
+/// default branch on both the trees API and raw.githubusercontent.com.
+const GITHUB_DEFAULT_REF: &str = "HEAD";
+
+/// A parsed reference to a skill (or a repo of skills) hosted on GitHub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubRef {
+    pub owner: String,
+    pub repo: String,
+    /// Branch, tag, or commit SHA. Defaults to [`GITHUB_DEFAULT_REF`] (`HEAD`).
+    pub git_ref: String,
+    /// Sub-path within the repo: a directory of skills, or a single SKILL.md.
+    /// `None` means "the whole repo" — discovery walks every SKILL.md in it.
+    pub path: Option<String>,
+}
+
+/// A single path segment is safe for a GitHub owner/repo/path component.
+fn valid_github_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// A git ref is safe: non-empty, no `..`, no whitespace; `/` is allowed so
+/// branch names like `release/v2` pass through.
+fn valid_github_ref(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains("..")
+        && !s.chars().any(|c| c.is_whitespace())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+}
+
+/// Validate a repo sub-path: every `/`-separated component must be a safe
+/// segment. Returns the normalized path (no leading/trailing slash) or `None`.
+fn normalize_github_path(path: &str) -> Option<String> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.split('/').all(valid_github_segment) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Parse a GitHub skill spec. Returns `None` when `input` is not a GitHub spec
+/// (so the caller can fall back to the skill.fish `parse_ref` path). Accepts:
+///   * `github:owner/repo`, `github:owner/repo/path/to/skill`, `…@ref`
+///   * `gh:owner/repo[/path][@ref]` (short alias)
+///   * `https://github.com/owner/repo`
+///   * `https://github.com/owner/repo/tree/<ref>/path/to/skill`
+///   * `https://github.com/owner/repo/blob/<ref>/path/to/skill/SKILL.md`
+/// A `.git` suffix on the repo is stripped. An unparsable/unsafe spec → `None`.
+pub fn parse_github_ref(input: &str) -> Option<GithubRef> {
+    let s = input.trim();
+    // `url_form` specs carry the ref inside `/tree/<ref>/` or `/blob/<ref>/`;
+    // `prefix` specs carry it as a trailing `@ref`.
+    let (rest, url_form) = if let Some(r) = s.strip_prefix("https://github.com/") {
+        (r, true)
+    } else if let Some(r) = s.strip_prefix("http://github.com/") {
+        (r, true)
+    } else if let Some(r) = s.strip_prefix("github.com/") {
+        (r, true)
+    } else if let Some(r) = s.strip_prefix("github:") {
+        (r, false)
+    } else if let Some(r) = s.strip_prefix("gh:") {
+        (r, false)
+    } else {
+        return None;
+    };
+
+    // A trailing `@ref` (prefix form only — a URL pins its ref via tree/blob).
+    let (body, at_ref) = if !url_form {
+        match rest.rsplit_once('@') {
+            Some((b, r)) if !r.is_empty() => (b, Some(r.to_string())),
+            _ => (rest, None),
+        }
+    } else {
+        (rest, None)
+    };
+
+    let body = body.trim_matches('/');
+    let segs: Vec<&str> = body.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.len() < 2 {
+        return None; // need at least owner/repo
+    }
+    let owner = segs[0];
+    let repo = segs[1].strip_suffix(".git").unwrap_or(segs[1]);
+    if !valid_github_segment(owner) || !valid_github_segment(repo) {
+        return None;
+    }
+
+    // Resolve the ref + the in-repo path from whatever segments remain.
+    let mut git_ref = at_ref.unwrap_or_else(|| GITHUB_DEFAULT_REF.to_string());
+    let rest_segs = &segs[2..];
+    let path_segs: &[&str] = if url_form
+        && matches!(rest_segs.first().copied(), Some("tree") | Some("blob"))
+    {
+        // /tree/<ref>/<path…> or /blob/<ref>/<path…>
+        match rest_segs.get(1) {
+            Some(r) => {
+                git_ref = (*r).to_string();
+                &rest_segs[2..]
+            }
+            None => return None, // `/tree` with no ref is malformed
+        }
+    } else {
+        rest_segs
+    };
+
+    if !valid_github_ref(&git_ref) {
+        return None;
+    }
+
+    let path = if path_segs.is_empty() {
+        None
+    } else {
+        Some(normalize_github_path(&path_segs.join("/"))?)
+    };
+
+    Some(GithubRef {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        git_ref,
+        path,
+    })
+}
+
+/// `true` when a repo-relative path's basename is exactly `SKILL.md`.
+fn is_skill_md_path(path: &str) -> bool {
+    path.rsplit('/').next() == Some("SKILL.md")
+}
+
+/// `true` when `path` (a SKILL.md file path) sits at or beneath `prefix`. A
+/// prefix that itself names a SKILL.md matches only that exact file; a directory
+/// prefix matches `prefix/SKILL.md` and anything deeper (`prefix/sub/SKILL.md`).
+fn path_under_prefix(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_matches('/');
+    if is_skill_md_path(prefix) {
+        return path == prefix;
+    }
+    path.starts_with(&format!("{prefix}/"))
+}
+
+/// The raw.githubusercontent.com URL for `file_path` in this ref's repo:
+/// `{raw_base}/{owner}/{repo}/{ref}/{file_path}`.
+fn github_raw_url_on(raw_base: &str, gh: &GithubRef, file_path: &str) -> String {
+    format!(
+        "{}/{}/{}/{}/{}",
+        raw_base.trim_end_matches('/'),
+        gh.owner,
+        gh.repo,
+        gh.git_ref,
+        file_path.trim_start_matches('/')
+    )
+}
+
+/// The GitHub trees-API URL that lists every path in the repo at this ref:
+/// `{api_base}/repos/{owner}/{repo}/git/trees/{ref}?recursive=1`.
+fn trees_api_url_on(api_base: &str, gh: &GithubRef) -> String {
+    format!(
+        "{}/repos/{}/{}/git/trees/{}?recursive=1",
+        api_base.trim_end_matches('/'),
+        gh.owner,
+        gh.repo,
+        gh.git_ref
+    )
+}
+
+/// Extract the repo-relative SKILL.md file paths from a GitHub trees-API
+/// response body. Keeps only `blob` entries whose basename is `SKILL.md`,
+/// optionally restricted to those under `path_prefix`. Sorted + deduped so
+/// multi-skill discovery is deterministic.
+fn parse_trees_skill_paths(body: &str, path_prefix: Option<&str>) -> Result<Vec<String>> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).context("GitHub trees response was not valid JSON")?;
+    let tree = v
+        .get("tree")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for entry in tree {
+        if entry.get("type").and_then(|t| t.as_str()) != Some("blob") {
+            continue;
+        }
+        let Some(p) = entry.get("path").and_then(|p| p.as_str()) else {
+            continue;
+        };
+        if !is_skill_md_path(p) {
+            continue;
+        }
+        if let Some(prefix) = path_prefix {
+            if !path_under_prefix(p, prefix) {
+                continue;
+            }
+        }
+        out.push(p.to_string());
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// The GitHub auth token, if present: `GITHUB_TOKEN` then `GH_TOKEN`. Sent as a
+/// Bearer token so private repos and rate-limited public ones work.
+fn github_token() -> Option<String> {
+    for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The active GitHub API base: `AISH_GITHUB_API_BASE` override else [`GITHUB_API`].
+fn github_api_base() -> String {
+    std::env::var("AISH_GITHUB_API_BASE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| GITHUB_API.to_string())
+}
+
+/// The active raw file base: `AISH_GITHUB_RAW_BASE` override else [`GITHUB_RAW`].
+fn github_raw_base() -> String {
+    std::env::var("AISH_GITHUB_RAW_BASE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| GITHUB_RAW.to_string())
+}
+
+/// A GET against GitHub with an optional Bearer token and Accept header. The
+/// caller inspects the returned response's status.
+async fn github_get(
+    url: &str,
+    token: Option<&str>,
+    accept: Option<&str>,
+) -> Result<reqwest::Response> {
+    check_url(url)?;
+    let client = http_client()?;
+    let mut req = client.get(url);
+    if let Some(a) = accept {
+        req = req.header(reqwest::header::ACCEPT, a);
+    }
+    if let Some(t) = token {
+        req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
+    }
+    req.send()
+        .await
+        .with_context(|| format!("requesting {url}"))
+}
+
+/// Fetch a raw text body from GitHub, erroring on a non-success status or an
+/// empty body.
+async fn fetch_github_text(url: &str, token: Option<&str>) -> Result<String> {
+    let resp = github_get(url, token, None).await?;
+    if !resp.status().is_success() {
+        bail!("GitHub returned HTTP {} for {url}", resp.status().as_u16());
+    }
+    let body = resp.text().await.context("reading the GitHub response body")?;
+    if body.trim().is_empty() {
+        bail!("GitHub returned an empty body for {url}");
+    }
+    Ok(body)
+}
+
+/// Discover every SKILL.md path in a repo (optionally under `gh.path`) via the
+/// trees API against a specific `api_base` (no env lookup) — the testable core.
+async fn discover_github_skills_on(
+    api_base: &str,
+    gh: &GithubRef,
+    token: Option<&str>,
+) -> Result<Vec<String>> {
+    let url = trees_api_url_on(api_base, gh);
+    let resp = github_get(&url, token, Some("application/vnd.github+json")).await?;
+    if !resp.status().is_success() {
+        bail!(
+            "GitHub trees API returned HTTP {} for {url}",
+            resp.status().as_u16()
+        );
+    }
+    let body = resp
+        .text()
+        .await
+        .context("reading the GitHub trees response")?;
+    parse_trees_skill_paths(&body, gh.path.as_deref())
+}
+
+/// Resolve the set of SKILL.md file paths a GitHub spec refers to:
+///   * an explicit `…/SKILL.md` path → just that file;
+///   * a directory path → trees-API discovery under it, falling back to a direct
+///     `<path>/SKILL.md` guess when the API is unavailable;
+///   * no path → whole-repo discovery, falling back to a root `SKILL.md`.
+async fn resolve_github_skill_paths(
+    api_base: &str,
+    gh: &GithubRef,
+    token: Option<&str>,
+) -> Result<Vec<String>> {
+    if let Some(p) = &gh.path {
+        if is_skill_md_path(p) {
+            return Ok(vec![p.clone()]);
+        }
+        // Directory: prefer discovery (multi-skill), fall back to a direct guess.
+        return match discover_github_skills_on(api_base, gh, token).await {
+            Ok(found) if !found.is_empty() => Ok(found),
+            _ => Ok(vec![format!("{}/SKILL.md", p.trim_end_matches('/'))]),
+        };
+    }
+    // Whole repo: discovery is the path; fall back to a root SKILL.md on failure.
+    match discover_github_skills_on(api_base, gh, token).await {
+        Ok(found) if !found.is_empty() => Ok(found),
+        _ => Ok(vec!["SKILL.md".to_string()]),
+    }
+}
+
+/// Fetch + import every SKILL.md a GitHub spec resolves to, against explicit
+/// bases (no env lookup) — the testable core of [`add_github`]. Skips any path
+/// whose body isn't a valid SKILL.md; errors only when nothing valid imported.
+async fn add_github_on(
+    api_base: &str,
+    raw_base: &str,
+    gh: &GithubRef,
+    token: Option<&str>,
+    skills_dir: &Path,
+) -> Result<Vec<ImportedSkill>> {
+    let paths = resolve_github_skill_paths(api_base, gh, token).await?;
+    let mut imported = Vec::new();
+    let mut last_err: Option<anyhow::Error> = None;
+    for fp in &paths {
+        let url = github_raw_url_on(raw_base, gh, fp);
+        let text = match fetch_github_text(&url, token).await {
+            Ok(t) => t,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        // Only import bodies that are genuine SKILL.md files.
+        let Some((name, description)) = crate::skills::parse_frontmatter(&text) else {
+            continue;
+        };
+        let path = import(&text, skills_dir)?;
+        imported.push(ImportedSkill {
+            name,
+            description,
+            path,
+        });
+    }
+    if imported.is_empty() {
+        if let Some(e) = last_err {
+            return Err(e.context(format!(
+                "no importable SKILL.md found in github:{}/{}",
+                gh.owner, gh.repo
+            )));
+        }
+        bail!(
+            "no importable SKILL.md found in github:{}/{}",
+            gh.owner,
+            gh.repo
+        );
+    }
+    Ok(imported)
+}
+
+/// Fetch + import a GitHub skill spec into `skills_dir`, reading the API/raw
+/// bases and the auth token from the environment.
+pub async fn add_github(gh: &GithubRef, skills_dir: &Path) -> Result<Vec<ImportedSkill>> {
+    add_github_on(
+        &github_api_base(),
+        &github_raw_base(),
+        gh,
+        github_token().as_deref(),
+        skills_dir,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -868,5 +1430,502 @@ mod tests {
         // Short strings pass through unchanged; newlines collapse to spaces.
         assert_eq!(truncate("short", 60), "short");
         assert_eq!(truncate("a\nb", 60), "a b");
+    }
+
+    // ---- Phase 3: mcpmarket search --------------------------------------
+
+    #[test]
+    fn mcpmarket_search_url_is_well_formed() {
+        let u = mcpmarket_search_url("https://mcpmarket.com", "git helper", 25);
+        assert_eq!(
+            u,
+            "https://mcpmarket.com/api/search?q=git%20helper&type=skills&limit=25"
+        );
+        // A trailing slash on the base is normalized away (no `//api`).
+        assert_eq!(
+            mcpmarket_search_url("http://localhost:9/", "x", 50),
+            "http://localhost:9/api/search?q=x&type=skills&limit=50"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcpmarket_parses_publisher_and_summary_aliases() {
+        // mcpmarket's field names (publisher/summary/full_name) fold onto the
+        // SearchResult struct via serde aliases.
+        let body = r#"{"results":[
+            {"name":"git-helper","publisher":"acme","summary":"Helps with git.","full_name":"acme/git-helper","version":"2.0.0"}
+        ]}"#;
+        let port = serve_once("200 OK", body.to_string()).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let got = search_mcpmarket_with_base(&base, "git", 50).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].author, "acme");
+        assert_eq!(got[0].description, "Helps with git.");
+        assert_eq!(got[0].ref_or_synth(), "acme/git-helper");
+        assert_eq!(got[0].version, "2.0.0");
+    }
+
+    #[tokio::test]
+    async fn mcpmarket_accepts_items_wrapper() {
+        // mcpmarket may wrap hits under `items` rather than `results`.
+        let body = r#"{"items":[{"name":"x","namespace":"o","slug":"o/x"}]}"#;
+        let port = serve_once("200 OK", body.to_string()).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let got = search_mcpmarket_with_base(&base, "x", 50).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].ref_or_synth(), "o/x");
+    }
+
+    #[tokio::test]
+    async fn mcpmarket_http_error_propagates() {
+        let port = serve_once("503 Service Unavailable", "down".to_string()).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let err = search_mcpmarket_with_base(&base, "x", 50)
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("mcpmarket"), "{err}");
+    }
+
+    #[test]
+    fn merge_results_dedups_fallback_against_primary() {
+        let mk = |r: &str| SearchResult {
+            name: String::new(),
+            author: String::new(),
+            description: String::new(),
+            version: String::new(),
+            reference: r.into(),
+        };
+        let primary = vec![mk("a/one"), mk("a/two")];
+        let fallback = vec![mk("a/two"), mk("a/three")];
+        let merged = merge_results(primary, fallback);
+        let refs: Vec<String> = merged.iter().map(|r| r.ref_or_synth()).collect();
+        // Primary order preserved; only the new fallback ref is appended.
+        assert_eq!(refs, vec!["a/one", "a/two", "a/three"]);
+    }
+
+    // ---- Phase 3: GitHub spec parsing -----------------------------------
+
+    #[test]
+    fn parses_github_prefix_specs() {
+        // bare repo
+        assert_eq!(
+            parse_github_ref("github:acme/skills").unwrap(),
+            GithubRef {
+                owner: "acme".into(),
+                repo: "skills".into(),
+                git_ref: "HEAD".into(),
+                path: None,
+            }
+        );
+        // gh: alias + sub-path
+        assert_eq!(
+            parse_github_ref("gh:acme/skills/packs/git").unwrap(),
+            GithubRef {
+                owner: "acme".into(),
+                repo: "skills".into(),
+                git_ref: "HEAD".into(),
+                path: Some("packs/git".into()),
+            }
+        );
+        // @ref pin + .git suffix stripped
+        assert_eq!(
+            parse_github_ref("github:acme/skills.git/packs/git@v1.2.0").unwrap(),
+            GithubRef {
+                owner: "acme".into(),
+                repo: "skills".into(),
+                git_ref: "v1.2.0".into(),
+                path: Some("packs/git".into()),
+            }
+        );
+        // branch name with a slash survives via @ref
+        assert_eq!(
+            parse_github_ref("github:acme/skills@release/v2").unwrap().git_ref,
+            "release/v2"
+        );
+    }
+
+    #[test]
+    fn parses_github_url_specs() {
+        // plain repo URL
+        assert_eq!(
+            parse_github_ref("https://github.com/acme/skills").unwrap(),
+            GithubRef {
+                owner: "acme".into(),
+                repo: "skills".into(),
+                git_ref: "HEAD".into(),
+                path: None,
+            }
+        );
+        // /tree/<ref>/<path>
+        assert_eq!(
+            parse_github_ref("https://github.com/acme/skills/tree/main/packs/git").unwrap(),
+            GithubRef {
+                owner: "acme".into(),
+                repo: "skills".into(),
+                git_ref: "main".into(),
+                path: Some("packs/git".into()),
+            }
+        );
+        // /blob/<ref>/<path>/SKILL.md
+        assert_eq!(
+            parse_github_ref("https://github.com/acme/skills/blob/main/packs/git/SKILL.md")
+                .unwrap(),
+            GithubRef {
+                owner: "acme".into(),
+                repo: "skills".into(),
+                git_ref: "main".into(),
+                path: Some("packs/git/SKILL.md".into()),
+            }
+        );
+        // scheme-less github.com/...
+        assert_eq!(
+            parse_github_ref("github.com/acme/skills").unwrap().repo,
+            "skills"
+        );
+    }
+
+    #[test]
+    fn non_github_and_unsafe_specs_return_none() {
+        // Not a GitHub spec → None (caller falls back to skill.fish parse_ref).
+        assert!(parse_github_ref("acme/git-helper").is_none());
+        assert!(parse_github_ref("https://skill.fish/acme/git").is_none());
+        // Missing repo segment.
+        assert!(parse_github_ref("github:acme").is_none());
+        // Traversal / unsafe segments are rejected.
+        assert!(parse_github_ref("github:acme/skills/../etc").is_none());
+        assert!(parse_github_ref("github:../evil/skills").is_none());
+        // `/tree` with no ref is malformed.
+        assert!(parse_github_ref("https://github.com/acme/skills/tree").is_none());
+    }
+
+    #[test]
+    fn github_url_builders_are_well_formed() {
+        let gh = GithubRef {
+            owner: "acme".into(),
+            repo: "skills".into(),
+            git_ref: "main".into(),
+            path: Some("packs/git".into()),
+        };
+        assert_eq!(
+            github_raw_url_on("https://raw.githubusercontent.com", &gh, "packs/git/SKILL.md"),
+            "https://raw.githubusercontent.com/acme/skills/main/packs/git/SKILL.md"
+        );
+        assert_eq!(
+            trees_api_url_on("https://api.github.com", &gh),
+            "https://api.github.com/repos/acme/skills/git/trees/main?recursive=1"
+        );
+        // Trailing slashes on the base are normalized away.
+        assert_eq!(
+            github_raw_url_on("https://raw.githubusercontent.com/", &gh, "/a/SKILL.md"),
+            "https://raw.githubusercontent.com/acme/skills/main/a/SKILL.md"
+        );
+    }
+
+    #[test]
+    fn skill_md_path_helpers() {
+        assert!(is_skill_md_path("SKILL.md"));
+        assert!(is_skill_md_path("packs/git/SKILL.md"));
+        assert!(!is_skill_md_path("packs/git/README.md"));
+        assert!(!is_skill_md_path("SKILL.md.bak"));
+        // A directory prefix matches its own SKILL.md and deeper ones.
+        assert!(path_under_prefix("packs/git/SKILL.md", "packs/git"));
+        assert!(path_under_prefix("packs/git/sub/SKILL.md", "packs/git"));
+        assert!(!path_under_prefix("packs/other/SKILL.md", "packs/git"));
+        // A SKILL.md prefix matches only that exact file.
+        assert!(path_under_prefix("packs/git/SKILL.md", "packs/git/SKILL.md"));
+        assert!(!path_under_prefix("packs/git/sub/SKILL.md", "packs/git/SKILL.md"));
+    }
+
+    #[test]
+    fn parse_trees_extracts_and_filters_skill_paths() {
+        // A realistic trees-API body: two skills, a non-skill blob, a tree node.
+        let body = r#"{
+            "tree": [
+                {"path":"README.md","type":"blob"},
+                {"path":"packs","type":"tree"},
+                {"path":"packs/alpha/SKILL.md","type":"blob"},
+                {"path":"packs/beta/SKILL.md","type":"blob"},
+                {"path":"packs/beta/reference.md","type":"blob"}
+            ],
+            "truncated": false
+        }"#;
+        // No prefix → both skills, sorted.
+        let all = parse_trees_skill_paths(body, None).unwrap();
+        assert_eq!(all, vec!["packs/alpha/SKILL.md", "packs/beta/SKILL.md"]);
+        // Prefix narrows to one.
+        let one = parse_trees_skill_paths(body, Some("packs/alpha")).unwrap();
+        assert_eq!(one, vec!["packs/alpha/SKILL.md"]);
+    }
+
+    // ---- Phase 3: GitHub discovery + import (loopback) -------------------
+
+    /// A multi-request loopback HTTP server. Each accepted connection is matched
+    /// against `routes` by the request's path (query string stripped); the first
+    /// route whose key equals the path wins. Unmatched paths get a 404. Runs for
+    /// the lifetime of the test (the task is dropped when the test returns).
+    /// Returns the bound port. Captures the Authorization header of the LAST
+    /// request into `auth_sink` so a test can assert the token was forwarded.
+    async fn serve_router(
+        routes: Vec<(String, String)>,
+        auth_sink: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let routes = routes.clone();
+                let auth_sink = auth_sink.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let target = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("")
+                        .split('?')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    // Record any Authorization header seen (header names are
+                    // case-insensitive; hyper emits them lower-cased on the wire).
+                    for line in req.lines() {
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.trim().eq_ignore_ascii_case("authorization") {
+                                auth_sink.lock().unwrap().push(value.trim().to_string());
+                            }
+                        }
+                    }
+                    let (status, body) = match routes.iter().find(|(p, _)| *p == target) {
+                        Some((_, b)) => ("200 OK", b.clone()),
+                        None => ("404 Not Found", String::new()),
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        port
+    }
+
+    fn skill_md(name: &str) -> String {
+        format!("---\nname: {name}\ndescription: GitHub skill {name}.\n---\nBody for {name}.\n")
+    }
+
+    #[tokio::test]
+    async fn github_multi_skill_discovery_imports_all() {
+        // The repo has two skills; whole-repo discovery imports both. The API
+        // base and the raw base point at the SAME loopback router, distinguished
+        // by path (`/repos/...` vs `/owner/repo/ref/...`).
+        let trees = r#"{"tree":[
+            {"path":"README.md","type":"blob"},
+            {"path":"packs/alpha/SKILL.md","type":"blob"},
+            {"path":"packs/beta/SKILL.md","type":"blob"}
+        ]}"#;
+        let routes = vec![
+            (
+                "/repos/acme/skills/git/trees/HEAD".to_string(),
+                trees.to_string(),
+            ),
+            (
+                "/acme/skills/HEAD/packs/alpha/SKILL.md".to_string(),
+                skill_md("alpha"),
+            ),
+            (
+                "/acme/skills/HEAD/packs/beta/SKILL.md".to_string(),
+                skill_md("beta"),
+            ),
+        ];
+        let auth = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = serve_router(routes, auth.clone()).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let gh = GithubRef {
+            owner: "acme".into(),
+            repo: "skills".into(),
+            git_ref: "HEAD".into(),
+            path: None,
+        };
+        let tmp = std::env::temp_dir().join(format!("aish-gh-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let imported = add_github_on(&base, &base, &gh, Some("secret-token"), &tmp)
+            .await
+            .unwrap();
+        let mut names: Vec<String> = imported.iter().map(|s| s.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["alpha", "beta"]);
+        // Both skills landed in the catalog.
+        assert_eq!(crate::skills::load(&tmp).len(), 2);
+        // The Bearer token was forwarded on the GitHub requests.
+        let seen = auth.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|h| h == "Bearer secret-token"),
+            "token not forwarded: {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn github_path_resolves_single_skill_md() {
+        // A spec that names a SKILL.md directly skips the API and fetches it.
+        let routes = vec![(
+            "/acme/skills/main/packs/git/SKILL.md".to_string(),
+            skill_md("git-pack"),
+        )];
+        let auth = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = serve_router(routes, auth).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let gh = parse_github_ref("https://github.com/acme/skills/blob/main/packs/git/SKILL.md")
+            .unwrap();
+        let tmp = std::env::temp_dir().join(format!("aish-gh-single-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // No token needed for a public file.
+        let imported = add_github_on(&base, &base, &gh, None, &tmp).await.unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].name, "git-pack");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn github_path_prefix_filters_discovery() {
+        // Discovery under a directory prefix imports only that sub-tree.
+        let trees = r#"{"tree":[
+            {"path":"packs/alpha/SKILL.md","type":"blob"},
+            {"path":"packs/beta/SKILL.md","type":"blob"}
+        ]}"#;
+        let routes = vec![
+            (
+                "/repos/acme/skills/git/trees/HEAD".to_string(),
+                trees.to_string(),
+            ),
+            (
+                "/acme/skills/HEAD/packs/alpha/SKILL.md".to_string(),
+                skill_md("alpha"),
+            ),
+            (
+                "/acme/skills/HEAD/packs/beta/SKILL.md".to_string(),
+                skill_md("beta"),
+            ),
+        ];
+        let auth = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = serve_router(routes, auth).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let gh = GithubRef {
+            owner: "acme".into(),
+            repo: "skills".into(),
+            git_ref: "HEAD".into(),
+            path: Some("packs/alpha".into()),
+        };
+        let tmp = std::env::temp_dir().join(format!("aish-gh-prefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let imported = add_github_on(&base, &base, &gh, None, &tmp).await.unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].name, "alpha");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn github_directory_falls_back_to_direct_when_api_unavailable() {
+        // The trees API 404s (no route), so a directory spec falls back to a
+        // direct `<path>/SKILL.md` raw fetch.
+        let routes = vec![(
+            "/acme/skills/HEAD/packs/git/SKILL.md".to_string(),
+            skill_md("git-pack"),
+        )];
+        let auth = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = serve_router(routes, auth).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let gh = GithubRef {
+            owner: "acme".into(),
+            repo: "skills".into(),
+            git_ref: "HEAD".into(),
+            path: Some("packs/git".into()),
+        };
+        let tmp = std::env::temp_dir().join(format!("aish-gh-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let imported = add_github_on(&base, &base, &gh, None, &tmp).await.unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].name, "git-pack");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn github_no_skill_found_errors() {
+        // An empty repo (no SKILL.md anywhere, root fallback 404s) errors.
+        let trees = r#"{"tree":[{"path":"README.md","type":"blob"}]}"#;
+        let routes = vec![(
+            "/repos/acme/empty/git/trees/HEAD".to_string(),
+            trees.to_string(),
+        )];
+        let auth = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = serve_router(routes, auth).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let gh = GithubRef {
+            owner: "acme".into(),
+            repo: "empty".into(),
+            git_ref: "HEAD".into(),
+            path: None,
+        };
+        let tmp = std::env::temp_dir().join(format!("aish-gh-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        assert!(add_github_on(&base, &base, &gh, None, &tmp).await.is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn add_routes_github_specs_through_discovery() {
+        // The unified `add()` entry point: a github: spec resolves via the
+        // GitHub path (env-overridable bases), not skill.fish parse_ref.
+        let trees = r#"{"tree":[{"path":"SKILL.md","type":"blob"}]}"#;
+        let routes = vec![
+            (
+                "/repos/acme/solo/git/trees/HEAD".to_string(),
+                trees.to_string(),
+            ),
+            ("/acme/solo/HEAD/SKILL.md".to_string(), skill_md("solo")),
+        ];
+        let auth = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = serve_router(routes, auth).await;
+        let base = format!("http://127.0.0.1:{port}");
+
+        // SAFETY: this test is the only one that sets these vars; serialize via
+        // the dedicated names so it doesn't collide with the base-taking tests.
+        // SAFETY: single-threaded within this test; restored at the end.
+        unsafe {
+            std::env::set_var("AISH_GITHUB_API_BASE", &base);
+            std::env::set_var("AISH_GITHUB_RAW_BASE", &base);
+        }
+        let tmp = std::env::temp_dir().join(format!("aish-gh-add-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let imported = add("github:acme/solo", &tmp).await.unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].name, "solo");
+
+        unsafe {
+            std::env::remove_var("AISH_GITHUB_API_BASE");
+            std::env::remove_var("AISH_GITHUB_RAW_BASE");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
