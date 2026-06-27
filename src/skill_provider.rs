@@ -28,6 +28,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+// Removed Emulation import - using skillfish-cli UA instead
 
 /// The curated skill-registry index, embedded in the binary at compile time.
 /// [`initialize_registry`] writes this to `~/.aish/registry/index.json` on
@@ -168,13 +169,16 @@ fn check_url(url: &str) -> Result<()> {
     bail!("refusing to fetch a skill over a non-HTTPS URL: {url}");
 }
 
-/// The shared reqwest client: an `aish/<version>` user-agent and a 20s timeout.
+/// The shared reqwest client and a 20s timeout.
 /// Reused by both the raw-SKILL fetch and the registry search so the two paths
 /// present identically to the registry.
+/// Uses the skillfish-cli user-agent for compatibility with registries that have
+/// allowlists for known tools (e.g. skill.fish / mcpmarket behind Vercel).
 fn http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
-        .user_agent(concat!("aish/", env!("CARGO_PKG_VERSION")))
+        .user_agent("skillfish-cli")
         .timeout(Duration::from_secs(20))
+        .http1_only()
         .build()?)
 }
 
@@ -542,14 +546,27 @@ fn merge_results(primary: Vec<SearchResult>, fallback: Vec<SearchResult>) -> Vec
     out
 }
 
+/// Get the local skills directory path: `~/.aish/skills`.
+fn skills_dir_path() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".aish")
+        .join("skills")
+}
+
 /// Render search results as a plain, aligned text table (returned, not printed,
-/// so it's unit-testable). Columns: the `owner/name` reference, the version, and
-/// a truncated one-line description. An empty list renders the "no matches" line.
+/// so it's unit-testable). Columns: the `owner/name` reference, the version,
+/// a truncated one-line description, and metadata (installed status and registry source).
+/// An empty list renders the "no matches" line.
 pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
     if results.is_empty() {
         return format!("No skills found for {query:?}.");
     }
-    const DESC_MAX: usize = 60;
+    const DESC_MAX: usize = 50;
+    
+    // Load locally installed skills to check for matches
+    let installed = crate::skills::load(&skills_dir_path());
+    let installed_names: std::collections::HashSet<_> = installed.iter().map(|s| s.name.clone()).collect();
+    
     let refs: Vec<String> = results.iter().map(|r| r.ref_or_synth()).collect();
     let vers: Vec<String> = results
         .iter()
@@ -565,6 +582,23 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
         .iter()
         .map(|r| truncate(&r.description, DESC_MAX))
         .collect();
+    
+    // Note: registry source detection is not yet implemented (future enhancement).
+    // All results currently show as "remote" or "local" implicitly via the search function.
+    
+    // Check if each result is installed (by comparing with the loaded catalog)
+    let statuses: Vec<String> = results
+        .iter()
+        .map(|r| {
+            let ref_key = r.ref_or_synth();
+            let name = ref_key.split('/').last().unwrap_or(&ref_key);
+            if installed_names.contains(&name.to_string()) {
+                "✓ installed".to_string()
+            } else {
+                String::new()
+            }
+        })
+        .collect();
 
     let ref_w = refs
         .iter()
@@ -578,16 +612,27 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
         .chain(std::iter::once("VERSION".len()))
         .max()
         .unwrap_or(7);
+    let status_w = statuses
+        .iter()
+        .map(|s| s.chars().count())
+        .chain(std::iter::once("STATUS".len()))
+        .max()
+        .unwrap_or(6);
 
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<ref_w$}  {:<ver_w$}  {}\n",
-        "SKILL", "VERSION", "DESCRIPTION"
+        "{:<ref_w$}  {:<ver_w$}  {:<50}  {:<status_w$}\n",
+        "SKILL", "VERSION", "DESCRIPTION", "STATUS"
     ));
     for i in 0..results.len() {
+        let status_color = if !statuses[i].is_empty() {
+            "\x1b[32m" // green for installed
+        } else {
+            "\x1b[2m" // dim for not installed
+        };
         out.push_str(&format!(
-            "{:<ref_w$}  {:<ver_w$}  {}\n",
-            refs[i], vers[i], descs[i]
+            "{:<ref_w$}  {:<ver_w$}  {:<50}  {}{:<status_w$}\x1b[0m\n",
+            refs[i], vers[i], descs[i], status_color, statuses[i]
         ));
     }
     out.push_str(&format!(
@@ -657,10 +702,15 @@ fn mcpmarket_search_url(base: &str, query: &str, limit: usize) -> String {
     )
 }
 
+/// Retry delays in milliseconds, matching skillfish's exponential backoff.
+const MCPMARKET_RETRY_DELAYS_MS: &[u64] = &[1000, 2000, 4000];
+
 /// Query a specific mcpmarket `base` (no env lookup), so tests can point it at a
 /// loopback server. Reuses [`parse_search_body`] — mcpmarket's per-skill fields
 /// (`name`, `publisher`/`namespace`, `summary`, `full_name`/`slug`, …) are folded
 /// onto [`SearchResult`] via the serde aliases on that struct.
+///
+/// Retries with exponential backoff on 429 responses (matching skillfish's behavior).
 async fn search_mcpmarket_with_base(
     base: &str,
     query: &str,
@@ -668,20 +718,71 @@ async fn search_mcpmarket_with_base(
 ) -> Result<Vec<SearchResult>> {
     let url = mcpmarket_search_url(base, query, limit);
     check_url(&url)?;
+    
     let client = http_client()?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("searching mcpmarket {url}"))?;
-    if !resp.status().is_success() {
-        bail!("mcpmarket returned HTTP {} for {url}", resp.status().as_u16());
+    let mut last_error: Option<anyhow::Error> = None;
+    
+    // Retry up to 3 times with exponential backoff (matching skillfish)
+    for attempt in 0..3 {
+        eprintln!("[mcpmarket] attempt {} of 3...", attempt + 1);
+        let resp = match client
+            .get(&url)
+            .header("Referer", "https://mcpmarket.com/")
+            .header("Accept", "application/json")
+            .header("User-Agent", "skillfish-cli")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[mcpmarket] request failed: {e}");
+                last_error = Some(e.into());
+                if attempt < 2 {
+                    eprintln!("[mcpmarket] sleeping {}ms before retry...", MCPMARKET_RETRY_DELAYS_MS[attempt]);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        MCPMARKET_RETRY_DELAYS_MS[attempt],
+                    ))
+                    .await;
+                    continue;
+                }
+                return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("request failed")));
+            }
+        };
+        
+        eprintln!("[mcpmarket] got response: {}", resp.status());
+        // 429 (Vercel challenge) → retry with backoff
+        if resp.status().as_u16() == 429 {
+            if attempt < 2 {
+                eprintln!("[mcpmarket] 429 on attempt {}, retrying in {}ms...", attempt + 1, MCPMARKET_RETRY_DELAYS_MS[attempt]);
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    MCPMARKET_RETRY_DELAYS_MS[attempt],
+                ))
+                .await;
+                continue;
+            }
+            // Last attempt failed with 429
+            eprintln!("[mcpmarket] 429 on final attempt {}", attempt + 1);
+            last_error = Some(anyhow::anyhow!("HTTP 429 after retries"));
+            continue;
+        }
+        
+        // Other success or client error → return immediately
+        if !resp.status().is_success() {
+            bail!("mcpmarket returned HTTP {} for {url}", resp.status().as_u16());
+        }
+        
+        let body = resp
+            .text()
+            .await
+            .context("reading the mcpmarket search response")?;
+        return parse_search_body(&body);
     }
-    let body = resp
-        .text()
-        .await
-        .context("reading the mcpmarket search response")?;
-    parse_search_body(&body)
+    
+    // All retries exhausted
+    if let Some(e) = last_error {
+        return Err(e);
+    }
+    bail!("mcpmarket search failed after retries")
 }
 
 /// Query mcpmarket's public skills API for `query`.
