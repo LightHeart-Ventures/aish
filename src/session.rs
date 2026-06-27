@@ -63,6 +63,12 @@ pub struct Session {
     pub env: Vec<(String, String)>,
     /// Pre-rendered system-prompt section listing ~/.aish/skills (may be empty).
     pub skills_prompt: String,
+    /// The parsed local skill catalog (`~/.aish/skills`), kept in step with
+    /// `skills_prompt`. Drives the per-turn skill-awareness nudge
+    /// (`crate::skill_match`): each turn the user's input is scored against these
+    /// and, when one clearly fits, a short note pointing at its SKILL.md is
+    /// folded into the turn input.
+    pub skills: Vec<crate::skills::Skill>,
     /// Connected MCP servers; their tools join the model's tool set.
     pub mcp: crate::mcp::McpHost,
     /// Persistent store (history + agent memories). None if it failed to open.
@@ -194,6 +200,7 @@ impl Session {
             host_info: host_info(),
             env: Vec::new(),
             skills_prompt: String::new(),
+            skills: Vec::new(),
             mcp: crate::mcp::McpHost::default(),
             db: None,
             raw_tool_output: false,
@@ -270,6 +277,9 @@ impl Session {
         // silently re-expose the full MCP catalog to the interactive agent.
         let mcp = crate::skills::interactive_mcp_skills(&self.mcp.skills());
         self.skills_prompt = crate::skills::render_prompt_section(&local, &mcp);
+        // Keep the parsed catalog in step so the per-turn skill-awareness nudge
+        // (crate::skill_match) sees a skill added/removed mid-session immediately.
+        self.skills = local;
     }
 
     /// Record the exit status of the command just dispatched, so the next line
