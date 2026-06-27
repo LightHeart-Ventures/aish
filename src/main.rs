@@ -25,6 +25,7 @@ mod rewrite;
 mod scope;
 mod script;
 mod session;
+mod skill_match;
 mod skill_provider;
 mod skills;
 mod style;
@@ -345,12 +346,16 @@ async fn main() -> Result<()> {
     //     install them into later.
     let interactive = args.command.is_none() && args.script_argv.is_empty();
     if interactive {
-        session.skills_prompt = skills::render_prompt_section(&skills::load(&skills_dir), &[]);
+        let local = skills::load(&skills_dir);
+        session.skills_prompt = skills::render_prompt_section(&local, &[]);
+        session.skills = local;
     } else {
         session.mcp = mcp::McpHost::start(&[project_mcp.as_path(), mcp_config.as_path()]).await;
         timer.mark("MCP connect");
+        let local = skills::load(&skills_dir);
         session.skills_prompt =
-            skills::render_prompt_section(&skills::load(&skills_dir), &session.mcp.skills());
+            skills::render_prompt_section(&local, &session.mcp.skills());
+        session.skills = local;
     }
     timer.mark("skills render");
     session.db = match db::Db::open(&aish_dir.join("aish.db")) {

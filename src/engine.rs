@@ -75,7 +75,15 @@ pub async fn run_turn(
     // has grown past the window threshold — offloading the oldest slice to the
     // SQLite memories table and replacing it with a short in-context summary.
     maybe_compact(backend, session);
+    // Skill-awareness (crate::skill_match): score THIS turn's request against the
+    // installed local skill catalog and, when one clearly fits, fold a short note
+    // pointing at its SKILL.md into the turn input. Matched on the raw request
+    // (before context-seeding) so a prepended preamble can't skew the keyword
+    // match; the note goes into the turn input, never the cached system prompt,
+    // so the prompt-cache prefix stays byte-stable.
+    let task = input.clone();
     let input = seed_context(session.history.is_empty(), session.last_output(), input);
+    let input = crate::skill_match::apply(&task, input, &session.skills);
     // S9.3: persist the turn input to the per-worker transcript (coordinator
     // run only — None/no-op interactively), so `:attach`/resume can replay the
     // user/system messages, not just the tool turns the audit journal records.

@@ -775,7 +775,7 @@ async fn search_mcpmarket_with_base(
             .text()
             .await
             .context("reading the mcpmarket search response")?;
-        return parse_search_body(&body);
+        return parse_mcpmarket_body(&body);
     }
     
     // All retries exhausted
@@ -788,6 +788,102 @@ async fn search_mcpmarket_with_base(
 /// Query mcpmarket's public skills API for `query`.
 async fn search_mcpmarket(query: &str, limit: usize) -> Result<Vec<SearchResult>> {
     search_mcpmarket_with_base(&mcpmarket_base(), query, limit).await
+}
+
+/// Parse an mcpmarket search response into [`SearchResult`]s.
+///
+/// mcpmarket's per-skill JSON shape differs from the generic registry shape that
+/// [`parse_search_body`] handles, so it needs its own mapping:
+///   * `owner` is a **nested object** `{name,url,avatar}` — not a bare string —
+///     so the generic serde `alias = "owner"` on `author` fails to deserialize
+///     and silently drops EVERY row (the bug this function fixes). We read
+///     `owner.name` explicitly.
+///   * the skill identifier lives in `skill_name`/`raw_name`/`slug`, not `name`
+///     (which is a human display title like "Discord Doctor").
+///   * the canonical, fetchable location is the `website` GitHub URL, which
+///     `:skill add` / `--skill-fetch` resolve via the GitHub path. We surface
+///     that as the `reference` so the value shown in the table actually fetches.
+///
+/// Hits are wrapped under `skills` (mcpmarket's key); we also accept the generic
+/// wrappers for forward-compatibility. Duplicates (by reference) are dropped.
+fn parse_mcpmarket_body(body: &str) -> Result<Vec<SearchResult>> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).context("mcpmarket search response was not valid JSON")?;
+    let arr = v
+        .get("skills")
+        .or_else(|| v.get("results"))
+        .or_else(|| v.get("items"))
+        .or_else(|| v.get("data"))
+        .or_else(|| v.get("hits"))
+        .and_then(|x| x.as_array())
+        .cloned()
+        .or_else(|| v.as_array().cloned())
+        .unwrap_or_default();
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in arr {
+        // First non-empty string among the given keys.
+        let pick = |keys: &[&str]| -> String {
+            for k in keys {
+                if let Some(s) = item.get(*k).and_then(|x| x.as_str()) {
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        return s.to_string();
+                    }
+                }
+            }
+            String::new()
+        };
+
+        // owner is usually a nested object {name,url,...}; tolerate a bare
+        // string too, then fall back to the flat publisher/namespace fields.
+        let author = item
+            .get("owner")
+            .and_then(|o| {
+                o.get("name")
+                    .and_then(|n| n.as_str())
+                    .or_else(|| o.as_str())
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| pick(&["publisher", "namespace", "author"]));
+
+        let name = pick(&["skill_name", "raw_name", "slug", "name"]);
+        let description = pick(&["description", "summary", "tagline"]);
+        let version = pick(&["version"]);
+
+        // Canonical fetchable location: the GitHub website URL. Fall back to the
+        // `github` short path, then a synthesized owner/name.
+        let website = pick(&["website"]);
+        let reference = if !website.is_empty() {
+            website
+        } else {
+            let gh = pick(&["github"]);
+            if !gh.is_empty() {
+                gh
+            } else if !author.is_empty() && !name.is_empty() {
+                format!("{author}/{name}")
+            } else {
+                name.clone()
+            }
+        };
+
+        if name.is_empty() && reference.is_empty() {
+            continue;
+        }
+        let r = SearchResult {
+            name,
+            author,
+            description,
+            version,
+            reference,
+        };
+        if seen.insert(r.ref_or_synth()) {
+            out.push(r);
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1550,11 +1646,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcpmarket_parses_publisher_and_summary_aliases() {
-        // mcpmarket's field names (publisher/summary/full_name) fold onto the
-        // SearchResult struct via serde aliases.
+    async fn mcpmarket_parses_real_skills_shape() {
+        // The REAL mcpmarket shape: hits under `skills`, a NESTED `owner` object
+        // (not a bare string), the identifier in `skill_name`/`slug`, and the
+        // fetchable location in the `website` GitHub URL. The generic
+        // parse_search_body silently dropped every such row because the nested
+        // owner object failed to deserialize into the String `author` field —
+        // this is the regression parse_mcpmarket_body fixes.
+        let body = r#"{"skills":[
+            {"id":29062,"name":"Discord Doctor","slug":"discord-doctor",
+             "owner":{"url":"https://github.com/lycfyi","name":"lycfyi"},
+             "github":"lycfyi/community-agent-plugin/discord-connector/discord-doctor",
+             "website":"https://github.com/lycfyi/community-agent-plugin/tree/abc123/plugins/discord-connector/skills/discord-doctor",
+             "raw_name":"discord-doctor","skill_name":"discord-doctor",
+             "description":"Diagnoses Discord configuration issues."}
+        ]}"#;
+        let port = serve_once("200 OK", body.to_string()).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let got = search_mcpmarket_with_base(&base, "discord", 50)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1, "nested-owner row was dropped");
+        assert_eq!(got[0].name, "discord-doctor");
+        assert_eq!(got[0].author, "lycfyi");
+        assert_eq!(got[0].description, "Diagnoses Discord configuration issues.");
+        // The fetchable GitHub website URL becomes the reference.
+        assert_eq!(
+            got[0].ref_or_synth(),
+            "https://github.com/lycfyi/community-agent-plugin/tree/abc123/plugins/discord-connector/skills/discord-doctor"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcpmarket_falls_back_to_flat_fields() {
+        // Forward-compat: a flat shape (publisher/summary, no owner object, no
+        // website) still maps, synthesizing the reference from author/name.
         let body = r#"{"results":[
-            {"name":"git-helper","publisher":"acme","summary":"Helps with git.","full_name":"acme/git-helper","version":"2.0.0"}
+            {"skill_name":"git-helper","publisher":"acme","summary":"Helps with git.","version":"2.0.0"}
         ]}"#;
         let port = serve_once("200 OK", body.to_string()).await;
         let base = format!("http://127.0.0.1:{port}");
@@ -1564,17 +1692,6 @@ mod tests {
         assert_eq!(got[0].description, "Helps with git.");
         assert_eq!(got[0].ref_or_synth(), "acme/git-helper");
         assert_eq!(got[0].version, "2.0.0");
-    }
-
-    #[tokio::test]
-    async fn mcpmarket_accepts_items_wrapper() {
-        // mcpmarket may wrap hits under `items` rather than `results`.
-        let body = r#"{"items":[{"name":"x","namespace":"o","slug":"o/x"}]}"#;
-        let port = serve_once("200 OK", body.to_string()).await;
-        let base = format!("http://127.0.0.1:{port}");
-        let got = search_mcpmarket_with_base(&base, "x", 50).await.unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].ref_or_synth(), "o/x");
     }
 
     #[tokio::test]
