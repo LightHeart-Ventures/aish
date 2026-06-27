@@ -12,7 +12,7 @@ hf-hub = { version = "0.4.3", optional = true, default-features = false, feature
 libc = "0.2"
 mistralrs = { version = "0.8.1", optional = true }
 regex = "1"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 # Browser-impersonating HTTP client (wreq) for bypassing bot protection
 # Used selectively for mcpmarket searches; standard reqwest for everything else
 wreq = { version = "6.0.0-rc", features = ["json"] }
