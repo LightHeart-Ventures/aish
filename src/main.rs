@@ -5,6 +5,7 @@ mod container;
 mod context;
 mod coordinator;
 mod db;
+mod diag;
 mod editor;
 mod engine;
 mod git;

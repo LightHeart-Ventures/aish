@@ -1618,14 +1618,17 @@ async fn dispatch(
     // tokenize (apostrophes in English) go to the model. `$VAR` references are
     // expanded here against the session's exports first, then the process
     // environment — matching what the spawned program would see.
-    let Some(mut words) = rc::tokenize_with(line, var_lookup(session)) else {
-        if force {
-            eprintln!(
-                "aish: can't run that directly — it uses shell syntax aish doesn't implement"
-            );
-            return Dispatch::Handled;
+    let mut words = match rc::tokenize_diagnosed(line, var_lookup(session)) {
+        Ok(w) => w,
+        Err(diag) => {
+            // Forced (`!`): surface WHY — caret + `aish::parse::` code + help.
+            // Auto: stay silent and route to the model (zero behavior change).
+            if force {
+                crate::diag::eprint(&diag);
+                return Dispatch::Handled;
+            }
+            return Dispatch::NotACommand;
         }
-        return Dispatch::NotACommand;
     };
     let Some(first) = words.first() else {
         return Dispatch::NotACommand;
@@ -1720,7 +1723,15 @@ async fn dispatch(
                 .unwrap_or_default();
             let Some(path) = resolve_program(cmd, &session.cwd, &path_var) else {
                 if force {
-                    eprintln!("aish: {cmd}: command not found");
+                    // Forced (`!`) miss: render a coded `aish::exec::not_found`
+                    // with a cheap bounded did-you-mean drawn from $PATH.
+                    let candidates = scan_path_commands(&path_var);
+                    let hint = crate::diag::nearest_command(
+                        cmd,
+                        candidates.iter().map(String::as_str),
+                    )
+                    .map(|near| format!("did you mean `{near}`?"));
+                    crate::diag::eprint(&crate::diag::AishDiagnostic::exec_not_found(cmd, hint));
                     return Dispatch::Handled;
                 }
                 return Dispatch::NotACommand;
