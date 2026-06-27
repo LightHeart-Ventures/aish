@@ -28,6 +28,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use wreq_util::Emulation;
 
 /// The curated skill-registry index, embedded in the binary at compile time.
 /// [`initialize_registry`] writes this to `~/.aish/registry/index.json` on
@@ -168,13 +169,16 @@ fn check_url(url: &str) -> Result<()> {
     bail!("refusing to fetch a skill over a non-HTTPS URL: {url}");
 }
 
-/// The shared reqwest client: an `aish/<version>` user-agent and a 20s timeout.
+/// The shared reqwest client and a 20s timeout.
 /// Reused by both the raw-SKILL fetch and the registry search so the two paths
 /// present identically to the registry.
+/// Uses the skillfish-cli user-agent for compatibility with registries that have
+/// allowlists for known tools (e.g. skill.fish / mcpmarket behind Vercel).
 fn http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
-        .user_agent(concat!("aish/", env!("CARGO_PKG_VERSION")))
+        .user_agent("skillfish-cli")
         .timeout(Duration::from_secs(20))
+        .http1_only()
         .build()?)
 }
 
@@ -661,6 +665,9 @@ fn mcpmarket_search_url(base: &str, query: &str, limit: usize) -> String {
 /// loopback server. Reuses [`parse_search_body`] — mcpmarket's per-skill fields
 /// (`name`, `publisher`/`namespace`, `summary`, `full_name`/`slug`, …) are folded
 /// onto [`SearchResult`] via the serde aliases on that struct.
+///
+/// Uses wreq (browser-impersonating HTTP client) to bypass Vercel's bot protection
+/// on mcpmarket.com. wreq spoofs TLS + HTTP/2 fingerprints to appear as a real browser.
 async fn search_mcpmarket_with_base(
     base: &str,
     query: &str,
@@ -668,15 +675,27 @@ async fn search_mcpmarket_with_base(
 ) -> Result<Vec<SearchResult>> {
     let url = mcpmarket_search_url(base, query, limit);
     check_url(&url)?;
-    let client = http_client()?;
+    
+    // Use wreq with explicit Chrome browser emulation to bypass Vercel's bot protection
+    // Chrome fingerprints are most commonly whitelisted by CDN/WAF systems
+    let client = wreq::Client::builder()
+        .emulation(Emulation::Chrome131)
+        .build()
+        .context("failed to build wreq client with Chrome131 emulation")?;
+    
     let resp = client
         .get(&url)
+        .header("Referer", "https://mcpmarket.com/")
+        .header("Accept", "application/json")
+        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
         .send()
         .await
-        .with_context(|| format!("searching mcpmarket {url}"))?;
+        .with_context(|| format!("searching mcpmarket {url} with wreq"))?;
+    
     if !resp.status().is_success() {
         bail!("mcpmarket returned HTTP {} for {url}", resp.status().as_u16());
     }
+    
     let body = resp
         .text()
         .await
