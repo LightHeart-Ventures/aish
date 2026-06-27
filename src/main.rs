@@ -14,6 +14,7 @@ mod jobs;
 mod loopguard;
 mod mcp;
 mod md;
+mod memory;
 #[cfg(test)]
 mod oracle;
 mod pipeline;

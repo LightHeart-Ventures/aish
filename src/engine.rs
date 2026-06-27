@@ -457,10 +457,13 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
     else {
         return;
     };
-    // Offload the dropped transcript to durable memory BEFORE mutating history,
-    // so nothing is lost even if the process dies right after.
+    // Offload the dropped transcript to the dedicated offloads table BEFORE
+    // mutating history, so nothing is lost even if the process dies right after.
+    // Stored OUT of `memories` so a routine recall of curated facts never drags
+    // the (potentially MB-scale) transcript along; recoverable via `recall` with
+    // the `context-offload` tag.
     if let Some(db) = &session.db {
-        let _ = db.remember(&plan.offload, Some("context-offload"));
+        let _ = db.remember_offload(&plan.offload);
     }
     let dropped = plan.dropped;
     crate::context::apply_compaction(&mut session.history, &plan);

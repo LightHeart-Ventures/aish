@@ -401,14 +401,18 @@ self-contained sentence."
         },
         ToolDef {
             name: "recall".into(),
-            description: "Search persistent memories by keyword (empty query → most recent). \
-Check here when past context might matter: preferences, project facts, prior decisions."
+            description: "Search persistent memories by keyword (empty query → most recent), \
+ranked by relevance. Check here when past context might matter: preferences, project facts, prior \
+decisions. Curated facts and compacted-conversation transcripts are kept separate: pass \
+tag=\"context-offload\" (or query \"context-offload\") to retrieve recent offloaded transcripts \
+instead of curated facts."
                 .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "limit": {"type": "integer", "description": "Max results (default 8)"}
+                    "limit": {"type": "integer", "description": "Max results (default 8)"},
+                    "tag": {"type": "string", "description": "Optional tag filter. Use \"context-offload\" to retrieve compacted-conversation transcripts (kept out of normal recall)."}
                 }
             }),
         },
@@ -2984,7 +2988,18 @@ fn recall(call: &ToolCall, session: &Session) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("memory store unavailable"))?;
     let query = call.args["query"].as_str().unwrap_or("");
     let limit = call.args["limit"].as_u64().unwrap_or(8) as usize;
-    let hits = db.recall(query, limit)?;
+    let tag = call.args["tag"].as_str().unwrap_or("");
+    // Route to the quarantined offload transcripts when explicitly asked for
+    // them (tag filter or the offload sentinel as the query) — they're kept out
+    // of normal curated recall so a routine lookup never drags an MB-scale
+    // transcript along. Everything else hits the relevance-ranked curated store.
+    let hits = if tag.trim() == crate::memory::OFFLOAD_TAG
+        || query.trim() == crate::memory::OFFLOAD_TAG
+    {
+        db.recall_offloads(limit)?
+    } else {
+        db.recall(query, limit)?
+    };
     Ok(if hits.is_empty() {
         "no memories match".into()
     } else {

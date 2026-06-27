@@ -59,6 +59,14 @@ impl Db {
                  memory_id INTEGER PRIMARY KEY,
                  embedding float[384]
              );
+             -- History-compaction transcripts live HERE, never in `memories`, so a
+             -- routine recall of curated facts can't drag an MB-scale transcript in
+             -- front of them (the offload token-blowup fix). Bounded by reap_offloads.
+             CREATE TABLE IF NOT EXISTS offloads (
+                 id      INTEGER PRIMARY KEY,
+                 ts      TEXT NOT NULL DEFAULT current_timestamp,
+                 content TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS allowed_tools (
                  tool TEXT PRIMARY KEY,
                  ts   TEXT NOT NULL DEFAULT current_timestamp
@@ -75,7 +83,89 @@ impl Db {
              );",
         )
         .context("schema init failed")?;
-        Ok(Self { conn })
+        let db = Self { conn };
+        db.migrate_memory_store();
+        Ok(db)
+    }
+
+    /// One-time, idempotent memory-store migrations (safe to run on every open):
+    ///   1. **Quarantine offloads** — move any legacy `context-offload` rows out
+    ///      of `memories` into the dedicated `offloads` table so curated recall
+    ///      never co-mingles with 2 MB transcripts (the token-blowup fix).
+    ///   2. **FTS5 index** — create the `memories_fts` keyword index and backfill
+    ///      it, so recall MATCHes an index instead of a raw `LIKE '%q%'` scan.
+    ///   3. **Embeddings** — populate the long-dormant `embedding` column (and the
+    ///      `vec_memories` mirror) for any un-embedded curated row, so recall can
+    ///      rank by relevance instead of pure recency.
+    ///
+    /// Every step is best-effort: a failure (e.g. FTS5 not compiled in) degrades
+    /// gracefully — recall falls back to a substring scan / recency ranking — and
+    /// never sinks `open`.
+    fn migrate_memory_store(&self) {
+        // 1. Quarantine legacy offload transcripts into the offloads table.
+        let _ = self.conn.execute(
+            "INSERT INTO offloads (ts, content)
+                 SELECT ts, content FROM memories WHERE tags = ?1",
+            [crate::memory::OFFLOAD_TAG],
+        );
+        let _ = self
+            .conn
+            .execute("DELETE FROM memories WHERE tags = ?1", [crate::memory::OFFLOAD_TAG]);
+        // 2. Keyword index (best-effort — needs FTS5 in the SQLite build).
+        let _ = self.conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(content, tags);",
+        );
+        let _ = self.conn.execute(
+            "INSERT INTO memories_fts(rowid, content, tags)
+                 SELECT id, content, coalesce(tags, '') FROM memories
+                 WHERE id NOT IN (SELECT rowid FROM memories_fts)",
+            [],
+        );
+        // 3. Backfill embeddings for any row that predates the embedder.
+        self.backfill_embeddings();
+    }
+
+    /// Compute + store the embedding for every curated memory whose `embedding`
+    /// column is still NULL (older rows, or rows written before the embedder was
+    /// wired in). Best-effort and idempotent — once a row is embedded it's
+    /// skipped on subsequent opens. The store is tiny (offloads are quarantined),
+    /// so this is a cheap one-pass loop.
+    fn backfill_embeddings(&self) {
+        let rows: Vec<(i64, String)> = {
+            let Ok(mut stmt) = self
+                .conn
+                .prepare("SELECT id, content FROM memories WHERE embedding IS NULL")
+            else {
+                return;
+            };
+            let Ok(mapped) = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))) else {
+                return;
+            };
+            mapped.filter_map(std::result::Result::ok).collect()
+        };
+        for (id, content) in rows {
+            self.index_embedding(id, &content);
+        }
+    }
+
+    /// Compute the embedding for `content` and persist it: the `memories.embedding`
+    /// BLOB (read back for relevance ranking) plus the `vec_memories` vec0 mirror
+    /// (the schema's KNN index, kept consistent for a future learned embedder).
+    /// Both writes are best-effort so a vector hiccup never fails the caller.
+    fn index_embedding(&self, id: i64, content: &str) {
+        let v = crate::memory::embed(content);
+        let blob = crate::memory::embed_to_blob(&v);
+        let _ = self
+            .conn
+            .execute("UPDATE memories SET embedding = ?2 WHERE id = ?1", (id, &blob));
+        // Mirror into the vec0 index (text JSON is the format sqlite-vec accepts).
+        let _ = self
+            .conn
+            .execute("DELETE FROM vec_memories WHERE memory_id = ?1", [id]);
+        let _ = self.conn.execute(
+            "INSERT INTO vec_memories(memory_id, embedding) VALUES (?1, ?2)",
+            (id, crate::memory::embed_to_json(&v)),
+        );
     }
 
     /// The sqlite-vec version string — proves vector support is actually loaded.
@@ -124,11 +214,23 @@ impl Db {
     }
 
     pub fn remember(&self, content: &str, tags: Option<&str>) -> Result<i64> {
+        let embedding = crate::memory::embed_to_blob(&crate::memory::embed(content));
         self.conn.execute(
-            "INSERT INTO memories (content, tags) VALUES (?1, ?2)",
-            (content, tags),
+            "INSERT INTO memories (content, tags, embedding) VALUES (?1, ?2, ?3)",
+            (content, tags, &embedding),
         )?;
         let id = self.conn.last_insert_rowid();
+        // Index the new row for keyword recall (best-effort — degrades to the
+        // LIKE-scan fallback if FTS5 isn't available) and mirror its embedding
+        // into the vec0 index. Neither must ever fail the remember itself.
+        let _ = self.conn.execute(
+            "INSERT INTO memories_fts(rowid, content, tags) VALUES (?1, ?2, ?3)",
+            (id, content, tags.unwrap_or("")),
+        );
+        let _ = self.conn.execute(
+            "INSERT INTO vec_memories(memory_id, embedding) VALUES (?1, ?2)",
+            (id, crate::memory::embed_to_json(&crate::memory::embed(content))),
+        );
         // Periodic self-organization: every ORGANIZE_EVERY writes, prune duplicate
         // memories so the store doesn't accumulate near-identical rows. Best-effort
         // — a failure here must never fail the remember itself.
@@ -138,22 +240,144 @@ impl Db {
         Ok(id)
     }
 
-    /// Keyword recall (newest first). `query` empty → most recent memories.
+    /// Persist a history-compaction transcript to the dedicated `offloads`
+    /// table (NOT `memories`), then bound the table so it can't grow without
+    /// limit. Keeping transcripts out of `memories` is what stops a routine
+    /// `recall` of curated facts from dragging an MB-scale blob into a tool
+    /// result. Returns the new offload row id.
+    pub fn remember_offload(&self, content: &str) -> Result<i64> {
+        self.conn
+            .execute("INSERT INTO offloads (content) VALUES (?1)", [content])?;
+        let id = self.conn.last_insert_rowid();
+        // Bound retention on every write (the table is small + the delete is
+        // cheap). Best-effort — a reap failure must never fail the offload.
+        let _ = self.reap_offloads(
+            crate::memory::OFFLOAD_KEEP_RECENT,
+            crate::memory::OFFLOAD_MAX_AGE_DAYS,
+        );
+        Ok(id)
+    }
+
+    /// The most-recent offload transcripts (newest first), each truncated to the
+    /// recall hit cap so even a rehydration can't blow the context window. Backs
+    /// the `recall "context-offload"` rehydration path.
+    pub fn recall_offloads(&self, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT ts, content FROM offloads ORDER BY id DESC LIMIT ?1")?;
+        let rows = stmt.query_map([limit], |r| {
+            let (ts, content): (String, String) = (r.get(0)?, r.get(1)?);
+            Ok(format!(
+                "[{ts}] {}",
+                crate::memory::truncate_hit(&content, crate::memory::RECALL_HIT_MAX_CHARS)
+            ))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Bound the `offloads` table: delete any transcript beyond the `keep_recent`
+    /// most-recent rows OR older than `max_age_days`. Mirrors the coordinator's
+    /// failed-run retention semantics (survive only when recent AND fresh).
+    /// Returns the number of rows reaped.
+    pub fn reap_offloads(&self, keep_recent: usize, max_age_days: i64) -> Result<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM offloads
+                 WHERE id NOT IN (SELECT id FROM offloads ORDER BY id DESC LIMIT ?1)
+                    OR (julianday('now') - julianday(ts)) > ?2",
+            (keep_recent as i64, max_age_days as f64),
+        )?;
+        Ok(n)
+    }
+
+    /// Relevance-ranked recall over CURATED memories (offloads are excluded —
+    /// they live in their own table). An empty query returns the most-recent
+    /// facts. Otherwise: generate keyword candidates via the FTS5 index (falling
+    /// back to a `LIKE` scan when FTS is unavailable or matches nothing), then
+    /// re-rank them by embedding cosine so the best match leads instead of merely
+    /// the newest. Every hit is truncated to the recall cap. `query` empty → most
+    /// recent memories.
     pub fn recall(&self, query: &str, limit: usize) -> Result<Vec<String>> {
-        let pattern = format!("%{query}%");
+        let q = query.trim();
+        if q.is_empty() {
+            return self.recent_memories(limit);
+        }
+        // FTS first (indexed); fall back to a substring scan on error/empty so a
+        // SQLite build without FTS5 — or a query the tokenizer can't match —
+        // still recalls.
+        let mut cands = self
+            .fts_candidates(q, crate::memory::RECALL_CANDIDATE_CAP)
+            .unwrap_or_default();
+        if cands.is_empty() {
+            cands = self.like_candidates(q, crate::memory::RECALL_CANDIDATE_CAP)?;
+        }
+        // Relevance re-rank by embedding cosine when the query has a usable
+        // embedding. Rows without an embedding sink below ranked ones but are
+        // still returned (preserving recall), keeping their FTS/recency order.
+        let qv = crate::memory::embed(q);
+        if qv.iter().any(|&x| x != 0.0) {
+            cands.sort_by(|a, b| {
+                let score = |e: &Option<Vec<f32>>| {
+                    e.as_ref()
+                        .map(|v| crate::memory::cosine(&qv, v))
+                        .unwrap_or(f32::MIN)
+                };
+                score(&b.embedding)
+                    .partial_cmp(&score(&a.embedding))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        Ok(cands.into_iter().take(limit).map(|c| c.render()).collect())
+    }
+
+    /// Most-recent curated memories (newest first), offloads excluded, each
+    /// truncated to the recall cap — the empty-query recall path.
+    fn recent_memories(&self, limit: usize) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT ts, content, coalesce(tags, '') FROM memories
-             WHERE content LIKE ?1 OR tags LIKE ?1
-             ORDER BY id DESC LIMIT ?2",
+                 WHERE tags IS NULL OR tags != ?2
+                 ORDER BY id DESC LIMIT ?1",
         )?;
-        let rows = stmt.query_map((pattern, limit), |r| {
-            let (ts, content, tags): (String, String, String) = (r.get(0)?, r.get(1)?, r.get(2)?);
-            Ok(if tags.is_empty() {
-                format!("[{ts}] {content}")
-            } else {
-                format!("[{ts}] ({tags}) {content}")
+        let rows = stmt.query_map((limit, crate::memory::OFFLOAD_TAG), |r| {
+            Ok(MemoryHit {
+                ts: r.get(0)?,
+                content: r.get(1)?,
+                tags: r.get(2)?,
+                embedding: None,
             })
         })?;
+        Ok(rows
+            .filter_map(std::result::Result::ok)
+            .map(|h| h.render())
+            .collect())
+    }
+
+    /// Keyword candidates from the FTS5 index, ordered by bm25 rank. Returns an
+    /// error when FTS5 is unavailable so `recall` can fall back to a scan.
+    fn fts_candidates(&self, query: &str, cap: usize) -> Result<Vec<MemoryHit>> {
+        let Some(m) = crate::memory::fts_match_query(query) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT m.ts, m.content, coalesce(m.tags, ''), m.embedding
+                 FROM memories_fts f JOIN memories m ON m.id = f.rowid
+                 WHERE f MATCH ?1
+                 ORDER BY rank LIMIT ?2",
+        )?;
+        let rows = stmt.query_map((m, cap), MemoryHit::from_row)?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Legacy substring candidates (`LIKE '%q%'`), offloads excluded — the
+    /// fallback when FTS5 is unavailable or matched nothing.
+    fn like_candidates(&self, query: &str, cap: usize) -> Result<Vec<MemoryHit>> {
+        let pattern = format!("%{query}%");
+        let mut stmt = self.conn.prepare(
+            "SELECT ts, content, coalesce(tags, ''), embedding FROM memories
+                 WHERE (content LIKE ?1 OR tags LIKE ?1)
+                   AND (tags IS NULL OR tags != ?3)
+                 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map((pattern, cap, crate::memory::OFFLOAD_TAG), MemoryHit::from_row)?;
         Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
@@ -183,8 +407,11 @@ impl Db {
     pub fn delete_memory(&self, id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM memories WHERE id = ?1", [id])?;
-        // The vec0 mirror is unused until an embedder is wired in, but keep the
-        // delete paired so a future embedding never outlives its memory.
+        // Keep the keyword index and the vec0 embedding mirror paired with the
+        // row so neither outlives its memory (both best-effort).
+        let _ = self
+            .conn
+            .execute("DELETE FROM memories_fts WHERE rowid = ?1", [id]);
         let _ = self
             .conn
             .execute("DELETE FROM vec_memories WHERE memory_id = ?1", [id]);
@@ -312,6 +539,40 @@ impl Db {
                 r.get(0)
             })
             .optional()?)
+    }
+}
+
+/// One recall candidate: the display fields plus the row's embedding (when
+/// present) for relevance re-ranking. Rendered to the `[ts] (tags) content`
+/// string the model sees, truncated to the recall hit cap.
+struct MemoryHit {
+    ts: String,
+    content: String,
+    tags: String,
+    embedding: Option<Vec<f32>>,
+}
+
+impl MemoryHit {
+    /// Build a hit from a `(ts, content, tags, embedding BLOB)` row.
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let blob: Option<Vec<u8>> = r.get(3)?;
+        Ok(MemoryHit {
+            ts: r.get(0)?,
+            content: r.get(1)?,
+            tags: r.get(2)?,
+            embedding: blob.as_deref().and_then(crate::memory::blob_to_embed),
+        })
+    }
+
+    /// The `[ts] (tags) content` line the model sees, content truncated to the
+    /// recall hit cap so no single fact can balloon a tool result.
+    fn render(&self) -> String {
+        let content = crate::memory::truncate_hit(&self.content, crate::memory::RECALL_HIT_MAX_CHARS);
+        if self.tags.is_empty() {
+            format!("[{}] {content}", self.ts)
+        } else {
+            format!("[{}] ({}) {content}", self.ts, self.tags)
+        }
     }
 }
 
@@ -1293,6 +1554,132 @@ mod tests {
 
         // Idempotent — a second pass removes nothing.
         assert_eq!(db.organize_memories().unwrap(), 0);
+    }
+
+    #[test]
+    fn offloads_are_quarantined_from_curated_recall() {
+        let db = temp_db("offloads");
+        db.remember("user prefers dark mode", Some("preference"))
+            .unwrap();
+        db.remember_offload("[context-offload] huge transcript about errors and builds")
+            .unwrap();
+        // Curated recall surfaces the fact, never the offload transcript.
+        let dark = db.recall("dark", 10).unwrap();
+        assert_eq!(dark.len(), 1);
+        assert!(dark[0].contains("dark mode"));
+        let trans = db.recall("transcript", 10).unwrap();
+        assert!(
+            trans.iter().all(|h| !h.contains("huge transcript")),
+            "offload must not appear in curated recall: {trans:?}"
+        );
+        // memory_count counts only curated rows (offloads live elsewhere).
+        assert_eq!(db.memory_count().unwrap(), 1);
+        // The offload is reachable on its own channel.
+        let offs = db.recall_offloads(10).unwrap();
+        assert_eq!(offs.len(), 1);
+        assert!(offs[0].contains("huge transcript"));
+    }
+
+    #[test]
+    fn recall_truncates_oversized_hits() {
+        let db = temp_db("trunc");
+        let big = format!("alpha {}", "x".repeat(5000));
+        db.remember(&big, None).unwrap();
+        let hits = db.recall("alpha", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].contains("KB elided"), "expected elision marker: {}", hits[0]);
+        assert!(
+            hits[0].chars().count() < big.chars().count(),
+            "hit should be capped well under the original"
+        );
+    }
+
+    #[test]
+    fn reap_offloads_bounds_by_count_and_age() {
+        let db = temp_db("reapoff");
+        for i in 0..5 {
+            db.remember_offload(&format!("offload number {i}")).unwrap();
+        }
+        // remember_offload reaps with the generous default keep — all 5 survive.
+        assert_eq!(db.recall_offloads(50).unwrap().len(), 5);
+        // Keep only the 2 most recent → 3 reaped.
+        assert_eq!(db.reap_offloads(2, 9_999).unwrap(), 3);
+        assert_eq!(db.recall_offloads(50).unwrap().len(), 2);
+        // An ancient row is reaped by the age bound regardless of the keep count.
+        db.conn
+            .execute(
+                "INSERT INTO offloads (ts, content) VALUES ('2000-01-01 00:00:00', 'ancient')",
+                [],
+            )
+            .unwrap();
+        let removed = db.reap_offloads(50, 7).unwrap();
+        assert!(removed >= 1, "ancient offload should be aged out");
+        assert!(
+            db.recall_offloads(50)
+                .unwrap()
+                .iter()
+                .all(|o| !o.contains("ancient")),
+            "aged-out offload must be gone"
+        );
+    }
+
+    #[test]
+    fn recall_ranks_by_relevance_not_recency() {
+        let db = temp_db("rank");
+        // Older row, but a near-perfect token overlap with the query.
+        db.remember("the rust compiler optimizes release builds", None)
+            .unwrap();
+        // Newer row, shares only the token "rust".
+        db.remember("rust is a programming language", None).unwrap();
+        let hits = db.recall("rust compiler optimizes release builds", 5).unwrap();
+        assert!(!hits.is_empty());
+        assert!(
+            hits[0].contains("optimizes release builds"),
+            "the highly-relevant older row must outrank the newer low-overlap one: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn recall_falls_back_when_no_token_matches() {
+        // A query whose tokens match nothing returns no curated hits (the LIKE
+        // fallback also finds nothing) rather than erroring.
+        let db = temp_db("nomatch");
+        db.remember("alpha beta gamma", None).unwrap();
+        assert!(db.recall("zzzznope", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_offload_rows_migrate_out_of_memories_on_open() {
+        let path =
+            std::env::temp_dir().join(format!("aish_migrate_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        // Simulate the pre-migration state: an offload transcript living in
+        // `memories` under the reserved tag (how compaction used to store it).
+        db.conn
+            .execute(
+                "INSERT INTO memories (content, tags) VALUES (?1, ?2)",
+                ("[context-offload] legacy transcript body", "context-offload"),
+            )
+            .unwrap();
+        db.remember("a real curated fact", None).unwrap();
+        drop(db);
+        // Reopening runs the idempotent migration.
+        let db2 = Db::open(&path).unwrap();
+        // The legacy offload is gone from curated memories…
+        assert_eq!(db2.memory_count().unwrap(), 1);
+        assert!(db2
+            .recall("legacy", 10)
+            .unwrap()
+            .iter()
+            .all(|h| !h.contains("legacy transcript")));
+        // …and now lives in the offloads table.
+        assert!(db2
+            .recall_offloads(10)
+            .unwrap()
+            .iter()
+            .any(|o| o.contains("legacy transcript body")));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
