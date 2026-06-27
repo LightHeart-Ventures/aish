@@ -546,14 +546,27 @@ fn merge_results(primary: Vec<SearchResult>, fallback: Vec<SearchResult>) -> Vec
     out
 }
 
+/// Get the local skills directory path: `~/.aish/skills`.
+fn skills_dir_path() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".aish")
+        .join("skills")
+}
+
 /// Render search results as a plain, aligned text table (returned, not printed,
-/// so it's unit-testable). Columns: the `owner/name` reference, the version, and
-/// a truncated one-line description. An empty list renders the "no matches" line.
+/// so it's unit-testable). Columns: the `owner/name` reference, the version,
+/// a truncated one-line description, and metadata (installed status and registry source).
+/// An empty list renders the "no matches" line.
 pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
     if results.is_empty() {
         return format!("No skills found for {query:?}.");
     }
-    const DESC_MAX: usize = 60;
+    const DESC_MAX: usize = 50;
+    
+    // Load locally installed skills to check for matches
+    let installed = crate::skills::load(&skills_dir_path());
+    let installed_names: std::collections::HashSet<_> = installed.iter().map(|s| s.name.clone()).collect();
+    
     let refs: Vec<String> = results.iter().map(|r| r.ref_or_synth()).collect();
     let vers: Vec<String> = results
         .iter()
@@ -569,6 +582,23 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
         .iter()
         .map(|r| truncate(&r.description, DESC_MAX))
         .collect();
+    
+    // Note: registry source detection is not yet implemented (future enhancement).
+    // All results currently show as "remote" or "local" implicitly via the search function.
+    
+    // Check if each result is installed (by comparing with the loaded catalog)
+    let statuses: Vec<String> = results
+        .iter()
+        .map(|r| {
+            let ref_key = r.ref_or_synth();
+            let name = ref_key.split('/').last().unwrap_or(&ref_key);
+            if installed_names.contains(&name.to_string()) {
+                "✓ installed".to_string()
+            } else {
+                String::new()
+            }
+        })
+        .collect();
 
     let ref_w = refs
         .iter()
@@ -582,16 +612,27 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
         .chain(std::iter::once("VERSION".len()))
         .max()
         .unwrap_or(7);
+    let status_w = statuses
+        .iter()
+        .map(|s| s.chars().count())
+        .chain(std::iter::once("STATUS".len()))
+        .max()
+        .unwrap_or(6);
 
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<ref_w$}  {:<ver_w$}  {}\n",
-        "SKILL", "VERSION", "DESCRIPTION"
+        "{:<ref_w$}  {:<ver_w$}  {:<50}  {:<status_w$}\n",
+        "SKILL", "VERSION", "DESCRIPTION", "STATUS"
     ));
     for i in 0..results.len() {
+        let status_color = if !statuses[i].is_empty() {
+            "\x1b[32m" // green for installed
+        } else {
+            "\x1b[2m" // dim for not installed
+        };
         out.push_str(&format!(
-            "{:<ref_w$}  {:<ver_w$}  {}\n",
-            refs[i], vers[i], descs[i]
+            "{:<ref_w$}  {:<ver_w$}  {:<50}  {}{:<status_w$}\x1b[0m\n",
+            refs[i], vers[i], descs[i], status_color, statuses[i]
         ));
     }
     out.push_str(&format!(
