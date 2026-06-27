@@ -205,8 +205,9 @@ fn inline_summary(msgs: &[Msg]) -> String {
     };
     format!(
         "[Context compacted: {} earlier message(s) were offloaded to long-term memory to free \
-context. Use the recall tool with query \"context-offload\" to retrieve the full transcript if \
-you need it.{earlier}]",
+context. Use the recall tool with query \"context-offload\" (or tag \"context-offload\") to \
+retrieve the recent offloaded transcript(s) if you need them — each is truncated, so narrow your \
+ask if you need more.{earlier}]",
         msgs.len()
     )
 }
