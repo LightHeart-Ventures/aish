@@ -28,7 +28,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use wreq_util::Emulation;
+// Removed Emulation import - using skillfish-cli UA instead
 
 /// The curated skill-registry index, embedded in the binary at compile time.
 /// [`initialize_registry`] writes this to `~/.aish/registry/index.json` on
@@ -678,19 +678,17 @@ async fn search_mcpmarket_with_base(
     
     // Use wreq with explicit Chrome browser emulation to bypass Vercel's bot protection
     // Chrome fingerprints are most commonly whitelisted by CDN/WAF systems
-    let client = wreq::Client::builder()
-        .emulation(Emulation::Chrome131)
-        .build()
-        .context("failed to build wreq client with Chrome131 emulation")?;
+    let client = http_client()?;
+
     
     let resp = client
         .get(&url)
         .header("Referer", "https://mcpmarket.com/")
         .header("Accept", "application/json")
-        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+        .header("User-Agent", "skillfish-cli")
         .send()
         .await
-        .with_context(|| format!("searching mcpmarket {url} with wreq"))?;
+        .with_context(|| format!("searching mcpmarket {url}"))?;
     
     if !resp.status().is_success() {
         bail!("mcpmarket returned HTTP {} for {url}", resp.status().as_u16());
