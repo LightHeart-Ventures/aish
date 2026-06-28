@@ -82,6 +82,19 @@ pub fn initialize_registry(aish_dir: &Path) -> std::io::Result<()> {
     std::fs::write(dir.join("index.json"), EMBEDDED_INDEX)
 }
 
+/// Read + parse the binary-shipped registry index (`~/.aish/registry/index.json`,
+/// written by [`initialize_registry`] on startup) WITHOUT any network — the
+/// source for the per-turn, offline skill-install recommendation
+/// (`crate::skill_match::recommend_install`). Returns the full curated catalog
+/// for the caller to rank in-process. Best-effort: a missing/unreadable/invalid
+/// index yields an empty list, never an error, so the hot path can't fail on it.
+pub fn local_index_catalog() -> Vec<SearchResult> {
+    let Ok(body) = std::fs::read_to_string(local_registry_path()) else {
+        return Vec::new();
+    };
+    parse_search_body(&body).unwrap_or_default()
+}
+
 /// A parsed reference to a skill on the registry.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SkillRef {

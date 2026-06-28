@@ -14,12 +14,17 @@
 //! byte-stable and the hint is contextual to the task at hand. It's a hint, not
 //! a command: the model still decides whether to read and follow the playbook.
 //!
-//! Scope: this is the "YES, an installed skill matches" half of the
-//! skill-awareness design. The "NO match → query the registry" half is
-//! deliberately NOT done on the per-turn hot path — a network round-trip on
-//! every prompt would add latency and hit registry rate limits/bot challenges.
-//! Discovery stays explicit via `:skill search <query>` / `--skill-search`
-//! (see `skill_provider`).
+//! Scope: this module covers BOTH halves of the skill-awareness design.
+//!   * "YES, an installed skill matches" → [`hint`] surfaces the local SKILL.md
+//!     so the model reads and follows it (the engine prepends it to the turn).
+//!   * "NO installed skill matches a substantial task" → [`recommend_install`]
+//!     names an installable skill from the registry catalog so the model can
+//!     RECOMMEND it (`:skill add <ref>`) instead of faking or hand-rolling it.
+//!     To keep the per-turn hot path fast and offline, the recommendation reads
+//!     the binary-shipped registry index (`skill_provider::local_index_catalog`)
+//!     — NO network round-trip per prompt. A full live search across mcpmarket /
+//!     skill.fish stays explicit via `:skill search <query>` / `--skill-search`
+//!     (see `skill_provider`).
 
 use crate::skills::Skill;
 use std::collections::HashSet;
@@ -75,13 +80,15 @@ fn token_matches(a: &str, b: &str) -> bool {
     short.len() >= 4 && long.starts_with(short)
 }
 
-/// Relevance score of `skill` for a tokenized task: for each DISTINCT task
-/// token, [`NAME_WEIGHT`] if it matches a token in the skill's name, else 1 if
-/// it matches a token in the description, else nothing. A token is counted once,
-/// at the higher (name) weight when it matches both.
-pub fn relevance(task_tokens: &[String], skill: &Skill) -> usize {
-    let name_toks = tokens(&skill.name);
-    let desc_toks = tokens(&skill.description);
+/// Relevance score of a `(name, description)` pair for a tokenized task: for
+/// each DISTINCT task token, [`NAME_WEIGHT`] if it matches a token in the name,
+/// else 1 if it matches a token in the description, else nothing. A token is
+/// counted once, at the higher (name) weight when it matches both. Shared by the
+/// installed-skill nudge ([`relevance`]) and the registry recommendation
+/// ([`recommend_install`]).
+fn relevance_named(task_tokens: &[String], name: &str, description: &str) -> usize {
+    let name_toks = tokens(name);
+    let desc_toks = tokens(description);
     let mut seen: HashSet<&str> = HashSet::new();
     let mut score = 0;
     for t in task_tokens {
@@ -95,6 +102,12 @@ pub fn relevance(task_tokens: &[String], skill: &Skill) -> usize {
         }
     }
     score
+}
+
+/// Relevance score of an installed `skill` for a tokenized task — a thin wrapper
+/// over [`relevance_named`] on the skill's name + description.
+pub fn relevance(task_tokens: &[String], skill: &Skill) -> usize {
+    relevance_named(task_tokens, &skill.name, &skill.description)
 }
 
 /// One ranked match: the skill and its relevance score (always `>= MIN_SCORE`).
@@ -126,7 +139,7 @@ pub fn rank<'a>(task: &str, skills: &'a [Skill]) -> Vec<Match<'a>> {
 
 /// The per-turn skill-awareness note for `task`, or `None` when no installed
 /// skill clears the bar. Names up to [`MAX_HINTS`] top matches and points the
-/// model at each one's SKILL.md. Pure + unit-tested; `apply` does the prepend.
+/// model at each one's SKILL.md. Pure + unit-tested; the engine does the prepend.
 pub fn hint(task: &str, skills: &[Skill]) -> Option<String> {
     let matches = rank(task, skills);
     if matches.is_empty() {
@@ -136,8 +149,10 @@ pub fn hint(task: &str, skills: &[Skill]) -> Option<String> {
     if top.len() == 1 {
         let m = &top[0];
         Some(format!(
-            "[aish skill-awareness] Your installed `{}` skill looks relevant to this task — \
-read its playbook FIRST with read_file(\"{}\") and follow it ({}).",
+            "[aish skill-awareness] Your installed `{}` skill fits this task. USING a skill just \
+means reading its SKILL.md and carrying out its steps yourself with your normal tools — there is \
+no separate command to \"invoke\" it. Read it FIRST with read_file(\"{}\") and follow it, BEFORE \
+attempting the task manually ({}).",
             m.skill.name,
             m.skill.path.display(),
             m.skill.description.trim_end_matches('.'),
@@ -159,15 +174,92 @@ read the best-fitting one FIRST with read_file and follow it:",
     }
 }
 
-/// Prepend the skill-awareness note (when one applies) to a turn's input. The
-/// hint is matched on the ORIGINAL `task` text — pass the user's request before
-/// any other context-seeding so a prepended preamble can't skew the keyword
-/// match. A no-op (returns `input` unchanged) when nothing clears the bar.
-pub fn apply(task: &str, input: String, skills: &[Skill]) -> String {
-    match hint(task, skills) {
-        Some(note) => format!("{note}\n\n{input}"),
-        None => input,
+/// Minimum number of SIGNIFICANT tokens (after stopword/short-word filtering) a
+/// task must carry to be "skill-worthy" — substantial enough that recommending
+/// an installable skill is worth the interruption. A one- or two-word command
+/// (`ls /tmp`, `git status`) falls below the bar; a real task ("resolve the
+/// merge conflicts on this branch") clears it.
+const SKILL_WORTHY_MIN_TOKENS: usize = 4;
+
+/// Whether `task` is substantial enough to warrant an offline registry
+/// recommendation when no installed skill matched. Trivial commands never trip
+/// a "you could install …" nudge.
+pub fn is_skill_worthy(task: &str) -> bool {
+    tokens(task).len() >= SKILL_WORTHY_MIN_TOKENS
+}
+
+/// A recommended-but-not-installed skill from the registry catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recommendation {
+    /// The `owner/name` (or GitHub URL) ref to pass to `:skill add` /
+    /// `--skill-fetch`. Doubles as the per-session dedup key.
+    pub reference: String,
+    /// The pre-rendered `[aish skill-awareness] …` note to fold into the turn.
+    pub note: String,
+}
+
+/// Recommend an installable skill from `catalog` (a registry index / search
+/// result set) for `task`, when NONE of the `installed` skills already fits.
+/// Pure + unit-tested: the caller supplies the catalog (loaded offline from the
+/// binary-shipped index — see `skill_provider::local_index_catalog`).
+///
+/// Returns `None` unless the task is skill-worthy AND a catalog entry clears the
+/// same name-level relevance bar ([`MIN_SCORE`]) the local nudge uses AND that
+/// entry isn't already installed (matched by skill name). The note tells the
+/// model to RECOMMEND the install to the user (`:skill add <ref>`) rather than
+/// fake, or manually re-implement, a skill that isn't installed.
+pub fn recommend_install(
+    task: &str,
+    installed: &[Skill],
+    catalog: &[crate::skill_provider::SearchResult],
+) -> Option<Recommendation> {
+    if !is_skill_worthy(task) {
+        return None;
     }
+    let task_tokens = tokens(task);
+    if task_tokens.is_empty() {
+        return None;
+    }
+    let installed_names: HashSet<&str> = installed.iter().map(|s| s.name.as_str()).collect();
+    // Rank catalog entries by the same name/description relevance the local nudge
+    // uses; skip anything already installed and anything below the bar. Highest
+    // score wins; ties break by reference so the pick is deterministic.
+    let mut best: Option<(&crate::skill_provider::SearchResult, usize)> = None;
+    for entry in catalog {
+        let name = entry.name.trim();
+        if name.is_empty() || installed_names.contains(name) {
+            continue;
+        }
+        let score = relevance_named(&task_tokens, &entry.name, &entry.description);
+        if score < MIN_SCORE {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((cur, cur_score)) => {
+                score > *cur_score
+                    || (score == *cur_score && entry.ref_or_synth() < cur.ref_or_synth())
+            }
+        };
+        if better {
+            best = Some((entry, score));
+        }
+    }
+    let (entry, _score) = best?;
+    let reference = entry.ref_or_synth();
+    let desc = entry.description.trim().trim_end_matches('.');
+    let suffix = if desc.is_empty() {
+        String::new()
+    } else {
+        format!(" ({desc})")
+    };
+    let note = format!(
+        "[aish skill-awareness] No installed skill fits this task, but the skill registry has \
+`{reference}`{suffix} — it looks relevant. RECOMMEND it to the user: they can install it with \
+`:skill add {reference}`, after which you'd read its SKILL.md and follow it. Do NOT pretend to \
+run, or silently hand-roll, a skill that isn't installed — surface the recommendation instead."
+    );
+    Some(Recommendation { reference, note })
 }
 
 #[cfg(test)]
@@ -295,22 +387,78 @@ mod tests {
         assert!(h.matches("\n- `").count() <= MAX_HINTS, "{h}");
     }
 
-    #[test]
-    fn apply_prepends_note_then_blank_line_then_input() {
-        let skills = catalog();
-        let out = apply(
-            "review this PR for security",
-            "review this PR for security".into(),
-            &skills,
-        );
-        assert!(out.starts_with("[aish skill-awareness]"), "{out}");
-        assert!(out.contains("\n\nreview this PR for security"), "{out}");
+    // ---- registry recommendation (no installed skill matched) -----------
+
+    fn search_result(name: &str, description: &str, reference: &str) -> crate::skill_provider::SearchResult {
+        crate::skill_provider::SearchResult {
+            name: name.into(),
+            author: "anthropic".into(),
+            description: description.into(),
+            version: "1.0.0".into(),
+            reference: reference.into(),
+            stars: 0,
+        }
+    }
+
+    /// A small registry catalog modeled on the binary-shipped index.json.
+    fn registry() -> Vec<crate::skill_provider::SearchResult> {
+        vec![
+            search_result("git-rebase", "Rebase and squash git commits interactively.", "anthropic/git-rebase"),
+            search_result("kubernetes-deploy", "Deploy applications to Kubernetes clusters.", "anthropic/kubernetes-deploy"),
+            search_result("terraform-plan", "Plan and apply Terraform infrastructure changes.", "anthropic/terraform-plan"),
+        ]
     }
 
     #[test]
-    fn apply_is_a_noop_without_a_match() {
-        let skills = catalog();
-        let input = "ls -la /tmp".to_string();
-        assert_eq!(apply("ls -la /tmp", input.clone(), &skills), input);
+    fn skill_worthy_gate_filters_trivial_tasks() {
+        // Substantial multi-word tasks clear the bar; short commands don't.
+        assert!(is_skill_worthy("deploy this application to a kubernetes cluster"));
+        assert!(!is_skill_worthy("ls /tmp"));
+        assert!(!is_skill_worthy("git status"));
+        assert!(!is_skill_worthy(""));
+    }
+
+    #[test]
+    fn recommends_a_relevant_registry_skill_when_none_installed() {
+        let rec = recommend_install(
+            "deploy the service to our kubernetes cluster",
+            &[],
+            &registry(),
+        )
+        .expect("a kubernetes task should match the kubernetes-deploy skill");
+        assert_eq!(rec.reference, "anthropic/kubernetes-deploy");
+        assert!(rec.note.starts_with("[aish skill-awareness]"), "{}", rec.note);
+        assert!(rec.note.contains(":skill add anthropic/kubernetes-deploy"), "{}", rec.note);
+        // The note steers away from faking/hand-rolling the skill.
+        assert!(rec.note.to_lowercase().contains("not pretend"), "{}", rec.note);
+    }
+
+    #[test]
+    fn no_recommendation_when_the_skill_is_already_installed() {
+        // The matching skill is installed → the local nudge handles it; the
+        // registry path must NOT also recommend installing it again.
+        let installed = vec![skill(
+            "kubernetes-deploy",
+            "Deploy applications to Kubernetes clusters.",
+        )];
+        assert_eq!(
+            recommend_install(
+                "deploy the service to our kubernetes cluster",
+                &installed,
+                &registry(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn no_recommendation_for_trivial_or_unmatched_tasks() {
+        // Below the skill-worthy token bar.
+        assert_eq!(recommend_install("git status", &[], &registry()), None);
+        // Substantial, but nothing in the catalog is relevant.
+        assert_eq!(
+            recommend_install("what is the capital of france today please", &[], &registry()),
+            None
+        );
     }
 }
