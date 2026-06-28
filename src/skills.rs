@@ -66,8 +66,13 @@ pub fn render_prompt_section(skills: &[Skill], mcp_skills: &[crate::mcp::McpSkil
     let mut s = String::new();
     if !skills.is_empty() {
         s.push_str(
-            "\n\nSkills — expert playbooks on disk. When a task matches one, read its file \
-with read_file FIRST and follow it (it may reference further files next to it):\n",
+            "\n\nSkills — expert playbooks on disk. USING a skill simply means reading its \
+SKILL.md and carrying out its steps yourself with your normal tools — there is no separate \
+command to \"invoke\" a skill, so never claim you can't run one. When a task matches one, read \
+its file with read_file FIRST and follow it (it may reference further files next to it), BEFORE \
+attempting the task by hand. If NO installed skill matches a substantial task, aish may suggest an \
+installable one — surface that `:skill add <ref>` recommendation to the user rather than faking or \
+hand-rolling the skill:\n",
         );
         for sk in skills {
             s.push_str(&format!(

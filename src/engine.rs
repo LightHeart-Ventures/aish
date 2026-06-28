@@ -83,7 +83,15 @@ pub async fn run_turn(
     // so the prompt-cache prefix stays byte-stable.
     let task = input.clone();
     let input = seed_context(session.history.is_empty(), session.last_output(), input);
-    let input = crate::skill_match::apply(&task, input, &session.skills);
+    // Prefer an INSTALLED skill: when one clearly fits, fold in the note pointing
+    // at its SKILL.md. When NONE fits a substantial task, fall back to an OFFLINE
+    // recommendation of an installable registry skill (read from the
+    // binary-shipped index — no network on the hot path), so the model surfaces a
+    // `:skill add <ref>` suggestion instead of faking or hand-rolling the work.
+    let input = match crate::skill_match::hint(&task, &session.skills) {
+        Some(note) => format!("{note}\n\n{input}"),
+        None => maybe_recommend_skill(&task, input, session),
+    };
     // S9.3: persist the turn input to the per-worker transcript (coordinator
     // run only — None/no-op interactively), so `:attach`/resume can replay the
     // user/system messages, not just the tool turns the audit journal records.
@@ -508,6 +516,25 @@ fn emit_narration(session: &mut Session, text: &str) {
 fn emit_thinking(session: &Session) {
     if session.nested {
         eprintln!("💭 thinking…");
+    }
+}
+
+/// When no INSTALLED skill matched a substantial task, fold in an OFFLINE
+/// recommendation of an installable registry skill (read from the binary-shipped
+/// index — `skill_provider::local_index_catalog`, no network on the hot path).
+/// Deduped per session via `session.skill_suggested`, so the same skill is only
+/// suggested once. A no-op (returns `input` unchanged) when the task is trivial,
+/// nothing in the catalog clears the relevance bar, or it was already suggested.
+fn maybe_recommend_skill(task: &str, input: String, session: &mut Session) -> String {
+    if !crate::skill_match::is_skill_worthy(task) {
+        return input;
+    }
+    let catalog = crate::skill_provider::local_index_catalog();
+    match crate::skill_match::recommend_install(task, &session.skills, &catalog) {
+        Some(rec) if session.skill_suggested.insert(rec.reference.clone()) => {
+            format!("{}\n\n{input}", rec.note)
+        }
+        _ => input,
     }
 }
 
