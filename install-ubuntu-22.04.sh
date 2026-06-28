@@ -46,20 +46,22 @@ echo -e "${YELLOW}[2/5]${NC} Installing build dependencies..."
 sudo apt-get update -qq
 sudo apt-get install -y --no-install-recommends \
     build-essential \
-    rustup \
     git \
     ca-certificates \
     curl \
-    >/dev/null 2>&1
+    pkg-config \
+    libssl-dev \
+    >/dev/null
 echo -e "${GREEN}✓${NC} Dependencies installed"
 echo ""
 
 # Step 3: Setup Rust toolchain
 echo -e "${YELLOW}[3/5]${NC} Configuring Rust toolchain..."
 if ! command -v cargo &> /dev/null; then
-    rustup-init -y --quiet
-    source "$HOME/.cargo/env"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --quiet
 fi
+# Bring cargo/rustc onto PATH for the rest of this script
+[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
 rustup update stable --quiet 2>/dev/null || true
 echo -e "${GREEN}✓${NC} Rust $(rustc --version | awk '{print $2}')"
 echo ""
