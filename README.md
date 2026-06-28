@@ -20,9 +20,8 @@ Mostly ~/models (412G of GGUF weights) — 87% of your usage.
 
 **Supported:**
 - **macOS** 12+ (x86_64, arm64/Apple Silicon)
-- **Linux** (glibc 2.35+): Ubuntu 20.04 LTS, Ubuntu 22.04 LTS, Ubuntu 24.04 LTS, Debian 12, Fedora 38+, etc.
+- **Linux** (glibc 2.35+): Ubuntu 24.04 LTS, Ubuntu 20.04 LTS, Debian 12, Fedora 38+, etc.
   - **Ubuntu 24.04 LTS**: [Detailed install guide](UBUNTU_24.04_INSTALL.md)
-  - **Ubuntu 22.04 LTS**: [Detailed install guide](UBUNTU_22.04_INSTALL.md)
 - **WSL** (Windows Subsystem for Linux) via Ubuntu/Debian base
 
 **Not supported:**
@@ -103,16 +102,6 @@ git clone https://github.com/LightHeart-Ventures/aish.git
 cd aish && bash install-ubuntu-24.04.sh
 ```
 
-**Ubuntu 22.04 LTS (Jammy Jellyfish)**
-```sh
-# From main (recommended once CDN syncs)
-curl -sSL https://raw.githubusercontent.com/LightHeart-Ventures/aish/main/install-ubuntu-22.04.sh | bash
-
-# Or from a repo clone (works immediately)
-git clone https://github.com/LightHeart-Ventures/aish.git
-cd aish && bash install-ubuntu-22.04.sh
-```
-
 ### Quick Start (All Platforms)
 
 ```sh
@@ -133,7 +122,7 @@ export ANTHROPIC_API_KEY=sk-ant-…
 aish
 ```
 
-**Ubuntu LTS users**: See the detailed install guide for prerequisites, troubleshooting, and advanced configuration — [Ubuntu 24.04](UBUNTU_24.04_INSTALL.md) or [Ubuntu 22.04](UBUNTU_22.04_INSTALL.md).
+**Ubuntu LTS users**: See the [detailed install guide](UBUNTU_24.04_INSTALL.md) for prerequisites, troubleshooting, and advanced configuration.
 
 ### Build from Source
 
@@ -218,8 +207,7 @@ are stored unencrypted in `~/.aish/aish.db`.
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option. Unless you explicitly state
-otherwise, any contribution intentionally submitted for inclusion in this
-crate, as defined in the Apache-2.0 license, shall be dual licensed as above,
-without any additional terms or conditions.
+Licensed under the [Apache License, Version 2.0](LICENSE-APACHE).
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this crate shall be licensed as above, without any
+additional terms or conditions.
