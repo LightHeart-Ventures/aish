@@ -374,7 +374,10 @@ fn render_messages(history: &[Msg]) -> Vec<Value> {
                             json!({
                                 "type": "tool_result",
                                 "tool_use_id": r.id,
-                                "content": r.content,
+                                // S7.3: thread the structured payload (when any)
+                                // to the model as additive compact JSON; a
+                                // text-only result renders `content` verbatim.
+                                "content": r.model_content(),
                                 "is_error": r.is_error,
                             })
                         })
@@ -486,6 +489,35 @@ mod tests {
             !wants_thinking("claude-opus-4-8", &prefill),
             "no thinking on prefill"
         );
+    }
+
+    #[test]
+    fn render_tool_result_threads_structured_payload_to_wire_content() {
+        // S7.4 AC1 at the Claude wire boundary: a text-only result renders its
+        // content verbatim (no payload, no marker); a structured result threads
+        // the additive compact JSON into the same `content` field, content first.
+        use super::super::ToolResult;
+        let hist = vec![Msg::tool_results(vec![
+            ToolResult::text("call_text", "plain output", false),
+            ToolResult::structured(
+                "call_struct",
+                "rendered text",
+                json!({ "k": "v", "n": 1 }),
+                false,
+            ),
+        ])];
+        let msgs = render_messages(&hist);
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        // text-only: content is the string verbatim, no [structured] marker.
+        assert_eq!(blocks[0]["tool_use_id"], "call_text");
+        assert_eq!(blocks[0]["content"], "plain output");
+        assert!(!blocks[0]["content"].as_str().unwrap().contains("[structured]"));
+        // structured: human content leads, compact JSON appended additively.
+        let sc = blocks[1]["content"].as_str().unwrap();
+        assert!(sc.starts_with("rendered text"), "content leads: {sc}");
+        assert!(sc.contains("[structured]"), "marker present: {sc}");
+        assert!(sc.contains("{\"k\":\"v\",\"n\":1}"), "compact json: {sc}");
+        assert_eq!(blocks[1]["is_error"], false);
     }
 
     #[test]

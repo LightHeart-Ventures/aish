@@ -634,7 +634,10 @@ fn render_messages(history: &[Msg]) -> Vec<Value> {
                         out.push(json!({
                             "role": "tool",
                             "tool_call_id": r.id,
-                            "content": r.content,
+                            // S7.3: structured payload (when any) is threaded to
+                            // the model as additive compact JSON; text-only
+                            // results send `content` verbatim.
+                            "content": r.model_content(),
                         }));
                     }
                 }
@@ -721,6 +724,25 @@ mod tests {
         assert_eq!(msgs[0]["content"], "out1");
         assert_eq!(msgs[1]["tool_call_id"], "call_2");
         assert_eq!(msgs[1]["content"], "out2");
+    }
+
+    #[test]
+    fn render_tool_result_threads_structured_payload_to_wire_content() {
+        // S7.4 AC1 at the Grok/OpenAI wire boundary: each tool result is one
+        // role:"tool" message; a text-only result is verbatim, a structured one
+        // carries the additive compact JSON in its content (content first).
+        let msg = Msg::tool_results(vec![
+            ToolResult::text("call_text", "plain output", false),
+            ToolResult::structured("call_struct", "rendered text", json!({ "k": "v", "n": 1 }), false),
+        ]);
+        let msgs = render_messages(&[msg]);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["tool_call_id"], "call_text");
+        assert_eq!(msgs[0]["content"], "plain output");
+        assert!(!msgs[0]["content"].as_str().unwrap().contains("[structured]"));
+        let sc = msgs[1]["content"].as_str().unwrap();
+        assert!(sc.starts_with("rendered text"), "content leads: {sc}");
+        assert!(sc.contains("[structured]") && sc.contains("{\"k\":\"v\",\"n\":1}"), "additive json: {sc}");
     }
 
     #[test]

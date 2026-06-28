@@ -62,8 +62,15 @@ pub struct ToolResult {
     /// Optional typed payload for tools whose output is already structured
     /// (records / tables). `content` stays the rendered, human-readable source
     /// of truth; this is additive JSON the model can consume without
-    /// re-parsing the text. `None` for free-form / text-only tools — by design
-    /// (this is NOT a typed pipeline; see the S7.2 PRD non-goals).
+    /// re-parsing the text. `None` for free-form / text-only tools — by design.
+    ///
+    /// SCOPE GUARDRAIL: this is a typed *description* of a result, never a
+    /// programmable pipeline. aish must not grow operators/selectors/verbs that
+    /// filter, transform, or compose these payloads (no jq/JSONPath, no
+    /// `:select`/`:where`, no persistent typed-result store, no schema
+    /// registry). A tool may *describe* its result in a typed way; the system
+    /// must never *operate* on those types. See `docs/S7.4-tests-docs-scope.md`
+    /// §3 (and the S7.2 PRD non-goals) before extending this field.
     pub structured: Option<Value>,
 }
 
@@ -93,6 +100,41 @@ impl ToolResult {
             content: content.into(),
             is_error,
             structured: Some(value),
+        }
+    }
+
+    /// The representation FED TO THE MODEL for this result (S7.3). Every backend
+    /// renderer calls this when building its wire `tool_result`, so the
+    /// structured/string split lives in exactly one place.
+    ///
+    /// - **Text-only path** (`structured == None`) — the path every tool took
+    ///   before S7.2, and every text-only tool still takes: returns `content`
+    ///   byte-for-byte. No payload marker, nothing added.
+    /// - **Structured path** (`structured == Some`) — threads the typed payload
+    ///   to the model as ADDITIVE compact JSON appended under a `[structured]`
+    ///   marker (S7.3 OQ1: compact JSON, not a flattened blob). The
+    ///   human-rendered `content` is preserved verbatim and leads; the payload
+    ///   never *substitutes* it (the S7.4 guardrail: a payload is additive). A
+    ///   structured-only result (empty `content`) emits just the marked JSON.
+    ///
+    /// TODO(S7 OQ3 — deferred per the S7.3 PRD): there is no per-result-set
+    /// token-cost cap on the appended JSON yet. A large structured payload
+    /// roughly doubles the result's token footprint. Monitor in production and
+    /// add a soft/hard size cap (truncating the JSON, never the `content`) in a
+    /// follow-up sprint if it bites.
+    pub fn model_content(&self) -> std::borrow::Cow<'_, str> {
+        use std::borrow::Cow;
+        match &self.structured {
+            None => Cow::Borrowed(self.content.as_str()),
+            Some(value) => {
+                let compact = serde_json::to_string(value).unwrap_or_default();
+                let body = if self.content.trim().is_empty() {
+                    format!("[structured]\n{compact}")
+                } else {
+                    format!("{}\n\n[structured]\n{compact}", self.content)
+                };
+                Cow::Owned(body)
+            }
         }
     }
 }
@@ -351,6 +393,47 @@ fn resolve_escalation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    // ── S7.4 AC1: the two model-facing payload paths through `model_content`,
+    // the single place the structured/string split is decided for every backend.
+    #[test]
+    fn model_content_string_only_is_byte_for_byte_content() {
+        // No structured payload → the model sees `content` verbatim, no marker.
+        let r = ToolResult::text("t", "hello\nworld", false);
+        assert!(r.structured.is_none());
+        assert_eq!(r.model_content(), "hello\nworld");
+        assert!(!r.model_content().contains("[structured]"));
+    }
+
+    #[test]
+    fn model_content_structured_is_additive_compact_json() {
+        // Structured payload → content LEADS verbatim, then the compact JSON is
+        // appended under a marker. The payload is additive, never a substitute.
+        let payload = json!({ "path": "file.txt", "type": "file", "size": 1024 });
+        let r = ToolResult::structured("t", "file.txt (1.0 KB)", payload.clone(), false);
+        let mc = r.model_content();
+        // human content preserved + leads
+        assert!(mc.starts_with("file.txt (1.0 KB)"), "content must lead: {mc}");
+        // additive structured marker + the COMPACT serialization (no whitespace
+        // between tokens — keyed off serde's own output so we don't assume key
+        // order, which serde sorts).
+        assert!(mc.contains("[structured]"), "marker present: {mc}");
+        let compact = serde_json::to_string(&payload).unwrap();
+        assert!(!compact.contains(": "), "serde compact form has no spaces: {compact}");
+        assert!(mc.contains(&compact), "compact json appended: {mc}");
+        assert!(mc.ends_with(&compact), "payload is the additive tail: {mc}");
+    }
+
+    #[test]
+    fn model_content_structured_only_emits_marked_json_without_blank_lead() {
+        // A structured-only result (empty content) still threads the payload, but
+        // without leading blank lines from an empty content prefix.
+        let payload = json!([1, 2, 3]);
+        let r = ToolResult::structured("t", "", payload, false);
+        let mc = r.model_content();
+        assert_eq!(mc, "[structured]\n[1,2,3]");
+    }
 
     #[test]
     fn body_snippet_handles_empty_and_long_bodies() {

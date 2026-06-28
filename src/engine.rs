@@ -379,6 +379,10 @@ pub async fn run_turn(
             results.push(result);
         }
         eprintln!(); // breathing room between tool activity and what follows
+        // S7.3: these results carry, per the structured-emitting tools, an
+        // optional typed payload that `ToolResult::model_content` threads to the
+        // model as additive compact JSON. TODO(S7 OQ3 — deferred): no per-turn
+        // token-cost cap on those payloads yet; see `ToolResult::model_content`.
         session.history.push(Msg::tool_results(results));
 
         // Confirmed loop this round → stop the turn with a tagged partial answer,
@@ -926,14 +930,38 @@ fn describe_call(call: &crate::backend::ToolCall) -> String {
     }
 }
 
-/// The text echoed (dim) for a tool result's raw body. Empty results get a
-/// placeholder so an error with no output still shows *something*.
-fn raw_body(result: &ToolResult) -> &str {
-    if result.content.trim().is_empty() {
-        "(no output)"
-    } else {
-        result.content.as_str()
+/// The text echoed (dim) for a tool result's raw body under Ctrl-O (S7.3).
+/// Ctrl-O always shows HUMAN text, decoupled from what the model receives:
+///
+/// - When a result has rendered `content` (the common case — every structured
+///   tool also renders text), show that VERBATIM. The compact JSON threaded to
+///   the model (`ToolResult::model_content`) is deliberately NOT echoed here —
+///   the raw view is for humans, not the model's wire form.
+/// - When a result carries ONLY a structured payload and no rendered text
+///   (the fallback case — `structured`-only), re-render the payload as
+///   human-readable text (pretty-printed JSON) rather than show nothing
+///   (S7.3 OQ2). Per the S7.4 scope guardrail this is a plain pretty-print, not
+///   a per-tool renderer registry (which would edge toward a typed-tool
+///   contract system — an explicit non-goal).
+/// - Empty + no payload → a `(no output)` placeholder so an error with no
+///   output still shows something.
+fn raw_body(result: &ToolResult) -> String {
+    if !result.content.trim().is_empty() {
+        return result.content.clone();
     }
+    if let Some(value) = &result.structured {
+        return render_structured_human(value);
+    }
+    "(no output)".to_string()
+}
+
+/// Re-render a structured payload as human-readable text for the Ctrl-O raw
+/// view (S7.3 OQ2 fallback). A pretty-printed JSON view — readable, and
+/// deliberately NOT a per-tool formatter (the S7.4 guardrail keeps the engine
+/// from operating on payload types). Falls back to the compact form if
+/// pretty-printing somehow fails.
+fn render_structured_human(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 /// Echo one tool result's raw content dim, nested under its 🔧 line. Printed
@@ -992,6 +1020,38 @@ mod tests {
         assert_eq!(raw_body(&mk("   \n ", false)), "(no output)");
         // error results keep their content — they are included, not skipped
         assert_eq!(raw_body(&mk("boom", true)), "boom");
+    }
+
+    // ── S7.4 AC1: the Ctrl-O raw view across BOTH payload paths. The raw view is
+    // for humans and is decoupled from what the model receives (the compact JSON
+    // in `model_content`); it never leaks the wire form into the human view.
+    #[test]
+    fn raw_body_string_only_path_is_verbatim_content() {
+        // String-only ToolResult: Ctrl-O shows `content` verbatim — exactly as
+        // before S7.3 (the regression fence).
+        let r = ToolResult::text("t", "file.txt\nother.txt", false);
+        assert_eq!(raw_body(&r), "file.txt\nother.txt");
+        // And the `[structured]` marker the model path appends never appears in
+        // the human raw view for a text-only result.
+        assert!(!raw_body(&r).contains("[structured]"));
+    }
+
+    #[test]
+    fn raw_body_structured_path_prefers_human_content_then_falls_back_to_payload() {
+        // Both present (every real structured tool): Ctrl-O shows the rendered
+        // human `content`, NOT the compact JSON threaded to the model.
+        let payload = serde_json::json!([{ "path": "a.rs", "type": "file", "size": 1 }]);
+        let both = ToolResult::structured("t", "file a.rs 1", payload.clone(), false);
+        assert_eq!(raw_body(&both), "file a.rs 1");
+        assert!(!raw_body(&both).contains("\"path\""), "raw view stays human, not JSON");
+
+        // Structured-ONLY fallback (no rendered text): the payload is re-rendered
+        // as human-readable pretty JSON rather than showing "(no output)".
+        let only = ToolResult::structured("t", "", payload.clone(), false);
+        let raw = raw_body(&only);
+        assert!(raw.contains("\"path\": \"a.rs\""), "pretty-printed payload: {raw}");
+        assert!(raw.contains('\n'), "pretty form is multi-line: {raw}");
+        assert_ne!(raw, "(no output)");
     }
 
     #[test]

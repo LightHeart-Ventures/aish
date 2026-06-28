@@ -107,7 +107,10 @@ impl LocalBackend {
                         req = req.add_message(TextMessageRole::User, &msg.text);
                     } else {
                         for r in &msg.tool_results {
-                            req = req.add_tool_message(&r.content, r.id.clone());
+                            // S7.3: thread the structured payload (when any) to
+                            // the model as additive compact JSON via the shared
+                            // `model_content()`; text-only stays verbatim.
+                            req = req.add_tool_message(r.model_content(), r.id.clone());
                         }
                     }
                 }

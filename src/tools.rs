@@ -3414,7 +3414,10 @@ mod tests {
     #[tokio::test]
     async fn normal_command_unaffected() {
         let out = run(&call("echo", &["hi"], None)).await;
-        assert_eq!(out.trim(), "hi");
+        // run_program now leads with the executed command line (`$ echo hi`,
+        // PR #214); the program's stdout is still the trailing line.
+        assert!(out.contains("$ echo hi"), "got: {out}");
+        assert_eq!(out.trim_end().lines().last().unwrap(), "hi");
     }
 
     #[test]
@@ -3455,7 +3458,10 @@ mod tests {
         // End-to-end: program="echo", args=["echo","hi"] must run `echo hi`,
         // not `echo echo hi` — the execution-side proof of the de-dup.
         let out = run(&call("echo", &["echo", "hi"], None)).await;
-        assert_eq!(out.trim(), "hi");
+        // The de-dup proof survives the PR #214 command-echo line: the shown
+        // command is `$ echo hi` (NOT `echo echo hi`), and stdout is just `hi`.
+        assert!(out.contains("$ echo hi") && !out.contains("echo echo"), "got: {out}");
+        assert_eq!(out.trim_end().lines().last().unwrap(), "hi");
     }
 
     #[tokio::test]
@@ -3477,8 +3483,9 @@ mod tests {
     async fn timed_out_command_returns_partial_output() {
         // `yes` floods stdout forever: exercises the cap, the drop marker, and the kill.
         let out = run(&call("yes", &[], Some(1))).await;
+        // PR #214 prefixes a `$ yes` command line; the flooded stdout follows.
         assert!(
-            out.starts_with("y\ny\n"),
+            out.contains("y\ny\ny\n"),
             "got: {}",
             &out[..out.len().min(40)]
         );
