@@ -374,7 +374,10 @@ fn render_messages(history: &[Msg]) -> Vec<Value> {
                             json!({
                                 "type": "tool_result",
                                 "tool_use_id": r.id,
-                                "content": r.content,
+                                // S7.3: thread the structured payload (compact
+                                // JSON) to the model when present; text-only
+                                // results send `content` verbatim as before.
+                                "content": r.model_content(),
                                 "is_error": r.is_error,
                             })
                         })
@@ -509,6 +512,32 @@ mod tests {
             text, "resume me",
             "trailing whitespace stripped on the prefill message"
         );
+    }
+
+    #[test]
+    fn render_tool_result_threads_structured_json_to_model() {
+        // S7.3 / AC1: a structured tool result is rendered to the model as the
+        // compact JSON payload, while a plain text result sends `content`.
+        use super::super::{Msg, ToolResult};
+        let hist = vec![Msg::tool_results(vec![
+            ToolResult::structured(
+                "s1",
+                "rendered table the human sees",
+                json!({"path": "f.txt", "type": "file", "size": 3}),
+                false,
+            ),
+            ToolResult::text("t1", "plain text result", false),
+        ])];
+        let msgs = render_messages(&hist);
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        // Structured → compact JSON (NOT the rendered text); keys sorted (BTreeMap).
+        assert_eq!(
+            blocks[0]["content"].as_str().unwrap(),
+            r#"{"path":"f.txt","size":3,"type":"file"}"#
+        );
+        assert_eq!(blocks[0]["tool_use_id"], "s1");
+        // Text-only → content verbatim.
+        assert_eq!(blocks[1]["content"].as_str().unwrap(), "plain text result");
     }
 
     #[test]

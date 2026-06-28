@@ -95,6 +95,33 @@ impl ToolResult {
             structured: Some(value),
         }
     }
+
+    /// The representation fed back to the MODEL for this result (S7.3).
+    ///
+    /// When a typed payload is present (the record/table tools from S7.2), the
+    /// model receives it as compact JSON — trustworthy structure it can parse
+    /// directly instead of re-deriving it from alignment/ellipsis-corrupted
+    /// ASCII. Text-only results (`structured == None`) thread their `content`
+    /// verbatim, exactly as before S7.3. This is the **model** half of the
+    /// S7.3 split; the Ctrl-O raw view stays on `content` (see
+    /// `engine::raw_body`), so the human always sees the verbatim tool output.
+    ///
+    /// TODO(S7.x, OQ3): token-cost cap per result set. Compact JSON for a large
+    /// `grep_files`/`glob_expand` payload can be heavier than the rendered text;
+    /// the size cap is deliberately deferred (see the S7.3 PRD, OQ3) — monitor
+    /// in production and add a hard/soft cap if it bites.
+    pub fn model_content(&self) -> std::borrow::Cow<'_, str> {
+        match &self.structured {
+            // Compact (not pretty) JSON keeps the wire payload tight. Fall back
+            // to the rendered text on the (practically impossible) serialize
+            // error so the model never receives an empty tool result.
+            Some(v) => match serde_json::to_string(v) {
+                Ok(json) => std::borrow::Cow::Owned(json),
+                Err(_) => std::borrow::Cow::Borrowed(self.content.as_str()),
+            },
+            None => std::borrow::Cow::Borrowed(self.content.as_str()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -363,6 +390,29 @@ mod tests {
         let s = body_snippet(&long);
         assert!(s.ends_with('…'));
         assert_eq!(s.chars().count(), 201); // 200 chars + ellipsis
+    }
+
+    #[test]
+    fn model_content_threads_compact_json_for_structured_results() {
+        // S7.3 / AC1: a structured result feeds the model the COMPACT JSON
+        // payload (keys sorted, no spaces), not the rendered text.
+        let r = ToolResult::structured(
+            "t1",
+            "f.txt  3\nsub/",
+            serde_json::json!([{"name": "f.txt", "type": "file", "size": 3}]),
+            false,
+        );
+        // serde_json's default Map is a BTreeMap (no `preserve_order` feature),
+        // so object keys serialize alphabetically: name, size, type.
+        assert_eq!(
+            r.model_content(),
+            r#"[{"name":"f.txt","size":3,"type":"file"}]"#
+        );
+        // S7.3 / AC3: a text-only result threads `content` verbatim (the
+        // pre-S7.3 behaviour) and borrows it (no JSON allocation).
+        let t = ToolResult::text("t2", "plain output", false);
+        assert_eq!(t.model_content(), "plain output");
+        assert!(matches!(t.model_content(), std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]
