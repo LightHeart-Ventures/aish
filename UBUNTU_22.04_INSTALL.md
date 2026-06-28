@@ -7,7 +7,7 @@ This guide covers installing aish on **Ubuntu 22.04 LTS** (Jammy Jellyfish).
 ```bash
 # 1. Install build dependencies
 sudo apt-get update
-sudo apt-get install -y build-essential rustup git
+sudo apt-get install -y build-essential cmake rustup git pkg-config libssl-dev perl
 
 # 2. Install Rust (if not present)
 rustup-init -y
@@ -34,23 +34,30 @@ aish
 sudo apt-get update
 sudo apt-get install -y \
   build-essential \
+  cmake \
   rustup \
   git \
   ca-certificates \
-  curl
+  curl \
+  pkg-config \
+  libssl-dev \
+  perl
 
 # Verify installations
 rustc --version
 cargo --version
 gcc --version
+cmake --version
 ```
+
+> **Note:** `cmake` and `perl` are required even for the Claude-only build —
+> the HTTP stack vendors and compiles BoringSSL, whose build uses CMake.
+> Omitting `cmake` causes the build to fail with `is cmake not installed?`.
 
 **Optional** (for local model inference):
 ```bash
-# If you plan to run Qwen3-1.7B offline (without `--backend local`):
+# If you plan to run Qwen3-1.7B offline:
 sudo apt-get install -y \
-  pkg-config \
-  libssl-dev \
   libsqlite3-dev
 ```
 

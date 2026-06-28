@@ -46,20 +46,24 @@ echo -e "${YELLOW}[2/5]${NC} Installing build dependencies..."
 sudo apt-get update -qq
 sudo apt-get install -y --no-install-recommends \
     build-essential \
-    rustup \
+    cmake \
     git \
     ca-certificates \
     curl \
-    >/dev/null 2>&1
+    pkg-config \
+    libssl-dev \
+    perl \
+    >/dev/null
 echo -e "${GREEN}✓${NC} Dependencies installed"
 echo ""
 
 # Step 3: Setup Rust toolchain
 echo -e "${YELLOW}[3/5]${NC} Configuring Rust toolchain..."
 if ! command -v cargo &> /dev/null; then
-    rustup-init -y --quiet
-    source "$HOME/.cargo/env"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --quiet
 fi
+# Bring cargo/rustc onto PATH for the rest of this script
+[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
 rustup update stable --quiet 2>/dev/null || true
 echo -e "${GREEN}✓${NC} Rust $(rustc --version | awk '{print $2}')"
 echo ""
@@ -73,7 +77,19 @@ git clone --depth 1 https://github.com/LightHeart-Ventures/aish.git "$TMPDIR" >/
     exit 1
 }
 cd "$TMPDIR"
-cargo build --release --no-default-features 2>&1 | grep -E "Compiling aish|Finished" || true
+# Build, streaming a condensed progress line but preserving the real exit status.
+# (Piping through grep would mask build failures behind a misleading
+#  "install: cannot stat 'target/release/aish'" error further down.)
+build_log="$TMPDIR/build.log"
+if ! cargo build --release --no-default-features 2>&1 | tee "$build_log" | grep -E "Compiling aish|Finished"; then
+    : # grep may exit non-zero if those lines never appear; real status checked below
+fi
+if [ ! -x target/release/aish ]; then
+    echo -e "${RED}✗${NC} Build failed — the aish binary was not produced."
+    echo "    Last lines of the build log:"
+    tail -n 20 "$build_log" | sed 's/^/      /'
+    exit 1
+fi
 mkdir -p "$HOME/.local/bin"
 install -m 0755 target/release/aish "$HOME/.local/bin/aish"
 echo -e "${GREEN}✓${NC} aish $("$HOME/.local/bin/aish" --version | head -1) installed to ~/.local/bin/aish"
