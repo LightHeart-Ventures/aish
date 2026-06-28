@@ -17,7 +17,7 @@ This guide covers installing and configuring **aish** (AI-native shell) on Ubunt
 The official aish project provides a one-liner installer:
 
 ```bash
-curl -fsSL https://install.getaish.com | bash
+curl -fsSL https://install.aish.sh | bash
 ```
 
 This script:
@@ -285,7 +285,7 @@ To update to the latest version:
 
 ```bash
 # Method 1: Re-run installer
-curl -fsSL https://install.getaish.com | bash
+curl -fsSL https://install.aish.sh | bash
 
 # Method 2: Manual update
 curl -fsSL https://github.com/anthropics/aish/releases/download/latest/aish-x86_64-unknown-linux-gnu \
@@ -375,7 +375,7 @@ rm -rf ~/.aish
 
 | Step | Command |
 |------|---------|
-| Install | `curl -fsSL https://install.getaish.com \| bash` |
+| Install | `curl -fsSL https://install.aish.sh \| bash` |
 | Set API key | `export ANTHROPIC_API_KEY="sk-ant-..."` |
 | Launch | `aish` |
 | Get help | `:help` (inside aish) |
