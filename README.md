@@ -16,6 +16,19 @@ Mostly ~/models (412G of GGUF weights) — 87% of your usage.
 ~/projects ❯ vim notes.md                          ← interactive: full TTY hand-off
 ```
 
+## Platform Support
+
+**Supported:**
+- **macOS** 12+ (x86_64, arm64/Apple Silicon)
+- **Linux** (glibc 2.35+): Ubuntu 20.04 LTS, Ubuntu 22.04 LTS, Debian 12, Fedora 38+, etc.
+  - **Ubuntu 22.04 LTS**: [Detailed install guide](UBUNTU_22.04_INSTALL.md)
+- **WSL** (Windows Subsystem for Linux) via Ubuntu/Debian base
+
+**Not supported:**
+- Windows native (use WSL instead)
+- iOS/Android
+- FreeBSD (possible but untested)
+
 ## How a line is routed
 
 1. `:command` — REPL meta (`:help`, `:mode`, `:model`, …)
@@ -72,7 +85,39 @@ Mostly ~/models (412G of GGUF weights) — 87% of your usage.
   (session + tools + backend) so it can graduate to a real login shell
   (`/etc/shells`, signals, job control) without rework.
 
-## Usage
+## Installation
+
+### One-Command Ubuntu 22.04 Install
+
+```sh
+curl -sSL https://raw.githubusercontent.com/LightHeart-Ventures/aish/main/install-ubuntu-22.04.sh | bash
+```
+
+This script installs dependencies, builds aish, and registers it in `/etc/shells`.
+
+### Quick Start (All Platforms)
+
+```sh
+# 1. Clone the repo
+git clone https://github.com/LightHeart-Ventures/aish.git
+cd aish
+
+# 2. Install Rust (if needed)
+rustup update stable
+
+# 3. Build and install
+make install
+
+# 4. Set your API key
+export ANTHROPIC_API_KEY=sk-ant-…
+
+# 5. Launch
+aish
+```
+
+**Ubuntu 22.04 LTS users**: See the [detailed Ubuntu 22.04 install guide](UBUNTU_22.04_INSTALL.md) for prerequisites, troubleshooting, and advanced configuration.
+
+### Build from Source
 
 ```sh
 export ANTHROPIC_API_KEY=sk-ant-…
