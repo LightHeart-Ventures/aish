@@ -1,0 +1,12 @@
+aish
+Copyright (c) The aish authors
+
+This product is licensed under the Apache License, Version 2.0.
+
+This product bundles third-party software. See THIRD_PARTY_NOTICES.md for
+direct-dependency attributions.
+
+Portions of this software are licensed under the Mozilla Public License 2.0
+(MPL-2.0). The source for those components is available unmodified from
+crates.io and their upstream repositories. See COMPLIANCE_REPORT.md § 3.3 for
+details.
