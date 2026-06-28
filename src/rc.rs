@@ -111,8 +111,29 @@ pub(crate) fn parse(text: &str) -> Rc {
 /// several profile files in sequence (see [`load_login_profiles`]) and have a
 /// `PATH` extended in `/etc/profile` flow into `~/.profile`.
 fn parse_into(text: &str, rc: &mut Rc) {
-    for line in text.lines() {
-        let line = line.trim();
+    // The diagnosed seam does the parsing AND returns the located diagnostics for
+    // every line aish couldn't honor; here we render each to stderr (caret +
+    // `aish::config::bad_export` code + help). Parsing always continues past a
+    // bad line, so a single malformed export never drops the rest of the file.
+    for d in parse_into_diagnosed(text, rc) {
+        crate::diag::eprint(&d);
+    }
+}
+
+/// Parse `text`'s `alias`/`export` lines INTO `rc` (identical accumulation to
+/// [`parse_into`]) and RETURN the located diagnostics for the lines aish can't
+/// honor — a testable emission seam (S7.1 / TASK-139). The mutation of `rc` is
+/// byte-for-byte what `parse_into` always did; only the previously side-effecting
+/// `eprintln!` skips are now returned as coded [`crate::diag::AishDiagnostic`]
+/// values so a caller (or a test) decides whether/how to surface them. Good
+/// lines still parse regardless of how many bad ones precede them (AC#5).
+pub(crate) fn parse_into_diagnosed(
+    text: &str,
+    rc: &mut Rc,
+) -> Vec<crate::diag::AishDiagnostic> {
+    let mut diags = Vec::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let line = raw.trim();
         if let Some(rest) = line.strip_prefix("alias ") {
             if let Some((name, value)) = split_assignment(rest) {
                 // The replacement has to survive our own tokenizer, or direct
@@ -124,11 +145,19 @@ fn parse_into(text: &str, rc: &mut Rc) {
                 }
             }
         } else if let Some(rest) = line.strip_prefix("export ") {
+            // Byte offset where `rest` starts within the trimmed line, so the
+            // caret lands on the right column of the ORIGINAL export line.
+            let rest_off = line.len() - rest.len();
             match split_assignment(rest) {
                 // Command substitution genuinely needs a shell we don't have.
-                Some((_, value)) if value.contains('`') => eprintln!(
-                    "\x1b[2maish: rc: skipped `{line}` — command substitution (`) needs a shell\x1b[0m"
-                ),
+                Some((_, value)) if value.contains('`') => {
+                    let off = rest_off + export_fault_offset(rest);
+                    diags.push(crate::diag::AishDiagnostic::bad_config_line(
+                        line,
+                        idx + 1,
+                        off,
+                    ));
+                }
                 // Resolve $NAME / ${NAME} against the exports parsed so far, then
                 // the process env — so `export PATH=\"$PATH:$HOME/.local/bin\"`
                 // extends the live PATH at startup.
@@ -136,12 +165,44 @@ fn parse_into(text: &str, rc: &mut Rc) {
                     let expanded = expand(&value, &rc.env);
                     rc.env.push((name, expanded));
                 }
-                None => eprintln!(
-                    "\x1b[2maish: rc: skipped `{line}` — not a plain NAME=value export\x1b[0m"
-                ),
+                None => {
+                    let off = rest_off + export_fault_offset(rest);
+                    diags.push(crate::diag::AishDiagnostic::bad_config_line(
+                        line,
+                        idx + 1,
+                        off,
+                    ));
+                }
             }
         }
     }
+    diags
+}
+
+/// Byte offset WITHIN `rest` (an `export` line's text after the `export `
+/// keyword) of the token that makes it un-honorable — used to place the
+/// diagnostic caret. A command-substitution backtick points at the backtick; an
+/// extra word after a bare value (`A=1 B=2`) points at that second word; any
+/// other shape falls back to the start of the value (or `rest`).
+fn export_fault_offset(rest: &str) -> usize {
+    if let Some(b) = rest.find('`') {
+        return b;
+    }
+    let Some(eq) = rest.find('=') else {
+        return 0;
+    };
+    let after = &rest[eq + 1..];
+    let val_lead = after.len() - after.trim_start().len();
+    let val = after[val_lead..].trim_end();
+    let value_start = eq + 1 + val_lead;
+    // A second whitespace-separated word in a bare value is the fault (the caret
+    // points at the start of that extra word, e.g. `B` in `A=1 B=2`).
+    if let Some(ws) = val.find(char::is_whitespace) {
+        let tail = &val[ws..];
+        let next = tail.len() - tail.trim_start().len();
+        return value_start + ws + next;
+    }
+    value_start
 }
 
 /// Parse `NAME=value` where value may be 'single', "double", or bare-quoted.
@@ -237,22 +298,42 @@ pub fn tokenize(line: &str) -> Option<Vec<String>> {
 /// whitespace nor re-scanned for metacharacters — so a variable can't smuggle
 /// shell syntax (pipes, `;`, …) into the argv.
 pub fn tokenize_with(line: &str, lookup: impl Fn(&str) -> Option<String>) -> Option<Vec<String>> {
+    // The span-aware [`tokenize_diagnosed`] is the single source of truth; the
+    // silent route-to-model path just drops the diagnostic. `.ok()` here is what
+    // guarantees ZERO behavioural change for every caller of `tokenize`/
+    // `tokenize_with` (S7.1 / TASK-139, AC#2).
+    tokenize_diagnosed(line, lookup).ok()
+}
+
+/// Span-aware sibling of [`tokenize_with`]: identical word-splitting and `$VAR`
+/// expansion, but every rejection returns a located [`crate::diag::AishDiagnostic`]
+/// (caret + stable code + help) instead of a bare `None`. This is the one
+/// tokenizer; `tokenize`/`tokenize_with`/`tokenize_pipeline` are `.ok()` shims
+/// over it, so the route-to-model path is byte-for-byte unchanged while the
+/// forced-shell (`!`) path can surface WHY a line wasn't a command (S7.1 /
+/// TASK-139). Byte offsets come from `char_indices`, so a caret lands on the
+/// exact offending byte even with multibyte input.
+pub fn tokenize_diagnosed(
+    line: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<String>, crate::diag::AishDiagnostic> {
+    use crate::diag::AishDiagnostic as D;
     const META: &[char] = &[
         '|', '&', ';', '<', '>', '`', '*', '?', '(', ')', '{', '}', '\\',
     ];
     let mut words: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut in_word = false;
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut chars = line.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
         match c {
             '\'' => {
                 in_word = true;
                 loop {
                     match chars.next() {
-                        Some('\'') => break,
-                        Some(ch) => cur.push(ch),
-                        None => return None, // unbalanced quote
+                        Some((_, '\'')) => break,
+                        Some((_, ch)) => cur.push(ch),
+                        None => return Err(D::unbalanced_quote(line, i)), // opening quote
                     }
                 }
             }
@@ -260,33 +341,36 @@ pub fn tokenize_with(line: &str, lookup: impl Fn(&str) -> Option<String>) -> Opt
                 in_word = true;
                 loop {
                     match chars.next() {
-                        Some('"') => break,
-                        Some('`') => return None, // command substitution
+                        Some((_, '"')) => break,
+                        // command substitution — no shell underneath aish
+                        Some((bi, '`')) => return Err(D::unsupported_meta(line, bi, '`')),
                         // Inside double quotes the word already exists, so even
                         // an empty expansion is part of it.
-                        Some('$') => match expand_dollar(&mut chars, &lookup)? {
-                            Dollar::Expanded(val) => cur.push_str(&val),
-                            Dollar::Literal => cur.push('$'),
+                        Some((di, '$')) => match expand_dollar(&mut chars, &lookup) {
+                            Some(Dollar::Expanded(val)) => cur.push_str(&val),
+                            Some(Dollar::Literal) => cur.push('$'),
+                            None => return Err(D::bad_var_ref(line, di)),
                         },
-                        Some(ch) => cur.push(ch),
-                        None => return None,
+                        Some((_, ch)) => cur.push(ch),
+                        None => return Err(D::unbalanced_quote(line, i)), // opening quote
                     }
                 }
             }
-            '$' => match expand_dollar(&mut chars, &lookup)? {
+            '$' => match expand_dollar(&mut chars, &lookup) {
                 // Unquoted: an empty expansion that isn't adjacent to other text
                 // produces no word at all (POSIX word-splitting), so only join
                 // the word when there's something to add.
-                Dollar::Expanded(val) => {
+                Some(Dollar::Expanded(val)) => {
                     if !val.is_empty() {
                         cur.push_str(&val);
                         in_word = true;
                     }
                 }
-                Dollar::Literal => {
+                Some(Dollar::Literal) => {
                     cur.push('$');
                     in_word = true;
                 }
+                None => return Err(D::bad_var_ref(line, i)),
             },
             c if c.is_whitespace() => {
                 if in_word {
@@ -294,7 +378,7 @@ pub fn tokenize_with(line: &str, lookup: impl Fn(&str) -> Option<String>) -> Opt
                     in_word = false;
                 }
             }
-            c if META.contains(&c) => return None,
+            c if META.contains(&c) => return Err(D::unsupported_meta(line, i, c)),
             c => {
                 in_word = true;
                 cur.push(c);
@@ -304,7 +388,7 @@ pub fn tokenize_with(line: &str, lookup: impl Fn(&str) -> Option<String>) -> Opt
     if in_word {
         words.push(cur);
     }
-    Some(words)
+    Ok(words)
 }
 
 /// Result of reading a `$…` reference after the `$` has been consumed.
@@ -329,18 +413,18 @@ enum Dollar {
 /// Returns None for a malformed `${…}` (unterminated or containing an invalid
 /// character) so the caller rejects the line and routes it to the model.
 fn expand_dollar(
-    chars: &mut std::iter::Peekable<std::str::Chars>,
+    chars: &mut std::iter::Peekable<std::str::CharIndices>,
     lookup: &impl Fn(&str) -> Option<String>,
 ) -> Option<Dollar> {
-    match chars.peek() {
+    match chars.peek().map(|&(_, c)| c) {
         Some('{') => {
             chars.next(); // consume '{'
             // A positional-list special as the sole braced content: ${@} ${*} ${#}.
-            if let Some(&c) = chars.peek() {
+            if let Some(&(_, c)) = chars.peek() {
                 if matches!(c, '@' | '*' | '#') {
                     chars.next();
                     return match chars.next() {
-                        Some('}') => {
+                        Some((_, '}')) => {
                             Some(Dollar::Expanded(lookup(&c.to_string()).unwrap_or_default()))
                         }
                         _ => None, // ${@x} / unterminated → route to the model
@@ -350,8 +434,8 @@ fn expand_dollar(
             let mut name = String::new();
             loop {
                 match chars.next() {
-                    Some('}') => break,
-                    Some(c) if c.is_ascii_alphanumeric() || c == '_' => name.push(c),
+                    Some((_, '}')) => break,
+                    Some((_, c)) if c.is_ascii_alphanumeric() || c == '_' => name.push(c),
                     _ => return None, // invalid char or unterminated ${…}
                 }
             }
@@ -377,19 +461,19 @@ fn expand_dollar(
         // `$1`..`$9` — a positional parameter (single digit, unbraced; POSIX
         // treats `$12` as `$1` then a literal `2`). Feeds script mode's
         // positional params (TASK-18); resolves empty in the REPL/pipeline paths.
-        Some(&c) if c.is_ascii_digit() => {
+        Some(c) if c.is_ascii_digit() => {
             chars.next();
             Some(Dollar::Expanded(lookup(&c.to_string()).unwrap_or_default()))
         }
         // `$@` / `$*` / `$#` — the positional-list special parameters: the script
         // args space-joined (`$@`/`$*`) and their count (`$#`).
-        Some(&c) if matches!(c, '@' | '*' | '#') => {
+        Some(c) if matches!(c, '@' | '*' | '#') => {
             chars.next();
             Some(Dollar::Expanded(lookup(&c.to_string()).unwrap_or_default()))
         }
-        Some(&c) if c.is_ascii_alphabetic() || c == '_' => {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
             let mut name = String::new();
-            while let Some(&c) = chars.peek() {
+            while let Some(&(_, c)) = chars.peek() {
                 if c.is_ascii_alphanumeric() || c == '_' {
                     name.push(c);
                     chars.next();
@@ -790,5 +874,134 @@ mod tests {
         assert_eq!(stages[0][0], "echo");
         assert!(!stages[0][1].contains('$'), "PATH must be expanded");
         assert_eq!(stages[1], vec!["cat"]);
+    }
+
+    // ---- S7.1 / TASK-139: diagnosed tokenizer ----------------------------
+
+    use crate::diag::AishDiagnostic as Diag;
+
+    /// The byte offset of a parse diagnostic's caret, for span assertions.
+    fn diag_offset(d: &Diag) -> usize {
+        match d {
+            Diag::UnbalancedQuote { span, .. }
+            | Diag::UnsupportedMeta { span, .. }
+            | Diag::EmptyStage { span, .. }
+            | Diag::BadVarRef { span, .. }
+            | Diag::BadConfigLine { span, .. } => span.offset(),
+            Diag::ExecFailed { .. } => panic!("exec diagnostic has no span"),
+        }
+    }
+
+    #[test]
+    fn tokenize_diagnosed_ok_matches_tokenize_over_corpus() {
+        // AC#2: `tokenize(x) == tokenize_diagnosed(x).ok()` over a corpus — the
+        // diagnosed tokenizer is the single source of truth, so the silent
+        // route-to-model path is byte-for-byte unchanged.
+        let env = |name: &str| std::env::var(name).ok();
+        let corpus = [
+            "ls -la",
+            "git commit -m \"fix: a thing\"",
+            "echo 'a  b'",
+            "  ",
+            "ls | wc -l",
+            "ls > out",
+            "a && b",
+            "rm *.rs",
+            "what?",
+            "grep 'a|b' x",
+            "what's eating my disk",
+            "echo $HOME/bin",
+            "echo ${UNCLOSED",
+            "echo ${}",
+            "echo \"oops",
+            "echo \"`date`\"",
+            "café résumé",
+        ];
+        for line in corpus {
+            let shim = tokenize(line);
+            let diagnosed = tokenize_diagnosed(line, env).ok();
+            assert_eq!(shim, diagnosed, "divergence on `{line}`");
+        }
+    }
+
+    #[test]
+    fn tokenize_diagnosed_span_offsets_equal_offending_char() {
+        // AC#4: the caret lands on the offending byte.
+        let env = |name: &str| std::env::var(name).ok();
+        let tok = |l: &str| tokenize_diagnosed(l, env).unwrap_err();
+
+        // `|` in `a | | b` — the FIRST `|` (byte 2) is the offending metachar.
+        let d = tok("a | | b");
+        assert!(matches!(d, Diag::UnsupportedMeta { ch: '|', .. }));
+        assert_eq!(diag_offset(&d), 2);
+
+        // `'` in an unbalanced single quote — the opening quote at byte 5.
+        let d = tok("echo 'x");
+        assert!(matches!(d, Diag::UnbalancedQuote { .. }));
+        assert_eq!(diag_offset(&d), 5);
+
+        // unbalanced double quote — opening `"` at byte 5.
+        let d = tok("echo \"x");
+        assert!(matches!(d, Diag::UnbalancedQuote { .. }));
+        assert_eq!(diag_offset(&d), 5);
+
+        // malformed `${…}` — the `$` at byte 5.
+        let d = tok("echo ${");
+        assert!(matches!(d, Diag::BadVarRef { .. }));
+        assert_eq!(diag_offset(&d), 5);
+
+        // command substitution backtick inside double quotes → unsupported_meta
+        // on the backtick (byte 6).
+        let d = tok("echo \"`date`\"");
+        assert!(matches!(d, Diag::UnsupportedMeta { ch: '`', .. }));
+        assert_eq!(diag_offset(&d), 6);
+
+        // multibyte: `café |` — `café` is 5 bytes (é is 2), space at 5, `|` at 6.
+        let d = tok("café |");
+        assert!(matches!(d, Diag::UnsupportedMeta { ch: '|', .. }));
+        assert_eq!(diag_offset(&d), 6);
+    }
+
+    #[test]
+    fn bad_config_line_caret_lands_on_offending_token() {
+        // AC#4: `B` in `export A=1 B=2` (byte 11 of the line).
+        let mut rc = Rc::default();
+        let diags = parse_into_diagnosed("export A=1 B=2\n", &mut rc);
+        assert_eq!(diags.len(), 1);
+        assert!(matches!(diags[0], Diag::BadConfigLine { .. }));
+        assert_eq!(diag_offset(&diags[0]), 11);
+        // The bad export was NOT applied.
+        assert!(!rc.env.iter().any(|(k, _)| k == "A"));
+
+        // Command substitution → caret on the backtick (byte 11).
+        let mut rc = Rc::default();
+        let diags = parse_into_diagnosed("export NOW=`date`\n", &mut rc);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diag_offset(&diags[0]), 11);
+    }
+
+    #[test]
+    fn bad_config_line_emits_diagnostic_and_keeps_good_lines() {
+        // AC#5: a malformed `~/.aishrc` line yields a coded/located diagnostic
+        // AND rc parsing continues — the good export still lands.
+        let mut rc = Rc::default();
+        let diags = parse_into_diagnosed(
+            "export A=1 B=2\n\
+             export GOOD=ok\n\
+             export NOW=`date`\n\
+             export ALSO=fine\n",
+            &mut rc,
+        );
+        // Two bad lines → two diagnostics.
+        assert_eq!(diags.len(), 2);
+        // …and both good exports survived.
+        assert!(rc.env.contains(&("GOOD".into(), "ok".into())));
+        assert!(rc.env.contains(&("ALSO".into(), "fine".into())));
+
+        // The diagnostic renders with the config code and the `~/.aishrc:N`
+        // header (line 1 for the first bad export).
+        let rendered = crate::diag::render_themed(&diags[0], false);
+        assert!(rendered.contains("aish::config::bad_export"), "{rendered}");
+        assert!(rendered.contains("~/.aishrc:1"), "{rendered}");
     }
 }
