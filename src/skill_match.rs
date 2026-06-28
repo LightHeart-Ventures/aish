@@ -396,6 +396,7 @@ mod tests {
             description: description.into(),
             version: "1.0.0".into(),
             reference: reference.into(),
+            stars: 0,
         }
     }
 
