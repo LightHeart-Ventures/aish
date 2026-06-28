@@ -1029,6 +1029,32 @@ mod tests {
     }
 
     #[test]
+    fn raw_body_payload_is_additive_matches_text_only_view() {
+        // S7.4 / AC2: the Ctrl-O raw view is ADDITIVE — attaching a payload must
+        // not change what the human sees. A structured result and a text-only
+        // result built from the SAME content render an identical raw body; the
+        // payload is the MODEL's view (model_content), never substituted into the
+        // human raw view. See docs/S7.4-tests-docs-scope.md §3.
+        let content = "name  type  size\nf.txt file  3";
+        let text = ToolResult::text("t", content, false);
+        let structured = ToolResult::structured(
+            "t",
+            content,
+            serde_json::json!([{"name": "f.txt", "type": "file", "size": 3}]),
+            false,
+        );
+        assert_eq!(
+            raw_body(&structured),
+            raw_body(&text),
+            "payload must not alter the raw view"
+        );
+        assert_eq!(raw_body(&structured), content);
+        // And the model sees something different (the compact JSON) — proving the
+        // payload is additive, not a no-op and not a substitute for the raw view.
+        assert_ne!(raw_body(&structured), structured.model_content());
+    }
+
+    #[test]
     fn tool_result_line_marks_status() {
         let ok = tool_result_line("read /etc/hosts", false);
         assert!(ok.contains("\x1b[32m✓\x1b[0m"), "success checkmark should be green: {ok}");

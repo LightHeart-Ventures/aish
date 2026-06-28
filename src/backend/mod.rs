@@ -62,8 +62,13 @@ pub struct ToolResult {
     /// Optional typed payload for tools whose output is already structured
     /// (records / tables). `content` stays the rendered, human-readable source
     /// of truth; this is additive JSON the model can consume without
-    /// re-parsing the text. `None` for free-form / text-only tools — by design
-    /// (this is NOT a typed pipeline; see the S7.2 PRD non-goals).
+    /// re-parsing the text. `None` for free-form / text-only tools.
+    ///
+    /// SCOPE GUARDRAIL (S7.4): this payload is a passive, per-call, OPAQUE
+    /// attachment the model reads — NOT a value in a programmable pipeline.
+    /// aish may *describe* a result in a typed way; it must never *operate* on
+    /// these types (no piping/composition, no query language, no persistent
+    /// typed store, no schema registry). See docs/S7.4-tests-docs-scope.md §3.
     pub structured: Option<Value>,
 }
 
@@ -413,6 +418,52 @@ mod tests {
         let t = ToolResult::text("t2", "plain output", false);
         assert_eq!(t.model_content(), "plain output");
         assert!(matches!(t.model_content(), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn structured_payload_is_additive_never_substitutes_content() {
+        // S7.4 / AC1+AC2: the typed payload is ADDITIVE. Attaching it must never
+        // mutate or replace `content` or `is_error` — a structured result and a
+        // text-only result built from the SAME content+flag are byte-identical
+        // in every human-facing field and differ ONLY in the model-facing
+        // representation (compact JSON vs verbatim text). This is the invariant
+        // the whole S7 structured-results capability rests on; see
+        // docs/S7.4-tests-docs-scope.md §3.
+        let content = "name  type  size\nf.txt file  3";
+        let payload = serde_json::json!([{"name": "f.txt", "type": "file", "size": 3}]);
+
+        let text = ToolResult::text("id", content, false);
+        let structured = ToolResult::structured("id", content, payload.clone(), false);
+
+        // String-only path: no payload, content fed to the model verbatim (and
+        // BORROWED — no JSON allocation), is_error preserved.
+        assert!(text.structured.is_none(), "text-only carries no payload");
+        assert_eq!(text.model_content(), content);
+        assert!(matches!(text.model_content(), std::borrow::Cow::Borrowed(_)));
+
+        // Structured path: payload present, but content + is_error are UNCHANGED
+        // relative to the text-only result — the payload is purely additive.
+        assert_eq!(
+            structured.content, text.content,
+            "payload must not substitute content"
+        );
+        assert_eq!(
+            structured.is_error, text.is_error,
+            "payload must not touch is_error"
+        );
+        assert_eq!(structured.structured.as_ref(), Some(&payload));
+
+        // The ONLY observable difference is the model-facing view: compact JSON
+        // for the structured result, verbatim content for the text-only one.
+        assert_ne!(structured.model_content(), text.model_content());
+        assert_eq!(
+            structured.model_content(),
+            r#"[{"name":"f.txt","size":3,"type":"file"}]"#
+        );
+
+        // is_error is honoured independently of the payload on BOTH paths.
+        assert!(ToolResult::text("e", "boom", true).is_error);
+        assert!(ToolResult::structured("e", "boom", serde_json::json!({}), true).is_error);
     }
 
     #[test]

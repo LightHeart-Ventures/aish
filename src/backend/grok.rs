@@ -727,6 +727,25 @@ mod tests {
     }
 
     #[test]
+    fn render_string_only_tool_result_wire_shape_has_no_payload_key() {
+        // S7.4 / AC1: a text-only ToolResult renders to the OpenAI role:"tool"
+        // message EXACTLY as before structured results existed — the three
+        // canonical keys only (role, tool_call_id, content), `content` verbatim.
+        // The typed payload is consumed by model_content(); it must NEVER leak
+        // onto the wire as a `structured`/`payload` sibling. The exact-key-count
+        // assertion is the guardrail.
+        let msg = Msg::tool_results(vec![ToolResult::text("call_1", "verbatim output", false)]);
+        let msgs = render_messages(&[msg]);
+        let m = msgs[0].as_object().unwrap();
+        assert_eq!(m["role"], "tool");
+        assert_eq!(m["tool_call_id"], "call_1");
+        assert_eq!(m["content"], "verbatim output"); // content verbatim
+        assert_eq!(m.len(), 3, "string-only tool message carries no extra key: {m:?}");
+        assert!(m.get("structured").is_none());
+        assert!(m.get("payload").is_none());
+    }
+
+    #[test]
     fn render_tool_result_threads_structured_json_to_model() {
         // S7.3 / AC1: a structured tool result becomes the model-facing content
         // (compact JSON) in its role:"tool" message; a text result stays verbatim.
