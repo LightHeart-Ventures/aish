@@ -710,16 +710,8 @@ mod tests {
     #[test]
     fn render_tool_results_expand_to_one_message_each() {
         let msg = Msg::tool_results(vec![
-            ToolResult {
-                id: "call_1".into(),
-                content: "out1".into(),
-                is_error: false,
-            },
-            ToolResult {
-                id: "call_2".into(),
-                content: "out2".into(),
-                is_error: true,
-            },
+            ToolResult::text("call_1", "out1", false),
+            ToolResult::text("call_2", "out2", true),
         ]);
         let msgs = render_messages(&[msg]);
         // One Msg → TWO role:"tool" messages.

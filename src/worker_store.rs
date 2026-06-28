@@ -683,11 +683,8 @@ fn records_to_history(records: &[TranscriptRecord]) -> Vec<Msg> {
                     .clone()
                     .or_else(|| last_call_id.take())
                     .unwrap_or_else(|| format!("seq{}", rec.seq));
-                let result = ToolResult {
-                    id,
-                    content: rec.output.clone().unwrap_or_default(),
-                    is_error: rec.is_error,
-                };
+                let result =
+                    ToolResult::text(id, rec.output.clone().unwrap_or_default(), rec.is_error);
                 history.push(Msg::tool_results(vec![result]));
             }
             "truncation" => {} // a rotation marker is not conversational
