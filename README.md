@@ -21,7 +21,6 @@ Mostly ~/models (412G of GGUF weights) — 87% of your usage.
 **Supported:**
 - **macOS** 12+ (x86_64, arm64/Apple Silicon)
 - **Linux** (glibc 2.35+): Ubuntu 24.04 LTS, Ubuntu 20.04 LTS, Debian 12, Fedora 38+, etc.
-  - **Ubuntu 24.04 LTS**: [Detailed install guide](UBUNTU_24.04_INSTALL.md)
 - **WSL** (Windows Subsystem for Linux) via Ubuntu/Debian base
 
 **Not supported:**
@@ -87,70 +86,137 @@ Mostly ~/models (412G of GGUF weights) — 87% of your usage.
 
 ## Installation
 
-### One-Command Ubuntu Install
+### Prerequisites
 
-Pick the script matching your release — both install dependencies, build aish,
-and register it in `/etc/shells`.
+**Required:**
+- Anthropic Claude API key (free at https://console.anthropic.com)
+- ~50 MB disk space
+- ~4 GB RAM (8 GB+ recommended for `--backend local`)
 
-**Ubuntu 24.04 LTS (Noble Numbat)**
-```sh
-# From main (recommended once CDN syncs)
-curl -sSL https://raw.githubusercontent.com/LightHeart-Ventures/aish/main/install-ubuntu-24.04.sh | bash
+**Linux (Ubuntu 24.04 LTS):**
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential \
+  cmake \
+  rustup \
+  git \
+  ca-certificates \
+  curl \
+  pkg-config \
+  libssl-dev \
+  perl
+```
 
-# Or from a repo clone (works immediately)
-git clone https://github.com/LightHeart-Ventures/aish.git
-cd aish && bash install-ubuntu-24.04.sh
+> **Note:** `cmake` and `perl` are required even for Claude-only build — the HTTP
+> stack vendors BoringSSL, which uses CMake.
+
+**macOS:**
+```bash
+# Xcode Command Line Tools (if not already installed)
+xcode-select --install
+
+# Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
 ### Quick Start (All Platforms)
 
+**1. Clone and build:**
 ```sh
-# 1. Clone the repo
 git clone https://github.com/LightHeart-Ventures/aish.git
 cd aish
-
-# 2. Install Rust (if needed)
-rustup update stable
-
-# 3. Build and install
 make install
+```
 
-# 4. Set your API key
+**2. Set your API key:**
+```sh
 export ANTHROPIC_API_KEY=sk-ant-…
+```
 
-# 5. Launch
+**3. Launch:**
+```sh
 aish
 ```
 
-**Ubuntu LTS users**: See the [detailed install guide](UBUNTU_24.04_INSTALL.md) for prerequisites, troubleshooting, and advanced configuration.
+### Ubuntu 24.04 LTS Installer Script
 
-### Build from Source
-
+For a one-command setup on Ubuntu:
 ```sh
-export ANTHROPIC_API_KEY=sk-ant-…
-cargo run --release                 # interactive shell
-cargo run --release -- -c "prompt"  # one-shot (login-shell -c style)
-cargo run --release -- script.aish  # run a script file, then exit
-cargo run --release -- --backend local   # offline, in-process Qwen3-1.7B
-cargo run --release -- --mode careful    # stricter confirmation gate
-cargo build --no-default-features   # fast Claude-only build (skips mistral.rs)
+# From main
+curl -sSL https://raw.githubusercontent.com/LightHeart-Ventures/aish/main/scripts/install-ubuntu-24.04.sh | bash
+
+# Or from a repo clone
+git clone https://github.com/LightHeart-Ventures/aish.git
+cd aish && bash scripts/install-ubuntu-24.04.sh
 ```
 
-Local model selection (no rebuild): `AISH_LOCAL_MODEL_ID` picks the GGUF repo
-(default `Qwen/Qwen3-1.7B-GGUF`, which ships a single `Q8_0` quant); for other
-repos the tokenizer and `*-Q4_K_M.gguf` filename are derived from the Qwen
-naming convention, or set explicitly with `AISH_LOCAL_TOK_ID` /
-`AISH_LOCAL_MODEL_FILE`:
+The script installs dependencies, builds aish, and registers it in `/etc/shells`.
 
+### Build from Source (Advanced)
+
+**Claude API only (fast, minimal):**
+```sh
+export ANTHROPIC_API_KEY=sk-ant-…
+cargo build --release --no-default-features
+./target/release/aish --version
+```
+
+**Full build (with Qwen3-1.7B local model support):**
+```sh
+export ANTHROPIC_API_KEY=sk-ant-…
+cargo build --release
+./target/release/aish --version
+```
+
+**One-shot command:**
+```sh
+cargo run --release -- -c "who is alan turing"
+```
+
+**Custom local model (no rebuild):**
 ```sh
 AISH_LOCAL_MODEL_ID=Qwen/Qwen3-4B-GGUF cargo run --release -- --backend local
 ```
 
-REPL commands: `:mode <paranoid|careful|normal|yolo>` · `:model <opus|sonnet|haiku|id>` ·
-`:backend <claude|local>` · `:yolo` · `:new` · `:help` · `:quit` (or Ctrl-D / `exit`).
-Ctrl-C aborts the current turn — or interrupts the foreground child during a
-TTY hand-off, exactly like a shell. `→`/`Ctrl-F` accept the history
-autosuggestion.
+### Configuration
+
+**Set your API key (required):**
+```bash
+export ANTHROPIC_API_KEY=sk-ant-…
+aish   # launch
+```
+
+**Optional: Default model**
+```bash
+export AISH_MODEL="claude-opus-4-6"
+aish
+```
+
+**Optional: Offline mode (local model)**
+```bash
+aish --backend local    # uses Qwen3-1.7B (first run downloads ~4 GB)
+```
+
+**Optional: Strict confirmation mode**
+```bash
+aish --mode paranoid    # confirm every tool call
+aish --mode careful     # confirm writes only
+```
+
+### REPL Commands
+
+`:mode <paranoid|careful|normal|yolo>` — set permission gate
+· `:model <opus|sonnet|haiku|id>` — switch model
+· `:backend <claude|local>` — switch inference backend
+· `:yolo` — shorthand for `:mode yolo`
+· `:new` — start a fresh session
+· `:help` — show all commands
+· `:quit` (or Ctrl-D / `exit`) — exit
+
+Ctrl-C aborts the current turn; during TTY hand-off (interactive programs like
+`vim`, `ssh`) it interrupts the foreground child, exactly like a shell.
+`→`/`Ctrl-F` accept history ghost-text suggestions.
 
 ## Scripting
 
@@ -207,8 +273,7 @@ are stored unencrypted in `~/.aish/aish.db`.
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option. Unless you explicitly state
-otherwise, any contribution intentionally submitted for inclusion in this
-crate, as defined in the Apache-2.0 license, shall be dual licensed as above,
-without any additional terms or conditions.
+Licensed under the [Apache License, Version 2.0](LICENSE-APACHE).
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this crate shall be licensed as above, without any
+additional terms or conditions.
