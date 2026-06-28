@@ -89,11 +89,18 @@ Mostly ~/models (412G of GGUF weights) — 87% of your usage.
 
 ### One-Command Ubuntu 22.04 Install
 
+**Option 1: From main (recommended once CDN syncs)**
 ```sh
 curl -sSL https://raw.githubusercontent.com/LightHeart-Ventures/aish/main/install-ubuntu-22.04.sh | bash
 ```
 
-This script installs dependencies, builds aish, and registers it in `/etc/shells`.
+**Option 2: From repo clone (works immediately)**
+```sh
+git clone https://github.com/LightHeart-Ventures/aish.git
+cd aish && bash install-ubuntu-22.04.sh
+```
+
+The script installs dependencies, builds aish, and registers it in `/etc/shells`.
 
 ### Quick Start (All Platforms)
 
