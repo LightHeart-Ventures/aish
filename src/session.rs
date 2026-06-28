@@ -444,7 +444,13 @@ which can itself fan heavy parallel sub-work out to the Anthropic Batches API. T
 \"batch\" mode to choose and no batch_result() to call — you just describe the task and offload it; the \
 result auto-delivers here when it's done. It returns a job id immediately and survives restarts. PREFER \
 run_in_background for deferrable, parallelizable, or non-urgent work — it keeps the conversation moving. \
-Only answer inline when the user needs the result right now. To answer \"what's running?\" call \
+Only answer inline when the user needs the result right now — and ALWAYS answer a QUESTION inline \
+rather than offloading it. Offloading is for NEW work the user is asking you to DO; a question — \
+including \"didn't we already dispatch a worker for this?\", \"what is it doing?\", or any ask about \
+the status or history of existing work — is something you ANSWER, not a task to spawn a coordinator \
+for. Read the request first: if it is a question, reach for background_status (or the relevant \
+lookup) and reply; dispatching a fresh coordinator to answer whether a coordinator was already \
+dispatched is exactly the wrong move. To answer \"what's running?\" call \
 background_status (never invent your own tracking). Steer a coordinator that is ALREADY running without restarting it: call the `tell` tool with its run id (from background_status) and a message — a clarification, a course-correction, a narrower scope — and it is folded into that coordinator's next round; this is how you and your background coordinators message each other mid-flight. When you offload, call run_in_background with NO \
 preamble, then reply with ONE short, natural sentence — tailored to what they asked — saying you're \
 handling it in the background and the answer will appear here when it's ready (e.g. \"On it — I'll work \
