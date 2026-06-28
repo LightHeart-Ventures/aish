@@ -232,11 +232,7 @@ mod tests {
         }
     }
     fn tool_results(content: &str) -> Msg {
-        Msg::tool_results(vec![ToolResult {
-            id: "t1".into(),
-            content: content.into(),
-            is_error: false,
-        }])
+        Msg::tool_results(vec![ToolResult::text("t1", content, false)])
     }
 
     #[test]

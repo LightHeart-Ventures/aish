@@ -69,6 +69,10 @@ pub struct Session {
     /// and, when one clearly fits, a short note pointing at its SKILL.md is
     /// folded into the turn input.
     pub skills: Vec<crate::skills::Skill>,
+    /// Registry skill refs already recommended-for-install this session (the
+    /// offline `crate::skill_match::recommend_install` path). Deduped so the same
+    /// "you could install `<ref>`" nudge fires at most once per session.
+    pub skill_suggested: HashSet<String>,
     /// Connected MCP servers; their tools join the model's tool set.
     pub mcp: crate::mcp::McpHost,
     /// Persistent store (history + agent memories). None if it failed to open.
@@ -201,6 +205,7 @@ impl Session {
             env: Vec::new(),
             skills_prompt: String::new(),
             skills: Vec::new(),
+            skill_suggested: HashSet::new(),
             mcp: crate::mcp::McpHost::default(),
             db: None,
             raw_tool_output: false,

@@ -199,15 +199,18 @@ async fn run_directly(
     // Single command. `$VAR`/`$?` and the positional `$0`/`$1`/`$@`/… expand
     // against the script params and the session's exports first, then the
     // process environment — what the spawned program would see.
-    let Some(mut words) = rc::tokenize_with(line, var_lookup(session, params)) else {
-        if force {
-            eprintln!(
-                "aish: can't run that directly — it uses shell syntax aish doesn't implement"
-            );
-            session.last_status = 1;
-            return Step::Ran;
+    let mut words = match rc::tokenize_diagnosed(line, var_lookup(session, params)) {
+        Ok(w) => w,
+        Err(diag) => {
+            // Forced (`!`): surface the coded diagnostic (caret + code + help).
+            // Auto: stay silent and route the line to the model.
+            if force {
+                crate::diag::eprint(&diag);
+                session.last_status = 1;
+                return Step::Ran;
+            }
+            return Step::NotACommand;
         }
-        return Step::NotACommand;
     };
     let Some(first) = words.first().cloned() else {
         return Step::NotACommand;

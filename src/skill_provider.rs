@@ -82,6 +82,19 @@ pub fn initialize_registry(aish_dir: &Path) -> std::io::Result<()> {
     std::fs::write(dir.join("index.json"), EMBEDDED_INDEX)
 }
 
+/// Read + parse the binary-shipped registry index (`~/.aish/registry/index.json`,
+/// written by [`initialize_registry`] on startup) WITHOUT any network — the
+/// source for the per-turn, offline skill-install recommendation
+/// (`crate::skill_match::recommend_install`). Returns the full curated catalog
+/// for the caller to rank in-process. Best-effort: a missing/unreadable/invalid
+/// index yields an empty list, never an error, so the hot path can't fail on it.
+pub fn local_index_catalog() -> Vec<SearchResult> {
+    let Ok(body) = std::fs::read_to_string(local_registry_path()) else {
+        return Vec::new();
+    };
+    parse_search_body(&body).unwrap_or_default()
+}
+
 /// A parsed reference to a skill on the registry.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SkillRef {
@@ -268,7 +281,8 @@ pub fn import(text: &str, skills_dir: &Path) -> Result<PathBuf> {
 
 /// CLI entry point for `aish --skill-fetch <ref>`: parse, fetch, import, report.
 /// Accepts a skill.fish `owner/name[@version]` ref, a `github:owner/repo[/path]`
-/// spec, or a `https://github.com/...` URL. A GitHub spec that points at a repo
+/// spec, a `https://github.com/...` URL, or a `https://raw.githubusercontent.com/
+/// owner/repo/<ref>/path/SKILL.md` raw URL. A GitHub spec that points at a repo
 /// (rather than a single skill) imports every SKILL.md discovered under it.
 pub async fn run_fetch(input: &str, skills_dir: &Path) -> Result<()> {
     let imported = add(input, skills_dir).await?;
@@ -305,7 +319,8 @@ pub struct ImportedSkill {
 
 /// Unified import entry point used by both the CLI (`--skill-fetch`) and the
 /// interactive `:skill add`. Detects the source from `input`:
-///   * a `github:owner/repo[/path][@ref]` spec or `https://github.com/...` URL
+///   * a `github:owner/repo[/path][@ref]` spec, a `https://github.com/...` URL,
+///     or a `https://raw.githubusercontent.com/...` raw URL
 ///     → GitHub path resolution + (possibly multi-skill) discovery & import;
 ///   * anything else → a skill.fish `owner/name[@version]` ref, fetched and
 ///     imported as a single skill.
@@ -315,15 +330,64 @@ pub async fn add(input: &str, skills_dir: &Path) -> Result<Vec<ImportedSkill>> {
         return add_github(&gh, skills_dir).await;
     }
     let r = parse_ref(input)?;
-    let text = fetch(&r).await?;
-    let path = import(&text, skills_dir)?;
-    let (name, description) =
-        crate::skills::parse_frontmatter(&text).unwrap_or((r.name.clone(), String::new()));
-    Ok(vec![ImportedSkill {
-        name,
-        description,
-        path,
-    }])
+    match fetch(&r).await {
+        Ok(text) => {
+            let path = import(&text, skills_dir)?;
+            let (name, description) =
+                crate::skills::parse_frontmatter(&text).unwrap_or((r.name.clone(), String::new()));
+            Ok(vec![ImportedSkill {
+                name,
+                description,
+                path,
+            }])
+        }
+        // The bare `owner/name` wasn't fetchable as a skill.fish skill. It may be
+        // a SHORT NAME shown by `--skill-search` (whose rows are mcpmarket/GitHub
+        // hits keyed by a long URL). Resolve the short name back to its real
+        // fetchable reference and import that, so what the table prints is
+        // exactly what `--skill-fetch` / `:skill add` accept.
+        Err(skillfish_err) => match resolve_ref_via_search(input).await {
+            Ok(reference) => {
+                if let Some(gh) = parse_github_ref(&reference) {
+                    return add_github(&gh, skills_dir).await;
+                }
+                let r2 = parse_ref(&reference)?;
+                let text = fetch(&r2).await?;
+                let path = import(&text, skills_dir)?;
+                let (name, description) = crate::skills::parse_frontmatter(&text)
+                    .unwrap_or((r2.name.clone(), String::new()));
+                Ok(vec![ImportedSkill {
+                    name,
+                    description,
+                    path,
+                }])
+            }
+            // No registry match either — surface the original fetch error.
+            Err(_) => Err(skillfish_err),
+        },
+    }
+}
+
+/// Resolve a short `owner/skill` name (as printed by `--skill-search`) back to a
+/// fetchable reference by re-querying the registry and matching on
+/// [`SearchResult::short_name`]. When several hits share the short name, the
+/// most-starred wins. Errors when nothing matches, so the caller can fall back
+/// to the original fetch error.
+async fn resolve_ref_via_search(input: &str) -> Result<String> {
+    let needle = input.trim().to_lowercase();
+    // Query with the leaf skill name to get a focused candidate set.
+    let leaf = needle.rsplit('/').next().unwrap_or(&needle).to_string();
+    let results = search(&leaf).await?;
+    let best = results
+        .iter()
+        .filter(|r| r.short_name().to_lowercase() == needle)
+        .max_by_key(|r| r.stars);
+    match best {
+        Some(r) => Ok(r.ref_or_synth()),
+        None => bail!(
+            "no skill named {input:?} in the registry — run `aish --skill-search {leaf}` to see exact names"
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +417,11 @@ pub struct SearchResult {
         alias = "id"
     )]
     pub reference: String,
+    /// Popularity signal from the registry (mcpmarket's `github_stars`). 0 when
+    /// the source doesn't report it. Surfaced as the STARS column and used to
+    /// rank results most-popular-first.
+    #[serde(default, alias = "github_stars", alias = "stars_count")]
+    pub stars: u64,
 }
 
 impl SearchResult {
@@ -367,6 +436,65 @@ impl SearchResult {
             format!("{}/{}", self.author, self.name)
         } else {
             self.name.clone()
+        }
+    }
+
+    /// A short, human-readable `author/skill` label for the SKILL column —
+    /// the readable counterpart to [`ref_or_synth`], which often holds a long
+    /// `https://github.com/owner/repo/tree/<sha>/path/skill` URL that's painful
+    /// to scan. Prefers the explicit `author` + `name`; when those are missing
+    /// it distills a short name out of the reference: for a GitHub tree/blob URL
+    /// it takes the repo owner and the leaf skill directory (e.g.
+    /// `openhands/skills/tree/<sha>/skills/github` → `openhands/github`); for a
+    /// bare `owner/name` ref it passes through unchanged.
+    pub fn short_name(&self) -> String {
+        let author = self.author.trim();
+        let name = self.name.trim();
+        if !author.is_empty() && !name.is_empty() {
+            return format!("{author}/{name}");
+        }
+        short_name_from_ref(&self.ref_or_synth())
+    }
+}
+
+/// Distill a compact `owner/skill` label from a registry reference. Handles a
+/// full `github.com/<owner>/<repo>/tree|blob/<ref>/<path…>/<skill>` URL by
+/// pairing the repo owner with the leaf path segment (the skill's own
+/// directory), and leaves a short `owner/name` ref untouched. Pure + testable.
+fn short_name_from_ref(reference: &str) -> String {
+    let r = reference.trim();
+    // Strip a known host prefix so we're left with path segments.
+    let path = r
+        .strip_prefix("https://github.com/")
+        .or_else(|| r.strip_prefix("http://github.com/"))
+        .or_else(|| r.strip_prefix("github.com/"))
+        .or_else(|| r.strip_prefix("https://skill.fish/"))
+        .unwrap_or(r)
+        .trim_matches('/');
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match segs.as_slice() {
+        [] => r.to_string(),
+        [only] => only.to_string(),
+        [owner, rest @ ..] => {
+            // Drop a `tree`/`blob` + ref marker and any trailing `SKILL.md`, then
+            // take the leaf path segment as the skill name.
+            let mut tail: Vec<&str> = rest.to_vec();
+            if matches!(tail.first().copied(), Some("tree") | Some("blob")) && tail.len() >= 2 {
+                tail.drain(0..2);
+            }
+            if tail.last().copied() == Some("SKILL.md") {
+                tail.pop();
+            }
+            // Skip generic container directories so the leaf is the real skill.
+            while tail.len() > 1
+                && matches!(tail.last().copied(), Some("skills") | Some("skill"))
+            {
+                tail.pop();
+            }
+            match tail.last() {
+                Some(skill) => format!("{owner}/{skill}"),
+                None => owner.to_string(),
+            }
         }
     }
 }
@@ -554,45 +682,45 @@ fn skills_dir_path() -> PathBuf {
 }
 
 /// Render search results as a plain, aligned text table (returned, not printed,
-/// so it's unit-testable). Columns: the `owner/name` reference, the version,
-/// a truncated one-line description, and metadata (installed status and registry source).
-/// An empty list renders the "no matches" line.
+/// so it's unit-testable). Columns: a short `author/skill` name, the GitHub
+/// star count (popularity), a truncated one-line description, and an installed
+/// marker. Results are ordered most-starred-first so the strongest candidate
+/// leads. An empty list renders the "no matches" line.
 pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
     if results.is_empty() {
         return format!("No skills found for {query:?}.");
     }
-    const DESC_MAX: usize = 50;
-    
-    // Load locally installed skills to check for matches
+    const DESC_MAX: usize = 56;
+
+    // Rank most-popular-first while keeping the registry's relative order as the
+    // stable tiebreaker (sort_by is stable), so 0-star ties preserve relevance.
+    let mut ranked: Vec<&SearchResult> = results.iter().collect();
+    ranked.sort_by(|a, b| b.stars.cmp(&a.stars));
+
+    // Load locally installed skills to mark ones already in the catalog.
     let installed = crate::skills::load(&skills_dir_path());
-    let installed_names: std::collections::HashSet<_> = installed.iter().map(|s| s.name.clone()).collect();
-    
-    let refs: Vec<String> = results.iter().map(|r| r.ref_or_synth()).collect();
-    let vers: Vec<String> = results
+    let installed_names: std::collections::HashSet<_> =
+        installed.iter().map(|s| s.name.clone()).collect();
+
+    let names: Vec<String> = ranked.iter().map(|r| r.short_name()).collect();
+    let stars: Vec<String> = ranked
         .iter()
-        .map(|r| {
-            if r.version.trim().is_empty() {
-                "-".to_string()
-            } else {
-                r.version.clone()
-            }
-        })
+        .map(|r| if r.stars > 0 { format!("★ {}", r.stars) } else { "-".to_string() })
         .collect();
-    let descs: Vec<String> = results
+    let descs: Vec<String> = ranked
         .iter()
         .map(|r| truncate(&r.description, DESC_MAX))
         .collect();
-    
-    // Note: registry source detection is not yet implemented (future enhancement).
-    // All results currently show as "remote" or "local" implicitly via the search function.
-    
-    // Check if each result is installed (by comparing with the loaded catalog)
-    let statuses: Vec<String> = results
+    let statuses: Vec<String> = ranked
         .iter()
         .map(|r| {
-            let ref_key = r.ref_or_synth();
-            let name = ref_key.split('/').last().unwrap_or(&ref_key);
-            if installed_names.contains(&name.to_string()) {
+            // A result counts as installed if either its short skill name or its
+            // raw `name` field matches a locally-installed skill directory.
+            let leaf = r.short_name();
+            let leaf = leaf.rsplit('/').next().unwrap_or(&leaf);
+            if installed_names.contains(&leaf.to_string())
+                || (!r.name.is_empty() && installed_names.contains(&r.name))
+            {
                 "✓ installed".to_string()
             } else {
                 String::new()
@@ -600,18 +728,18 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
         })
         .collect();
 
-    let ref_w = refs
+    let name_w = names
         .iter()
         .map(|s| s.chars().count())
         .chain(std::iter::once("SKILL".len()))
         .max()
         .unwrap_or(5);
-    let ver_w = vers
+    let star_w = stars
         .iter()
         .map(|s| s.chars().count())
-        .chain(std::iter::once("VERSION".len()))
+        .chain(std::iter::once("STARS".len()))
         .max()
-        .unwrap_or(7);
+        .unwrap_or(5);
     let status_w = statuses
         .iter()
         .map(|s| s.chars().count())
@@ -619,25 +747,34 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
         .max()
         .unwrap_or(6);
 
+    // Respect --no-color / NO_COLOR / a piped stdout so escape codes never leak
+    // into a grep or a redirect (skill output is routinely piped).
+    let color = crate::style::colors_enabled();
+    let (bold, dim, green, yellow, reset) = if color {
+        ("\x1b[1m", "\x1b[2m", "\x1b[32m", "\x1b[33m", "\x1b[0m")
+    } else {
+        ("", "", "", "", "")
+    };
+
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<ref_w$}  {:<ver_w$}  {:<50}  {:<status_w$}\n",
-        "SKILL", "VERSION", "DESCRIPTION", "STATUS"
+        "{:<name_w$}  {:>star_w$}  {:<DESC_MAX$}  {:<status_w$}\n",
+        "SKILL", "STARS", "DESCRIPTION", "STATUS"
     ));
-    for i in 0..results.len() {
-        let status_color = if !statuses[i].is_empty() {
-            "\x1b[32m" // green for installed
-        } else {
-            "\x1b[2m" // dim for not installed
-        };
+    for i in 0..ranked.len() {
+        let status_color = if statuses[i].is_empty() { dim } else { green };
         out.push_str(&format!(
-            "{:<ref_w$}  {:<ver_w$}  {:<50}  {}{:<status_w$}\x1b[0m\n",
-            refs[i], vers[i], descs[i], status_color, statuses[i]
+            "{bold}{:<name_w$}{reset}  {yellow}{:>star_w$}{reset}  {:<DESC_MAX$}  {status_color}{:<status_w$}{reset}\n",
+            names[i], stars[i], descs[i], statuses[i]
         ));
     }
+    // Echo the top hit so the suggested fetch command is copy-paste ready.
+    let top = names.first().cloned().unwrap_or_default();
     out.push_str(&format!(
-        "\n{} result(s) — fetch one with `aish --skill-fetch <skill>` or `:skill add <skill>`",
-        results.len()
+        "\n{} result(s) — fetch one by name, e.g. `aish --skill-fetch {}` or `:skill add {}`",
+        ranked.len(),
+        top,
+        top
     ));
     out
 }
@@ -659,7 +796,8 @@ pub async fn run_search(query: &str) -> Result<()> {
     if query.is_empty() {
         bail!("empty search query — try `aish --skill-search <query>`");
     }
-    println!("\x1b[2msearching {} for {query:?} …\x1b[0m", registry());
+    let line = format!("searching {} for {query:?} …", registry());
+    println!("{}", crate::style::dim(&line));
     let results = search(query).await?;
     println!("{}", print_results_table(query, &results));
     Ok(())
@@ -677,6 +815,15 @@ pub async fn run_search(query: &str) -> Result<()> {
 /// The mcpmarket origin. Override with `AISH_MCPMARKET_BASE` (used by the tests
 /// to point at a loopback server, and available as an escape hatch for a mirror).
 const MCPMARKET_BASE: &str = "https://mcpmarket.com";
+
+/// Whether to emit the verbose `[mcpmarket]` retry/transport trace to stderr.
+/// Off by default — those lines were polluting a normal `--skill-search` run.
+/// Set `AISH_SKILL_DEBUG=1` to turn the trace back on for troubleshooting.
+fn skill_debug() -> bool {
+    std::env::var("AISH_SKILL_DEBUG")
+        .map(|v| v != "0" && !v.trim().is_empty())
+        .unwrap_or(false)
+}
 
 /// How many skills to ask mcpmarket for. Matches the registry's own `limit=50`.
 const MCPMARKET_LIMIT: usize = 50;
@@ -722,9 +869,12 @@ async fn search_mcpmarket_with_base(
     let client = http_client()?;
     let mut last_error: Option<anyhow::Error> = None;
     
+    let debug = skill_debug();
     // Retry up to 3 times with exponential backoff (matching skillfish)
     for attempt in 0..3 {
-        eprintln!("[mcpmarket] attempt {} of 3...", attempt + 1);
+        if debug {
+            eprintln!("[mcpmarket] attempt {} of 3...", attempt + 1);
+        }
         let resp = match client
             .get(&url)
             .header("Referer", "https://mcpmarket.com/")
@@ -735,10 +885,14 @@ async fn search_mcpmarket_with_base(
         {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[mcpmarket] request failed: {e}");
+                if debug {
+                    eprintln!("[mcpmarket] request failed: {e}");
+                }
                 last_error = Some(e.into());
                 if attempt < 2 {
-                    eprintln!("[mcpmarket] sleeping {}ms before retry...", MCPMARKET_RETRY_DELAYS_MS[attempt]);
+                    if debug {
+                        eprintln!("[mcpmarket] sleeping {}ms before retry...", MCPMARKET_RETRY_DELAYS_MS[attempt]);
+                    }
                     tokio::time::sleep(tokio::time::Duration::from_millis(
                         MCPMARKET_RETRY_DELAYS_MS[attempt],
                     ))
@@ -748,12 +902,16 @@ async fn search_mcpmarket_with_base(
                 return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("request failed")));
             }
         };
-        
-        eprintln!("[mcpmarket] got response: {}", resp.status());
+
+        if debug {
+            eprintln!("[mcpmarket] got response: {}", resp.status());
+        }
         // 429 (Vercel challenge) → retry with backoff
         if resp.status().as_u16() == 429 {
             if attempt < 2 {
-                eprintln!("[mcpmarket] 429 on attempt {}, retrying in {}ms...", attempt + 1, MCPMARKET_RETRY_DELAYS_MS[attempt]);
+                if debug {
+                    eprintln!("[mcpmarket] 429 on attempt {}, retrying in {}ms...", attempt + 1, MCPMARKET_RETRY_DELAYS_MS[attempt]);
+                }
                 tokio::time::sleep(tokio::time::Duration::from_millis(
                     MCPMARKET_RETRY_DELAYS_MS[attempt],
                 ))
@@ -761,7 +919,9 @@ async fn search_mcpmarket_with_base(
                 continue;
             }
             // Last attempt failed with 429
-            eprintln!("[mcpmarket] 429 on final attempt {}", attempt + 1);
+            if debug {
+                eprintln!("[mcpmarket] 429 on final attempt {}", attempt + 1);
+            }
             last_error = Some(anyhow::anyhow!("HTTP 429 after retries"));
             continue;
         }
@@ -852,6 +1012,11 @@ fn parse_mcpmarket_body(body: &str) -> Result<Vec<SearchResult>> {
         let name = pick(&["skill_name", "raw_name", "slug", "name"]);
         let description = pick(&["description", "summary", "tagline"]);
         let version = pick(&["version"]);
+        // Popularity: mcpmarket reports `github_stars` as a number.
+        let stars = ["github_stars", "stars", "stars_count"]
+            .iter()
+            .find_map(|k| item.get(*k).and_then(|x| x.as_u64()))
+            .unwrap_or(0);
 
         // Canonical fetchable location: the GitHub website URL. Fall back to the
         // `github` short path, then a synthesized owner/name.
@@ -878,6 +1043,7 @@ fn parse_mcpmarket_body(body: &str) -> Result<Vec<SearchResult>> {
             description,
             version,
             reference,
+            stars,
         };
         if seen.insert(r.ref_or_synth()) {
             out.push(r);
@@ -961,9 +1127,61 @@ fn normalize_github_path(path: &str) -> Option<String> {
 ///   * `https://github.com/owner/repo`
 ///   * `https://github.com/owner/repo/tree/<ref>/path/to/skill`
 ///   * `https://github.com/owner/repo/blob/<ref>/path/to/skill/SKILL.md`
+///   * `https://raw.githubusercontent.com/owner/repo/<ref>/path/to/SKILL.md`
+///     (the "Raw" button URL / what `curl` fetches; ref is the 3rd segment)
 /// A `.git` suffix on the repo is stripped. An unparsable/unsafe spec → `None`.
+/// Parse a `raw.githubusercontent.com/<owner>/<repo>/<ref>/<path…>` URL body
+/// (everything after the host) into a [`GithubRef`]. This is the "Raw" button
+/// URL — and exactly what `curl`/`wget` fetch — so a user who copies the raw
+/// link to a SKILL.md can paste it straight into `:skill add`. Unlike a
+/// github.com tree/blob URL, the ref is a single POSITIONAL segment (branch,
+/// tag, or commit SHA) with no `tree`/`blob` marker, so it needs its own parse.
+/// A trailing `?…` query (e.g. a `?token=` on a private raw link) is stripped.
+/// The remaining path is returned verbatim — for a direct raw link it ends in
+/// `SKILL.md`, which [`resolve_github_skill_paths`] fetches as a single skill.
+/// Returns `None` for an unsafe or too-short path (caller falls back to the
+/// skill.fish `parse_ref` path).
+fn parse_github_raw_ref(rest: &str) -> Option<GithubRef> {
+    let body = rest.split('?').next().unwrap_or(rest).trim_matches('/');
+    let segs: Vec<&str> = body.split('/').filter(|s| !s.is_empty()).collect();
+    // Need at least owner/repo/ref.
+    if segs.len() < 3 {
+        return None;
+    }
+    let owner = segs[0];
+    let repo = segs[1].strip_suffix(".git").unwrap_or(segs[1]);
+    let git_ref = segs[2];
+    if !valid_github_segment(owner) || !valid_github_segment(repo) || !valid_github_ref(git_ref) {
+        return None;
+    }
+    let path = if segs.len() > 3 {
+        Some(normalize_github_path(&segs[3..].join("/"))?)
+    } else {
+        None
+    };
+    Some(GithubRef {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        git_ref: git_ref.to_string(),
+        path,
+    })
+}
+
 pub fn parse_github_ref(input: &str) -> Option<GithubRef> {
     let s = input.trim();
+    // raw.githubusercontent.com/<owner>/<repo>/<ref>/<path…> — the "Raw" button
+    // URL (and what `curl`/`wget` fetch). Its ref is positional, not behind a
+    // `tree`/`blob` marker, so it gets a dedicated parse before the github.com /
+    // `github:` forms below.
+    for raw_host in [
+        "https://raw.githubusercontent.com/",
+        "http://raw.githubusercontent.com/",
+        "raw.githubusercontent.com/",
+    ] {
+        if let Some(rest) = s.strip_prefix(raw_host) {
+            return parse_github_raw_ref(rest);
+        }
+    }
     // `url_form` specs carry the ref inside `/tree/<ref>/` or `/blob/<ref>/`;
     // `prefix` specs carry it as a trailing `@ref`.
     let (rest, url_form) = if let Some(r) = s.strip_prefix("https://github.com/") {
@@ -1608,14 +1826,90 @@ mod tests {
             description: "Helps with git operations.".into(),
             version: "1.0.0".into(),
             reference: "acme/git-helper".into(),
+            stars: 42,
         };
         let s = print_results_table("git", &[r]);
         assert!(s.contains("SKILL"));
-        assert!(s.contains("VERSION"));
+        // The popularity column replaces the old VERSION column.
+        assert!(s.contains("STARS"));
+        assert!(s.contains("★ 42"));
+        // The SKILL column shows the short author/name, not a long URL.
         assert!(s.contains("acme/git-helper"));
-        assert!(s.contains("1.0.0"));
         assert!(s.contains("Helps with git operations."));
         assert!(s.contains("1 result(s)"));
+        // The footer echoes the top hit as a copy-paste-ready fetch target.
+        assert!(s.contains("--skill-fetch acme/git-helper"), "got: {s}");
+    }
+
+    #[test]
+    fn print_results_table_uses_short_name_and_ranks_by_stars() {
+        // A long GitHub URL reference collapses to `owner/skill`; the more-starred
+        // row sorts first regardless of input order.
+        let low = SearchResult {
+            name: String::new(),
+            author: String::new(),
+            description: "Low stars.".into(),
+            version: String::new(),
+            reference:
+                "https://github.com/openhands/skills/tree/abc123/skills/github".into(),
+            stars: 3,
+        };
+        let high = SearchResult {
+            name: String::new(),
+            author: String::new(),
+            description: "High stars.".into(),
+            version: String::new(),
+            reference:
+                "https://github.com/clawdbot/clawdbot/tree/def456/skills/github".into(),
+            stars: 99,
+        };
+        let s = print_results_table("github", &[low, high]);
+        // Short names are derived from the URLs.
+        assert!(s.contains("openhands/github"), "got: {s}");
+        assert!(s.contains("clawdbot/github"), "got: {s}");
+        // The 99-star row appears before the 3-star row (ranked by stars).
+        let hi = s.find("clawdbot/github").unwrap();
+        let lo = s.find("openhands/github").unwrap();
+        assert!(hi < lo, "high-star row should lead:\n{s}");
+    }
+
+    #[test]
+    fn short_name_from_url_distills_owner_and_skill() {
+        // tree URL with a skills/ container → owner + leaf skill dir.
+        assert_eq!(
+            short_name_from_ref(
+                "https://github.com/openhands/skills/tree/f5b98/skills/github"
+            ),
+            "openhands/github"
+        );
+        // blob URL ending in SKILL.md → strip the filename, take the dir.
+        assert_eq!(
+            short_name_from_ref(
+                "https://github.com/acme/repo/blob/main/packs/git/SKILL.md"
+            ),
+            "acme/git"
+        );
+        // A bare owner/name ref passes through untouched.
+        assert_eq!(short_name_from_ref("anthropic/github-pr"), "anthropic/github-pr");
+        // A scheme-less github path also works.
+        assert_eq!(
+            short_name_from_ref("github.com/foo/bar/tree/main/skills/baz"),
+            "foo/baz"
+        );
+    }
+
+    #[test]
+    fn search_result_short_name_prefers_author_and_name() {
+        // When author + name are present they win over reference distillation.
+        let r = SearchResult {
+            name: "github".into(),
+            author: "lycfyi".into(),
+            description: String::new(),
+            version: String::new(),
+            reference: "https://github.com/lycfyi/repo/tree/abc/skills/github".into(),
+            stars: 7,
+        };
+        assert_eq!(r.short_name(), "lycfyi/github");
     }
 
     #[test]
@@ -1678,6 +1972,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcpmarket_parses_github_stars() {
+        // The popularity signal `github_stars` is read onto SearchResult.stars.
+        let body = r#"{"skills":[
+            {"skill_name":"github","owner":{"name":"clawdbot"},
+             "website":"https://github.com/clawdbot/clawdbot/tree/abc/skills/github",
+             "description":"GitHub ops.","github_stars":123}
+        ]}"#;
+        let port = serve_once("200 OK", body.to_string()).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let got = search_mcpmarket_with_base(&base, "github", 50).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].stars, 123);
+        assert_eq!(got[0].short_name(), "clawdbot/github");
+    }
+
+    #[tokio::test]
     async fn mcpmarket_falls_back_to_flat_fields() {
         // Forward-compat: a flat shape (publisher/summary, no owner object, no
         // website) still maps, synthesizing the reference from author/name.
@@ -1712,6 +2022,7 @@ mod tests {
             description: String::new(),
             version: String::new(),
             reference: r.into(),
+            stars: 0,
         };
         let primary = vec![mk("a/one"), mk("a/two")];
         let fallback = vec![mk("a/two"), mk("a/three")];
@@ -1799,6 +2110,54 @@ mod tests {
         assert_eq!(
             parse_github_ref("github.com/acme/skills").unwrap().repo,
             "skills"
+        );
+    }
+
+    #[test]
+    fn parses_raw_githubusercontent_urls() {
+        // The "Raw" button URL / what `curl` fetches: the ref is the 3rd path
+        // segment (no tree/blob marker) and the remainder is the file path.
+        assert_eq!(
+            parse_github_ref(
+                "https://raw.githubusercontent.com/acme/skills/main/packs/git/SKILL.md"
+            )
+            .unwrap(),
+            GithubRef {
+                owner: "acme".into(),
+                repo: "skills".into(),
+                git_ref: "main".into(),
+                path: Some("packs/git/SKILL.md".into()),
+            }
+        );
+        // A 40-char commit SHA as the ref + a deep path (the omniclaude shape).
+        assert_eq!(
+            parse_github_ref(
+                "https://raw.githubusercontent.com/omninode-ai/omniclaude/b60e95ca064e0008987791f29c5cf730cb5dbf21/plugins/onex/skills/unstick_queue/SKILL.md"
+            )
+            .unwrap(),
+            GithubRef {
+                owner: "omninode-ai".into(),
+                repo: "omniclaude".into(),
+                git_ref: "b60e95ca064e0008987791f29c5cf730cb5dbf21".into(),
+                path: Some("plugins/onex/skills/unstick_queue/SKILL.md".into()),
+            }
+        );
+        // scheme-less host + a `?token=…` query is stripped.
+        assert_eq!(
+            parse_github_ref("raw.githubusercontent.com/acme/skills/v1/SKILL.md?token=abc")
+                .unwrap(),
+            GithubRef {
+                owner: "acme".into(),
+                repo: "skills".into(),
+                git_ref: "v1".into(),
+                path: Some("SKILL.md".into()),
+            }
+        );
+        // Too short (no ref) and traversal in the path are rejected.
+        assert!(parse_github_ref("https://raw.githubusercontent.com/acme/skills").is_none());
+        assert!(
+            parse_github_ref("https://raw.githubusercontent.com/acme/skills/main/../etc/x")
+                .is_none()
         );
     }
 

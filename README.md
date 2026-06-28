@@ -16,6 +16,20 @@ Mostly ~/models (412G of GGUF weights) — 87% of your usage.
 ~/projects ❯ vim notes.md                          ← interactive: full TTY hand-off
 ```
 
+## Platform Support
+
+**Supported:**
+- **macOS** 12+ (x86_64, arm64/Apple Silicon)
+- **Linux** (glibc 2.35+): Ubuntu 20.04 LTS, Ubuntu 22.04 LTS, Ubuntu 24.04 LTS, Debian 12, Fedora 38+, etc.
+  - **Ubuntu 24.04 LTS**: [Detailed install guide](UBUNTU_24.04_INSTALL.md)
+  - **Ubuntu 22.04 LTS**: [Detailed install guide](UBUNTU_22.04_INSTALL.md)
+- **WSL** (Windows Subsystem for Linux) via Ubuntu/Debian base
+
+**Not supported:**
+- Windows native (use WSL instead)
+- iOS/Android
+- FreeBSD (possible but untested)
+
 ## How a line is routed
 
 1. `:command` — REPL meta (`:help`, `:mode`, `:model`, …)
@@ -72,7 +86,56 @@ Mostly ~/models (412G of GGUF weights) — 87% of your usage.
   (session + tools + backend) so it can graduate to a real login shell
   (`/etc/shells`, signals, job control) without rework.
 
-## Usage
+## Installation
+
+### One-Command Ubuntu Install
+
+Pick the script matching your release — both install dependencies, build aish,
+and register it in `/etc/shells`.
+
+**Ubuntu 24.04 LTS (Noble Numbat)**
+```sh
+# From main (recommended once CDN syncs)
+curl -sSL https://raw.githubusercontent.com/LightHeart-Ventures/aish/main/install-ubuntu-24.04.sh | bash
+
+# Or from a repo clone (works immediately)
+git clone https://github.com/LightHeart-Ventures/aish.git
+cd aish && bash install-ubuntu-24.04.sh
+```
+
+**Ubuntu 22.04 LTS (Jammy Jellyfish)**
+```sh
+# From main (recommended once CDN syncs)
+curl -sSL https://raw.githubusercontent.com/LightHeart-Ventures/aish/main/install-ubuntu-22.04.sh | bash
+
+# Or from a repo clone (works immediately)
+git clone https://github.com/LightHeart-Ventures/aish.git
+cd aish && bash install-ubuntu-22.04.sh
+```
+
+### Quick Start (All Platforms)
+
+```sh
+# 1. Clone the repo
+git clone https://github.com/LightHeart-Ventures/aish.git
+cd aish
+
+# 2. Install Rust (if needed)
+rustup update stable
+
+# 3. Build and install
+make install
+
+# 4. Set your API key
+export ANTHROPIC_API_KEY=sk-ant-…
+
+# 5. Launch
+aish
+```
+
+**Ubuntu LTS users**: See the detailed install guide for prerequisites, troubleshooting, and advanced configuration — [Ubuntu 24.04](UBUNTU_24.04_INSTALL.md) or [Ubuntu 22.04](UBUNTU_22.04_INSTALL.md).
+
+### Build from Source
 
 ```sh
 export ANTHROPIC_API_KEY=sk-ant-…

@@ -347,7 +347,20 @@ struct ThinkingSpinner {
 impl ThinkingSpinner {
     /// Start animating a thinking row for `label`, or `None` when stderr isn't a
     /// TTY (no animation possible — the caller prints the static notice instead).
-    fn start(label: &str) -> Option<Self> {
+    ///
+    /// `show_output` / `attached` are the SAME shared handles the stream loop
+    /// gates forwarding on (`should_forward`). The animation re-checks that gate
+    /// every frame and self-erases the instant it closes — so when the user
+    /// Shift-Tabs to cycle/detach away from a coordinator that is mid-think
+    /// (`cycle_worker` mutates `attached`), or flips `:output off`, the thinking
+    /// animation is REMOVED promptly instead of spinning on, unwatched, until the
+    /// coordinator's next stderr line happens to arrive (which, mid model-reasoning,
+    /// can be many seconds off — the loop is parked in `next_line().await`).
+    fn start(
+        label: &str,
+        show_output: Arc<AtomicBool>,
+        attached: Arc<Mutex<Option<String>>>,
+    ) -> Option<Self> {
         if !stderr_is_tty() {
             return None;
         }
@@ -357,6 +370,20 @@ impl ThinkingSpinner {
             let mut tick = tokio::time::interval(Duration::from_millis(80));
             for i in 0.. {
                 tick.tick().await;
+                // Shift-Tab / `:detach` / `:output off` close this worker's
+                // forward gate. The stream loop can't react until its next line
+                // (it's parked in `next_line().await`), so the spinner watches
+                // the gate itself: the moment it closes, erase the row, restore
+                // the cursor, and stop — the thinking animation vanishes at once.
+                let attached_id = attached.lock().ok().and_then(|g| g.clone());
+                if !should_forward(
+                    show_output.load(Ordering::Relaxed),
+                    attached_id.as_deref(),
+                    &label,
+                ) {
+                    eprint!("\r\x1b[2K\x1b[?25h");
+                    break;
+                }
                 // Cyan braille frame + dim "thinking…", mirroring the interactive
                 // spinner's look, framed as a pane row so it carries the same
                 // border + `[label]` gutter as every other streamed line.
@@ -437,7 +464,11 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                     if let Some(spin) = thinking.take() {
                         spin.stop();
                     }
-                    thinking = ThinkingSpinner::start(label);
+                    // Hand the spinner the SAME forward-gate handles the stream
+                    // loop reads, so it can self-erase the moment the user
+                    // Shift-Tabs / detaches away mid-think (see ThinkingSpinner).
+                    thinking =
+                        ThinkingSpinner::start(label, show_output.clone(), attached.clone());
                     if thinking.is_none() {
                         crate::tools::announce_raw(&pane_row(label, &text));
                     }
@@ -2195,6 +2226,29 @@ mod tests {
         assert!(!should_forward(false, Some("w_bbb"), "w_aaa"));
         // Toggle off but attached to THIS worker → forwarded (the :attach stream).
         assert!(should_forward(false, Some("w_aaa"), "w_aaa"));
+    }
+
+    #[test]
+    fn shift_tab_away_closes_the_thinking_gate() {
+        // The ThinkingSpinner re-evaluates `should_forward` every frame off the
+        // SAME shared `attached` handle `cycle_worker` mutates. Pressing Shift-Tab
+        // to cycle/detach away from the coordinator being watched flips the gate
+        // to closed, which is the spinner's signal to erase itself and stop — so
+        // the thinking animation is removed promptly rather than spinning on while
+        // the stream loop is still parked in `next_line().await`.
+        let label = "w_aaa";
+        // Per-worker `:attach` stream (output toggle off): watching THIS worker →
+        // gate open, animation runs.
+        assert!(should_forward(false, Some(label), label));
+        // Shift-Tab cycles the attach cursor to another worker → gate closed for
+        // this one → spinner self-erases.
+        assert!(!should_forward(false, Some("w_bbb"), label));
+        // Shift-Tab one more press detaches back to the interactive prompt
+        // (attached = None) → still closed → animation gone.
+        assert!(!should_forward(false, None, label));
+        // But with the session-wide `:output on`, the user wants every
+        // coordinator's reasoning visible, so cycling away does NOT kill it.
+        assert!(should_forward(true, None, label));
     }
 
     #[test]

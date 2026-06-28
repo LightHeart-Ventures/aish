@@ -19,6 +19,7 @@ Every direct dependency is **permissive (Apache-2.0 OR MIT)** and fully compatib
 | [clap](https://github.com/clap-rs/clap) | Apache-2.0 OR MIT | Command-line argument parsing |
 | [hf-hub](https://github.com/huggingface/hf-hub) | Apache-2.0 OR MIT | Hugging Face model/GGUF downloads (`local` feature) |
 | [libc](https://github.com/rust-lang/libc) | Apache-2.0 OR MIT | Raw FFI bindings to system libraries |
+| [miette](https://github.com/zkat/miette) | Apache-2.0 | Diagnostic rendering — span carets, codes, help (`src/diag.rs`) |
 | [mistralrs](https://github.com/EricLBuehler/mistral.rs) | Apache-2.0 OR MIT | In-process local LLM inference (`local` feature) |
 | [regex](https://github.com/rust-lang/regex) | Apache-2.0 OR MIT | Regular expressions |
 | [reqwest](https://github.com/seanmonstar/reqwest) | Apache-2.0 OR MIT | HTTP client (rustls, HTTP/2) |
@@ -27,6 +28,7 @@ Every direct dependency is **permissive (Apache-2.0 OR MIT)** and fully compatib
 | [serde](https://github.com/serde-rs/serde) | Apache-2.0 OR MIT | Serialization framework |
 | [serde_json](https://github.com/serde-rs/json) | Apache-2.0 OR MIT | JSON serialization |
 | [sqlite-vec](https://github.com/asg017/sqlite-vec) | Apache-2.0 OR MIT | Vector search extension for SQLite |
+| [thiserror](https://github.com/dtolnay/thiserror) | Apache-2.0 OR MIT | Derive macro for the `AishDiagnostic` error type |
 | [tokio](https://github.com/tokio-rs/tokio) | Apache-2.0 OR MIT | Async runtime |
 | [unicode-width](https://github.com/unicode-rs/unicode-width) | Apache-2.0 OR MIT | Terminal display-width of Unicode |
 | [urlencoding](https://github.com/kornelski/rust_urlencoding) | Apache-2.0 OR MIT | URL percent-encoding |

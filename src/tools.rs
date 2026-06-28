@@ -560,24 +560,53 @@ pub async fn execute(
             &format!("{} {args}", call.name),
             confirm,
         ) {
-            return ToolResult {
-                id: call.id.clone(),
-                content: "user declined this tool call".into(),
-                is_error: false,
-            };
+            return ToolResult::text(
+                call.id.clone(),
+                "user declined this tool call",
+                false,
+            );
         }
     }
+
+    // S7.2: structured-emitting tools return their typed payload alongside the
+    // rendered text. `content` is byte-for-byte the text-only rendering; the
+    // payload is additive JSON the model can trust without re-parsing ASCII.
+    // These run AFTER the paranoid gate above and short-circuit the text match
+    // below; every text-only tool falls through with `structured = None`.
+    let structured_tool = match call.name.as_str() {
+        "list_dir" => Some(list_dir(call, session)),
+        "glob_expand" => Some(glob_expand(call, session)),
+        "grep_files" => Some(grep_files(call, session)),
+        "stat_file" => Some(stat_file(call, session)),
+        "diff_files" => Some(diff_files(call, session)),
+        _ => None,
+    };
+    if let Some(res) = structured_tool {
+        return match res {
+            Ok((content, value)) => ToolResult::structured(call.id.clone(), content, value, false),
+            Err(e) => ToolResult::text(call.id.clone(), format!("error: {e:#}"), true),
+        };
+    }
+    // MCP results re-attach their already-parsed JSON response (when the tool
+    // returns JSON); a non-JSON / plain-text MCP result stays text-only.
+    if call.name.starts_with("mcp__") {
+        return match mcp_call(call, session, confirm).await {
+            Ok((content, structured)) => ToolResult {
+                id: call.id.clone(),
+                content,
+                is_error: false,
+                structured,
+            },
+            Err(e) => ToolResult::text(call.id.clone(), format!("error: {e:#}"), true),
+        };
+    }
+
     let result = match call.name.as_str() {
         "run_program" => run_program(call, session, confirm).await,
         "run_interactive" => run_interactive(call, session, confirm).await,
         "read_file" => read_file(call, session, confirm),
         "write_file" => write_file(call, session, confirm),
         "edit_file" => edit_file(call, session, confirm),
-        "list_dir" => list_dir(call, session),
-        "glob_expand" => glob_expand(call, session),
-        "grep_files" => grep_files(call, session),
-        "stat_file" => stat_file(call, session),
-        "diff_files" => diff_files(call, session),
         "copy_file" => copy_file(call, session, confirm),
         "rename_file" => rename_file(call, session, confirm),
         "append_file" => append_file(call, session, confirm),
@@ -591,20 +620,11 @@ pub async fn execute(
         "tell" => tell(call, session),
         "escalate" => escalate(call, session).await,
         "get_skill" => get_skill(call, session).await,
-        other if other.starts_with("mcp__") => mcp_call(call, session, confirm).await,
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
     };
     match result {
-        Ok(content) => ToolResult {
-            id: call.id.clone(),
-            content,
-            is_error: false,
-        },
-        Err(e) => ToolResult {
-            id: call.id.clone(),
-            content: format!("error: {e:#}"),
-            is_error: true,
-        },
+        Ok(content) => ToolResult::text(call.id.clone(), content, false),
+        Err(e) => ToolResult::text(call.id.clone(), format!("error: {e:#}"), true),
     }
 }
 
@@ -1041,6 +1061,15 @@ branch, and open a pull request (gh pr create) instead."
     let stderr = await_capture(&mut err_task).await;
 
     let mut out = String::new();
+    // Prepend the full command being executed
+    out.push_str("$ ");
+    out.push_str(&program);
+    if !args.is_empty() {
+        out.push(' ');
+        out.push_str(&args.join(" "));
+    }
+    out.push('\n');
+    
     if !stdout.is_empty() {
         out.push_str(&stdout);
     }
@@ -2031,7 +2060,7 @@ async fn mcp_call(
     call: &ToolCall,
     session: &mut Session,
     confirm: &mut Confirm<'_>,
-) -> Result<String> {
+) -> Result<(String, Option<serde_json::Value>)> {
     let gated = matches!(
         session.mode,
         crate::session::Mode::Careful | crate::session::Mode::Normal
@@ -2045,13 +2074,15 @@ async fn mcp_call(
             &format!("{} {args}", call.name),
             confirm,
         ) {
-            return Ok("user declined this tool call".into());
+            return Ok(("user declined this tool call".into(), None));
         }
     }
-    Ok(truncate_middle(
-        session.mcp.call(&call.name, &call.args).await?,
-        MAX_OUTPUT,
-    ))
+    let raw = session.mcp.call(&call.name, &call.args).await?;
+    // Re-attach the parsed JSON when the MCP tool already speaks JSON (S7.2):
+    // the full parsed value rides along even when the text rendering is
+    // truncated. A plain-text MCP result simply stays text-only (`None`).
+    let structured = serde_json::from_str::<serde_json::Value>(raw.trim()).ok();
+    Ok((truncate_middle(raw, MAX_OUTPUT), structured))
 }
 
 fn read_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
@@ -2314,10 +2345,12 @@ fn edit_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) 
     ))
 }
 
-fn list_dir(call: &ToolCall, session: &Session) -> Result<String> {
+fn list_dir(call: &ToolCall, session: &Session) -> Result<(String, serde_json::Value)> {
     let path = call.args["path"].as_str().unwrap_or(".");
     let full = resolve(session, path);
-    let mut entries: Vec<String> = Vec::new();
+    // Each row carries its rendered line (the source of truth) and the typed
+    // record built from the SAME metadata, so the text and JSON can never drift.
+    let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
     for entry in std::fs::read_dir(&full).map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))? {
         let entry = entry?;
         let meta = entry.metadata()?;
@@ -2333,16 +2366,23 @@ fn list_dir(call: &ToolCall, session: &Session) -> Result<String> {
         } else {
             String::new()
         };
-        entries.push(format!(
-            "{kind} {}{size}",
-            entry.file_name().to_string_lossy()
-        ));
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let line = format!("{kind} {name}{size}");
+        let mut rec = serde_json::Map::new();
+        rec.insert("name".into(), json!(name));
+        rec.insert("type".into(), json!(kind.trim()));
+        if meta.is_file() {
+            rec.insert("size".into(), json!(meta.len()));
+        }
+        rows.push((line, serde_json::Value::Object(rec)));
     }
-    entries.sort();
-    if entries.is_empty() {
-        return Ok("[empty directory]".into());
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let payload = serde_json::Value::Array(rows.iter().map(|(_, v)| v.clone()).collect());
+    if rows.is_empty() {
+        return Ok(("[empty directory]".into(), payload));
     }
-    Ok(truncate_middle(entries.join("\n"), MAX_OUTPUT))
+    let text = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
+    Ok((truncate_middle(text, MAX_OUTPUT), payload))
 }
 
 // ---------------------------------------------------------------------------
@@ -2456,7 +2496,7 @@ fn glob_path_match(pat_segs: &[&str], path_segs: &[&str]) -> bool {
     }
 }
 
-fn glob_expand(call: &ToolCall, session: &Session) -> Result<String> {
+fn glob_expand(call: &ToolCall, session: &Session) -> Result<(String, serde_json::Value)> {
     let pattern = call.args["pattern"].as_str().ok_or_else(|| anyhow::anyhow!("missing pattern"))?;
     let type_filter = call.args["type"].as_str().unwrap_or("any");
     let max = call.args["max"].as_u64().unwrap_or(1000) as usize;
@@ -2478,7 +2518,9 @@ fn glob_expand(call: &ToolCall, session: &Session) -> Result<String> {
         anyhow::bail!("empty pattern");
     }
 
-    let mut out: Vec<String> = Vec::new();
+    // Each row pairs the rendered line with the typed record from the SAME
+    // entry so text and JSON stay in lock-step.
+    let mut out: Vec<(String, serde_json::Value)> = Vec::new();
     let mut visited = 0usize;
     let mut truncated = false;
     // Iterative DFS over the base tree, carrying each dir's path segments
@@ -2517,12 +2559,21 @@ fn glob_expand(call: &ToolCall, session: &Session) -> Result<String> {
                     } else {
                         "file"
                     };
-                    let size = if ft.is_file() {
-                        entry.metadata().map(|m| format!(" {}", m.len())).unwrap_or_default()
+                    let file_size = if ft.is_file() {
+                        entry.metadata().map(|m| m.len()).ok()
                     } else {
-                        String::new()
+                        None
                     };
-                    out.push(format!("{kind} {}{size}", rel.join("/")));
+                    let size = file_size.map(|n| format!(" {n}")).unwrap_or_default();
+                    let rel_path = rel.join("/");
+                    let line = format!("{kind} {rel_path}{size}");
+                    let mut rec = serde_json::Map::new();
+                    rec.insert("path".into(), json!(rel_path));
+                    rec.insert("type".into(), json!(kind.trim()));
+                    if let Some(n) = file_size {
+                        rec.insert("size".into(), json!(n));
+                    }
+                    out.push((line, serde_json::Value::Object(rec)));
                     if out.len() >= max {
                         truncated = true;
                         break 'walk;
@@ -2535,18 +2586,19 @@ fn glob_expand(call: &ToolCall, session: &Session) -> Result<String> {
             }
         }
     }
-    out.sort();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    let payload = serde_json::Value::Array(out.iter().map(|(_, v)| v.clone()).collect());
     if out.is_empty() {
-        return Ok(format!("[no matches for {pattern}]"));
+        return Ok((format!("[no matches for {pattern}]"), payload));
     }
-    let mut res = out.join("\n");
+    let mut res = out.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
     if truncated {
         res.push_str("\n…[results truncated]");
     }
-    Ok(truncate_middle(res, MAX_OUTPUT))
+    Ok((truncate_middle(res, MAX_OUTPUT), payload))
 }
 
-fn grep_files(call: &ToolCall, session: &Session) -> Result<String> {
+fn grep_files(call: &ToolCall, session: &Session) -> Result<(String, serde_json::Value)> {
     let pattern = call.args["pattern"].as_str().ok_or_else(|| anyhow::anyhow!("missing pattern"))?;
     if pattern.is_empty() {
         anyhow::bail!("empty pattern");
@@ -2609,6 +2661,10 @@ fn grep_files(call: &ToolCall, session: &Session) -> Result<String> {
     files.sort();
 
     let mut out: Vec<String> = Vec::new();
+    // Typed records carry one entry per MATCH line (`{path, line, text}`) —
+    // context lines and separators are a text-rendering nicety, kept out of
+    // the payload so it's a clean list of hits.
+    let mut records: Vec<serde_json::Value> = Vec::new();
     let mut total = 0usize;
     'outer: for f in &files {
         let bytes = match std::fs::read(f) {
@@ -2639,6 +2695,7 @@ fn grep_files(call: &ToolCall, session: &Session) -> Result<String> {
                 } else {
                     out.push(format!("{display}:{}: {}", i + 1, line));
                 }
+                records.push(json!({ "path": display, "line": i + 1, "text": line }));
                 total += 1;
                 if total >= max {
                     out.push("…[matches truncated]".into());
@@ -2647,10 +2704,11 @@ fn grep_files(call: &ToolCall, session: &Session) -> Result<String> {
             }
         }
     }
+    let payload = serde_json::Value::Array(records);
     if out.is_empty() {
-        return Ok(format!("[no matches for \"{pattern}\"]"));
+        return Ok((format!("[no matches for \"{pattern}\"]"), payload));
     }
-    Ok(truncate_middle(out.join("\n"), MAX_OUTPUT))
+    Ok((truncate_middle(out.join("\n"), MAX_OUTPUT), payload))
 }
 
 fn human_age(secs: i64) -> String {
@@ -2666,7 +2724,7 @@ fn human_age(secs: i64) -> String {
     }
 }
 
-fn stat_file(call: &ToolCall, session: &Session) -> Result<String> {
+fn stat_file(call: &ToolCall, session: &Session) -> Result<(String, serde_json::Value)> {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
     let path = call.args["path"].as_str().ok_or_else(|| anyhow::anyhow!("missing path"))?;
@@ -2688,24 +2746,36 @@ fn stat_file(call: &ToolCall, session: &Session) -> Result<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    let perms = format!("{:o}", meta.permissions().mode() & 0o7777);
     let mut lines = vec![
         format!("path: {}", full.display()),
         format!("type: {kind}"),
         format!("size: {} bytes", meta.len()),
-        format!("perms: {:o}", meta.permissions().mode() & 0o7777),
+        format!("perms: {perms}"),
         format!("uid/gid: {}/{}", meta.uid(), meta.gid()),
         format!("nlink: {}", meta.nlink()),
         format!("modified: {} (epoch), {} ago", meta.mtime(), human_age(now - meta.mtime())),
     ];
+    // Build the typed record from the SAME metadata so it can't drift.
+    let mut rec = serde_json::Map::new();
+    rec.insert("path".into(), json!(full.display().to_string()));
+    rec.insert("type".into(), json!(kind));
+    rec.insert("size".into(), json!(meta.len()));
+    rec.insert("perms".into(), json!(perms));
+    rec.insert("uid".into(), json!(meta.uid()));
+    rec.insert("gid".into(), json!(meta.gid()));
+    rec.insert("nlink".into(), json!(meta.nlink()));
+    rec.insert("modified".into(), json!(meta.mtime()));
     if ft.is_symlink() {
         if let Ok(target) = std::fs::read_link(&full) {
             lines.push(format!("symlink_target: {}", target.display()));
+            rec.insert("symlink_target".into(), json!(target.display().to_string()));
         }
     }
-    Ok(lines.join("\n"))
+    Ok((lines.join("\n"), serde_json::Value::Object(rec)))
 }
 
-fn diff_files(call: &ToolCall, session: &Session) -> Result<String> {
+fn diff_files(call: &ToolCall, session: &Session) -> Result<(String, serde_json::Value)> {
     let a_path = call.args["a"].as_str().ok_or_else(|| anyhow::anyhow!("missing a"))?;
     let full_a = resolve(session, a_path);
     let a_text = std::fs::read_to_string(&full_a)
@@ -2723,9 +2793,20 @@ fn diff_files(call: &ToolCall, session: &Session) -> Result<String> {
     let context = call.args["context"].as_u64().unwrap_or(3) as usize;
     let diff = unified_diff(&a_text, &b_text, &full_a.display().to_string(), &b_label, context);
     if diff.trim().is_empty() {
-        return Ok("[files are identical]".into());
+        return Ok(("[files are identical]".into(), json!({ "identical": true })));
     }
-    Ok(truncate_middle(diff, MAX_OUTPUT))
+    // Cheap +/- line counts off the rendered diff (header lines `---`/`+++` and
+    // hunk headers `@@` are naturally excluded; content lines lead with a space).
+    let added = diff
+        .lines()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+        .count();
+    let removed = diff
+        .lines()
+        .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+        .count();
+    let payload = json!({ "identical": false, "added": added, "removed": removed });
+    Ok((truncate_middle(diff, MAX_OUTPUT), payload))
 }
 
 #[derive(PartialEq)]
@@ -3942,6 +4023,12 @@ mod fileops_tests {
         assert!(r.content.contains("src/a.rs"), "{}", r.content);
         assert!(r.content.contains("src/inner/b.rs"), "{}", r.content);
         assert!(!r.content.contains("c.txt"), "{}", r.content);
+        // S7.2: structured payload is an array of {path,type,size} records that
+        // matches the rendered text (AC1/AC3).
+        let arr = r.structured.as_ref().expect("glob_expand carries a payload").as_array().unwrap().clone();
+        assert!(arr.iter().any(|e| e["path"] == "src/a.rs" && e["type"] == "file" && e["size"] == 1));
+        assert!(arr.iter().any(|e| e["path"] == "src/inner/b.rs" && e["size"] == 2));
+        assert!(!arr.iter().any(|e| e["path"].as_str().unwrap_or("").ends_with("c.txt")));
         // type filter
         let d = run(&mut s, "glob_expand", json!({"pattern": "src/**", "type": "dir"})).await;
         assert!(d.content.contains("src/inner"), "{}", d.content);
@@ -3956,6 +4043,12 @@ mod fileops_tests {
         let r = run(&mut s, "grep_files", json!({"pattern": "hello"})).await;
         assert!(r.content.contains("a.txt:1:"), "{}", r.content);
         assert!(!r.content.contains("a.txt:3:"), "{}", r.content);
+        // S7.2: one {path,line,text} record per MATCH line.
+        let arr = r.structured.as_ref().expect("grep_files carries a payload").as_array().unwrap().clone();
+        assert_eq!(arr.len(), 1, "one match record");
+        assert_eq!(arr[0]["path"], "a.txt");
+        assert_eq!(arr[0]["line"], 1);
+        assert_eq!(arr[0]["text"], "hello world");
         let r2 = run(&mut s, "grep_files", json!({"pattern": "hello", "ignore_case": true})).await;
         assert!(r2.content.contains("a.txt:3:"), "{}", r2.content);
         // glob scoping excludes non-matching files
@@ -3975,7 +4068,41 @@ mod fileops_tests {
         assert!(r.content.contains("type: file"), "{}", r.content);
         assert!(r.content.contains("size: 5 bytes"), "{}", r.content);
         assert!(r.content.contains("perms:"), "{}", r.content);
+        // S7.2: typed metadata record mirrors the rendered fields.
+        let v = r.structured.as_ref().expect("stat_file carries a payload");
+        assert_eq!(v["type"], "file");
+        assert_eq!(v["size"], 5);
+        assert!(v["perms"].is_string());
+        assert!(v["uid"].is_number() && v["nlink"].is_number());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn list_dir_carries_structured_payload() {
+        let dir = tmp("listdir");
+        std::fs::write(dir.join("f.txt"), b"abc").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let mut s = yolo_session(&dir);
+        let r = run(&mut s, "list_dir", json!({})).await;
+        assert!(!r.is_error, "{}", r.content);
+        // text rendering is unchanged (AC2): "file f.txt 3", "dir  sub".
+        assert!(r.content.contains("file f.txt 3"), "{}", r.content);
+        let arr = r.structured.as_ref().expect("list_dir carries a payload").as_array().unwrap().clone();
+        assert!(arr.iter().any(|e| e["name"] == "f.txt" && e["type"] == "file" && e["size"] == 3));
+        assert!(arr.iter().any(|e| e["name"] == "sub" && e["type"] == "dir" && e["size"].is_null()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn text_tools_have_no_structured_payload() {
+        // AC1/AC6: a representative text-only tool leaves `structured` None.
+        let dir = tmp("textnone");
+        std::fs::write(dir.join("f.txt"), b"hi").unwrap();
+        let mut s = yolo_session(&dir);
+        let r = run(&mut s, "read_file", json!({"path": "f.txt"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(r.content, "hi");
+        assert!(r.structured.is_none(), "read_file must stay text-only");
     }
 
     #[tokio::test]
@@ -4023,8 +4150,15 @@ mod fileops_tests {
         assert!(r.content.contains("@@"), "{}", r.content);
         assert!(r.content.contains("-two"), "{}", r.content);
         assert!(r.content.contains("+2"), "{}", r.content);
+        // S7.2: payload flags non-identical with +/- counts.
+        let v = r.structured.as_ref().expect("diff_files carries a payload");
+        assert_eq!(v["identical"], false);
+        assert_eq!(v["added"], 1);
+        assert_eq!(v["removed"], 1);
         let same = run(&mut s, "diff_files", json!({"a": "a", "b": "a"})).await;
         assert!(same.content.contains("identical"), "{}", same.content);
+        // identical files → {identical:true} (AC3).
+        assert_eq!(same.structured.as_ref().unwrap()["identical"], true);
         // inline b_content
         let ic = run(&mut s, "diff_files", json!({"a": "a", "b_content": "one\ntwo\nthree\n"})).await;
         assert!(ic.content.contains("identical"), "{}", ic.content);

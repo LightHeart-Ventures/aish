@@ -59,6 +59,42 @@ pub struct ToolResult {
     pub id: String,
     pub content: String,
     pub is_error: bool,
+    /// Optional typed payload for tools whose output is already structured
+    /// (records / tables). `content` stays the rendered, human-readable source
+    /// of truth; this is additive JSON the model can consume without
+    /// re-parsing the text. `None` for free-form / text-only tools — by design
+    /// (this is NOT a typed pipeline; see the S7.2 PRD non-goals).
+    pub structured: Option<Value>,
+}
+
+impl ToolResult {
+    /// A text-only result — `structured` is `None`. This is the path every tool
+    /// took before S7.2, and the path every text-only tool still takes.
+    pub fn text(id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
+        Self {
+            id: id.into(),
+            content: content.into(),
+            is_error,
+            structured: None,
+        }
+    }
+
+    /// A result carrying a typed payload alongside the rendered text (S7.2).
+    /// `content` remains the human-readable source of truth; `value` is the
+    /// same data as trustworthy JSON for the model.
+    pub fn structured(
+        id: impl Into<String>,
+        content: impl Into<String>,
+        value: Value,
+        is_error: bool,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            content: content.into(),
+            is_error,
+            structured: Some(value),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
