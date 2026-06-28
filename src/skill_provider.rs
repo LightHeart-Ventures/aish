@@ -281,7 +281,8 @@ pub fn import(text: &str, skills_dir: &Path) -> Result<PathBuf> {
 
 /// CLI entry point for `aish --skill-fetch <ref>`: parse, fetch, import, report.
 /// Accepts a skill.fish `owner/name[@version]` ref, a `github:owner/repo[/path]`
-/// spec, or a `https://github.com/...` URL. A GitHub spec that points at a repo
+/// spec, a `https://github.com/...` URL, or a `https://raw.githubusercontent.com/
+/// owner/repo/<ref>/path/SKILL.md` raw URL. A GitHub spec that points at a repo
 /// (rather than a single skill) imports every SKILL.md discovered under it.
 pub async fn run_fetch(input: &str, skills_dir: &Path) -> Result<()> {
     let imported = add(input, skills_dir).await?;
@@ -318,7 +319,8 @@ pub struct ImportedSkill {
 
 /// Unified import entry point used by both the CLI (`--skill-fetch`) and the
 /// interactive `:skill add`. Detects the source from `input`:
-///   * a `github:owner/repo[/path][@ref]` spec or `https://github.com/...` URL
+///   * a `github:owner/repo[/path][@ref]` spec, a `https://github.com/...` URL,
+///     or a `https://raw.githubusercontent.com/...` raw URL
 ///     → GitHub path resolution + (possibly multi-skill) discovery & import;
 ///   * anything else → a skill.fish `owner/name[@version]` ref, fetched and
 ///     imported as a single skill.
@@ -1125,9 +1127,61 @@ fn normalize_github_path(path: &str) -> Option<String> {
 ///   * `https://github.com/owner/repo`
 ///   * `https://github.com/owner/repo/tree/<ref>/path/to/skill`
 ///   * `https://github.com/owner/repo/blob/<ref>/path/to/skill/SKILL.md`
+///   * `https://raw.githubusercontent.com/owner/repo/<ref>/path/to/SKILL.md`
+///     (the "Raw" button URL / what `curl` fetches; ref is the 3rd segment)
 /// A `.git` suffix on the repo is stripped. An unparsable/unsafe spec → `None`.
+/// Parse a `raw.githubusercontent.com/<owner>/<repo>/<ref>/<path…>` URL body
+/// (everything after the host) into a [`GithubRef`]. This is the "Raw" button
+/// URL — and exactly what `curl`/`wget` fetch — so a user who copies the raw
+/// link to a SKILL.md can paste it straight into `:skill add`. Unlike a
+/// github.com tree/blob URL, the ref is a single POSITIONAL segment (branch,
+/// tag, or commit SHA) with no `tree`/`blob` marker, so it needs its own parse.
+/// A trailing `?…` query (e.g. a `?token=` on a private raw link) is stripped.
+/// The remaining path is returned verbatim — for a direct raw link it ends in
+/// `SKILL.md`, which [`resolve_github_skill_paths`] fetches as a single skill.
+/// Returns `None` for an unsafe or too-short path (caller falls back to the
+/// skill.fish `parse_ref` path).
+fn parse_github_raw_ref(rest: &str) -> Option<GithubRef> {
+    let body = rest.split('?').next().unwrap_or(rest).trim_matches('/');
+    let segs: Vec<&str> = body.split('/').filter(|s| !s.is_empty()).collect();
+    // Need at least owner/repo/ref.
+    if segs.len() < 3 {
+        return None;
+    }
+    let owner = segs[0];
+    let repo = segs[1].strip_suffix(".git").unwrap_or(segs[1]);
+    let git_ref = segs[2];
+    if !valid_github_segment(owner) || !valid_github_segment(repo) || !valid_github_ref(git_ref) {
+        return None;
+    }
+    let path = if segs.len() > 3 {
+        Some(normalize_github_path(&segs[3..].join("/"))?)
+    } else {
+        None
+    };
+    Some(GithubRef {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        git_ref: git_ref.to_string(),
+        path,
+    })
+}
+
 pub fn parse_github_ref(input: &str) -> Option<GithubRef> {
     let s = input.trim();
+    // raw.githubusercontent.com/<owner>/<repo>/<ref>/<path…> — the "Raw" button
+    // URL (and what `curl`/`wget` fetch). Its ref is positional, not behind a
+    // `tree`/`blob` marker, so it gets a dedicated parse before the github.com /
+    // `github:` forms below.
+    for raw_host in [
+        "https://raw.githubusercontent.com/",
+        "http://raw.githubusercontent.com/",
+        "raw.githubusercontent.com/",
+    ] {
+        if let Some(rest) = s.strip_prefix(raw_host) {
+            return parse_github_raw_ref(rest);
+        }
+    }
     // `url_form` specs carry the ref inside `/tree/<ref>/` or `/blob/<ref>/`;
     // `prefix` specs carry it as a trailing `@ref`.
     let (rest, url_form) = if let Some(r) = s.strip_prefix("https://github.com/") {
@@ -2056,6 +2110,54 @@ mod tests {
         assert_eq!(
             parse_github_ref("github.com/acme/skills").unwrap().repo,
             "skills"
+        );
+    }
+
+    #[test]
+    fn parses_raw_githubusercontent_urls() {
+        // The "Raw" button URL / what `curl` fetches: the ref is the 3rd path
+        // segment (no tree/blob marker) and the remainder is the file path.
+        assert_eq!(
+            parse_github_ref(
+                "https://raw.githubusercontent.com/acme/skills/main/packs/git/SKILL.md"
+            )
+            .unwrap(),
+            GithubRef {
+                owner: "acme".into(),
+                repo: "skills".into(),
+                git_ref: "main".into(),
+                path: Some("packs/git/SKILL.md".into()),
+            }
+        );
+        // A 40-char commit SHA as the ref + a deep path (the omniclaude shape).
+        assert_eq!(
+            parse_github_ref(
+                "https://raw.githubusercontent.com/omninode-ai/omniclaude/b60e95ca064e0008987791f29c5cf730cb5dbf21/plugins/onex/skills/unstick_queue/SKILL.md"
+            )
+            .unwrap(),
+            GithubRef {
+                owner: "omninode-ai".into(),
+                repo: "omniclaude".into(),
+                git_ref: "b60e95ca064e0008987791f29c5cf730cb5dbf21".into(),
+                path: Some("plugins/onex/skills/unstick_queue/SKILL.md".into()),
+            }
+        );
+        // scheme-less host + a `?token=…` query is stripped.
+        assert_eq!(
+            parse_github_ref("raw.githubusercontent.com/acme/skills/v1/SKILL.md?token=abc")
+                .unwrap(),
+            GithubRef {
+                owner: "acme".into(),
+                repo: "skills".into(),
+                git_ref: "v1".into(),
+                path: Some("SKILL.md".into()),
+            }
+        );
+        // Too short (no ref) and traversal in the path are rejected.
+        assert!(parse_github_ref("https://raw.githubusercontent.com/acme/skills").is_none());
+        assert!(
+            parse_github_ref("https://raw.githubusercontent.com/acme/skills/main/../etc/x")
+                .is_none()
         );
     }
 
