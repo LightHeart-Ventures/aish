@@ -634,7 +634,10 @@ fn render_messages(history: &[Msg]) -> Vec<Value> {
                         out.push(json!({
                             "role": "tool",
                             "tool_call_id": r.id,
-                            "content": r.content,
+                            // S7.3: thread the structured payload (compact JSON)
+                            // to the model when present; text-only results send
+                            // `content` verbatim as before.
+                            "content": r.model_content(),
                         }));
                     }
                 }
@@ -721,6 +724,31 @@ mod tests {
         assert_eq!(msgs[0]["content"], "out1");
         assert_eq!(msgs[1]["tool_call_id"], "call_2");
         assert_eq!(msgs[1]["content"], "out2");
+    }
+
+    #[test]
+    fn render_tool_result_threads_structured_json_to_model() {
+        // S7.3 / AC1: a structured tool result becomes the model-facing content
+        // (compact JSON) in its role:"tool" message; a text result stays verbatim.
+        let msg = Msg::tool_results(vec![
+            ToolResult::structured(
+                "s1",
+                "rendered table the human sees",
+                json!({"path": "f.txt", "type": "file", "size": 3}),
+                false,
+            ),
+            ToolResult::text("t1", "plain text result", false),
+        ]);
+        let msgs = render_messages(&[msg]);
+        assert_eq!(msgs.len(), 2);
+        // Structured → compact JSON (keys sorted: path, size, type).
+        assert_eq!(msgs[0]["tool_call_id"], "s1");
+        assert_eq!(
+            msgs[0]["content"].as_str().unwrap(),
+            r#"{"path":"f.txt","size":3,"type":"file"}"#
+        );
+        // Text-only → content verbatim.
+        assert_eq!(msgs[1]["content"].as_str().unwrap(), "plain text result");
     }
 
     #[test]

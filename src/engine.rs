@@ -926,14 +926,26 @@ fn describe_call(call: &crate::backend::ToolCall) -> String {
     }
 }
 
-/// The text echoed (dim) for a tool result's raw body. Empty results get a
-/// placeholder so an error with no output still shows *something*.
-fn raw_body(result: &ToolResult) -> &str {
-    if result.content.trim().is_empty() {
-        "(no output)"
-    } else {
-        result.content.as_str()
+/// The text echoed (dim) for a tool result's raw body under Ctrl-O — the **raw**
+/// half of the S7.3 split. Deliberately INDEPENDENT of what the model receives
+/// (`ToolResult::model_content`): the model gets the structured JSON payload,
+/// while the human always sees the verbatim, human-readable tool output here.
+/// `content` is that verbatim rendering for every tool (S7.2 kept it
+/// byte-for-byte), so a structured tool's Ctrl-O view stays its aligned text —
+/// never a JSON dump (OQ2). Empty results get a placeholder so an error with no
+/// output still shows *something*; a (rare) structured-only result — empty
+/// `content` but a payload present — falls back to its pretty-printed JSON
+/// rather than the bare "(no output)" (FR4).
+fn raw_body(result: &ToolResult) -> String {
+    if !result.content.trim().is_empty() {
+        return result.content.clone();
     }
+    if let Some(v) = &result.structured {
+        if let Ok(pretty) = serde_json::to_string_pretty(v) {
+            return pretty;
+        }
+    }
+    "(no output)".to_string()
 }
 
 /// Echo one tool result's raw content dim, nested under its 🔧 line. Printed
@@ -992,6 +1004,28 @@ mod tests {
         assert_eq!(raw_body(&mk("   \n ", false)), "(no output)");
         // error results keep their content — they are included, not skipped
         assert_eq!(raw_body(&mk("boom", true)), "boom");
+    }
+
+    #[test]
+    fn raw_body_shows_human_text_not_model_json_for_structured_results() {
+        // S7.3 / AC2 + OQ2: Ctrl-O's raw view is INDEPENDENT of what the model
+        // gets. A structured result threads compact JSON to the model
+        // (model_content), but raw_body keeps showing the verbatim, aligned
+        // human-readable `content` — never a JSON dump.
+        let r = ToolResult::structured(
+            "t",
+            "file f.txt 3\ndir  sub",
+            serde_json::json!([{"name": "f.txt", "type": "file", "size": 3}]),
+            false,
+        );
+        assert_eq!(raw_body(&r), "file f.txt 3\ndir  sub");
+        // The model path differs — proving the split is real.
+        assert_ne!(raw_body(&r), r.model_content());
+
+        // FR4 fallback: a (rare) structured-only result with empty content
+        // pretty-prints its payload rather than showing "(no output)".
+        let so = ToolResult::structured("t", "", serde_json::json!({"k": 1}), false);
+        assert_eq!(raw_body(&so), "{\n  \"k\": 1\n}");
     }
 
     #[test]
