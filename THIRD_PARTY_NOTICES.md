@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-`aish` is licensed under **MIT OR Apache-2.0**.
+`aish` is licensed under **Apache-2.0**.
 
 It is built on a number of open-source Rust crates. This file lists the **direct
 dependencies** declared in `Cargo.toml` and their licenses. For the complete set of
@@ -9,7 +9,7 @@ generate the bundle with `cargo about` / `cargo bundle-licenses` (see
 [`COMPLIANCE_REPORT.md`](./COMPLIANCE_REPORT.md) §4).
 
 Every direct dependency is **permissive (Apache-2.0 OR MIT)** and fully compatible with
-`aish`'s own license. We gratefully acknowledge their authors and contributors.
+`aish`'s Apache 2.0 license. We gratefully acknowledge their authors and contributors.
 
 ## Direct dependencies
 
