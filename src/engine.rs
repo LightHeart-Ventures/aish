@@ -296,11 +296,11 @@ pub async fn run_turn(
                     "\x1b[2m  ⚠ {}\x1b[0m",
                     crate::loopguard::repeat_log_line(&desc, repeat_count, repeat)
                 );
-                let result = ToolResult {
-                    id: call.id.clone(),
-                    content: crate::loopguard::blocked_result_text(&desc, repeat_count),
-                    is_error: true,
-                };
+                let result = ToolResult::text(
+                    call.id.clone(),
+                    crate::loopguard::blocked_result_text(&desc, repeat_count),
+                    true,
+                );
                 if session.raw_tool_output {
                     print_raw_result(&result);
                 }
@@ -334,7 +334,7 @@ pub async fn run_turn(
                 // re-execution) and reuse the journaled result.
                 let (output, is_error) = (output.clone(), *is_error);
                 eprintln!("\x1b[2m  \u{21ba} replayed {desc}\x1b[0m");
-                ToolResult { id: call.id.clone(), content: output, is_error }
+                ToolResult::text(call.id.clone(), output, is_error)
             } else {
                 // Live turn. Tool-execution phase: this call gets its own animated
                 // line while it runs — a braille spinner turning to the LEFT of a
@@ -986,11 +986,7 @@ mod tests {
 
     #[test]
     fn raw_body_placeholder() {
-        let mk = |content: &str, is_error| ToolResult {
-            id: "t".into(),
-            content: content.into(),
-            is_error,
-        };
+        let mk = |content: &str, is_error| ToolResult::text("t", content, is_error);
         assert_eq!(raw_body(&mk("hello", false)), "hello");
         assert_eq!(raw_body(&mk("", true)), "(no output)");
         assert_eq!(raw_body(&mk("   \n ", false)), "(no output)");

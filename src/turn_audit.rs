@@ -499,18 +499,10 @@ mod tests {
     }
 
     fn ok_result(content: &str) -> ToolResult {
-        ToolResult {
-            id: "t".into(),
-            content: content.into(),
-            is_error: false,
-        }
+        ToolResult::text("t", content, false)
     }
     fn err_result(content: &str) -> ToolResult {
-        ToolResult {
-            id: "t".into(),
-            content: content.into(),
-            is_error: true,
-        }
+        ToolResult::text("t", content, true)
     }
 
     #[test]
