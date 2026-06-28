@@ -632,6 +632,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ),
     ("backend", "switch backend (claude|grok|local)"),
     ("batch", "background batch mode (on|off|status)"),
+    (
+        "close",
+        "remove the attached (or named) coordinator from the worker list + Shift-Tab rotation",
+    ),
     ("compact", "compact history, offload to memory"),
     ("context", "show context-window usage"),
     ("detach", "stop watching the attached coordinator"),
@@ -2514,38 +2518,6 @@ fn send_to_attached(run_id: &str, message: &str, session: &mut Session) {
     }
 }
 
-/// Auto-detach when the attached coordinator is no longer a live worker in this
-/// session (it finished, failed, or is gone). Printed above the prompt so the
-/// operator isn't left typing into a dead mailbox. A no-op when not attached.
-fn auto_detach_finished(session: &mut Session) {
-    let attached = session.attached.lock().unwrap().clone();
-    let Some(run_id) = attached else {
-        return;
-    };
-    // The goal isn't a worker job — its liveness is the goal handle itself.
-    // Stay attached while the goal is active; detach once it finishes/clears.
-    if run_id == GOAL_ATTACH_ID {
-        if !session.goal.as_ref().is_some_and(|g| g.is_active()) {
-            *session.attached.lock().unwrap() = None;
-            println!("\x1b[2m⇄ goal finished — detached. `:goal` for its final status.\x1b[0m");
-        }
-        return;
-    }
-    let still_live = session
-        .worker_jobs
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|w| w.id == run_id && !matches!(w.status().as_str(), "done" | "failed"));
-    if !still_live {
-        *session.attached.lock().unwrap() = None;
-        let short = crate::batch::short_id(&run_id);
-        println!(
-            "\x1b[2m⇄ {short} finished — detached. :result {short} to view its result.\x1b[0m"
-        );
-    }
-}
-
 /// When the attached coordinator reaches a terminal state, announce it ONCE and
 /// KEEP the attachment (review mode): the operator stays bound to the run so a
 /// typed line RESUMES it (see `send_to_attached` -> `resume_coordinator`) rather
@@ -2677,9 +2649,9 @@ OWN prior work, not a fresh task, and build on it.\n\n\
 /// currently-attached id (`None` = the interactive prompt). The cycle is
 /// `interactive(0) → running[0](1) → … → running[n-1](n) → interactive(0)`;
 /// the return is the NEXT slot, where 0 means "interactive" and any `k` in
-/// `1..=running.len()` means `running[k - 1]`. An unknown `current` (e.g. it
-/// just finished and was swept from `running`) restarts the cycle from
-/// interactive. Returns 0 when there is nothing running.
+/// `1..=running.len()` means `running[k - 1]`. An unknown `current` (e.g. it was
+/// `:close`d and removed from `running`) restarts the cycle from interactive.
+/// Returns 0 when there is nothing to cycle through.
 fn next_attach_index(running: &[String], current: Option<&str>) -> usize {
     if running.is_empty() {
         return 0;
@@ -2692,59 +2664,78 @@ fn next_attach_index(running: &[String], current: Option<&str>) -> usize {
 }
 
 /// `Shift-Tab` — cycle the interactive session's attach cursor across the
-/// coordinators it has running. The cycle is `interactive → worker₁ → worker₂
+/// coordinators it launched. The cycle is `interactive → worker₁ → worker₂
 /// → … → interactive`, in `:workers` listing order: each Shift-Tab advances
-/// to the next live coordinator (streaming its activity + steering input to it,
+/// to the next coordinator (streaming its activity + steering input to it,
 /// exactly like `:attach`), and one more press past the last detaches back to
-/// the interactive prompt. With a single running worker it toggles attach/detach
-/// of that one; with none it's a no-op with a hint. Finished workers are first
-/// swept by `auto_detach_finished`, then excluded from the cycle so Shift-Tab
-/// never lands on a dead mailbox.
+/// the interactive prompt. With a single worker it toggles attach/detach of that
+/// one; with none it's a no-op with a hint.
+///
+/// FINISHED (done/failed) coordinators are part of the rotation too — landing on
+/// one drops into review mode (replay its work + result; a typed line resumes
+/// it), mirroring `attach_worker`'s terminal branch. This makes Shift-Tab a way
+/// to flip back through completed/failed agents, not just the still-running ones.
 fn cycle_worker(session: &mut Session) {
-    // Drop the attachment first if the currently-attached coordinator already
-    // finished, so the cursor advances from a clean "interactive" baseline.
-    auto_detach_finished(session);
-
-    // Live (non-terminal) coordinators in listing order — the cycle targets.
-    let running: Vec<String> = session
+    // All coordinators this session launched, in listing order — LIVE and
+    // TERMINAL — paired with a `terminal` flag so the attach branch can choose
+    // review-mode vs live-stream. Shift-Tab rotates through finished/failed
+    // agents too, so a completed run is reachable by cycling, not only `:attach`.
+    let workers: Vec<(String, bool)> = session
         .worker_jobs
         .lock()
         .unwrap()
         .iter()
-        .filter(|w| !matches!(w.status().as_str(), "done" | "failed"))
-        .map(|w| w.id.clone())
+        .map(|w| (w.id.clone(), matches!(w.status().as_str(), "done" | "failed")))
         .collect();
-    if running.is_empty() {
+    if workers.is_empty() {
         println!(
-            "\x1b[2m⇄ no running coordinators to cycle through — :dispatch <task> to launch one\x1b[0m"
+            "\x1b[2m⇄ no coordinators to cycle through — :dispatch <task> to launch one\x1b[0m"
         );
         return;
     }
 
-    // The cycle is [interactive, running[0], running[1], …]; index 0 is the
+    // The cycle is [interactive, workers[0], workers[1], …]; index 0 is the
     // detached interactive prompt. The index math is factored into the pure,
     // unit-tested `next_attach_index` so it stays verifiable without spawning
     // real coordinators.
+    let ids: Vec<String> = workers.iter().map(|(id, _)| id.clone()).collect();
     let current = session.attached.lock().unwrap().clone();
-    let next_idx = next_attach_index(&running, current.as_deref());
+    let next_idx = next_attach_index(&ids, current.as_deref());
 
     if next_idx == 0 {
         // Wrapped past the last worker — back to the interactive prompt.
         *session.attached.lock().unwrap() = None;
+        *session.attach_review_announced.lock().unwrap() = None;
         println!(
             "\x1b[2m⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)\x1b[0m"
         );
+        return;
+    }
+
+    let (run_id, terminal) = workers[next_idx - 1].clone();
+    *session.attached.lock().unwrap() = Some(run_id.clone());
+    let short = crate::batch::short_id(&run_id);
+    if terminal {
+        // Finished agent: review mode (mirrors `attach_worker`'s terminal
+        // branch). Pre-seed the review marker so `announce_attach_review`
+        // doesn't re-announce the finish, replay its work, then show its result.
+        // A typed line resumes it (see `send_to_attached` → `resume_coordinator`).
+        *session.attach_review_announced.lock().unwrap() = Some(run_id.clone());
+        println!(
+            "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m \x1b[2m({}/{} · review mode: type a message to resume it, Shift-Tab to cycle, :detach to stop)\x1b[0m",
+            next_idx,
+            ids.len()
+        );
+        backfill_attached(&run_id, session);
+        print_attached_result(&run_id, session);
     } else {
-        let run_id = running[next_idx - 1].clone();
-        *session.attached.lock().unwrap() = Some(run_id.clone());
         // Live worker: clear any stale review marker so a later finish is
         // announced exactly once (mirrors `attach_worker`'s live branch).
         *session.attach_review_announced.lock().unwrap() = None;
-        let short = crate::batch::short_id(&run_id);
         println!(
             "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({}/{} · Shift-Tab to cycle, :detach to stop)\x1b[0m",
             next_idx,
-            running.len()
+            ids.len()
         );
         // Replay the input + activity captured so far, THEN the live stream
         // continues — the same backfill `:attach` performs. The worker's
@@ -2752,6 +2743,92 @@ fn cycle_worker(session: &mut Session) {
         // subsequent line, so the operator gets the full session transcript
         // first and live output after, instead of only future output.
         backfill_attached(&run_id, session);
+    }
+}
+
+/// `:close [worker-id]` — remove a coordinator from THIS session: drop it from
+/// the worker list (so it no longer shows in `:workers`) AND from the Shift-Tab
+/// rotation, and detach if it was the attached one. With no id it closes the
+/// coordinator the session is currently attached to — "the one you're in". An
+/// exact id or a unique prefix selects the target; an ambiguous prefix lists the
+/// matches.
+///
+/// Removing the in-memory record is what drops the worker from both `:workers`
+/// and the Shift-Tab cycle (both read `session.worker_jobs`). Closing a FINISHED
+/// agent simply discards its record. A still-RUNNING coordinator keeps running
+/// in the background — aish only stops tracking it here — so we say so plainly.
+fn close_worker(id: Option<&str>, session: &mut Session) {
+    let attached = session.attached.lock().unwrap().clone();
+    // Default target: the worker we're attached to ("the one you're in"). The
+    // goal sentinel isn't a worker job, so it can't be closed this way.
+    let target = id.map(str::to_string).or_else(|| {
+        attached
+            .clone()
+            .filter(|r| r != GOAL_ATTACH_ID)
+    });
+    let Some(target) = target else {
+        if attached.as_deref() == Some(GOAL_ATTACH_ID) {
+            println!(
+                "\x1b[2mthe goal isn't a worker — `:goal clear` to stop it, `:detach` to stop watching.\x1b[0m"
+            );
+        } else {
+            println!(
+                "usage: :close [worker-id]   — not attached to a coordinator; pass an id (see :workers)"
+            );
+        }
+        return;
+    };
+
+    // Resolve to a single worker by exact id or unique prefix (like `:attach`).
+    let hit = |wid: &str| wid == target || wid.starts_with(&target);
+    let matches: Vec<(String, String)> = session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|w| hit(&w.id))
+        .map(|w| (w.id.clone(), w.status()))
+        .collect();
+    let (run_id, status) = match matches.as_slice() {
+        [] => {
+            println!("no coordinator in this session matching '{target}' (see :workers)");
+            return;
+        }
+        [(rid, st)] => (rid.clone(), st.clone()),
+        many => {
+            println!(
+                "'{target}' matches {} coordinators — be more specific:",
+                many.len()
+            );
+            for (rid, _) in many {
+                println!("  {rid}");
+            }
+            return;
+        }
+    };
+
+    // Drop the record — removes it from `:workers` AND the Shift-Tab rotation.
+    session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .retain(|w| w.id != run_id);
+
+    // Detach if we just closed the worker we were attached to.
+    if attached.as_deref() == Some(run_id.as_str()) {
+        *session.attached.lock().unwrap() = None;
+        *session.attach_review_announced.lock().unwrap() = None;
+    }
+
+    let short = crate::batch::short_id(&run_id);
+    if matches!(status.as_str(), "done" | "failed") {
+        println!(
+            "\x1b[2m⇄ closed {short} — removed from :workers and the Shift-Tab rotation.\x1b[0m"
+        );
+    } else {
+        println!(
+            "\x1b[2m⇄ closed {short} — removed from :workers and the Shift-Tab rotation; it keeps running in the background.\x1b[0m"
+        );
     }
 }
 /// AC7 (TASK-201 / S9.2) ownership decision for steering a coordinator that may
@@ -3177,6 +3254,7 @@ async fn handle_colon(
                  :tell [--any] <id> <message>        send instructions to an in-flight coordinator (folded in next round; --any steers another session's)\n\
                  :attach <id>|goal                   watch a running coordinator live + steer it (typed lines go to it); `goal` watches the active :goal\n\
                  :detach                             stop watching the attached coordinator (it keeps running)\n\
+                 :close [id]                         remove the attached (or named) coordinator from :workers + the Shift-Tab rotation\n\
                  :skill <add|search|list|remove>     install, search, list, or remove skill.fish skills\n\
                  :rename <name>                      name the session (prefixes the prompt); auto-set to the repo name at startup, bare :rename clears\n\
                  :rewrite <intent>                   AI-rewrite intent into ONE command, prefilled to edit/accept before it runs (alias :rw)\n\
@@ -3190,7 +3268,7 @@ async fn handle_colon(
                  a at a prompt                       always-allow this tool (see :allow)\n\
                  d at a read/write/delete prompt     allow that permission for the whole dir, recursively\n\
                  Ctrl-O                              toggle raw tool output (show/squelch tool results)\n\
-                 Shift-Tab                           cycle attach across running coordinators (interactive → each worker → back)\n\
+                 Shift-Tab                           cycle attach across all coordinators incl. finished/failed (interactive → each worker → back)\n\
                  :quit                               exit (also Ctrl-D or `exit`)"
             );
         }
@@ -3428,6 +3506,7 @@ async fn handle_colon(
         }
         Some("attach") => attach_worker(parts.next(), session),
         Some("detach") => detach_worker(session),
+        Some("close") => close_worker(parts.next(), session),
         Some("tell" | "msg" | "send") => {
             // Steer an in-flight coordinator: queue an operator message that the
             // running coordinator folds into its next round (see coordinator::drive).
@@ -4930,9 +5009,9 @@ mod tests {
     #[test]
     fn cycle_unknown_attachment_restarts_from_interactive() {
         let running = ids(&["w_a", "w_b"]);
-        // An attachment that is no longer live (swept by auto_detach_finished)
-        // is treated as interactive, so the next press lands on the first
-        // running worker rather than panicking or skipping.
+        // An attachment whose id is no longer in the cycle list (e.g. it was
+        // `:close`d) is treated as interactive, so the next press lands on the
+        // first worker rather than panicking or skipping.
         assert_eq!(next_attach_index(&running, Some("w_gone")), 1);
     }
 
@@ -5154,6 +5233,17 @@ mod tests {
     fn skill_in_colon_catalog() {
         // The catalog carries :skill so the palette + completion offer it.
         assert!(colon_command_matches("sk").contains(&"skill"));
+    }
+
+    #[test]
+    fn close_in_colon_catalog() {
+        // The catalog carries :close so the palette + completion offer it.
+        assert!(colon_command_matches("cl").contains(&"close"));
+        // It does not collide with :compact / :context under the `c` prefix.
+        let c = colon_command_matches("c");
+        assert!(c.contains(&"close"));
+        assert!(c.contains(&"compact"));
+        assert!(c.contains(&"context"));
     }
 
     // ---- ISS-2045: :update running-job skew gate ------------------------
