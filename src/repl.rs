@@ -2693,20 +2693,22 @@ fn next_attach_index(running: &[String], current: Option<&str>) -> usize {
 
 /// `Shift-Tab` — cycle the interactive session's attach cursor across the
 /// coordinators it has running. The cycle is `interactive → worker₁ → worker₂
-/// → … → interactive`, in `:workers` listing order: each Shift-Tab advances
-/// to the next live coordinator (streaming its activity + steering input to it,
-/// exactly like `:attach`), and one more press past the last detaches back to
-/// the interactive prompt. With a single running worker it toggles attach/detach
-/// of that one; with none it's a no-op with a hint. Finished workers are first
-/// swept by `auto_detach_finished`, then excluded from the cycle so Shift-Tab
-/// never lands on a dead mailbox.
+/// → … → goal → interactive`, in `:workers` listing order: each Shift-Tab
+/// advances to the next live coordinator (streaming its activity + steering
+/// input to it, exactly like `:attach`), and one more press past the last
+/// detaches back to the interactive prompt. An active background `:goal` loop
+/// is included as the last cycle target (watch-only, like `:attach goal`). With
+/// a single running target it toggles attach/detach of that one; with none it's
+/// a no-op with a hint. Finished workers are first swept by
+/// `auto_detach_finished`, then excluded from the cycle so Shift-Tab never lands
+/// on a dead mailbox.
 fn cycle_worker(session: &mut Session) {
     // Drop the attachment first if the currently-attached coordinator already
     // finished, so the cursor advances from a clean "interactive" baseline.
     auto_detach_finished(session);
 
     // Live (non-terminal) coordinators in listing order — the cycle targets.
-    let running: Vec<String> = session
+    let mut running: Vec<String> = session
         .worker_jobs
         .lock()
         .unwrap()
@@ -2714,9 +2716,15 @@ fn cycle_worker(session: &mut Session) {
         .filter(|w| !matches!(w.status().as_str(), "done" | "failed"))
         .map(|w| w.id.clone())
         .collect();
+    // An active background `:goal` loop is a cycle target too — Shift-Tab lands
+    // on it just like `:attach goal`, streaming its turns live (watch-only; the
+    // goal has no operator mailbox, so it's appended after the workers).
+    if session.goal.as_ref().is_some_and(|g| g.is_active()) {
+        running.push(GOAL_ATTACH_ID.to_string());
+    }
     if running.is_empty() {
         println!(
-            "\x1b[2m⇄ no running coordinators to cycle through — :dispatch <task> to launch one\x1b[0m"
+            "\x1b[2m⇄ no running coordinators or goal to cycle through — :dispatch <task> to launch one, :goal <condition> to set a goal\x1b[0m"
         );
         return;
     }
@@ -2733,6 +2741,16 @@ fn cycle_worker(session: &mut Session) {
         *session.attached.lock().unwrap() = None;
         println!(
             "\x1b[2m⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)\x1b[0m"
+        );
+    } else if running[next_idx - 1] == GOAL_ATTACH_ID {
+        // Goal slot — watch-only, no mailbox and no backfill (mirrors the
+        // `:attach goal` branch of `attach_worker`): point the shared handle at
+        // the sentinel so each goal turn streams live.
+        *session.attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
+        println!(
+            "\x1b[1;33m⇄ attached to the goal\x1b[0m \x1b[2m({}/{} · streaming its turns · goals are watch-only · Shift-Tab to cycle, :detach to stop)\x1b[0m",
+            next_idx,
+            running.len()
         );
     } else {
         let run_id = running[next_idx - 1].clone();
@@ -4942,6 +4960,23 @@ mod tests {
         // Nothing to cycle into — stays at interactive regardless of state.
         assert_eq!(next_attach_index(&running, None), 0);
         assert_eq!(next_attach_index(&running, Some("w_a")), 0);
+    }
+
+    #[test]
+    fn cycle_includes_active_goal_as_last_target() {
+        // `cycle_worker` appends the GOAL_ATTACH_ID sentinel after the live
+        // workers when a `:goal` loop is active, so Shift-Tab lands on the goal
+        // just like `:attach goal`. The index math treats it as any other
+        // target: interactive → worker → goal → interactive.
+        let with_goal = ids(&["w_a", GOAL_ATTACH_ID]);
+        assert_eq!(next_attach_index(&with_goal, None), 1); // -> w_a
+        assert_eq!(next_attach_index(&with_goal, Some("w_a")), 2); // -> goal
+        assert_eq!(next_attach_index(&with_goal, Some(GOAL_ATTACH_ID)), 0); // -> interactive
+
+        // Goal-only (no workers): interactive toggles to/from the goal.
+        let goal_only = ids(&[GOAL_ATTACH_ID]);
+        assert_eq!(next_attach_index(&goal_only, None), 1); // -> goal
+        assert_eq!(next_attach_index(&goal_only, Some(GOAL_ATTACH_ID)), 0); // -> interactive
     }
 
     #[test]
