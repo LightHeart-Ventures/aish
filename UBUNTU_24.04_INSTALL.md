@@ -281,7 +281,7 @@ aish script.aish           # run a script, then exit
 
 | Requirement | Ubuntu 24.04 | Notes |
 |---|---|---|
-| **OS** | ✅ | Tested on 24.04 LTS; 22.04 / 20.04 also work |
+| **OS** | ✅ | Tested on 24.04 LTS; 20.04 also works |
 | **CPU** | Any | x86_64 or ARM64 (e.g., AWS Graviton) |
 | **RAM** | 4 GB+ | 8 GB+ recommended for `--backend local` |
 | **Disk** | 500 MB+ | 5 GB+ if running local model (model cache) |
