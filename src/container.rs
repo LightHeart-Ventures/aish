@@ -28,6 +28,11 @@
 //! writer. The DETACHED, shell-survival lifecycle (write the answer to the
 //! volume, read it back after `wait`) is S9.4's concern and layers on top of
 //! this abstraction without changing it.
+//!
+//! S9.5 (discovery + `:forget`) adds the lifecycle-management side: [`list`] is
+//! enriched to carry each container's labels (so a worker is matched to its
+//! `meta.json` by `aish.worker_id`), [`rm`] deletes an exited container, and
+//! [`forget_container`] ties the two together for the `:forget` command.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -99,7 +104,6 @@ pub fn runtime_on_path(rt: Runtime) -> bool {
 /// Auto-detect the preferred runtime on PATH per AC1: prefer **podman** (rootless,
 /// daemonless), else **docker**, else `None` (no engine → host path). Honors an
 /// explicit `AISH_CONTAINER_RUNTIME=none` by short-circuiting to `None`.
-#[allow(dead_code)] // AC1 auto-detect entry point; the engaged cutover uses resolve_selection.
 pub fn detect_runtime() -> Option<Runtime> {
     match Runtime::parse_selector(std::env::var("AISH_CONTAINER_RUNTIME").ok().as_deref()) {
         SelectorPref::Force(rt) => runtime_on_path(rt).then_some(rt),
@@ -387,20 +391,74 @@ pub fn image_exists(rt: Runtime, tag: &str) -> bool {
 /// A discovered worker container — the unit S9.5 discovery scans by label, and
 /// what `list` returns.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // S9.5 discovery scans containers by label into these.
+#[allow(dead_code)] // labels + accessors feed the S9.5 discovery follow-up.
 pub struct ContainerHandle {
     pub id: String,
     pub name: String,
     pub labels: HashMap<String, String>,
 }
 
+#[allow(dead_code)] // join-key accessors for the S9.5 discovery follow-up.
+impl ContainerHandle {
+    /// The worker id this container belongs to (`aish.worker_id` label), if any.
+    /// This is discovery's idempotency + meta.json join key (AC1).
+    pub fn worker_id(&self) -> Option<&str> {
+        self.labels.get("aish.worker_id").map(String::as_str)
+    }
+
+    /// The owning session id (`aish.session_id` label), if any — the scope key
+    /// discovery filters on (AC4).
+    pub fn session_id(&self) -> Option<&str> {
+        self.labels.get("aish.session_id").map(String::as_str)
+    }
+
+    /// The label-schema version (`aish.schema`), if present. Discovery skips a
+    /// container whose schema it doesn't understand rather than crash (AC edge).
+    pub fn schema(&self) -> Option<&str> {
+        self.labels.get("aish.schema").map(String::as_str)
+    }
+}
+
+/// Parse a `{{.Labels}}` field (the engine renders it as a comma-joined
+/// `key=value` list, e.g. `aish.schema=1,aish.worker_id=w_x`) into a map.
+/// Tolerant: blank entries and entries without an `=` are skipped. Pure → tested.
+fn parse_labels_field(field: &str) -> HashMap<String, String> {
+    field
+        .split(',')
+        .filter_map(|kv| {
+            let kv = kv.trim();
+            if kv.is_empty() {
+                return None;
+            }
+            let (k, v) = kv.split_once('=')?;
+            let k = k.trim();
+            (!k.is_empty()).then(|| (k.to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Parse one `{{.ID}}\t{{.Names}}\t{{.Labels}}` line into a [`ContainerHandle`].
+/// `None` when the id field is empty. Pure → unit-tested without a daemon.
+fn parse_ps_line(line: &str) -> Option<ContainerHandle> {
+    let mut it = line.splitn(3, '\t');
+    let id = it.next()?.trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let name = it.next().unwrap_or("").trim().to_string();
+    let labels = parse_labels_field(it.next().unwrap_or(""));
+    Some(ContainerHandle { id, name, labels })
+}
+
 /// List containers carrying ALL of `label_filter` (AND semantics, via repeated
-/// `--filter label=k=v`). Best-effort — empty on any error. Used by S9.5 to
-/// rediscover workers the shell can't reap, and by the AC3 uniqueness probe.
-#[allow(dead_code)] // S9.5 label-based worker rediscovery / AC3 uniqueness probe.
+/// `--filter label=k=v`). Each handle carries its full label set (parsed from
+/// the `{{.Labels}}` column), so S9.5 discovery can join a container to its
+/// on-disk `meta.json` by `aish.worker_id` and scope by `aish.session_id`.
+/// Best-effort — empty on any error (no runtime, daemon down, …) so a missing
+/// engine reads cleanly as "no containers" rather than failing.
 pub fn list(rt: Runtime, label_filter: &[(&str, &str)]) -> Vec<ContainerHandle> {
     let mut cmd = std::process::Command::new(rt.bin());
-    cmd.args(["ps", "-a", "--format", "{{.ID}}\t{{.Names}}"]);
+    cmd.args(["ps", "-a", "--format", "{{.ID}}\t{{.Names}}\t{{.Labels}}"]);
     for (k, v) in label_filter {
         cmd.arg("--filter");
         cmd.arg(format!("label={k}={v}"));
@@ -411,17 +469,50 @@ pub fn list(rt: Runtime, label_filter: &[(&str, &str)]) -> Vec<ContainerHandle> 
     };
     String::from_utf8_lossy(&out)
         .lines()
-        .filter_map(|line| {
-            let mut it = line.splitn(2, '\t');
-            let id = it.next()?.trim().to_string();
-            let name = it.next().unwrap_or("").trim().to_string();
-            (!id.is_empty()).then_some(ContainerHandle {
-                id,
-                name,
-                labels: HashMap::new(),
-            })
-        })
+        .filter_map(parse_ps_line)
         .collect()
+}
+
+/// Remove a container by id/name. `force` adds `-f` (the engine SIGKILLs a
+/// running container before removing it); without it, an engine REFUSES to
+/// remove a still-running container — which is exactly the guard `:forget` wants
+/// so it can never reap a live worker's container (AC5a). Best-effort: returns
+/// `true` only on a clean removal, `false` on any error (no runtime, already
+/// gone, still running without force). Quiet — stdout/stderr are suppressed.
+pub fn rm(rt: Runtime, id: &str, force: bool) -> bool {
+    let mut cmd = std::process::Command::new(rt.bin());
+    cmd.arg("rm");
+    if force {
+        cmd.arg("-f");
+    }
+    cmd.arg(id)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `:forget` (S9.5) container cleanup: find the worker's container by its
+/// `aish.worker_id` label and remove it WITHOUT force, so a still-running
+/// container is left intact (the engine refuses a no-force `rm` on a live
+/// container). Honors `AISH_CONTAINER_RUNTIME` for engine selection and is a
+/// no-op (returns `false`) when no runtime is available — the common case today,
+/// since the default backend is the host subprocess. Returns `true` when a
+/// container was actually removed.
+pub fn forget_container(worker_id: &str) -> bool {
+    let Some(rt) = detect_runtime() else {
+        return false;
+    };
+    let mut removed = false;
+    for h in list(rt, &[("aish.worker_id", worker_id)]) {
+        // Prefer the stable name when present, else the id — both resolve.
+        let target = if h.name.is_empty() { &h.id } else { &h.name };
+        if rm(rt, target, false) {
+            removed = true;
+        }
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -665,5 +756,43 @@ mod tests {
     fn runtime_bin_names() {
         assert_eq!(Runtime::Podman.bin(), "podman");
         assert_eq!(Runtime::Docker.bin(), "docker");
+    }
+
+    #[test]
+    fn parse_labels_field_splits_kv_pairs_and_skips_junk() {
+        let m = parse_labels_field("aish.schema=1,aish.worker_id=w_x,aish.session_id=sess-a");
+        assert_eq!(m.get("aish.schema").map(String::as_str), Some("1"));
+        assert_eq!(m.get("aish.worker_id").map(String::as_str), Some("w_x"));
+        assert_eq!(m.get("aish.session_id").map(String::as_str), Some("sess-a"));
+        // Blank field → empty map (no labels, e.g. a non-aish container).
+        assert!(parse_labels_field("").is_empty());
+        // Entries without an `=`, or with an empty key, are skipped.
+        let m2 = parse_labels_field("bogus,,=novalue,k=v");
+        assert_eq!(m2.len(), 1);
+        assert_eq!(m2.get("k").map(String::as_str), Some("v"));
+        // A value that itself contains `=` keeps everything after the first `=`.
+        let m3 = parse_labels_field("k=a=b=c");
+        assert_eq!(m3.get("k").map(String::as_str), Some("a=b=c"));
+    }
+
+    #[test]
+    fn parse_ps_line_builds_handle_with_labels() {
+        let h = parse_ps_line(
+            "abc123\taish-sess-w_x\taish.schema=1,aish.worker_id=w_x,aish.session_id=sess-a",
+        )
+        .expect("a well-formed line parses");
+        assert_eq!(h.id, "abc123");
+        assert_eq!(h.name, "aish-sess-w_x");
+        assert_eq!(h.worker_id(), Some("w_x"));
+        assert_eq!(h.session_id(), Some("sess-a"));
+        assert_eq!(h.schema(), Some("1"));
+        // No labels column → handle with an empty label map (accessors None).
+        let bare = parse_ps_line("def456\tsome-name\t").expect("bare line parses");
+        assert_eq!(bare.id, "def456");
+        assert!(bare.worker_id().is_none());
+        assert!(bare.schema().is_none());
+        // Empty id → no handle (a blank ps line is dropped).
+        assert!(parse_ps_line("").is_none());
+        assert!(parse_ps_line("\t\t").is_none());
     }
 }
