@@ -9,6 +9,16 @@
 - **Structured tool results threaded to model + Ctrl-O keeps raw view** (S7.3): The optional typed JSON payload now reaches the model as compact JSON instead of alignment-corrupted ASCII, while Ctrl-O keeps the human-readable text view unchanged.
 - **curated registry index** with 20 high-value installable skills from skillfish ecosystem.
 
+## [0.17.0] - 2025-07-02
+
+### Added
+- **Session-scoped job filtering** (S9.6 / TASK-251): The `:workers` command (and `background_status` tool) now accepts a `filter` argument to narrow to current-session, specific-job, or all-tenant jobs. Defaults to session scope for interactive use (`status/session`), matching the REPL's mental model. Useful when you have dozens of background coordinators across multiple sessions and want to focus on the current session's work.
+- **CI conflict escalation + playbook surfacing**: When CI fails or a merge conflict is encountered, the system now surfaces the `fix-ci` and `fix-conflicts` skill recommendations alongside a hand-off to run them. Operators get guidance on where to read the root cause + proposed fix plan.
+- **Repospec metadata** (`.repospec.json`): Added a standard [repospec/v1](https://github.com/LightHeart-Ventures/repospec)-compliant metadata file documenting aish's 3 entrypoints, 13 modules, 8 patterns, 5 features, 3 infrastructure layers, 6 dependencies, and 5 project goals. Agents can now read one file to understand the codebase structure instead of keyword-searching through 2500+ lines of source.
+
+### Changed
+- **Background-mode nudge tightened**: Clarified that a question — including "what's running?", "didn't we dispatch a worker for this?", or "what is the coordinator doing?" — must be answered inline (via `background_status` or a lookup), never offloaded to a fresh coordinator.
+
 ## [Unreleased]
 
 ### Added
