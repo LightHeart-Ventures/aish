@@ -18,9 +18,10 @@ const CLAUDE_CODE_SPOOF: &str = "You are Claude Code, Anthropic's official CLI f
 enum Auth {
     /// `x-api-key` — a metered `sk-ant-…` key (full API surface, incl. Batches).
     ApiKey(String),
-    /// `Authorization: Bearer` — a subscription `CLAUDE_CODE_OAUTH_TOKEN`
-    /// (`sk-ant-oat…`). Works for the Messages API; the Batches API is out of
-    /// reach for subscription credentials.
+    /// `Authorization: Bearer` — a subscription token (`sk-ant-oat…`) from
+    /// `CLAUDE_CODE_OAUTH_TOKEN` or the Claude Code CLI's
+    /// `~/.claude/.credentials.json`. Works for the Messages API; the Batches
+    /// API is out of reach for subscription credentials.
     Oauth(String),
 }
 
@@ -42,18 +43,31 @@ impl Credential {
         crate::rc::env_value(extra, key)
     }
 
-    /// Resolve a credential, checking the ~/.aishrc exports in `extra` before the
-    /// process env. A `CLAUDE_CODE_OAUTH_TOKEN` (Claude Max/Pro subscription)
-    /// wins over `ANTHROPIC_API_KEY` (metered). Errors if neither is set. Pass
-    /// `&[]` when no rc context is available.
+    /// Resolve a credential, in precedence order:
+    ///   1. `CLAUDE_CODE_OAUTH_TOKEN` (Claude Max/Pro subscription) from the
+    ///      ~/.aishrc exports in `extra`, else the process env;
+    ///   2. the subscription token the Claude Code CLI writes to
+    ///      `~/.claude/.credentials.json` after `claude login` — so an existing
+    ///      Claude Code session is reused with zero extra setup;
+    ///   3. `ANTHROPIC_API_KEY` (metered) from `extra`, else the process env.
+    ///
+    /// Both subscription sources outrank the metered key (they share the OAuth
+    /// auth/system shaping). Errors if none is found. Pass `&[]` when no rc
+    /// context is available.
     pub fn resolve(extra: &[(String, String)]) -> Result<Self> {
-        let auth = match Self::lookup(extra, "CLAUDE_CODE_OAUTH_TOKEN") {
-            Some(t) => Auth::Oauth(t),
-            None => Auth::ApiKey(Self::lookup(extra, "ANTHROPIC_API_KEY").context(
+        let auth = if let Some(t) = Self::lookup(extra, "CLAUDE_CODE_OAUTH_TOKEN") {
+            Auth::Oauth(t)
+        } else if let Some(t) = credentials_file_token() {
+            Auth::Oauth(t)
+        } else if let Some(k) = Self::lookup(extra, "ANTHROPIC_API_KEY") {
+            Auth::ApiKey(k)
+        } else {
+            bail!(
                 "no Claude credential — set CLAUDE_CODE_OAUTH_TOKEN (a Claude Max/Pro \
-subscription token from `claude setup-token`) or ANTHROPIC_API_KEY (a metered key), \
-in your environment or ~/.aishrc",
-            )?),
+subscription token from `claude setup-token`), sign in with the Claude Code CLI (which \
+writes ~/.claude/.credentials.json), or set ANTHROPIC_API_KEY (a metered key), in your \
+environment or ~/.aishrc"
+            );
         };
         Ok(Self { auth })
     }
@@ -82,6 +96,49 @@ in your environment or ~/.aishrc",
             Auth::ApiKey(_) => json!(system),
         }
     }
+}
+
+/// Read a Claude Code subscription token from `~/.claude/.credentials.json` —
+/// the file the `claude` CLI writes after an interactive sign-in. This lets aish
+/// reuse an existing Claude Code session with no extra setup (no
+/// `claude setup-token`, no env var). Returns the access token when the file is
+/// present, readable, well-formed, and the token is non-empty and unexpired;
+/// `None` for every miss (no HOME, missing/unreadable file, malformed JSON, no
+/// token, or a past `expiresAt`) so resolution falls through to the next source.
+fn credentials_file_token() -> Option<String> {
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    let path = std::path::Path::new(&home)
+        .join(".claude")
+        .join(".credentials.json");
+    let contents = std::fs::read_to_string(path).ok()?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    token_from_credentials_json(&contents, now_ms)
+}
+
+/// Pure parse of a `~/.claude/.credentials.json` body: pull
+/// `claudeAiOauth.accessToken`, accepting it only when non-empty and either
+/// without an `expiresAt` or with one (epoch milliseconds) still in the future
+/// relative to `now_ms`. An already-expired token returns `None` so resolution
+/// falls through to `ANTHROPIC_API_KEY` instead of sending a token the API will
+/// reject. Split out from the file IO so the shape/expiry policy is unit-testable.
+fn token_from_credentials_json(contents: &str, now_ms: u64) -> Option<String> {
+    let v: Value = serde_json::from_str(contents).ok()?;
+    let oauth = v.get("claudeAiOauth")?;
+    let token = oauth.get("accessToken")?.as_str()?.trim();
+    if token.is_empty() {
+        return None;
+    }
+    // A present, non-zero expiry that's already passed → treat as unusable.
+    // A missing or zero `expiresAt` is treated as non-expiring.
+    if let Some(exp) = oauth.get("expiresAt").and_then(Value::as_u64) {
+        if exp != 0 && exp <= now_ms {
+            return None;
+        }
+    }
+    Some(token.to_string())
 }
 
 pub struct ClaudeBackend {
@@ -672,6 +729,51 @@ mod tests {
         assert_eq!(
             api_key().system_value("REAL SYSTEM PROMPT"),
             json!("REAL SYSTEM PROMPT")
+        );
+    }
+
+    #[test]
+    fn credentials_json_extracts_unexpired_oauth_token() {
+        // The shape the Claude Code CLI writes to ~/.claude/.credentials.json.
+        let body = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-from-file","refreshToken":"sk-ant-ort-x","expiresAt":2000,"scopes":["user:inference"],"subscriptionType":"max"}}"#;
+        // now < expiresAt → the token is returned.
+        assert_eq!(
+            token_from_credentials_json(body, 1000),
+            Some("sk-ant-oat-from-file".to_string())
+        );
+        // now >= expiresAt → expired, treated as unset so we fall through.
+        assert_eq!(token_from_credentials_json(body, 2000), None);
+        assert_eq!(token_from_credentials_json(body, 3000), None);
+    }
+
+    #[test]
+    fn credentials_json_without_expiry_is_non_expiring() {
+        // No expiresAt (and a zero expiresAt) → always usable.
+        let no_exp = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-noexp"}}"#;
+        assert_eq!(
+            token_from_credentials_json(no_exp, 9_999_999_999_999),
+            Some("sk-ant-oat-noexp".to_string())
+        );
+        let zero_exp = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-z","expiresAt":0}}"#;
+        assert_eq!(
+            token_from_credentials_json(zero_exp, 9_999_999_999_999),
+            Some("sk-ant-oat-z".to_string())
+        );
+    }
+
+    #[test]
+    fn credentials_json_rejects_malformed_or_empty() {
+        // Not JSON, no oauth object, no token, and a blank/whitespace token all
+        // resolve to None rather than panicking or yielding an empty credential.
+        assert_eq!(token_from_credentials_json("not json", 0), None);
+        assert_eq!(token_from_credentials_json("{}", 0), None);
+        assert_eq!(
+            token_from_credentials_json(r#"{"claudeAiOauth":{}}"#, 0),
+            None
+        );
+        assert_eq!(
+            token_from_credentials_json(r#"{"claudeAiOauth":{"accessToken":"   "}}"#, 0),
+            None
         );
     }
 
