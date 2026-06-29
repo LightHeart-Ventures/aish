@@ -1,0 +1,549 @@
+{
+  "schema": "repospec/v1",
+  "name": "aish",
+  "version": "0.16.0",
+  "description": "An AI-native Linux shell that routes commands and intent to Claude or local LLMs",
+  "repository": "https://github.com/LightHeart-Ventures/aish",
+  "license": "Apache-2.0",
+  "summary": "AI-native shell: type commands to run directly, intent to an agent that plans, executes, and iterates until done.",
+  "entrypoints": [
+    {
+      "name": "aish-repl",
+      "kind": "cli",
+      "path": "src/main.rs",
+      "purpose": "Interactive REPL shell; entry point for session startup, command routing, and model interaction",
+      "start": "cargo run --release",
+      "tags": ["frontend", "interactive"]
+    },
+    {
+      "name": "coordinator-worker",
+      "kind": "cli",
+      "path": "src/coordinator.rs",
+      "purpose": "Persistent background coordinator run; re-executes aish with a task, manages multi-turn agent loops, and returns structured output",
+      "tags": ["background", "agent", "worker"]
+    },
+    {
+      "name": "batch-processor",
+      "kind": "worker",
+      "path": "src/batch.rs",
+      "purpose": "Anthropic Batches API integration; queues and monitors async batch runs for cost-optimized bulk agent invocations",
+      "tags": ["background", "api-integration"]
+    }
+  ],
+  "modules": [
+    {
+      "id": "repl",
+      "path": "src/repl.rs",
+      "purpose": "Interactive REPL loop (rustyline); reads user input, routes to dispatch or model, manages `:commands`, attachment UI",
+      "depends_on": ["engine", "session", "editor"],
+      "key_files": ["src/repl.rs"],
+      "tags": ["frontend", "interactive"]
+    },
+    {
+      "id": "engine",
+      "path": "src/engine.rs",
+      "purpose": "Core agentic turn loop; invokes Claude/LLM, processes tool calls, maintains conversation history",
+      "depends_on": ["backend", "tools", "session", "context"],
+      "key_files": ["src/engine.rs"],
+      "tags": ["agent", "core"]
+    },
+    {
+      "id": "backend",
+      "path": "src/backend",
+      "purpose": "LLM provider abstraction; supports Claude API, Grok, and mistral.rs (local inference)",
+      "depends_on": [],
+      "key_files": ["src/backend/mod.rs", "src/backend/claude.rs"],
+      "tags": ["llm", "api-integration"]
+    },
+    {
+      "id": "tools",
+      "path": "src/tools.rs",
+      "purpose": "Tool execution layer; implements read_file, write_file, run_program, run_interactive, change_dir, etc.",
+      "depends_on": ["session"],
+      "key_files": ["src/tools.rs"],
+      "tags": ["execution", "core"]
+    },
+    {
+      "id": "dispatch",
+      "path": "src/repl.rs",
+      "purpose": "Direct-dispatch routing; decides whether a line is a real command (run directly) or intent (route to model)",
+      "depends_on": ["rc", "tools", "pipeline"],
+      "key_files": ["src/repl.rs"],
+      "tags": ["routing", "shell"]
+    },
+    {
+      "id": "coordinator",
+      "path": "src/coordinator.rs",
+      "purpose": "Background worker orchestration; spawns, monitors, resumes durable coordinator runs with persistent context",
+      "depends_on": ["worker", "container", "session", "engine"],
+      "key_files": ["src/coordinator.rs", "src/worker.rs"],
+      "tags": ["background", "worker"]
+    },
+    {
+      "id": "session",
+      "path": "src/session.rs",
+      "purpose": "Per-REPL or per-worker session state; holds cwd, environment, history, backend config, MCP connections",
+      "depends_on": ["db", "mcp"],
+      "key_files": ["src/session.rs"],
+      "tags": ["state", "core"]
+    },
+    {
+      "id": "database",
+      "path": "src/db.rs",
+      "purpose": "SQLite + sqlite-vec persistence layer; stores input/output history, memories, worker records, and vector embeddings",
+      "depends_on": [],
+      "key_files": ["src/db.rs", "src/worker_store.rs"],
+      "tags": ["persistence", "storage"]
+    },
+    {
+      "id": "mcp",
+      "path": "src/mcp.rs",
+      "purpose": "Model Context Protocol server integration; manages MCP server lifecycle, tool routing, and skill discovery",
+      "depends_on": ["tools"],
+      "key_files": ["src/mcp.rs", "src/skill_provider.rs"],
+      "tags": ["extensibility", "tools"]
+    },
+    {
+      "id": "container",
+      "path": "src/container.rs",
+      "purpose": "Docker container lifecycle for background workers; spawns, monitors, cleans up ephemeral worker containers",
+      "depends_on": [],
+      "key_files": ["src/container.rs"],
+      "tags": ["infrastructure", "worker"]
+    },
+    {
+      "id": "git-integration",
+      "path": "src/git_repo.rs",
+      "purpose": "Git repository utilities; manages branches, commits, pull requests via GitHub API integration",
+      "depends_on": ["tools"],
+      "key_files": ["src/git_repo.rs", "src/git.rs"],
+      "tags": ["vcs", "integration"]
+    },
+    {
+      "id": "memory",
+      "path": "src/memory.rs",
+      "purpose": "Persistent memory system; stores agent/user facts across sessions via recall/remember tools",
+      "depends_on": ["db"],
+      "key_files": ["src/memory.rs"],
+      "tags": ["persistence", "ai"]
+    },
+    {
+      "id": "skills",
+      "path": "src/skill_provider.rs",
+      "purpose": "Skill discovery and management; loads SKILL.md files from ~/.aish/skills/, advertises to model",
+      "depends_on": ["tools"],
+      "key_files": ["src/skill_provider.rs", "src/skills.rs"],
+      "tags": ["extensibility", "prompting"]
+    }
+  ],
+  "patterns": [
+    {
+      "concern": "session-state-immutability",
+      "defined_in": "src/session.rs",
+      "convention": "Session is the carrier of per-execution state (cwd, env, history). Mutated in-place by builtins (cd, set, export) and tools; not passed via function return.",
+      "tags": ["core", "design"]
+    },
+    {
+      "concern": "tool-error-handling",
+      "defined_in": "src/tools.rs",
+      "applied_via": "Every tool returns anyhow::Result<T>; partial failures (e.g., a read timeout) return Some(output) + Err, preserving partial work.",
+      "convention": "Tools never panic; they log, return Err or degraded output, and let the agent decide next steps.",
+      "tags": ["reliability", "design"]
+    },
+    {
+      "concern": "routing-heuristics",
+      "defined_in": "src/repl.rs",
+      "applied_via": "split_route() + dispatch() + looks_like_prose() + route_preview()",
+      "convention": "Lines are routed by predicates: `:command` → REPL, word-1 is real binary → direct, else → model. `!` forces direct, `?` forces model.",
+      "tags": ["routing", "shell-semantics"]
+    },
+    {
+      "concern": "confirmation-gates",
+      "defined_in": "src/tools.rs",
+      "applied_via": "tools::Decision enum; :mode <paranoid|careful|normal|yolo> sets the gate level per session",
+      "convention": "Each tool checks `session.mode` before execution: paranoid=all, careful=writes only, normal=write+delete, yolo=none.",
+      "tags": ["security", "safety"]
+    },
+    {
+      "concern": "ansi-formatting-and-markdown-rendering",
+      "defined_in": "src/style.rs src/md.rs",
+      "applied_via": "crate::style:: for colors/emphasis; crate::md::render_stdout() for markdown → terminal",
+      "convention": "Model responses are markdown; stdout is rendered with colors + emoji. NO_COLOR env disables; piped stdout auto-disables.",
+      "tags": ["presentation", "ux"]
+    },
+    {
+      "concern": "timeout-and-signal-handling",
+      "defined_in": "src/tools.rs src/engine.rs",
+      "applied_via": "timeout_secs (default 120s) on run_program; Ctrl-C caught by tokio::signal::ctrl_c() for turn abort",
+      "convention": "Model-run programs are killed after timeout with partial output. Interactive (TTY) programs run to completion and inherit signals.",
+      "tags": ["reliability", "ux"]
+    },
+    {
+      "concern": "history-recording",
+      "defined_in": "src/db.rs",
+      "applied_via": "db.record('input', ...) + db.record('output', ...) after each interactive turn",
+      "convention": "All input/output is stored to aish.db for recall; large outputs truncated head-first to 4000 bytes.",
+      "tags": ["persistence", "observability"]
+    },
+    {
+      "concern": "vector-embeddings-for-memory-search",
+      "defined_in": "src/db.rs",
+      "applied_via": "sqlite-vec to store embeddings; memory recall uses vector similarity search",
+      "convention": "recall tool returns top-K memories by cosine similarity; embeddings are computed lazily on recall.",
+      "tags": ["ai", "persistence"]
+    }
+  ],
+  "key_files": {
+    "config": [
+      ".cargo/config.toml",
+      ".mcp.json",
+      "~/.aishrc"
+    ],
+    "build": [
+      "Cargo.toml",
+      "Cargo.lock",
+      "Makefile"
+    ],
+    "ci": [
+      ".github/workflows"
+    ],
+    "docker": [
+      "Dockerfile.worker"
+    ],
+    "tests": [
+      "tests/"
+    ],
+    "install": [
+      "scripts/install-ubuntu-24.04.sh",
+      "aish.sh"
+    ],
+    "docs": [
+      "README.md",
+      "CHANGELOG.md",
+      "docs/"
+    ]
+  },
+  "features": [
+    {
+      "name": "command-routing",
+      "description": "Lines are routed: `:commands` → REPL, real binaries → direct dispatch, anything else → model. Escape hatches: `!` forces direct, `?` forces model.",
+      "flow": [
+        {
+          "step": "user-input",
+          "file": "src/repl.rs",
+          "fn": "run",
+          "note": "Read line from LineEditor"
+        },
+        {
+          "step": "route-decision",
+          "file": "src/repl.rs",
+          "fn": "split_route",
+          "note": "Strip `!`/`?` prefix if present"
+        },
+        {
+          "step": "dispatch",
+          "file": "src/repl.rs",
+          "fn": "dispatch",
+          "note": "Try to resolve first word as program; if fails → return NotACommand"
+        },
+        {
+          "step": "heuristics",
+          "file": "src/repl.rs",
+          "fn": "looks_like_prose",
+          "note": "Check if line reads as English, not a command (e.g. 'who is alice')"
+        },
+        {
+          "step": "execution",
+          "file": "src/tools.rs",
+          "fn": "run_on_tty",
+          "note": "Direct: exec program on terminal; Model: route to engine"
+        }
+      ],
+      "tests": [
+        "src/repl.rs (oracle_direct_stdout_matches_bash)",
+        "src/repl.rs (routing_decision_snapshot)"
+      ],
+      "tags": [
+        "core",
+        "shell-semantics"
+      ]
+    },
+    {
+      "name": "agent-turn-loop",
+      "description": "Model invocation: maintain conversation history, execute tool calls, observe output, iterate until done or user aborts.",
+      "flow": [
+        {
+          "step": "user-intent",
+          "file": "src/repl.rs",
+          "fn": "run",
+          "note": "User types intent (routed to model)"
+        },
+        {
+          "step": "engine-init",
+          "file": "src/engine.rs",
+          "fn": "run_turn",
+          "note": "Prepare session + prompt; build request to LLM"
+        },
+        {
+          "step": "llm-invoke",
+          "file": "src/backend/claude.rs",
+          "fn": "invoke",
+          "note": "Send conversation history + request to Claude API"
+        },
+        {
+          "step": "tool-dispatch",
+          "file": "src/engine.rs",
+          "fn": "run_turn",
+          "note": "Parse tool calls from response; dispatch each via tools.rs"
+        },
+        {
+          "step": "tool-result",
+          "file": "src/tools.rs",
+          "fn": "read_file / run_program / …",
+          "note": "Execute tool, capture output (or error)"
+        },
+        {
+          "step": "loop-until-done",
+          "file": "src/engine.rs",
+          "fn": "run_turn",
+          "note": "Append tool result, invoke LLM again; repeat until stop_reason=end_turn"
+        },
+        {
+          "step": "response-render",
+          "file": "src/repl.rs",
+          "fn": "run",
+          "note": "Render final text (markdown → terminal); record to history"
+        }
+      ],
+      "tests": [
+        "src/engine.rs (integration tests)"
+      ],
+      "tags": [
+        "agent",
+        "core"
+      ]
+    },
+    {
+      "name": "background-coordinator-runs",
+      "description": "Spawn durable background workers for long-running tasks; attach/detach to steer; resume with context preservation.",
+      "flow": [
+        {
+          "step": "trigger",
+          "file": "src/repl.rs",
+          "fn": "dispatch_background",
+          "note": "User types work-signal intent or `:dispatch` command"
+        },
+        {
+          "step": "spawn",
+          "file": "src/worker.rs",
+          "fn": "spawn",
+          "note": "Launch container or subprocess with aish re-exec"
+        },
+        {
+          "step": "coordinator-init",
+          "file": "src/coordinator.rs",
+          "fn": "drive",
+          "note": "Coordinator manages multi-turn loop, journaling, attachment"
+        },
+        {
+          "step": "attach",
+          "file": "src/repl.rs",
+          "fn": "handle_colon (:attach)",
+          "note": "User attaches to see activity; typed lines are steered via tell-mailbox"
+        },
+        {
+          "step": "resume",
+          "file": "src/repl.rs",
+          "fn": "resume_coordinator",
+          "note": "When worker finishes, user can type to resume with new context"
+        },
+        {
+          "step": "result-capture",
+          "file": "src/worker.rs",
+          "fn": "fetch",
+          "note": "Worker returns structured output (json or rendered text)"
+        }
+      ],
+      "tests": [
+        "src/coordinator.rs (integration tests)"
+      ],
+      "tags": [
+        "background",
+        "worker",
+        "critical"
+      ]
+    },
+    {
+      "name": "persistent-memory",
+      "description": "Store and recall facts across sessions; agent reads/writes via remember/recall tools.",
+      "flow": [
+        {
+          "step": "remember",
+          "file": "src/tools.rs",
+          "fn": "remember",
+          "note": "User or agent calls remember(content, tags); stored in db.memories"
+        },
+        {
+          "step": "embed",
+          "file": "src/db.rs",
+          "fn": "record_memory",
+          "note": "Compute embedding via model; store in sqlite-vec"
+        },
+        {
+          "step": "recall",
+          "file": "src/tools.rs",
+          "fn": "recall",
+          "note": "Embed query; search top-K memories by cosine similarity"
+        },
+        {
+          "step": "context-injection",
+          "file": "src/engine.rs",
+          "fn": "run_turn",
+          "note": "Recalled memories injected into system prompt for turn"
+        }
+      ],
+      "tests": [
+        "src/db.rs (memory tests)"
+      ],
+      "tags": [
+        "persistence",
+        "ai"
+      ]
+    },
+    {
+      "name": "mcp-skill-integration",
+      "description": "Load MCP servers + SKILL.md packs; advertise tools and skills in model prompts.",
+      "flow": [
+        {
+          "step": "mcp-startup",
+          "file": "src/mcp.rs",
+          "fn": "McpHost::start",
+          "note": "Connect to servers in ~/.aish/.mcp.json (stdio transport)"
+        },
+        {
+          "step": "tool-discovery",
+          "file": "src/mcp.rs",
+          "fn": "tool_defs",
+          "note": "Call tools/list; cache definitions for dispatch"
+        },
+        {
+          "step": "skill-load",
+          "file": "src/skill_provider.rs",
+          "fn": "catalog_skills",
+          "note": "Walk ~/.aish/skills/; parse SKILL.md frontmatter"
+        },
+        {
+          "step": "prompt-injection",
+          "file": "src/engine.rs",
+          "fn": "run_turn",
+          "note": "Append tools + skills to system prompt; model can reference"
+        },
+        {
+          "step": "tool-invoke",
+          "file": "src/engine.rs",
+          "fn": "run_turn",
+          "note": "Dispatch MCP tool calls via mcp__server__tool pattern"
+        }
+      ],
+      "tests": [
+        "src/mcp.rs (mcp tests)"
+      ],
+      "tags": [
+        "extensibility",
+        "integration"
+      ]
+    }
+  ],
+  "testing": {
+    "unit": "Inline `#[test]` and `#[tokio::test]` in source files; run with `cargo test --lib`",
+    "integration": "tests/ directory; routes, dispatch routing, oracle tests (bash compatibility checks)",
+    "fixtures": "tests/golden/ (golden snapshot files); test data embedded in test functions",
+    "run": "cargo test --all (unit + integration + doc tests); CARGO_BUILD_JOBS=4 for low-memory machines"
+  },
+  "infrastructure": [
+    {
+      "name": "github-actions-ci",
+      "kind": "ci",
+      "provider": "github-actions",
+      "path": ".github/workflows",
+      "purpose": "Test suite (cargo test), linting (clippy, fmt), security audit (deny.toml), and release builds",
+      "triggers": [
+        "push to main",
+        "pull-request",
+        "tag push (releases)"
+      ],
+      "environments": [
+        "ubuntu-latest",
+        "macos-latest"
+      ],
+      "tags": [
+        "ci",
+        "release"
+      ]
+    },
+    {
+      "name": "docker-worker-image",
+      "kind": "container",
+      "provider": "docker",
+      "path": "Dockerfile.worker",
+      "purpose": "Ephemeral containers for background coordinator runs; includes Rust toolchain + aish binary",
+      "manages": [
+        "container-image"
+      ],
+      "tags": [
+        "infrastructure",
+        "worker"
+      ]
+    },
+    {
+      "name": "makefile-build",
+      "kind": "pipeline",
+      "provider": "make",
+      "path": "Makefile",
+      "purpose": "Development targets: build, install, test, lint, clean, register-shell",
+      "deploy": "make install",
+      "tags": [
+        "build",
+        "local"
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "name": "tokio",
+      "version": "1.52.3",
+      "why": "Async runtime for concurrent tool execution, model invocation, worker management, signal handling"
+    },
+    {
+      "name": "rustyline",
+      "version": "18.0.0",
+      "why": "REPL line editor with completion, history, and hints (fish-style ghost text)"
+    },
+    {
+      "name": "mistralrs",
+      "why": "Optional: local LLM inference (Qwen3-1.7B GGUF) when --backend local is used; lazy-loaded from HF cache"
+    },
+    {
+      "name": "sqlite-vec",
+      "version": "0.1.6",
+      "why": "Vector similarity search for persistent memory recall; embeddings stored alongside history in aish.db"
+    },
+    {
+      "name": "rusqlite",
+      "version": "0.32",
+      "why": "SQLite bindings for history, memories, and worker state persistence"
+    },
+    {
+      "name": "anyhow",
+      "why": "Error handling throughout; flexible Result<T> with context"
+    }
+  ],
+  "goals": [
+    "Provide a shell that routes real commands (binaries) directly and intent to Claude, eliminating the need to remember syntax",
+    "Support persistent background workers that can be attached/detached and resumed with context",
+    "Extend seamlessly via MCP servers and SKILL.md packs without code changes",
+    "Maintain full transparency: all tool calls, model prompts, and decisions are auditable",
+    "Support both cloud (Claude API) and local (mistral.rs GGUF) inference"
+  ],
+  "notes": "This is the main aish REPL + coordinator orchestrator. The architecture splits the interactive frontend (repl.rs) from the core execution engine (engine.rs) to enable future evolutions to a full login shell. Background workers (coordinator.rs + container.rs) are spawned as separate aish processes that manage their own multi-turn loops. All state is serialized in SQLite (aish.db) for durability and recall across sessions."
+}
