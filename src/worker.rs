@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use uuid::Uuid;
@@ -281,6 +281,16 @@ pub fn pane_replay_header(short: &str) -> String {
     format!(
         "\x1b[36m\u{250f}\u{2501} {short} \u{2014} output to date \x1b[0m\x1b[2m(replay; live activity follows)\x1b[0m\x1b[36m \u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\x1b[0m"
     )
+}
+
+/// Render the coordinator's INPUT (the task it was given) as the opening row of
+/// an `:attach` replay. This is the START of the conversation, so — unlike the
+/// activity rows that follow — it's set apart to be unmistakable: a 💬 speech
+/// glyph announces "this is the prompt" and the whole line is bold (`\x1b[1m…
+/// \x1b[0m`). Framed as a normal pane row so it still carries the cyan border +
+/// `[label]` gutter. Pure — unit-tested.
+pub fn pane_input_row(label: &str, task: &str) -> String {
+    pane_row(label, &format!("\x1b[1m💬 task: {task}\x1b[0m"))
 }
 
 /// Stream a child's stderr line by line, forwarding the interesting lines to the
@@ -1399,6 +1409,15 @@ struct JobInner {
     transcript: VecDeque<(String, String)>,
     /// Running byte total of `transcript` entries, for the byte-budget cap.
     transcript_bytes: usize,
+    /// Wall-clock start (worker construction) — the base for the `:workers`
+    /// Started / Runtime columns. Stored as `SystemTime` (not `Instant`) so it
+    /// can render an absolute "started X ago" and reconcile with the durable
+    /// `coordinator_runs.created_at` timestamps for the same row scheme.
+    started: SystemTime,
+    /// Wall-clock completion, stamped once by `set_done`/`set_failed`. `None`
+    /// while the worker is still running, so the Runtime column shows
+    /// elapsed-so-far for a live worker and the frozen total for a terminal one.
+    finished: Option<SystemTime>,
 }
 
 pub type WorkerJobs = Arc<Mutex<Vec<Arc<WorkerJob>>>>;
@@ -1488,6 +1507,7 @@ impl WorkerJob {
         let mut i = self.inner.lock().unwrap();
         i.status = "done".into();
         i.result = Some(result);
+        i.finished.get_or_insert_with(SystemTime::now);
     }
     /// Record the branch an isolated worker left its changes on (kept worktree).
     fn set_branch(&self, branch: String) {
@@ -1558,6 +1578,31 @@ impl WorkerJob {
         let mut i = self.inner.lock().unwrap();
         i.status = "failed".into();
         i.error = Some(err);
+        i.finished.get_or_insert_with(SystemTime::now);
+    }
+
+    /// Epoch seconds the worker started — the base for the `:workers` Started /
+    /// Runtime columns. `None` only if the clock is before the Unix epoch.
+    pub fn started_epoch(&self) -> Option<i64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .started
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs() as i64)
+    }
+
+    /// Epoch seconds the worker reached a terminal state, or `None` while it is
+    /// still running. Lets the Runtime column freeze at the total run span once
+    /// the worker finishes.
+    pub fn finished_epoch(&self) -> Option<i64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .finished
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
     }
     pub fn status(&self) -> String {
         self.inner.lock().unwrap().status.clone()
@@ -1848,6 +1893,8 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
             last_turn_completion: None,
             transcript: VecDeque::new(),
             transcript_bytes: 0,
+            started: SystemTime::now(),
+            finished: None,
         }),
     });
     guard.push(job.clone());
@@ -2301,6 +2348,8 @@ mod tests {
                 last_turn_completion: None,
                 transcript: VecDeque::new(),
                 transcript_bytes: 0,
+            started: SystemTime::now(),
+            finished: None,
             }),
         });
         assert!(job.fetch().contains("still running"));
@@ -2325,6 +2374,8 @@ mod tests {
                 last_turn_completion: None,
                 transcript: VecDeque::new(),
                 transcript_bytes: 0,
+            started: SystemTime::now(),
+            finished: None,
             }),
         });
         job.set_failed("boom".into());
@@ -2608,6 +2659,30 @@ mod tests {
     }
 
     #[test]
+    fn pane_input_row_sets_apart_the_task_with_emoji_and_bold() {
+        // The coordinator's input (its task) opens the replay and must stand out
+        // as the START of the conversation: a 💬 glyph + bold, framed as a normal
+        // pane row (border + [label] gutter) with the task text preserved.
+        let row = pane_input_row("w_a7k3m2pQ", "review the design doc");
+        assert!(
+            row.starts_with(PANE_BORDER),
+            "input row carries the pane border: {row}"
+        );
+        assert!(
+            row.contains("[w_a7k3m2pQ]"),
+            "gutter carries the worker id: {row}"
+        );
+        assert!(row.contains('💬'), "input row carries the speech glyph: {row}");
+        assert!(row.contains("\x1b[1m"), "input row is bold: {row}");
+        assert!(
+            row.contains("review the design doc"),
+            "task text preserved: {row}"
+        );
+        // The bold is closed so it doesn't bleed into following rows.
+        assert!(row.ends_with("\x1b[0m"), "bold is reset at the end: {row}");
+    }
+
+    #[test]
     fn transcript_records_and_bounds_oldest_first() {
         let job = Arc::new(WorkerJob {
             id: "w_tx".into(),
@@ -2622,6 +2697,8 @@ mod tests {
                 last_turn_completion: None,
                 transcript: VecDeque::new(),
                 transcript_bytes: 0,
+            started: SystemTime::now(),
+            finished: None,
             }),
         });
         // Record well past the line cap; the oldest rows are evicted.
@@ -2761,6 +2838,8 @@ mod tests {
                 last_turn_completion: None,
                 transcript: VecDeque::new(),
                 transcript_bytes: 0,
+            started: SystemTime::now(),
+            finished: None,
             }),
         });
         let lines = concat!(
@@ -2824,6 +2903,8 @@ mod tests {
                 last_turn_completion: None,
                 transcript: VecDeque::new(),
                 transcript_bytes: 0,
+            started: SystemTime::now(),
+            finished: None,
             }),
         });
         // No events yet.
@@ -2858,6 +2939,8 @@ mod tests {
                     last_turn_completion: None,
                     transcript: VecDeque::new(),
                     transcript_bytes: 0,
+            started: SystemTime::now(),
+            finished: None,
                 }),
             });
             jobs.lock().unwrap().push(j.clone());

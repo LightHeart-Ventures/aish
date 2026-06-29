@@ -111,6 +111,17 @@ pub async fn run(
     // makes the old tty_handoff disambiguation flag unnecessary; TASK-116 removed it.
     tools::ignore_job_control_signals();
 
+    // Load the lifecycle-hook registry (~/.aish/hooks.json + ./.aish/hooks.json)
+    // now that the session cwd is established, then fire SessionStart. Both are
+    // no-ops when no hook is configured — the empty registry spawns nothing.
+    session.load_hooks();
+    if session.hooks.has(crate::hooks::HookEvent::SessionStart) {
+        let p = session.hook_payload(crate::hooks::HookEvent::SessionStart);
+        session
+            .hooks
+            .fire_observe(crate::hooks::HookEvent::SessionStart, p);
+    }
+
     // Install the process-wide SIGINT handler up front. A Ctrl-C during a
     // direct-dispatch child is delivered by the terminal straight to that child's
     // own process group (it leads its own pgrp and owns the tty via tcsetpgrp), so
@@ -543,6 +554,17 @@ pub async fn run(
     // Don't leave managed jobs — especially stopped ones — orphaned on exit:
     // hang them up (SIGCONT + SIGHUP) so they terminate with the shell (TASK-123).
     tools::hangup_jobs_on_exit(&session.jobs);
+
+    // Fire SessionEnd and AWAIT it: the process is about to exit, so a detached
+    // task would be killed before it ran (hence run_observe_blocking, bounded by
+    // each hook's timeout). No-op when no SessionEnd hook is configured.
+    if session.hooks.has(crate::hooks::HookEvent::SessionEnd) {
+        let p = session.hook_payload(crate::hooks::HookEvent::SessionEnd);
+        session
+            .hooks
+            .run_observe_blocking(crate::hooks::HookEvent::SessionEnd, p)
+            .await;
+    }
 
     editor.save_history();
     println!("bye");
@@ -1745,11 +1767,9 @@ async fn dispatch(
                     // Forced (`!`) miss: render a coded `aish::exec::not_found`
                     // with a cheap bounded did-you-mean drawn from $PATH.
                     let candidates = scan_path_commands(&path_var);
-                    let hint = crate::diag::nearest_command(
-                        cmd,
-                        candidates.iter().map(String::as_str),
-                    )
-                    .map(|near| format!("did you mean `{near}`?"));
+                    let hint =
+                        crate::diag::nearest_command(cmd, candidates.iter().map(String::as_str))
+                            .map(|near| format!("did you mean `{near}`?"));
                     crate::diag::eprint(&crate::diag::AishDiagnostic::exec_not_found(cmd, hint));
                     return Dispatch::Handled;
                 }
@@ -2453,13 +2473,11 @@ fn backfill_attached(run_id: &str, session: &Session) {
     let Some(job) = job else { return };
     let short = crate::batch::short_id(run_id);
     println!("{}", crate::worker::pane_replay_header(&short));
-    // The task is the coordinator's "input". The `\u{b7}task` marker is folded
-    // into the row text \u{2014} `pane_row` carries only `[label]` in its gutter now
-    // (the single-glyph convention; the source glyph rides inside the text).
-    println!(
-        "{}",
-        crate::worker::pane_row(run_id, &format!("·task {}", job.task))
-    );
+    // The task is the coordinator's "input" — the START of the conversation. It's
+    // rendered set-apart (a 💬 glyph + bold) by `pane_input_row` so it's obvious
+    // this row is the prompt the coordinator was given, not one of its own
+    // activity lines that follow.
+    println!("{}", crate::worker::pane_input_row(run_id, &job.task));
     let rows = job.transcript_rows();
     if rows.is_empty() {
         println!(
@@ -2747,12 +2765,8 @@ fn announce_attach_review(session: &mut Session) {
         .map(|w| w.status());
     match status.as_deref() {
         Some("done") | Some("failed") => {
-            let already = session
-                .attach_review_announced
-                .lock()
-                .unwrap()
-                .as_deref()
-                == Some(run_id.as_str());
+            let already =
+                session.attach_review_announced.lock().unwrap().as_deref() == Some(run_id.as_str());
             if !already {
                 // The coordinator's FINAL answer is written to stdout — NOT the
                 // streamed stderr we forward live — so a live `:attach` that runs
@@ -2918,7 +2932,12 @@ fn cycle_worker(session: &mut Session) {
         .unwrap()
         .iter()
         .rev()
-        .map(|w| (w.id.clone(), matches!(w.status().as_str(), "done" | "failed")))
+        .map(|w| {
+            (
+                w.id.clone(),
+                matches!(w.status().as_str(), "done" | "failed"),
+            )
+        })
         .collect();
     if workers.is_empty() {
         println!(
@@ -2994,11 +3013,9 @@ fn close_worker(id: Option<&str>, session: &mut Session) {
     let attached = session.attached.lock().unwrap().clone();
     // Default target: the worker we're attached to ("the one you're in"). The
     // goal sentinel isn't a worker job, so it can't be closed this way.
-    let target = id.map(str::to_string).or_else(|| {
-        attached
-            .clone()
-            .filter(|r| r != GOAL_ATTACH_ID)
-    });
+    let target = id
+        .map(str::to_string)
+        .or_else(|| attached.clone().filter(|r| r != GOAL_ATTACH_ID));
     let Some(target) = target else {
         if attached.as_deref() == Some(GOAL_ATTACH_ID) {
             println!(
@@ -3442,6 +3459,14 @@ fn skill_remove(name: &str, session: &mut Session) -> Result<()> {
     Ok(())
 }
 
+/// Markdown header for the `:workers` table. Kept as a const so the column set
+/// — Worker | Session | Status | Started | Runtime | Doing | Result — is a
+/// single source of truth and unit-testable. The Started column is a relative
+/// "ago" label; Runtime is the elapsed-so-far (running) or total (terminal) span
+/// (see `crate::style::time_cells`).
+const WORKERS_TABLE_HEADER: &str =
+    "| Worker | Session | Status | Started | Runtime | Doing | Result |\n|---|---|---|---|---|---|---|\n";
+
 /// Returns true when the REPL should exit.
 async fn handle_colon(
     cmd: &str,
@@ -3579,21 +3604,32 @@ async fn handle_colon(
                 .clone()
                 .unwrap_or_else(|| crate::batch::short_id(&session.session_id).to_string());
 
-            let mut table = String::from(
-                "| Worker | Session | Status | Doing | Result |\n|---|---|---|---|---|\n",
-            );
+            let mut table = String::from(WORKERS_TABLE_HEADER);
+            // Epoch-seconds "now", computed once so every row's Started/Runtime
+            // cell is reconciled against the same instant.
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
             let mut any = false;
             let mut seen = std::collections::HashSet::new();
             // In-memory coordinators launched by THIS session (live status).
             for w in session.worker_jobs.lock().unwrap().iter() {
                 any = true;
                 seen.insert(w.id.clone());
+                let (started_cell, runtime_cell) = crate::style::time_cells(
+                    w.started_epoch(),
+                    w.finished_epoch(),
+                    now_epoch,
+                );
                 table.push_str(&format!(
-                    "| {} {} | {} * | {} | {} | {} |\n",
+                    "| {} {} | {} * | {} | {} | {} | {} | {} |\n",
                     crate::style::job_type_emoji("worker"),
                     w.id,
                     me_label,
                     crate::style::styled_status(&w.status()),
+                    started_cell,
+                    runtime_cell,
                     one_line(&w.task),
                     crate::style::styled_result(&w.result_cell())
                 ));
@@ -3640,12 +3676,31 @@ async fn handle_colon(
                             }
                             _ => "—".to_string(),
                         };
+                        // Start from created_at; freeze the runtime at heartbeat_at
+                        // once terminal (set_done/set_failed bump the heartbeat),
+                        // else let it tick against now.
+                        let started = r
+                            .created_at
+                            .as_deref()
+                            .and_then(crate::style::parse_sqlite_utc);
+                        let terminal = matches!(r.phase.as_str(), "done" | "failed");
+                        let finished = if terminal {
+                            r.heartbeat_at
+                                .as_deref()
+                                .and_then(crate::style::parse_sqlite_utc)
+                        } else {
+                            None
+                        };
+                        let (started_cell, runtime_cell) =
+                            crate::style::time_cells(started, finished, now_epoch);
                         table.push_str(&format!(
-                            "| {} {} | {} | {} | {} | {} |\n",
+                            "| {} {} | {} | {} | {} | {} | {} | {} |\n",
                             crate::style::job_type_emoji("coordinator"),
                             crate::batch::short_id(&r.run_id),
                             session_cell,
                             crate::style::styled_status(&r.phase),
+                            started_cell,
+                            runtime_cell,
                             one_line(&r.task),
                             crate::style::styled_result(&result_cell)
                         ));
@@ -5536,6 +5591,28 @@ mod tests {
     fn forget_in_colon_catalog() {
         // The catalog carries :forget so the palette + completion offer it.
         assert!(colon_command_matches("for").contains(&"forget"));
+    }
+
+    #[test]
+    fn workers_table_header_carries_started_and_runtime_columns() {
+        // The `:workers` table must list Started + Runtime between Status and
+        // Doing, in that order, so each row shows when a worker started and how
+        // long it has run (or ran).
+        let header = WORKERS_TABLE_HEADER.lines().next().unwrap();
+        let cols: Vec<&str> = header
+            .trim_matches('|')
+            .split('|')
+            .map(|c| c.trim())
+            .collect();
+        assert_eq!(
+            cols,
+            vec![
+                "Worker", "Session", "Status", "Started", "Runtime", "Doing", "Result"
+            ]
+        );
+        // The separator row has one delimiter cell per column (7).
+        let sep = WORKERS_TABLE_HEADER.lines().nth(1).unwrap();
+        assert_eq!(sep.matches("---").count(), 7);
     }
 
     #[test]

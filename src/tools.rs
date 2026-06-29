@@ -623,8 +623,42 @@ pub async fn execute(
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
     };
     match result {
-        Ok(content) => ToolResult::text(call.id.clone(), content, false),
+        Ok(content) => {
+            // Observe hook: FileChanged — a file-mutating tool succeeded. Fires
+            // once per changed (absolute) path; empty for every non-mutating
+            // tool, so a read never triggers it. Zero-cost when no hook is
+            // registered (`has` short-circuits before any path is resolved).
+            if session.hooks.has(crate::hooks::HookEvent::FileChanged) {
+                for path in changed_paths(session, call) {
+                    let p = session
+                        .hook_payload(crate::hooks::HookEvent::FileChanged)
+                        .with("tool", call.name.clone())
+                        .with("path", path);
+                    session
+                        .hooks
+                        .fire_observe(crate::hooks::HookEvent::FileChanged, p);
+                }
+            }
+            ToolResult::text(call.id.clone(), content, false)
+        }
         Err(e) => ToolResult::text(call.id.clone(), format!("error: {e:#}"), true),
+    }
+}
+
+/// Absolute path(s) a file-mutating tool changed, for the `FileChanged` observe
+/// hook. Returns empty for every non-mutating tool, so the caller fires nothing.
+/// Paths are resolved against the session cwd so the hook always sees an
+/// absolute path (design §6.1).
+fn changed_paths(session: &Session, call: &ToolCall) -> Vec<String> {
+    let abs = |key: &str| {
+        call.args[key]
+            .as_str()
+            .map(|p| resolve(session, p).to_string_lossy().into_owned())
+    };
+    match call.name.as_str() {
+        "write_file" | "edit_file" | "append_file" => abs("path").into_iter().collect(),
+        "copy_file" | "rename_file" => abs("dst").into_iter().collect(),
+        _ => Vec::new(),
     }
 }
 

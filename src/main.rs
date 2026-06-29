@@ -11,6 +11,7 @@ mod engine;
 mod git;
 mod git_repo;
 mod goal;
+mod hooks;
 mod jobs;
 mod loopguard;
 mod mcp;
@@ -354,8 +355,7 @@ async fn main() -> Result<()> {
         session.mcp = mcp::McpHost::start(&[project_mcp.as_path(), mcp_config.as_path()]).await;
         timer.mark("MCP connect");
         let local = skills::load(&skills_dir);
-        session.skills_prompt =
-            skills::render_prompt_section(&local, &session.mcp.skills());
+        session.skills_prompt = skills::render_prompt_section(&local, &session.mcp.skills());
         session.skills = local;
     }
     timer.mark("skills render");
@@ -398,6 +398,15 @@ async fn main() -> Result<()> {
         Err(e) => eprintln!("\x1b[33maish:\x1b[0m coordinator store unavailable: {e:#}"),
     }
     timer.mark("coordinator rehydrate");
+
+    // Load the lifecycle-hook registry for the non-interactive entry paths
+    // (one-shot `-c`, background coordinator, script). The interactive REPL loads
+    // it itself in `repl::run` (right before firing SessionStart). This is what
+    // makes the PreToolUse/PostToolUse/FileChanged hook sites fire identically in
+    // a nested background coordinator (design §8 coordinator-parity).
+    if !interactive {
+        session.load_hooks();
+    }
 
     if let Some(prompt) = args.command {
         if args.coordinator {
