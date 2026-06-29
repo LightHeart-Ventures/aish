@@ -162,9 +162,24 @@ fn raw_url_on(base: &str, r: &SkillRef) -> String {
     u
 }
 
-/// The raw SKILL.md URL on the configured registry for this ref.
+/// The upstream origin used to FETCH an individual skill by its bare
+/// `owner/name` ref. This is DISTINCT from [`registry`]: search defaults to the
+/// local `file://` index (a catalog), but fetching one skill must hit a live
+/// origin that serves `/{owner}/{name}/raw` — the file index is not a per-skill
+/// file server, so reusing it as a fetch base yields a bogus
+/// `file://…/index.json/{owner}/{name}/raw` path (ENOTDIR). An
+/// `AISH_SKILL_REGISTRY` override is honored only when it's a real http(s)
+/// mirror; a `file://` override (or no override) falls back to skill.fish.
+fn fetch_origin() -> String {
+    match registry_override() {
+        Some(o) if !o.starts_with("file://") => o,
+        _ => "https://skill.fish".to_string(),
+    }
+}
+
+/// The raw SKILL.md URL on the configured fetch origin for this ref.
 pub fn raw_url(r: &SkillRef) -> String {
-    raw_url_on(&registry(), r)
+    raw_url_on(&fetch_origin(), r)
 }
 
 /// Refuse anything but HTTPS, except a loopback origin (for self-hosted mirrors
@@ -1595,6 +1610,28 @@ mod tests {
         let reg = default_registry();
         assert!(reg.starts_with("file://"), "got: {reg}");
         assert!(reg.ends_with("/registry/index.json"), "got: {reg}");
+    }
+
+    #[test]
+    fn fetch_origin_ignores_file_override_uses_skillfish() {
+        // No override (or a file:// override) must NOT be used as a fetch base —
+        // the file index can't serve `/{owner}/{name}/raw`, so fetch falls back
+        // to the live skill.fish origin. An http(s) override IS honored.
+        // SAFETY: single-threaded test; var restored before returning.
+        let prev = std::env::var("AISH_SKILL_REGISTRY").ok();
+        unsafe { std::env::remove_var("AISH_SKILL_REGISTRY") };
+        assert_eq!(fetch_origin(), "https://skill.fish");
+
+        unsafe { std::env::set_var("AISH_SKILL_REGISTRY", "file:///tmp/index.json") };
+        assert_eq!(fetch_origin(), "https://skill.fish");
+
+        unsafe { std::env::set_var("AISH_SKILL_REGISTRY", "https://mirror.example") };
+        assert_eq!(fetch_origin(), "https://mirror.example");
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AISH_SKILL_REGISTRY", v) },
+            None => unsafe { std::env::remove_var("AISH_SKILL_REGISTRY") },
+        }
     }
 
     #[test]
