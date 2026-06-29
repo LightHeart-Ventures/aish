@@ -81,6 +81,18 @@ fn reset_window_title() {
     let _ = std::io::stdout().flush();
 }
 
+/// Clear the screen and home the cursor so the next output starts at the top —
+/// but only on an interactive terminal (a piped stdout stays free of escape
+/// noise). Used by the Shift-Tab worker cycle so each attach/detach view opens
+/// on a fresh screen instead of scrolling under the prior one.
+fn clear_screen() {
+    // SAFETY: plain isatty query.
+    if unsafe { libc::isatty(1) } == 1 {
+        print!("\x1b[2J\x1b[H");
+        let _ = std::io::stdout().flush();
+    }
+}
+
 pub async fn run(
     mut backend: Backend,
     mut session: Session,
@@ -178,10 +190,7 @@ pub async fn run(
     // completes a `:`-prefix via the Completer.
 
     // Start on a clean screen (interactive terminals only — keep piped output clean).
-    // SAFETY: plain isatty query.
-    if unsafe { libc::isatty(1) } == 1 {
-        print!("\x1b[2J\x1b[H");
-    }
+    clear_screen();
     println!(
         "\x1b[1maish\x1b[0m \x1b[2mv{}\x1b[0m — AI-native shell · {} · :help for commands",
         crate::update::current_version(),
@@ -2863,6 +2872,10 @@ fn next_attach_index(running: &[String], current: Option<&str>) -> usize {
 /// it), mirroring `attach_worker`'s terminal branch. This makes Shift-Tab a way
 /// to flip back through completed/failed agents, not just the still-running ones.
 fn cycle_worker(session: &mut Session) {
+    // Wipe the screen and home the cursor first, so this cycle's attach/detach
+    // view (status line + any backfilled activity / result) opens at the top of
+    // a fresh screen instead of scrolling under the previous prompt and output.
+    clear_screen();
     // All coordinators this session launched, in listing order — LIVE and
     // TERMINAL — paired with a `terminal` flag so the attach branch can choose
     // review-mode vs live-stream. Shift-Tab rotates through finished/failed
