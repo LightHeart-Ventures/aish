@@ -4035,6 +4035,13 @@ async fn handle_colon(
         Some("context") => handle_context(backend, session),
         Some("compact") => handle_compact(backend, session),
         Some("memories" | "memory") => handle_memories(parts.next(), session),
+        Some("version" | "ver") => {
+            println!(
+                "\x1b[1maish\x1b[0m \x1b[2mv{}\x1b[0m — {}",
+                crate::update::current_version(),
+                backend.describe()
+            );
+        }
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
     }

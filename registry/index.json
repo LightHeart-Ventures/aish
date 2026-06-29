@@ -1,144 +1,164 @@
 {
   "results": [
     {
-      "name": "github-pr",
-      "author": "anthropic",
-      "description": "Manage GitHub pull requests with gh CLI.",
+      "name": "create-pr",
+      "author": "n8n-io",
+      "description": "Automates the creation of GitHub pull requests with structured titles and descriptions.",
       "version": "1.0.0",
-      "reference": "anthropic/github-pr"
+      "reference": "n8n-io/create-pr",
+      "stars": 170914
     },
     {
-      "name": "github-issue",
-      "author": "anthropic",
-      "description": "Manage GitHub issues with gh CLI.",
+      "name": "code-review-excellence",
+      "author": "wshobson",
+      "description": "Enhances the code review process through structured feedback on security, correctness, and style.",
       "version": "1.0.0",
-      "reference": "anthropic/github-issue"
+      "reference": "wshobson/code-review-excellence",
+      "stars": 23139
     },
     {
-      "name": "aws-s3",
-      "author": "anthropic",
-      "description": "Interact with AWS S3 buckets.",
+      "name": "resolve-conflicts",
+      "author": "antinomyhq",
+      "description": "Resolves complex Git merge, rebase, and cherry-pick conflicts by analyzing commit history.",
       "version": "1.0.0",
-      "reference": "anthropic/aws-s3"
+      "reference": "antinomyhq/resolve-conflicts",
+      "stars": 4590
+    },
+    {
+      "name": "cargo-fuzz",
+      "author": "trailofbits",
+      "description": "Facilitates automated fuzz testing and vulnerability detection for Rust projects.",
+      "version": "1.0.0",
+      "reference": "trailofbits/cargo-fuzz",
+      "stars": 939
+    },
+    {
+      "name": "rust-testing",
+      "author": "loulanyue",
+      "description": "Implements comprehensive Rust testing suites including unit, integration, and property tests.",
+      "version": "1.0.0",
+      "reference": "loulanyue/rust-testing",
+      "stars": 151
+    },
+    {
+      "name": "commit",
+      "author": "bitsocialnet",
+      "description": "Automates logical code grouping and generates standardized Conventional Commit messages.",
+      "version": "1.0.0",
+      "reference": "bitsocialnet/commit",
+      "stars": 126
+    },
+    {
+      "name": "release-notes",
+      "author": "phuryn",
+      "description": "Transforms technical tickets and changelogs into polished, user-facing release notes.",
+      "version": "1.0.0",
+      "reference": "phuryn/release-notes",
+      "stars": 9437
+    },
+    {
+      "name": "docker-container-basics",
+      "author": "jeremylongshore",
+      "description": "Streamlines the creation and management of Docker containers and images.",
+      "version": "1.0.0",
+      "reference": "jeremylongshore/docker-container-basics",
+      "stars": 983
     },
     {
       "name": "aws-lambda",
-      "author": "anthropic",
-      "description": "Deploy and manage AWS Lambda functions.",
+      "author": "awslabs",
+      "description": "Builds, deploys, and optimizes production-ready serverless AWS Lambda functions.",
       "version": "1.0.0",
-      "reference": "anthropic/aws-lambda"
+      "reference": "awslabs/aws-lambda",
+      "stars": 645
     },
     {
-      "name": "aws-dynamodb",
-      "author": "anthropic",
-      "description": "Query and manage DynamoDB tables.",
+      "name": "terraform-patterns",
+      "author": "alirezarezvani",
+      "description": "Implements production-grade Terraform workflows for secure infrastructure as code.",
       "version": "1.0.0",
-      "reference": "anthropic/aws-dynamodb"
+      "reference": "alirezarezvani/terraform-patterns",
+      "stars": 12697
     },
     {
-      "name": "aws-ec2",
-      "author": "anthropic",
-      "description": "Manage AWS EC2 instances.",
+      "name": "running-in-ci",
+      "author": "max-sixty",
+      "description": "Automates GitHub Actions workflows, PR management, and CI monitoring.",
       "version": "1.0.0",
-      "reference": "anthropic/aws-ec2"
+      "reference": "max-sixty/running-in-ci",
+      "stars": 2908
     },
     {
-      "name": "terraform-plan",
-      "author": "anthropic",
-      "description": "Plan and apply Terraform infrastructure changes.",
+      "name": "documentation",
+      "author": "EpicenterHQ",
+      "description": "Crafts authentic, non-AI-sounding technical documentation and READMEs.",
       "version": "1.0.0",
-      "reference": "anthropic/terraform-plan"
+      "reference": "EpicenterHQ/documentation",
+      "stars": 3817
     },
     {
-      "name": "fly-deploy",
-      "author": "anthropic",
-      "description": "Deploy apps to Fly.io with Fly CLI.",
+      "name": "security-audit",
+      "author": "davepoon",
+      "description": "Performs comprehensive security audits including OWASP Top 10 and dependency scanning.",
       "version": "1.0.0",
-      "reference": "anthropic/fly-deploy"
+      "reference": "davepoon/security-audit",
+      "stars": 2733
     },
     {
-      "name": "postgres-query",
-      "author": "anthropic",
-      "description": "Query and manage PostgreSQL databases.",
+      "name": "sql-database-assistant",
+      "author": "alirezarezvani",
+      "description": "Automates SQL query writing, database performance optimization, and migrations.",
       "version": "1.0.0",
-      "reference": "anthropic/postgres-query"
+      "reference": "alirezarezvani/sql-database-assistant",
+      "stars": 16512
     },
     {
-      "name": "sqlite-query",
-      "author": "anthropic",
-      "description": "Query and manage SQLite databases.",
+      "name": "refactoring-assistant",
+      "author": "a5c-ai",
+      "description": "Enhances code quality and maintainability by identifying and applying safe refactorings.",
       "version": "1.0.0",
-      "reference": "anthropic/sqlite-query"
+      "reference": "a5c-ai/refactoring-assistant",
+      "stars": 1203
     },
     {
-      "name": "nodejs-build",
-      "author": "anthropic",
-      "description": "Build and package Node.js applications.",
+      "name": "debugging-strategies",
+      "author": "wshobson",
+      "description": "Implements systematic debugging techniques and root cause analysis.",
       "version": "1.0.0",
-      "reference": "anthropic/nodejs-build"
+      "reference": "wshobson/debugging-strategies",
+      "stars": 23139
     },
     {
-      "name": "nodejs-test",
-      "author": "anthropic",
-      "description": "Run tests for Node.js projects with Jest/Mocha.",
+      "name": "designing-apis",
+      "author": "CloudAI-X",
+      "description": "Architects professional REST and GraphQL APIs with OpenAPI standards.",
       "version": "1.0.0",
-      "reference": "anthropic/nodejs-test"
+      "reference": "CloudAI-X/designing-apis",
+      "stars": 1171
     },
     {
-      "name": "rust-build",
-      "author": "anthropic",
-      "description": "Build and package Rust applications with Cargo.",
+      "name": "bash-style",
+      "author": "doccker",
+      "description": "Enforces professional Bash, Shell, Dockerfile, and Makefile scripting standards.",
       "version": "1.0.0",
-      "reference": "anthropic/rust-build"
+      "reference": "doccker/bash-style",
+      "stars": 772
     },
     {
-      "name": "rust-test",
-      "author": "anthropic",
-      "description": "Run tests for Rust projects with Cargo.",
+      "name": "kubernetes-deployment-creator",
+      "author": "jeremylongshore",
+      "description": "Automates the generation of production-grade Kubernetes deployment manifests.",
       "version": "1.0.0",
-      "reference": "anthropic/rust-test"
+      "reference": "jeremylongshore/kubernetes-deployment-creator",
+      "stars": 983
     },
     {
-      "name": "docker-build",
-      "author": "anthropic",
-      "description": "Build and push Docker images.",
+      "name": "tdd-guide",
+      "author": "alirezarezvani",
+      "description": "Automates test-driven development workflows by generating failing tests first.",
       "version": "1.0.0",
-      "reference": "anthropic/docker-build"
-    },
-    {
-      "name": "git-commit",
-      "author": "anthropic",
-      "description": "Commit and push changes to git repositories.",
-      "version": "1.0.0",
-      "reference": "anthropic/git-commit"
-    },
-    {
-      "name": "git-rebase",
-      "author": "anthropic",
-      "description": "Rebase and squash git commits interactively.",
-      "version": "1.0.0",
-      "reference": "anthropic/git-rebase"
-    },
-    {
-      "name": "react-component",
-      "author": "anthropic",
-      "description": "Generate and scaffold React components.",
-      "version": "1.0.0",
-      "reference": "anthropic/react-component"
-    },
-    {
-      "name": "api-design",
-      "author": "anthropic",
-      "description": "Design REST APIs with OpenAPI spec.",
-      "version": "1.0.0",
-      "reference": "anthropic/api-design"
-    },
-    {
-      "name": "kubernetes-deploy",
-      "author": "anthropic",
-      "description": "Deploy applications to Kubernetes clusters.",
-      "version": "1.0.0",
-      "reference": "anthropic/kubernetes-deploy"
+      "reference": "alirezarezvani/tdd-guide",
+      "stars": 9958
     }
   ]
 }
