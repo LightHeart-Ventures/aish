@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.16.0] - 2025-06-29
+
+### Added
+- **`aish --version` flag and `:version` REPL command**: Query the running aish version from both CLI and the REPL. `aish --version` wires clap's version attribute to print the build version; `:version` (alias `:ver`) shows the version plus the active backend via `backend.describe()`.
+
+### Fixed
+- **Structured tool results threaded to model + Ctrl-O keeps raw view** (S7.3): The optional typed JSON payload now reaches the model as compact JSON instead of alignment-corrupted ASCII, while Ctrl-O keeps the human-readable text view unchanged.
+- **curated registry index** with 20 high-value installable skills from skillfish ecosystem.
+
 ## [Unreleased]
 
 ### Added
