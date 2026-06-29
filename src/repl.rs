@@ -2480,13 +2480,27 @@ fn backfill_attached(run_id: &str, session: &Session) {
     println!("{}", crate::worker::pane_input_row(run_id, &job.task));
     let rows = job.transcript_rows();
     if rows.is_empty() {
-        println!(
-            "{}",
-            crate::worker::pane_row(
-                run_id,
-                "\u{b7}thinking (no activity captured yet \u{2014} live output follows)",
-            )
-        );
+        // No activity captured yet. For a LIVE worker, show an ANIMATED
+        // "thinking…" row (matching the live-stream / interactive spinner)
+        // instead of a static placeholder — the live stream stops + replaces it
+        // the instant its first forwarded line lands (worker::stop_backfill_thinking).
+        // Off a TTY (no animation), or for an already-finished worker (nothing
+        // left to stop the spinner), fall back to the one-shot static notice.
+        let running = job.status() == "running";
+        let animated = running
+            && job.start_backfill_thinking(
+                session.show_worker_output.clone(),
+                session.attached.clone(),
+            );
+        if !animated {
+            println!(
+                "{}",
+                crate::worker::pane_row(
+                    run_id,
+                    "\u{b7}thinking (no activity captured yet \u{2014} live output follows)",
+                )
+            );
+        }
     } else {
         // The transcript suffix is empty under the single-glyph convention\u{2014}
         // the source glyph is already stamped in `text`. Fold any legacy suffix
