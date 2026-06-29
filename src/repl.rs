@@ -704,6 +704,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
         "message an in-flight coordinator (--any: cross-session)",
     ),
     ("update", "upgrade aish to the latest release"),
+    ("version", "show aish version + backend"),
     (
         "workers",
         "list this session's coordinators (all = every session)",
@@ -3511,6 +3512,7 @@ async fn handle_colon(
                  :context                            show context-window usage (tokens, %, memories)\n\
                  :compact                            offload older history to long-term memory now\n\
                  :memories [organize]                list stored memories, or dedup them\n\
+                 :version                            show aish version + active backend\n\
                  :update                             check GitHub for a newer release and upgrade\n\
                  :batch <on|off|status|clear>        interactive batch mode: agent offloads deferrable\n\
                                                      work to background Anthropic batches (Opus, ~50%\n\
@@ -4028,6 +4030,13 @@ async fn handle_colon(
         Some("context") => handle_context(backend, session),
         Some("compact") => handle_compact(backend, session),
         Some("memories" | "memory") => handle_memories(parts.next(), session),
+        Some("version" | "ver") => {
+            println!(
+                "\x1b[1maish\x1b[0m \x1b[2mv{}\x1b[0m — {}",
+                crate::update::current_version(),
+                backend.describe()
+            );
+        }
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
     }
