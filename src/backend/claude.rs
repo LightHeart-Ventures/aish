@@ -408,6 +408,62 @@ same oversized call.]",
     })
 }
 
+/// Drop empty / whitespace-only `text` content blocks from an assistant content
+/// array. The Claude Messages API rejects ANY `{"type":"text","text":""}` block
+/// with `messages: text content blocks must be non-empty` — a 400 that aborts
+/// the entire run. Because we echo assistant content verbatim via `raw` to
+/// preserve thinking signatures (required by adaptive thinking + tools), an
+/// empty text block the model emitted (e.g. a blank leading block before a
+/// `tool_use`) would otherwise ride straight back to the API next turn and kill
+/// the session. Non-text blocks (`tool_use`, `thinking`, …) pass through
+/// untouched, preserving signatures. A non-array `raw` is returned unchanged.
+fn strip_empty_text_blocks(content: Value) -> Value {
+    match content {
+        Value::Array(blocks) => Value::Array(
+            blocks
+                .into_iter()
+                .filter(|b| {
+                    // Keep everything EXCEPT text blocks whose text is blank.
+                    if b.get("type").and_then(Value::as_str) == Some("text") {
+                        b.get("text")
+                            .and_then(Value::as_str)
+                            .map(|t| !t.trim().is_empty())
+                            .unwrap_or(false)
+                    } else {
+                        true
+                    }
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Rebuild a clean assistant content array from the normalized `Msg` fields
+/// (used when `raw` is absent or sanitized to empty). Emits a `text` block only
+/// when the text is non-empty, then one `tool_use` block per tool call. When
+/// `is_prefill` (this is the trailing assistant message the model resumes), the
+/// text is `trim_end`ed — the API rejects assistant content ending in whitespace.
+fn rebuild_assistant_content(msg: &Msg, is_prefill: bool) -> Value {
+    let mut blocks = Vec::new();
+    if !msg.text.is_empty() {
+        let t = if is_prefill {
+            msg.text.trim_end()
+        } else {
+            msg.text.as_str()
+        };
+        if !t.is_empty() {
+            blocks.push(json!({"type": "text", "text": t}));
+        }
+    }
+    for tc in &msg.tool_calls {
+        blocks.push(json!({
+            "type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.args
+        }));
+    }
+    Value::Array(blocks)
+}
+
 /// Render normalized history into Claude wire messages.
 fn render_messages(history: &[Msg]) -> Vec<Value> {
     let last = history.len().saturating_sub(1);
@@ -415,35 +471,46 @@ fn render_messages(history: &[Msg]) -> Vec<Value> {
     for (i, msg) in history.iter().enumerate() {
         match msg.role {
             Role::Assistant => {
+                // Rebuild a clean assistant message from the normalized fields —
+                // the fallback whenever raw is absent OR raw sanitizes to empty.
+                let rebuild = || rebuild_assistant_content(msg, i == last);
                 // Echo raw content verbatim when we have it — preserves thinking
-                // blocks + signatures, required with adaptive thinking + tools.
-                let content = msg.raw.clone().unwrap_or_else(|| {
-                    let mut blocks = Vec::new();
-                    if !msg.text.is_empty() {
-                        // A trailing assistant message is a PREFILL the model
-                        // resumes; the API rejects assistant content that ends
-                        // with whitespace, so trim it on the last message only.
-                        let t = if i == last {
-                            msg.text.trim_end()
+                // blocks + signatures, required with adaptive thinking + tools —
+                // but FIRST strip any empty/whitespace `text` blocks. The model
+                // sometimes emits an empty leading text block before a tool_use;
+                // echoed verbatim next turn the API rejects it with
+                // `messages: text content blocks must be non-empty` (a 400 that
+                // aborts the whole run). If stripping empties the array, fall
+                // back to the normalized rebuild so we never send empty content.
+                let content = match msg.raw.clone() {
+                    Some(raw) => {
+                        let cleaned = strip_empty_text_blocks(raw);
+                        if cleaned
+                            .as_array()
+                            .map(|a| a.is_empty())
+                            .unwrap_or(false)
+                        {
+                            rebuild()
                         } else {
-                            msg.text.as_str()
-                        };
-                        if !t.is_empty() {
-                            blocks.push(json!({"type": "text", "text": t}));
+                            cleaned
                         }
                     }
-                    for tc in &msg.tool_calls {
-                        blocks.push(json!({
-                            "type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.args
-                        }));
-                    }
-                    Value::Array(blocks)
-                });
+                    None => rebuild(),
+                };
                 out.push(json!({"role": "assistant", "content": content}));
             }
             Role::User => {
                 if msg.tool_results.is_empty() {
-                    out.push(json!({"role": "user", "content": msg.text}));
+                    // A user turn with empty text would send `content: ""`, which
+                    // the API rejects (`text content blocks must be non-empty`).
+                    // The engine should never produce one, but guard it so a
+                    // stray empty turn can't 400 and lose the whole run.
+                    let text = if msg.text.trim().is_empty() {
+                        "(no content)"
+                    } else {
+                        msg.text.as_str()
+                    };
+                    out.push(json!({"role": "user", "content": text}));
                 } else {
                     let blocks: Vec<Value> = msg
                         .tool_results
@@ -590,6 +657,100 @@ mod tests {
             text, "resume me",
             "trailing whitespace stripped on the prefill message"
         );
+    }
+
+    #[test]
+    fn strip_empty_text_blocks_drops_blank_text_keeps_rest() {
+        // The core guard: a blank/whitespace text block alongside a tool_use is
+        // the exact shape that 400s the API when echoed verbatim. It must be
+        // dropped while the tool_use (and any non-empty text) survives intact.
+        let raw = json!([
+            {"type": "text", "text": ""},
+            {"type": "text", "text": "   \n"},
+            {"type": "thinking", "thinking": "reasoning", "signature": "sig"},
+            {"type": "text", "text": "real answer"},
+            {"type": "tool_use", "id": "t1", "name": "ls", "input": {}}
+        ]);
+        let cleaned = strip_empty_text_blocks(raw);
+        let blocks = cleaned.as_array().unwrap();
+        assert_eq!(blocks.len(), 3, "two blank text blocks removed: {blocks:?}");
+        assert_eq!(blocks[0]["type"], "thinking"); // signature preserved
+        assert_eq!(blocks[1]["text"], "real answer");
+        assert_eq!(blocks[2]["type"], "tool_use");
+        // A non-array raw passes through unchanged.
+        assert_eq!(strip_empty_text_blocks(json!("plain")), json!("plain"));
+    }
+
+    #[test]
+    fn render_echoed_raw_with_empty_text_block_is_sanitized() {
+        // An assistant turn whose raw carries a blank leading text block (what
+        // the model sometimes emits before a tool_use). Echoed verbatim this is
+        // the `text content blocks must be non-empty` 400; render must strip it.
+        use super::super::ToolResult;
+        let hist = vec![
+            Msg::user("go"),
+            Msg {
+                role: Role::Assistant,
+                text: String::new(),
+                tool_calls: vec![],
+                tool_results: vec![],
+                raw: Some(json!([
+                    {"type": "text", "text": ""},
+                    {"type": "tool_use", "id": "t1", "name": "ls", "input": {}}
+                ])),
+            },
+            // A trailing tool_result keeps the assistant message non-terminal.
+            Msg::tool_results(vec![ToolResult::text("t1", "ok", false)]),
+        ];
+        let msgs = render_messages(&hist);
+        let blocks = msgs[1]["content"].as_array().unwrap();
+        assert!(
+            blocks
+                .iter()
+                .all(|b| b["type"] != "text" || !b["text"].as_str().unwrap_or("").is_empty()),
+            "no empty text block may reach the wire: {blocks:?}"
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn render_raw_of_only_empty_text_falls_back_to_rebuild() {
+        // If raw is NOTHING but empty text blocks, sanitizing empties the array.
+        // We must fall back to the normalized rebuild so the assistant message is
+        // never sent as empty `[]` (also a 400).
+        use super::super::ToolResult;
+        let hist = vec![
+            Msg::user("go"),
+            Msg {
+                role: Role::Assistant,
+                text: "rebuilt text".into(),
+                tool_calls: vec![ToolCall {
+                    id: "t1".into(),
+                    name: "ls".into(),
+                    args: json!({}),
+                }],
+                tool_results: vec![],
+                raw: Some(json!([{"type": "text", "text": "  "}])),
+            },
+            Msg::tool_results(vec![ToolResult::text("t1", "ok", false)]),
+        ];
+        let msgs = render_messages(&hist);
+        let blocks = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["text"], "rebuilt text");
+        assert_eq!(blocks[1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn render_empty_user_message_is_guarded() {
+        // A user turn with blank text would send `content: ""` → 400. The guard
+        // substitutes a placeholder so a stray empty turn can't kill the run.
+        let msgs = render_messages(&[Msg::user("   ")]);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "(no content)");
+        // A normal user turn is untouched.
+        let ok = render_messages(&[Msg::user("hello")]);
+        assert_eq!(ok[0]["content"], "hello");
     }
 
     #[test]
