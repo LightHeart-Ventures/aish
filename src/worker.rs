@@ -464,6 +464,12 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                 label,
             );
             if on {
+                // This worker's first forwarded line after an `:attach` replaces
+                // any attach-time "thinking…" placeholder spinner — stop + erase
+                // it so this row lands on the cleared line (no-op once gone).
+                if let Some(job) = &pulse {
+                    job.stop_backfill_thinking();
+                }
                 if is_thinking_notice(&line) {
                     // Model-reasoning phase: replace any prior thinking row, then
                     // animate THIS one in place (transient) until the worker's
@@ -510,9 +516,13 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
         tail.push_back(line);
     }
     // Stream ended — tear down any lingering thinking spinner so it doesn't leave
-    // the cursor hidden or a half-drawn frame behind.
+    // the cursor hidden or a half-drawn frame behind, including an attach-time
+    // backfill spinner that never got a first line to replace it.
     if let Some(spin) = thinking.take() {
         spin.stop();
+    }
+    if let Some(job) = &pulse {
+        job.stop_backfill_thinking();
     }
     tail.into_iter().collect::<Vec<_>>().join("\n")
 }
@@ -1418,6 +1428,14 @@ struct JobInner {
     /// while the worker is still running, so the Runtime column shows
     /// elapsed-so-far for a live worker and the frozen total for a terminal one.
     finished: Option<SystemTime>,
+    /// Animated "thinking…" spinner shown when an `:attach` lands BEFORE the
+    /// coordinator has produced any forwardable activity (empty transcript) —
+    /// the attach-pane analogue of the live-stream / interactive spinner, in
+    /// place of the old static "no activity captured yet" placeholder row. Owned
+    /// here so the live stderr stream can stop it (`stop_backfill_thinking`) the
+    /// instant its first forwarded line replaces it. `None` whenever no such
+    /// attach-time spinner is active.
+    backfill_spinner: Option<ThinkingSpinner>,
 }
 
 pub type WorkerJobs = Arc<Mutex<Vec<Arc<WorkerJob>>>>;
@@ -1557,6 +1575,47 @@ impl WorkerJob {
             .cloned()
             .collect()
     }
+    /// Begin an ANIMATED "thinking…" row for this worker in the attach pane when
+    /// an `:attach` lands before the coordinator has produced any forwardable
+    /// activity (empty transcript). Mirrors the live-stream thinking spinner: a
+    /// cyan braille frame redrawn in place under the pane, self-erasing the moment
+    /// the forward gate closes (`:detach` / `:output off`). The live stream stops
+    /// it via [`stop_backfill_thinking`] the instant its first line lands. Returns
+    /// `true` when the animation started (stderr is a TTY); `false` off a terminal,
+    /// so the caller prints the one-shot static notice instead. `show_output` /
+    /// `attached` are the SAME shared handles the stream loop gates forwarding on.
+    pub fn start_backfill_thinking(
+        &self,
+        show_output: Arc<AtomicBool>,
+        attached: Arc<Mutex<Option<String>>>,
+    ) -> bool {
+        match ThinkingSpinner::start(&self.id, show_output, attached) {
+            Some(spin) => {
+                let mut i = self.inner.lock().unwrap();
+                // Replace any stale spinner (a single session attaches one worker
+                // at a time, so this should already be None).
+                if let Some(old) = i.backfill_spinner.take() {
+                    old.stop();
+                }
+                i.backfill_spinner = Some(spin);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Stop + erase any attach-time thinking spinner this worker is animating
+    /// (see [`start_backfill_thinking`]). Called by the live stream the instant
+    /// its first forwarded line replaces the placeholder, and again at stream end
+    /// so a lingering spinner never leaves the cursor hidden. Cheap no-op once the
+    /// slot is empty.
+    pub fn stop_backfill_thinking(&self) {
+        let spin = self.inner.lock().unwrap().backfill_spinner.take();
+        if let Some(spin) = spin {
+            spin.stop();
+        }
+    }
+
     /// The most recent badge-pulse event on this worker (tool outcome vs turn
     /// completion — whichever happened later), paired with when it happened.
     /// `None` when neither has occurred. Recency is judged by the caller against
@@ -1893,6 +1952,7 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
             last_turn_completion: None,
             transcript: VecDeque::new(),
             transcript_bytes: 0,
+            backfill_spinner: None,
             started: SystemTime::now(),
             finished: None,
         }),
@@ -2348,6 +2408,7 @@ mod tests {
                 last_turn_completion: None,
                 transcript: VecDeque::new(),
                 transcript_bytes: 0,
+            backfill_spinner: None,
             started: SystemTime::now(),
             finished: None,
             }),
@@ -2374,6 +2435,7 @@ mod tests {
                 last_turn_completion: None,
                 transcript: VecDeque::new(),
                 transcript_bytes: 0,
+            backfill_spinner: None,
             started: SystemTime::now(),
             finished: None,
             }),
@@ -2697,6 +2759,7 @@ mod tests {
                 last_turn_completion: None,
                 transcript: VecDeque::new(),
                 transcript_bytes: 0,
+            backfill_spinner: None,
             started: SystemTime::now(),
             finished: None,
             }),
@@ -2838,6 +2901,7 @@ mod tests {
                 last_turn_completion: None,
                 transcript: VecDeque::new(),
                 transcript_bytes: 0,
+            backfill_spinner: None,
             started: SystemTime::now(),
             finished: None,
             }),
@@ -2903,6 +2967,7 @@ mod tests {
                 last_turn_completion: None,
                 transcript: VecDeque::new(),
                 transcript_bytes: 0,
+            backfill_spinner: None,
             started: SystemTime::now(),
             finished: None,
             }),
@@ -2939,6 +3004,7 @@ mod tests {
                     last_turn_completion: None,
                     transcript: VecDeque::new(),
                     transcript_bytes: 0,
+            backfill_spinner: None,
             started: SystemTime::now(),
             finished: None,
                 }),
