@@ -121,6 +121,24 @@ pub async fn run_turn(
     let mut repeat_guard = crate::loopguard::RepeatGuard::default();
 
     for iteration in 1..=MAX_ITERATIONS {
+        // Context-awareness INSIDE the agentic loop. The pre-loop `maybe_compact`
+        // above only fires between TURNS, but a single long turn — the
+        // coordinator's bread-and-butter, and any tool-heavy interactive turn —
+        // appends many (often large) tool-result messages and can blow past the
+        // model's window WITHIN this one `run_turn`, long before the next turn's
+        // pre-loop check would ever run. So re-check here, right before the next
+        // model call, using the running usage figure from the previous round
+        // (`session.context_used`, updated each iteration below). This is the fix
+        // for "ran out of context mid-conversation": without it, compaction was
+        // structurally unreachable during the very loop that grows history.
+        //
+        // Skipped while a prefill continuation is in flight: that path resumes a
+        // trailing assistant message verbatim, and compaction must not perturb
+        // the message the backend is mid-resume on (it only ever drops a PREFIX
+        // and keeps the recent tail, so this is belt-and-suspenders).
+        if !continuing {
+            maybe_compact(backend, session);
+        }
         // Keep the input prompt VISIBLE while the turn runs (option-1 of the
         // type-while-busy ask): aish's editor only reads BETWEEN turns, so during
         // the model⇄tools loop the prompt would otherwise vanish. Print a dim,
