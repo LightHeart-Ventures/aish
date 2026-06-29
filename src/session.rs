@@ -190,6 +190,12 @@ pub struct Session {
     /// once and `:attach`-ing an already-finished worker does not double-announce.
     /// Cleared when the attachment goes live again (e.g. on resume). Session-local.
     pub attach_review_announced: Arc<Mutex<Option<String>>>,
+    /// Lifecycle-hook registry (see `crate::hooks`), merged from
+    /// `~/.aish/hooks.json` and the project-local `.aish/hooks.json`. Defaults to
+    /// EMPTY — the zero-overhead state every call site checks first
+    /// (`hooks.has(event)`), so an unconfigured session spawns no hook process
+    /// and builds no payload. Loaded explicitly at startup via `load_hooks`.
+    pub hooks: crate::hooks::HookSet,
 }
 
 impl Session {
@@ -231,7 +237,43 @@ impl Session {
             login: false,
             attached: Arc::new(Mutex::new(None)),
             attach_review_announced: Arc::new(Mutex::new(None)),
+            hooks: crate::hooks::HookSet::empty(),
         })
+    }
+
+    /// Load the lifecycle-hook registry from the user-global
+    /// (`~/.aish/hooks.json`) and project-local (`<cwd>/.aish/hooks.json`)
+    /// config, replacing whatever was set. Called once at startup (after the cwd
+    /// is established). A missing/empty config leaves the zero-overhead empty set
+    /// in place. `:hooks reload` re-invokes this to pick up edits mid-session.
+    pub fn load_hooks(&mut self) {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        self.hooks = crate::hooks::HookSet::load(home.as_deref(), &self.cwd);
+    }
+
+    /// The autonomy descriptor stamped on every hook payload (design §3.1): a
+    /// background coordinator (`nested`) is `coordinator`, everything else is
+    /// `interactive`. Lets a hook scope itself to human vs. autonomous turns.
+    pub fn agent_kind(&self) -> crate::hooks::Agent {
+        if self.nested {
+            crate::hooks::Agent::Coordinator
+        } else {
+            crate::hooks::Agent::Interactive
+        }
+    }
+
+    /// Build a hook payload pre-filled with this session's common envelope
+    /// (session id, agent kind, cwd, mode). Call sites add event-specific fields
+    /// with `.with(...)`. Only constructed inside a `hooks.has(event)` guard, so
+    /// the empty fast path never reaches here.
+    pub fn hook_payload(&self, event: crate::hooks::HookEvent) -> crate::hooks::HookPayload {
+        crate::hooks::HookPayload::new(
+            event,
+            &self.session_id,
+            self.agent_kind(),
+            &self.cwd,
+            self.mode.name(),
+        )
     }
 
     /// Set a session environment variable (last-wins), replacing any existing
@@ -444,7 +486,13 @@ which can itself fan heavy parallel sub-work out to the Anthropic Batches API. T
 \"batch\" mode to choose and no batch_result() to call — you just describe the task and offload it; the \
 result auto-delivers here when it's done. It returns a job id immediately and survives restarts. PREFER \
 run_in_background for deferrable, parallelizable, or non-urgent work — it keeps the conversation moving. \
-Only answer inline when the user needs the result right now. To answer \"what's running?\" call \
+Only answer inline when the user needs the result right now — and ALWAYS answer a QUESTION inline \
+rather than offloading it. Offloading is for NEW work the user is asking you to DO; a question — \
+including \"didn't we already dispatch a worker for this?\", \"what is it doing?\", or any ask about \
+the status or history of existing work — is something you ANSWER, not a task to spawn a coordinator \
+for. Read the request first: if it is a question, reach for background_status (or the relevant \
+lookup) and reply; dispatching a fresh coordinator to answer whether a coordinator was already \
+dispatched is exactly the wrong move. To answer \"what's running?\" call \
 background_status (never invent your own tracking). Steer a coordinator that is ALREADY running without restarting it: call the `tell` tool with its run id (from background_status) and a message — a clarification, a course-correction, a narrower scope — and it is folded into that coordinator's next round; this is how you and your background coordinators message each other mid-flight. When you offload, call run_in_background with NO \
 preamble, then reply with ONE short, natural sentence — tailored to what they asked — saying you're \
 handling it in the background and the answer will appear here when it's ready (e.g. \"On it — I'll work \

@@ -55,6 +55,42 @@ pub async fn run_turn(
     input: String,
     confirm: &mut Confirm<'_>,
 ) -> Result<String> {
+    let result = run_turn_inner(backend, session, input, confirm).await;
+    // Observe hooks at the turn boundary: TurnEnd on a final answer (carrying its
+    // length), TurnEndFailure on a backend/loop error. Fires once per LOGICAL
+    // turn (this is the single return point), so a consumer never double-counts a
+    // prefill-continuation that spanned several rounds. Zero-cost when no hook is
+    // registered (`has` short-circuits before any payload is built).
+    match &result {
+        Ok(text) if session.hooks.has(crate::hooks::HookEvent::TurnEnd) => {
+            let p = session
+                .hook_payload(crate::hooks::HookEvent::TurnEnd)
+                .with("answer_len", text.len() as u64);
+            session
+                .hooks
+                .fire_observe(crate::hooks::HookEvent::TurnEnd, p);
+        }
+        Err(e) if session.hooks.has(crate::hooks::HookEvent::TurnEndFailure) => {
+            let p = session
+                .hook_payload(crate::hooks::HookEvent::TurnEndFailure)
+                .with("error", e.to_string());
+            session
+                .hooks
+                .fire_observe(crate::hooks::HookEvent::TurnEndFailure, p);
+        }
+        _ => {}
+    }
+    result
+}
+
+/// The agentic turn body. Wrapped by [`run_turn`], which fires the
+/// `TurnEnd`/`TurnEndFailure` observe hooks around it.
+async fn run_turn_inner(
+    backend: &Backend,
+    session: &mut Session,
+    input: String,
+    confirm: &mut Confirm<'_>,
+) -> Result<String> {
     // Decide, for this turn, whether a stronger model is worth escalating to
     // (weak frontend → Some) and stash it so the `escalate` tool can rebuild that
     // backend at call time. Drives both the tool's availability and the nudge.
@@ -101,6 +137,20 @@ pub async fn run_turn(
     session.history.push(Msg::user(input));
     session.last_turn_tools.clear();
 
+    // Observe hook: UserPromptSubmit — the turn has begun (after compaction +
+    // skill-hint folding, the prompt is now the trailing history message). Phase
+    // 1 is observe-only: the prompt-prepend/append mutation is Phase 3. The raw
+    // request (`task`, pre-seeding) is sent so a consumer logs what the user
+    // actually asked. Zero-cost when no hook is registered.
+    if session.hooks.has(crate::hooks::HookEvent::UserPromptSubmit) {
+        let p = session
+            .hook_payload(crate::hooks::HookEvent::UserPromptSubmit)
+            .with("prompt", task.clone());
+        session
+            .hooks
+            .fire_observe(crate::hooks::HookEvent::UserPromptSubmit, p);
+    }
+
     // First local use lazy-loads (and maybe downloads) weights — do it before
     // any spinner exists so the download progress line owns stderr.
     backend.prepare().await?;
@@ -121,6 +171,24 @@ pub async fn run_turn(
     let mut repeat_guard = crate::loopguard::RepeatGuard::default();
 
     for iteration in 1..=MAX_ITERATIONS {
+        // Context-awareness INSIDE the agentic loop. The pre-loop `maybe_compact`
+        // above only fires between TURNS, but a single long turn — the
+        // coordinator's bread-and-butter, and any tool-heavy interactive turn —
+        // appends many (often large) tool-result messages and can blow past the
+        // model's window WITHIN this one `run_turn`, long before the next turn's
+        // pre-loop check would ever run. So re-check here, right before the next
+        // model call, using the running usage figure from the previous round
+        // (`session.context_used`, updated each iteration below). This is the fix
+        // for "ran out of context mid-conversation": without it, compaction was
+        // structurally unreachable during the very loop that grows history.
+        //
+        // Skipped while a prefill continuation is in flight: that path resumes a
+        // trailing assistant message verbatim, and compaction must not perturb
+        // the message the backend is mid-resume on (it only ever drops a PREFIX
+        // and keeps the recent tail, so this is belt-and-suspenders).
+        if !continuing {
+            maybe_compact(backend, session);
+        }
         // Keep the input prompt VISIBLE while the turn runs (option-1 of the
         // type-while-busy ask): aish's editor only reads BETWEEN turns, so during
         // the model⇄tools loop the prompt would otherwise vanish. Print a dim,
@@ -154,7 +222,9 @@ pub async fn run_turn(
         // so the two never run at once.
         emit_thinking(session);
         let spinner = Spinner::start();
-        let turn = backend.complete(&effective_system, &session.history, active_tools).await;
+        let turn = backend
+            .complete(&effective_system, &session.history, active_tools)
+            .await;
         drop(spinner);
         let turn = turn?;
         let usage = turn.usage;
@@ -192,7 +262,9 @@ pub async fn run_turn(
                 });
                 turn.text.clone()
             };
-            let reason = crate::loopguard::ExitReason::ForcedSummarize { iterations: iteration };
+            let reason = crate::loopguard::ExitReason::ForcedSummarize {
+                iterations: iteration,
+            };
             eprintln!("\x1b[2maish: {}\x1b[0m", reason.log_line());
             return Ok(crate::loopguard::with_banner(&reason, &text));
         }
@@ -280,7 +352,11 @@ pub async fn run_turn(
             // double-width wrench/handshake need no more than that; the narrow
             // 🛠️ hammer (U+1F6E0+VS16, width-1 in most terminals) carries its own
             // trailing spacer in `tool_glyph` so it still reads `🛠️ <desc>`.
-            let desc = format!("{} {}", tool_glyph(&call.name), flatten_ws(&describe_call(call)));
+            let desc = format!(
+                "{} {}",
+                tool_glyph(&call.name),
+                flatten_ws(&describe_call(call))
+            );
 
             // ── Same-call repeat guard (loop detection). A tool call whose exact
             // (name, args) signature has recurred past the soft threshold is NOT
@@ -316,6 +392,17 @@ pub async fn run_turn(
                 continue;
             }
 
+            // Observe hook: PreToolUse. Fires for every tool aish is about to run
+            // (zero-cost when no hook is registered — `has` short-circuits before
+            // any payload is built). Observe-only in Phase 1: it cannot veto or
+            // mutate the call (the blocking gate is Phase 2). See crate::hooks.
+            if session.hooks.has(crate::hooks::HookEvent::PreToolUse) {
+                let p = tool_hook_payload(session, crate::hooks::HookEvent::PreToolUse, call);
+                session
+                    .hooks
+                    .fire_observe(crate::hooks::HookEvent::PreToolUse, p);
+            }
+
             // Tier-1 turn audit (background coordinator only — None otherwise).
             // Ask the journal whether this exact tool call was already completed
             // in a prior, crashed run: a Replay short-circuits execution and
@@ -327,43 +414,64 @@ pub async fn run_turn(
                 .as_mut()
                 .map(|a| a.begin(&call.name, &call.args));
 
-            let result = if let Some(crate::turn_audit::Step::Replay { output, is_error }) =
-                &audit_step
-            {
-                // Resumed turn: surface a dim replay marker (no spinner, no
-                // re-execution) and reuse the journaled result.
-                let (output, is_error) = (output.clone(), *is_error);
-                eprintln!("\x1b[2m  \u{21ba} replayed {desc}\x1b[0m");
-                ToolResult::text(call.id.clone(), output, is_error)
-            } else {
-                // Live turn. Tool-execution phase: this call gets its own animated
-                // line while it runs — a braille spinner turning to the LEFT of a
-                // steady tool glyph. Calls execute sequentially, so only the
-                // current one animates; the spinner is replaced by a final static
-                // line (✓/✗ + desc) when the tool returns. `run_interactive` hands
-                // the terminal to a child, so it opts out of the animation (which
-                // would fight the child for stderr) and shows a plain static line.
-                let tool_spin = ToolSpinner::start(&desc, animates(&call.name));
-                // Pause the animation around any permission prompt: the spinner
-                // must not animate (or overwrite the prompt) while we wait for the
-                // answer, then it resumes for the tool's actual execution.
-                let stopper = tool_spin.stopper();
-                let mut gated = |p: &str| {
-                    pause_spinner(&stopper);
-                    let decision = confirm(p);
-                    resume_spinner(&stopper);
-                    decision
-                };
-                let result = tools::execute(call, session, &mut gated).await;
-                tool_spin.finish(&desc, result.is_error);
-                // Journal the terminal (complete/failed) record for this live turn.
-                if let Some(crate::turn_audit::Step::Execute { turn }) = audit_step {
-                    if let Some(a) = session.turn_audit.as_mut() {
-                        a.complete(turn, &call.name, &result);
+            let result =
+                if let Some(crate::turn_audit::Step::Replay { output, is_error }) = &audit_step {
+                    // Resumed turn: surface a dim replay marker (no spinner, no
+                    // re-execution) and reuse the journaled result.
+                    let (output, is_error) = (output.clone(), *is_error);
+                    eprintln!("\x1b[2m  \u{21ba} replayed {desc}\x1b[0m");
+                    ToolResult::text(call.id.clone(), output, is_error)
+                } else {
+                    // Live turn. Tool-execution phase: this call gets its own animated
+                    // line while it runs — a braille spinner turning to the LEFT of a
+                    // steady tool glyph. Calls execute sequentially, so only the
+                    // current one animates; the spinner is replaced by a final static
+                    // line (✓/✗ + desc) when the tool returns. `run_interactive` hands
+                    // the terminal to a child, so it opts out of the animation (which
+                    // would fight the child for stderr) and shows a plain static line.
+                    let tool_spin = ToolSpinner::start(&desc, animates(&call.name));
+                    // Pause the animation around any permission prompt: the spinner
+                    // must not animate (or overwrite the prompt) while we wait for the
+                    // answer, then it resumes for the tool's actual execution.
+                    let stopper = tool_spin.stopper();
+                    let mut gated = |p: &str| {
+                        pause_spinner(&stopper);
+                        let decision = confirm(p);
+                        resume_spinner(&stopper);
+                        decision
+                    };
+                    let result = tools::execute(call, session, &mut gated).await;
+                    tool_spin.finish(&desc, result.is_error);
+                    // Journal the terminal (complete/failed) record for this live turn.
+                    if let Some(crate::turn_audit::Step::Execute { turn }) = audit_step {
+                        if let Some(a) = session.turn_audit.as_mut() {
+                            a.complete(turn, &call.name, &result);
+                        }
                     }
-                }
-                result
-            };
+                    result
+                };
+            // Observe hooks: PostToolUse (always) + PostToolUseFailure (on error).
+            // Carry the tool name, program/path, and the error flag so an audit
+            // sink sees the outcome of every call. Zero-cost when unconfigured.
+            if session.hooks.has(crate::hooks::HookEvent::PostToolUse) {
+                let p = tool_hook_payload(session, crate::hooks::HookEvent::PostToolUse, call)
+                    .with("is_error", result.is_error);
+                session
+                    .hooks
+                    .fire_observe(crate::hooks::HookEvent::PostToolUse, p);
+            }
+            if result.is_error
+                && session
+                    .hooks
+                    .has(crate::hooks::HookEvent::PostToolUseFailure)
+            {
+                let p =
+                    tool_hook_payload(session, crate::hooks::HookEvent::PostToolUseFailure, call)
+                        .with("is_error", true);
+                session
+                    .hooks
+                    .fire_observe(crate::hooks::HookEvent::PostToolUseFailure, p);
+            }
             if session.raw_tool_output {
                 print_raw_result(&result);
             }
@@ -385,7 +493,10 @@ pub async fn run_turn(
         // so the work isn't silently spun away and the coordinator can decide a
         // recovery disposition.
         if let Some((call_desc, count)) = loop_break {
-            let reason = crate::loopguard::ExitReason::LoopDetected { call: call_desc, count };
+            let reason = crate::loopguard::ExitReason::LoopDetected {
+                call: call_desc,
+                count,
+            };
             eprintln!("\x1b[2maish: {}\x1b[0m", reason.log_line());
             let partial = if turn.text.trim().is_empty() {
                 "Stopped by the loop guard before a final answer was produced.".to_string()
@@ -399,7 +510,9 @@ pub async fn run_turn(
     // Hard backstop. With the forced-summarize step firing at FORCE_SUMMARIZE_PCT
     // this is effectively unreachable, but keep a tagged exit so a future budget
     // change can't silently resurrect the old "throw the work away" stop.
-    let reason = crate::loopguard::ExitReason::BudgetExhausted { iterations: MAX_ITERATIONS };
+    let reason = crate::loopguard::ExitReason::BudgetExhausted {
+        iterations: MAX_ITERATIONS,
+    };
     eprintln!("\x1b[2maish: {}\x1b[0m", reason.log_line());
     Ok(crate::loopguard::with_banner(
         &reason,
@@ -575,7 +688,10 @@ fn stderr_cols() -> usize {
             return ws.ws_col as usize;
         }
     }
-    std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(80)
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(80)
 }
 
 /// Truncate `s` to at most `max` terminal columns (Unicode *display* width, so a
@@ -657,7 +773,10 @@ impl Spinner {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(80));
             for i in 0.. {
                 tick.tick().await;
-                eprint!("\r\x1b[36m{}\x1b[0m \x1b[2;36mthinking…\x1b[0m", FRAMES[i % FRAMES.len()]);
+                eprint!(
+                    "\r\x1b[36m{}\x1b[0m \x1b[2;36mthinking…\x1b[0m",
+                    FRAMES[i % FRAMES.len()]
+                );
             }
         })))
     }
@@ -724,8 +843,8 @@ fn tool_glyph(tool_name: &str) -> &'static str {
         return "🔧"; // MCP tool call — the wrench
     }
     "🛠️ " // local tool/exe/script — hammer & wrench (VS16 emoji presentation)
-         // + a trailing spacer: U+1F6E0 renders width-1 in most terminals, so the
-         // single join-space looks swallowed; the extra space keeps a clear gap.
+    // + a trailing spacer: U+1F6E0 renders width-1 in most terminals, so the
+    // single join-space looks swallowed; the extra space keeps a clear gap.
 }
 
 /// Whether a tool's execution should be animated. Tools that hand the terminal
@@ -781,7 +900,11 @@ impl ToolSpinner {
                 }
             }
         });
-        Self { state, task: Some(task), animated: true }
+        Self {
+            state,
+            task: Some(task),
+            animated: true,
+        }
     }
 
     /// A clone of the animation state — the confirm wrapper pauses/resumes it
@@ -799,7 +922,10 @@ impl ToolSpinner {
             t.abort();
         }
         if self.animated {
-            eprintln!("\r\x1b[2K\x1b[2m  {}\x1b[0m", tool_result_line(desc, is_error));
+            eprintln!(
+                "\r\x1b[2K\x1b[2m  {}\x1b[0m",
+                tool_result_line(desc, is_error)
+            );
         } else {
             // Non-animated (piped / background coordinator): the dim start line
             // was already printed at `start`; emit the static ✓/✗ result line too
@@ -861,9 +987,9 @@ impl Drop for ToolSpinner {
 /// glyph (🛠️/🔧/🤝) is part of `desc`, so only the colorized status mark is added.
 fn tool_result_line(desc: &str, is_error: bool) -> String {
     if is_error {
-        format!("\x1b[31m✗\x1b[0m {desc}")  // red for error
+        format!("\x1b[31m✗\x1b[0m {desc}") // red for error
     } else {
-        format!("\x1b[32m✓\x1b[0m {desc}")  // green for success
+        format!("\x1b[32m✓\x1b[0m {desc}") // green for success
     }
 }
 
@@ -880,6 +1006,27 @@ fn tool_result_line(desc: &str, is_error: bool) -> String {
 /// clamps its width.
 fn flatten_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Build a `PreToolUse`/`PostToolUse` payload for `call`: the common session
+/// envelope plus the tool name and, when present, the spawned program
+/// (`run_program`/`run_interactive`) and a path argument (file tools). These are
+/// exactly the fields the hook matcher filters on (`tool`/`program`/`path`), so
+/// a hook like `{ "tool": "run_program", "program": "git" }` resolves correctly.
+/// Only called inside a `hooks.has(...)` guard.
+fn tool_hook_payload(
+    session: &Session,
+    event: crate::hooks::HookEvent,
+    call: &crate::backend::ToolCall,
+) -> crate::hooks::HookPayload {
+    let mut p = session.hook_payload(event).with("tool", call.name.clone());
+    if let Some(program) = call.args.get("program").and_then(|v| v.as_str()) {
+        p = p.with("program", program.to_string());
+    }
+    if let Some(path) = call.args.get("path").and_then(|v| v.as_str()) {
+        p = p.with("path", path.to_string());
+    }
+    p
 }
 
 fn describe_call(call: &crate::backend::ToolCall) -> String {
@@ -960,7 +1107,10 @@ fn print_raw_result(result: &ToolResult) {
 /// retroactive reveal when raw output is toggled on after an answer.
 pub fn reveal_last_turn(session: &Session) {
     for (desc, result) in &session.last_turn_tools {
-        eprintln!("\x1b[2m  {}\x1b[0m", tool_result_line(desc, result.is_error));
+        eprintln!(
+            "\x1b[2m  {}\x1b[0m",
+            tool_result_line(desc, result.is_error)
+        );
         print_raw_result(result);
     }
 }
@@ -991,9 +1141,18 @@ mod tests {
         let line = prompt_footer_line(std::path::Path::new("/tmp/x"));
         assert!(line.starts_with("\x1b[2m"), "footer must be dim: {line}");
         assert!(line.ends_with("\x1b[0m"), "footer must reset SGR: {line}");
-        assert!(line.contains("/tmp/x ❯"), "footer must show the cwd + prompt glyph: {line}");
-        assert!(line.contains(":command"), "footer must mention :commands: {line}");
-        assert!(line.contains("Ctrl-C"), "footer must mention the abort key: {line}");
+        assert!(
+            line.contains("/tmp/x ❯"),
+            "footer must show the cwd + prompt glyph: {line}"
+        );
+        assert!(
+            line.contains(":command"),
+            "footer must mention :commands: {line}"
+        );
+        assert!(
+            line.contains("Ctrl-C"),
+            "footer must mention the abort key: {line}"
+        );
     }
 
     #[test]
@@ -1029,11 +1188,43 @@ mod tests {
     }
 
     #[test]
+    fn raw_body_payload_is_additive_matches_text_only_view() {
+        // S7.4 / AC2: the Ctrl-O raw view is ADDITIVE — attaching a payload must
+        // not change what the human sees. A structured result and a text-only
+        // result built from the SAME content render an identical raw body; the
+        // payload is the MODEL's view (model_content), never substituted into the
+        // human raw view. See docs/S7.4-tests-docs-scope.md §3.
+        let content = "name  type  size\nf.txt file  3";
+        let text = ToolResult::text("t", content, false);
+        let structured = ToolResult::structured(
+            "t",
+            content,
+            serde_json::json!([{"name": "f.txt", "type": "file", "size": 3}]),
+            false,
+        );
+        assert_eq!(
+            raw_body(&structured),
+            raw_body(&text),
+            "payload must not alter the raw view"
+        );
+        assert_eq!(raw_body(&structured), content);
+        // And the model sees something different (the compact JSON) — proving the
+        // payload is additive, not a no-op and not a substitute for the raw view.
+        assert_ne!(raw_body(&structured), structured.model_content());
+    }
+
+    #[test]
     fn tool_result_line_marks_status() {
         let ok = tool_result_line("read /etc/hosts", false);
-        assert!(ok.contains("\x1b[32m✓\x1b[0m"), "success checkmark should be green: {ok}");
+        assert!(
+            ok.contains("\x1b[32m✓\x1b[0m"),
+            "success checkmark should be green: {ok}"
+        );
         let err = tool_result_line("write x", true);
-        assert!(err.contains("\x1b[31m✗\x1b[0m"), "error X should be red: {err}");
+        assert!(
+            err.contains("\x1b[31m✗\x1b[0m"),
+            "error X should be red: {err}"
+        );
     }
 
     #[test]
@@ -1058,14 +1249,24 @@ mod tests {
             name: "escalate".into(),
             args: serde_json::json!({ "task": "estimate the LOE" }),
         };
-        let desc = format!("{} {}", tool_glyph(&call.name), flatten_ws(&describe_call(&call)));
+        let desc = format!(
+            "{} {}",
+            tool_glyph(&call.name),
+            flatten_ws(&describe_call(&call))
+        );
         assert!(
             desc.starts_with("🤝 escalate:"),
             "escalate line must lead with the handshake: {desc}"
         );
-        assert!(!desc.contains('🔧'), "escalate must not show the wrench: {desc}");
+        assert!(
+            !desc.contains('🔧'),
+            "escalate must not show the wrench: {desc}"
+        );
         let done = tool_result_line(&desc, false);
-        assert!(done.contains("\x1b[32m✓\x1b[0m"), "done line should be green-checked: {done}");
+        assert!(
+            done.contains("\x1b[32m✓\x1b[0m"),
+            "done line should be green-checked: {done}"
+        );
         assert!(done.contains("🤝"), "done line keeps the handshake: {done}");
     }
 
@@ -1082,7 +1283,10 @@ mod tests {
         assert!(!TOOL_FRAMES.is_empty());
         assert!(TOOL_FRAMES.iter().all(|f| !f.is_empty()));
         // i % len wraps back to frame 0 after a full cycle.
-        assert_eq!(TOOL_FRAMES[0 % TOOL_FRAMES.len()], TOOL_FRAMES[TOOL_FRAMES.len() % TOOL_FRAMES.len()]);
+        assert_eq!(
+            TOOL_FRAMES[0 % TOOL_FRAMES.len()],
+            TOOL_FRAMES[TOOL_FRAMES.len() % TOOL_FRAMES.len()]
+        );
     }
 
     #[test]
@@ -1106,8 +1310,15 @@ mod tests {
         let long = "run_program ./scripts/init-rpc-node.sh ".repeat(20);
         for max in [10usize, 20, 40, 80] {
             let out = truncate_to_cols(&long, max);
-            assert!(out.width() <= max, "width {} exceeds max {max}: {out:?}", out.width());
-            assert!(out.ends_with('…'), "truncated line should end with an ellipsis: {out:?}");
+            assert!(
+                out.width() <= max,
+                "width {} exceeds max {max}: {out:?}",
+                out.width()
+            );
+            assert!(
+                out.ends_with('…'),
+                "truncated line should end with an ellipsis: {out:?}"
+            );
         }
         // A zero budget can't even hold the ellipsis — produce nothing rather
         // than overflow the row.
@@ -1121,7 +1332,11 @@ mod tests {
         // desc overflow the row by one column and reintroduce the wrap bug.
         let desc = "🔧 ".to_string() + &"x".repeat(100);
         let out = truncate_to_cols(&desc, 10);
-        assert!(out.width() <= 10, "wide-glyph desc overflowed: width {}", out.width());
+        assert!(
+            out.width() <= 10,
+            "wide-glyph desc overflowed: width {}",
+            out.width()
+        );
         assert!(out.starts_with('🔧'), "leading glyph preserved: {out:?}");
     }
 
@@ -1134,9 +1349,15 @@ mod tests {
         let desc = "🔧 gh pr create --title fix --body ## Issue\n\nbody\n- a\n- b";
         let out = flatten_ws(desc);
         assert!(!out.contains('\n'), "newlines must be gone: {out:?}");
-        assert!(!out.contains('\r'), "carriage returns must be gone: {out:?}");
+        assert!(
+            !out.contains('\r'),
+            "carriage returns must be gone: {out:?}"
+        );
         assert!(!out.contains('\t'), "tabs must be gone: {out:?}");
-        assert_eq!(out, "🔧 gh pr create --title fix --body ## Issue body - a - b");
+        assert_eq!(
+            out,
+            "🔧 gh pr create --title fix --body ## Issue body - a - b"
+        );
     }
 
     #[test]
@@ -1153,7 +1374,10 @@ mod tests {
         assert!(seeded.contains("df output"));
         assert!(seeded.ends_with("summarize that"));
         // Mid-conversation → untouched (the model already has prior output).
-        assert_eq!(seed_context(false, Some("df output".into()), "next".into()), "next");
+        assert_eq!(
+            seed_context(false, Some("df output".into()), "next".into()),
+            "next"
+        );
         // No prior output, or an empty one → untouched.
         assert_eq!(seed_context(true, None, "hi".into()), "hi");
         assert_eq!(seed_context(true, Some("   \n".into()), "hi".into()), "hi");

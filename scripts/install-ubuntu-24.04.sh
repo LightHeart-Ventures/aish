@@ -1,10 +1,10 @@
 #!/bin/bash
-# aish — one-command Ubuntu 22.04 installer
+# aish — one-command Ubuntu 24.04 installer
 #
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/LightHeart-Ventures/aish/main/install-ubuntu-22.04.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/LightHeart-Ventures/aish/main/install-ubuntu-24.04.sh | bash
 #   # or
-#   bash install-ubuntu-22.04.sh
+#   bash install-ubuntu-24.04.sh
 #
 # This script:
 # 1. Installs build dependencies (build-essential, rustup, git)
@@ -24,15 +24,15 @@ NC='\033[0m' # No Color
 
 echo -e "${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║         aish — AI-native Linux Shell                       ║${NC}"
-echo -e "${BLUE}║         Ubuntu 22.04 LTS Installer                         ║${NC}"
+echo -e "${BLUE}║         Ubuntu 24.04 LTS Installer                         ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
 # Step 1: Check Ubuntu version
-echo -e "${YELLOW}[1/5]${NC} Verifying Ubuntu 22.04 LTS..."
-if ! grep -q "jammy" /etc/os-release 2>/dev/null; then
-    if ! grep -q "22.04" /etc/os-release 2>/dev/null; then
-        echo -e "${YELLOW}⚠️  This system may not be Ubuntu 22.04 LTS${NC}"
+echo -e "${YELLOW}[1/5]${NC} Verifying Ubuntu 24.04 LTS..."
+if ! grep -q "noble" /etc/os-release 2>/dev/null; then
+    if ! grep -q "24.04" /etc/os-release 2>/dev/null; then
+        echo -e "${YELLOW}⚠️  This system may not be Ubuntu 24.04 LTS${NC}"
         echo "    (It may still work with Ubuntu 20.04+ or Debian 12+)"
         read -p "Continue anyway? (y/n) " -n 1 -r; echo
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 1; fi
@@ -130,5 +130,5 @@ echo ""
 echo "  3. (Optional) Make it your login shell:"
 echo "     chsh -s ~/.local/bin/aish"
 echo ""
-echo "For more info: https://github.com/LightHeart-Ventures/aish/blob/main/UBUNTU_22.04_INSTALL.md"
+echo "For more info: https://github.com/LightHeart-Ventures/aish/blob/main/README.md"
 echo ""

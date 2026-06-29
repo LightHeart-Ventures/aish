@@ -515,6 +515,39 @@ mod tests {
     }
 
     #[test]
+    fn render_string_only_tool_result_wire_shape_has_no_payload_key() {
+        // S7.4 / AC1: a text-only ToolResult renders to the Claude tool_result
+        // wire block EXACTLY as before structured results existed — the four
+        // canonical keys only (type, tool_use_id, content, is_error), `content`
+        // verbatim, and `is_error` honoured on both a success and a failure
+        // result. The typed payload is consumed by model_content(); it must
+        // NEVER leak onto the wire as a `structured`/`payload` sibling field.
+        // The exact-key-count assertion is the guardrail: letting the payload
+        // serialize as a wire sibling fails this test.
+        use super::super::{Msg, ToolResult};
+        let hist = vec![Msg::tool_results(vec![
+            ToolResult::text("ok", "verbatim output", false),
+            ToolResult::text("bad", "it failed", true),
+        ])];
+        let msgs = render_messages(&hist);
+        let blocks = msgs[0]["content"].as_array().unwrap();
+
+        let ok = blocks[0].as_object().unwrap();
+        assert_eq!(ok["type"], "tool_result");
+        assert_eq!(ok["tool_use_id"], "ok");
+        assert_eq!(ok["content"], "verbatim output"); // content verbatim
+        assert_eq!(ok["is_error"], false); // is_error honoured
+        // EXACTLY the four canonical keys — no payload/structured sibling.
+        assert_eq!(ok.len(), 4, "string-only block carries no extra key: {ok:?}");
+        assert!(ok.get("structured").is_none());
+        assert!(ok.get("payload").is_none());
+
+        // is_error is threaded for the failing result too; content stays verbatim.
+        assert_eq!(blocks[1]["is_error"], true);
+        assert_eq!(blocks[1]["content"], "it failed");
+    }
+
+    #[test]
     fn render_tool_result_threads_structured_json_to_model() {
         // S7.3 / AC1: a structured tool result is rendered to the model as the
         // compact JSON payload, while a plain text result sends `content`.

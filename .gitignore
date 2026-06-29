@@ -1,4 +1,5 @@
 /target
 /aish
-# Tier-1 coordinator turn-audit journals (runtime state, never committed).
+# Coordinator state (runtime, never committed).
+.claude/
 .atum/

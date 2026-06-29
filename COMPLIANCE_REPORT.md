@@ -1,13 +1,13 @@
 # License Compliance Report — aish
 
 **Project:** `aish` v0.11.0
-**Project license:** `MIT OR Apache-2.0` (dual)
+**Project license:** `Apache-2.0`
 **Analysis basis:** `cargo license` over the full dependency graph (`Cargo.lock`), default + `local` features enabled.
 **Date:** generated from the committed `Cargo.lock`.
 
 ## 1. Overview
 
-`aish` is dual-licensed `MIT OR Apache-2.0`. This report evaluates every crate in the
+`aish` is licensed under **Apache-2.0**. This report evaluates every crate in the
 resolved dependency tree (direct **and** transitive — ~660 crate instances across the
 graph) for compatibility with **Apache-2.0** as the outbound license.
 
@@ -124,13 +124,13 @@ crates.io / their upstream repositories.
 
 | # | Action | Priority | Owner | Status |
 |---|---|---|---|---|
-| 1 | Land `THIRD_PARTY_NOTICES.md` (direct deps) | High | maintainers | ✅ in this PR |
-| 2 | Add top-level `NOTICE` file (template in §4) | Medium | maintainers | ☐ todo |
-| 3 | Generate `licenses/THIRD_PARTY_FULL.txt` via `cargo about`/`cargo bundle-licenses` | Medium | maintainers | ☐ todo |
+| 1 | Land `THIRD_PARTY_NOTICES.md` (direct deps) | High | maintainers | ✅ done |
+| 2 | Add top-level `NOTICE` file (template in §4) | Medium | maintainers | ✅ done |
+| 3 | Generate `licenses/THIRD_PARTY_FULL.txt` via `cargo about`/`cargo bundle-licenses` | Medium | maintainers | ☐ future (optional) |
 | 4 | List MPL-2.0 crates with source pointers in notices | Medium | maintainers | ✅ §3.3 |
-| 5 | Add `deny.toml` + `cargo deny check licenses` to CI (allowlist permissive + MPL-2.0) | Medium | CI | ☐ todo |
-| 6 | Keep MPL-2.0 crates unmodified (no vendored patches) | Ongoing | all | ☐ policy |
-| 7 | Re-run this analysis on any `Cargo.lock` change (CI gate) | Low | CI | ☐ todo |
+| 5 | Add `deny.toml` + `cargo deny check licenses` to CI (allowlist permissive + MPL-2.0) | Medium | CI | ✅ done |
+| 6 | Keep MPL-2.0 crates unmodified (no vendored patches) | Ongoing | all | ✅ policy |
+| 7 | Re-run this analysis on any `Cargo.lock` change (CI gate) | Low | CI | ☐ future (optional) |
 
 ## 6. Conclusion
 

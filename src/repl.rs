@@ -81,6 +81,18 @@ fn reset_window_title() {
     let _ = std::io::stdout().flush();
 }
 
+/// Clear the screen and home the cursor so the next output starts at the top —
+/// but only on an interactive terminal (a piped stdout stays free of escape
+/// noise). Used by the Shift-Tab worker cycle so each attach/detach view opens
+/// on a fresh screen instead of scrolling under the prior one.
+fn clear_screen() {
+    // SAFETY: plain isatty query.
+    if unsafe { libc::isatty(1) } == 1 {
+        print!("\x1b[2J\x1b[H");
+        let _ = std::io::stdout().flush();
+    }
+}
+
 pub async fn run(
     mut backend: Backend,
     mut session: Session,
@@ -98,6 +110,17 @@ pub async fn run(
     // receives SIGINT when IT owns the terminal — i.e. during a model turn. That
     // makes the old tty_handoff disambiguation flag unnecessary; TASK-116 removed it.
     tools::ignore_job_control_signals();
+
+    // Load the lifecycle-hook registry (~/.aish/hooks.json + ./.aish/hooks.json)
+    // now that the session cwd is established, then fire SessionStart. Both are
+    // no-ops when no hook is configured — the empty registry spawns nothing.
+    session.load_hooks();
+    if session.hooks.has(crate::hooks::HookEvent::SessionStart) {
+        let p = session.hook_payload(crate::hooks::HookEvent::SessionStart);
+        session
+            .hooks
+            .fire_observe(crate::hooks::HookEvent::SessionStart, p);
+    }
 
     // Install the process-wide SIGINT handler up front. A Ctrl-C during a
     // direct-dispatch child is delivered by the terminal straight to that child's
@@ -178,10 +201,7 @@ pub async fn run(
     // completes a `:`-prefix via the Completer.
 
     // Start on a clean screen (interactive terminals only — keep piped output clean).
-    // SAFETY: plain isatty query.
-    if unsafe { libc::isatty(1) } == 1 {
-        print!("\x1b[2J\x1b[H");
-    }
+    clear_screen();
     println!(
         "\x1b[1maish\x1b[0m \x1b[2mv{}\x1b[0m — AI-native shell · {} · :help for commands",
         crate::update::current_version(),
@@ -533,6 +553,17 @@ pub async fn run(
     // hang them up (SIGCONT + SIGHUP) so they terminate with the shell (TASK-123).
     tools::hangup_jobs_on_exit(&session.jobs);
 
+    // Fire SessionEnd and AWAIT it: the process is about to exit, so a detached
+    // task would be killed before it ran (hence run_observe_blocking, bounded by
+    // each hook's timeout). No-op when no SessionEnd hook is configured.
+    if session.hooks.has(crate::hooks::HookEvent::SessionEnd) {
+        let p = session.hook_payload(crate::hooks::HookEvent::SessionEnd);
+        session
+            .hooks
+            .run_observe_blocking(crate::hooks::HookEvent::SessionEnd, p)
+            .await;
+    }
+
     editor.save_history();
     println!("bye");
     Ok(())
@@ -640,6 +671,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("context", "show context-window usage"),
     ("detach", "stop watching the attached coordinator"),
     ("dispatch", "launch a background coordinator"),
+    (
+        "forget",
+        "remove an exited worker (--all-exited: every exited one)",
+    ),
     ("goal", "pursue a goal in the background"),
     ("help", "show command help"),
     ("jobs", "list background jobs"),
@@ -1730,11 +1765,9 @@ async fn dispatch(
                     // Forced (`!`) miss: render a coded `aish::exec::not_found`
                     // with a cheap bounded did-you-mean drawn from $PATH.
                     let candidates = scan_path_commands(&path_var);
-                    let hint = crate::diag::nearest_command(
-                        cmd,
-                        candidates.iter().map(String::as_str),
-                    )
-                    .map(|near| format!("did you mean `{near}`?"));
+                    let hint =
+                        crate::diag::nearest_command(cmd, candidates.iter().map(String::as_str))
+                            .map(|near| format!("did you mean `{near}`?"));
                     crate::diag::eprint(&crate::diag::AishDiagnostic::exec_not_found(cmd, hint));
                     return Dispatch::Handled;
                 }
@@ -2415,13 +2448,11 @@ fn backfill_attached(run_id: &str, session: &Session) {
     let Some(job) = job else { return };
     let short = crate::batch::short_id(run_id);
     println!("{}", crate::worker::pane_replay_header(&short));
-    // The task is the coordinator's "input". The `\u{b7}task` marker is folded
-    // into the row text \u{2014} `pane_row` carries only `[label]` in its gutter now
-    // (the single-glyph convention; the source glyph rides inside the text).
-    println!(
-        "{}",
-        crate::worker::pane_row(run_id, &format!("·task {}", job.task))
-    );
+    // The task is the coordinator's "input" — the START of the conversation. It's
+    // rendered set-apart (a 💬 glyph + bold) by `pane_input_row` so it's obvious
+    // this row is the prompt the coordinator was given, not one of its own
+    // activity lines that follow.
+    println!("{}", crate::worker::pane_input_row(run_id, &job.task));
     let rows = job.transcript_rows();
     if rows.is_empty() {
         println!(
@@ -2477,6 +2508,174 @@ fn detach_worker(session: &mut Session) {
         }
         None => println!("not attached to any coordinator"),
     }
+}
+
+/// What a `:forget` invocation resolved to. Pure shaping (parsed from the
+/// command tail) so the handler's IO stays thin and the parse is unit-testable.
+#[derive(Debug, PartialEq)]
+enum ForgetCmd {
+    /// No argument (or an unrecognized one) -> print usage.
+    Usage,
+    /// `--all-exited` / `--all` -> bulk-forget every exited, owned worker (AC6).
+    AllExited,
+    /// `<id>` (full id or prefix) -> forget that one worker (AC5).
+    One(String),
+}
+
+/// Parse the whitespace-split tail of `:forget` into a [`ForgetCmd`]. Pure ->
+/// unit-tested. Exactly one token is accepted (an id, or the bulk flag);
+/// anything else is usage.
+fn parse_forget_cmd(parts: &[&str]) -> ForgetCmd {
+    match parts {
+        [] => ForgetCmd::Usage,
+        [flag] if *flag == "--all-exited" || *flag == "--all" => ForgetCmd::AllExited,
+        [id] if !id.is_empty() && !id.starts_with("--") => ForgetCmd::One((*id).to_string()),
+        _ => ForgetCmd::Usage,
+    }
+}
+
+/// Whether a worker/coordinator `status` (an in-memory `WorkerJob::status` or a
+/// durable `coordinator_runs.phase`) means it is STILL LIVE. `:forget` refuses a
+/// live worker (AC5a) so it can never reap work in flight. Unknown/terminal
+/// states (`done`/`failed`, or a stale label whose container is gone) are
+/// forgettable. Pure -> unit-tested.
+fn forget_status_is_live(status: &str) -> bool {
+    matches!(status.trim(), "running" | "coordinating" | "awaiting_batch")
+}
+
+/// Remove every durable trace of one (already-confirmed-exited) worker: its
+/// container (if a runtime is engaged, AC5b), its on-disk state dir
+/// (`~/.aish/workers/<id>/`, S9.3, AC5c), its durable `coordinator_runs` row, and
+/// its in-memory job entry (AC5d). Best-effort per component; returns a one-line
+/// human summary of what was reclaimed.
+fn do_forget(full_id: &str, session: &mut Session) -> String {
+    let short = crate::batch::short_id(full_id);
+    let dir_path = crate::worker_store::worker_dir(full_id);
+    let had_dir = dir_path.exists();
+    let container_removed = crate::container::forget_container(full_id);
+    let dir_removed = match crate::worker_store::forget(full_id) {
+        Ok(()) => had_dir && !dir_path.exists(),
+        Err(_) => false,
+    };
+    let row_removed = session
+        .coordinator_store
+        .as_ref()
+        .and_then(|s| s.delete_runs(&[full_id.to_string()]).ok())
+        .unwrap_or(0)
+        > 0;
+    // Drop from the in-memory list so it leaves :workers and the wheel-N badge.
+    let mem_removed = {
+        let mut jobs = session.worker_jobs.lock().unwrap();
+        let before = jobs.len();
+        jobs.retain(|w| w.id != full_id);
+        jobs.len() != before
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    if container_removed {
+        parts.push("container");
+    }
+    if dir_removed {
+        parts.push("state dir");
+    }
+    if row_removed {
+        parts.push("run record");
+    }
+    if mem_removed {
+        parts.push("job entry");
+    }
+    if parts.is_empty() {
+        format!("\x1b[2m\u{2713} forgot {short} (nothing left to remove)\x1b[0m")
+    } else {
+        format!(
+            "\x1b[32m\u{2713}\x1b[0m forgot {short} \u{2014} removed {}",
+            parts.join(", ")
+        )
+    }
+}
+
+/// `:forget <id>` (S9.5 AC5) — remove an EXITED worker's footprint. Resolves
+/// `id` as a full id or prefix across this session's in-memory workers (live
+/// status) and the durable coordinator store, refuses a still-running worker with
+/// guidance (AC5a), reports an unknown or ambiguous id, and otherwise reclaims
+/// the container + state dir + run record + job entry via [`do_forget`].
+fn forget_worker(id: &str, session: &mut Session) {
+    let id = id.trim();
+    if id.is_empty() {
+        println!("usage: :forget <id>   (or :forget --all-exited)");
+        return;
+    }
+    let hit = |jid: &str| jid == id || jid.starts_with(id);
+    // (full_id, status) candidates: in-memory first (live status), then the
+    // durable store (skipping ids already collected in-memory).
+    let mut found: Vec<(String, String)> = Vec::new();
+    for w in session.worker_jobs.lock().unwrap().iter() {
+        if hit(&w.id) {
+            found.push((w.id.clone(), w.status()));
+        }
+    }
+    if let Some(store) = &session.coordinator_store {
+        if let Ok(rows) = store.load_all() {
+            for r in rows.iter().filter(|r| hit(&r.run_id)) {
+                if !found.iter().any(|(mid, _)| mid == &r.run_id) {
+                    found.push((r.run_id.clone(), r.phase.clone()));
+                }
+            }
+        }
+    }
+    match found.as_slice() {
+        [] => println!("no background worker matching '{id}' (see :workers)"),
+        [(full_id, status)] => {
+            if forget_status_is_live(status) {
+                let short = crate::batch::short_id(full_id);
+                println!(
+                    "\x1b[33m\u{2717}\x1b[0m {short} is still running \u{2014} :attach {short} and stop it (or wait) before :forget"
+                );
+                return;
+            }
+            println!("{}", do_forget(full_id, session));
+        }
+        many => {
+            println!(
+                "'{id}' is ambiguous \u{2014} matches {} workers:",
+                many.len()
+            );
+            for (mid, status) in many {
+                println!("  {} ({status})", crate::batch::short_id(mid));
+            }
+            println!("disambiguate with a longer id prefix");
+        }
+    }
+}
+
+/// `:forget --all-exited` (S9.5 AC6) — bulk-remove every exited worker OWNED by
+/// this session: terminal in-memory workers (always owned) plus terminal durable
+/// rows whose `session_id` matches. Running workers are left untouched.
+fn forget_all_exited(session: &mut Session) {
+    let mut victims: Vec<String> = Vec::new();
+    for w in session.worker_jobs.lock().unwrap().iter() {
+        if !forget_status_is_live(&w.status()) {
+            victims.push(w.id.clone());
+        }
+    }
+    if let Some(store) = &session.coordinator_store {
+        if let Ok(rows) = store.load_all() {
+            for r in rows.iter() {
+                let mine = r.session_id.as_deref() == Some(session.session_id.as_str());
+                if mine && !forget_status_is_live(&r.phase) && !victims.contains(&r.run_id) {
+                    victims.push(r.run_id.clone());
+                }
+            }
+        }
+    }
+    if victims.is_empty() {
+        println!("no exited workers to forget");
+        return;
+    }
+    let n = victims.len();
+    for id in &victims {
+        println!("{}", do_forget(id, session));
+    }
+    println!("\x1b[2mforgot {n} exited worker(s)\x1b[0m");
 }
 
 /// Handle a typed operator line while attached. For a LIVE coordinator this
@@ -2541,13 +2740,24 @@ fn announce_attach_review(session: &mut Session) {
         .map(|w| w.status());
     match status.as_deref() {
         Some("done") | Some("failed") => {
-            let mut announced = session.attach_review_announced.lock().unwrap();
-            if announced.as_deref() != Some(run_id.as_str()) {
+            let already =
+                session.attach_review_announced.lock().unwrap().as_deref() == Some(run_id.as_str());
+            if !already {
+                // The coordinator's FINAL answer is written to stdout — NOT the
+                // streamed stderr we forward live — so a live `:attach` that runs
+                // through to completion would otherwise never show the last
+                // (result) turn: it gets "cut off" at the last tool/narration
+                // line. Replay the captured result into the attach pane before
+                // the review notice, exactly as attaching to an already-finished
+                // worker does (`print_attached_result`). The de-dupe marker below
+                // means an `:attach` of an already-terminal worker (which already
+                // printed the result) does not print it a second time here.
+                print_attached_result(&run_id, session);
                 let short = crate::batch::short_id(&run_id);
                 println!(
                     "\x1b[2m⇄ {short} finished — review mode: type a message to resume it, or :detach to return to your shell.\x1b[0m"
                 );
-                *announced = Some(run_id);
+                *session.attach_review_announced.lock().unwrap() = Some(run_id);
             }
         }
         // Still live (or resumed into a new live state) — clear so a later finish
@@ -2676,6 +2886,10 @@ fn next_attach_index(running: &[String], current: Option<&str>) -> usize {
 /// it), mirroring `attach_worker`'s terminal branch. This makes Shift-Tab a way
 /// to flip back through completed/failed agents, not just the still-running ones.
 fn cycle_worker(session: &mut Session) {
+    // Wipe the screen and home the cursor first, so this cycle's attach/detach
+    // view (status line + any backfilled activity / result) opens at the top of
+    // a fresh screen instead of scrolling under the previous prompt and output.
+    clear_screen();
     // All coordinators this session launched, in listing order — LIVE and
     // TERMINAL — paired with a `terminal` flag so the attach branch can choose
     // review-mode vs live-stream. Shift-Tab rotates through finished/failed
@@ -2685,7 +2899,12 @@ fn cycle_worker(session: &mut Session) {
         .lock()
         .unwrap()
         .iter()
-        .map(|w| (w.id.clone(), matches!(w.status().as_str(), "done" | "failed")))
+        .map(|w| {
+            (
+                w.id.clone(),
+                matches!(w.status().as_str(), "done" | "failed"),
+            )
+        })
         .collect();
     if workers.is_empty() {
         println!(
@@ -2761,11 +2980,9 @@ fn close_worker(id: Option<&str>, session: &mut Session) {
     let attached = session.attached.lock().unwrap().clone();
     // Default target: the worker we're attached to ("the one you're in"). The
     // goal sentinel isn't a worker job, so it can't be closed this way.
-    let target = id.map(str::to_string).or_else(|| {
-        attached
-            .clone()
-            .filter(|r| r != GOAL_ATTACH_ID)
-    });
+    let target = id
+        .map(str::to_string)
+        .or_else(|| attached.clone().filter(|r| r != GOAL_ATTACH_ID));
     let Some(target) = target else {
         if attached.as_deref() == Some(GOAL_ATTACH_ID) {
             println!(
@@ -3209,6 +3426,14 @@ fn skill_remove(name: &str, session: &mut Session) -> Result<()> {
     Ok(())
 }
 
+/// Markdown header for the `:workers` table. Kept as a const so the column set
+/// — Worker | Session | Status | Started | Runtime | Doing | Result — is a
+/// single source of truth and unit-testable. The Started column is a relative
+/// "ago" label; Runtime is the elapsed-so-far (running) or total (terminal) span
+/// (see `crate::style::time_cells`).
+const WORKERS_TABLE_HEADER: &str =
+    "| Worker | Session | Status | Started | Runtime | Doing | Result |\n|---|---|---|---|---|---|---|\n";
+
 /// Returns true when the REPL should exit.
 async fn handle_colon(
     cmd: &str,
@@ -3254,6 +3479,7 @@ async fn handle_colon(
                  :tell [--any] <id> <message>        send instructions to an in-flight coordinator (folded in next round; --any steers another session's)\n\
                  :attach <id>|goal                   watch a running coordinator live + steer it (typed lines go to it); `goal` watches the active :goal\n\
                  :detach                             stop watching the attached coordinator (it keeps running)\n\
+                 :forget <id>|--all-exited           remove an exited worker's container + state dir + run record (refuses a running one)\n\
                  :close [id]                         remove the attached (or named) coordinator from :workers + the Shift-Tab rotation\n\
                  :skill <add|search|list|remove>     install, search, list, or remove skill.fish skills\n\
                  :rename <name>                      name the session (prefixes the prompt); auto-set to the repo name at startup, bare :rename clears\n\
@@ -3345,21 +3571,32 @@ async fn handle_colon(
                 .clone()
                 .unwrap_or_else(|| crate::batch::short_id(&session.session_id).to_string());
 
-            let mut table = String::from(
-                "| Worker | Session | Status | Doing | Result |\n|---|---|---|---|---|\n",
-            );
+            let mut table = String::from(WORKERS_TABLE_HEADER);
+            // Epoch-seconds "now", computed once so every row's Started/Runtime
+            // cell is reconciled against the same instant.
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
             let mut any = false;
             let mut seen = std::collections::HashSet::new();
             // In-memory coordinators launched by THIS session (live status).
             for w in session.worker_jobs.lock().unwrap().iter() {
                 any = true;
                 seen.insert(w.id.clone());
+                let (started_cell, runtime_cell) = crate::style::time_cells(
+                    w.started_epoch(),
+                    w.finished_epoch(),
+                    now_epoch,
+                );
                 table.push_str(&format!(
-                    "| {} {} | {} * | {} | {} | {} |\n",
+                    "| {} {} | {} * | {} | {} | {} | {} | {} |\n",
                     crate::style::job_type_emoji("worker"),
                     w.id,
                     me_label,
                     crate::style::styled_status(&w.status()),
+                    started_cell,
+                    runtime_cell,
                     one_line(&w.task),
                     crate::style::styled_result(&w.result_cell())
                 ));
@@ -3406,12 +3643,31 @@ async fn handle_colon(
                             }
                             _ => "—".to_string(),
                         };
+                        // Start from created_at; freeze the runtime at heartbeat_at
+                        // once terminal (set_done/set_failed bump the heartbeat),
+                        // else let it tick against now.
+                        let started = r
+                            .created_at
+                            .as_deref()
+                            .and_then(crate::style::parse_sqlite_utc);
+                        let terminal = matches!(r.phase.as_str(), "done" | "failed");
+                        let finished = if terminal {
+                            r.heartbeat_at
+                                .as_deref()
+                                .and_then(crate::style::parse_sqlite_utc)
+                        } else {
+                            None
+                        };
+                        let (started_cell, runtime_cell) =
+                            crate::style::time_cells(started, finished, now_epoch);
                         table.push_str(&format!(
-                            "| {} {} | {} | {} | {} | {} |\n",
+                            "| {} {} | {} | {} | {} | {} | {} | {} |\n",
                             crate::style::job_type_emoji("coordinator"),
                             crate::batch::short_id(&r.run_id),
                             session_cell,
                             crate::style::styled_status(&r.phase),
+                            started_cell,
+                            runtime_cell,
                             one_line(&r.task),
                             crate::style::styled_result(&result_cell)
                         ));
@@ -3506,6 +3762,16 @@ async fn handle_colon(
         }
         Some("attach") => attach_worker(parts.next(), session),
         Some("detach") => detach_worker(session),
+        Some("forget") => {
+            let toks: Vec<&str> = parts.collect();
+            match parse_forget_cmd(&toks) {
+                ForgetCmd::Usage => println!(
+                    "usage: :forget <id>            remove an EXITED worker's container + state dir + record\n       :forget --all-exited    remove every exited worker in this session"
+                ),
+                ForgetCmd::AllExited => forget_all_exited(session),
+                ForgetCmd::One(id) => forget_worker(&id, session),
+            }
+        }
         Some("close") => close_worker(parts.next(), session),
         Some("tell" | "msg" | "send") => {
             // Steer an in-flight coordinator: queue an operator message that the
@@ -5250,6 +5516,69 @@ mod tests {
     fn skill_in_colon_catalog() {
         // The catalog carries :skill so the palette + completion offer it.
         assert!(colon_command_matches("sk").contains(&"skill"));
+    }
+
+    #[test]
+    fn forget_cmd_parses_id_flag_and_usage() {
+        assert_eq!(parse_forget_cmd(&[]), ForgetCmd::Usage);
+        assert_eq!(parse_forget_cmd(&["--all-exited"]), ForgetCmd::AllExited);
+        assert_eq!(parse_forget_cmd(&["--all"]), ForgetCmd::AllExited);
+        assert_eq!(
+            parse_forget_cmd(&["w_abc"]),
+            ForgetCmd::One("w_abc".to_string())
+        );
+        // A card-id / prefix is just an id.
+        assert_eq!(
+            parse_forget_cmd(&["card_9"]),
+            ForgetCmd::One("card_9".to_string())
+        );
+        // Extra tokens, or an unknown flag, are usage (no silent guess).
+        assert_eq!(parse_forget_cmd(&["w_abc", "extra"]), ForgetCmd::Usage);
+        assert_eq!(parse_forget_cmd(&["--bogus"]), ForgetCmd::Usage);
+    }
+
+    #[test]
+    fn forget_status_live_vs_terminal() {
+        // Live phases/statuses are refused by :forget (AC5a).
+        assert!(forget_status_is_live("running"));
+        assert!(forget_status_is_live("coordinating"));
+        assert!(forget_status_is_live("awaiting_batch"));
+        assert!(forget_status_is_live("  running  ")); // trimmed
+        // Terminal states are forgettable.
+        assert!(!forget_status_is_live("done"));
+        assert!(!forget_status_is_live("failed"));
+        // An unknown/stale status (e.g. container gone) is treated as terminal
+        // so an orphan dir can still be reclaimed (AC edge).
+        assert!(!forget_status_is_live(""));
+        assert!(!forget_status_is_live("zombie"));
+    }
+
+    #[test]
+    fn forget_in_colon_catalog() {
+        // The catalog carries :forget so the palette + completion offer it.
+        assert!(colon_command_matches("for").contains(&"forget"));
+    }
+
+    #[test]
+    fn workers_table_header_carries_started_and_runtime_columns() {
+        // The `:workers` table must list Started + Runtime between Status and
+        // Doing, in that order, so each row shows when a worker started and how
+        // long it has run (or ran).
+        let header = WORKERS_TABLE_HEADER.lines().next().unwrap();
+        let cols: Vec<&str> = header
+            .trim_matches('|')
+            .split('|')
+            .map(|c| c.trim())
+            .collect();
+        assert_eq!(
+            cols,
+            vec![
+                "Worker", "Session", "Status", "Started", "Runtime", "Doing", "Result"
+            ]
+        );
+        // The separator row has one delimiter cell per column (7).
+        let sep = WORKERS_TABLE_HEADER.lines().nth(1).unwrap();
+        assert_eq!(sep.matches("---").count(), 7);
     }
 
     #[test]
