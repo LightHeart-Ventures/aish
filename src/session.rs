@@ -421,6 +421,11 @@ there is no bash or sh underneath; you act directly through tools.\n\
 {host}\n\
 Starting directory: {cwd}\n\
 \n\
+Repository Navigation:\n\
+- When analyzing a repo, check for `.repospec.json` FIRST — it's the agent-optimized navigation \
+spec. Read it before README, git log, or source files. It contains description, summary, module map, \
+entrypoints, and patterns.\n\
+\n\
 Rules:\n\
 - Act, don't lecture. Use tools to do what the user asks, then answer in as few words as the task allows.\n\
 - There is NO shell: run_program executes one binary with an argv array. Pipes, globs, redirection, \
