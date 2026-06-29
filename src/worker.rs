@@ -283,6 +283,16 @@ pub fn pane_replay_header(short: &str) -> String {
     )
 }
 
+/// Render the coordinator's INPUT (the task it was given) as the opening row of
+/// an `:attach` replay. This is the START of the conversation, so — unlike the
+/// activity rows that follow — it's set apart to be unmistakable: a 💬 speech
+/// glyph announces "this is the prompt" and the whole line is bold (`\x1b[1m…
+/// \x1b[0m`). Framed as a normal pane row so it still carries the cyan border +
+/// `[label]` gutter. Pure — unit-tested.
+pub fn pane_input_row(label: &str, task: &str) -> String {
+    pane_row(label, &format!("\x1b[1m💬 task: {task}\x1b[0m"))
+}
+
 /// Stream a child's stderr line by line, forwarding the interesting lines to the
 /// user's terminal live via `announce`, and retaining only the last
 /// `STDERR_TAIL_LINES` raw lines as a bounded ring for the failure message.
@@ -2646,6 +2656,30 @@ mod tests {
             h.contains("output to date"),
             "replay header labels the block: {h}"
         );
+    }
+
+    #[test]
+    fn pane_input_row_sets_apart_the_task_with_emoji_and_bold() {
+        // The coordinator's input (its task) opens the replay and must stand out
+        // as the START of the conversation: a 💬 glyph + bold, framed as a normal
+        // pane row (border + [label] gutter) with the task text preserved.
+        let row = pane_input_row("w_a7k3m2pQ", "review the design doc");
+        assert!(
+            row.starts_with(PANE_BORDER),
+            "input row carries the pane border: {row}"
+        );
+        assert!(
+            row.contains("[w_a7k3m2pQ]"),
+            "gutter carries the worker id: {row}"
+        );
+        assert!(row.contains('💬'), "input row carries the speech glyph: {row}");
+        assert!(row.contains("\x1b[1m"), "input row is bold: {row}");
+        assert!(
+            row.contains("review the design doc"),
+            "task text preserved: {row}"
+        );
+        // The bold is closed so it doesn't bleed into following rows.
+        assert!(row.ends_with("\x1b[0m"), "bold is reset at the end: {row}");
     }
 
     #[test]

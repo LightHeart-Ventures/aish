@@ -2428,13 +2428,11 @@ fn backfill_attached(run_id: &str, session: &Session) {
     let Some(job) = job else { return };
     let short = crate::batch::short_id(run_id);
     println!("{}", crate::worker::pane_replay_header(&short));
-    // The task is the coordinator's "input". The `\u{b7}task` marker is folded
-    // into the row text \u{2014} `pane_row` carries only `[label]` in its gutter now
-    // (the single-glyph convention; the source glyph rides inside the text).
-    println!(
-        "{}",
-        crate::worker::pane_row(run_id, &format!("·task {}", job.task))
-    );
+    // The task is the coordinator's "input" — the START of the conversation. It's
+    // rendered set-apart (a 💬 glyph + bold) by `pane_input_row` so it's obvious
+    // this row is the prompt the coordinator was given, not one of its own
+    // activity lines that follow.
+    println!("{}", crate::worker::pane_input_row(run_id, &job.task));
     let rows = job.transcript_rows();
     if rows.is_empty() {
         println!(
