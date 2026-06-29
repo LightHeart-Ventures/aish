@@ -118,7 +118,15 @@ async fn run_turn_inner(
     // match; the note goes into the turn input, never the cached system prompt,
     // so the prompt-cache prefix stays byte-stable.
     let task = input.clone();
-    let input = seed_context(session.history.is_empty(), session.last_output(), input);
+    // `:new` sets suppress_context_seed so the freshly-cleared (empty) history
+    // doesn't re-trigger the last-output seed below. Consume it one-shot: a later
+    // command's output can still seed a genuinely fresh prompt.
+    let seed_prev = if std::mem::take(&mut session.suppress_context_seed) {
+        None
+    } else {
+        session.last_output()
+    };
+    let input = seed_context(session.history.is_empty(), seed_prev, input);
     // Prefer an INSTALLED skill: when one clearly fits, fold in the note pointing
     // at its SKILL.md. When NONE fits a substantial task, fall back to an OFFLINE
     // recommendation of an installable registry skill (read from the

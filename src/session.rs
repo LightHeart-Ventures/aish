@@ -202,6 +202,15 @@ pub struct Session {
     /// (`hooks.has(event)`), so an unconfigured session spawns no hook process
     /// and builds no payload. Loaded explicitly at startup via `load_hooks`.
     pub hooks: crate::hooks::HookSet,
+    /// Suppress the next turn's last-output context seed (TASK-13). `:new` clears
+    /// `history` to start a fresh conversation, but an empty history is exactly
+    /// the condition `seed_context` uses to re-inject the previous recorded
+    /// output (`$LAST`) as `[Previous command output, for reference: …]`. Without
+    /// this flag the old conversation's final reply would bleed straight back
+    /// into the supposedly-clean turn. `:new` sets it; the engine consumes it on
+    /// the next turn (one-shot), so a later command's output can still seed a
+    /// genuinely fresh prompt. Session-local, never persisted.
+    pub suppress_context_seed: bool,
 }
 
 impl Session {
@@ -245,6 +254,7 @@ impl Session {
             attach_review_announced: Arc::new(Mutex::new(None)),
             output_json: false,
             hooks: crate::hooks::HookSet::empty(),
+            suppress_context_seed: false,
         })
     }
 
