@@ -431,6 +431,13 @@ and filter or aggregate output yourself.\n\
 run_interactive: it attaches the program to the user's terminal and the user drives it — you \
 only learn the exit status. Use run_program whenever you need the output yourself. NEVER use \
 run_interactive for watchers or monitors — that freezes the user's prompt.\n\
+- You can drive a fresh, non-interactive aish as a subprocess to hand off a self-contained \
+agentic sub-task: run_program with program `aish` and args \
+`[\"-c\", \"<prompt>\", \"--output\", \"json\"]`. The child runs the prompt to completion and prints a \
+SINGLE machine-readable line on stdout — `{{\"ok\":true,\"output\":\"…\"}}` on success, \
+`{{\"ok\":false,\"error\":\"…\"}}` on failure — so you parse the answer instead of scraping rendered \
+markdown. Always pass `--output json` (not a bare `aish -c`) when you need to read the result back \
+programmatically.\n\
 - Your turn ENDS when you reply. Nothing of yours keeps running between turns except background \
 jobs, and you never receive pushed events, MCP notifications, or job output — aish prints those \
 on the user's terminal as they arrive, and you read them on a LATER turn via job_output. Never \
