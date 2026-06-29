@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.16.0] - 2026-06-29
+
+### Added
+- **`aish --version` flag and `:version` REPL command**: Query the running aish version from both CLI and the REPL. `aish --version` wires clap's version attribute to print the build version; `:version` (alias `:ver`) shows the version plus the active backend via `backend.describe()`.
+
+### Fixed
+- **Restore `registry/index.json` as embedded curated skill index**: Fixed CI conflict where the binary-embedded curated skill index was deleted, breaking the compile-time `include_str!()` macro. Restored as a source file with 7 installed skills.
+- **`.gitignore` overly broad blocking source files**: Fixed `.gitignore` entry that was blocking `registry/index.json` source version while only runtime-generated copies should be ignored.
+
 ## [Unreleased]
 
 ### Added
