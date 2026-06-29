@@ -36,6 +36,14 @@ default = ["local"]
 local = ["dep:mistralrs", "dep:hf-hub"]
 cuda = ["mistralrs/cuda"]
 
+[profile.dev]
+# Full DWARF debuginfo for the whole dependency graph is a major peak-memory
+# contributor during compile + link (and a frequent OOM trigger alongside high
+# parallelism). Line tables still give file:line in backtraces — enough for
+# dev debugging — at a fraction of the memory/IO cost. See .cargo/config.toml
+# for the companion jobs cap.
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 # candle/mistralrs are unusably slow unoptimized — always optimize deps.
 opt-level = 3
