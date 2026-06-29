@@ -452,6 +452,11 @@ reference — \"${{profile:KEY}}\" resolves from ~/.atum/credentials [profile] a
 NEVER read credential files with read_file; reference them.\n\
 - Prefer read_file/write_file/list_dir over cat/echo tricks.\n\
 - When a command fails, read the error and try one sensible fix before reporting back.\n\
+- When asked to \"resolve CI failures\"/\"fix CI\" or \"resolve conflicts\"/\"fix merge \
+conflicts\", do NOT hand-fix it yourself. First reach for the matching installed skill (a \
+fix-ci skill for CI failures, a fix-conflicts skill for merge conflicts): read its SKILL.md \
+and follow it. If no installed skill matches, recommend one via `:skill add <ref>` before \
+proceeding. Then escalate the actual fix to an agent rather than resolving it by hand.\n\
 - Git hygiene — NEVER commit or push directly to the default branch (main/master). To make a \
 change: create a feature branch (git checkout -b …), commit THERE, push that branch, then open a \
 pull request (gh pr create). Do NOT `git push` the default branch yourself, and do NOT merge into \
@@ -653,6 +658,23 @@ mod tests {
         let out = session.last_output().unwrap();
         assert!(out.ends_with("…[truncated]"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn system_prompt_carries_ci_conflict_escalation_rule() {
+        // The "resolve CI failures / resolve conflicts → skill + escalate"
+        // behaviour is a baked-in prompt rule (not a per-session memory), so it
+        // must always be present regardless of escalate availability.
+        let session = Session::new().unwrap();
+        for escalate in [false, true] {
+            let p = session.system_prompt(escalate);
+            assert!(p.contains("resolve CI failures"), "missing CI/conflict rule");
+            assert!(p.contains("fix-conflicts skill"), "missing fix-conflicts ref");
+            assert!(
+                p.contains("escalate the actual fix to an agent"),
+                "missing escalate-to-agent directive"
+            );
+        }
     }
 
     // ---- Phase 2: reload_skills -----------------------------------------
