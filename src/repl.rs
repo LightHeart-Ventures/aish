@@ -2713,13 +2713,28 @@ fn announce_attach_review(session: &mut Session) {
         .map(|w| w.status());
     match status.as_deref() {
         Some("done") | Some("failed") => {
-            let mut announced = session.attach_review_announced.lock().unwrap();
-            if announced.as_deref() != Some(run_id.as_str()) {
+            let already = session
+                .attach_review_announced
+                .lock()
+                .unwrap()
+                .as_deref()
+                == Some(run_id.as_str());
+            if !already {
+                // The coordinator's FINAL answer is written to stdout — NOT the
+                // streamed stderr we forward live — so a live `:attach` that runs
+                // through to completion would otherwise never show the last
+                // (result) turn: it gets "cut off" at the last tool/narration
+                // line. Replay the captured result into the attach pane before
+                // the review notice, exactly as attaching to an already-finished
+                // worker does (`print_attached_result`). The de-dupe marker below
+                // means an `:attach` of an already-terminal worker (which already
+                // printed the result) does not print it a second time here.
+                print_attached_result(&run_id, session);
                 let short = crate::batch::short_id(&run_id);
                 println!(
                     "\x1b[2m⇄ {short} finished — review mode: type a message to resume it, or :detach to return to your shell.\x1b[0m"
                 );
-                *announced = Some(run_id);
+                *session.attach_review_announced.lock().unwrap() = Some(run_id);
             }
         }
         // Still live (or resumed into a new live state) — clear so a later finish
