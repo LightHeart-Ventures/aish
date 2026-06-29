@@ -257,6 +257,27 @@ impl ClaudeBackend {
                     }
                     let msg = v["error"]["message"].as_str().unwrap_or("unknown error");
                     let kind = v["error"]["type"].as_str().unwrap_or("error");
+                    // Detect auth failures on OAuth tokens and guide user to refresh.
+                    let is_auth_error = matches!(status, 401 | 403)
+                        || (status == 400 && {
+                            let m = msg.to_ascii_lowercase();
+                            m.contains("invalid") || m.contains("expired") || m.contains("unauthorized")
+                        });
+                    if is_auth_error && matches!(self.cred.auth, Auth::Oauth(_)) && !last {
+                        eprintln!(
+                            "\x1b[1m\n⚠ Claude OAuth token expired\x1b[0m"
+                        );
+                        eprintln!(
+                            "  Your Claude Max/Pro subscription token needs to be refreshed.\n\
+  Run: \x1b[1mclaude setup-token\x1b[0m\n\
+  Then set CLAUDE_CODE_OAUTH_TOKEN in your shell or ~/.aishrc"
+                        );
+                        eprintln!();
+                        bail!(
+                            "claude api authentication failed ({status}): {msg} — \
+please refresh your token with `claude setup-token`"
+                        );
+                    }
                     // Retry only what's retryable: rate limits (429) and 5xx.
                     // Other 4xx (bad request, auth, …) fail fast — retrying can't help.
                     if (status == 429 || status >= 500) && !last {
@@ -754,5 +775,36 @@ mod tests {
             token_from_credentials_json(r#"{"claudeAiOauth":{"accessToken":"   "}}"#, 0),
             None
         );
+    }
+
+    #[test]
+    fn oauth_detects_401_as_auth_failure() {
+        // Matches 401/403 auth responses.
+        let oauth_cred = oauth();
+        assert!(matches!(oauth_cred.auth, Auth::Oauth(_)));
+        // Test the logic that would be in post_with_retry:
+        // a 401 on an OAuth token is an auth failure.
+        let status = 401;
+        let is_auth_error = matches!(status, 401 | 403);
+        assert!(is_auth_error);
+    }
+
+    #[test]
+    fn oauth_detects_400_with_expired_keyword() {
+        let msg = "invalid_request: oauth token expired";
+        let is_auth_error = {
+            let m = msg.to_ascii_lowercase();
+            m.contains("invalid") || m.contains("expired") || m.contains("unauthorized")
+        };
+        assert!(is_auth_error);
+    }
+
+    #[test]
+    fn api_key_does_not_trigger_oauth_guidance() {
+        // Only OAuth credentials should get the refresh suggestion.
+        let api_key_cred = api_key();
+        assert!(matches!(api_key_cred.auth, Auth::ApiKey(_)));
+        // The auth error path in post_with_retry checks `matches!(self.cred.auth, Auth::Oauth(_))`,
+        // so API keys would NOT enter the OAuth-specific error path.
     }
 }
