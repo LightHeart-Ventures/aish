@@ -190,6 +190,12 @@ pub struct Session {
     /// once and `:attach`-ing an already-finished worker does not double-announce.
     /// Cleared when the attachment goes live again (e.g. on resume). Session-local.
     pub attach_review_announced: Arc<Mutex<Option<String>>>,
+    /// Lifecycle-hook registry (see `crate::hooks`), merged from
+    /// `~/.aish/hooks.json` and the project-local `.aish/hooks.json`. Defaults to
+    /// EMPTY — the zero-overhead state every call site checks first
+    /// (`hooks.has(event)`), so an unconfigured session spawns no hook process
+    /// and builds no payload. Loaded explicitly at startup via `load_hooks`.
+    pub hooks: crate::hooks::HookSet,
 }
 
 impl Session {
@@ -231,7 +237,43 @@ impl Session {
             login: false,
             attached: Arc::new(Mutex::new(None)),
             attach_review_announced: Arc::new(Mutex::new(None)),
+            hooks: crate::hooks::HookSet::empty(),
         })
+    }
+
+    /// Load the lifecycle-hook registry from the user-global
+    /// (`~/.aish/hooks.json`) and project-local (`<cwd>/.aish/hooks.json`)
+    /// config, replacing whatever was set. Called once at startup (after the cwd
+    /// is established). A missing/empty config leaves the zero-overhead empty set
+    /// in place. `:hooks reload` re-invokes this to pick up edits mid-session.
+    pub fn load_hooks(&mut self) {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        self.hooks = crate::hooks::HookSet::load(home.as_deref(), &self.cwd);
+    }
+
+    /// The autonomy descriptor stamped on every hook payload (design §3.1): a
+    /// background coordinator (`nested`) is `coordinator`, everything else is
+    /// `interactive`. Lets a hook scope itself to human vs. autonomous turns.
+    pub fn agent_kind(&self) -> crate::hooks::Agent {
+        if self.nested {
+            crate::hooks::Agent::Coordinator
+        } else {
+            crate::hooks::Agent::Interactive
+        }
+    }
+
+    /// Build a hook payload pre-filled with this session's common envelope
+    /// (session id, agent kind, cwd, mode). Call sites add event-specific fields
+    /// with `.with(...)`. Only constructed inside a `hooks.has(event)` guard, so
+    /// the empty fast path never reaches here.
+    pub fn hook_payload(&self, event: crate::hooks::HookEvent) -> crate::hooks::HookPayload {
+        crate::hooks::HookPayload::new(
+            event,
+            &self.session_id,
+            self.agent_kind(),
+            &self.cwd,
+            self.mode.name(),
+        )
     }
 
     /// Set a session environment variable (last-wins), replacing any existing

@@ -99,6 +99,17 @@ pub async fn run(
     // makes the old tty_handoff disambiguation flag unnecessary; TASK-116 removed it.
     tools::ignore_job_control_signals();
 
+    // Load the lifecycle-hook registry (~/.aish/hooks.json + ./.aish/hooks.json)
+    // now that the session cwd is established, then fire SessionStart. Both are
+    // no-ops when no hook is configured — the empty registry spawns nothing.
+    session.load_hooks();
+    if session.hooks.has(crate::hooks::HookEvent::SessionStart) {
+        let p = session.hook_payload(crate::hooks::HookEvent::SessionStart);
+        session
+            .hooks
+            .fire_observe(crate::hooks::HookEvent::SessionStart, p);
+    }
+
     // Install the process-wide SIGINT handler up front. A Ctrl-C during a
     // direct-dispatch child is delivered by the terminal straight to that child's
     // own process group (it leads its own pgrp and owns the tty via tcsetpgrp), so
@@ -532,6 +543,17 @@ pub async fn run(
     // Don't leave managed jobs — especially stopped ones — orphaned on exit:
     // hang them up (SIGCONT + SIGHUP) so they terminate with the shell (TASK-123).
     tools::hangup_jobs_on_exit(&session.jobs);
+
+    // Fire SessionEnd and AWAIT it: the process is about to exit, so a detached
+    // task would be killed before it ran (hence run_observe_blocking, bounded by
+    // each hook's timeout). No-op when no SessionEnd hook is configured.
+    if session.hooks.has(crate::hooks::HookEvent::SessionEnd) {
+        let p = session.hook_payload(crate::hooks::HookEvent::SessionEnd);
+        session
+            .hooks
+            .run_observe_blocking(crate::hooks::HookEvent::SessionEnd, p)
+            .await;
+    }
 
     editor.save_history();
     println!("bye");
@@ -1734,11 +1756,9 @@ async fn dispatch(
                     // Forced (`!`) miss: render a coded `aish::exec::not_found`
                     // with a cheap bounded did-you-mean drawn from $PATH.
                     let candidates = scan_path_commands(&path_var);
-                    let hint = crate::diag::nearest_command(
-                        cmd,
-                        candidates.iter().map(String::as_str),
-                    )
-                    .map(|near| format!("did you mean `{near}`?"));
+                    let hint =
+                        crate::diag::nearest_command(cmd, candidates.iter().map(String::as_str))
+                            .map(|near| format!("did you mean `{near}`?"));
                     crate::diag::eprint(&crate::diag::AishDiagnostic::exec_not_found(cmd, hint));
                     return Dispatch::Handled;
                 }
@@ -2713,12 +2733,8 @@ fn announce_attach_review(session: &mut Session) {
         .map(|w| w.status());
     match status.as_deref() {
         Some("done") | Some("failed") => {
-            let already = session
-                .attach_review_announced
-                .lock()
-                .unwrap()
-                .as_deref()
-                == Some(run_id.as_str());
+            let already =
+                session.attach_review_announced.lock().unwrap().as_deref() == Some(run_id.as_str());
             if !already {
                 // The coordinator's FINAL answer is written to stdout — NOT the
                 // streamed stderr we forward live — so a live `:attach` that runs
@@ -2872,7 +2888,12 @@ fn cycle_worker(session: &mut Session) {
         .lock()
         .unwrap()
         .iter()
-        .map(|w| (w.id.clone(), matches!(w.status().as_str(), "done" | "failed")))
+        .map(|w| {
+            (
+                w.id.clone(),
+                matches!(w.status().as_str(), "done" | "failed"),
+            )
+        })
         .collect();
     if workers.is_empty() {
         println!(
@@ -2948,11 +2969,9 @@ fn close_worker(id: Option<&str>, session: &mut Session) {
     let attached = session.attached.lock().unwrap().clone();
     // Default target: the worker we're attached to ("the one you're in"). The
     // goal sentinel isn't a worker job, so it can't be closed this way.
-    let target = id.map(str::to_string).or_else(|| {
-        attached
-            .clone()
-            .filter(|r| r != GOAL_ATTACH_ID)
-    });
+    let target = id
+        .map(str::to_string)
+        .or_else(|| attached.clone().filter(|r| r != GOAL_ATTACH_ID));
     let Some(target) = target else {
         if attached.as_deref() == Some(GOAL_ATTACH_ID) {
             println!(
