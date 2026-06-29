@@ -486,9 +486,17 @@ a backend or worry about batches — just describe the task and offload it."
                 "List ALL background jobs and their LIVE status — background coordinators \
 (running in this session) and durable coordinator runs / Anthropic batch jobs (shared across \
 sessions). Call this to answer \"what's running?\" / \"status\" instead of guessing or inventing \
-your own tracking. Returns a table: id, kind, owner, status, task, result."
+your own tracking. Returns a table: id, kind, owner, status, task, result. \
+Pass `scope` to narrow the listing: omit it (or \"all\") for every session's jobs (the \
+default); \"session\"/\"mine\" for only THIS shell's jobs; a job id / id-prefix for one job; \
+a repo name for a repo (repo filtering is not yet wired to the durable store)."
                     .into(),
-            schema: json!({ "type": "object", "properties": {} }),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "description": "Which jobs to list. \"all\" (default) = every session's jobs; \"session\"/\"mine\"/\"this\" = only this shell's jobs; a job id or id-prefix (e.g. \"w_a7k3m2pQ\") = that one job; any other token = a repo name. Absent ⇒ all."}
+                }
+            }),
         });
         // The agent-facing side of the `:tell` channel (the human types `:tell`;
         // the model calls this). Lets the interactive agent and one coordinator
@@ -616,7 +624,7 @@ pub async fn execute(
         "job_output" => job_output(call, session),
         "run_in_background" => run_in_background(call, session),
         "batch_result" => batch_result(call, session),
-        "background_status" => background_status(session),
+        "background_status" => background_status(call, session),
         "tell" => tell(call, session),
         "escalate" => escalate(call, session).await,
         "get_skill" => get_skill(call, session).await,
@@ -1548,7 +1556,24 @@ fn tell(call: &ToolCall, session: &Session) -> Result<String> {
     }
 }
 
-fn background_status(session: &Session) -> Result<String> {
+fn background_status(call: &ToolCall, session: &Session) -> Result<String> {
+    use crate::scope::{JobRef, JobScope};
+
+    // Phase 0.3: the `scope` arg narrows the listing. Default (absent) stays
+    // `All` so omitting it preserves the original cross-session firehose; the
+    // model/REPL opt into `Session`/`Job` explicitly. `Repo` filtering needs the
+    // durable `repo_key` column (Phase 1) that isn't in the store yet, so it
+    // short-circuits with an explanatory note rather than silently matching none.
+    let scope = JobScope::parse(call.args["scope"].as_str());
+    if let JobScope::Repo(key) = &scope {
+        return Ok(format!(
+            "Repo-scoped status (`{key}`) isn't wired yet — durable jobs don't carry a repo-key \
+until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) or \
+`scope:\"session\"` (this shell) for now."
+        ));
+    }
+    let me = session.session_id.as_str();
+
     let trunc = |t: &str| -> String {
         let t = t.replace('|', "\\|");
         if t.chars().count() > 56 {
@@ -1589,6 +1614,16 @@ fn background_status(session: &Session) -> Result<String> {
     // This session's full-tool background coordinators (in memory; the live
     // subprocess handle is session-local even though its durable row is shared).
     for w in session.worker_jobs.lock().unwrap().iter() {
+        // In-memory workers belong to THIS session (they're spawned here), so
+        // they always carry the current session id as their owner.
+        let jref = JobRef {
+            owner_session_id: Some(me),
+            repo_key: None,
+            id: &w.id,
+        };
+        if !scope.matches(&jref, me) {
+            continue;
+        }
         any = true;
         out.push_str(&format!(
             "| `{}` | coordinator | you | {} | — | {} | — |\n",
@@ -1602,6 +1637,14 @@ fn background_status(session: &Session) -> Result<String> {
     if let Some(store) = &session.coordinator_store {
         if let Ok(rows) = store.load_all() {
             for r in rows {
+                let jref = JobRef {
+                    owner_session_id: r.session_id.as_deref(),
+                    repo_key: None, // Phase 1: populate from the durable repo_key column.
+                    id: &r.run_id,
+                };
+                if !scope.matches(&jref, me) {
+                    continue;
+                }
                 any = true;
                 let owner = if r.session_id.as_deref() == Some(session.session_id.as_str()) {
                     "you".into()
@@ -1633,6 +1676,14 @@ fn background_status(session: &Session) -> Result<String> {
     if let Some(store) = &session.batch_store {
         if let Ok(rows) = store.load_all() {
             for r in rows {
+                let jref = JobRef {
+                    owner_session_id: r.session_id.as_deref(),
+                    repo_key: None, // Phase 1: populate from the durable repo_key column.
+                    id: &r.local_id,
+                };
+                if !scope.matches(&jref, me) {
+                    continue;
+                }
                 any = true;
                 let owner = r
                     .session_name
@@ -1663,7 +1714,15 @@ fn background_status(session: &Session) -> Result<String> {
     }
 
     if !any {
-        return Ok("No background jobs running.".into());
+        return Ok(match &scope {
+            JobScope::Session => {
+                "No background jobs owned by this session (try `scope:\"all\"` to see every \
+session's jobs)."
+                    .into()
+            }
+            JobScope::Job(q) => format!("No background job matching `{q}`."),
+            _ => "No background jobs running.".into(),
+        });
     }
     Ok(out)
 }
