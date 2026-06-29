@@ -3409,6 +3409,14 @@ fn skill_remove(name: &str, session: &mut Session) -> Result<()> {
     Ok(())
 }
 
+/// Markdown header for the `:workers` table. Kept as a const so the column set
+/// — Worker | Session | Status | Started | Runtime | Doing | Result — is a
+/// single source of truth and unit-testable. The Started column is a relative
+/// "ago" label; Runtime is the elapsed-so-far (running) or total (terminal) span
+/// (see `crate::style::time_cells`).
+const WORKERS_TABLE_HEADER: &str =
+    "| Worker | Session | Status | Started | Runtime | Doing | Result |\n|---|---|---|---|---|---|---|\n";
+
 /// Returns true when the REPL should exit.
 async fn handle_colon(
     cmd: &str,
@@ -3546,21 +3554,32 @@ async fn handle_colon(
                 .clone()
                 .unwrap_or_else(|| crate::batch::short_id(&session.session_id).to_string());
 
-            let mut table = String::from(
-                "| Worker | Session | Status | Doing | Result |\n|---|---|---|---|---|\n",
-            );
+            let mut table = String::from(WORKERS_TABLE_HEADER);
+            // Epoch-seconds "now", computed once so every row's Started/Runtime
+            // cell is reconciled against the same instant.
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
             let mut any = false;
             let mut seen = std::collections::HashSet::new();
             // In-memory coordinators launched by THIS session (live status).
             for w in session.worker_jobs.lock().unwrap().iter() {
                 any = true;
                 seen.insert(w.id.clone());
+                let (started_cell, runtime_cell) = crate::style::time_cells(
+                    w.started_epoch(),
+                    w.finished_epoch(),
+                    now_epoch,
+                );
                 table.push_str(&format!(
-                    "| {} {} | {} * | {} | {} | {} |\n",
+                    "| {} {} | {} * | {} | {} | {} | {} | {} |\n",
                     crate::style::job_type_emoji("worker"),
                     w.id,
                     me_label,
                     crate::style::styled_status(&w.status()),
+                    started_cell,
+                    runtime_cell,
                     one_line(&w.task),
                     crate::style::styled_result(&w.result_cell())
                 ));
@@ -3607,12 +3626,31 @@ async fn handle_colon(
                             }
                             _ => "—".to_string(),
                         };
+                        // Start from created_at; freeze the runtime at heartbeat_at
+                        // once terminal (set_done/set_failed bump the heartbeat),
+                        // else let it tick against now.
+                        let started = r
+                            .created_at
+                            .as_deref()
+                            .and_then(crate::style::parse_sqlite_utc);
+                        let terminal = matches!(r.phase.as_str(), "done" | "failed");
+                        let finished = if terminal {
+                            r.heartbeat_at
+                                .as_deref()
+                                .and_then(crate::style::parse_sqlite_utc)
+                        } else {
+                            None
+                        };
+                        let (started_cell, runtime_cell) =
+                            crate::style::time_cells(started, finished, now_epoch);
                         table.push_str(&format!(
-                            "| {} {} | {} | {} | {} | {} |\n",
+                            "| {} {} | {} | {} | {} | {} | {} | {} |\n",
                             crate::style::job_type_emoji("coordinator"),
                             crate::batch::short_id(&r.run_id),
                             session_cell,
                             crate::style::styled_status(&r.phase),
+                            started_cell,
+                            runtime_cell,
                             one_line(&r.task),
                             crate::style::styled_result(&result_cell)
                         ));
@@ -5502,6 +5540,28 @@ mod tests {
     fn forget_in_colon_catalog() {
         // The catalog carries :forget so the palette + completion offer it.
         assert!(colon_command_matches("for").contains(&"forget"));
+    }
+
+    #[test]
+    fn workers_table_header_carries_started_and_runtime_columns() {
+        // The `:workers` table must list Started + Runtime between Status and
+        // Doing, in that order, so each row shows when a worker started and how
+        // long it has run (or ran).
+        let header = WORKERS_TABLE_HEADER.lines().next().unwrap();
+        let cols: Vec<&str> = header
+            .trim_matches('|')
+            .split('|')
+            .map(|c| c.trim())
+            .collect();
+        assert_eq!(
+            cols,
+            vec![
+                "Worker", "Session", "Status", "Started", "Runtime", "Doing", "Result"
+            ]
+        );
+        // The separator row has one delimiter cell per column (7).
+        let sep = WORKERS_TABLE_HEADER.lines().nth(1).unwrap();
+        assert_eq!(sep.matches("---").count(), 7);
     }
 
     #[test]

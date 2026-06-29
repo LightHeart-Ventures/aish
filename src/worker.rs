@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use uuid::Uuid;
@@ -1399,6 +1399,15 @@ struct JobInner {
     transcript: VecDeque<(String, String)>,
     /// Running byte total of `transcript` entries, for the byte-budget cap.
     transcript_bytes: usize,
+    /// Wall-clock start (worker construction) — the base for the `:workers`
+    /// Started / Runtime columns. Stored as `SystemTime` (not `Instant`) so it
+    /// can render an absolute "started X ago" and reconcile with the durable
+    /// `coordinator_runs.created_at` timestamps for the same row scheme.
+    started: SystemTime,
+    /// Wall-clock completion, stamped once by `set_done`/`set_failed`. `None`
+    /// while the worker is still running, so the Runtime column shows
+    /// elapsed-so-far for a live worker and the frozen total for a terminal one.
+    finished: Option<SystemTime>,
 }
 
 pub type WorkerJobs = Arc<Mutex<Vec<Arc<WorkerJob>>>>;
@@ -1488,6 +1497,7 @@ impl WorkerJob {
         let mut i = self.inner.lock().unwrap();
         i.status = "done".into();
         i.result = Some(result);
+        i.finished.get_or_insert_with(SystemTime::now);
     }
     /// Record the branch an isolated worker left its changes on (kept worktree).
     fn set_branch(&self, branch: String) {
@@ -1558,6 +1568,31 @@ impl WorkerJob {
         let mut i = self.inner.lock().unwrap();
         i.status = "failed".into();
         i.error = Some(err);
+        i.finished.get_or_insert_with(SystemTime::now);
+    }
+
+    /// Epoch seconds the worker started — the base for the `:workers` Started /
+    /// Runtime columns. `None` only if the clock is before the Unix epoch.
+    pub fn started_epoch(&self) -> Option<i64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .started
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs() as i64)
+    }
+
+    /// Epoch seconds the worker reached a terminal state, or `None` while it is
+    /// still running. Lets the Runtime column freeze at the total run span once
+    /// the worker finishes.
+    pub fn finished_epoch(&self) -> Option<i64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .finished
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
     }
     pub fn status(&self) -> String {
         self.inner.lock().unwrap().status.clone()
@@ -1848,6 +1883,8 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
             last_turn_completion: None,
             transcript: VecDeque::new(),
             transcript_bytes: 0,
+            started: SystemTime::now(),
+            finished: None,
         }),
     });
     guard.push(job.clone());
@@ -2301,6 +2338,8 @@ mod tests {
                 last_turn_completion: None,
                 transcript: VecDeque::new(),
                 transcript_bytes: 0,
+            started: SystemTime::now(),
+            finished: None,
             }),
         });
         assert!(job.fetch().contains("still running"));
@@ -2325,6 +2364,8 @@ mod tests {
                 last_turn_completion: None,
                 transcript: VecDeque::new(),
                 transcript_bytes: 0,
+            started: SystemTime::now(),
+            finished: None,
             }),
         });
         job.set_failed("boom".into());
@@ -2622,6 +2663,8 @@ mod tests {
                 last_turn_completion: None,
                 transcript: VecDeque::new(),
                 transcript_bytes: 0,
+            started: SystemTime::now(),
+            finished: None,
             }),
         });
         // Record well past the line cap; the oldest rows are evicted.
@@ -2761,6 +2804,8 @@ mod tests {
                 last_turn_completion: None,
                 transcript: VecDeque::new(),
                 transcript_bytes: 0,
+            started: SystemTime::now(),
+            finished: None,
             }),
         });
         let lines = concat!(
@@ -2824,6 +2869,8 @@ mod tests {
                 last_turn_completion: None,
                 transcript: VecDeque::new(),
                 transcript_bytes: 0,
+            started: SystemTime::now(),
+            finished: None,
             }),
         });
         // No events yet.
@@ -2858,6 +2905,8 @@ mod tests {
                     last_turn_completion: None,
                     transcript: VecDeque::new(),
                     transcript_bytes: 0,
+            started: SystemTime::now(),
+            finished: None,
                 }),
             });
             jobs.lock().unwrap().push(j.clone());
