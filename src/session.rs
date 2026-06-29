@@ -190,6 +190,12 @@ pub struct Session {
     /// once and `:attach`-ing an already-finished worker does not double-announce.
     /// Cleared when the attachment goes live again (e.g. on resume). Session-local.
     pub attach_review_announced: Arc<Mutex<Option<String>>>,
+    /// When true, a headless `--coordinator` run prints its final result as a
+    /// machine-readable JSON object (`{"ok":true,"output":"…"}`) instead of
+    /// rendered markdown — set from `--output json` in `main`. Mirrors the
+    /// one-shot `-c` JSON path so an agent driving a background coordinator can
+    /// parse the result. Always false for an interactive session.
+    pub output_json: bool,
     /// Lifecycle-hook registry (see `crate::hooks`), merged from
     /// `~/.aish/hooks.json` and the project-local `.aish/hooks.json`. Defaults to
     /// EMPTY — the zero-overhead state every call site checks first
@@ -237,6 +243,7 @@ impl Session {
             login: false,
             attached: Arc::new(Mutex::new(None)),
             attach_review_announced: Arc::new(Mutex::new(None)),
+            output_json: false,
             hooks: crate::hooks::HookSet::empty(),
         })
     }

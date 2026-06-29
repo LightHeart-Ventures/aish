@@ -49,6 +49,14 @@ struct Args {
     #[arg(short = 'c', long = "command")]
     command: Option<String>,
 
+    /// Output format for one-shot (-c) / coordinator runs: `text` (rendered
+    /// markdown, the default) or `json` (a machine-readable object printed to
+    /// stdout — `{"ok":true,"output":"…"}` on success, `{"ok":false,"error":"…"}`
+    /// on failure — so a calling agent can parse the answer instead of scraping
+    /// rendered text). Has no effect on the interactive REPL.
+    #[arg(long = "output", value_enum, default_value_t = OutputFormat::Text)]
+    output: OutputFormat,
+
     /// Backend to use: claude | grok | local
     #[arg(long, default_value = "claude")]
     backend: String,
@@ -117,6 +125,38 @@ struct Args {
         allow_hyphen_values = true
     )]
     script_argv: Vec<String>,
+}
+
+/// How a one-shot (`-c`) or `--coordinator` run prints its final answer to
+/// stdout. `Text` keeps the long-standing behavior (markdown rendered for a TTY,
+/// raw markdown when piped — see `md::render_stdout`). `Json` emits a single
+/// machine-readable line so a calling agent can parse the result without
+/// scraping rendered text. Selected with `--output <text|json>`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
+/// Serialize a successful answer as a one-line JSON object:
+/// `{"ok":true,"output":"…"}`. The raw model answer (markdown, possibly carrying
+/// a loop-guard banner line) is placed verbatim in `output` — no ANSI rendering,
+/// so the consumer parses clean text. `serde_json` handles all escaping.
+fn json_ok(output: &str) -> String {
+    serde_json::json!({ "ok": true, "output": output }).to_string()
+}
+
+/// Serialize a failed run as a one-line JSON object:
+/// `{"ok":false,"error":"…"}`. Uses the `{:#}` anyhow chain so the full cause
+/// is preserved for the caller.
+fn json_err(err: &anyhow::Error) -> String {
+    json_ok_err(&format!("{err:#}"))
+}
+
+/// Serialize a failure from a plain message string (the coordinator path, where
+/// the error is already a `String`): `{"ok":false,"error":"…"}`.
+pub fn json_ok_err(error: &str) -> String {
+    serde_json::json!({ "ok": false, "error": error }).to_string()
 }
 
 /// Lightweight, env-gated startup phase timer. Enabled by `AISH_TIME_STARTUP=1`
@@ -432,10 +472,26 @@ async fn main() -> Result<()> {
                     session.name = Some(name);
                 }
             }
+            session.output_json = matches!(args.output, OutputFormat::Json);
             return engine::run_coordinator(&backend, &mut session, prompt, &run_id).await;
         }
-        let out = engine::run_turn(&backend, &mut session, prompt, &mut repl::confirm_tty).await?;
-        println!("{}", md::render_stdout(&out));
+        match engine::run_turn(&backend, &mut session, prompt, &mut repl::confirm_tty).await {
+            Ok(out) => match args.output {
+                OutputFormat::Text => println!("{}", md::render_stdout(&out)),
+                OutputFormat::Json => println!("{}", json_ok(&out)),
+            },
+            Err(e) => match args.output {
+                // Text mode: propagate the error as before (aish prints it +
+                // exits non-zero via main's Result).
+                OutputFormat::Text => return Err(e),
+                // JSON mode: emit a structured error object on stdout and exit
+                // non-zero so the caller still sees the failure in `$?`.
+                OutputFormat::Json => {
+                    println!("{}", json_err(&e));
+                    std::process::exit(1);
+                }
+            },
+        }
         return Ok(());
     }
 

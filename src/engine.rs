@@ -543,15 +543,25 @@ pub async fn run_coordinator(
     match outcome.phase {
         crate::coordinator::Phase::Done => {
             if let Some(result) = &outcome.result {
-                println!("{}", crate::md::render_stdout(result));
+                if session.output_json {
+                    println!("{}", crate::json_ok(result));
+                } else {
+                    println!("{}", crate::md::render_stdout(result));
+                }
             }
             Ok(())
         }
         // A failed run prints its error to stdout (the worker captures stdout as
         // the result) and propagates a non-zero exit so the parent marks it
-        // failed. The durable row already records the failure for rehydrate.
+        // failed. The durable row already records the failure for rehydrate. In
+        // `--output json` mode the error is emitted as a structured object first,
+        // so a driving agent parses `{"ok":false,"error":"…"}` instead of a bare
+        // anyhow chain on stderr.
         _ => {
             let err = outcome.error.unwrap_or_else(|| "coordinator failed".into());
+            if session.output_json {
+                println!("{}", crate::json_ok_err(&err));
+            }
             anyhow::bail!("{err}")
         }
     }
