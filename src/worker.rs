@@ -1527,6 +1527,33 @@ impl WorkerJob {
         i.result = Some(result);
         i.finished.get_or_insert_with(SystemTime::now);
     }
+    /// Annotate a FINISHED worker's tail with the id of the resumed run that
+    /// continued it (see `resume_coordinator`). Appended to whichever terminal
+    /// field is populated — `result` for a done run, `error` for a failed one —
+    /// so a later `:attach`/Shift-Tab into review mode (which renders `fetch()`)
+    /// shows "↻ continued in <new_id>". Idempotent per id: re-resuming the same
+    /// original twice records each distinct continuation once, and a repeat with
+    /// the same `new_id` is a no-op (so a re-attach that re-resumes can't stack
+    /// duplicate lines). A still-running worker is left untouched — only a
+    /// terminal run is ever resumed.
+    pub fn note_continued_in(&self, new_id: &str) {
+        let mut i = self.inner.lock().unwrap();
+        let line = format!("↻ continued in {new_id}");
+        let field = match i.status.as_str() {
+            "done" => &mut i.result,
+            "failed" => &mut i.error,
+            _ => return,
+        };
+        let body = field.get_or_insert_with(String::new);
+        // Guard against stacking the same continuation note twice.
+        if body.lines().any(|l| l.trim() == line) {
+            return;
+        }
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(&line);
+    }
     /// Record the branch an isolated worker left its changes on (kept worktree).
     fn set_branch(&self, branch: String) {
         self.inner.lock().unwrap().branch = Some(branch);
@@ -2418,6 +2445,77 @@ mod tests {
         assert_eq!(job.fetch(), "the answer");
         assert!(job.summary_line().contains("worker_1"));
         assert!(job.summary_line().contains("done"));
+    }
+
+    #[test]
+    fn note_continued_in_annotates_terminal_tail() {
+        // A finished (done) run's tail gains "↻ continued in <new_id>" so a later
+        // review-mode attach shows it was resumed; re-noting the same id is a
+        // no-op, and a second distinct resume stacks a second line.
+        let job = Arc::new(WorkerJob {
+            id: "w_orig".into(),
+            task: "build feature".into(),
+            inner: Mutex::new(JobInner {
+                status: "running".into(),
+                result: None,
+                error: None,
+                displayed: false,
+                branch: None,
+                last_tool_outcome: None,
+                last_turn_completion: None,
+                transcript: VecDeque::new(),
+                transcript_bytes: 0,
+                backfill_spinner: None,
+                started: SystemTime::now(),
+                finished: None,
+            }),
+        });
+        // While still running, the note is refused (only terminal runs resume).
+        job.note_continued_in("w_new1");
+        assert!(job.fetch().contains("still running"));
+        assert!(!job.fetch().contains("continued in"));
+
+        job.set_done("done work".into());
+        job.note_continued_in("w_new1");
+        let after = job.fetch();
+        assert!(after.contains("done work"));
+        assert!(after.contains("↻ continued in w_new1"));
+        // Idempotent for the same id.
+        job.note_continued_in("w_new1");
+        assert_eq!(job.fetch().matches("w_new1").count(), 1);
+        // A second distinct resume adds a second line.
+        job.note_continued_in("w_new2");
+        let two = job.fetch();
+        assert!(two.contains("↻ continued in w_new1"));
+        assert!(two.contains("↻ continued in w_new2"));
+    }
+
+    #[test]
+    fn note_continued_in_annotates_failed_tail() {
+        // A failed run carries the breadcrumb on its error tail.
+        let job = Arc::new(WorkerJob {
+            id: "w_fail".into(),
+            task: "x".into(),
+            inner: Mutex::new(JobInner {
+                status: "running".into(),
+                result: None,
+                error: None,
+                displayed: false,
+                branch: None,
+                last_tool_outcome: None,
+                last_turn_completion: None,
+                transcript: VecDeque::new(),
+                transcript_bytes: 0,
+                backfill_spinner: None,
+                started: SystemTime::now(),
+                finished: None,
+            }),
+        });
+        job.set_failed("boom".into());
+        job.note_continued_in("w_resume");
+        let out = job.fetch();
+        assert!(out.contains("boom"));
+        assert!(out.contains("↻ continued in w_resume"));
     }
 
     #[test]

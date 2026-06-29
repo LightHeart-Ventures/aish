@@ -2869,6 +2869,19 @@ fn resume_coordinator(prev_run_id: &str, message: &str, session: &mut Session) {
         attached: session.attached.clone(),
     };
     let new_id = crate::worker::spawn(&session.worker_jobs, resume_task, spec);
+    // Annotate the ORIGINAL (finished) run's tail with the id of the resume, so a
+    // later Shift-Tab / `:attach` into its review mode shows "↻ continued in
+    // <new_id>" — the breadcrumb that ties the finished agent to the run that
+    // picked up where it left off.
+    if let Some(prev) = session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|w| w.id == *prev_run_id)
+    {
+        prev.note_continued_in(&new_id);
+    }
     // Hand the attachment to the resumed run so its activity streams here and the
     // next typed line steers it.
     *session.attached.lock().unwrap() = Some(new_id.clone());
