@@ -43,7 +43,11 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "aish", version, about = "An AI-native shell — no bash, just intent")]
+#[command(
+    name = "aish",
+    about = "An AI-native shell — no bash, just intent",
+    version
+)]
 struct Args {
     /// Run a single prompt non-interactively and exit (login-shell style)
     #[arg(short = 'c', long = "command")]
