@@ -471,7 +471,9 @@ pub async fn run(
                 // Skipped inside a coordinator (no nested coordinators).
                 if route == Route::Auto && !session.nested && mentions_work_signal(&line) {
                     println!();
-                    dispatch_background(&line, &mut session);
+                    // The agent is escalating this work to a background worker on
+                    // its own (a work-signal line, outside an explicit :dispatch).
+                    dispatch_background(&line, &mut session, true);
                     continue;
                 }
 
@@ -2315,17 +2317,40 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
 /// tool's fire-and-forget contract: dispatching does not commandeer the prompt
 /// or start streaming the worker's activity. Use `:attach <id>` afterwards to
 /// watch + steer it, or `:output on` to stream every coordinator's activity.
-fn dispatch_background(task: &str, session: &mut Session) {
+///
+/// `escalation` distinguishes the two ways we reach here. An explicit
+/// `:dispatch <task>` (`escalation == false`) is a deliberate launch and prints
+/// the neutral "dispatched … :attach/:output" guidance. An ESCALATION
+/// (`escalation == true`) is the agent offloading heavy work on its own — either
+/// because it decided to, or because the typed line carried a work signal
+/// (outside `:dispatch`). An escalation prints the dedicated escalating banner
+/// (emoji + "Shift-Tab to see work") and leaves the operator free to keep
+/// working in the interactive session, the newly-spawned worker (a `w_########`
+/// id) waiting one Shift-Tab away.
+fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
     let Dispatched { id, message } = dispatch_coordinator(task, session);
-    println!("{message}");
-    if let Some(id) = id {
-        // Fire-and-forget: unlike the old behaviour we do NOT auto-attach or
-        // turn `:output` on — surface how to opt into watching/steering instead.
-        let short = crate::batch::short_id(&id);
+    // A guard failure (empty/nested/no-credential/no-binary) carries no id —
+    // print its explanation regardless of how we got here and bail.
+    let Some(id) = id else {
+        println!("{message}");
+        return;
+    };
+    let short = crate::batch::short_id(&id);
+    if escalation {
+        // The agent escalated this on its own (or via a work-signal line). Run it
+        // as a background worker, tell the operator they can keep working, and
+        // point them at Shift-Tab to watch it — newest worker is one press away.
         println!(
-            "\x1b[2m:attach {short} to watch + steer it · :output on to stream coordinator activity\x1b[0m"
+            "\x1b[1;33m⤴\u{fe0f}  escalated to background worker {short}\x1b[0m \x1b[2m— keep working here; Shift-Tab to see work.\x1b[0m"
         );
+        return;
     }
+    println!("{message}");
+    // Fire-and-forget: unlike the old behaviour we do NOT auto-attach or
+    // turn `:output` on — surface how to opt into watching/steering instead.
+    println!(
+        "\x1b[2m:attach {short} to watch + steer it · :output on to stream coordinator activity\x1b[0m"
+    );
 }
 
 /// Sentinel id `:attach goal` resolves to. Equal to the goal loop's live
@@ -2860,9 +2885,12 @@ fn next_attach_index(running: &[String], current: Option<&str>) -> usize {
 }
 
 /// `Shift-Tab` — cycle the interactive session's attach cursor across the
-/// coordinators it launched. The cycle is `interactive → worker₁ → worker₂
-/// → … → interactive`, in `:workers` listing order: each Shift-Tab advances
-/// to the next coordinator (streaming its activity + steering input to it,
+/// coordinators it launched, NEWEST first. The cycle is `interactive → newest
+/// → … → oldest → interactive` (reverse spawn order): the first press from the
+/// interactive prompt lands on the most recently spawned coordinator — the one
+/// a just-escalated worker — and each further press walks back toward the
+/// oldest. Each Shift-Tab advances to the next coordinator (streaming its
+/// activity + steering input to it,
 /// exactly like `:attach`), and one more press past the last detaches back to
 /// the interactive prompt. With a single worker it toggles attach/detach of that
 /// one; with none it's a no-op with a hint.
@@ -2880,11 +2908,16 @@ fn cycle_worker(session: &mut Session) {
     // TERMINAL — paired with a `terminal` flag so the attach branch can choose
     // review-mode vs live-stream. Shift-Tab rotates through finished/failed
     // agents too, so a completed run is reachable by cycling, not only `:attach`.
+    // Newest worker FIRST: `worker_jobs` is in spawn order (oldest pushed first),
+    // so `.rev()` puts the most recently spawned coordinator at slot 1 — the
+    // first Shift-Tab from the interactive prompt lands on the newest worker and
+    // each further press walks back toward the oldest, then wraps to interactive.
     let workers: Vec<(String, bool)> = session
         .worker_jobs
         .lock()
         .unwrap()
         .iter()
+        .rev()
         .map(|w| (w.id.clone(), matches!(w.status().as_str(), "done" | "failed")))
         .collect();
     if workers.is_empty() {
@@ -3469,7 +3502,7 @@ async fn handle_colon(
                  a at a prompt                       always-allow this tool (see :allow)\n\
                  d at a read/write/delete prompt     allow that permission for the whole dir, recursively\n\
                  Ctrl-O                              toggle raw tool output (show/squelch tool results)\n\
-                 Shift-Tab                           cycle attach across all coordinators incl. finished/failed (interactive → each worker → back)\n\
+                 Shift-Tab                           cycle attach across all coordinators incl. finished/failed, newest first (interactive → newest → … → oldest → back)\n\
                  :quit                               exit (also Ctrl-D or `exit`)"
             );
         }
@@ -3703,7 +3736,8 @@ async fn handle_colon(
             // the deterministic equivalent of the model calling run_in_background.
             // Shares dispatch_coordinator with the "troubleshoot" auto-offload.
             let task = parts.collect::<Vec<_>>().join(" ");
-            dispatch_background(&task, session);
+            // Explicit operator launch — not an agent escalation.
+            dispatch_background(&task, session, false);
         }
         Some("attach") => attach_worker(parts.next(), session),
         Some("detach") => detach_worker(session),
