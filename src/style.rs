@@ -169,9 +169,171 @@ pub fn job_type_emoji(kind: &str) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Time formatting — start/stop timestamps + durations for the `:workers` table
+// ---------------------------------------------------------------------------
+
+/// Format a whole-second duration compactly, two units at most:
+/// `"45s"`, `"2m 30s"`, `"1h 45m"`, `"2d 3h"`. The trailing sub-unit is dropped
+/// when zero (`"2m"`, `"1h"`, `"3d"`). Pure — unit-tested.
+pub fn fmt_duration(secs: u64) -> String {
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * MIN;
+    const DAY: u64 = 24 * HOUR;
+    if secs < MIN {
+        return format!("{secs}s");
+    }
+    if secs < HOUR {
+        let (m, s) = (secs / MIN, secs % MIN);
+        return if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m {s}s")
+        };
+    }
+    if secs < DAY {
+        let (h, m) = (secs / HOUR, (secs % HOUR) / MIN);
+        return if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h {m}m")
+        };
+    }
+    let (d, h) = (secs / DAY, (secs % DAY) / HOUR);
+    if h == 0 {
+        format!("{d}d")
+    } else {
+        format!("{d}d {h}h")
+    }
+}
+
+/// A relative "ago" label for an elapsed delta in whole seconds:
+/// `"just now"` (< 5s), `"30s ago"`, `"5m ago"`, `"2h ago"`, `"3d ago"`. Pure.
+pub fn fmt_ago(secs: u64) -> String {
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * MIN;
+    const DAY: u64 = 24 * HOUR;
+    if secs < 5 {
+        "just now".to_string()
+    } else if secs < MIN {
+        format!("{secs}s ago")
+    } else if secs < HOUR {
+        format!("{}m ago", secs / MIN)
+    } else if secs < DAY {
+        format!("{}h ago", secs / HOUR)
+    } else {
+        format!("{}d ago", secs / DAY)
+    }
+}
+
+/// Parse a SQLite `current_timestamp` UTC string (`"YYYY-MM-DD HH:MM:SS"`, the
+/// format `coordinator_runs.created_at` / `heartbeat_at` are stored in) to epoch
+/// seconds. Tolerates a `T` date/time separator and a trailing fractional part.
+/// `None` on any malformed field. Pure — unit-tested (no chrono dependency).
+pub fn parse_sqlite_utc(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date, time) = s.split_once([' ', 'T'])?;
+    let mut d = date.split('-');
+    let year: i64 = d.next()?.parse().ok()?;
+    let month: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    // Drop any fractional seconds / timezone suffix on the time part.
+    let time = time.split(['.', '+', 'Z']).next().unwrap_or(time);
+    let mut t = time.split(':');
+    let hour: i64 = t.next()?.parse().ok()?;
+    let min: i64 = t.next()?.parse().ok()?;
+    let sec: i64 = t.next().unwrap_or("0").parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some(((days * 24 + hour) * 60 + min) * 60 + sec)
+}
+
+/// Days since the Unix epoch (1970-01-01) for a proleptic-Gregorian civil date.
+/// Howard Hinnant's `days_from_civil` algorithm — exact integer math, no deps.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719468
+}
+
+/// Build the `(Started, Runtime)` cells for a `:workers` row from epoch seconds.
+/// `started` is the worker's start time, `finished` its terminal time (None
+/// while running), `now` the current time. The Started cell is a relative "ago"
+/// label; the Runtime cell is the elapsed-so-far (running) or total (terminal)
+/// duration. A missing start renders both as the dim em-dash placeholder. Pure
+/// — the single source of truth for both the in-memory and durable rows.
+pub fn time_cells(started: Option<i64>, finished: Option<i64>, now: i64) -> (String, String) {
+    let Some(start) = started else {
+        return ("—".to_string(), "—".to_string());
+    };
+    let started_cell = fmt_ago((now - start).max(0) as u64);
+    let end = finished.unwrap_or(now);
+    let runtime_cell = fmt_duration((end - start).max(0) as u64);
+    (started_cell, runtime_cell)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fmt_duration_compact_two_units() {
+        assert_eq!(fmt_duration(0), "0s");
+        assert_eq!(fmt_duration(45), "45s");
+        assert_eq!(fmt_duration(60), "1m");
+        assert_eq!(fmt_duration(150), "2m 30s");
+        assert_eq!(fmt_duration(3600), "1h");
+        assert_eq!(fmt_duration(6300), "1h 45m"); // 1h45m
+        assert_eq!(fmt_duration(86_400), "1d");
+        assert_eq!(fmt_duration(183_600), "2d 3h"); // 2d3h
+    }
+
+    #[test]
+    fn fmt_ago_buckets() {
+        assert_eq!(fmt_ago(0), "just now");
+        assert_eq!(fmt_ago(4), "just now");
+        assert_eq!(fmt_ago(30), "30s ago");
+        assert_eq!(fmt_ago(300), "5m ago");
+        assert_eq!(fmt_ago(7200), "2h ago");
+        assert_eq!(fmt_ago(259_200), "3d ago");
+    }
+
+    #[test]
+    fn parse_sqlite_utc_roundtrips_epoch() {
+        // The Unix epoch itself.
+        assert_eq!(parse_sqlite_utc("1970-01-01 00:00:00"), Some(0));
+        // A known instant: 2021-01-01 00:00:00 UTC = 1609459200.
+        assert_eq!(parse_sqlite_utc("2021-01-01 00:00:00"), Some(1_609_459_200));
+        // 'T' separator + fractional seconds are tolerated.
+        assert_eq!(
+            parse_sqlite_utc("2021-01-01T00:00:01.500"),
+            Some(1_609_459_201)
+        );
+        // Malformed input → None (never panics).
+        assert_eq!(parse_sqlite_utc("not a timestamp"), None);
+        assert_eq!(parse_sqlite_utc("2021-13-01 00:00:00"), None); // bad month
+        assert_eq!(parse_sqlite_utc(""), None);
+    }
+
+    #[test]
+    fn time_cells_running_vs_terminal() {
+        // Running: finished=None → runtime is now-start, started shows "ago".
+        let (started, runtime) = time_cells(Some(1000), None, 1150);
+        assert_eq!(started, "2m ago"); // relative label rounds to the minute
+        assert_eq!(runtime, "2m 30s"); // runtime keeps sub-unit precision
+        // Terminal: runtime is the FROZEN stop-start span, not now-start.
+        let (started, runtime) = time_cells(Some(1000), Some(1090), 5000);
+        assert_eq!(runtime, "1m 30s"); // 90s total, regardless of now
+        assert!(started.ends_with("ago"));
+        // No start → both placeholders.
+        assert_eq!(time_cells(None, None, 9999), ("—".to_string(), "—".to_string()));
+    }
+
 
     #[test]
     fn no_color_override_forces_plain() {
