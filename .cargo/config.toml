@@ -1,0 +1,18 @@
+# Build configuration — committed so every checkout (and every background
+# coordinator that rebuilds aish) inherits the same OOM-safe defaults.
+#
+# Why a jobs cap:
+#   The `local` feature pulls in mistralrs / candle / gemm, all compiled at
+#   opt-level=3 (see [profile.dev.package."*"] in Cargo.toml). cargo otherwise
+#   fans codegen across every core (`nproc`), and a single optimizing rustc on
+#   one of those crates peaks well past 1.5 GB. On a typical 16 GB worker host,
+#   ~28 of those in parallel overcommit RAM and the kernel OOM-killer aborts the
+#   build (the `cargo build` failures seen across coordinator runs, e.g.
+#   w_SlcE27iD). Capping parallelism keeps peak memory bounded while still using
+#   most cores.
+#
+# Override on a high-memory machine:
+#   cargo build --jobs N         (one-off)
+#   CARGO_BUILD_JOBS=N cargo …   (env)
+[build]
+jobs = 6
