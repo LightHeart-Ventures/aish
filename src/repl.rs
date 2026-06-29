@@ -704,6 +704,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
         "message an in-flight coordinator (--any: cross-session)",
     ),
     ("update", "upgrade aish to the latest release"),
+    ("version", "show aish version + backend"),
     (
         "workers",
         "list this session's coordinators (all = every session)",
@@ -3511,6 +3512,7 @@ async fn handle_colon(
                  :context                            show context-window usage (tokens, %, memories)\n\
                  :compact                            offload older history to long-term memory now\n\
                  :memories [organize]                list stored memories, or dedup them\n\
+                 :version                            show aish version + backend (also `aish --version`)\n\
                  :update                             check GitHub for a newer release and upgrade\n\
                  :batch <on|off|status|clear>        interactive batch mode: agent offloads deferrable\n\
                                                      work to background Anthropic batches (Opus, ~50%\n\
@@ -3532,8 +3534,6 @@ async fn handle_colon(
                  :rename <name>                      name the session (prefixes the prompt); auto-set to the repo name at startup, bare :rename clears\n\
                  :rewrite <intent>                   AI-rewrite intent into ONE command, prefilled to edit/accept before it runs (alias :rw)\n\
                  :suggest [hint]                     AI-suggest the next command from session context, prefilled to edit/accept before it runs (alias :sg)\n\
-                 :suggest [hint]                     AI-suggest the next command from session context, prefilled to edit/accept before it runs (alias :sg)\n\
-                 :suggest [hint]                     AI-suggest the next command from session context, prefilled to edit/accept before it runs (alias :sg)\n\
                  :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
                                                      a verifier judges each turn. :goal status, :goal clear\n\
                  :allow                              list always-allowed tools/commands + dir grants\n\
@@ -3543,6 +3543,13 @@ async fn handle_colon(
                  Ctrl-O                              toggle raw tool output (show/squelch tool results)\n\
                  Shift-Tab                           cycle attach across all coordinators incl. finished/failed, newest first (interactive → newest → … → oldest → back)\n\
                  :quit                               exit (also Ctrl-D or `exit`)"
+            );
+        }
+        Some("version" | "ver") => {
+            println!(
+                "\x1b[1maish\x1b[0m \x1b[2mv{}\x1b[0m — {}",
+                crate::update::current_version(),
+                backend.describe()
             );
         }
         Some("jobs") => {
