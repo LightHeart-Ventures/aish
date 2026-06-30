@@ -1,7 +1,8 @@
 /// Minimal markdown → ANSI for model replies. Models speak markdown even when
 /// asked not to; rather than fight it, render the small subset they actually
-/// emit in shell answers: **bold**, *italic*, `code`, # headers, - bullets,
-/// and ``` fences. Not a spec parser — anything unmatched stays literal.
+/// emit in shell answers: **bold**, *italic*, `code`, ~~strike~~, [links](url),
+/// # headers, - bullets, 1. ordered lists, > quotes, --- rules, | tables |, and
+/// ``` fences. Not a spec parser — anything unmatched stays literal.
 ///
 /// `base` is the style to re-assert after a reset (e.g. "\x1b[2m" when the
 /// caller prints the whole line dim) — SGR 22 turns off bold *and* dim, so a
@@ -37,6 +38,23 @@ pub fn render(text: &str, base: &str) -> String {
             i = end;
             continue;
         }
+        // Horizontal rule: `---`, `***`, `___` (3+ of one marker, spaces ok) on
+        // its own line → a dim full-width rule. Checked before the bullet branch
+        // so `- - -` reads as a rule, not a bullet.
+        if is_hrule(trimmed) {
+            out.push(format!("{indent}\x1b[2m{}\x1b[22m{base}", "─".repeat(hrule_width(indent))));
+            i += 1;
+            continue;
+        }
+        // Blockquote: `> text` (nestable `> > `) → a dim gutter bar per level
+        // followed by the quoted text rendered with inline markup.
+        if trimmed.starts_with('>') {
+            let (depth, content) = strip_quote(trimmed);
+            let gutter = format!("\x1b[2m▎\x1b[22m{base} ").repeat(depth);
+            out.push(format!("{indent}{gutter}{}", inline(content, base)));
+            i += 1;
+            continue;
+        }
         // `# Header` → bold line (inline runs with bold in the base so an
         // embedded `code` span doesn't end the header style early)
         let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
@@ -50,8 +68,20 @@ pub fn render(text: &str, base: &str) -> String {
                 continue;
             }
         }
-        if let Some(item) = trimmed.strip_prefix("- ") {
+        // Unordered bullet: `- `, `* `, or `+ ` → a normalized `•` marker. (A
+        // lone `*word*` stays italic — the bullet form requires the space.)
+        if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))
+        {
             out.push(format!("{indent}• {}", inline(item, base)));
+            i += 1;
+            continue;
+        }
+        // Ordered list: `1. ` / `2) ` → keep the marker, render the item inline.
+        if let Some((marker, item)) = split_ordered(trimmed) {
+            out.push(format!("{indent}{marker} {}", inline(item, base)));
             i += 1;
             continue;
         }
@@ -67,6 +97,55 @@ fn is_separator_row(line: &str) -> bool {
     t.starts_with('|') && t.contains('-') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
 }
 
+/// A standalone horizontal rule: at least three of the SAME marker (`-`/`*`/`_`),
+/// with only that marker and spaces on the line.
+fn is_hrule(trimmed: &str) -> bool {
+    let t = trimmed.trim_end();
+    let marker = match t.chars().next() {
+        Some(c @ ('-' | '*' | '_')) => c,
+        _ => return false,
+    };
+    t.chars().filter(|&c| c == marker).count() >= 3
+        && t.chars().all(|c| c == marker || c == ' ')
+}
+
+/// Display width for a horizontal rule: the terminal width (capped so a piped,
+/// unbounded width doesn't emit a runaway line) minus the line's indent.
+fn hrule_width(indent: &str) -> usize {
+    term_width()
+        .min(64)
+        .saturating_sub(visible_width(indent))
+        .max(3)
+}
+
+/// Peel the leading `>` quote markers off a line, returning the nesting depth and
+/// the remaining content. `> > text` → (2, "text"); `>` alone → (1, "").
+fn strip_quote(trimmed: &str) -> (usize, &str) {
+    let mut depth = 0;
+    let mut rest = trimmed;
+    while let Some(r) = rest.strip_prefix('>') {
+        depth += 1;
+        rest = r.strip_prefix(' ').unwrap_or(r);
+    }
+    (depth.max(1), rest)
+}
+
+/// Split an ordered-list line into its `N.`/`N)` marker and the item text.
+/// Returns None when the line isn't `<digits><'.'|')'><space>…`.
+fn split_ordered(trimmed: &str) -> Option<(&str, &str)> {
+    let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || digits > 9 {
+        return None;
+    }
+    let after = &trimmed[digits..];
+    let delim = after.as_bytes().first().copied()?;
+    if delim != b'.' && delim != b')' {
+        return None;
+    }
+    let item = after[1..].strip_prefix(' ')?;
+    Some((&trimmed[..digits + 1], item))
+}
+
 #[derive(Clone, Copy)]
 enum Align {
     Left,
@@ -74,8 +153,10 @@ enum Align {
     Center,
 }
 
-/// Markdown table → aligned columns with dim `│`/`─` rules, bold header.
-/// Column widths use marker-stripped cell text so `**bold**` cells line up.
+/// Markdown table → a clean boxed table: rounded outer frame, dim `│`/`─` rules,
+/// bold header, per-column alignment. Column widths use marker-stripped cell text
+/// so `**bold**` cells line up. Cells that would overflow the terminal are
+/// word-wrapped into narrowed columns rather than letting the row hard-wrap.
 fn render_table(block: &[&str], indent: &str, base: &str, out: &mut Vec<String>) {
     let header = split_row(block[0]);
     let aligns: Vec<Align> = split_row(block[1])
@@ -101,19 +182,25 @@ fn render_table(block: &[&str], indent: &str, base: &str, out: &mut Vec<String>)
         }
     }
 
-    // Fit to the terminal: if the natural table would overflow the width, shrink
-    // the widest columns and WORD-WRAP their cells into the narrowed columns —
-    // multi-line rows with aligned `│` rules — rather than letting the terminal
-    // hard-wrap whole rows (which mangles the column structure). When it already
-    // fits (the common case), `fit_widths` returns the natural widths unchanged
-    // and every cell wraps to a single line, so output is identical to before.
+    // Fit to the terminal. The box frame costs a fixed number of columns per row:
+    // the left "│ " and right " │" borders (4) plus a " │ " divider between each
+    // pair of columns (3 each). Subtract that from the terminal width before
+    // distributing the remainder to columns; `fit_widths` shrinks the widest
+    // column first and `wrap_cell` word-wraps the overflow. When the table fits
+    // (the common case) the natural widths are returned unchanged.
     let indent_w = visible_width(indent);
-    let sep_w = 3 * ncols.saturating_sub(1); // " │ " between columns ≈ 3 cols
-    let avail = term_width().saturating_sub(indent_w + sep_w);
+    let frame_w = 4 + 3 * ncols.saturating_sub(1);
+    let avail = term_width().saturating_sub(indent_w + frame_w);
     let widths = fit_widths(&natural, avail);
 
-    let bar = format!(" \x1b[2m│\x1b[22m{base} ");
-    // One logical row → one or more physical lines (each wrapped cell line).
+    // Dim vertical border with the base style re-asserted after it.
+    let vbar = format!("\x1b[2m│\x1b[22m{base}");
+    let left = format!("{indent}{vbar} ");
+    let mid = format!(" {vbar} ");
+    let right = format!(" {vbar}");
+
+    // One logical row → one or more physical lines (each wrapped cell line),
+    // wrapped in the left/right frame borders.
     let row_lines = |cells: &[String], bold: bool| -> Vec<String> {
         let wrapped: Vec<Vec<String>> = (0..ncols)
             .map(|c| wrap_cell(cells.get(c).map(String::as_str).unwrap_or(""), widths[c]))
@@ -141,17 +228,26 @@ fn render_table(block: &[&str], indent: &str, base: &str, out: &mut Vec<String>)
                         format!("{}{rendered}{}", " ".repeat(l), " ".repeat(r))
                     })
                     .collect();
-                format!("{indent}{}", parts.join(&bar))
+                format!("{left}{}{right}", parts.join(&mid))
             })
             .collect()
     };
 
+    // A horizontal frame line with the given corner/junction glyphs; each column
+    // segment spans its width plus the one-space cell padding on each side, so the
+    // junctions land exactly under the `│` dividers.
+    let divider = |lc: &str, j: &str, rc: &str| -> String {
+        let segs: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
+        format!("{indent}\x1b[2m{lc}{}{rc}\x1b[22m{base}", segs.join(j))
+    };
+
+    out.push(divider("╭", "┬", "╮"));
     out.extend(row_lines(&header, true));
-    let rule: Vec<String> = widths.iter().map(|w| "─".repeat(*w)).collect();
-    out.push(format!("{indent}\x1b[2m{}\x1b[22m{base}", rule.join("─┼─")));
+    out.push(divider("├", "┼", "┤"));
     for row in &rows {
         out.extend(row_lines(row, false));
     }
+    out.push(divider("╰", "┴", "╯"));
 }
 
 /// Terminal width in columns for table fitting. A tty is queried via TIOCGWINSZ.
@@ -310,8 +406,8 @@ pub fn render_stdout(text: &str) -> String {
     }
 }
 
-/// Inline spans: `code`, **bold**, *italic*. Underscore emphasis is skipped
-/// on purpose — it would mangle snake_case identifiers.
+/// Inline spans: `code`, **bold**, *italic*, ~~strike~~, [text](url). Underscore
+/// emphasis is skipped on purpose — it would mangle snake_case identifiers.
 fn inline(s: &str, base: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
@@ -325,6 +421,24 @@ fn inline(s: &str, base: &str) -> String {
                 out.push_str(base);
                 i += end + 2;
                 continue;
+            }
+        } else if rest.starts_with('[') {
+            // [label](url): show the label (cyan), keeping the url dim in parens
+            // when it differs — copy-friendly in a terminal, no OSC-8 to leak.
+            if let Some(consumed) = render_link(rest, base, &mut out) {
+                i += consumed;
+                continue;
+            }
+        } else if rest.starts_with("~~") {
+            if let Some(end) = rest[2..].find("~~") {
+                if end > 0 {
+                    out.push_str("\x1b[9m");
+                    out.push_str(&inline(&rest[2..2 + end], &format!("{base}\x1b[9m")));
+                    out.push_str("\x1b[29m");
+                    out.push_str(base);
+                    i += end + 4;
+                    continue;
+                }
             }
         } else if rest.starts_with("**") {
             if let Some(end) = rest[2..].find("**") {
@@ -355,6 +469,32 @@ fn inline(s: &str, base: &str) -> String {
         i += ch.len_utf8();
     }
     out
+}
+
+/// Render a `[label](url)` link starting at `rest`, appending to `out`. Returns
+/// the number of bytes consumed, or None when `rest` isn't a well-formed link (so
+/// the caller leaves the literal `[` in place). The label renders cyan; a url
+/// that differs from the label trails dim in parentheses.
+fn render_link(rest: &str, base: &str, out: &mut String) -> Option<usize> {
+    let close = rest.find(']')?;
+    if !rest[close + 1..].starts_with('(') {
+        return None;
+    }
+    let url_start = close + 2;
+    let url_end = url_start + rest[url_start..].find(')')?;
+    let label = &rest[1..close];
+    let url = &rest[url_start..url_end];
+    if label.is_empty() || url.is_empty() {
+        return None;
+    }
+    out.push_str("\x1b[36m");
+    out.push_str(&inline(label, &format!("{base}\x1b[36m")));
+    out.push_str("\x1b[39m");
+    out.push_str(base);
+    if url != label {
+        out.push_str(&format!(" \x1b[2m({url})\x1b[22m{base}"));
+    }
+    Some(url_end + 1)
 }
 
 #[cfg(test)]
@@ -402,8 +542,8 @@ mod tests {
         let md = "| Key | Note |\n|---|---|\n| a | one two three four five six seven |";
         let out = render(md, "");
         let lines: Vec<&str> = out.lines().collect();
-        // header + rule + ≥2 wrapped body lines
-        assert!(lines.len() >= 4, "expected wrapped rows, got {lines:#?}");
+        // framed (top + header + mid + ≥2 wrapped body lines + bottom)
+        assert!(lines.len() >= 6, "expected wrapped+framed rows, got {lines:#?}");
         unsafe { std::env::remove_var("COLUMNS") };
     }
 
@@ -420,6 +560,27 @@ mod tests {
     }
 
     #[test]
+    fn strikethrough_and_links() {
+        // ~~strike~~ → SGR 9/29, with inner inline markup still honored.
+        assert_eq!(
+            render("~~gone~~ now", ""),
+            "\x1b[9mgone\x1b[29m now"
+        );
+        // [label](url): cyan label + dim (url) when they differ.
+        assert_eq!(
+            render("see [docs](https://x.io)", ""),
+            "see \x1b[36mdocs\x1b[39m \x1b[2m(https://x.io)\x1b[22m"
+        );
+        // label == url → no duplicate parenthetical.
+        assert_eq!(
+            render("[https://x.io](https://x.io)", ""),
+            "\x1b[36mhttps://x.io\x1b[39m"
+        );
+        // Malformed link stays literal.
+        assert_eq!(render("[oops] not a link", ""), "[oops] not a link");
+    }
+
+    #[test]
     fn literals_stay_literal() {
         assert_eq!(render("2 * 3 = 6", ""), "2 * 3 = 6"); // spaced star ≠ italic
         assert_eq!(render("a ** b", ""), "a ** b"); // unmatched/empty bold
@@ -430,9 +591,42 @@ mod tests {
     fn blocks() {
         assert_eq!(render("# Title", ""), "\x1b[1mTitle\x1b[22m");
         assert_eq!(render("- item", ""), "• item");
+        // Alternate bullet markers normalize to •.
+        assert_eq!(render("* star", ""), "• star");
+        assert_eq!(render("+ plus", ""), "• plus");
+        // Ordered list keeps its marker, renders the item inline.
+        assert_eq!(render("1. first", ""), "1. first");
+        assert_eq!(render("3) third", ""), "3) third");
         assert_eq!(
             render("```\n**raw**\n```", ""),
             "\x1b[2m```\x1b[22m\n**raw**\n\x1b[2m```\x1b[22m"
+        );
+    }
+
+    #[test]
+    fn horizontal_rule() {
+        // A standalone rule renders as a dim line of ─; width is bounded.
+        unsafe { std::env::set_var("COLUMNS", "20") };
+        for src in ["---", "***", "___", "- - -"] {
+            let out = render(src, "");
+            assert!(out.starts_with("\x1b[2m"), "{src} → {out:?}");
+            assert!(out.contains('─'), "{src} → {out:?}");
+            assert!(!out.contains('-'), "rule should not echo dashes: {out:?}");
+        }
+        unsafe { std::env::remove_var("COLUMNS") };
+    }
+
+    #[test]
+    fn blockquote() {
+        // `> text` → dim gutter + inline-rendered content.
+        assert_eq!(
+            render("> heads up", ""),
+            "\x1b[2m▎\x1b[22m heads up"
+        );
+        // Nested `> > ` → two gutters; inner markup still renders.
+        assert_eq!(
+            render("> > **bang**", ""),
+            "\x1b[2m▎\x1b[22m \x1b[2m▎\x1b[22m \x1b[1mbang\x1b[22m"
         );
     }
 
@@ -445,29 +639,37 @@ mod tests {
     }
 
     #[test]
-    fn table_aligns_columns() {
+    fn table_is_boxed_and_aligned() {
+        // term_width() falls back to $COLUMNS off-tty; keep it wide so the small
+        // table renders at its natural widths.
+        unsafe { std::env::set_var("COLUMNS", "200") };
         let out = render(
             "| Sprint | Pts |\n|---|---:|\n| SPR-036 | 16 |\n| **S2** | 5 |",
             "",
         );
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 4);
-        // header bold, dim │ separator
-        assert_eq!(
-            lines[0],
-            "\x1b[1mSprint\x1b[22m  \x1b[2m│\x1b[22m \x1b[1mPts\x1b[22m"
-        );
-        assert_eq!(lines[1], "\x1b[2m────────┼────\x1b[22m");
-        // all rows have equal visible width: pad by marker-stripped cell text
-        let w = |l: &str| super::strip_ansi(l).chars().count();
-        assert_eq!(w(lines[0]), w(lines[1]));
-        assert_eq!(w(lines[1]), w(lines[2]));
-        assert_eq!(w(lines[2]), w(lines[3]));
-        // right-aligned numeric column
-        assert!(super::strip_ansi(lines[2]).ends_with(" 16"));
-        assert!(super::strip_ansi(lines[3]).ends_with("  5"));
-        // bold cell padded by its stripped width (2), not its raw width (6)
-        assert!(super::strip_ansi(lines[3]).starts_with("S2      "));
+        // top + header + mid + 2 body + bottom = 6 framed lines.
+        assert_eq!(lines.len(), 6, "{lines:#?}");
+        let stripped: Vec<String> = lines.iter().map(|l| super::strip_ansi(l)).collect();
+        // Rounded corners on the outer frame.
+        assert!(stripped[0].starts_with('╭') && stripped[0].ends_with('╮'));
+        assert!(stripped[2].starts_with('├') && stripped[2].ends_with('┤'));
+        assert!(stripped[5].starts_with('╰') && stripped[5].ends_with('╯'));
+        // Every physical line is the same display width (the frame lines up).
+        let w = |l: &str| super::visible_width(l);
+        let width0 = w(&stripped[0]);
+        for s in &stripped {
+            assert_eq!(w(s), width0, "ragged frame: {s:?}");
+        }
+        // Header is bold, body rows carry the dim │ border.
+        assert!(lines[1].contains("\x1b[1mSprint\x1b[22m"));
+        assert!(lines[3].contains("\x1b[2m│\x1b[22m"));
+        // Right-aligned numeric column: the cell text hugs the right border.
+        assert!(stripped[3].contains("16 │"));
+        assert!(stripped[4].contains(" 5 │"));
+        // Bold cell padded by its stripped width (2), not its raw width (6).
+        assert!(stripped[4].contains("│ S2      │"));
+        unsafe { std::env::remove_var("COLUMNS") };
     }
 
     #[test]
@@ -475,35 +677,38 @@ mod tests {
         // Mixes a single-codepoint emoji (🚀, 1 char / 2 cols) with a VS16
         // emoji-presentation sequence (⚙️ = U+2699 U+FE0F, 2 chars / 2 cols):
         // counting chars would under-pad 🚀 by one and the column would ragged.
+        unsafe { std::env::set_var("COLUMNS", "200") };
         let out = render(
             "| Emoji | Module |\n|---|---|\n| 🚀 | main.rs |\n| ⚙️ | engine.rs |",
             "",
         );
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 4);
+        // top + header + mid + 2 body + bottom.
+        assert_eq!(lines.len(), 6);
         // Display width via the same unicode-width measure render uses.
         let w = |l: &str| super::visible_width(&super::strip_ansi(l));
         let header = w(lines[0]);
         for l in &lines {
             assert_eq!(w(l), header, "row {l:?} display width != header");
         }
-        // The `│` / `┼` separators must land at the same display column on
-        // every row — the actual symptom of the bug. Measure each separator's
-        // column as the display width of the text preceding it (measuring
-        // char-by-char would mis-split the ⚙️ VS16 sequence).
+        // Every `│`/junction glyph must land at the same display column on every
+        // row — the actual symptom of the bug. Measure each separator's column as
+        // the display width of the text preceding it (char-by-char would mis-split
+        // the ⚙️ VS16 sequence).
         let sep_cols = |l: &str| -> Vec<usize> {
             let stripped = super::strip_ansi(l);
             stripped
                 .char_indices()
-                .filter(|&(_, ch)| ch == '│' || ch == '┼')
+                .filter(|&(_, ch)| matches!(ch, '│' | '┼' | '┬' | '┴'))
                 .map(|(i, _)| super::visible_width(&stripped[..i]))
                 .collect::<Vec<_>>()
         };
-        let expected = sep_cols(lines[0]);
-        assert_eq!(expected.len(), 1, "one separator per row");
-        for l in &lines {
+        // Body/header rows carry the same separator columns as the header row.
+        let expected = sep_cols(lines[1]);
+        for l in &[lines[1], lines[3], lines[4]] {
             assert_eq!(sep_cols(l), expected, "separator misaligned in {l:?}");
         }
+        unsafe { std::env::remove_var("COLUMNS") };
     }
 
     #[test]
@@ -513,7 +718,9 @@ mod tests {
 
     #[test]
     fn escaped_pipe_stays_in_cell() {
+        unsafe { std::env::set_var("COLUMNS", "200") };
         let out = render("| Cmd |\n|---|\n| a \\| b |", "");
         assert!(out.contains("a | b"));
+        unsafe { std::env::remove_var("COLUMNS") };
     }
 }
