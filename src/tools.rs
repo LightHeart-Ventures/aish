@@ -1012,9 +1012,41 @@ fn parse_argv(call: &ToolCall) -> Result<(String, Vec<String>)> {
         .and_then(|s| s.to_str())
         .unwrap_or(&program);
     if matches!(bin, "sh" | "bash" | "zsh" | "dash" | "fish" | "ksh") {
-        anyhow::bail!("aish does not invoke shells — call the underlying program directly");
+        anyhow::bail!("{}", shell_refusal(bin, &args));
     }
     Ok((program, args))
+}
+
+/// Build the "no shell" refusal message. aish refuses to fork a shell, but it
+/// CAN run an aish-compatible script file itself (`aish <file>` is a real
+/// line-by-line interpreter — see `script.rs`). So when the call is the
+/// `bash <file>` form — exactly one non-flag argument, no inline `-c` — point
+/// the model straight at the working path: re-run the script *through aish*.
+/// For the inline `-c "…"` form (or anything else) there's no file to hand off,
+/// so the model is told to call the underlying program directly, with the
+/// aish-script escape hatch mentioned as a parenthetical. The caveat about
+/// bash-specific grammar is spelled out so the model doesn't blindly reroute a
+/// genuine bash script (which aish would mis-execute).
+fn shell_refusal(shell: &str, args: &[String]) -> String {
+    let inline = args.iter().any(|a| a == "-c");
+    let non_flags: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    if !inline {
+        if let [file] = non_flags.as_slice() {
+            return format!(
+                "aish does not invoke shells like `{shell}`. To run the script `{file}`, run it \
+through aish itself: run_program program=\"aish\" args=[\"{file}\"] — aish has its own \
+line-by-line script interpreter. Caveat: aish runs each line as a single command/pipeline, NOT a \
+bash grammar — if `{file}` uses bash-specific syntax (&&, ||, $(…), for/while/if, redirections, \
+heredocs) it will be mis-executed, so port those lines or run the underlying programs directly \
+instead."
+            );
+        }
+    }
+    format!(
+        "aish does not invoke shells like `{shell}` — call the underlying program directly. (To \
+run an aish-compatible script file, use run_program program=\"aish\" args=[\"<file>\"]; aish's \
+script mode is line-by-line, not a bash grammar.)"
+    )
 }
 
 async fn run_program(
@@ -3844,6 +3876,24 @@ mod tests {
         assert_eq!(session.last_status, 1);
         let _ = execute(&call("true", &[], None), &mut session, &mut confirm).await;
         assert_eq!(session.last_status, 0);
+    }
+
+    #[test]
+    fn shell_refusal_points_at_aish_for_single_file() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // `bash /tmp/x.sh` → reroute hint naming the file and the aish escape hatch.
+        let m = shell_refusal("bash", &v(&["/tmp/cost_writers.sh"]));
+        assert!(m.contains("program=\"aish\""), "{m}");
+        assert!(m.contains("/tmp/cost_writers.sh"), "{m}");
+        assert!(m.contains("line-by-line"), "{m}");
+        // `bash script.sh arg` (two non-flags) is NOT the single-file form → generic msg.
+        let multi = shell_refusal("bash", &v(&["script.sh", "arg"]));
+        assert!(!multi.contains("To run the script"), "{multi}");
+        assert!(multi.contains("call the underlying program directly"), "{multi}");
+        // `bash -c "…"` (inline) → generic msg, never the file-reroute branch.
+        let inline = shell_refusal("bash", &v(&["-c", "echo hi"]));
+        assert!(!inline.contains("To run the script"), "{inline}");
+        assert!(inline.contains("call the underlying program directly"), "{inline}");
     }
 
     #[test]
