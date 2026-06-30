@@ -122,12 +122,9 @@ jobs:
             target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      # --no-default-features drops the in-process local model (mistralrs), which
-      # is huge, slow to build, and not needed for the distributed binary. The
-      # released aish is the fast Claude/Grok build; users who want local
-      # inference build from source with `--features local`.
+      # Build with --features local to include in-process local inference (llama.cpp).
       - name: Build release binary
-        run: cargo build --release --no-default-features --target ${{ matrix.target }}
+        run: cargo build --release --features local --target ${{ matrix.target }}
         shell: bash
 
       # Stage the binary under its per-platform asset name and emit a SHA256
