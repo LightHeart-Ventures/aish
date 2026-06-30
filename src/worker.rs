@@ -1476,6 +1476,14 @@ struct JobInner {
     /// instant its first forwarded line replaces it. `None` whenever no such
     /// attach-time spinner is active.
     backfill_spinner: Option<ThinkingSpinner>,
+    /// How many times this worker has been resumed IN PLACE (operator typed a
+    /// follow-up while attached to a finished run). Starts at 0 for the original
+    /// run; each `resume_in_place` mints a fresh underlying coordinator `run_id`
+    /// (a new "thread" — its own durable `coordinator_runs` row) and bumps this,
+    /// while the worker keeps its stable visible `id`, `:workers` slot, and attach
+    /// binding. This is what makes "type a message to a finished worker" continue
+    /// the SAME worker instead of spawning a brand-new one each time.
+    resumes: u32,
 }
 
 pub type WorkerJobs = Arc<Mutex<Vec<Arc<WorkerJob>>>>;
@@ -1566,33 +1574,6 @@ impl WorkerJob {
         i.status = "done".into();
         i.result = Some(result);
         i.finished.get_or_insert_with(SystemTime::now);
-    }
-    /// Annotate a FINISHED worker's tail with the id of the resumed run that
-    /// continued it (see `resume_coordinator`). Appended to whichever terminal
-    /// field is populated — `result` for a done run, `error` for a failed one —
-    /// so a later `:attach`/Shift-Tab into review mode (which renders `fetch()`)
-    /// shows "↻ continued in <new_id>". Idempotent per id: re-resuming the same
-    /// original twice records each distinct continuation once, and a repeat with
-    /// the same `new_id` is a no-op (so a re-attach that re-resumes can't stack
-    /// duplicate lines). A still-running worker is left untouched — only a
-    /// terminal run is ever resumed.
-    pub fn note_continued_in(&self, new_id: &str) {
-        let mut i = self.inner.lock().unwrap();
-        let line = format!("↻ continued in {new_id}");
-        let field = match i.status.as_str() {
-            "done" => &mut i.result,
-            "failed" => &mut i.error,
-            _ => return,
-        };
-        let body = field.get_or_insert_with(String::new);
-        // Guard against stacking the same continuation note twice.
-        if body.lines().any(|l| l.trim() == line) {
-            return;
-        }
-        if !body.is_empty() {
-            body.push_str("\n\n");
-        }
-        body.push_str(&line);
     }
     /// Record the branch an isolated worker left its changes on (kept worktree).
     fn set_branch(&self, branch: String) {
@@ -1707,6 +1688,41 @@ impl WorkerJob {
         i.finished.get_or_insert_with(SystemTime::now);
     }
 
+    /// The number of distinct coordinator runs (threads) this worker has had: 1
+    /// for the original run, +1 per in-place resume. Surfaced in the resume notice
+    /// and `:workers` summary so the operator can see a finished worker was
+    /// continued in place (a new thread under the covers) rather than respawned.
+    pub fn thread_count(&self) -> u32 {
+        self.inner.lock().unwrap().resumes + 1
+    }
+
+    /// Reset a TERMINAL worker back to `running` for an in-place resume: clear the
+    /// prior run's result/error/transcript/pulse/spinner state, restamp `started`,
+    /// and bump the resume counter (a fresh "thread"). The worker's stable `id`,
+    /// task, and its slot in `:workers` are untouched, so the operator keeps
+    /// interacting with the SAME worker. Returns the new thread number
+    /// (`resumes + 1`). Caller guarantees the worker is terminal — only a finished
+    /// run is ever resumed.
+    fn reset_for_resume(&self) -> u32 {
+        let mut i = self.inner.lock().unwrap();
+        i.resumes = i.resumes.saturating_add(1);
+        i.status = "running".into();
+        i.result = None;
+        i.error = None;
+        i.displayed = false;
+        i.branch = None;
+        i.last_tool_outcome = None;
+        i.last_turn_completion = None;
+        i.transcript.clear();
+        i.transcript_bytes = 0;
+        if let Some(spin) = i.backfill_spinner.take() {
+            spin.stop();
+        }
+        i.started = SystemTime::now();
+        i.finished = None;
+        i.resumes + 1
+    }
+
     /// Epoch seconds the worker started — the base for the `:workers` Started /
     /// Runtime columns. `None` only if the clock is before the Unix epoch.
     pub fn started_epoch(&self) -> Option<i64> {
@@ -1744,10 +1760,6 @@ impl WorkerJob {
     }
     fn mark_displayed(&self) {
         self.inner.lock().unwrap().displayed = true;
-    }
-    /// One line for a `:workers`-style listing.
-    pub fn summary_line(&self) -> String {
-        format!("{} [{}] {}", self.id, self.status(), self.task)
     }
     /// The rendered result, a failure note, or a still-running status.
     pub fn fetch(&self) -> String {
@@ -2011,6 +2023,7 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
         task: task.clone(),
         inner: Mutex::new(JobInner {
             status: "running".into(),
+            resumes: 0,
             result: None,
             error: None,
             displayed: false,
@@ -2027,13 +2040,43 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
     guard.push(job.clone());
     drop(guard);
 
-    tokio::spawn(run_worker(jobs.clone(), job, task, spec));
+    // The original run's coordinator `run_id` IS the worker's visible id. A later
+    // in-place resume passes a FRESH run id here (a new thread) while reusing this
+    // same `WorkerJob`, so the durable side gets a distinct row per thread without
+    // the worker changing its visible identity. See `resume_in_place`.
+    tokio::spawn(run_worker(jobs.clone(), job, id.clone(), task, spec));
     id
+}
+
+/// Resume a FINISHED worker IN PLACE: reuse the SAME `WorkerJob` — keeping its
+/// visible `id`, its slot in `:workers`, and the operator's attach binding — but
+/// reset it to `running`, mint a FRESH underlying coordinator `run_id` (a new
+/// thread, with its own durable `coordinator_runs` row + per-worker transcript),
+/// and relaunch the coordinator child seeded with `task`. This is the fix for
+/// "typing a follow-up to a finished worker spawns a brand-new worker each time":
+/// the operator now continues the SAME worker, with each resume tracked as a new
+/// thread under the covers. Returns `(worker_id, thread_number)`. Caller must
+/// ensure the worker is terminal (only finished runs are resumed).
+pub fn resume_in_place(jobs: &WorkerJobs, job: Arc<WorkerJob>, task: String, spec: WorkerSpec) -> (String, u32) {
+    let thread = job.reset_for_resume();
+    // A fresh coordinator run id for this thread — distinct from the worker's
+    // visible id, so the child's durable record and per-worker transcript don't
+    // collide with the prior thread's.
+    let run_id = new_worker_id();
+    let id = job.id.clone();
+    tokio::spawn(run_worker(jobs.clone(), job, run_id, task, spec));
+    (id, thread)
 }
 
 /// The run task: re-exec aish in `--coordinator` mode, capture stdout as the
 /// result, enforce a timeout, then surface it.
-async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: WorkerSpec) {
+/// Drive one coordinator run to completion against `job`. `run_id` is the
+/// coordinator run identity for THIS thread — equal to `job.id` for the original
+/// run, but a fresh id for an in-place resume (so the child's worktree leaf,
+/// durable record, and per-worker transcript are thread-distinct). All
+/// operator-facing labels (`[{}]` announces, `:workers` row) stay keyed on the
+/// stable `job.id`.
+async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, run_id: String, task: String, spec: WorkerSpec) {
     // Isolation: a writing/building coordinator gets its own git worktree
     // (branched from `spec.base` — a clean trunk baseline by default, or the
     // current HEAD on request) so parallel coordinators can't clobber the shared
@@ -2046,7 +2089,7 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
         // leaf is just the id: two sessions / two checkouts share the `{repo-key}`
         // parent dir but never collide on the leaf. Lives under `~/.aish/worktrees`
         // (off the OS-reaped temp dir — ISS-2046), swept on startup if abandoned.
-        create_worktree(&spec.cwd, &job.id, &spec.base)
+        create_worktree(&spec.cwd, &run_id, &spec.base)
     } else {
         None
     };
@@ -2068,7 +2111,7 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
     );
     let (mut cmd, env_file_cleanup) = match selection {
         crate::container::Selection::Container(rt) => {
-            match build_container_command(rt, &spec, &task, &job.id, &run_cwd) {
+            match build_container_command(rt, &spec, &task, &run_id, &run_cwd) {
                 Some(launch) => {
                     crate::tools::announce(
                         &format!("[{}]", job.id),
@@ -2076,11 +2119,11 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, task: String, spec: W
                     );
                     (launch.cmd, Some(launch.env_file))
                 }
-                None => (worker_command(&spec, &task, &job.id, &run_cwd), None),
+                None => (worker_command(&spec, &task, &run_id, &run_cwd), None),
             }
         }
         crate::container::Selection::Host => {
-            (worker_command(&spec, &task, &job.id, &run_cwd), None)
+            (worker_command(&spec, &task, &run_id, &run_cwd), None)
         }
     };
 
@@ -2467,6 +2510,7 @@ mod tests {
             task: "scan repo".into(),
             inner: Mutex::new(JobInner {
                 status: "running".into(),
+            resumes: 0,
                 result: None,
                 error: None,
                 displayed: false,
@@ -2483,79 +2527,6 @@ mod tests {
         assert!(job.fetch().contains("still running"));
         job.set_done("the answer".into());
         assert_eq!(job.fetch(), "the answer");
-        assert!(job.summary_line().contains("worker_1"));
-        assert!(job.summary_line().contains("done"));
-    }
-
-    #[test]
-    fn note_continued_in_annotates_terminal_tail() {
-        // A finished (done) run's tail gains "↻ continued in <new_id>" so a later
-        // review-mode attach shows it was resumed; re-noting the same id is a
-        // no-op, and a second distinct resume stacks a second line.
-        let job = Arc::new(WorkerJob {
-            id: "w_orig".into(),
-            task: "build feature".into(),
-            inner: Mutex::new(JobInner {
-                status: "running".into(),
-                result: None,
-                error: None,
-                displayed: false,
-                branch: None,
-                last_tool_outcome: None,
-                last_turn_completion: None,
-                transcript: VecDeque::new(),
-                transcript_bytes: 0,
-                backfill_spinner: None,
-                started: SystemTime::now(),
-                finished: None,
-            }),
-        });
-        // While still running, the note is refused (only terminal runs resume).
-        job.note_continued_in("w_new1");
-        assert!(job.fetch().contains("still running"));
-        assert!(!job.fetch().contains("continued in"));
-
-        job.set_done("done work".into());
-        job.note_continued_in("w_new1");
-        let after = job.fetch();
-        assert!(after.contains("done work"));
-        assert!(after.contains("↻ continued in w_new1"));
-        // Idempotent for the same id.
-        job.note_continued_in("w_new1");
-        assert_eq!(job.fetch().matches("w_new1").count(), 1);
-        // A second distinct resume adds a second line.
-        job.note_continued_in("w_new2");
-        let two = job.fetch();
-        assert!(two.contains("↻ continued in w_new1"));
-        assert!(two.contains("↻ continued in w_new2"));
-    }
-
-    #[test]
-    fn note_continued_in_annotates_failed_tail() {
-        // A failed run carries the breadcrumb on its error tail.
-        let job = Arc::new(WorkerJob {
-            id: "w_fail".into(),
-            task: "x".into(),
-            inner: Mutex::new(JobInner {
-                status: "running".into(),
-                result: None,
-                error: None,
-                displayed: false,
-                branch: None,
-                last_tool_outcome: None,
-                last_turn_completion: None,
-                transcript: VecDeque::new(),
-                transcript_bytes: 0,
-                backfill_spinner: None,
-                started: SystemTime::now(),
-                finished: None,
-            }),
-        });
-        job.set_failed("boom".into());
-        job.note_continued_in("w_resume");
-        let out = job.fetch();
-        assert!(out.contains("boom"));
-        assert!(out.contains("↻ continued in w_resume"));
     }
 
     #[test]
@@ -2565,6 +2536,7 @@ mod tests {
             task: "x".into(),
             inner: Mutex::new(JobInner {
                 status: "running".into(),
+            resumes: 0,
                 result: None,
                 error: None,
                 displayed: false,
@@ -2889,6 +2861,7 @@ mod tests {
             task: "t".into(),
             inner: Mutex::new(JobInner {
                 status: "running".into(),
+            resumes: 0,
                 result: None,
                 error: None,
                 displayed: false,
@@ -3031,6 +3004,7 @@ mod tests {
             task: "t".into(),
             inner: Mutex::new(JobInner {
                 status: "running".into(),
+            resumes: 0,
                 result: None,
                 error: None,
                 displayed: false,
@@ -3097,6 +3071,7 @@ mod tests {
             task: "t".into(),
             inner: Mutex::new(JobInner {
                 status: "running".into(),
+            resumes: 0,
                 result: None,
                 error: None,
                 displayed: false,
@@ -3134,6 +3109,7 @@ mod tests {
                 task: "t".into(),
                 inner: Mutex::new(JobInner {
                     status: "running".into(),
+            resumes: 0,
                     result: None,
                     error: None,
                     displayed: false,

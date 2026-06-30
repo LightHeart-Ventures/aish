@@ -2890,27 +2890,34 @@ fn resume_coordinator(prev_run_id: &str, message: &str, session: &mut Session) {
         show_output: session.show_worker_output.clone(),
         attached: session.attached.clone(),
     };
-    let new_id = crate::worker::spawn(&session.worker_jobs, resume_task, spec);
-    // Annotate the ORIGINAL (finished) run's tail with the id of the resume, so a
-    // later Shift-Tab / `:attach` into its review mode shows "↻ continued in
-    // <new_id>" — the breadcrumb that ties the finished agent to the run that
-    // picked up where it left off.
-    if let Some(prev) = session
+    // Resume IN PLACE: reuse the SAME `WorkerJob` — same visible id, same slot in
+    // `:workers`, same attachment — instead of spawning a fresh worker. The job
+    // flips back to `running` and a NEW coordinator run id (a new thread) is minted
+    // under the covers, so the operator keeps working with the SAME agent rather
+    // than accruing a brand-new `w_…` on every follow-up. This is the fix for "we
+    // keep getting a new worker when a worker finishes — I thought we continue the
+    // session and track it as a new thread under the covers".
+    let job = session
         .worker_jobs
         .lock()
         .unwrap()
         .iter()
         .find(|w| w.id == *prev_run_id)
-    {
-        prev.note_continued_in(&new_id);
-    }
-    // Hand the attachment to the resumed run so its activity streams here and the
-    // next typed line steers it.
-    *session.attached.lock().unwrap() = Some(new_id.clone());
+        .cloned();
+    let Some(job) = job else {
+        println!(
+            "can't resume '{prev_run_id}' — its record is no longer in this session (see :workers)"
+        );
+        return;
+    };
+    let (_id, thread) =
+        crate::worker::resume_in_place(&session.worker_jobs, job, resume_task, spec);
+    // The attachment already points at THIS worker (we were in its review mode),
+    // so there's nothing to re-bind — just clear the review marker so the next
+    // finish re-announces. Activity for the new thread streams into this same pane.
     *session.attach_review_announced.lock().unwrap() = None;
-    let new_short = crate::batch::short_id(&new_id);
     println!(
-        "\x1b[1;33m↻ resuming {prev_short} as {new_short}\x1b[0m — folding in your message; its activity streams here. \x1b[2m:detach to stop.\x1b[0m"
+        "\x1b[1;33m↻ resuming {prev_short} (thread {thread})\x1b[0m — folding in your message; its activity streams here. \x1b[2m:detach to stop.\x1b[0m"
     );
 }
 
@@ -3721,10 +3728,18 @@ async fn handle_colon(
                     w.finished_epoch(),
                     now_epoch,
                 );
+                // A resumed worker (≥1 in-place resume) carries a `↻N` thread
+                // marker on its id so the operator can see it's the SAME worker
+                // continued as a new thread, not a fresh spawn.
+                let id_cell = if w.thread_count() > 1 {
+                    format!("{} ↻{}", w.id, w.thread_count())
+                } else {
+                    w.id.clone()
+                };
                 table.push_str(&format!(
                     "| {} {} | {} * | {} | {} | {} | {} | {} |\n",
                     crate::style::job_type_emoji("worker"),
-                    w.id,
+                    id_cell,
                     me_label,
                     crate::style::styled_status(&w.status()),
                     started_cell,
