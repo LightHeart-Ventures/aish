@@ -474,8 +474,8 @@ a backend or worry about batches — just describe the task and offload it."
                 "type": "object",
                 "properties": {
                     "task": {"type": "string", "description": "The self-contained task to run in the background. It has no access to THIS conversation — include everything it needs. It CAN read the project files and use tools/MCP in the current directory."},
-                    "isolate": {"type": "boolean", "description": "Set TRUE for any task that WRITES or EDITS files or runs builds/tests — it then runs in its own dedicated git worktree (a fresh branch) so it can't clobber the working tree of other parallel background jobs or your live session. Set FALSE for read-only / analysis tasks (search, summarize, inspect) that change nothing. If omitted, it defaults to TRUE when the current directory is a git repo (isolation is free when no changes are made — the worktree is auto-removed), FALSE otherwise. When an isolated job makes changes, its branch is left intact and reported back for you to review/merge; nothing is auto-merged."},
-                    "base": {"type": "string", "enum": ["main", "head"], "description": "Which baseline an ISOLATED job branches from (ignored when isolate is false). \"main\" (default) = a CLEAN trunk baseline (latest origin/main when there's a remote, else local main) — use it for independent/new work so the job doesn't inherit unrelated in-progress changes. \"head\" = branch from the CURRENT checkout — use it ONLY when the task must build on the work currently in this branch (\"continue/extend what I'm doing\")."}
+                    "isolate": {"type": "boolean", "description": "Set TRUE for any task that WRITES or EDITS files or runs builds/tests — it then runs in its own dedicated git worktree (a fresh branch) so it can't clobber the working tree of other parallel background jobs or your live session. Set FALSE for read-only / analysis tasks (search, summarize, inspect) that change nothing. Defaults to TRUE (isolation is free when no changes are made — the worktree is auto-removed). When an isolated job makes changes, its branch is left intact and reported back for you to review/merge; nothing is auto-merged."},
+                    "base": {"type": "string", "enum": ["main", "head"], "description": "Which baseline an ISOLATED job branches from (ignored when isolate is false). \"main\" (default) = a CLEAN trunk baseline (latest origin/main when there's a remote, else local main) — use it for independent/new work so the job doesn't inherit unrelated in-progress changes. \"head\" = branch from the CURRENT checkout (including all uncommitted and committed changes on your current branch) — pass this when you're working interactively and want a worker to CONTINUE your work from where you are, building on your existing changes. The worker gets its own isolated worktree so it won't interfere with your interactive session, and if it makes changes they'll land on a separate branch you can review and merge."}
                 },
                 "required": ["task"]
             }),
@@ -1437,7 +1437,7 @@ you're working on it and the answer will appear here when ready — no job id, n
     // free for a no-change job (the worktree auto-removes) so it's the safe default.
     let isolate = match call.args["isolate"].as_bool() {
         Some(b) => b,
-        None => crate::worker::is_git_repo(&session.cwd),
+        None => true, // Force 1 worker = 1 worktree by default to prevent parallel jobs clobbering each other.
     };
     // Base for the isolated worktree: default to a clean trunk baseline ("main"),
     // so a job never inherits a stale/unrelated local checkout. The model passes
