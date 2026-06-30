@@ -988,6 +988,69 @@ pub(crate) fn dedup_program_argv(program: &str, mut args: Vec<String>) -> Vec<St
     args
 }
 
+/// Unwrap a POSIX shell builtin the model reaches for that is NOT a real
+/// executable, so a bare fork/exec 404s (the `✗ command which psql` failure).
+/// aish has no shell to run these, but their intent is unambiguous, so we
+/// rewrite them to the real program a shell's `command`/`builtin` would run —
+/// and map the existence-probe forms (`command -v X`, `type X`) to `which`, the
+/// real binary that answers "is X on PATH / where is it". Returns the rewritten
+/// (program, args) when `program` is one of these no-exec builtins and a target
+/// can be derived; None otherwise (leave the call untouched). Pure + unit-tested.
+fn unwrap_noexec_builtin(program: &str, args: &[String]) -> Option<(String, Vec<String>)> {
+    match bin_name(program) {
+        // `command [-p] NAME [args…]` runs NAME ignoring functions/aliases;
+        // `command -v|-V NAME…` is the portable existence probe → `which`.
+        // `builtin NAME [args…]` is the same unwrap (it has no -v form).
+        "command" | "builtin" => {
+            let mut probe = false;
+            let mut i = 0;
+            // Consume leading flags (-p, -v, -V, combined like -pv); stop at `--`
+            // or the first non-flag token (the program/name).
+            while i < args.len() {
+                let a = &args[i];
+                if a == "--" {
+                    i += 1;
+                    break;
+                }
+                match a.strip_prefix('-') {
+                    Some(flags) if !flags.is_empty() => {
+                        if flags.contains('v') || flags.contains('V') {
+                            probe = true;
+                        }
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            let mut tail = args[i..].to_vec();
+            if tail.is_empty() {
+                return None; // nothing to run / probe — let it fail naturally
+            }
+            if probe {
+                return Some(("which".to_string(), tail));
+            }
+            let prog = tail.remove(0);
+            Some((prog, tail))
+        }
+        // `type NAME…` is a builtin existence/kind probe with no executable →
+        // `which NAME…` (the closest real tool; aish has no shell functions).
+        "type" => {
+            let names: Vec<String> = args
+                .iter()
+                .filter(|a| !a.starts_with('-'))
+                .cloned()
+                .collect();
+            if names.is_empty() {
+                None
+            } else {
+                Some(("which".to_string(), names))
+            }
+        }
+        _ => None,
+    }
+}
+
+
 /// Extract (program, args) from a tool call, enforcing the "no shell" invariant.
 fn parse_argv(call: &ToolCall) -> Result<(String, Vec<String>)> {
     let program = call.args["program"]
@@ -1005,6 +1068,16 @@ fn parse_argv(call: &ToolCall) -> Result<(String, Vec<String>)> {
     // Defend against the model echoing the binary into argv[0] (see
     // dedup_program_argv): `gh gh pr create` would otherwise fail as an unknown
     let args = dedup_program_argv(&program, args);
+
+    // Unwrap a no-exec POSIX builtin (`command`/`builtin`/`type`) the model
+    // reached for — there's no such binary to fork/exec, so rewrite to the real
+    // target (or `which` for the `-v`/`type` existence probe). Done BEFORE the
+    // no-shell check so `command bash -c …` still unwraps to `bash` and is then
+    // refused as a shell.
+    let (program, args) = match unwrap_noexec_builtin(&program, &args) {
+        Some(rewritten) => rewritten,
+        None => (program, args),
+    };
 
     // The "no shell" invariant: refuse to be a backdoor into one.
     let bin = Path::new(&program)
@@ -3672,6 +3745,48 @@ mod tests {
             dedup_program_argv("/usr/bin/gh", v(&["gh", "pr"])),
             v(&["gh", "pr"])
         );
+    }
+
+    #[tokio::test]
+    async fn run_program_unwraps_command_builtin() {
+        // End-to-end: program="command", args=["echo","hi"] runs `echo hi`,
+        // not a 404 on a nonexistent `command` binary.
+        let out = run(&call("command", &["echo", "hi"], None)).await;
+        assert_eq!(out.trim(), "hi");
+    }
+
+    #[test]
+    fn unwrap_noexec_builtin_rewrites_command_and_type() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let u = |p: &str, a: &[&str]| unwrap_noexec_builtin(p, &v(a));
+
+        // `command which psql` (the reported failure) → run `which psql`.
+        assert_eq!(u("command", &["which", "psql"]), Some(("which".into(), v(&["psql"]))));
+        // `command -v psql` is the existence probe → `which psql`.
+        assert_eq!(u("command", &["-v", "psql"]), Some(("which".into(), v(&["psql"]))));
+        // `command -V psql` (verbose probe) likewise → `which psql`.
+        assert_eq!(u("command", &["-V", "psql"]), Some(("which".into(), v(&["psql"]))));
+        // Combined flags like `-pv` still detect the probe bit.
+        assert_eq!(u("command", &["-pv", "psql"]), Some(("which".into(), v(&["psql"]))));
+        // `command -p git status` → run `git status` (strip the -p, keep argv).
+        assert_eq!(u("command", &["-p", "git", "status"]), Some(("git".into(), v(&["status"]))));
+        // `command git status` (no flags) → `git status`.
+        assert_eq!(u("command", &["git", "status"]), Some(("git".into(), v(&["status"]))));
+        // `builtin ls -la` unwraps the same way (no -v form).
+        assert_eq!(u("builtin", &["ls", "-la"]), Some(("ls".into(), v(&["-la"]))));
+        // `type psql` (and multi-name) → `which psql …`.
+        assert_eq!(u("type", &["psql"]), Some(("which".into(), v(&["psql"]))));
+        assert_eq!(u("type", &["-a", "psql", "gh"]), Some(("which".into(), v(&["psql", "gh"]))));
+        // `--` terminates flag scanning: `command -- -weird` runs `-weird`.
+        assert_eq!(u("command", &["--", "-weird"]), Some(("-weird".into(), v(&[]))));
+
+        // Untouched: a real program, and the degenerate empty forms.
+        assert_eq!(u("psql", &["-l"]), None);
+        assert_eq!(u("command", &[]), None);
+        assert_eq!(u("command", &["-v"]), None);
+        assert_eq!(u("type", &[]), None);
+        // Absolute path to a `command`-named binary still unwraps on basename.
+        assert_eq!(u("/usr/bin/command", &["which", "psql"]), Some(("which".into(), v(&["psql"]))));
     }
 
     #[tokio::test]
