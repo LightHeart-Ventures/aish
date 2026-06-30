@@ -843,6 +843,15 @@ fn skill_debug() -> bool {
 /// How many skills to ask mcpmarket for. Matches the registry's own `limit=50`.
 const MCPMARKET_LIMIT: usize = 50;
 
+/// The minimum GitHub-star count an mcpmarket result must have to be surfaced by
+/// `:skill search` / `--skill-search`. mcpmarket carries a long tail of 0-star
+/// skills (placeholders, unstarred forks, low-signal entries); requiring at
+/// least one star keeps the results list to skills with at least minimal
+/// community validation. Only the mcpmarket source is filtered — the curated,
+/// binary-embedded index and any explicit `AISH_SKILL_REGISTRY` mirror are
+/// surfaced unfiltered.
+const MCPMARKET_MIN_STARS: u64 = 1;
+
 /// The active mcpmarket base: the `AISH_MCPMARKET_BASE` override when set and
 /// non-empty (trailing slash trimmed), else the public origin.
 fn mcpmarket_base() -> String {
@@ -1050,6 +1059,12 @@ fn parse_mcpmarket_body(body: &str) -> Result<Vec<SearchResult>> {
         };
 
         if name.is_empty() && reference.is_empty() {
+            continue;
+        }
+        // mvpmarket.com / mcpmarket.com only: drop low-signal 0-star skills so
+        // search surfaces only skills with at least one star (see
+        // MCPMARKET_MIN_STARS).
+        if stars < MCPMARKET_MIN_STARS {
             continue;
         }
         let r = SearchResult {
@@ -1990,7 +2005,7 @@ mod tests {
              "github":"lycfyi/community-agent-plugin/discord-connector/discord-doctor",
              "website":"https://github.com/lycfyi/community-agent-plugin/tree/abc123/plugins/discord-connector/skills/discord-doctor",
              "raw_name":"discord-doctor","skill_name":"discord-doctor",
-             "description":"Diagnoses Discord configuration issues."}
+             "description":"Diagnoses Discord configuration issues.","github_stars":7}
         ]}"#;
         let port = serve_once("200 OK", body.to_string()).await;
         let base = format!("http://127.0.0.1:{port}");
@@ -2025,11 +2040,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcpmarket_drops_zero_star_skills() {
+        // mvpmarket.com / mcpmarket.com only surface skills with >= 1 star
+        // (MCPMARKET_MIN_STARS). A 0-star row (or one with no star field at all)
+        // is dropped; a 1-star row survives.
+        let body = r#"{"skills":[
+            {"skill_name":"zero","owner":{"name":"acme"},
+             "website":"https://github.com/acme/acme/tree/abc/skills/zero",
+             "description":"No stars.","github_stars":0},
+            {"skill_name":"missing","owner":{"name":"acme"},
+             "website":"https://github.com/acme/acme/tree/abc/skills/missing",
+             "description":"No star field."},
+            {"skill_name":"one","owner":{"name":"acme"},
+             "website":"https://github.com/acme/acme/tree/abc/skills/one",
+             "description":"One star.","github_stars":1}
+        ]}"#;
+        let port = serve_once("200 OK", body.to_string()).await;
+        let base = format!("http://127.0.0.1:{port}");
+        let got = search_mcpmarket_with_base(&base, "x", 50).await.unwrap();
+        assert_eq!(got.len(), 1, "0-star and star-less rows must be dropped");
+        assert_eq!(got[0].name, "one");
+        assert_eq!(got[0].stars, 1);
+    }
+
+    #[tokio::test]
     async fn mcpmarket_falls_back_to_flat_fields() {
         // Forward-compat: a flat shape (publisher/summary, no owner object, no
         // website) still maps, synthesizing the reference from author/name.
         let body = r#"{"results":[
-            {"skill_name":"git-helper","publisher":"acme","summary":"Helps with git.","version":"2.0.0"}
+            {"skill_name":"git-helper","publisher":"acme","summary":"Helps with git.","version":"2.0.0","stars":1}
         ]}"#;
         let port = serve_once("200 OK", body.to_string()).await;
         let base = format!("http://127.0.0.1:{port}");
