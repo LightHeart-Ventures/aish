@@ -41,6 +41,43 @@ impl Mode {
     }
 }
 
+/// Largest iteration count `:loop` will accept — a guard so a fat-fingered
+/// `:loop 100000 …` can't pin the session in a runaway agentic loop.
+pub const MAX_LOOP: usize = 100;
+
+/// State of an active `:loop`. `:loop <count> <prompt>` re-runs <prompt> as a
+/// foreground model turn `count` times in sequence — each iteration is a normal
+/// agentic turn, so conversation context accumulates across them, mirroring an
+/// autonomous "keep iterating on this" loop (à la Claude CLI). The REPL drains
+/// one iteration per pass via [`Session::next_loop_tick`]; a Ctrl-C on any turn
+/// clears it. Session-local, never persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopState {
+    /// The prompt re-submitted each iteration.
+    pub prompt: String,
+    /// Total iterations requested (drives the `i/N` header).
+    pub total: usize,
+    /// Iterations already dispatched.
+    pub done: usize,
+}
+
+/// What the REPL should do for one pass of the loop, returned by
+/// [`Session::next_loop_tick`]. Keeps all the counter bookkeeping inside
+/// `Session` (unit-tested) while leaving the IO to the REPL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopTick {
+    /// Dispatch iteration `index` of `total`: run `body` as a model turn.
+    Run {
+        index: usize,
+        total: usize,
+        body: String,
+    },
+    /// The loop just finished its last iteration (announce once, then idle).
+    Done { total: usize },
+    /// No loop is active — read a line from the user as usual.
+    Idle,
+}
+
 /// Engine-side state, independent of any frontend (REPL today, login shell later).
 pub struct Session {
     /// The shell's working directory. Lives HERE, never in the process global —
@@ -227,6 +264,11 @@ pub struct Session {
     /// offloaded. Set by `coordinator::drive` at startup; always `None` for an
     /// interactive session (whose conversation has no single fixed task).
     pub task_anchor: Option<String>,
+    /// The active `:loop`, if any (one per session). Set by `:loop <count>
+    /// <prompt>`, drained one iteration per REPL pass by `next_loop_tick`,
+    /// stopped by `:loop stop` or a Ctrl-C abort. Always `None` for a background
+    /// coordinator — loops are an interactive affordance.
+    pub loop_state: Option<LoopState>,
 }
 
 impl Session {
@@ -273,7 +315,60 @@ impl Session {
             hooks: crate::hooks::HookSet::empty(),
             suppress_context_seed: false,
             task_anchor: None,
+            loop_state: None,
         })
+    }
+
+    /// Begin a `:loop`: re-run `prompt` as a foreground model turn `count`
+    /// times. Replaces any prior loop. `count` is clamped to `1..=MAX_LOOP`.
+    pub fn start_loop(&mut self, count: usize, prompt: impl Into<String>) {
+        let total = count.clamp(1, MAX_LOOP);
+        self.loop_state = Some(LoopState {
+            prompt: prompt.into(),
+            total,
+            done: 0,
+        });
+    }
+
+    /// Advance the active loop by one pass. Returns [`LoopTick::Run`] for each
+    /// iteration to dispatch, [`LoopTick::Done`] exactly once when the last
+    /// iteration has been dispatched (clearing the loop), and [`LoopTick::Idle`]
+    /// when no loop is active. The REPL prints the header / completion notice and
+    /// feeds the `body` to the model — `Session` owns only the counter.
+    pub fn next_loop_tick(&mut self) -> LoopTick {
+        let Some(st) = self.loop_state.as_mut() else {
+            return LoopTick::Idle;
+        };
+        if st.done >= st.total {
+            let total = st.total;
+            self.loop_state = None;
+            return LoopTick::Done { total };
+        }
+        st.done += 1;
+        LoopTick::Run {
+            index: st.done,
+            total: st.total,
+            body: st.prompt.clone(),
+        }
+    }
+
+    /// Clear any active loop (Ctrl-C abort, or `:loop stop`). Returns true when
+    /// one was active.
+    pub fn clear_loop(&mut self) -> bool {
+        self.loop_state.take().is_some()
+    }
+
+    /// One-line status of the active loop (bare `:loop` / `:loop status`).
+    pub fn loop_status(&self) -> String {
+        match &self.loop_state {
+            Some(st) => format!(
+                "loop active — {}/{} iterations dispatched · prompt: {}",
+                st.done, st.total, st.prompt
+            ),
+            None => {
+                "no loop running — `:loop <count> <prompt>` to start one".to_string()
+            }
+        }
     }
 
     /// Load the lifecycle-hook registry from the user-global

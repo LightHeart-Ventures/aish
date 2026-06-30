@@ -308,10 +308,26 @@ pub async fn run(
             "{name}{attach}{badge}\x1b[36m{}\x1b[0m ❯ ",
             short_cwd(&session)
         );
-        // Consume an accepted-rewrite line before falling back to the editor.
+        // Consume an accepted-rewrite line first, then an active `:loop`
+        // iteration, before falling back to the editor. A loop iteration is fed
+        // to the model inline via the `?` route escape so it runs as an agentic
+        // turn — never shell-dispatched or auto-offloaded to a coordinator.
         let outcome = match injected.take() {
             Some(l) => ReadOutcome::Line(l),
-            None => editor.read_line(&prompt),
+            None => match session.next_loop_tick() {
+                crate::session::LoopTick::Run { index, total, body } => {
+                    println!("\x1b[2m↻ loop {index}/{total}\x1b[0m");
+                    ReadOutcome::Line(format!("?{body}"))
+                }
+                crate::session::LoopTick::Done { total } => {
+                    println!(
+                        "\x1b[2m✓ loop complete ({total} iteration{})\x1b[0m",
+                        if total == 1 { "" } else { "s" }
+                    );
+                    continue;
+                }
+                crate::session::LoopTick::Idle => editor.read_line(&prompt),
+            },
         };
         match outcome {
             ReadOutcome::Line(line) => {
@@ -522,6 +538,11 @@ pub async fn run(
                     // tool_result — the next request would 400. Roll it back.
                     session.history.truncate(pre_len);
                     println!("\x1b[33m^C\x1b[0m turn aborted");
+                    // A Ctrl-C also abandons any in-flight `:loop` — the operator
+                    // wanted out, not just this one iteration.
+                    if session.clear_loop() {
+                        println!("\x1b[33m↻\x1b[0m loop cancelled");
+                    }
                 } else if let Some(text) = reply {
                     if !text.trim().is_empty() {
                         println!("{}", crate::md::render_stdout(text.trim()));
@@ -664,7 +685,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
         "watch + steer a coordinator, or `goal` to watch the goal",
     ),
     ("backend", "switch backend (claude|grok|local)"),
-    ("batch", "background batch mode (on|off|status|force-batches)"),
+    ("batch", "background batch mode (on|off|status)"),
     (
         "close",
         "remove the attached (or named) coordinator from the worker list + Shift-Tab rotation",
@@ -681,12 +702,14 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("help", "show command help"),
     ("jobs", "list background jobs"),
     ("kill", "kill a background job"),
+    ("loop", "re-run a prompt N times inline (status|stop)"),
     ("mcp", "manage MCP servers"),
     ("memories", "stored memories / organize"),
     ("mode", "set confirmation level"),
     ("model", "switch model (opus|sonnet|haiku)"),
     ("new", "clear conversation history"),
     ("output", "stream coordinators' activity"),
+    ("quit", "exit aish"),
     ("rename", "rename this session"),
     ("result", "view a finished job's result"),
     (
@@ -2966,27 +2989,18 @@ fn cycle_worker(session: &mut Session) {
             )
         })
         .collect();
-    // An active background `:goal` loop joins the rotation as its own LAST
-    // target (after every worker), so Shift-Tab walks interactive → newest
-    // worker → … → oldest worker → goal → interactive — the goal reachable by
-    // cycling, not only via `:attach goal`. It streams watch-only (no resume),
-    // so it's carried as the sentinel id rather than a worker record.
-    let goal_active = session.goal.as_ref().is_some_and(|g| g.is_active());
-    if workers.is_empty() && !goal_active {
+    if workers.is_empty() {
         println!(
             "\x1b[2m⇄ no coordinators to cycle through — :dispatch <task> to launch one\x1b[0m"
         );
         return;
     }
 
-    // The cycle is [interactive, workers[0], …, (goal)]; index 0 is the
+    // The cycle is [interactive, workers[0], workers[1], …]; index 0 is the
     // detached interactive prompt. The index math is factored into the pure,
     // unit-tested `next_attach_index` so it stays verifiable without spawning
     // real coordinators.
-    let mut ids: Vec<String> = workers.iter().map(|(id, _)| id.clone()).collect();
-    if goal_active {
-        ids.push(GOAL_ATTACH_ID.to_string());
-    }
+    let ids: Vec<String> = workers.iter().map(|(id, _)| id.clone()).collect();
     let current = session.attached.lock().unwrap().clone();
     let next_idx = next_attach_index(&ids, current.as_deref());
 
@@ -2996,20 +3010,6 @@ fn cycle_worker(session: &mut Session) {
         *session.attach_review_announced.lock().unwrap() = None;
         println!(
             "\x1b[2m⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)\x1b[0m"
-        );
-        return;
-    }
-
-    // Landing on the goal sentinel (always the last slot when present): attach
-    // watch-only, exactly like `:attach goal` — stream its turns live, no review
-    // or resume (a goal is verifier-driven, with no operator mailbox).
-    if ids[next_idx - 1] == GOAL_ATTACH_ID {
-        *session.attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
-        *session.attach_review_announced.lock().unwrap() = None;
-        println!(
-            "\x1b[1;33m⇄ attached to the goal\x1b[0m \x1b[2m({}/{} · streaming its turns live; goals are watch-only — :goal clear to stop it, Shift-Tab to cycle, :detach to stop watching)\x1b[0m",
-            next_idx,
-            ids.len()
         );
         return;
     }
@@ -3526,6 +3526,48 @@ async fn handle_colon(
 ) -> bool {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
+        Some("q" | "quit" | "exit") => return true,
+        Some("loop") => match parts.next() {
+            // Bare `:loop` or `:loop status` — report the active loop, if any.
+            None | Some("status") => println!("\x1b[2m{}\x1b[0m", session.loop_status()),
+            // `:loop stop` / `:loop clear` — abandon an in-flight loop.
+            Some("stop") | Some("clear") => {
+                if session.clear_loop() {
+                    println!("\x1b[33m↻\x1b[0m loop stopped");
+                } else {
+                    println!("\x1b[2mno loop running\x1b[0m");
+                }
+            }
+            // `:loop <count> <prompt>` — arm a new loop.
+            Some(tok) => match tok.parse::<usize>() {
+                Ok(count) => {
+                    let prompt = parts.collect::<Vec<_>>().join(" ");
+                    if prompt.trim().is_empty() {
+                        println!("\x1b[2musage: :loop <count> <prompt>\x1b[0m");
+                    } else if session.loop_state.is_some() {
+                        println!(
+                            "\x1b[33m↻\x1b[0m a loop is already active — `:loop stop` it first"
+                        );
+                    } else {
+                        if count > crate::session::MAX_LOOP {
+                            println!(
+                                "\x1b[2mloop count capped at {}\x1b[0m",
+                                crate::session::MAX_LOOP
+                            );
+                        }
+                        let total = count.clamp(1, crate::session::MAX_LOOP);
+                        session.start_loop(count, prompt);
+                        println!(
+                            "\x1b[2m↻ loop armed — {total} iteration{}\x1b[0m",
+                            if total == 1 { "" } else { "s" }
+                        );
+                    }
+                }
+                Err(_) => println!(
+                    "\x1b[2musage: :loop <count> <prompt>  (count must be a number)\x1b[0m"
+                ),
+            },
+        },
         Some("help") => {
             println!(
                 "type a command (first word in PATH) to run it directly — anything else goes to the model\n\
@@ -3570,12 +3612,15 @@ async fn handle_colon(
                  :suggest [hint]                     AI-suggest the next command from session context, prefilled to edit/accept before it runs (alias :sg)\n\
                  :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
                                                      a verifier judges each turn. :goal status, :goal clear\n\
+                 :loop <count> <prompt>              re-run <prompt> as an inline agentic turn <count> times;\n\
+                                                     context accumulates across iterations. :loop status, :loop stop\n\
                  :allow                              list always-allowed tools/commands + dir grants\n\
                  :allow remove <tool>|<perm>:<dir>   revoke a tool or a directory grant\n\
                  a at a prompt                       always-allow this tool (see :allow)\n\
                  d at a read/write/delete prompt     allow that permission for the whole dir, recursively\n\
                  Ctrl-O                              toggle raw tool output (show/squelch tool results)\n\
-                 Shift-Tab                           cycle attach across all coordinators incl. finished/failed, newest first (interactive → newest → … → oldest → back)"
+                 Shift-Tab                           cycle attach across all coordinators incl. finished/failed, newest first (interactive → newest → … → oldest → back)\n\
+                 :quit                               exit (also Ctrl-D or `exit`)"
             );
         }
         Some("version" | "ver") => {
@@ -4385,8 +4430,7 @@ fn handle_allow(sub: Option<&str>, arg: Option<&str>, session: &Session) {
 
 /// `:batch` toggles/inspects interactive batch mode. `:batch` or `:batch status`
 /// reports the mode and lists this session's batch jobs; `:batch on|off` flips
-/// the (persisted) flag; `:batch model <id>` sets the model batches run on;
-/// `:batch force-batches` forces deferrable work onto Anthropic batches.
+/// the (persisted) flag; `:batch model <id>` sets the model batches run on.
 fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
     let persist = |session: &Session| {
         if let Some(db) = session.db.as_ref() {
@@ -4426,17 +4470,6 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
                 session.batch_model
             ),
         },
-        Some("force-batches") => {
-            if !session.batch_mode {
-                println!(
-                    "batch mode is off — turn it on with `:batch on` first; force-batches has no effect until then"
-                );
-            }
-            session.batch_force_batches = true;
-            println!(
-                "force-batches on — deferrable work will be dispatched as Anthropic batches (takes effect next turn)"
-            );
-        }
         Some("clear") => {
             // Drop finished (done/failed) jobs from both the store and memory.
             if let Some(store) = session.batch_store.as_ref() {
@@ -4455,10 +4488,9 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
         }
         None | Some("status") => {
             println!(
-                "batch mode: {} · model: {} · force-batches: {}",
+                "batch mode: {} · model: {}",
                 if session.batch_mode { "on" } else { "off" },
-                session.batch_model,
-                if session.batch_force_batches { "on" } else { "off" }
+                session.batch_model
             );
             let jobs = session.batch_jobs.lock().unwrap();
             if jobs.is_empty() {
@@ -4471,7 +4503,7 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
         }
         Some(other) => {
             println!(
-                "unknown :batch subcommand '{other}' — usage: :batch [on|off|status|clear|force-batches|model <id>]"
+                "unknown :batch subcommand '{other}' — usage: :batch [on|off|status|clear|model <id>]"
             )
         }
     }
