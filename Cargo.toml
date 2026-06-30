@@ -7,10 +7,8 @@ license = "Apache-2.0"
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
-# Same version mistralrs pins — used only to prefetch GGUFs with a progress bar.
-hf-hub = { version = "0.4.3", optional = true, default-features = false, features = ["tokio", "rustls-tls"] }
 libc = "0.2"
-mistralrs = { version = "0.8.1", optional = true }
+llama-cpp-2 = { version = "0.1", optional = true }
 regex = "1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 # Browser-impersonating HTTP client (wreq) for bypassing bot protection
@@ -30,11 +28,11 @@ miette = { version = "7", features = ["fancy"] }
 thiserror = "2"
 
 [features]
-default = ["local"]
-# Local in-process inference (mistral.rs). Disable for a fast, Claude-only build:
-#   cargo build --no-default-features
-local = ["dep:mistralrs", "dep:hf-hub"]
-cuda = ["mistralrs/cuda"]
+default = []
+# Local in-process inference via llama.cpp (GGUF models). Off by default — the
+# native llama.cpp build is heavy; opt in with `cargo build --features local`.
+local = ["dep:llama-cpp-2"]
+cuda = ["llama-cpp-2/cuda"]
 
 [profile.dev]
 # Full DWARF debuginfo for the whole dependency graph is a major peak-memory
@@ -45,7 +43,7 @@ cuda = ["mistralrs/cuda"]
 debug = "line-tables-only"
 
 [profile.dev.package."*"]
-# candle/mistralrs are unusably slow unoptimized — always optimize deps.
+# Native/ML deps (e.g. the llama.cpp bindings) are unusably slow unoptimized — always optimize deps.
 opt-level = 3
 
 [profile.release]

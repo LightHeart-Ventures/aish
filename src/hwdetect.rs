@@ -25,11 +25,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Fallback model id when nothing has been detected yet (matches the historical
-/// hard-coded default of the local backend). Only read on the `local`-feature
-/// path, so the default build sees it as unused.
+/// Fallback model id when nothing has been detected yet — the smallest tier in
+/// the ladder, so it runs on practically any machine. Only read on the
+/// `local`-feature path, so the default build sees it as unused.
 #[allow(dead_code)]
-pub const DEFAULT_MODEL_ID: &str = "mistral-7b-instruct-v0.2";
+pub const DEFAULT_MODEL_ID: &str = "qwen2.5-0.5b-instruct";
 
 // ---------------------------------------------------------------------------
 // System profile

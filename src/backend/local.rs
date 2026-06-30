@@ -1,12 +1,12 @@
 //! Local inference backend using llama.cpp for GGUF model support.
 //!
 //! This module provides lightweight, embedded inference via llama-cpp-2 bindings.
-//! Models are lazy-loaded on first use. The default model is Mistral 7B Instruct
-//! (quantized), with model selection via environment variables.
+//! Models are lazy-loaded on first use. The model is chosen by the hardware-aware
+//! selector (see `crate::hwdetect`), with overrides via environment variables.
 //!
 //! Environment variables:
-//! - `AISH_LOCAL_MODEL_PATH`: Full path to a .gguf model file (required if not using HF Hub)
-//! - `AISH_LOCAL_MODEL_ID`: Hugging Face model ID (e.g., "mistralai/Mistral-7B-Instruct-v0.2")
+//! - `AISH_LOCAL_MODEL_PATH`: Full path to a .gguf model file (operator pin)
+//! - `AISH_LOCAL_MODEL_ID`: Model id from the selection ladder (e.g., "qwen2.5-0.5b-instruct")
 //! - `AISH_LOCAL_N_GPU_LAYERS`: Number of layers to offload to GPU (default: 0, CPU-only)
 
 #[cfg(feature = "local")]

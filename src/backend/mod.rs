@@ -308,7 +308,7 @@ impl Backend {
             Backend::Claude(b) => crate::context::context_window(&b.model),
             Backend::Grok(b) => crate::context::context_window(&b.model),
             #[cfg(feature = "local")]
-            Backend::Local(_) => 4096, // Mistral 7B context limit
+            Backend::Local(_) => 4096, // conservative context floor for local GGUF models
         }
     }
 
@@ -413,7 +413,7 @@ mod tests {
         // OQ3 cap: a structured payload whose compact JSON exceeds the budget
         // must NOT be fed to the model — it falls back to the rendered text,
         // byte-capped, so an enormous grep payload can't overflow the context
-        // window (the mistralrs-core 218k-token crash). This is the durable
+        // window (the 218k-token context-overflow crash). This is the durable
         // guardrail behind the grep skip-dirs + per-line truncation fixes.
         let huge: Vec<_> = (0..50_000)
             .map(|i| serde_json::json!({"path": "target/x.rs", "line": i, "text": "x".repeat(40)}))

@@ -2,8 +2,9 @@
 # coordinator that rebuilds aish) inherits the same OOM-safe defaults.
 #
 # Why a jobs cap:
-#   The `local` feature pulls in mistralrs / candle / gemm, all compiled at
-#   opt-level=3 (see [profile.dev.package."*"] in Cargo.toml). cargo otherwise
+#   The `local` feature pulls in the llama.cpp native bindings (llama-cpp-2 /
+#   llama-cpp-sys-2), compiled at opt-level=3 (see [profile.dev.package."*"] in
+#   Cargo.toml) plus a cmake build of llama.cpp itself. cargo otherwise
 #   fans codegen across every core (`nproc`), and a single optimizing rustc on
 #   one of those crates peaks well past 1.5 GB. On a typical 16 GB worker host,
 #   ~28 of those in parallel overcommit RAM and the kernel OOM-killer aborts the

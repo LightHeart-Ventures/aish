@@ -3,9 +3,9 @@
 # builds — the two OOM mitigations from the build-stability review, in one
 # place so every automated rebuild inherits them.
 #
-#   1. Don't compile mistralrs.  `--no-default-features` drops the heavy `local`
-#      (mistralrs / candle / gemm) feature — the entire opt-level=3 phase and the
-#      crate that peaks past 1.5 GB per rustc. Use this anywhere local in-process
+#   1. Don't compile the local backend.  `--no-default-features` drops the heavy
+#      `local` (llama.cpp native) feature — the entire opt-level=3 phase plus the
+#      cmake build of llama.cpp. Use this anywhere local in-process
 #      inference isn't needed (every coordinator + CI build). Pass --features
 #      local explicitly when you DO need it.
 #

@@ -2845,7 +2845,7 @@ fn glob_expand(call: &ToolCall, session: &Session) -> Result<(String, serde_json
 /// skips them so a search at a project root doesn't descend into `target/` or
 /// `node_modules/`, whose generated/minified files carry enormously long single
 /// lines that can blow the model's context budget (the original
-/// `mistralrs-core` 218k-token overflow). The skip applies only while
+/// 218k-token context overflow). The skip applies only while
 /// RECURSING: an explicit `path` INTO such a dir is still honoured because that
 /// dir is the walk root, not a descendant.
 const GREP_SKIP_DIRS: &[&str] = &[
@@ -4421,21 +4421,21 @@ mod fileops_tests {
         // A recursive grep at a project root must NOT descend into target/,
         // node_modules/, .git/ etc. — those carry generated files with huge
         // single lines that once blew the model's context window (the
-        // mistralrs-core 218k-token overflow). The real source hit IS returned.
+        // 218k-token context overflow). The real source hit IS returned.
         let dir = tmp("grepskip");
-        std::fs::write(dir.join("real.rs"), b"use mistralrs_core::thing;\n").unwrap();
+        std::fs::write(dir.join("real.rs"), b"use llama_cpp_2::thing;\n").unwrap();
         for skip in ["target", "node_modules", ".git", "vendor"] {
             std::fs::create_dir_all(dir.join(skip)).unwrap();
-            std::fs::write(dir.join(skip).join("gen.rs"), b"mistralrs_core junk\n").unwrap();
+            std::fs::write(dir.join(skip).join("gen.rs"), b"llama_cpp_2 junk\n").unwrap();
         }
         let mut s = yolo_session(&dir);
-        let r = run(&mut s, "grep_files", json!({"pattern": "mistralrs_core"})).await;
+        let r = run(&mut s, "grep_files", json!({"pattern": "llama_cpp_2"})).await;
         assert!(!r.is_error, "{}", r.content);
         let arr = r.structured.as_ref().unwrap().as_array().unwrap().clone();
         assert_eq!(arr.len(), 1, "only the real source hit: {}", r.content);
         assert_eq!(arr[0]["path"], "real.rs");
         // ...but an EXPLICIT path INTO a skipped dir is honoured (it's the root).
-        let r2 = run(&mut s, "grep_files", json!({"pattern": "mistralrs_core", "path": "target"})).await;
+        let r2 = run(&mut s, "grep_files", json!({"pattern": "llama_cpp_2", "path": "target"})).await;
         assert!(r2.content.contains("gen.rs"), "explicit root honoured: {}", r2.content);
         let _ = std::fs::remove_dir_all(&dir);
     }
