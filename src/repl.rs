@@ -308,10 +308,26 @@ pub async fn run(
             "{name}{attach}{badge}\x1b[36m{}\x1b[0m ❯ ",
             short_cwd(&session)
         );
-        // Consume an accepted-rewrite line before falling back to the editor.
+        // Consume an accepted-rewrite line first, then an active `:loop`
+        // iteration, before falling back to the editor. A loop iteration is fed
+        // to the model inline via the `?` route escape so it runs as an agentic
+        // turn — never shell-dispatched or auto-offloaded to a coordinator.
         let outcome = match injected.take() {
             Some(l) => ReadOutcome::Line(l),
-            None => editor.read_line(&prompt),
+            None => match session.next_loop_tick() {
+                crate::session::LoopTick::Run { index, total, body } => {
+                    println!("\x1b[2m↻ loop {index}/{total}\x1b[0m");
+                    ReadOutcome::Line(format!("?{body}"))
+                }
+                crate::session::LoopTick::Done { total } => {
+                    println!(
+                        "\x1b[2m✓ loop complete ({total} iteration{})\x1b[0m",
+                        if total == 1 { "" } else { "s" }
+                    );
+                    continue;
+                }
+                crate::session::LoopTick::Idle => editor.read_line(&prompt),
+            },
         };
         match outcome {
             ReadOutcome::Line(line) => {
@@ -522,6 +538,11 @@ pub async fn run(
                     // tool_result — the next request would 400. Roll it back.
                     session.history.truncate(pre_len);
                     println!("\x1b[33m^C\x1b[0m turn aborted");
+                    // A Ctrl-C also abandons any in-flight `:loop` — the operator
+                    // wanted out, not just this one iteration.
+                    if session.clear_loop() {
+                        println!("\x1b[33m↻\x1b[0m loop cancelled");
+                    }
                 } else if let Some(text) = reply {
                     if !text.trim().is_empty() {
                         println!("{}", crate::md::render_stdout(text.trim()));
@@ -681,6 +702,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("help", "show command help"),
     ("jobs", "list background jobs"),
     ("kill", "kill a background job"),
+    ("loop", "re-run a prompt N times inline (status|stop)"),
     ("mcp", "manage MCP servers"),
     ("memories", "stored memories / organize"),
     ("mode", "set confirmation level"),
@@ -3505,6 +3527,47 @@ async fn handle_colon(
     let mut parts = cmd.split_whitespace();
     match parts.next() {
         Some("q" | "quit" | "exit") => return true,
+        Some("loop") => match parts.next() {
+            // Bare `:loop` or `:loop status` — report the active loop, if any.
+            None | Some("status") => println!("\x1b[2m{}\x1b[0m", session.loop_status()),
+            // `:loop stop` / `:loop clear` — abandon an in-flight loop.
+            Some("stop") | Some("clear") => {
+                if session.clear_loop() {
+                    println!("\x1b[33m↻\x1b[0m loop stopped");
+                } else {
+                    println!("\x1b[2mno loop running\x1b[0m");
+                }
+            }
+            // `:loop <count> <prompt>` — arm a new loop.
+            Some(tok) => match tok.parse::<usize>() {
+                Ok(count) => {
+                    let prompt = parts.collect::<Vec<_>>().join(" ");
+                    if prompt.trim().is_empty() {
+                        println!("\x1b[2musage: :loop <count> <prompt>\x1b[0m");
+                    } else if session.loop_state.is_some() {
+                        println!(
+                            "\x1b[33m↻\x1b[0m a loop is already active — `:loop stop` it first"
+                        );
+                    } else {
+                        if count > crate::session::MAX_LOOP {
+                            println!(
+                                "\x1b[2mloop count capped at {}\x1b[0m",
+                                crate::session::MAX_LOOP
+                            );
+                        }
+                        let total = count.clamp(1, crate::session::MAX_LOOP);
+                        session.start_loop(count, prompt);
+                        println!(
+                            "\x1b[2m↻ loop armed — {total} iteration{}\x1b[0m",
+                            if total == 1 { "" } else { "s" }
+                        );
+                    }
+                }
+                Err(_) => println!(
+                    "\x1b[2musage: :loop <count> <prompt>  (count must be a number)\x1b[0m"
+                ),
+            },
+        },
         Some("help") => {
             println!(
                 "type a command (first word in PATH) to run it directly — anything else goes to the model\n\
@@ -3549,6 +3612,8 @@ async fn handle_colon(
                  :suggest [hint]                     AI-suggest the next command from session context, prefilled to edit/accept before it runs (alias :sg)\n\
                  :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
                                                      a verifier judges each turn. :goal status, :goal clear\n\
+                 :loop <count> <prompt>              re-run <prompt> as an inline agentic turn <count> times;\n\
+                                                     context accumulates across iterations. :loop status, :loop stop\n\
                  :allow                              list always-allowed tools/commands + dir grants\n\
                  :allow remove <tool>|<perm>:<dir>   revoke a tool or a directory grant\n\
                  a at a prompt                       always-allow this tool (see :allow)\n\
