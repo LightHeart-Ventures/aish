@@ -136,9 +136,41 @@ pub fn parse_ref(input: &str) -> Result<SkillRef> {
     })
 }
 
+/// Turn a SKILL.md frontmatter `name:` into a filesystem-safe directory
+/// segment. The on-disk directory name is just storage — the catalog displays
+/// the real `name:` from the frontmatter (see [`crate::skills::load`], which
+/// re-parses each SKILL.md), so a human-readable name with spaces or
+/// punctuation (e.g. `Neon Automation`) need not be a valid path itself: we
+/// slugify it. Every char outside `[A-Za-z0-9._-]` becomes `-`, runs of `-`
+/// collapse, and leading/trailing `-`/`.` are trimmed. This doubles as a hard
+/// path-traversal guard — `/` and `\` can't survive the slug, so the result can
+/// never escape the skills dir. Errors only when nothing usable remains (an
+/// empty slug, or `.`/`..`).
+fn sanitize_dir_segment(name: &str) -> Result<String> {
+    let mut slug = String::with_capacity(name.len());
+    let mut prev_dash = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '.') {
+            slug.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            // Any other char (space, '/', '\\', punctuation, non-ASCII) becomes
+            // a single '-', collapsing consecutive separators.
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    let slug = slug.trim_matches(|c| c == '-' || c == '.').to_string();
+    if slug.is_empty() || slug == "." || slug == ".." {
+        bail!("SKILL.md frontmatter `name:` has no filesystem-safe characters: {name:?}");
+    }
+    Ok(slug)
+}
+
 /// Reject path segments that could escape the skills dir or carry odd chars —
-/// a SKILL.md `name:` becomes a directory name, so this is also a hard guard
-/// against path traversal from an untrusted registry response.
+/// used to validate `owner`/`name` parsed from an untrusted registry ref, where
+/// the value must be exact (not slugified). A SKILL.md frontmatter `name:` that
+/// becomes a directory goes through [`sanitize_dir_segment`] instead.
 fn validate_segment(s: &str) -> Result<()> {
     if s.is_empty() || s == "." || s == ".." || s.contains('/') || s.contains('\\') {
         bail!("unsafe path segment: {s:?}");
@@ -286,8 +318,9 @@ pub fn import(text: &str, skills_dir: &Path) -> Result<PathBuf> {
     let (name, _desc) = crate::skills::parse_frontmatter(text).context(
         "fetched content is not a valid SKILL.md (needs `name:`/`description:` frontmatter)",
     )?;
-    validate_segment(&name).context("SKILL.md frontmatter `name:` is unsafe as a directory")?;
-    let dir = skills_dir.join(&name);
+    let dir_name = sanitize_dir_segment(&name)
+        .context("SKILL.md frontmatter `name:` is unusable as a directory name")?;
+    let dir = skills_dir.join(&dir_name);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join("SKILL.md");
     std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
@@ -1699,6 +1732,49 @@ mod tests {
         let loaded = crate::skills::load(&tmp);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "demo");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sanitize_dir_segment_slugifies_unsafe_names() {
+        // The reported bug: a human-readable name with a space.
+        assert_eq!(
+            sanitize_dir_segment("Neon Automation").unwrap(),
+            "Neon-Automation"
+        );
+        // Already-safe names pass through unchanged.
+        assert_eq!(sanitize_dir_segment("git-helper").unwrap(), "git-helper");
+        assert_eq!(sanitize_dir_segment("aws_s3.v2").unwrap(), "aws_s3.v2");
+        // Runs of unsafe chars collapse to a single dash; ends are trimmed.
+        assert_eq!(
+            sanitize_dir_segment("  Foo / Bar :: Baz  ").unwrap(),
+            "Foo-Bar-Baz"
+        );
+        // Path separators can't survive — no traversal possible.
+        assert_eq!(sanitize_dir_segment("a/../../etc").unwrap(), "a-..-..-etc");
+        assert_eq!(sanitize_dir_segment("../evil").unwrap(), "evil");
+        // Non-ASCII becomes a separator.
+        assert_eq!(sanitize_dir_segment("café münchen").unwrap(), "caf-m-nchen");
+        // Nothing usable left → error.
+        assert!(sanitize_dir_segment("").is_err());
+        assert!(sanitize_dir_segment("..").is_err());
+        assert!(sanitize_dir_segment("///").is_err());
+    }
+
+    #[test]
+    fn import_slugifies_frontmatter_name_with_space() {
+        // A SKILL.md whose `name:` has a space (the ComposioHQ/neon-automation
+        // case) imports into a slugified directory, while the catalog still
+        // shows the real, human-readable name from the frontmatter.
+        let tmp = std::env::temp_dir().join(format!("aish-sf-slug-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let md = "---\nname: Neon Automation\ndescription: Automate Neon.\n---\nDo it.\n";
+        let path = import(md, &tmp).unwrap();
+        assert_eq!(path, tmp.join("Neon-Automation").join("SKILL.md"));
+        // The file is written verbatim, so load() surfaces the real name.
+        let loaded = crate::skills::load(&tmp);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Neon Automation");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
