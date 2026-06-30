@@ -685,7 +685,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
         "watch + steer a coordinator, or `goal` to watch the goal",
     ),
     ("backend", "switch backend (claude|grok|local)"),
-    ("batch", "background batch mode (on|off|status)"),
+    ("batch", "background batch mode (on|off|status|force-batches)"),
     (
         "close",
         "remove the attached (or named) coordinator from the worker list + Shift-Tab rotation",
@@ -2989,18 +2989,27 @@ fn cycle_worker(session: &mut Session) {
             )
         })
         .collect();
-    if workers.is_empty() {
+    // An active background `:goal` loop joins the rotation as its own LAST
+    // target (after every worker), so Shift-Tab walks interactive → newest
+    // worker → … → oldest worker → goal → interactive — the goal reachable by
+    // cycling, not only via `:attach goal`. It streams watch-only (no resume),
+    // so it's carried as the sentinel id rather than a worker record.
+    let goal_active = session.goal.as_ref().is_some_and(|g| g.is_active());
+    if workers.is_empty() && !goal_active {
         println!(
             "\x1b[2m⇄ no coordinators to cycle through — :dispatch <task> to launch one\x1b[0m"
         );
         return;
     }
 
-    // The cycle is [interactive, workers[0], workers[1], …]; index 0 is the
+    // The cycle is [interactive, workers[0], …, (goal)]; index 0 is the
     // detached interactive prompt. The index math is factored into the pure,
     // unit-tested `next_attach_index` so it stays verifiable without spawning
     // real coordinators.
-    let ids: Vec<String> = workers.iter().map(|(id, _)| id.clone()).collect();
+    let mut ids: Vec<String> = workers.iter().map(|(id, _)| id.clone()).collect();
+    if goal_active {
+        ids.push(GOAL_ATTACH_ID.to_string());
+    }
     let current = session.attached.lock().unwrap().clone();
     let next_idx = next_attach_index(&ids, current.as_deref());
 
@@ -3010,6 +3019,20 @@ fn cycle_worker(session: &mut Session) {
         *session.attach_review_announced.lock().unwrap() = None;
         println!(
             "\x1b[2m⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)\x1b[0m"
+        );
+        return;
+    }
+
+    // Landing on the goal sentinel (always the last slot when present): attach
+    // watch-only, exactly like `:attach goal` — stream its turns live, no review
+    // or resume (a goal is verifier-driven, with no operator mailbox).
+    if ids[next_idx - 1] == GOAL_ATTACH_ID {
+        *session.attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
+        *session.attach_review_announced.lock().unwrap() = None;
+        println!(
+            "\x1b[1;33m⇄ attached to the goal\x1b[0m \x1b[2m({}/{} · streaming its turns live; goals are watch-only — :goal clear to stop it, Shift-Tab to cycle, :detach to stop watching)\x1b[0m",
+            next_idx,
+            ids.len()
         );
         return;
     }
@@ -4430,7 +4453,8 @@ fn handle_allow(sub: Option<&str>, arg: Option<&str>, session: &Session) {
 
 /// `:batch` toggles/inspects interactive batch mode. `:batch` or `:batch status`
 /// reports the mode and lists this session's batch jobs; `:batch on|off` flips
-/// the (persisted) flag; `:batch model <id>` sets the model batches run on.
+/// the (persisted) flag; `:batch model <id>` sets the model batches run on;
+/// `:batch force-batches` forces deferrable work onto Anthropic batches.
 fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
     let persist = |session: &Session| {
         if let Some(db) = session.db.as_ref() {
@@ -4470,6 +4494,17 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
                 session.batch_model
             ),
         },
+        Some("force-batches") => {
+            if !session.batch_mode {
+                println!(
+                    "batch mode is off — turn it on with `:batch on` first; force-batches has no effect until then"
+                );
+            }
+            session.batch_force_batches = true;
+            println!(
+                "force-batches on — deferrable work will be dispatched as Anthropic batches (takes effect next turn)"
+            );
+        }
         Some("clear") => {
             // Drop finished (done/failed) jobs from both the store and memory.
             if let Some(store) = session.batch_store.as_ref() {
@@ -4488,9 +4523,10 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
         }
         None | Some("status") => {
             println!(
-                "batch mode: {} · model: {}",
+                "batch mode: {} · model: {} · force-batches: {}",
                 if session.batch_mode { "on" } else { "off" },
-                session.batch_model
+                session.batch_model,
+                if session.batch_force_batches { "on" } else { "off" }
             );
             let jobs = session.batch_jobs.lock().unwrap();
             if jobs.is_empty() {
@@ -4503,7 +4539,7 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
         }
         Some(other) => {
             println!(
-                "unknown :batch subcommand '{other}' — usage: :batch [on|off|status|clear|model <id>]"
+                "unknown :batch subcommand '{other}' — usage: :batch [on|off|status|clear|force-batches|model <id>]"
             )
         }
     }

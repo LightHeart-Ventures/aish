@@ -152,6 +152,10 @@ pub struct Session {
     /// Opus by default — deferred work gets the strongest model regardless of the
     /// interactive backend. Settable via `:batch model`.
     pub batch_model: String,
+    /// When on, force deferrable work to run as Anthropic Batches even when a
+    /// background coordinator might otherwise execute it inline. Toggled with
+    /// `:batch force-batches`; resets per session (not persisted).
+    pub batch_force_batches: bool,
     /// Live background batch jobs (in memory for the session, mirrored to
     /// `batch_store` for durability).
     pub batch_jobs: crate::batch::BatchJobs,
@@ -292,6 +296,7 @@ impl Session {
             context_used: 0,
             batch_mode: true,
             batch_model: crate::batch::DEFAULT_BATCH_MODEL.to_string(),
+            batch_force_batches: false,
             batch_jobs: Default::default(),
             batch_store: None,
             worker_jobs: Default::default(),
@@ -596,7 +601,7 @@ matter — aish renders these as aligned terminal tables. Be verbose with column
 terse, and order the rows deliberately: chronological for events or history, by stage for \
 pipelines or build/run phases, by category for mixed or grouped sets.\n\
 - Final replies are terse and shell-like. One line when one line will do, but reach for a table \
-the moment there are several items to compare. No markdown headers.{skills}{batch}{escalate}{task}",
+the moment there are several items to compare. No markdown headers.{skills}{batch}{escalate}{console}{task}",
             host = self.host_info,
             cwd = self.cwd.display(),
             skills = self.skills_prompt,
@@ -606,6 +611,7 @@ the moment there are several items to compare. No markdown headers.{skills}{batc
             } else {
                 ""
             },
+            console = if self.nested { CONSOLE_NUDGE } else { "" },
             task = self
                 .task_anchor
                 .as_deref()
@@ -680,6 +686,21 @@ synchronous consult that returns the stronger model's reasoning in a few seconds
 needs in `task` (it sees nothing else), then act on its answer with your tools. If the result can wait, \
 use run_in_background instead. Escalating a hard step is the correct, expected move here, not a \
 failure — a wrong guess you act on is far more costly than a few seconds of consulting.";
+
+/// Appended to a background coordinator's system prompt (`nested`). Advertises
+/// the one-way `message_console` channel: a coordinator can post a short note
+/// straight to the human's interactive console at any point — shown immediately,
+/// bypassing the quiet `:worker-output` gate — without waiting to deliver its
+/// final result. Interactive sessions never see this (there is no parent console
+/// to message).
+const CONSOLE_NUDGE: &str = "\n\nYou are a background coordinator, and your activity is QUIET by \
+default — the human who launched you does not see your tool calls or narration unless they turn on \
+`:worker-output`. When something genuinely warrants the operator's attention BEFORE you finish — a \
+surfaced finding, a heads-up, a non-blocking question, meaningful progress on a long job, or a \
+reason you may take a while — call message_console(message) to post a short note straight to their \
+interactive console. It is ALWAYS shown the moment you send it, framed as coming from you. It is \
+one-way (you cannot read a reply) and is NOT a substitute for your final result — it's an \
+out-of-band note, so use it sparingly and keep it to a line or two.";
 
 /// Hard cap (bytes) on last-output text exposed via `$LAST`/`$_` and the
 /// automatic model-prompt context (TASK-13 AC3). Outputs longer than this are

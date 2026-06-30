@@ -176,7 +176,7 @@ fn allow_key(call: &ToolCall) -> String {
     }
 }
 
-pub fn tool_defs(batch_mode: bool, escalate_available: bool) -> Vec<ToolDef> {
+pub fn tool_defs(batch_mode: bool, escalate_available: bool, nested: bool) -> Vec<ToolDef> {
     let mut defs = vec![
         ToolDef {
             name: "run_program".into(),
@@ -515,6 +515,29 @@ a repo name for a repo (repo filtering is not yet wired to the durable store)."
             }),
         });
     }
+    // Coordinator→console channel: only a background coordinator (`nested`) can
+    // reach the operator's interactive terminal, so the tool is offered only
+    // there. An interactive session has no parent console to message.
+    if nested {
+        defs.push(ToolDef {
+            name: "message_console".into(),
+            description: "Post a short note straight to the operator's interactive console, shown \
+IMMEDIATELY. You are a background coordinator whose activity is normally QUIET (hidden behind \
+`:worker-output`); this is the ONE channel that is always surfaced the moment you send it, framed \
+as coming from you. Use it sparingly, for something that genuinely warrants the operator's \
+attention BEFORE you finish — a surfaced finding, a heads-up, a non-blocking question, meaningful \
+progress on a long job, or a reason you'll take a while. It is ONE-WAY (you cannot read a reply) \
+and is NOT a substitute for your final result — keep it to a line or two."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "The note to show on the operator's console. Keep it to a line or two — an out-of-band heads-up, not your final result."}
+                },
+                "required": ["message"]
+            }),
+        });
+    }
     // Synchronous escalation: only offered to a weak frontend (a stronger model
     // is reachable). An Opus/default-Grok session never sees this tool — it would
     // just be the model consulting itself.
@@ -626,6 +649,7 @@ pub async fn execute(
         "batch_result" => batch_result(call, session),
         "background_status" => background_status(call, session),
         "tell" => tell(call, session),
+        "message_console" => message_console(call, session),
         "escalate" => escalate(call, session).await,
         "get_skill" => get_skill(call, session).await,
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
@@ -1545,6 +1569,35 @@ fn tell(call: &ToolCall, session: &Session) -> Result<String> {
             )
         }
     }
+}
+
+/// `message_console` — the coordinator→console one-way channel. A background
+/// coordinator calls this to post a short note straight to the operator's
+/// interactive terminal, shown immediately and bypassing the quiet
+/// `:worker-output` gate. It works by emitting a `📣` sentinel line on this
+/// coordinator's stderr; the parent shell's worker stderr stream
+/// (`worker::stream_stderr`) recognizes that sentinel and ALWAYS forwards the
+/// note to the terminal, framed as a console message — even when worker output
+/// is otherwise suppressed. One-way: there is no reply channel. The tool is only
+/// registered for a nested (coordinator) session, but we guard anyway so an
+/// interactive call fails loudly instead of writing a stray sentinel to the TTY.
+fn message_console(call: &ToolCall, session: &Session) -> Result<String> {
+    let message = call.args["message"].as_str().map(str::trim).unwrap_or("");
+    if message.is_empty() {
+        anyhow::bail!("`message` is required — the note to show on the operator's console");
+    }
+    if !session.nested {
+        return Ok("message_console is only available to a background coordinator — an \
+interactive session has no parent console to message".into());
+    }
+    // One sentinel line per physical line so a multi-line note is forwarded
+    // intact and the operator sees the coordinator's intended line breaks. The
+    // parent re-frames each line as a console row. Mirrors how the coordinator's
+    // narration/thinking sentinels are emitted on stderr.
+    for line in message.lines() {
+        eprintln!("📣 {line}");
+    }
+    Ok("delivered to the operator's console".into())
 }
 
 fn background_status(call: &ToolCall, session: &Session) -> Result<String> {
@@ -3382,7 +3435,7 @@ mod tests {
 
     #[test]
     fn edit_file_tool_is_offered() {
-        let defs = tool_defs(false, false);
+        let defs = tool_defs(false, false, false);
         assert!(defs.iter().any(|d| d.name == "edit_file"), "edit_file must be in the tool set");
     }
 
@@ -3390,14 +3443,14 @@ mod tests {
     fn escalate_tool_gated_on_availability() {
         let has = |defs: &[ToolDef], n: &str| defs.iter().any(|d| d.name == n);
         // Offered only to a weak frontend (escalate_available = true).
-        let weak = tool_defs(true, true);
+        let weak = tool_defs(true, true, false);
         assert!(has(&weak, "escalate"));
         // A frontier frontend never sees it — no self-escalation.
-        let strong = tool_defs(true, false);
+        let strong = tool_defs(true, false, false);
         assert!(!has(&strong, "escalate"));
         // Independent of batch mode: escalate tracks its own flag.
-        assert!(has(&tool_defs(false, true), "escalate"));
-        assert!(!has(&tool_defs(false, false), "escalate"));
+        assert!(has(&tool_defs(false, true, false), "escalate"));
+        assert!(!has(&tool_defs(false, false, false), "escalate"));
     }
 
     #[test]
@@ -3405,10 +3458,16 @@ mod tests {
         let has = |defs: &[ToolDef], n: &str| defs.iter().any(|d| d.name == n);
         // The `tell` channel rides with background mode — there are no
         // coordinators to steer when batch mode is off.
-        assert!(has(&tool_defs(true, false), "tell"));
-        assert!(has(&tool_defs(true, true), "tell"));
-        assert!(!has(&tool_defs(false, false), "tell"));
-        assert!(!has(&tool_defs(false, true), "tell"));
+        assert!(has(&tool_defs(true, false, false), "tell"));
+        assert!(has(&tool_defs(true, true, false), "tell"));
+        assert!(!has(&tool_defs(false, false, false), "tell"));
+        assert!(!has(&tool_defs(false, true, false), "tell"));
+        // message_console is gated on `nested` (the 3rd flag), independent of
+        // batch_mode / escalate — only a background coordinator gets it.
+        assert!(has(&tool_defs(false, false, true), "message_console"));
+        assert!(has(&tool_defs(true, true, true), "message_console"));
+        assert!(!has(&tool_defs(false, false, false), "message_console"));
+        assert!(!has(&tool_defs(true, true, false), "message_console"));
     }
 
     #[test]
@@ -4251,7 +4310,7 @@ mod fileops_tests {
 
     #[tokio::test]
     async fn new_tools_are_registered() {
-        let defs = tool_defs(false, false);
+        let defs = tool_defs(false, false, false);
         for t in [
             "glob_expand",
             "grep_files",
