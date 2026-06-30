@@ -1103,14 +1103,6 @@ branch, and open a pull request (gh pr create) instead."
     let stderr = await_capture(&mut err_task).await;
 
     let mut out = String::new();
-    // Prepend the full command being executed
-    out.push_str("$ ");
-    out.push_str(&program);
-    if !args.is_empty() {
-        out.push(' ');
-        out.push_str(&args.join(" "));
-    }
-    out.push('\n');
     
     if !stdout.is_empty() {
         out.push_str(&stdout);
