@@ -99,7 +99,7 @@ async fn run_turn_inner(
         .map(|(provider, model)| (provider.to_string(), model));
     let escalate_available = session.escalation.is_some();
     let system = session.system_prompt(escalate_available);
-    let mut tool_defs = tools::tool_defs(session.batch_mode, escalate_available);
+    let mut tool_defs = tools::tool_defs(session.batch_mode, escalate_available, session.nested);
     if backend.include_mcp_tools() {
         tool_defs.extend(session.mcp.tool_defs());
     }
