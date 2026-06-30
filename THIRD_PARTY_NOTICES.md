@@ -17,10 +17,9 @@ Every direct dependency is **permissive (Apache-2.0 OR MIT)** and fully compatib
 |---|---|---|
 | [anyhow](https://github.com/dtolnay/anyhow) | Apache-2.0 OR MIT | Flexible error handling |
 | [clap](https://github.com/clap-rs/clap) | Apache-2.0 OR MIT | Command-line argument parsing |
-| [hf-hub](https://github.com/huggingface/hf-hub) | Apache-2.0 OR MIT | Hugging Face model/GGUF downloads (`local` feature) |
 | [libc](https://github.com/rust-lang/libc) | Apache-2.0 OR MIT | Raw FFI bindings to system libraries |
+| [llama-cpp-2](https://github.com/utilityai/llama-cpp-rs) | Apache-2.0 OR MIT | In-process local LLM inference via llama.cpp (`local` feature) |
 | [miette](https://github.com/zkat/miette) | Apache-2.0 | Diagnostic rendering — span carets, codes, help (`src/diag.rs`) |
-| [mistralrs](https://github.com/EricLBuehler/mistral.rs) | Apache-2.0 OR MIT | In-process local LLM inference (`local` feature) |
 | [regex](https://github.com/rust-lang/regex) | Apache-2.0 OR MIT | Regular expressions |
 | [reqwest](https://github.com/seanmonstar/reqwest) | Apache-2.0 OR MIT | HTTP client (rustls, HTTP/2) |
 | [rusqlite](https://github.com/rusqlite/rusqlite) | Apache-2.0 OR MIT | SQLite bindings (bundled) |

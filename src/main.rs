@@ -12,6 +12,7 @@ mod git;
 mod git_repo;
 mod goal;
 mod hooks;
+mod hwdetect;
 mod jobs;
 mod loopguard;
 mod mcp;
@@ -65,6 +66,10 @@ struct Args {
     #[arg(long, default_value = "claude")]
     backend: String,
 
+    /// Use local llama.cpp backend (shorthand for --backend=local)
+    #[arg(long)]
+    local: bool,
+
     /// Model override (e.g. claude-haiku-4-5)
     #[arg(long)]
     model: Option<String>,
@@ -80,6 +85,13 @@ struct Args {
     /// Check for a newer published release, upgrade if one exists, and exit.
     #[arg(long)]
     update: bool,
+
+    /// Re-run the hardware probe, pick the best-fitting local model for this
+    /// machine (whichllm-style), persist it to ~/.aish/local-model.json, and
+    /// exit. An operator-pinned model (AISH_LOCAL_MODEL_* / --model) is reported
+    /// and left untouched. Mirrors the `:model-detect` REPL command.
+    #[arg(long = "detect-local-model")]
+    detect_local_model: bool,
 
     /// Fetch and import a skill (opt-in), then exit. Accepts a URL or the
     /// owner/name shorthand. Supports any skill provider (default: skill.fish).
@@ -255,6 +267,24 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    // `aish --detect-local-model`: re-profile the hardware, pick + persist the
+    // best local model, and exit. Needs no backend or credentials. `force=true`
+    // re-runs detection even if a selection already exists; an operator pin
+    // (env / --model) still wins and is simply reported.
+    if args.detect_local_model {
+        let cli_model = args.model.as_deref();
+        match hwdetect::ensure_selected(true, cli_model) {
+            Ok(sel) => {
+                hwdetect::apply_env(&sel);
+                println!("{}", hwdetect::report(&sel));
+            }
+            Err(e) => {
+                eprintln!("\x1b[31maish:\x1b[0m local model detection failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
 
     // Load ~/.aishrc up front, BEFORE building the backend: its `export` lines
     // (credentials included) populate session.env, and the Claude backend
@@ -335,7 +365,22 @@ async fn main() -> Result<()> {
     }
     timer.mark("registry init");
 
-    let backend = match args.backend.as_str() {
+    // First run: profile the machine once and record the best-fitting local
+    // model so a later `:backend local` (or `--local` launch) has a selection
+    // ready. Cheap, best-effort, and only when nothing has been selected yet —
+    // never overrides an operator pin, never blocks startup on failure.
+    if !hwdetect::selection_path().exists() {
+        let _ = hwdetect::ensure_selected(false, None);
+    }
+
+    // --local is a shorthand for --backend=local
+    let backend_name = if args.local {
+        "local"
+    } else {
+        &args.backend
+    };
+
+    let backend = match backend_name {
         "claude" => {
             let cred = backend::claude::Credential::resolve(&session.env)?;
             backend::Backend::new_claude(
@@ -349,7 +394,25 @@ async fn main() -> Result<()> {
             &session.env,
         )?,
         #[cfg(feature = "local")]
-        "local" => backend::Backend::new_local(),
+        "local" => {
+            // Ensure a local model is selected before constructing the backend.
+            // An operator pin (--model on a local launch, or AISH_LOCAL_MODEL_*)
+            // wins; otherwise a prior detected selection is reused, or the
+            // hardware is profiled now. apply_env exports AISH_LOCAL_* so
+            // new_local() picks up the chosen model.
+            match hwdetect::ensure_selected(false, args.model.as_deref()) {
+                Ok(sel) => {
+                    hwdetect::apply_env(&sel);
+                    eprintln!("\x1b[2m{}\x1b[0m", hwdetect::short_line(&sel));
+                }
+                Err(e) => {
+                    eprintln!("\x1b[33maish:\x1b[0m local model detection failed: {e:#}")
+                }
+            }
+            backend::Backend::new_local()?
+        }
+        #[cfg(not(feature = "local"))]
+        "local" => anyhow::bail!("aish was built without the 'local' feature"),
         other => anyhow::bail!("unknown backend: {other} (available: claude, grok, local)"),
     };
     timer.mark("backend built");

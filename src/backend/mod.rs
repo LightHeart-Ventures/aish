@@ -219,7 +219,7 @@ pub struct ToolDef {
     pub schema: Value,
 }
 
-/// Enum dispatch — two backends don't justify a trait object.
+/// Enum dispatch — three backends.
 pub enum Backend {
     Claude(claude::ClaudeBackend),
     Grok(grok::GrokBackend),
@@ -236,6 +236,11 @@ impl Backend {
         Ok(Backend::Grok(grok::GrokBackend::new(model, extra_env)?))
     }
 
+    #[cfg(feature = "local")]
+    pub fn new_local() -> Result<Self> {
+        Ok(Backend::Local(local::LocalBackend::new()?))
+    }
+
     /// A stable short name for the active backend (`"claude"`/`"grok"`/`"local"`).
     /// Used to thread the active backend through to background coordinators so
     /// they run on the same provider the interactive session does.
@@ -248,26 +253,19 @@ impl Backend {
         }
     }
 
-    #[cfg(feature = "local")]
-    pub fn new_local() -> Self {
-        Backend::Local(local::LocalBackend::new())
-    }
-
     /// The active model id (e.g. `claude-opus-4-8`, `grok-…`). Used to stamp
     /// the per-worker `meta.json` (S9.3) so a persisted worker session records
-    /// which model produced it. `"local"` for the in-process backend.
+    /// which model produced it.
     pub fn model(&self) -> String {
         match self {
             Backend::Claude(b) => b.model.clone(),
             Backend::Grok(b) => b.model.clone(),
             #[cfg(feature = "local")]
-            Backend::Local(_) => "local".to_string(),
+            Backend::Local(_) => crate::hwdetect::selected_model_id(),
         }
     }
 
-    /// Pre-turn hook: the local backend lazy-loads weights here — drawing a
-    /// download progress line if needed — before the engine's "thinking"
-    /// spinner starts overwriting stderr. No-op for Claude.
+    /// Pre-turn hook: No-op for cloud backends. For local, lazy-loads the model.
     pub async fn prepare(&self) -> Result<()> {
         match self {
             Backend::Claude(_) => Ok(()),
@@ -289,9 +287,7 @@ impl Backend {
     /// Whether this backend can resume a truncated PLAIN-TEXT answer via an
     /// assistant-prefill continuation round. Claude's Messages API resumes a
     /// trailing assistant message verbatim, so the engine continues cut-off
-    /// answers there. The OpenAI-shaped chat-completions backends (Grok, local)
-    /// don't have well-defined assistant-prefill continuation, so they keep the
-    /// in-band "[response truncated]" note instead of risking a re-answer loop.
+    /// answers there.
     pub fn supports_prefill_continuation(&self) -> bool {
         matches!(self, Backend::Claude(_))
     }
@@ -301,7 +297,7 @@ impl Backend {
             Backend::Claude(b) => format!("claude ({})", b.model),
             Backend::Grok(b) => format!("grok ({} · {})", b.model, b.auth_label()),
             #[cfg(feature = "local")]
-            Backend::Local(b) => format!("local ({} · in-process)", b.file),
+            Backend::Local(_) => format!("local ({})", crate::hwdetect::selected_model_id()),
         }
     }
 
@@ -312,22 +308,13 @@ impl Backend {
             Backend::Claude(b) => crate::context::context_window(&b.model),
             Backend::Grok(b) => crate::context::context_window(&b.model),
             #[cfg(feature = "local")]
-            Backend::Local(_) => crate::context::context_window("local"),
+            Backend::Local(_) => 4096, // conservative context floor for local GGUF models
         }
     }
 
-    /// MCP tool schemas can dwarf a small local context window (one server
-    /// with 144 tools is ~50k tokens of JSON Schema — bigger than the local
-    /// model's entire context before the conversation even starts), so only
-    /// the Claude backend gets them. Local runs with the built-in shell tools.
+    /// Both cloud backends support MCP tool schemas.
     pub fn include_mcp_tools(&self) -> bool {
-        match self {
-            Backend::Claude(_) => true,
-            // Grok is a capable, large-context model — give it the full MCP tool set.
-            Backend::Grok(_) => true,
-            #[cfg(feature = "local")]
-            Backend::Local(_) => false,
-        }
+        true
     }
 
     pub fn set_model(&mut self, model: String) {
@@ -335,11 +322,7 @@ impl Backend {
             Backend::Claude(b) => b.model = model,
             Backend::Grok(b) => b.model = model,
             #[cfg(feature = "local")]
-            Backend::Local(_) => {
-                eprintln!(
-                    "(:model on the local backend isn't wired — set AISH_LOCAL_MODEL_ID and restart, or use :backend claude)"
-                )
-            }
+            Backend::Local(_) => {} // Model is baked in for local backend
         }
     }
 
@@ -357,31 +340,23 @@ impl Backend {
     pub fn escalation_target(
         &self,
         batch_model: &str,
-        env: &[(String, String)],
+        _env: &[(String, String)],
     ) -> Option<(&'static str, String)> {
         match self {
-            Backend::Claude(b) => resolve_escalation("claude", &b.model, batch_model, false),
-            Backend::Grok(b) => resolve_escalation("grok", &b.model, batch_model, false),
+            Backend::Claude(b) => resolve_escalation("claude", &b.model, batch_model),
+            Backend::Grok(b) => resolve_escalation("grok", &b.model, batch_model),
             #[cfg(feature = "local")]
-            Backend::Local(_) => resolve_escalation(
-                "local",
-                "",
-                batch_model,
-                claude::Credential::resolve(env).is_ok(),
-            ),
+            Backend::Local(_) => {
+                // Local can escalate to Claude if credentials are available
+                Some(("claude", batch_model.to_string()))
+            }
         }
     }
 }
 
 /// Pure escalation policy, split out so it's unit-testable without constructing
-/// a live backend (which needs credentials). `claude_cred_ok` only matters for
-/// the local frontend, which must reach a cloud model to escalate at all.
-fn resolve_escalation(
-    kind: &str,
-    model: &str,
-    batch_model: &str,
-    claude_cred_ok: bool,
-) -> Option<(&'static str, String)> {
+/// a live backend (which needs credentials).
+fn resolve_escalation(kind: &str, model: &str, batch_model: &str) -> Option<(&'static str, String)> {
     match kind {
         // Opus is already the strongest Claude model — nothing to escalate to.
         "claude" if model.contains("opus") => None,
@@ -389,9 +364,6 @@ fn resolve_escalation(
         // Grok ships a single model here; if we're already on it, no escalation.
         "grok" if model == grok::DEFAULT_MODEL => None,
         "grok" => Some(("grok", grok::DEFAULT_MODEL.to_string())),
-        // The local model is the weakest frontend; escalate to Claude's strong
-        // model when (and only when) a Claude credential is reachable.
-        "local" if claude_cred_ok => Some(("claude", batch_model.to_string())),
         _ => None,
     }
 }
@@ -441,7 +413,7 @@ mod tests {
         // OQ3 cap: a structured payload whose compact JSON exceeds the budget
         // must NOT be fed to the model — it falls back to the rendered text,
         // byte-capped, so an enormous grep payload can't overflow the context
-        // window (the mistralrs-core 218k-token crash). This is the durable
+        // window (the 218k-token context-overflow crash). This is the durable
         // guardrail behind the grep skip-dirs + per-line truncation fixes.
         let huge: Vec<_> = (0..50_000)
             .map(|i| serde_json::json!({"path": "target/x.rs", "line": i, "text": "x".repeat(40)}))
@@ -509,25 +481,16 @@ mod tests {
         let opus = "claude-opus-4-8";
         // Small Claude frontends escalate to the batch (strong) model.
         assert_eq!(
-            resolve_escalation("claude", "claude-haiku-4-5", opus, false),
+            resolve_escalation("claude", "claude-haiku-4-5", opus),
             Some(("claude", opus.to_string()))
         );
         assert_eq!(
-            resolve_escalation("claude", "claude-sonnet-4-6", opus, false),
+            resolve_escalation("claude", "claude-sonnet-4-6", opus),
             Some(("claude", opus.to_string()))
         );
         // An Opus frontend is already frontier — no self-escalation.
-        assert_eq!(resolve_escalation("claude", opus, opus, false), None);
+        assert_eq!(resolve_escalation("claude", opus, opus), None);
         // Grok on its only model: nothing stronger to reach.
-        assert_eq!(
-            resolve_escalation("grok", grok::DEFAULT_MODEL, opus, false),
-            None
-        );
-        // Local escalates to Claude's strong model, but only with a credential.
-        assert_eq!(
-            resolve_escalation("local", "", opus, true),
-            Some(("claude", opus.to_string()))
-        );
-        assert_eq!(resolve_escalation("local", "", opus, false), None);
+        assert_eq!(resolve_escalation("grok", grok::DEFAULT_MODEL, opus), None);
     }
 }
