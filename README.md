@@ -20,7 +20,7 @@ Mostly ~/models (412G of GGUF weights) — 87% of your usage.
 
 **Supported:**
 - **macOS** 12+ (x86_64, arm64/Apple Silicon)
-- **Linux** (glibc 2.35+): Ubuntu 24.04 LTS, Ubuntu 20.04 LTS, Debian 12, Fedora 38+, etc.
+- **Linux** (glibc 2.35+): Ubuntu 24.04 LTS, Ubuntu 22.04 LTS, Debian 12, Fedora 38+, etc.
 - **WSL** (Windows Subsystem for Linux) via Ubuntu/Debian base
 
 **Not supported:**
