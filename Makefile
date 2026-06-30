@@ -16,12 +16,24 @@ RELEASE  = target/release/$(BIN)
 DEST     = $(BINDIR)/$(BIN)
 UNAME_S := $(shell uname -s)
 
-.PHONY: all build install sign uninstall clean register-shell worker-image worker-image-multiarch
+.PHONY: all build test test-local install sign uninstall clean register-shell worker-image worker-image-multiarch
 
 all: build
 
 build:
 	$(CARGO) build --release
+
+# Test build policy: mistralrs-core (the `local` in-process model) is dropped
+# from test builds by default — it's huge, slow to compile, and irrelevant to
+# the unit/oracle/pty suites. Run `make test-local` (or
+# `cargo test --features local`) only when you explicitly need to exercise the
+# local-inference path. This mirrors the CI gate (.github/workflows/ci.yml).
+test:
+	$(CARGO) test --no-default-features $(CARGO_TEST_ARGS)
+
+# Opt back in to the mistralrs-backed local-inference path for tests.
+test-local:
+	$(CARGO) test --features local $(CARGO_TEST_ARGS)
 
 # Build, copy onto PATH, then re-sign (macOS). Depends on `build` so the
 # binary is always current.

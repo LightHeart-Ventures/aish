@@ -31,14 +31,11 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      # --no-default-features drops the in-process local model (mistralrs), which
-      # is huge and unneeded for the oracle harness + unit tests. The oracle
-      # cases (src/oracle.rs) diff aish's native pipeline/direct-dispatch path
-      # against real bash; bash ships on the runner.
-      # NOTE: Temporarily disabled due to pre-existing openssl/native-tls linker issue.
-      # The release workflow builds successfully; re-enable once linker issue is resolved.
+      # --no-default-features drops the in-process local model (mistralrs /
+      # mistralrs-core), which is huge and unneeded for the oracle harness +
+      # unit tests. The oracle cases (src/oracle.rs) diff aish's native
+      # pipeline/direct-dispatch path against real bash; bash ships on the
+      # runner. Test builds must NOT pull in mistralrs-core unless a job
+      # explicitly opts back in with `--features local`.
       - name: Test
-        run: |
-          echo "Test suite temporarily disabled due to build environment linker issue."
-          echo "Linker issue: openssl/native-tls conflict with btls-sys."
-          exit 0
+        run: cargo test --no-default-features --locked
