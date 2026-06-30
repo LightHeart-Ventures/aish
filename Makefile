@@ -16,12 +16,37 @@ RELEASE  = target/release/$(BIN)
 DEST     = $(BINDIR)/$(BIN)
 UNAME_S := $(shell uname -s)
 
-.PHONY: all build test test-local install sign uninstall clean register-shell worker-image worker-image-multiarch
+# Cross-worktree build serialization (OOM mitigation #2).
+# Many background-coordinator worktrees can share one host; an unbounded set of
+# concurrent `cargo build`s overcommits RAM and trips the kernel OOM-killer (the
+# per-build `jobs` cap in .cargo/config.toml only bounds ONE build's parallelism,
+# not the number of builds running at once). A single advisory file lock bounds
+# *cross-build* concurrency to 1 — each build still uses up to `jobs` cores
+# internally, but only one worktree compiles at a time. flock is util-linux
+# (Linux only); on macOS / hosts without it, LOCKED collapses to a no-op prefix.
+BUILD_LOCK ?= /tmp/aish-build.lock
+FLOCK      := $(shell command -v flock 2>/dev/null)
+ifeq ($(FLOCK),)
+LOCKED      =
+else
+LOCKED      = $(FLOCK) $(BUILD_LOCK)
+endif
+
+.PHONY: all build build-fast test test-local install sign uninstall clean register-shell worker-image worker-image-multiarch
 
 all: build
 
 build:
-	$(CARGO) build --release
+	$(LOCKED) $(CARGO) build --release
+
+# Fast, Claude-only build (OOM mitigation #1): drops the heavy `local`
+# (mistralrs / candle / gemm) feature entirely — the whole opt-level=3 phase and
+# the crate that peaks past 1.5 GB per rustc — so coordinator / CI / worktree
+# rebuilds that never touch local inference compile a fraction of the graph.
+# Serialized across worktrees like every other build target here. Equivalent to
+# `scripts/build.sh --release`.
+build-fast:
+	$(LOCKED) $(CARGO) build --release --no-default-features
 
 # Test build policy: mistralrs-core (the `local` in-process model) is dropped
 # from test builds by default — it's huge, slow to compile, and irrelevant to
@@ -29,11 +54,11 @@ build:
 # `cargo test --features local`) only when you explicitly need to exercise the
 # local-inference path. This mirrors the CI gate (.github/workflows/ci.yml).
 test:
-	$(CARGO) test --no-default-features $(CARGO_TEST_ARGS)
+	$(LOCKED) $(CARGO) test --no-default-features $(CARGO_TEST_ARGS)
 
 # Opt back in to the mistralrs-backed local-inference path for tests.
 test-local:
-	$(CARGO) test --features local $(CARGO_TEST_ARGS)
+	$(LOCKED) $(CARGO) test --features local $(CARGO_TEST_ARGS)
 
 # Build, copy onto PATH, then re-sign (macOS). Depends on `build` so the
 # binary is always current.

@@ -202,11 +202,18 @@ impl ClaudeBackend {
 
     async fn post_with_retry(&self, body: &Value) -> Result<Value> {
         // A headless coordinator can run for many minutes; a transient
-        // `Connection reset by peer` / timeout burst must not be fatal and lose
-        // all progress. Retry generously (6 attempts) with exponential backoff,
-        // but cap each sleep at MAX_DELAY so the total wait stays bounded.
-        const MAX_ATTEMPTS: u32 = 6;
-        const MAX_DELAY: Duration = Duration::from_secs(30);
+        // `Connection reset by peer` / timeout burst — or a 429 rate-limit
+        // window — must not be fatal and lose all progress. A rate limit that
+        // outlives our retry budget bubbles up, fails the turn, and ends the
+        // coordinator run; resuming a *terminal* run then spawns a brand-new
+        // worker (a fresh `w_…`). Riding the limit out HERE keeps the same
+        // worker alive instead. Retry generously with exponential backoff, cap
+        // each sleep at MAX_DELAY, and on 429 honor the server's `Retry-After`
+        // (capped at RATE_LIMIT_MAX_DELAY) since its window routinely exceeds
+        // the exponential cap.
+        const MAX_ATTEMPTS: u32 = 8;
+        const MAX_DELAY: Duration = Duration::from_secs(60);
+        const RATE_LIMIT_MAX_DELAY: Duration = Duration::from_secs(90);
         let mut delay = Duration::from_secs(2);
         for attempt in 0..MAX_ATTEMPTS {
             let last = attempt + 1 == MAX_ATTEMPTS;
@@ -219,6 +226,16 @@ impl ClaudeBackend {
 
             match resp {
                 Ok(r) => {
+                    // Capture Retry-After BEFORE the body is consumed — Anthropic
+                    // sends it on 429s and its window (often 60s) routinely
+                    // exceeds our exponential cap. Honoring it lets this worker
+                    // ride out the rate limit instead of exhausting retries.
+                    let retry_after = r
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|h| h.to_str().ok())
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .map(Duration::from_secs);
                     // Decode to text first so a non-JSON gateway/edge body (502/503
                     // HTML, empty body, Cloudflare page) is a retryable signal, not a
                     // fatal decode error that stops the worker. See
@@ -281,8 +298,19 @@ please refresh your token with `claude setup-token`"
                     // Retry only what's retryable: rate limits (429) and 5xx.
                     // Other 4xx (bad request, auth, …) fail fast — retrying can't help.
                     if (status == 429 || status >= 500) && !last {
-                        eprintln!("\x1b[2m  api {kind} ({status}), retrying…\x1b[0m");
-                        tokio::time::sleep(delay).await;
+                        // On 429, prefer the server-advertised Retry-After (capped
+                        // so a pathological value can't park the worker forever);
+                        // otherwise fall back to the exponential backoff.
+                        let wait = if status == 429 {
+                            retry_after.unwrap_or(delay).min(RATE_LIMIT_MAX_DELAY)
+                        } else {
+                            delay
+                        };
+                        eprintln!(
+                            "\x1b[2m  api {kind} ({status}), retrying in {}s…\x1b[0m",
+                            wait.as_secs()
+                        );
+                        tokio::time::sleep(wait).await;
                         delay = (delay * 2).min(MAX_DELAY);
                         continue;
                     }
