@@ -52,6 +52,40 @@ jobs:
           fi
         shell: bash
 
+      # Fail FAST (before the multi-minute cross-target builds) if a *published*
+      # GitHub Release already exists for this tag. GitHub immutable releases
+      # freeze a release the moment it is published: its metadata can't be
+      # updated AND no assets can be attached afterwards (HTTP 422 "Cannot upload
+      # assets to an immutable release"). So if someone pre-publishes a bare
+      # release out-of-band (e.g. `gh release create v$tag --notes ...` from a
+      # local release script), the `publish release` job below cannot attach the
+      # per-platform binaries that `:update` (src/update.rs) depends on — it dies
+      # 4 minutes in with the cryptic "target_commitish cannot be changed when
+      # release is immutable". This guard turns that into an instant, actionable
+      # failure. A pre-existing *draft* is fine: drafts stay mutable, so the
+      # softprops step uploads assets and publishes it. The happy path (no
+      # release exists yet) passes straight through — the workflow creates and
+      # publishes the release itself, with assets, in one shot.
+      - name: Assert no published release already exists for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft 2>/dev/null || true)"
+          if [ -z "$json" ]; then
+            echo "No existing release for $tag — this workflow will create and publish it. OK."
+            exit 0
+          fi
+          is_draft="$(echo "$json" | jq -r '.isDraft')"
+          if [ "$is_draft" = "true" ]; then
+            echo "A DRAFT release exists for $tag — drafts are mutable, so the publish job will upload assets and publish it. OK."
+            exit 0
+          fi
+          echo "::error::A PUBLISHED release already exists for $tag. GitHub immutable releases cannot receive assets after publishing, so this workflow cannot attach the binaries that ':update' needs — it would fail with 'target_commitish cannot be changed when release is immutable'. Do NOT pre-publish the release: let this workflow create it, or pre-create it as a DRAFT. To recover this tag: delete the release AND the tag, then re-push the tag so this workflow recreates it with assets (or bump the version)."
+          exit 1
+        shell: bash
+
   build:
     name: build ${{ matrix.target }}
     needs: verify-version
