@@ -707,6 +707,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("memories", "stored memories / organize"),
     ("mode", "set confirmation level"),
     ("model", "switch model (opus|sonnet|haiku)"),
+    ("model-detect", "pick the best local model for this machine"),
     ("new", "clear conversation history"),
     ("output", "stream coordinators' activity"),
     ("quit", "exit aish"),
@@ -3525,6 +3526,30 @@ const WORKERS_TABLE_HEADER: &str =
     "| Worker | Session | Status | Started | Runtime | Doing | Result |\n|---|---|---|---|---|---|---|\n";
 
 /// Returns true when the REPL should exit.
+/// Is the active backend the local llama.cpp backend? (Always false without the
+/// `local` feature, where `Backend::Local` doesn't exist.)
+#[cfg(feature = "local")]
+fn is_local_backend(backend: &Backend) -> bool {
+    matches!(backend, Backend::Local(_))
+}
+#[cfg(not(feature = "local"))]
+fn is_local_backend(_backend: &Backend) -> bool {
+    false
+}
+
+/// Rebuild the local backend in place so a freshly-detected model selection
+/// takes effect. No-op stub without the `local` feature.
+#[cfg(feature = "local")]
+fn rebuild_local_backend(backend: &mut Backend, session: &mut Session) -> anyhow::Result<()> {
+    *backend = Backend::new_local()?;
+    session.backend_kind = backend.kind().to_string();
+    Ok(())
+}
+#[cfg(not(feature = "local"))]
+fn rebuild_local_backend(_backend: &mut Backend, _session: &mut Session) -> anyhow::Result<()> {
+    anyhow::bail!("built without the 'local' feature")
+}
+
 async fn handle_colon(
     cmd: &str,
     backend: &mut Backend,
@@ -3583,6 +3608,7 @@ async fn handle_colon(
                  :mode <paranoid|careful|normal|yolo> confirmation level (paranoid asks for everything,\n\
                                                      normal only for write/create/delete, yolo never)\n\
                  :model <opus|sonnet|haiku|full-id>  switch model\n\
+                 :model-detect                       re-detect + select the best local model for this machine\n\
                  :backend <claude|grok|local>        switch backend\n\
                  :mcp [list|status]                  list connected MCP servers\n\
                  :mcp reconnect [name|all]           restart MCP server(s)\n\
@@ -4039,6 +4065,25 @@ async fn handle_colon(
             }
             None => println!("{}", backend.describe()),
         },
+        Some("model-detect") => {
+            // Re-run hardware detection, pick + persist the best-fitting local
+            // model, and export the AISH_LOCAL_* hints. An operator pin (env /
+            // --model) wins and is simply reported. If we're already on the
+            // local backend, rebuild it so the new selection takes effect.
+            match crate::hwdetect::ensure_selected(true, None) {
+                Ok(sel) => {
+                    crate::hwdetect::apply_env(&sel);
+                    println!("{}", crate::hwdetect::report(&sel));
+                    if is_local_backend(backend) {
+                        match rebuild_local_backend(backend, session) {
+                            Ok(()) => println!("backend → {}", backend.describe()),
+                            Err(e) => println!("can't reload local backend: {e:#}"),
+                        }
+                    }
+                }
+                Err(e) => eprintln!("\x1b[31maish:\x1b[0m local model detection failed: {e:#}"),
+            }
+        }
         Some("backend") => match parts.next() {
             Some("claude") => {
                 if matches!(backend, Backend::Claude(_)) {
@@ -4078,12 +4123,26 @@ async fn handle_colon(
                 if matches!(backend, Backend::Local(_)) {
                     println!("already on {}", backend.describe());
                 } else {
-                    *backend = Backend::new_local();
-                    session.backend_kind = backend.kind().to_string();
-                    println!(
-                        "backend → {} (loads on first use; MCP tools off — they don't fit a small context window)",
-                        backend.describe()
-                    );
+                    // First switch to local on a machine that's never been
+                    // profiled? Detect hardware and pick the best-fitting local
+                    // model (operator env pins win; never overridden).
+                    match crate::hwdetect::ensure_selected(false, None) {
+                        Ok(sel) => {
+                            crate::hwdetect::apply_env(&sel);
+                            println!("{}", crate::hwdetect::short_line(&sel));
+                        }
+                        Err(e) => eprintln!(
+                            "\x1b[33maish:\x1b[0m local model detection failed: {e:#}"
+                        ),
+                    }
+                    match Backend::new_local() {
+                        Ok(b) => {
+                            *backend = b;
+                            session.backend_kind = backend.kind().to_string();
+                            println!("backend → {}", backend.describe());
+                        }
+                        Err(e) => println!("can't switch: {e:#}"),
+                    }
                 }
             }
             #[cfg(not(feature = "local"))]
@@ -4133,13 +4192,6 @@ async fn handle_colon(
         Some("context") => handle_context(backend, session),
         Some("compact") => handle_compact(backend, session),
         Some("memories" | "memory") => handle_memories(parts.next(), session),
-        Some("version" | "ver") => {
-            println!(
-                "\x1b[1maish\x1b[0m \x1b[2mv{}\x1b[0m — {}",
-                crate::update::current_version(),
-                backend.describe()
-            );
-        }
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
     }
@@ -5229,13 +5281,16 @@ mod tests {
                 .map(|p| p.replacement.trim_start_matches(':').trim_end().to_string())
                 .collect::<Vec<_>>()
         };
-        // commands starting with 'm': mcp, mode, model.
-        assert_eq!(names("m"), vec!["mcp", "memories", "mode", "model"]);
-        // typing m -> o -> d -> e -> l narrows mcp/mode/model down to just model
-        assert_eq!(names("mo"), vec!["mode", "model"]);
-        assert_eq!(names("mod"), vec!["mode", "model"]);
-        assert_eq!(names("mode"), vec!["mode", "model"]);
-        assert_eq!(names("model"), vec!["model"]);
+        // commands starting with 'm': mcp, mode, model, model-detect.
+        assert_eq!(
+            names("m"),
+            vec!["mcp", "memories", "mode", "model", "model-detect"]
+        );
+        // typing m -> o -> d -> e -> l narrows down to model/model-detect
+        assert_eq!(names("mo"), vec!["mode", "model", "model-detect"]);
+        assert_eq!(names("mod"), vec!["mode", "model", "model-detect"]);
+        assert_eq!(names("mode"), vec!["mode", "model", "model-detect"]);
+        assert_eq!(names("model"), vec!["model", "model-detect"]);
         // a char that matches nothing yields an empty set (menu closes / beeps).
         assert!(names("modez").is_empty());
     }
@@ -5247,7 +5302,7 @@ mod tests {
         assert_eq!(start, 0);
         // `mode` and `model` both match `mo`.
         let repls: Vec<&str> = pairs.iter().map(|p| p.replacement.as_str()).collect();
-        assert_eq!(repls, vec![":mode ", ":model "]);
+        assert_eq!(repls, vec![":mode ", ":model ", ":model-detect "]);
         // The display carries the description; the replacement does not.
         assert!(pairs[0].display.starts_with(":mode"));
         assert!(pairs[0].display.contains("confirmation"));
