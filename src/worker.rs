@@ -177,6 +177,16 @@ fn strip_sentinel(raw: &str, mark: &str) -> Option<String> {
     (!rest.is_empty()).then(|| rest.to_string())
 }
 
+/// A coordinator's `message_console` note: the `📣` sentinel line emitted by the
+/// `message_console` tool (see `tools::message_console`). Unlike every other
+/// forwarded line, a console message ALWAYS reaches the operator's terminal — it
+/// bypasses the `:worker-output` suppression gate — so the stream loop matches it
+/// FIRST, before the normal forward/suppress logic. Returns the cleaned note text
+/// after the sentinel, or `None`. Pure → unit-testable without a pipe.
+fn console_message(raw: &str) -> Option<String> {
+    strip_sentinel(raw, "📣")
+}
+
 /// Decide what (if anything) to forward to the user's terminal for ONE raw
 /// coordinator-stderr line, given whether `:worker-output` is on. Returns the
 /// cleaned text to announce as `[label] text`, or `None` to drop the line. Pure
@@ -291,6 +301,18 @@ pub fn pane_replay_header(short: &str) -> String {
 /// `[label]` gutter. Pure — unit-tested.
 pub fn pane_input_row(label: &str, task: &str) -> String {
     pane_row(label, &format!("\x1b[1m💬 task: {task}\x1b[0m"))
+}
+
+/// Frame a coordinator's `message_console` note for the operator's terminal.
+/// Unlike the dim `:output` pane rows — which are gated behind `:worker-output`
+/// and styled as quiet chrome — a console message is ALWAYS shown the instant the
+/// coordinator sends it, so it is styled to STAND OUT and read unmistakably as a
+/// direct message from that worker: a bright 📣 megaphone, the worker's `[label]`,
+/// and the note itself. Carries no pane border (it is deliberately NOT part of
+/// the contained activity stream — it's an out-of-band interjection). Pure —
+/// unit-tested.
+pub fn console_row(label: &str, text: &str) -> String {
+    format!("\x1b[1;36m📣 [{label}]\x1b[0m {text}")
 }
 
 /// Stream a child's stderr line by line, forwarding the interesting lines to the
@@ -432,6 +454,24 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
     // interactive thinking spinner that animates then vanishes when output begins.
     let mut thinking: Option<ThinkingSpinner> = None;
     while let Ok(Some(line)) = lines.next_line().await {
+        // A `message_console` note (📣) is the coordinator's ONE always-surfaced
+        // channel: it reaches the operator's terminal IMMEDIATELY, bypassing the
+        // `:worker-output` suppression gate entirely. Match it FIRST, before the
+        // normal forward/suppress logic. Tear down any in-flight thinking spinner
+        // so the note lands on a clean line, print it with its distinct console
+        // framing, retain it in the failure tail, and move on — it is never
+        // routed through `forward_decision` (which would drop it when output is off).
+        if let Some(note) = console_message(&line) {
+            if let Some(spin) = thinking.take() {
+                spin.stop();
+            }
+            crate::tools::announce_raw(&console_row(label, &note));
+            if tail.len() == STDERR_TAIL_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+            continue;
+        }
         // Drive the prompt-badge pulse from EVERY line (independent of the
         // `:worker-output` forwarding gate) so the badge colour-pulses even when
         // the verbose stream is suppressed — the badge is the quiet liveness cue.

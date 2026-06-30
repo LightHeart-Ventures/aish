@@ -21,6 +21,9 @@
 
 ## [Unreleased]
 
+### Added
+- **Serialized, Claude-only build path for coordinator / CI / multi-worktree rebuilds** (`scripts/build.sh`, `make build-fast`): two OOM mitigations bundled so every automated rebuild inherits them. (1) `--no-default-features` drops the heavy `local` (mistralrs / candle / gemm) feature — the whole opt-level=3 phase and the crate that peaks past 1.5 GB per rustc — wherever in-process inference isn't needed (already the policy in CI, release, and the Ubuntu installer; `make build-fast` and `scripts/build.sh` bring it to the local/coordinator path too). (2) A single advisory file lock — `flock /tmp/aish-build.lock` — serializes builds so the dozens of background-coordinator worktrees on one host can't overcommit RAM at once; the `.cargo/config.toml` `jobs` cap only bounds ONE build's internal parallelism, this bounds *cross-build* concurrency to 1. Every `make` build/test target now takes the lock (`LOCKED` prefix, a no-op on hosts without `flock` such as macOS). Pass `--features local` / `make` `test-local` to opt local inference back in.
+
 ### Changed
 - **Test builds drop `mistralrs-core` by default**: the CI `Test` job and the new `make test` target both run `cargo test --no-default-features`, so the heavy `local` in-process model (mistralrs / mistralrs-core / candle) is no longer compiled for the unit/oracle/pty suites unless a build explicitly opts back in. Exercise the local-inference path on demand with `make test-local` or `cargo test --features local`. The CI `Test` step (previously a stubbed `exit 0` over a since-resolved openssl/btls linker note) is re-enabled now that `cargo test --no-default-features` links cleanly.
 
