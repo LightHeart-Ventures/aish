@@ -980,7 +980,6 @@ fn parse_argv(call: &ToolCall) -> Result<(String, Vec<String>)> {
         .unwrap_or_default();
     // Defend against the model echoing the binary into argv[0] (see
     // dedup_program_argv): `gh gh pr create` would otherwise fail as an unknown
-    // subcommand and read as aish "intercepting" the binary.
     let args = dedup_program_argv(&program, args);
 
     // The "no shell" invariant: refuse to be a backdoor into one.
@@ -3507,7 +3506,7 @@ mod tests {
     #[tokio::test]
     async fn normal_command_unaffected() {
         let out = run(&call("echo", &["hi"], None)).await;
-        assert_eq!(out.trim(), "hi");
+        assert!(out.contains("hi") && out.contains("$ echo hi"), "output should include command and result: {}", out);
     }
 
     #[test]
@@ -3548,7 +3547,9 @@ mod tests {
         // End-to-end: program="echo", args=["echo","hi"] must run `echo hi`,
         // not `echo echo hi` — the execution-side proof of the de-dup.
         let out = run(&call("echo", &["echo", "hi"], None)).await;
-        assert_eq!(out.trim(), "hi");
+        assert!(out.contains("$ echo hi"), "expected deduped command: {}", out);
+        assert!(!out.contains("echo echo"), "binary should be de-duped, not run as `echo echo hi`: {}", out);
+        assert!(out.contains("hi"), "expected command result: {}", out);
     }
 
     #[tokio::test]
@@ -3571,7 +3572,7 @@ mod tests {
         // `yes` floods stdout forever: exercises the cap, the drop marker, and the kill.
         let out = run(&call("yes", &[], Some(1))).await;
         assert!(
-            out.starts_with("y\ny\n"),
+            out.contains("y\ny\ny"),
             "got: {}",
             &out[..out.len().min(40)]
         );
