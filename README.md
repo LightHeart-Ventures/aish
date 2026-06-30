@@ -169,6 +169,17 @@ cargo build --release
 ./target/release/aish --version
 ```
 
+**Coordinator / CI / multi-worktree build (serialized, Claude-only):**
+```sh
+scripts/build.sh --release        # = flock /tmp/aish-build.lock cargo build --release --no-default-features
+```
+`scripts/build.sh` bundles the two OOM mitigations for automated rebuilds:
+(1) `--no-default-features` drops the heavy `local` (mistralrs) phase wherever
+in-process inference isn't needed, and (2) a single `flock /tmp/aish-build.lock`
+serializes builds so dozens of background-coordinator worktrees can't overcommit
+RAM at once. `make build-fast` is the same thing; every `make` build/test target
+takes the lock too. Pass `--features local` to opt local inference back in.
+
 **One-shot command:**
 ```sh
 cargo run --release -- -c "who is alan turing"
