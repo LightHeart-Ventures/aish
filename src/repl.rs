@@ -2552,10 +2552,33 @@ fn print_attached_result(run_id: &str, session: &Session) {
         .find(|w| w.id == *run_id)
         .cloned();
     if let Some(job) = job {
-        println!(
-            "{}",
-            crate::worker::pane_row(run_id, &format!("·result {}", job.fetch()))
-        );
+        // The coordinator's FINAL answer is multi-line markdown. Render it for
+        // the terminal (the parent REPL is interactive → ANSI) and emit it as
+        // ONE pane row PER LINE so every line carries the `┃ [label]` border and
+        // stays INSIDE the contained `:output` pane. Previously the whole blob
+        // was handed to a single `pane_row`, so only the first physical line got
+        // the border + `·result` gutter and every continuation line fell outside
+        // the pane — the operator saw the result "cut off" after the first line
+        // (e.g. only `·result Diagnosis complete. …` with the rest of the
+        // markdown missing). Splitting per line is the same shape
+        // `backfill_attached` uses for the streamed activity rows.
+        let rendered = crate::md::render_stdout(job.fetch().trim());
+        let mut lines = rendered.split('\n');
+        match lines.next() {
+            Some(first) => {
+                println!(
+                    "{}",
+                    crate::worker::pane_row(run_id, &format!("·result {first}"))
+                );
+                for line in lines {
+                    println!("{}", crate::worker::pane_row(run_id, line));
+                }
+            }
+            None => println!(
+                "{}",
+                crate::worker::pane_row(run_id, "·result (empty result)")
+            ),
+        }
     }
 }
 
