@@ -687,7 +687,6 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("model", "switch model (opus|sonnet|haiku)"),
     ("new", "clear conversation history"),
     ("output", "stream coordinators' activity"),
-    ("quit", "exit aish"),
     ("rename", "rename this session"),
     ("result", "view a finished job's result"),
     (
@@ -3527,7 +3526,6 @@ async fn handle_colon(
 ) -> bool {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
-        Some("q" | "quit" | "exit") => return true,
         Some("help") => {
             println!(
                 "type a command (first word in PATH) to run it directly — anything else goes to the model\n\
@@ -3577,8 +3575,7 @@ async fn handle_colon(
                  a at a prompt                       always-allow this tool (see :allow)\n\
                  d at a read/write/delete prompt     allow that permission for the whole dir, recursively\n\
                  Ctrl-O                              toggle raw tool output (show/squelch tool results)\n\
-                 Shift-Tab                           cycle attach across all coordinators incl. finished/failed, newest first (interactive → newest → … → oldest → back)\n\
-                 :quit                               exit (also Ctrl-D or `exit`)"
+                 Shift-Tab                           cycle attach across all coordinators incl. finished/failed, newest first (interactive → newest → … → oldest → back)"
             );
         }
         Some("version" | "ver") => {
