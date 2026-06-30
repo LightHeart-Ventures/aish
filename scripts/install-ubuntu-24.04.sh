@@ -47,6 +47,8 @@ sudo apt-get update -qq
 sudo apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
+    clang \
+    libclang-dev \
     git \
     ca-certificates \
     curl \
@@ -64,7 +66,7 @@ if ! command -v cargo &> /dev/null; then
 fi
 # Bring cargo/rustc onto PATH for the rest of this script
 [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
-rustup update stable --quiet 2>/dev/null || true
+rustup --quiet update stable 2>/dev/null || true
 echo -e "${GREEN}✓${NC} Rust $(rustc --version | awk '{print $2}')"
 echo ""
 
