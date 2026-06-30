@@ -378,6 +378,15 @@ pub async fn drive(
     run_id: &str,
     store: Option<&CoordinatorStore>,
 ) -> Outcome {
+    // Pin the verbatim task into the system prompt so it survives every history
+    // compaction for the whole run (see `Session::task_anchor`). The first turn's
+    // `next_input` below also carries the task, but that message is conversational
+    // history — the earliest thing `crate::context` offloads when the window fills
+    // — after which only a "[Context compacted: …]" banner remains. The anchored
+    // copy lives in the never-compacted system prompt, so the worker keeps its
+    // assignment in front of it no matter how long it runs.
+    session.task_anchor = Some(input.clone());
+
     if let Some(s) = store {
         // session.session_id/name were adopted from the LAUNCHING session at
         // startup (see main.rs), so the row attributes to who asked for the work.
