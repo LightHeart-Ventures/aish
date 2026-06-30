@@ -33,7 +33,7 @@ echo -e "${YELLOW}[1/5]${NC} Verifying Ubuntu 24.04 LTS..."
 if ! grep -q "noble" /etc/os-release 2>/dev/null; then
     if ! grep -q "24.04" /etc/os-release 2>/dev/null; then
         echo -e "${YELLOW}⚠️  This system may not be Ubuntu 24.04 LTS${NC}"
-        echo "    (It may still work with Ubuntu 20.04+ or Debian 12+)"
+        echo "    (It may still work with Ubuntu 22.04+ or Debian 12+)"
         read -p "Continue anyway? (y/n) " -n 1 -r; echo
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 1; fi
     fi
