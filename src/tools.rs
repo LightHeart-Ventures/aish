@@ -3498,7 +3498,7 @@ mod tests {
     #[tokio::test]
     async fn normal_command_unaffected() {
         let out = run(&call("echo", &["hi"], None)).await;
-        assert!(out.contains("hi") && out.contains("$ echo hi"), "output should include command and result: {}", out);
+        assert_eq!(out.trim(), "hi");
     }
 
     #[test]
@@ -3539,9 +3539,7 @@ mod tests {
         // End-to-end: program="echo", args=["echo","hi"] must run `echo hi`,
         // not `echo echo hi` — the execution-side proof of the de-dup.
         let out = run(&call("echo", &["echo", "hi"], None)).await;
-        assert!(out.contains("$ echo hi"), "expected deduped command: {}", out);
-        assert!(!out.contains("echo echo"), "binary should be de-duped, not run as `echo echo hi`: {}", out);
-        assert!(out.contains("hi"), "expected command result: {}", out);
+        assert_eq!(out.trim(), "hi");
     }
 
     #[tokio::test]
@@ -3564,7 +3562,7 @@ mod tests {
         // `yes` floods stdout forever: exercises the cap, the drop marker, and the kill.
         let out = run(&call("yes", &[], Some(1))).await;
         assert!(
-            out.contains("y\ny\ny"),
+            out.starts_with("y\ny\n"),
             "got: {}",
             &out[..out.len().min(40)]
         );
