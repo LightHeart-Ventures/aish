@@ -1057,7 +1057,41 @@ fn describe_call(call: &crate::backend::ToolCall) -> String {
             a["path"].as_str().unwrap_or("?"),
             a["content"].as_str().map(str::len).unwrap_or(0)
         ),
+        "edit_file" => format!(
+            "edit {} ({:?})",
+            a["path"].as_str().unwrap_or("?"),
+            a["pattern"].as_str().unwrap_or("?")
+        ),
+        "append_file" => format!(
+            "append {} ({} bytes)",
+            a["path"].as_str().unwrap_or("?"),
+            a["content"].as_str().map(str::len).unwrap_or(0)
+        ),
+        "copy_file" => format!(
+            "copy {} → {}",
+            a["src"].as_str().unwrap_or("?"),
+            a["dst"].as_str().unwrap_or("?")
+        ),
+        "rename_file" => format!(
+            "rename {} → {}",
+            a["src"].as_str().unwrap_or("?"),
+            a["dst"].as_str().unwrap_or("?")
+        ),
         "list_dir" => format!("list {}", a["path"].as_str().unwrap_or(".")),
+        "glob_expand" => match a["path"].as_str().filter(|p| !p.is_empty()) {
+            Some(p) => format!("glob {} in {p}", a["pattern"].as_str().unwrap_or("?")),
+            None => format!("glob {}", a["pattern"].as_str().unwrap_or("?")),
+        },
+        "grep_files" => format!(
+            "grep {:?} in {}",
+            a["pattern"].as_str().unwrap_or("?"),
+            a["path"].as_str().unwrap_or(".")
+        ),
+        "stat_file" => format!("stat {}", a["path"].as_str().unwrap_or("?")),
+        "diff_files" => match a["b"].as_str().filter(|b| !b.is_empty()) {
+            Some(b) => format!("diff {} {b}", a["a"].as_str().unwrap_or("?")),
+            None => format!("diff {} (inline)", a["a"].as_str().unwrap_or("?")),
+        },
         "change_dir" => format!("cd {}", a["path"].as_str().unwrap_or("?")),
         "remember" => format!("remember: {}", a["content"].as_str().unwrap_or("?")),
         "recall" => format!("recall: {}", a["query"].as_str().unwrap_or("(recent)")),
@@ -1066,6 +1100,23 @@ fn describe_call(call: &crate::backend::ToolCall) -> String {
             crate::batch::one_line(a["task"].as_str().unwrap_or("?"))
         ),
         "background_status" => "background status".to_string(),
+        "job_output" => format!(
+            "job output: {}",
+            a["job"]
+                .as_u64()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".into())
+        ),
+        "get_skill" => format!(
+            "skill {}/{}",
+            a["server"].as_str().unwrap_or("?"),
+            a["name"].as_str().unwrap_or("?")
+        ),
+        "tell" => format!(
+            "tell {}: {}",
+            a["id"].as_str().unwrap_or("?"),
+            crate::batch::one_line(a["message"].as_str().unwrap_or("?"))
+        ),
         "escalate" => format!(
             "escalate: {}",
             crate::batch::one_line(a["task"].as_str().unwrap_or("?"))
@@ -1233,6 +1284,59 @@ mod tests {
             "done line should be green-checked: {done}"
         );
         assert!(done.contains("🤝"), "done line keeps the handshake: {done}");
+    }
+
+    #[test]
+    fn describe_call_names_target_for_internal_tools() {
+        let d = |name: &str, args: serde_json::Value| {
+            describe_call(&crate::backend::ToolCall {
+                id: "t".into(),
+                name: name.into(),
+                args,
+            })
+        };
+        use serde_json::json;
+        assert_eq!(d("read_file", json!({"path": "a.rs"})), "read a.rs");
+        assert_eq!(
+            d("edit_file", json!({"path": "a.rs", "pattern": "foo"})),
+            "edit a.rs (\"foo\")"
+        );
+        assert_eq!(
+            d("append_file", json!({"path": "log.txt", "content": "hi"})),
+            "append log.txt (2 bytes)"
+        );
+        assert_eq!(d("copy_file", json!({"src": "a", "dst": "b"})), "copy a → b");
+        assert_eq!(
+            d("rename_file", json!({"src": "a", "dst": "b"})),
+            "rename a → b"
+        );
+        assert_eq!(d("glob_expand", json!({"pattern": "*.rs"})), "glob *.rs");
+        assert_eq!(
+            d("glob_expand", json!({"pattern": "*.rs", "path": "src"})),
+            "glob *.rs in src"
+        );
+        assert_eq!(
+            d("grep_files", json!({"pattern": "TODO", "path": "src"})),
+            "grep \"TODO\" in src"
+        );
+        assert_eq!(
+            d("grep_files", json!({"pattern": "TODO"})),
+            "grep \"TODO\" in ."
+        );
+        assert_eq!(d("stat_file", json!({"path": "a.rs"})), "stat a.rs");
+        assert_eq!(d("diff_files", json!({"a": "x", "b": "y"})), "diff x y");
+        assert_eq!(d("diff_files", json!({"a": "x"})), "diff x (inline)");
+        assert_eq!(d("job_output", json!({"job": 3})), "job output: 3");
+        assert_eq!(
+            d("get_skill", json!({"server": "atum", "name": "review-pr"})),
+            "skill atum/review-pr"
+        );
+        assert_eq!(
+            d("tell", json!({"id": "w_abc", "message": "narrow scope"})),
+            "tell w_abc: narrow scope"
+        );
+        // An unmapped tool still falls back to its bare name.
+        assert_eq!(d("mystery_tool", json!({})), "mystery_tool");
     }
 
     #[test]
