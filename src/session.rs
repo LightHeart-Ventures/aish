@@ -211,6 +211,18 @@ pub struct Session {
     /// the next turn (one-shot), so a later command's output can still seed a
     /// genuinely fresh prompt. Session-local, never persisted.
     pub suppress_context_seed: bool,
+    /// The verbatim assignment a background coordinator was launched with, PINNED
+    /// into the system prompt so it survives every history compaction. A
+    /// long-running worker compacts its oldest turns to free context (see
+    /// `crate::context`), and the original task message is the FIRST thing
+    /// dropped — after which the worker only sees a "[Context compacted: …]"
+    /// banner and can lose track of what it was doing (the banner even recurses
+    /// into itself across repeated compactions). The system prompt is rebuilt
+    /// every turn and is NEVER compacted, so anchoring the task here keeps it in
+    /// front of the model for the whole run regardless of how much history is
+    /// offloaded. Set by `coordinator::drive` at startup; always `None` for an
+    /// interactive session (whose conversation has no single fixed task).
+    pub task_anchor: Option<String>,
 }
 
 impl Session {
@@ -255,6 +267,7 @@ impl Session {
             output_json: false,
             hooks: crate::hooks::HookSet::empty(),
             suppress_context_seed: false,
+            task_anchor: None,
         })
     }
 
@@ -488,7 +501,7 @@ matter — aish renders these as aligned terminal tables. Be verbose with column
 terse, and order the rows deliberately: chronological for events or history, by stage for \
 pipelines or build/run phases, by category for mixed or grouped sets.\n\
 - Final replies are terse and shell-like. One line when one line will do, but reach for a table \
-the moment there are several items to compare. No markdown headers.{skills}{batch}{escalate}",
+the moment there are several items to compare. No markdown headers.{skills}{batch}{escalate}{task}",
             host = self.host_info,
             cwd = self.cwd.display(),
             skills = self.skills_prompt,
@@ -498,6 +511,11 @@ the moment there are several items to compare. No markdown headers.{skills}{batc
             } else {
                 ""
             },
+            task = self
+                .task_anchor
+                .as_deref()
+                .map(task_anchor_block)
+                .unwrap_or_default(),
         )
     }
 }
@@ -509,6 +527,24 @@ fn default_skills_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
         .join(".aish")
         .join("skills")
+}
+
+/// Render the PINNED-task block appended to a background coordinator's system
+/// prompt (see [`Session::task_anchor`]). Lives in the system prompt — never
+/// compacted — so the worker's original assignment stays in front of the model
+/// for the entire run, even after its earliest turns (including the task message
+/// itself) have been offloaded by [`crate::context`]. The wording tells the
+/// model this is the authoritative copy to fall back on whenever a compaction
+/// banner has displaced the conversational history.
+fn task_anchor_block(task: &str) -> String {
+    format!(
+        "\n\nYOUR ASSIGNED TASK (verbatim, pinned — this is your single source of truth). You are a \
+background coordinator working to complete exactly this; it is reproduced here because your \
+conversation history is periodically compacted to free context, and when that happens the original \
+task message is dropped and replaced by a \"[Context compacted: …]\" banner. Whenever you are unsure \
+what you are doing, re-read THIS block — not the banner — and keep going until it is done:\n\n{task}",
+        task = task.trim()
+    )
 }
 
 /// Appended to the system prompt when batch mode is on (ported from atum's
