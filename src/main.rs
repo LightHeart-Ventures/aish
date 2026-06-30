@@ -18,6 +18,7 @@ mod loopguard;
 mod mcp;
 mod md;
 mod memory;
+mod modelfetch;
 #[cfg(test)]
 mod oracle;
 mod pipeline;

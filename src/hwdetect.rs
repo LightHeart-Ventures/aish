@@ -459,6 +459,20 @@ pub fn selected_model_id() -> String {
         .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string())
 }
 
+/// Look up the curated Hugging Face repo + quant for a known `model_id`, so a
+/// recorded selection (which may predate the `hf_repo`/`quant` fields, or carry
+/// only a bare id) can still be resolved to downloadable weights. Returns
+/// `(hf_repo, quant)` when the id matches a tier, else `None`. Consumed by
+/// `crate::modelfetch` on the `local`-feature path.
+#[allow(dead_code)]
+pub fn repo_and_quant_for(model_id: &str) -> Option<(String, String)> {
+    TIERS
+        .iter()
+        .find(|t| t.model_id == model_id)
+        .map(|t| (t.hf_repo.to_string(), t.quant.to_string()))
+}
+
+
 /// An operator pin, if one is in force. `--model` (passed through as `cli_model`
 /// on a local launch) wins over env, then `AISH_LOCAL_MODEL_PATH` (an explicit
 /// GGUF file), then `AISH_LOCAL_MODEL_ID`. Returns `(model_id, model_path?)`.

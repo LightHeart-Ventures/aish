@@ -32,7 +32,11 @@ use super::{Msg, Role, ToolDef, Turn};
 
 #[cfg(feature = "local")]
 pub struct LocalBackend {
-    model_path: PathBuf,
+    /// An operator pin from `AISH_LOCAL_MODEL_PATH`, if set. When present it is
+    /// authoritative and must already exist on disk. When `None`, the GGUF is
+    /// resolved (and downloaded on first use) from the hardware-detected
+    /// selection by `crate::modelfetch::ensure_model_file`.
+    pinned_path: Option<PathBuf>,
     n_gpu_layers: u32,
     model: OnceCell<LlamaModel>,
     backend: LlamaBackend,
@@ -41,23 +45,14 @@ pub struct LocalBackend {
 #[cfg(feature = "local")]
 impl LocalBackend {
     pub fn new() -> Result<Self> {
-        // Resolve the GGUF path. Precedence:
-        //   1. AISH_LOCAL_MODEL_PATH — an explicit operator-pinned file.
-        //   2. The persisted hardware-detected selection's recorded path, if
-        //      the operator downloaded a GGUF and recorded it.
-        //   3. A conventional `<selected-model-id>.gguf` in the cwd, so the
-        //      hardware-detected model id maps to a discoverable filename.
-        let model_path = std::env::var("AISH_LOCAL_MODEL_PATH").unwrap_or_else(|_| {
-            let sel = crate::hwdetect::load_selection();
-            if let Some(path) = sel.as_ref().and_then(|s| s.model_path.clone()) {
-                path
-            } else {
-                let id = sel
-                    .map(|s| s.model_id)
-                    .unwrap_or_else(|| crate::hwdetect::DEFAULT_MODEL_ID.to_string());
-                format!("{id}.gguf")
-            }
-        });
+        // An explicit operator pin wins outright; otherwise the GGUF is resolved
+        // (and downloaded on first use) from the hardware-detected selection when
+        // the model is actually loaded — see `resolve_path`.
+        let pinned_path = std::env::var("AISH_LOCAL_MODEL_PATH")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
 
         let n_gpu_layers = std::env::var("AISH_LOCAL_N_GPU_LAYERS")
             .ok()
@@ -68,7 +63,7 @@ impl LocalBackend {
             LlamaBackend::init().context("failed to initialize llama.cpp backend")?;
 
         Ok(Self {
-            model_path: PathBuf::from(model_path),
+            pinned_path,
             n_gpu_layers,
             model: OnceCell::new(),
             backend,
@@ -81,15 +76,36 @@ impl LocalBackend {
         self.model().await.map(|_| ())
     }
 
+    /// Resolve the concrete GGUF path to load. An operator pin
+    /// (`AISH_LOCAL_MODEL_PATH`) must already exist; otherwise the
+    /// hardware-detected selection is resolved to a cached file, downloading the
+    /// weights from Hugging Face on first use (`crate::modelfetch`).
+    async fn resolve_path(&self) -> Result<PathBuf> {
+        if let Some(p) = &self.pinned_path {
+            if !p.is_file() {
+                return Err(anyhow!(
+                    "pinned local model file not found: {} (AISH_LOCAL_MODEL_PATH)",
+                    p.display()
+                ));
+            }
+            return Ok(p.clone());
+        }
+        let sel = crate::hwdetect::load_selection();
+        crate::modelfetch::ensure_model_file(sel.as_ref())
+            .await
+            .context("failed to resolve local model file")
+    }
+
     async fn model(&self) -> Result<&LlamaModel> {
         self.model
             .get_or_try_init(|| async {
-                eprintln!("\x1b[2m  loading model from {}…\x1b[0m", self.model_path.display());
+                let path = self.resolve_path().await?;
+                eprintln!("\x1b[2m  loading model from {}…\x1b[0m", path.display());
 
                 let model_params = LlamaModelParams::default()
                     .with_n_gpu_layers(self.n_gpu_layers);
 
-                let model = LlamaModel::load_from_file(&self.backend, &self.model_path, &model_params)
+                let model = LlamaModel::load_from_file(&self.backend, &path, &model_params)
                     .map_err(|e| anyhow!("failed to load local model: {e}"))?;
 
                 eprintln!("\x1b[2m  model ready\x1b[0m");
