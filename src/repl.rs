@@ -4081,23 +4081,8 @@ async fn handle_colon(
                     }
                 }
             }
-            #[cfg(feature = "local")]
-            Some("local") => {
-                if matches!(backend, Backend::Local(_)) {
-                    println!("already on {}", backend.describe());
-                } else {
-                    *backend = Backend::new_local();
-                    session.backend_kind = backend.kind().to_string();
-                    println!(
-                        "backend → {} (loads on first use; MCP tools off — they don't fit a small context window)",
-                        backend.describe()
-                    );
-                }
-            }
-            #[cfg(not(feature = "local"))]
-            Some("local") => {
-                println!("built without the local feature (cargo build --features local)")
-            }
+
+
             _ => println!("usage: :backend <claude|grok|local>"),
         },
         Some("mode") => match parts.next().and_then(crate::session::Mode::parse) {
@@ -4141,13 +4126,7 @@ async fn handle_colon(
         Some("context") => handle_context(backend, session),
         Some("compact") => handle_compact(backend, session),
         Some("memories" | "memory") => handle_memories(parts.next(), session),
-        Some("version" | "ver") => {
-            println!(
-                "\x1b[1maish\x1b[0m \x1b[2mv{}\x1b[0m — {}",
-                crate::update::current_version(),
-                backend.describe()
-            );
-        }
+
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
     }

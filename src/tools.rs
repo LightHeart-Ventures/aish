@@ -4305,22 +4305,21 @@ mod fileops_tests {
     async fn grep_skips_build_and_vcs_dirs() {
         // A recursive grep at a project root must NOT descend into target/,
         // node_modules/, .git/ etc. — those carry generated files with huge
-        // single lines that once blew the model's context window (the
-        // mistralrs-core 218k-token overflow). The real source hit IS returned.
+        // single lines that could bloat the model's context window. The real source hit IS returned.
         let dir = tmp("grepskip");
-        std::fs::write(dir.join("real.rs"), b"use mistralrs_core::thing;\n").unwrap();
+        std::fs::write(dir.join("real.rs"), b"use some_lib::thing;\n").unwrap();
         for skip in ["target", "node_modules", ".git", "vendor"] {
             std::fs::create_dir_all(dir.join(skip)).unwrap();
-            std::fs::write(dir.join(skip).join("gen.rs"), b"mistralrs_core junk\n").unwrap();
+            std::fs::write(dir.join(skip).join("gen.rs"), b"generated junk\n").unwrap();
         }
         let mut s = yolo_session(&dir);
-        let r = run(&mut s, "grep_files", json!({"pattern": "mistralrs_core"})).await;
+        let r = run(&mut s, "grep_files", json!({"pattern": "some_lib"})).await;
         assert!(!r.is_error, "{}", r.content);
         let arr = r.structured.as_ref().unwrap().as_array().unwrap().clone();
         assert_eq!(arr.len(), 1, "only the real source hit: {}", r.content);
         assert_eq!(arr[0]["path"], "real.rs");
         // ...but an EXPLICIT path INTO a skipped dir is honoured (it's the root).
-        let r2 = run(&mut s, "grep_files", json!({"pattern": "mistralrs_core", "path": "target"})).await;
+        let r2 = run(&mut s, "grep_files", json!({"pattern": "generated", "path": "target"})).await;
         assert!(r2.content.contains("gen.rs"), "explicit root honoured: {}", r2.content);
         let _ = std::fs::remove_dir_all(&dir);
     }

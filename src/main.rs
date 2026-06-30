@@ -61,7 +61,7 @@ struct Args {
     #[arg(long = "output", value_enum, default_value_t = OutputFormat::Text)]
     output: OutputFormat,
 
-    /// Backend to use: claude | grok | local
+    /// Backend to use: claude | grok
     #[arg(long, default_value = "claude")]
     backend: String,
 
@@ -348,9 +348,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| backend::grok::DEFAULT_MODEL.into()),
             &session.env,
         )?,
-        #[cfg(feature = "local")]
-        "local" => backend::Backend::new_local(),
-        other => anyhow::bail!("unknown backend: {other} (available: claude, grok, local)"),
+        other => anyhow::bail!("unknown backend: {other} (available: claude, grok)"),
     };
     timer.mark("backend built");
     // Record which provider the interactive session runs on, so background
