@@ -2767,6 +2767,50 @@ fn glob_expand(call: &ToolCall, session: &Session) -> Result<(String, serde_json
     Ok((truncate_middle(res, MAX_OUTPUT), payload))
 }
 
+/// Directory names that hold VCS metadata, build output, or vendored
+/// dependencies — never the user's own source. `grep_files`' recursive walk
+/// skips them so a search at a project root doesn't descend into `target/` or
+/// `node_modules/`, whose generated/minified files carry enormously long single
+/// lines that can blow the model's context budget (the original
+/// `mistralrs-core` 218k-token overflow). The skip applies only while
+/// RECURSING: an explicit `path` INTO such a dir is still honoured because that
+/// dir is the walk root, not a descendant.
+const GREP_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".gradle",
+    ".terraform",
+    "vendor",
+    "dist",
+    "build",
+];
+
+/// Max bytes of a single matched line kept in a `grep_files` structured record.
+/// One pathological long line (a minified bundle, a generated lookup table)
+/// otherwise bloats the typed payload that's fed to the model; the rendered
+/// text keeps the full line (it's separately byte-capped by `truncate_middle`).
+const GREP_MAX_LINE: usize = 1_000;
+
+/// Cap one matched line for the structured grep payload on a char boundary,
+/// appending a marker noting how many bytes were dropped.
+fn truncate_line(line: &str, max: usize) -> String {
+    if line.len() <= max {
+        return line.to_string();
+    }
+    let end = char_floor(line, max);
+    format!("{}…[+{} bytes]", &line[..end], line.len() - end)
+}
+
 fn grep_files(call: &ToolCall, session: &Session) -> Result<(String, serde_json::Value)> {
     let pattern = call.args["pattern"].as_str().ok_or_else(|| anyhow::anyhow!("missing pattern"))?;
     if pattern.is_empty() {
@@ -2808,7 +2852,12 @@ fn grep_files(call: &ToolCall, session: &Session) -> Result<(String, serde_json:
                     Err(_) => continue,
                 };
                 if ft.is_dir() && !ft.is_symlink() {
-                    if entry.file_name() == ".git" {
+                    // Skip VCS metadata / build output / dependency dirs while
+                    // recursing — their generated files carry huge single lines
+                    // that can blow the context budget. An explicit `path` into
+                    // such a dir is still honoured (it's the walk root here).
+                    let dname = entry.file_name();
+                    if GREP_SKIP_DIRS.iter().any(|d| dname == **d) {
                         continue;
                     }
                     stack.push(entry.path());
@@ -2864,7 +2913,7 @@ fn grep_files(call: &ToolCall, session: &Session) -> Result<(String, serde_json:
                 } else {
                     out.push(format!("{display}:{}: {}", i + 1, line));
                 }
-                records.push(json!({ "path": display, "line": i + 1, "text": line }));
+                records.push(json!({ "path": display, "line": i + 1, "text": truncate_line(line, GREP_MAX_LINE) }));
                 total += 1;
                 if total >= max {
                     out.push("…[matches truncated]".into());
@@ -3291,7 +3340,7 @@ fn change_dir(call: &ToolCall, session: &mut Session) -> Result<String> {
 }
 
 /// Keep head + tail when output exceeds the cap; the middle is least useful.
-fn truncate_middle(s: String, max: usize) -> String {
+pub(crate) fn truncate_middle(s: String, max: usize) -> String {
     if s.len() <= max {
         return s;
     }
@@ -4249,6 +4298,47 @@ mod fileops_tests {
         let r3 = run(&mut s, "grep_files", json!({"pattern": "hello", "glob": "*.rs"})).await;
         assert!(r3.content.contains("b.rs:1:"), "{}", r3.content);
         assert!(!r3.content.contains("a.txt"), "{}", r3.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_skips_build_and_vcs_dirs() {
+        // A recursive grep at a project root must NOT descend into target/,
+        // node_modules/, .git/ etc. — those carry generated files with huge
+        // single lines that once blew the model's context window (the
+        // mistralrs-core 218k-token overflow). The real source hit IS returned.
+        let dir = tmp("grepskip");
+        std::fs::write(dir.join("real.rs"), b"use mistralrs_core::thing;\n").unwrap();
+        for skip in ["target", "node_modules", ".git", "vendor"] {
+            std::fs::create_dir_all(dir.join(skip)).unwrap();
+            std::fs::write(dir.join(skip).join("gen.rs"), b"mistralrs_core junk\n").unwrap();
+        }
+        let mut s = yolo_session(&dir);
+        let r = run(&mut s, "grep_files", json!({"pattern": "mistralrs_core"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        let arr = r.structured.as_ref().unwrap().as_array().unwrap().clone();
+        assert_eq!(arr.len(), 1, "only the real source hit: {}", r.content);
+        assert_eq!(arr[0]["path"], "real.rs");
+        // ...but an EXPLICIT path INTO a skipped dir is honoured (it's the root).
+        let r2 = run(&mut s, "grep_files", json!({"pattern": "mistralrs_core", "path": "target"})).await;
+        assert!(r2.content.contains("gen.rs"), "explicit root honoured: {}", r2.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_truncates_long_matched_lines() {
+        // A pathological long matched line is byte-capped in the structured
+        // record so one match can't bloat the typed payload.
+        let dir = tmp("greplong");
+        let mut line = String::from("needle ");
+        line.push_str(&"x".repeat(5_000));
+        std::fs::write(dir.join("big.txt"), line.as_bytes()).unwrap();
+        let mut s = yolo_session(&dir);
+        let r = run(&mut s, "grep_files", json!({"pattern": "needle"})).await;
+        let arr = r.structured.as_ref().unwrap().as_array().unwrap().clone();
+        let text = arr[0]["text"].as_str().unwrap();
+        assert!(text.len() <= GREP_MAX_LINE + 32, "record text capped: {}", text.len());
+        assert!(text.contains("[+"), "carries a truncation marker: {text:.80}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
