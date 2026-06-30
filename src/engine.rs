@@ -133,7 +133,32 @@ async fn run_turn_inner(
     // binary-shipped index — no network on the hot path), so the model surfaces a
     // `:skill add <ref>` suggestion instead of faking or hand-rolling the work.
     let input = match crate::skill_match::hint(&task, &session.skills) {
-        Some(note) => format!("{note}\n\n{input}"),
+        Some(note) => {
+            // Observe hook: SkillMatched — an INSTALLED skill cleared the
+            // relevance bar for this turn's task and its SKILL.md note was folded
+            // into the input. Carry the top-ranked skill's name + path (the path
+            // is matchable via the matcher's `path_glob`), its score, and the
+            // total number of matching skills, so a consumer can log which
+            // playbook was surfaced. Observe-only — it can't change the hint. The
+            // registry-recommendation path (no installed match) is a different
+            // event and deliberately does NOT fire this. Zero-cost when no hook is
+            // registered (`has` short-circuits before any rank/payload work).
+            if session.hooks.has(crate::hooks::HookEvent::SkillMatched) {
+                let matches = crate::skill_match::rank(&task, &session.skills);
+                if let Some(top) = matches.first() {
+                    let p = session
+                        .hook_payload(crate::hooks::HookEvent::SkillMatched)
+                        .with("skill", top.skill.name.clone())
+                        .with("path", top.skill.path.to_string_lossy().into_owned())
+                        .with("score", top.score as u64)
+                        .with("match_count", matches.len() as u64);
+                    session
+                        .hooks
+                        .fire_observe(crate::hooks::HookEvent::SkillMatched, p);
+                }
+            }
+            format!("{note}\n\n{input}")
+        }
         None => maybe_recommend_skill(&task, input, session),
     };
     // S9.3: persist the turn input to the per-worker transcript (coordinator
