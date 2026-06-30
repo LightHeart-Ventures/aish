@@ -601,10 +601,11 @@ matter — aish renders these as aligned terminal tables. Be verbose with column
 terse, and order the rows deliberately: chronological for events or history, by stage for \
 pipelines or build/run phases, by category for mixed or grouped sets.\n\
 - Final replies are terse and shell-like. One line when one line will do, but reach for a table \
-the moment there are several items to compare. No markdown headers.{skills}{batch}{escalate}{console}{task}",
+the moment there are several items to compare. No markdown headers.{skills}{orchestrator}{batch}{escalate}{console}{task}",
             host = self.host_info,
             cwd = self.cwd.display(),
             skills = self.skills_prompt,
+            orchestrator = if self.nested { "" } else { ORCHESTRATOR_NUDGE },
             batch = if self.batch_mode { BATCH_NUDGE } else { "" },
             escalate = if escalate_available {
                 ESCALATE_NUDGE
@@ -669,6 +670,28 @@ preamble, then reply with ONE short, natural sentence — tailored to what they 
 handling it in the background and the answer will appear here when it's ready (e.g. \"On it — I'll work \
 that out in the background and post the answer here.\"). Do NOT predict or mention the job id, restate \
 the task, or explain cost/timing; the result auto-delivers.";
+
+/// Appended to an INTERACTIVE session's system prompt (`!self.nested`) to frame
+/// the agent as an ORCHESTRATOR — one that plans, routes, and delegates — rather
+/// than a terse one-shot doer. Sibling of [`BATCH_NUDGE`]; the two compose
+/// (batch supplies the offload MECHANISM, this supplies the planning/routing
+/// INTENT that decides what to offload and to whom). Deliberately omitted for a
+/// background coordinator (`nested`): a coordinator IS the delegate at the end of
+/// the chain and must not recursively spin up its own orchestration layer.
+const ORCHESTRATOR_NUDGE: &str = "\n\nYou are an ORCHESTRATOR, not only a doer. For each request, \
+first read the intent and gauge scope. Small, clear, local tasks — just do them yourself with your \
+tools; don't over-plan. But for anything larger — a feature, a multi-step build, an investigation \
+spanning several areas — work as an orchestrator: lay out a short PLAN of the steps, then for EACH \
+step decide DO-vs-DELEGATE. Handle the quick, local steps yourself; DELEGATE the heavy, parallel, or \
+specialist steps. ROUTE each delegated step to the right owner: a general background coordinator \
+(run_in_background) for autonomous multi-step work, or a NAMED specialist agent from the catalog for \
+role-specific work — call atum_list_agents to see who's available, then atum_invoke_agent to dispatch \
+(a Product Manager to write a PRD, an Architect for a system design, QA for a test plan). You can \
+ESCALATE the planning itself: when a request needs a real plan or spec before any building (\"I need a \
+plan to build feature X\"), spin up a Product Manager to produce the PRD, then build on its output \
+rather than hand-waving the plan yourself. TRACK what you dispatched with background_status and \
+SYNTHESIZE the results into one coherent answer or next step when they return — don't just relay N \
+separate outputs. State the plan briefly and say which steps you're delegating to whom, then act.";
 
 /// Appended when the frontend is a smaller/faster model than the strongest one
 /// available (haiku/sonnet, or a local model with a Claude credential). It tells
@@ -842,6 +865,37 @@ mod tests {
                 "missing escalate-to-agent directive"
             );
         }
+    }
+
+    #[test]
+    fn orchestrator_nudge_present_interactive_absent_nested() {
+        // PL-1: the interactive agent is framed as an orchestrator (plan/route/
+        // delegate), but a background coordinator — the delegate at the end of
+        // the chain — must NOT get that framing.
+        let mut session = Session::new().unwrap();
+
+        // Interactive session (force the flag so the test is env-independent).
+        session.nested = false;
+        for escalate in [false, true] {
+            let p = session.system_prompt(escalate);
+            assert!(
+                p.contains("You are an ORCHESTRATOR"),
+                "interactive prompt missing orchestrator nudge"
+            );
+            // Role-aware routing guidance points at the catalog-dispatch tools.
+            assert!(p.contains("atum_list_agents"), "missing agent-catalog guidance");
+            assert!(p.contains("atum_invoke_agent"), "missing role-routing guidance");
+            // The blessed "escalate planning to a PM for a PRD" idiom.
+            assert!(p.contains("PRD"), "missing PM/PRD delegation idiom");
+        }
+
+        // Background coordinator (nested): orchestrator framing is omitted.
+        session.nested = true;
+        let p = session.system_prompt(false);
+        assert!(
+            !p.contains("You are an ORCHESTRATOR"),
+            "nested coordinator prompt should omit the orchestrator nudge"
+        );
     }
 
     // ---- Phase 2: reload_skills -----------------------------------------
