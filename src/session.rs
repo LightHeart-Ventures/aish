@@ -115,6 +115,10 @@ pub struct Session {
     /// Opus by default — deferred work gets the strongest model regardless of the
     /// interactive backend. Settable via `:batch model`.
     pub batch_model: String,
+    /// When on, force deferrable work to run as Anthropic Batches even when a
+    /// background coordinator might otherwise execute it inline. Toggled with
+    /// `:batch force-batches`; resets per session (not persisted).
+    pub batch_force_batches: bool,
     /// Live background batch jobs (in memory for the session, mirrored to
     /// `batch_store` for durability).
     pub batch_jobs: crate::batch::BatchJobs,
@@ -250,6 +254,7 @@ impl Session {
             context_used: 0,
             batch_mode: true,
             batch_model: crate::batch::DEFAULT_BATCH_MODEL.to_string(),
+            batch_force_batches: false,
             batch_jobs: Default::default(),
             batch_store: None,
             worker_jobs: Default::default(),

@@ -664,7 +664,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
         "watch + steer a coordinator, or `goal` to watch the goal",
     ),
     ("backend", "switch backend (claude|grok|local)"),
-    ("batch", "background batch mode (on|off|status)"),
+    ("batch", "background batch mode (on|off|status|force-batches)"),
     (
         "close",
         "remove the attached (or named) coordinator from the worker list + Shift-Tab rotation",
@@ -4388,7 +4388,8 @@ fn handle_allow(sub: Option<&str>, arg: Option<&str>, session: &Session) {
 
 /// `:batch` toggles/inspects interactive batch mode. `:batch` or `:batch status`
 /// reports the mode and lists this session's batch jobs; `:batch on|off` flips
-/// the (persisted) flag; `:batch model <id>` sets the model batches run on.
+/// the (persisted) flag; `:batch model <id>` sets the model batches run on;
+/// `:batch force-batches` forces deferrable work onto Anthropic batches.
 fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
     let persist = |session: &Session| {
         if let Some(db) = session.db.as_ref() {
@@ -4428,6 +4429,17 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
                 session.batch_model
             ),
         },
+        Some("force-batches") => {
+            if !session.batch_mode {
+                println!(
+                    "batch mode is off — turn it on with `:batch on` first; force-batches has no effect until then"
+                );
+            }
+            session.batch_force_batches = true;
+            println!(
+                "force-batches on — deferrable work will be dispatched as Anthropic batches (takes effect next turn)"
+            );
+        }
         Some("clear") => {
             // Drop finished (done/failed) jobs from both the store and memory.
             if let Some(store) = session.batch_store.as_ref() {
@@ -4446,9 +4458,10 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
         }
         None | Some("status") => {
             println!(
-                "batch mode: {} · model: {}",
+                "batch mode: {} · model: {} · force-batches: {}",
                 if session.batch_mode { "on" } else { "off" },
-                session.batch_model
+                session.batch_model,
+                if session.batch_force_batches { "on" } else { "off" }
             );
             let jobs = session.batch_jobs.lock().unwrap();
             if jobs.is_empty() {
@@ -4461,7 +4474,7 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
         }
         Some(other) => {
             println!(
-                "unknown :batch subcommand '{other}' — usage: :batch [on|off|status|clear|model <id>]"
+                "unknown :batch subcommand '{other}' — usage: :batch [on|off|status|clear|force-batches|model <id>]"
             )
         }
     }
