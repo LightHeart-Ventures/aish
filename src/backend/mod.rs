@@ -111,17 +111,33 @@ impl ToolResult {
     /// S7.3 split; the Ctrl-O raw view stays on `content` (see
     /// `engine::raw_body`), so the human always sees the verbatim tool output.
     ///
-    /// TODO(S7.x, OQ3): token-cost cap per result set. Compact JSON for a large
-    /// `grep_files`/`glob_expand` payload can be heavier than the rendered text;
-    /// the size cap is deliberately deferred (see the S7.3 PRD, OQ3) — monitor
-    /// in production and add a hard/soft cap if it bites.
+    /// OQ3 cap (S7.3): a hard ceiling on what one tool result may feed the
+    /// model. Compact JSON for a large `grep_files`/`glob_expand` payload can be
+    /// far heavier than the rendered text — a 500-record grep over generated
+    /// files once serialized to 218k tokens and overflowed Claude's 200k window.
+    /// When the JSON payload exceeds the budget we fall back to the rendered
+    /// `content` (itself capped at `MAX_OUTPUT` by the emitting tool, and
+    /// re-capped here for any caller that isn't), so an oversized structured
+    /// result degrades to representative text instead of crashing the turn.
     pub fn model_content(&self) -> std::borrow::Cow<'_, str> {
+        // ~25k tokens. Comfortably below the model's context window while still
+        // large enough for a legitimate structured result.
+        const MAX_MODEL_RESULT: usize = 100_000;
         match &self.structured {
             // Compact (not pretty) JSON keeps the wire payload tight. Fall back
             // to the rendered text on the (practically impossible) serialize
             // error so the model never receives an empty tool result.
             Some(v) => match serde_json::to_string(v) {
-                Ok(json) => std::borrow::Cow::Owned(json),
+                Ok(json) if json.len() <= MAX_MODEL_RESULT => std::borrow::Cow::Owned(json),
+                // Oversized payload: ship the human-rendered text instead, byte-
+                // capped so it can't overflow either. Truncating the JSON itself
+                // would yield invalid JSON the model couldn't parse, so we hand
+                // back valid representative text (head+tail) rather than a broken
+                // array.
+                Ok(_) => std::borrow::Cow::Owned(crate::tools::truncate_middle(
+                    self.content.clone(),
+                    MAX_MODEL_RESULT,
+                )),
                 Err(_) => std::borrow::Cow::Borrowed(self.content.as_str()),
             },
             None => std::borrow::Cow::Borrowed(self.content.as_str()),
@@ -418,6 +434,26 @@ mod tests {
         let t = ToolResult::text("t2", "plain output", false);
         assert_eq!(t.model_content(), "plain output");
         assert!(matches!(t.model_content(), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn model_content_caps_oversized_structured_payload() {
+        // OQ3 cap: a structured payload whose compact JSON exceeds the budget
+        // must NOT be fed to the model — it falls back to the rendered text,
+        // byte-capped, so an enormous grep payload can't overflow the context
+        // window (the mistralrs-core 218k-token crash). This is the durable
+        // guardrail behind the grep skip-dirs + per-line truncation fixes.
+        let huge: Vec<_> = (0..50_000)
+            .map(|i| serde_json::json!({"path": "target/x.rs", "line": i, "text": "x".repeat(40)}))
+            .collect();
+        let rendered = "representative rendered text".to_string();
+        let r = ToolResult::structured("t", rendered.clone(), serde_json::json!(huge), false);
+        let out = r.model_content();
+        // Did NOT ship the giant JSON array...
+        assert!(!out.starts_with("[{"), "oversized JSON must not be sent");
+        // ...shipped the (capped) rendered text instead.
+        assert!(out.contains("representative rendered text"), "fell back to text");
+        assert!(out.len() <= 100_000, "capped under budget: {}", out.len());
     }
 
     #[test]
