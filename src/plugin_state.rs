@@ -1,6 +1,6 @@
 //! Plugin-scoped state / config store (Phase 1.5).
 //!
-//! A single global SQLite database at `~/.aish/plugins.db` gives every aish
+//! A single global SQLite database at `~/.aish/database/plugins.db` gives every aish
 //! plugin a small, durable, namespaced key/value store. Namespacing is by
 //! `plugin_id`: two plugins can use the same `key` without colliding because the
 //! primary key is the composite `(plugin_id, key)`. Values are arbitrary JSON
@@ -191,7 +191,7 @@ impl PluginStateStore {
 static GLOBAL: OnceLock<PluginStateStore> = OnceLock::new();
 
 /// Initialize (once) and return the global plugin-state store backed by the file
-/// at `path` (typically `~/.aish/plugins.db`). Idempotent: the first successful
+/// at `path` (typically `~/.aish/database/plugins.db`). Idempotent: the first successful
 /// call wins and subsequent calls return the already-initialized store,
 /// ignoring `path`. Startup wiring calls this and logs — but does not fail on —
 /// an error, so a bad DB never blocks the shell from launching.

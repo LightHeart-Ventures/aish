@@ -5,6 +5,7 @@ mod container;
 mod context;
 mod coordinator;
 mod db;
+mod db_paths;
 mod diag;
 mod editor;
 mod engine;
@@ -435,9 +436,9 @@ async fn main() -> Result<()> {
     let _ = std::fs::create_dir_all(aish_dir.join("skills"));
     let skills_dir = aish_dir.join("skills");
     // Plugin-scoped state store (Phase 1.5): one global SQLite DB at
-    // ~/.aish/plugins.db, initialized once here so plugin hooks can reach it via
+    // ~/.aish/database/plugins.db, initialized once here so plugin hooks can reach it via
     // `plugin_state::global()`. Non-fatal — a bad DB must never block startup.
-    if let Err(e) = plugin_state::init_global(&aish_dir.join("plugins.db")) {
+    if let Err(e) = plugin_state::init_global(&db_paths::plugin_state_db_path()) {
         eprintln!("\x1b[33maish:\x1b[0m plugin state store unavailable: {e}");
     }
     // Plugin webhook dispatcher (Phase 1.6): route lifecycle events to plugins
@@ -483,7 +484,7 @@ async fn main() -> Result<()> {
         session.skills = local;
     }
     timer.mark("skills render");
-    session.db = match db::Db::open(&aish_dir.join("aish.db")) {
+    session.db = match db::Db::open(&db_paths::main_db_path()) {
         Ok(d) => Some(d),
         Err(e) => {
             eprintln!("\x1b[33maish:\x1b[0m persistent store unavailable: {e:#}");
@@ -503,7 +504,7 @@ async fn main() -> Result<()> {
     // Durable batch jobs: open the store and reattach any in-flight batches from
     // a previous session (the batch keeps running platform-side while aish is
     // down; this picks the handle back up so results land here when they finish).
-    match db::BatchStore::open(&aish_dir.join("aish.db")) {
+    match db::BatchStore::open(&db_paths::main_db_path()) {
         Ok(store) => {
             session.batch_store = Some(store);
             batch::rehydrate(&mut session);
@@ -514,7 +515,7 @@ async fn main() -> Result<()> {
 
     // Durable coordinator runs: open the store and reattach prior runs — surface
     // any that finished while we were down, reap orphaned (stale-heartbeat) ones.
-    match db::CoordinatorStore::open(&aish_dir.join("aish.db")) {
+    match db::CoordinatorStore::open(&db_paths::main_db_path()) {
         Ok(store) => {
             session.coordinator_store = Some(store);
             coordinator::rehydrate(&mut session);
