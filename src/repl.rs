@@ -2406,6 +2406,39 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
 /// (emoji + "Shift-Tab to see work") and leaves the operator free to keep
 /// working in the interactive session, the newly-spawned worker (a `w_########`
 /// id) waiting one Shift-Tab away.
+/// Print the escalation banner, animating the leading arrow so it "lifts off"
+/// the way the work does — a right→up-right→curve-up glyph sweep that settles on
+/// the ⤴️ emoji, then the static banner text. The animation runs ONLY on an
+/// interactive terminal (a piped/redirected stdout gets the final frame in one
+/// clean write, no escape/`\r` noise — same TTY-gating contract as
+/// `clear_screen`). Each frame rewrites the line in place with `\r\x1b[2K`; the
+/// final frame is left on screen followed by a newline.
+fn print_escalation_banner(short: &str) {
+    // Body of the banner, minus the leading arrow glyph (which is what animates).
+    let body = format!(
+        "  escalated to background worker {short}\x1b[0m \x1b[2m— keep working here; Shift-Tab to see work.\x1b[0m"
+    );
+    // SAFETY: plain isatty query. Off a TTY, skip the motion entirely.
+    let is_tty = unsafe { libc::isatty(1) } == 1;
+    if !is_tty {
+        println!("\x1b[1;33m⤴\u{fe0f}{body}");
+        return;
+    }
+    // Liftoff frames: a flat arrow tilts upward, then curls into the final
+    // curve-up emoji — reads as the escalated work taking off.
+    const FRAMES: &[&str] = &["\u{2192}", "\u{2197}", "\u{2b06}\u{fe0f}", "\u{2934}\u{fe0f}"];
+    let mut out = std::io::stdout();
+    for frame in FRAMES {
+        let _ = write!(out, "\r\x1b[2K\x1b[1;33m{frame}{body}");
+        let _ = out.flush();
+        std::thread::sleep(Duration::from_millis(90));
+    }
+    // Leave the final frame on screen and terminate the line.
+    let _ = writeln!(out);
+    let _ = out.flush();
+}
+
+
 fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
     let Dispatched { id, message } = dispatch_coordinator(task, session);
     // A guard failure (empty/nested/no-credential/no-binary) carries no id —
@@ -2419,9 +2452,8 @@ fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
         // The agent escalated this on its own (or via a work-signal line). Run it
         // as a background worker, tell the operator they can keep working, and
         // point them at Shift-Tab to watch it — newest worker is one press away.
-        println!(
-            "\x1b[1;33m⤴\u{fe0f}  escalated to background worker {short}\x1b[0m \x1b[2m— keep working here; Shift-Tab to see work.\x1b[0m"
-        );
+        // The leading ⤴️ "lifts off" with a brief liftoff animation on a TTY.
+        print_escalation_banner(&short);
         return;
     }
     println!("{message}");
