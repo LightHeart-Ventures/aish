@@ -125,7 +125,27 @@ jobs:
             --prerelease \
             --title "aish $tag (ci)" \
             --notes "CI/CD build from ${{ github.event.head_commit.url || 'HEAD' }}. Internal testing only — highly unstable." \
-            dist/aish-* dist/SHA256SUMS 2>/dev/null || true
+            dist/aish-* dist/SHA256SUMS
+        shell: bash
+
+      # Fail loudly if the published release is asset-less. `gh release create`
+      # uploads assets atomically before publish (unlike softprops' create-then-
+      # upload, which 422s on this immutable-release repo — see run 28553643115),
+      # but masking publish errors with `|| true` previously let zero-asset
+      # releases ship green and silently break `:update --channel ci`. Assert the
+      # 7 expected assets (3 binaries + 3 .sha256 + SHA256SUMS) exist.
+      - name: Verify release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          count="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')"
+          echo "Published $tag with $count assets."
+          if [ "$count" -lt 7 ]; then
+            echo "::error::CI release $tag published with $count assets (expected 7). ':update --channel ci' would break. Failing so this surfaces instead of shipping silently."
+            exit 1
+          fi
         shell: bash
 
   prune:
