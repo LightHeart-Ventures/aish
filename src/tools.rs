@@ -221,11 +221,18 @@ whenever you need the output."
         ToolDef {
             name: "read_file".into(),
             description: "Read a file's contents. Call this instead of running cat/head/tail. \
-Relative paths resolve against the shell's current directory."
+Relative paths resolve against the shell's current directory. For a LARGE file, pass \
+`line_start`/`line_end` (1-based, inclusive) to read only that slice instead of re-reading the \
+whole file — cheaper, and it avoids the duplicate-read loop-guard. Prefer a targeted range (or \
+grep_files) over repeatedly reading a big file end to end."
                 .into(),
             schema: json!({
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "line_start": {"type": "integer", "description": "Optional 1-based first line to return (inclusive). Lines before this are omitted."},
+                    "line_end": {"type": "integer", "description": "Optional 1-based last line to return (inclusive). Lines after this are omitted. Omit to read to end of file."}
+                },
                 "required": ["path"]
             }),
         },
@@ -2556,6 +2563,31 @@ fn read_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) 
     }
     let content =
         std::fs::read_to_string(&full).map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
+
+    // Optional 1-based inclusive line range. Reading a slice of a large file is
+    // cheaper than the whole thing and sidesteps the duplicate-read loop-guard.
+    let line_start = call.args["line_start"].as_u64();
+    let line_end = call.args["line_end"].as_u64();
+    if line_start.is_some() || line_end.is_some() {
+        let start = line_start.unwrap_or(1).max(1) as usize;
+        let end = line_end.map(|e| e as usize).unwrap_or(usize::MAX);
+        if end < start {
+            return Err(anyhow::anyhow!(
+                "line_end ({end}) is before line_start ({start})"
+            ));
+        }
+        let total = content.lines().count();
+        let sliced: String = content
+            .lines()
+            .skip(start - 1)
+            .take(end.saturating_sub(start).saturating_add(1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let shown_end = end.min(total);
+        let header = format!("[lines {start}-{shown_end} of {total}]\n");
+        return Ok(truncate_middle(format!("{header}{sliced}"), MAX_FILE_READ));
+    }
+
     Ok(truncate_middle(content, MAX_FILE_READ))
 }
 
@@ -4467,6 +4499,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_file(&dbpath);
+    }
+
+    // read_file honours a 1-based inclusive line range and prepends a
+    // `[lines a-b of N]` header, so agents can slice a large file instead of
+    // re-reading it whole (and tripping the duplicate-read loop-guard).
+    #[tokio::test]
+    async fn read_file_line_range_slices_and_headers() {
+        let path = std::env::temp_dir().join(format!("aish_readrange_{}.txt", std::process::id()));
+        std::fs::write(&path, b"L1\nL2\nL3\nL4\nL5\n").unwrap();
+        let mut session = Session::new().unwrap();
+
+        let call = |args: serde_json::Value| ToolCall {
+            id: "t".into(),
+            name: "read_file".into(),
+            args,
+        };
+        let mut confirm = |_: &str| Decision::AllowOnce;
+
+        // Middle slice: lines 2-4 inclusive.
+        let r = execute(
+            &call(json!({ "path": path.to_string_lossy(), "line_start": 2, "line_end": 4 })),
+            &mut session,
+            &mut confirm,
+        )
+        .await;
+        assert!(!r.is_error, "got: {}", r.content);
+        assert_eq!(r.content, "[lines 2-4 of 5]\nL2\nL3\nL4");
+
+        // Open-ended range (no line_end) reads to EOF, header clamps to total.
+        let r = execute(
+            &call(json!({ "path": path.to_string_lossy(), "line_start": 4 })),
+            &mut session,
+            &mut confirm,
+        )
+        .await;
+        assert!(!r.is_error, "got: {}", r.content);
+        assert_eq!(r.content, "[lines 4-5 of 5]\nL4\nL5");
+
+        // Inverted range is a hard error.
+        let r = execute(
+            &call(json!({ "path": path.to_string_lossy(), "line_start": 4, "line_end": 2 })),
+            &mut session,
+            &mut confirm,
+        )
+        .await;
+        assert!(r.is_error, "inverted range should error: {}", r.content);
+
+        // No range → whole file (back-compat).
+        let r = execute(
+            &call(json!({ "path": path.to_string_lossy() })),
+            &mut session,
+            &mut confirm,
+        )
+        .await;
+        assert!(!r.is_error, "got: {}", r.content);
+        assert_eq!(r.content, "L1\nL2\nL3\nL4\nL5\n");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     // AC ac_ea23cef2b000 — `bg`/`fg` continue a genuinely stopped job: SIGCONT
