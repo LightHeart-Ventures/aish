@@ -37,6 +37,15 @@ pub struct PluginManifest {
     /// Plugins are enabled unless the manifest explicitly sets `false`.
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Phase 1.6 webhook opt-in: an HTTP endpoint lifecycle events are POSTed
+    /// to. Consumed by [`crate::plugin_dispatcher`]; parsed here so the field is
+    /// part of the canonical manifest surface (not silently dropped).
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    /// Phase 1.6 webhook opt-in: a shell command run on each lifecycle event
+    /// (event JSON on stdin). Consumed by [`crate::plugin_dispatcher`].
+    #[serde(default)]
+    pub webhook_command: Option<String>,
 }
 
 impl PluginManifest {
