@@ -545,6 +545,188 @@ impl std::fmt::Display for DispatchError {
     }
 }
 
+/// The outcome of the Phase 2 blocking gate for one event. `Allow` lets the
+/// action proceed; `Deny` carries a human-readable reason that is threaded into
+/// the synthetic "declined" tool result the model sees — identical to a human
+/// decline — so the model handles a hook veto exactly like a user one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    Allow,
+    Deny(String),
+}
+
+impl Decision {
+    /// True when this is a veto.
+    pub fn is_deny(&self) -> bool {
+        matches!(self, Decision::Deny(_))
+    }
+}
+
+impl HookSet {
+    /// Evaluate a BLOCKING event (the Phase 2 gate): run every matching hook
+    /// SEQUENTIALLY and combine most-restrictive-wins — the FIRST `Deny`
+    /// short-circuits and is returned. A hook can only make a decision stricter,
+    /// never loosen it (design §6.2), so there is no "allow override": an
+    /// explicit `Allow` from one hook does not cancel a later hook's `Deny`
+    /// (we stop at the first deny). Zero-cost and `Allow` when nothing matches
+    /// or when we are already inside a hook (`AISH_IN_HOOK`).
+    ///
+    /// Per action kind:
+    ///   * `command` — spawned fork/exec with the payload on stdin; **exit 0 =
+    ///     allow, non-zero = deny** (its first non-empty stdout line becomes the
+    ///     reason). On spawn failure or timeout a `required` hook fails **closed**
+    ///     (deny), an optional hook fails **open** (allow).
+    ///   * `rule` — the inline `deny_if` predicate is evaluated with NO process
+    ///     spawned at all (see [`eval_rule`]); a match denies.
+    ///
+    /// Requires a tokio runtime in scope (the call site is inside one).
+    pub async fn evaluate(&self, event: HookEvent, payload: HookPayload) -> Decision {
+        if in_hook() {
+            return Decision::Allow;
+        }
+        let matched = self.matching(event, &payload);
+        if matched.is_empty() {
+            return Decision::Allow;
+        }
+        let body = payload.to_json_string();
+        for hook in matched {
+            let decision = match &hook.action {
+                Action::Rule { deny_if } => eval_rule(deny_if.as_deref(), &payload),
+                Action::Command { required, .. } => match dispatch_capture(&hook.action, &body).await
+                {
+                    Ok((true, _)) => Decision::Allow,
+                    Ok((false, reason)) => Decision::Deny(
+                        reason.unwrap_or_else(|| "hook command exited non-zero".to_string()),
+                    ),
+                    Err(e) => {
+                        if *required {
+                            Decision::Deny(format!("required hook failed ({e})"))
+                        } else {
+                            // Optional hook: fail OPEN so a flaky logger can't wedge work.
+                            eprintln!("\x1b[2maish: hook dispatch error (allowed) — {e}\x1b[0m");
+                            Decision::Allow
+                        }
+                    }
+                },
+            };
+            if decision.is_deny() {
+                return decision;
+            }
+        }
+        Decision::Allow
+    }
+}
+
+/// Like [`dispatch`] but CAPTURES the hook's stdout so a non-zero exit can carry
+/// a reason (its first non-empty stdout line) into the blocking gate's `Deny`.
+/// Returns `(exit_ok, reason)`; `Err` on spawn failure or timeout (the gate maps
+/// that to fail-open/closed per the hook's `required` flag). On timeout the
+/// dropped child is reaped by `kill_on_drop`.
+async fn dispatch_capture(
+    action: &Action,
+    payload: &str,
+) -> Result<(bool, Option<String>), DispatchError> {
+    let (program, args) = match action {
+        Action::Command { program, args, .. } => (program.clone(), args.clone()),
+        Action::Rule { .. } => return Ok((true, None)),
+    };
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new(&program)
+        .args(&args)
+        .env(RECURSION_GUARD, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| DispatchError::Spawn(e.to_string()))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.as_bytes()).await;
+        let _ = stdin.shutdown().await;
+    }
+    match tokio::time::timeout(action.timeout(), child.wait_with_output()).await {
+        Ok(Ok(output)) => {
+            let reason = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(|s| s.to_string());
+            Ok((output.status.success(), reason))
+        }
+        Ok(Err(e)) => Err(DispatchError::Wait(e.to_string())),
+        Err(_) => Err(DispatchError::Timeout),
+    }
+}
+
+/// Evaluate an inline `deny_if` predicate against the payload — a tiny,
+/// zero-spawn policy language for the common blocking cases. Supported forms
+/// (case-sensitive keyword, single-quoted string arg):
+///   * `always` / `true`             → always deny
+///   * `never`  / `false`            → never deny
+///   * `tool_is('run_program')`      → deny when the `tool` field == arg
+///   * `program_is('git')`           → deny when `program` == arg
+///   * `program_contains('rm')`      → deny when `program` contains arg
+///   * `path_contains('secret')`     → deny when `path` contains arg
+///   * `path_glob('*.lock')`         → deny when `path` glob-matches arg
+///   * `mode_is('yolo')`             → deny when the confirmation `mode` == arg
+///
+/// A referenced field that is absent from the payload does NOT match (the
+/// predicate can't be satisfied → allow). An UNRECOGNIZED or malformed
+/// expression denies **fail-closed**, so a typo can't silently disable a policy.
+/// A rule with no `deny_if` at all is a no-op (allow).
+fn eval_rule(expr: Option<&str>, payload: &HookPayload) -> Decision {
+    let Some(raw) = expr else {
+        return Decision::Allow;
+    };
+    let e = raw.trim();
+    let blocked = |b: bool| {
+        if b {
+            Decision::Deny(format!("blocked by rule: {e}"))
+        } else {
+            Decision::Allow
+        }
+    };
+    match e {
+        "always" | "true" => return Decision::Deny(format!("blocked by rule: {e}")),
+        "never" | "false" => return Decision::Allow,
+        _ => {}
+    }
+    let Some((name, arg)) = parse_predicate(e) else {
+        return Decision::Deny(format!("malformed hook rule (fail-closed): {e}"));
+    };
+    let field = |k: &str| payload.field(k);
+    match name {
+        "tool_is" => blocked(field("tool") == Some(arg.as_str())),
+        "program_is" => blocked(field("program") == Some(arg.as_str())),
+        "program_contains" => blocked(field("program").is_some_and(|v| v.contains(arg.as_str()))),
+        "path_contains" => blocked(field("path").is_some_and(|v| v.contains(arg.as_str()))),
+        "path_glob" => blocked(field("path").is_some_and(|v| glob_match(&arg, v))),
+        "mode_is" => blocked(field("mode") == Some(arg.as_str())),
+        other => Decision::Deny(format!("unknown hook rule predicate (fail-closed): {other}")),
+    }
+}
+
+/// Parse a `name('single-quoted arg')` predicate into `(name, arg)`. Returns
+/// `None` when the shape doesn't match (the caller fails that closed). Only
+/// single quotes; the arg may contain any char except a single quote.
+fn parse_predicate(e: &str) -> Option<(&str, String)> {
+    // Tolerate surrounding whitespace even on a direct call (eval_rule already
+    // trims, but the predicate parser is robust on its own).
+    let e = e.trim();
+    let open = e.find('(')?;
+    let name = e[..open].trim();
+    if name.is_empty() || !e.ends_with(')') {
+        return None;
+    }
+    let inner = e[open + 1..e.len() - 1].trim();
+    let stripped = inner.strip_prefix('\'')?.strip_suffix('\'')?;
+    if stripped.contains('\'') {
+        return None;
+    }
+    Some((name, stripped.to_string()))
+}
+
 /// Parse a `hooks.json` body into a `Vec<Hook>`. Surfaces a clear error on
 /// malformed JSON or an unknown event name.
 fn parse_hooks(text: &str) -> Result<Vec<Hook>, String> {
@@ -639,6 +821,20 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that touch the PROCESS-GLOBAL recursion-guard env var or
+    /// depend on it being unset. `AISH_IN_HOOK` is process-wide, so a test that
+    /// sets it (the recursion-guard tests) races every parallel test that spawns
+    /// a hook or calls `evaluate`/`run_observe_blocking` (each early-returns when
+    /// the guard is seen). Every such test grabs this lock first, forcing them to
+    /// run one-at-a-time. Poison is ignored — a panic in one guarded test must
+    /// not wedge the rest.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     fn payload(event: HookEvent) -> HookPayload {
         HookPayload::new(
@@ -990,6 +1186,7 @@ mod tests {
 
     #[tokio::test]
     async fn fire_observe_is_recursion_guarded() {
+        let _env = env_lock();
         // With AISH_IN_HOOK set, fire_observe must early-return without spawning.
         // SAFETY: single-threaded test; we set and unset the guard around the call.
         unsafe { std::env::set_var(RECURSION_GUARD, "1") };
@@ -1013,6 +1210,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_observe_blocking_invokes_matching_hooks() {
+        let _env = env_lock();
         let dir = std::env::temp_dir().join(format!("aish-hook-block-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1039,6 +1237,7 @@ mod tests {
 
     #[tokio::test]
     async fn matching_bumps_counter() {
+        let _env = env_lock();
         let json = r#"{ "hooks": [ { "event": "PostToolUse", "action": { "type": "command", "program": "true" } } ] }"#;
         let dir = std::env::temp_dir().join(format!("aish-hook-count-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1051,5 +1250,214 @@ mod tests {
             .await;
         assert_eq!(set.hooks()[0].matched.load(Ordering::Relaxed), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Phase 2: blocking gate (evaluate / eval_rule / parse_predicate) ----
+
+    #[test]
+    fn parse_predicate_shapes() {
+        assert_eq!(
+            parse_predicate("path_contains('secret')"),
+            Some(("path_contains", "secret".to_string()))
+        );
+        // Whitespace around the name / arg is tolerated.
+        assert_eq!(
+            parse_predicate("  program_is( 'git' ) "),
+            Some(("program_is", "git".to_string()))
+        );
+        // Empty arg is a valid string.
+        assert_eq!(parse_predicate("tool_is('')"), Some(("tool_is", String::new())));
+        // Malformed shapes → None (caller fails these closed).
+        assert_eq!(parse_predicate("no_parens"), None);
+        assert_eq!(parse_predicate("missing_close('x'"), None);
+        assert_eq!(parse_predicate("unquoted(x)"), None);
+        assert_eq!(parse_predicate("('orphan')"), None);
+    }
+
+    #[test]
+    fn eval_rule_keywords_and_predicates() {
+        let p = payload(HookEvent::PreToolUse)
+            .with("tool", "run_program")
+            .with("program", "git")
+            .with("path", "/proj/.env.secret");
+        // Keyword forms.
+        assert!(eval_rule(Some("always"), &p).is_deny());
+        assert!(eval_rule(Some("true"), &p).is_deny());
+        assert_eq!(eval_rule(Some("never"), &p), Decision::Allow);
+        assert_eq!(eval_rule(Some("false"), &p), Decision::Allow);
+        // No deny_if at all → allow.
+        assert_eq!(eval_rule(None, &p), Decision::Allow);
+        // Field predicates that match → deny.
+        assert!(eval_rule(Some("tool_is('run_program')"), &p).is_deny());
+        assert!(eval_rule(Some("program_is('git')"), &p).is_deny());
+        assert!(eval_rule(Some("program_contains('gi')"), &p).is_deny());
+        assert!(eval_rule(Some("path_contains('secret')"), &p).is_deny());
+        assert!(eval_rule(Some("path_glob('*.secret')"), &p).is_deny());
+        // Predicates that do not match → allow.
+        assert_eq!(eval_rule(Some("program_is('rm')"), &p), Decision::Allow);
+        assert_eq!(eval_rule(Some("path_contains('nope')"), &p), Decision::Allow);
+        // Absent field → cannot be satisfied → allow.
+        assert_eq!(eval_rule(Some("mode_is('yolo')"), &p), Decision::Allow);
+    }
+
+    #[test]
+    fn eval_rule_fails_closed_on_garbage() {
+        let p = payload(HookEvent::PreToolUse);
+        // Unknown predicate name and malformed expressions both DENY (fail-closed)
+        // so a typo can't silently disable a policy.
+        assert!(eval_rule(Some("banana('x')"), &p).is_deny());
+        assert!(eval_rule(Some("path_contains(secret)"), &p).is_deny());
+        assert!(eval_rule(Some("garbage"), &p).is_deny());
+    }
+
+    /// Build a `HookSet` from an inline JSON body (test helper).
+    fn set_from_json(json: &str) -> HookSet {
+        let dir = std::env::temp_dir().join(format!(
+            "aish-hook-eval-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("h.json");
+        std::fs::write(&cfg, json).unwrap();
+        HookSet::load_from(&[cfg])
+    }
+
+    #[tokio::test]
+    async fn evaluate_rule_denies_matching_call() {
+        let _env = env_lock();
+        let set = set_from_json(
+            r#"{ "hooks": [ { "event": "PreToolUse", "matcher": { "tool": "run_program" },
+                 "action": { "type": "rule", "deny_if": "program_contains('rm')" } } ] }"#,
+        );
+        // A matching call is vetoed…
+        let deny = set
+            .evaluate(
+                HookEvent::PreToolUse,
+                payload(HookEvent::PreToolUse)
+                    .with("tool", "run_program")
+                    .with("program", "rm"),
+            )
+            .await;
+        assert!(deny.is_deny(), "{deny:?}");
+        // …a non-matching program is allowed.
+        let allow = set
+            .evaluate(
+                HookEvent::PreToolUse,
+                payload(HookEvent::PreToolUse)
+                    .with("tool", "run_program")
+                    .with("program", "ls"),
+            )
+            .await;
+        assert_eq!(allow, Decision::Allow);
+    }
+
+    #[tokio::test]
+    async fn evaluate_allows_when_nothing_matches() {
+        let _env = env_lock();
+        let set = set_from_json(
+            r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "rule", "deny_if": "always" } } ] }"#,
+        );
+        // A different event has no matching hook → allow, no spawn.
+        let d = set
+            .evaluate(HookEvent::PostToolUse, payload(HookEvent::PostToolUse))
+            .await;
+        assert_eq!(d, Decision::Allow);
+    }
+
+    #[tokio::test]
+    async fn evaluate_command_exit_code_gates() {
+        let _env = env_lock();
+        // `false` exits non-zero → deny; `true` exits zero → allow.
+        let deny_set = set_from_json(
+            r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "command", "program": "false", "timeout_ms": 2000 } } ] }"#,
+        );
+        assert!(deny_set
+            .evaluate(HookEvent::PreToolUse, payload(HookEvent::PreToolUse))
+            .await
+            .is_deny());
+        let allow_set = set_from_json(
+            r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "command", "program": "true", "timeout_ms": 2000 } } ] }"#,
+        );
+        assert_eq!(
+            allow_set
+                .evaluate(HookEvent::PreToolUse, payload(HookEvent::PreToolUse))
+                .await,
+            Decision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_command_reason_from_stdout() {
+        let _env = env_lock();
+        // A denying command's first stdout line becomes the human-readable reason.
+        let set = set_from_json(
+            r#"{ "hooks": [ { "event": "PreToolUse",
+                 "action": { "type": "command", "program": "bash", "args": ["-c", "echo policy: no secrets; exit 3"], "timeout_ms": 2000 } } ] }"#,
+        );
+        match set
+            .evaluate(HookEvent::PreToolUse, payload(HookEvent::PreToolUse))
+            .await
+        {
+            Decision::Deny(reason) => assert_eq!(reason, "policy: no secrets"),
+            other => panic!("expected deny with reason, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluate_required_command_fails_closed_on_spawn_error() {
+        let _env = env_lock();
+        // A required hook whose program can't spawn DENIES (fail-closed)…
+        let required = set_from_json(
+            r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "command", "program": "/nonexistent/aish-hook-x", "required": true } } ] }"#,
+        );
+        assert!(required
+            .evaluate(HookEvent::PreToolUse, payload(HookEvent::PreToolUse))
+            .await
+            .is_deny());
+        // …an optional one fails OPEN (allow).
+        let optional = set_from_json(
+            r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "command", "program": "/nonexistent/aish-hook-x", "required": false } } ] }"#,
+        );
+        assert_eq!(
+            optional
+                .evaluate(HookEvent::PreToolUse, payload(HookEvent::PreToolUse))
+                .await,
+            Decision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_most_restrictive_wins() {
+        let _env = env_lock();
+        // Two matching rules: the first allows, the second denies → deny overall.
+        let set = set_from_json(
+            r#"{ "hooks": [
+                 { "event": "PreToolUse", "action": { "type": "rule", "deny_if": "never" } },
+                 { "event": "PreToolUse", "action": { "type": "rule", "deny_if": "always" } }
+               ] }"#,
+        );
+        assert!(set
+            .evaluate(HookEvent::PreToolUse, payload(HookEvent::PreToolUse))
+            .await
+            .is_deny());
+    }
+
+    #[tokio::test]
+    async fn evaluate_is_recursion_guarded() {
+        let _env = env_lock();
+        // SAFETY: single-threaded test; guard is set/unset around the call.
+        unsafe { std::env::set_var(RECURSION_GUARD, "1") };
+        let set = set_from_json(
+            r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "rule", "deny_if": "always" } } ] }"#,
+        );
+        let d = set
+            .evaluate(HookEvent::PreToolUse, payload(HookEvent::PreToolUse))
+            .await;
+        unsafe { std::env::remove_var(RECURSION_GUARD) };
+        assert_eq!(d, Decision::Allow, "inside a hook, the gate must not veto");
     }
 }

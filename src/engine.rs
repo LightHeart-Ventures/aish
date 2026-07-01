@@ -434,15 +434,59 @@ async fn run_turn_inner(
                 continue;
             }
 
-            // Observe hook: PreToolUse. Fires for every tool aish is about to run
-            // (zero-cost when no hook is registered — `has` short-circuits before
-            // any payload is built). Observe-only in Phase 1: it cannot veto or
-            // mutate the call (the blocking gate is Phase 2). See crate::hooks.
+            // Phase 2 blocking gate: PreToolUse. Every matching hook runs
+            // SEQUENTIALLY (most-restrictive-wins); the first `Deny` VETOES the
+            // call BEFORE it executes. The veto is threaded through the SAME
+            // synthetic "declined" ToolResult path a human decline uses, so the
+            // model handles a hook veto identically — it sees an error result and
+            // re-plans. An observe-style PreToolUse hook (a logger that exits 0)
+            // returns Allow and falls through to normal execution, subsuming the
+            // old fire-and-forget observe behavior (now synchronous, bounded by
+            // the hook's timeout). Zero-cost when no PreToolUse hook is registered
+            // (`has` short-circuits before any payload is built). See crate::hooks.
             if session.hooks.has(crate::hooks::HookEvent::PreToolUse) {
                 let p = tool_hook_payload(session, crate::hooks::HookEvent::PreToolUse, call);
-                session
+                if let crate::hooks::Decision::Deny(reason) = session
                     .hooks
-                    .fire_observe(crate::hooks::HookEvent::PreToolUse, p);
+                    .evaluate(crate::hooks::HookEvent::PreToolUse, p)
+                    .await
+                {
+                    eprintln!("\x1b[2m  ⛔ {} — hook denied: {reason}\x1b[0m", desc);
+                    let result = ToolResult::text(
+                        call.id.clone(),
+                        format!("Blocked by a PreToolUse hook: {reason}"),
+                        true,
+                    );
+                    if session.raw_tool_output {
+                        print_raw_result(&result);
+                    }
+                    if let Some(w) = session.worker_transcript.as_mut() {
+                        w.record_tool_call(&call.id, &call.name, &call.args);
+                        w.record_tool_result(
+                            &call.id,
+                            &call.name,
+                            &result.content,
+                            result.is_error,
+                        );
+                    }
+                    // Observe hook: PermissionDenied — a hook vetoed the call.
+                    // Fire-and-forget so an audit sink records the veto (carrying
+                    // the reason). Zero-cost when unconfigured.
+                    if session.hooks.has(crate::hooks::HookEvent::PermissionDenied) {
+                        let dp = tool_hook_payload(
+                            session,
+                            crate::hooks::HookEvent::PermissionDenied,
+                            call,
+                        )
+                        .with("reason", reason.clone());
+                        session
+                            .hooks
+                            .fire_observe(crate::hooks::HookEvent::PermissionDenied, dp);
+                    }
+                    session.last_turn_tools.push((desc.clone(), result.clone()));
+                    results.push(result);
+                    continue;
+                }
             }
 
             // Tier-1 turn audit (background coordinator only — None otherwise).
