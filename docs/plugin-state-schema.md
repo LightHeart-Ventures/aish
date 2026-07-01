@@ -7,10 +7,12 @@ namespaced key/value store. Implemented in [`src/plugin_state.rs`]; tests in
 ## Location
 
 ```
-~/.aish/plugins.db
+~/.aish/database/plugins.db
 ```
 
-One file for all plugins. Initialized once on shell startup (see
+All aish databases live under `~/.aish/database/` — see
+[`DATABASE_PATHS.md`](./DATABASE_PATHS.md). One file for all plugins. Initialized
+once on shell startup (see
 [Initialization](#initialization)). WAL sidecars (`plugins.db-wal`,
 `plugins.db-shm`) may appear next to it — that is normal for WAL journaling.
 
@@ -83,8 +85,9 @@ flat, display-ready error without importing `rusqlite`'s error type.
 
 ## Initialization
 
-`src/main.rs` calls `plugin_state::init_global(&aish_dir().join("plugins.db"))`
-during interactive/one-shot startup, right after ensuring `~/.aish/` exists. The
+`src/main.rs` calls `plugin_state::init_global(&db_paths::plugin_state_db_path())`
+during interactive/one-shot startup, right after ensuring `~/.aish/` exists
+(`db_paths::db_dir()` creates `~/.aish/database/` on first use). The
 call is **non-fatal**: on error it logs a yellow `aish:` warning to stderr and
 the shell continues — a bad or locked DB must never block launch. Plugin hooks
 reach the store via `plugin_state::global()`.
