@@ -72,7 +72,29 @@ use crate::db::CoordinatorStore;
 use crate::session::Session;
 use crate::tools;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Cross-turn interrupt latch for a running coordinator. Set from an async
+/// SIGINT handler installed in [`drive`] (Ctrl-C at the interactive prompt is
+/// forwarded to an `:attach`ed worker's process group as SIGINT — see
+/// `repl.rs`), read+cleared at the top of every engine turn iteration
+/// (`engine::run_turn`). It is process-global because the coordinator runs one
+/// `drive` loop per process; interactive sessions never install the handler, so
+/// the latch is never set there and the engine seam is a no-op.
+static INTERRUPT: AtomicBool = AtomicBool::new(false);
+
+/// Signal that the operator interrupted the current turn. Called from the
+/// SIGINT handler task; idempotent.
+pub fn request_interrupt() {
+    INTERRUPT.store(true, Ordering::SeqCst);
+}
+
+/// Read AND clear the interrupt latch. Returns `true` exactly once per
+/// interrupt so a single Ctrl-C stops a single turn, not every turn after it.
+pub fn take_interrupt() -> bool {
+    INTERRUPT.swap(false, Ordering::SeqCst)
+}
 
 /// Default upper bound on agentic rounds (a misbehaving model can't spin
 /// forever). Mirrors atum's `DEFAULT_MAX_STEPS` backstop, scaled for a shell
@@ -387,6 +409,26 @@ pub async fn drive(
     // assignment in front of it no matter how long it runs.
     session.task_anchor = Some(input.clone());
 
+    // ── Operator interrupt (Ctrl-C forwarding). By default SIGINT terminates
+    // the process; a coordinator must instead treat it as "interrupt the
+    // current turn and reassess" so a live worker survives a Ctrl-C from an
+    // `:attach`ed interactive session (which forwards SIGINT to this process
+    // group — see repl.rs). Install an async handler that latches the interrupt
+    // flag; the engine turn loop reads+clears it at its next iteration seam and
+    // ends the turn with an `interrupted` banner, which the drive loop below
+    // turns into a reassess round. Best-effort: if the handler can't be
+    // installed we simply keep the default SIGINT behavior.
+    if let Ok(mut sigint) =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+    {
+        tokio::spawn(async move {
+            while sigint.recv().await.is_some() {
+                request_interrupt();
+                eprintln!("\x1b[2maish: SIGINT — interrupting current turn\x1b[0m");
+            }
+        });
+    }
+
     if let Some(s) = store {
         // session.session_id/name were adopted from the LAUNCHING session at
         // startup (see main.rs), so the row attributes to who asked for the work.
@@ -585,6 +627,22 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
         // recovery disposition rather than treating the (possibly partial) answer
         // as a finished result.
         if let Some(reason) = crate::loopguard::ExitReason::parse_banner(&answer) {
+            // Operator Ctrl-C interrupt: NOT a failure and NOT an auto-recovery.
+            // Keep the coordinator alive, fold a reassess directive, and drive
+            // the next round — where fold_operator_messages also picks up any
+            // fresh `:tell` steer the operator sent alongside the interrupt.
+            if matches!(reason, crate::loopguard::ExitReason::Interrupted) {
+                eprintln!(
+                    "\x1b[2maish: round {rounds} interrupted by operator (Ctrl-C) — reassessing\x1b[0m"
+                );
+                next_input = "[operator interrupt] The operator pressed Ctrl-C to interrupt your \
+previous turn mid-flight. Stop what you were doing — do NOT blindly resume it. Re-read the task \
+and any newer operator messages, reassess your approach, and either continue with the most \
+sensible next step or, if you should wait for direction, give a brief status plus your best \
+partial result."
+                    .to_string();
+                continue;
+            }
             let disp = crate::loopguard::classify_disposition(
                 &reason,
                 auto_recoveries,

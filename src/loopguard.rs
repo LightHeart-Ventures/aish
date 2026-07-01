@@ -271,6 +271,11 @@ pub enum ExitReason {
     /// The loop ran out of budget without an answer (a backstop — normally the
     /// forced-summarize step fires first).
     BudgetExhausted { iterations: usize },
+    /// The operator interrupted the turn — Ctrl-C forwarded (as SIGINT) to a
+    /// background coordinator the interactive session is `:attach`ed to. This is
+    /// NOT a failure: the coordinator stays alive, folds a reassess directive,
+    /// and drives the next round. Carries no counters.
+    Interrupted,
 }
 
 impl ExitReason {
@@ -281,6 +286,7 @@ impl ExitReason {
             ExitReason::ForcedSummarize { .. } => "forced-summarize",
             ExitReason::LoopDetected { .. } => "loop-detected",
             ExitReason::BudgetExhausted { .. } => "budget-exhausted",
+            ExitReason::Interrupted => "interrupted",
         }
     }
 
@@ -307,6 +313,7 @@ impl ExitReason {
             ExitReason::BudgetExhausted { iterations } => {
                 format!("exhausted the {iterations}-round tool-call budget without a final answer")
             }
+            ExitReason::Interrupted => "was interrupted by the operator (Ctrl-C)".to_string(),
         }
     }
 
@@ -324,6 +331,7 @@ impl ExitReason {
             ExitReason::Completed => (0, 0),
             ExitReason::ForcedSummarize { iterations } => (*iterations, 0),
             ExitReason::BudgetExhausted { iterations } => (*iterations, 0),
+            ExitReason::Interrupted => (0, 0),
             ExitReason::LoopDetected { count, .. } => (0, *count),
         };
         format!(
@@ -355,6 +363,7 @@ impl ExitReason {
         match tag {
             "forced-summarize" => Some(ExitReason::ForcedSummarize { iterations: iters }),
             "budget-exhausted" => Some(ExitReason::BudgetExhausted { iterations: iters }),
+            "interrupted" => Some(ExitReason::Interrupted),
             "loop-detected" => Some(ExitReason::LoopDetected {
                 call: String::new(),
                 count,
@@ -432,7 +441,7 @@ pub fn classify_disposition(
     max_auto: usize,
 ) -> Disposition {
     match reason {
-        ExitReason::Completed => Disposition::None,
+        ExitReason::Completed | ExitReason::Interrupted => Disposition::None,
         _ if auto_recoveries >= max_auto => Disposition::FlagOperator,
         ExitReason::LoopDetected { .. } => Disposition::Nudge,
         ExitReason::ForcedSummarize { .. } | ExitReason::BudgetExhausted { .. } => {
