@@ -52,6 +52,33 @@ Confirm it's loaded from the interactive shell:
 | `version`     | no       | semver string                                       |
 | `description` | no       | one-line summary                                    |
 | `enabled`     | no       | set `false` to keep the plugin on disk but inert    |
+| `config_schema` | no     | JSON-Schema-shaped config declaration (Phase 1.4)   |
+
+## Configuration (Phase 1.4)
+
+When a plugin declares a `config_schema`, aish resolves the plugin's config on
+discovery: it reads `config.json` (optional), fills any missing keys from the
+schema's `default`s, expands every `${env:VAR}` reference against the process
+environment, then validates `required` keys and declared `type`s. Secrets live
+only in the environment — `config.json`/`plugin.json` carry `${env:VAR}`
+references, never the resolved value.
+
+This example ships both halves:
+
+```jsonc
+// plugin.json → config_schema.properties
+"greeting": { "type": "string",  "default": "Hello, World!" },
+"shout":    { "type": "boolean", "default": false },
+"greeter":  { "type": "string",  "default": "${env:USER}" }   // env-ref default
+
+// config.json (overrides the schema defaults)
+{ "greeting": "¡Hola, mundo!", "shout": true }
+```
+
+Resolved config (with `USER=ada`): `greeting="¡Hola, mundo!"`, `shout=true`,
+`greeter="ada"`. A config error (unset `${env:VAR}`, missing `required` key,
+type mismatch) never drops the plugin — its skills still load; only the resolved
+`config` is withheld.
 
 Unknown fields are ignored, so this manifest stays forward-compatible with the
 richer plugin schema in [`docs/PLUGIN_SYSTEM_DESIGN.md`](../../../docs/PLUGIN_SYSTEM_DESIGN.md)

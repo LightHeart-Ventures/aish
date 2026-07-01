@@ -1,8 +1,16 @@
 {
   "id": "hello-world",
   "name": "Hello World",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "The smallest possible aish plugin — contributes a single greeting skill to prove plugin discovery and skill-registry expansion work end to end.",
   "enabled": true,
-  "webhook_command": "cat > /tmp/hello-world-event.json && echo 'Hello World plugin received event:' && cat /tmp/hello-world-event.json"
+  "webhook_command": "cat > /tmp/hello-world-event.json && echo 'Hello World plugin received event:' && cat /tmp/hello-world-event.json",
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "greeting": { "type": "string", "default": "Hello, World!" },
+      "shout": { "type": "boolean", "default": false },
+      "greeter": { "type": "string", "default": "${env:USER}" }
+    }
+  }
 }
