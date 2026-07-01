@@ -9,7 +9,7 @@
 //! RAM), then choose the largest model whose quantized footprint fits that
 //! budget.
 //!
-//! The choice is persisted to `~/.aish/local-model.json` and re-applied on later
+//! The choice is persisted to `~/.aish/config/local-model.json` and re-applied on later
 //! launches, so detection runs once and the answer sticks. An operator-pinned
 //! model — `AISH_LOCAL_MODEL_PATH` / `AISH_LOCAL_MODEL_ID`, or a `--model` flag
 //! on a local launch — ALWAYS wins and is never overridden by auto-detection.
@@ -392,7 +392,7 @@ pub enum SelectionSource {
     Operator,
 }
 
-/// The persisted local-model choice (`~/.aish/local-model.json`).
+/// The persisted local-model choice (`~/.aish/config/local-model.json`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Selection {
     pub model_id: String,
@@ -427,25 +427,47 @@ pub fn aish_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".aish")
 }
 
-/// Path of the persisted selection file.
+/// The config subdirectory, `~/.aish/config/`, where the persisted local-model
+/// selection now lives (mirrors `db_paths::db_dir`'s pattern). Best-effort
+/// creates the directory on every call via `fs::create_dir_all` (idempotent),
+/// so callers can write straight into the returned path without a separate
+/// mkdir. A creation failure is swallowed here — the subsequent write surfaces
+/// a precise, actionable error instead.
+pub fn config_dir() -> PathBuf {
+    let dir = aish_dir().join("config");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Path of the persisted selection file: `~/.aish/config/local-model.json`.
 pub fn selection_path() -> PathBuf {
+    config_dir().join("local-model.json")
+}
+
+/// Legacy path of the persisted selection: `~/.aish/local-model.json`. Read as
+/// a fallback so a selection written before the move to `~/.aish/config/`
+/// survives the upgrade.
+fn legacy_selection_path() -> PathBuf {
     aish_dir().join("local-model.json")
 }
 
-/// Load the persisted selection, if any. Returns `None` on a missing or
-/// unparseable file (treated as "never selected").
+/// Load the persisted selection, if any. Prefers the current
+/// `~/.aish/config/local-model.json`, falling back to the legacy
+/// `~/.aish/local-model.json`. Returns `None` on a missing or unparseable file
+/// (treated as "never selected").
 pub fn load_selection() -> Option<Selection> {
-    let raw = std::fs::read_to_string(selection_path()).ok()?;
+    let raw = std::fs::read_to_string(selection_path())
+        .or_else(|_| std::fs::read_to_string(legacy_selection_path()))
+        .ok()?;
     serde_json::from_str(&raw).ok()
 }
 
-/// Persist a selection to `~/.aish/local-model.json` (pretty-printed).
+/// Persist a selection to `~/.aish/config/local-model.json` (pretty-printed).
 pub fn save_selection(sel: &Selection) -> Result<()> {
-    let dir = aish_dir();
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    // `selection_path()` -> `config_dir()` creates `~/.aish/config/` for us.
+    let path = selection_path();
     let json = serde_json::to_string_pretty(sel).context("serializing local-model selection")?;
-    std::fs::write(selection_path(), json)
-        .with_context(|| format!("writing {}", selection_path().display()))?;
+    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -734,6 +756,17 @@ mod tests {
         assert_eq!(pin, Some(("my-custom-model".to_string(), None)));
         // Empty / whitespace cli model is ignored.
         assert_eq!(operator_pin(Some("   ")), None);
+    }
+
+    #[test]
+    fn selection_path_lives_under_config_dir() {
+        // The persisted selection now lives at ~/.aish/config/local-model.json,
+        // not loose in the config home (~/.aish/local-model.json).
+        let path = selection_path();
+        assert!(path.ends_with("config/local-model.json"), "{}", path.display());
+        assert!(config_dir().ends_with("config"));
+        // config_dir() is a strict child of aish_dir().
+        assert_eq!(config_dir().parent(), Some(aish_dir().as_path()));
     }
 
     #[test]
