@@ -6,6 +6,12 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 _Nothing yet._
 
+## [0.21.1] - 2026-07-01
+
+### Changed
+- **Interactive aish system-prompt refresh (LightHeart persona)**: the interactive system prompt is refreshed to the current LightHeart persona.
+- **NEVER FABRICATE, ALWAYS VERIFY guardrail**: added to both the system and worker prompts — agents must confirm claims with evidence (tool output, live state) rather than asserting unverified results.
+
 ## [0.21.0] - 2026-07-01
 
 ### Added
