@@ -595,7 +595,7 @@ impl Session {
     /// the local catalog from `skills_dir` and re-renders `skills_prompt`,
     /// keeping the interactive routing subset of the live MCP skills alongside it.
     pub fn reload_skills_from(&mut self, skills_dir: &std::path::Path) {
-        let local = crate::skills::load(skills_dir);
+        let local = crate::skills::load_catalog(skills_dir);
         // `reload_skills` is invoked ONLY from the interactive `:skill add` /
         // `:skill remove` path — never by a background coordinator (which builds
         // its skills_prompt once, from the full catalog, in `main`). So a reload

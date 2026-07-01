@@ -4,7 +4,8 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- **Plugin system — skill-registry expansion (first slice)**: aish now discovers plugins under `~/.aish/plugins/<id>/` and merges each enabled plugin's skills into the same catalog it advertises for `~/.aish/skills`. A plugin is any directory with a readable `plugin.json`; its skills use the standard `skills/<name>/SKILL.md` layout. Installed skills win on a name collision; disabled/malformed plugins are skipped silently. New `src/plugins.rs` + `skills::load_catalog`, wired into startup, the deferred interactive MCP handshake, and `:skill` reloads. Ships a runnable `examples/plugins/hello-world/` plugin that contributes one greeting skill as an end-to-end proof. See `docs/PLUGIN_SYSTEM_DESIGN.md` § Implementation status.
 
 ## [0.21.1] - 2026-07-01
 

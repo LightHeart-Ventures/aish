@@ -43,6 +43,31 @@ pub fn load(dir: &Path) -> Vec<Skill> {
     skills
 }
 
+/// Load the full skill catalog: the installed skills in `skills_dir`
+/// (`~/.aish/skills`) PLUS every skill contributed by discovered plugins under
+/// the sibling `plugins/` directory (`~/.aish/plugins/<id>/skills/`). Plugins
+/// thus **expand the skill registry** without the caller wiring anything up.
+///
+/// The plugins directory is derived as `skills_dir`'s sibling `plugins/`, so a
+/// standard `~/.aish/skills` maps to `~/.aish/plugins`. An installed skill wins
+/// on a name collision — a user's `~/.aish/skills/<name>` always shadows a
+/// plugin's same-named skill. Tests that want *only* the on-disk skills keep
+/// calling [`load`]; production call sites use this.
+pub fn load_catalog(skills_dir: &Path) -> Vec<Skill> {
+    let mut skills = load(skills_dir);
+    if let Some(plugins_dir) = skills_dir.parent().map(|p| p.join("plugins")) {
+        let have: std::collections::HashSet<String> =
+            skills.iter().map(|s| s.name.clone()).collect();
+        for sk in crate::plugins::plugin_skills(&plugins_dir) {
+            if !have.contains(&sk.name) {
+                skills.push(sk);
+            }
+        }
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    skills
+}
+
 /// Pull `name:` and `description:` out of a `---`-fenced frontmatter block.
 /// Single-line values only — that's what the convention uses in practice.
 /// Shared with the skill.fish importer, which validates fetched SKILL.md files.
@@ -191,5 +216,46 @@ mod tests {
         assert_eq!(kept, vec!["atum/should-i-hire-an-agent", "atum/pick-model"]);
         // Empty catalog stays empty.
         assert!(interactive_mcp_skills(&[]).is_empty());
+    }
+
+    #[test]
+    fn load_catalog_merges_plugin_skills() {
+        // Build an `~/.aish`-shaped layout: <root>/skills + <root>/plugins.
+        let root = std::env::temp_dir().join(format!(
+            "aish-catalog-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let skills_dir = root.join("skills");
+        let plugin_skill = root.join("plugins").join("hello-world").join("skills").join("hello-world");
+        std::fs::create_dir_all(skills_dir.join("deploy")).unwrap();
+        std::fs::create_dir_all(&plugin_skill).unwrap();
+        std::fs::write(
+            skills_dir.join("deploy").join("SKILL.md"),
+            "---\nname: deploy\ndescription: Ship it.\n---\nbody",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("plugins").join("hello-world").join("plugin.json"),
+            r#"{"id":"hello-world"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_skill.join("SKILL.md"),
+            "---\nname: hello-world\ndescription: Greet.\n---\nbody",
+        )
+        .unwrap();
+
+        let names: Vec<String> = load_catalog(&skills_dir).into_iter().map(|s| s.name).collect();
+        // Installed skill + plugin-contributed skill, sorted by name.
+        assert_eq!(names, vec!["deploy", "hello-world"]);
+
+        // `load` alone (no plugin merge) sees only the installed skill.
+        assert_eq!(load(&skills_dir).len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

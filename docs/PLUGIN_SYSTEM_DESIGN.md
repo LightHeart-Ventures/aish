@@ -829,6 +829,35 @@ pub fn webhook_status() -> Result<WebhookStatus> {
 
 ---
 
+## Implementation status
+
+**Shipped — skill-registry expansion (the first, smallest slice):**
+
+aish discovers plugins under `~/.aish/plugins/<plugin-id>/` and merges each
+enabled plugin's **skills** into the same catalog the agent sees for
+`~/.aish/skills`. A plugin is any directory containing a readable, parseable
+`plugin.json`; its skills use the standard installed-skill layout
+`skills/<skill-name>/SKILL.md` (subdir + `SKILL.md`), so they load through the
+exact same parser as `~/.aish/skills` — this is a deliberate, small divergence
+from the flat `skills/<name>.md` sketch above, chosen for parser reuse and
+consistency with the existing skill convention.
+
+- Code: `src/plugins.rs` (discovery + `plugin_skills`), `skills::load_catalog`
+  (merge; installed skills win on a name collision).
+- Wired into startup (`main.rs`), the deferred interactive MCP handshake
+  (`repl.rs`), and mid-session `:skill` reloads (`session.rs`).
+- Disabled (`"enabled": false`), malformed, or manifest-less directories are
+  skipped silently — a broken plugin never blocks startup.
+- Runnable example: [`examples/plugins/hello-world/`](../examples/plugins/hello-world/)
+  — a plugin whose only job is to contribute one `hello-world` greeting skill,
+  proving plugin discovery + skill expansion end to end.
+
+Everything else in this document (MCP servers, tools, webhooks, hooks, memory,
+schemas) remains forward-looking. Unknown `plugin.json` keys are ignored today,
+so a manifest can grow into the richer schema without breaking existing plugins.
+
+---
+
 ## Timeline
 
 - **Phases 1–3 (Core):** Sprint S10 (weeks 1–2) — 18 SP
