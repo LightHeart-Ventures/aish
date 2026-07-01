@@ -202,10 +202,10 @@ pub async fn run(
 
     // Start on a clean screen (interactive terminals only — keep piped output clean).
     clear_screen();
+    // Print the live statusline (top of screen) with version and backend model.
+    println!("{}", crate::style::statusline(crate::update::current_version(), &backend.describe()));
     println!(
-        "\x1b[1maish\x1b[0m \x1b[2mv{}\x1b[0m — AI-native shell · {} · :help for commands",
-        crate::update::current_version(),
-        backend.describe()
+        "\x1b[2m:help for commands — :workers to monitor background tasks\x1b[0m"
     );
 
     let mut prev_dir: Option<PathBuf> = None;
@@ -374,6 +374,14 @@ pub async fn run(
             "{name}{attach}{badge}\x1b[36m{}\x1b[0m ❯ ",
             short_cwd(&session)
         );
+        
+        // Print the live statusline before idle (refreshes the time every loop iteration).
+        // Only on first iteration or when colors_enabled (avoid cluttering piped output).
+        if crate::style::colors_enabled() {
+            print!("\x1b[H"); // Home cursor to top (ANSI escape)
+            println!("{}", crate::style::statusline(crate::update::current_version(), &backend.describe()));
+        }
+        
         // Consume an accepted-rewrite line first, then an active `:loop`
         // iteration, before falling back to the editor. A loop iteration is fed
         // to the model inline via the `?` route escape so it runs as an agentic
@@ -2627,7 +2635,7 @@ fn backfill_attached(run_id: &str, session: &Session) {
     // this row is the prompt the coordinator was given, not one of its own
     // activity lines that follow.
     println!("{}", crate::worker::pane_input_row(run_id, &job.task));
-    let rows = job.transcript_rows();
+    let mut rows = job.transcript_rows();
     if rows.is_empty() {
         // No activity captured yet. For a LIVE worker, show an ANIMATED
         // "thinking…" row (matching the live-stream / interactive spinner)
@@ -2651,6 +2659,14 @@ fn backfill_attached(run_id: &str, session: &Session) {
             );
         }
     } else {
+        // Tail to the last 40 lines of transcript. When attaching/cycling,
+        // show only the latest ~1 screen of output to avoid scrolling chat
+        // history offscreen. The live stream continues below this tail.
+        const TAIL_LINES: usize = 40;
+        let total_rows = rows.len();
+        if total_rows > TAIL_LINES {
+            rows = rows.into_iter().skip(total_rows - TAIL_LINES).collect();
+        }
         // The transcript suffix is empty under the single-glyph convention\u{2014}
         // the source glyph is already stamped in `text`. Fold any legacy suffix
         // into the row text so the gutter stays a bare `[label]`.
