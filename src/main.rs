@@ -22,6 +22,7 @@ mod modelfetch;
 #[cfg(test)]
 mod oracle;
 mod pipeline;
+mod plugin_state;
 mod plugins;
 mod present;
 mod rc;
@@ -432,6 +433,12 @@ async fn main() -> Result<()> {
     // ~/.aish/ — config home (created above): .mcp.json (MCP servers) and skills/.
     let _ = std::fs::create_dir_all(aish_dir.join("skills"));
     let skills_dir = aish_dir.join("skills");
+    // Plugin-scoped state store (Phase 1.5): one global SQLite DB at
+    // ~/.aish/plugins.db, initialized once here so plugin hooks can reach it via
+    // `plugin_state::global()`. Non-fatal — a bad DB must never block startup.
+    if let Err(e) = plugin_state::init_global(&aish_dir.join("plugins.db")) {
+        eprintln!("\x1b[33maish:\x1b[0m plugin state store unavailable: {e}");
+    }
     let mcp_config = aish_dir.join(".mcp.json");
     if !mcp_config.exists() {
         let _ = std::fs::write(&mcp_config, "{\n  \"mcpServers\": {\n  }\n}\n");
