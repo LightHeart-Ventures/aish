@@ -81,7 +81,7 @@ impl Channel {
 /// Parse a channel name (case-insensitive). Recognises `prod`/`stable`,
 /// `dev`/`nightly`, and `ci`; anything else (including unset) is `None` so the
 /// caller can fall back to the default.
-fn parse_channel(s: &str) -> Option<Channel> {
+pub fn parse_channel(s: &str) -> Option<Channel> {
     match s.trim().to_ascii_lowercase().as_str() {
         "prod" | "stable" | "release" => Some(Channel::Prod),
         "dev" | "nightly" => Some(Channel::Dev),
@@ -332,8 +332,15 @@ async fn view_release(repo: &str, tag: &str) -> Result<GhRelease> {
 /// swallows errors). All three channels converge here and hand a single
 /// [`UpdateInfo`] to the existing download/apply path.
 pub async fn check() -> Result<Option<UpdateInfo>> {
+    check_channel(channel()).await
+}
+
+/// Same as [`check`] but for an explicitly-chosen [`Channel`], bypassing the
+/// `AISH_UPDATE_CHANNEL` env default. Backs `:update <channel>`, letting a user
+/// pull from dev/ci for a single invocation without exporting the env var.
+pub async fn check_channel(ch: Channel) -> Result<Option<UpdateInfo>> {
     let repo = repo();
-    let Some(release) = resolve_release(&repo, channel()).await? else {
+    let Some(release) = resolve_release(&repo, ch).await? else {
         return Ok(None);
     };
 

@@ -27,6 +27,24 @@ export AISH_UPDATE_CHANNEL=ci
 
 When unset or unrecognized, `:update` defaults to `prod` (stable).
 
+### One-off override: `:update [channel]`
+
+You don't have to export the env var to pull from another channel. `:update`
+accepts an optional channel argument that overrides `AISH_UPDATE_CHANNEL` for
+that single invocation:
+
+```
+:update            # use AISH_UPDATE_CHANNEL (default prod)
+:update dev        # pull the latest nightly, just this once
+:update ci         # pull the latest CI snapshot, just this once
+:update prod       # force stable, ignoring an exported dev/ci channel
+```
+
+The argument is the channel *selector* — there is no separate `:channel`
+command. An unrecognized value (e.g. `:update nope`) aborts with an error
+instead of silently falling back to prod. Aliases are accepted: `stable`/
+`release` → prod, `nightly` → dev.
+
 ### Setting the channel permanently
 
 Add the export to your shell profile:
@@ -64,13 +82,17 @@ Once a release is discovered, all three channels use the same download/verify/sw
 ### Switch to dev builds
 
 ```bash
+# Either export the channel…
 export AISH_UPDATE_CHANNEL=dev
 aish -c ':update'
+
+# …or override it for one invocation:
+aish -c ':update dev'
 ```
 
 Output:
 ```
-[dev] checking for updates …
+checking dev channel (nightly dev-v{next}-dev.{n} pre-releases) for updates…
 Found dev-v0.24.0-dev.42 (newer than 0.23.0) — installing…
 ✓ downloaded aish-aarch64-apple-darwin (28.5 MB)
 installing …
