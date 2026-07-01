@@ -277,6 +277,87 @@ pub fn time_cells(started: Option<i64>, finished: Option<i64>, now: i64) -> (Str
     (started_cell, runtime_cell)
 }
 
+// ---------------------------------------------------------------------------
+// Statusline — a left/right-justified info bar printed above the REPL prompt
+// ---------------------------------------------------------------------------
+
+/// Stdout terminal width in columns, floored at 80. A tty is queried via
+/// TIOCGWINSZ; off a tty we honor `$COLUMNS`, else fall back to 80. The floor
+/// keeps the statusline from collapsing on a narrow or unknown terminal.
+fn statusline_width() -> usize {
+    // SAFETY: isatty + a read-only TIOCGWINSZ ioctl on stdout (fd 1).
+    unsafe {
+        if libc::isatty(1) == 1 {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+                return (ws.ws_col as usize).max(80);
+            }
+        }
+    }
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.parse::<usize>().ok())
+        .map(|w| w.max(80))
+        .unwrap_or(80)
+}
+
+/// Civil date `(year, month, day)` from days-since-Unix-epoch. Inverse of
+/// [`days_from_civil`] — Howard Hinnant's `civil_from_days`, exact integer math.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Format a UTC epoch-second instant as `"YYYY-MM-DD HH:MM"` (minute precision).
+/// Pure — no chrono dependency; unit-tested against known instants.
+pub fn fmt_datetime_utc(epoch: i64) -> String {
+    let days = epoch.div_euclid(86_400);
+    let sod = epoch.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let (hh, mm) = (sod / 3600, (sod % 3600) / 60);
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
+}
+
+/// Render the REPL statusline: version + shell tagline + model on the LEFT,
+/// the current UTC date/time (`YYYY-MM-DD HH:MM`) right-justified on the RIGHT,
+/// separated by enough spaces to fill the terminal width. Runtime form — reads
+/// the wall clock, terminal width, and [`colors_enabled`]. Off a tty (piped /
+/// `NO_COLOR`) it still returns plain text; the caller decides whether to print.
+pub fn statusline(version: &str, model: &str) -> String {
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    statusline_at(version, model, epoch, statusline_width(), colors_enabled())
+}
+
+/// Pure form of [`statusline`]: the caller supplies the instant, width, and
+/// color decision, so alignment + padding are unit-testable without a TTY.
+pub fn statusline_at(version: &str, model: &str, epoch: i64, width: usize, color_on: bool) -> String {
+    let left = format!("aish v{version} — AI-native shell · {model}");
+    let right = fmt_datetime_utc(epoch);
+    let width = width.max(80);
+    // Char counts, not byte lengths — the em-dash and middle-dot are multi-byte
+    // but single-column, so counting chars keeps the right edge aligned.
+    let (lw, rw) = (left.chars().count(), right.chars().count());
+    // At least one space between the two halves when they'd otherwise collide.
+    let gap = width.saturating_sub(lw + rw).max(1);
+    let spaces = " ".repeat(gap);
+    if color_on {
+        format!("\x1b[2m{left}{spaces}{right}{RESET}")
+    } else {
+        format!("{left}{spaces}{right}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +415,41 @@ mod tests {
         assert_eq!(time_cells(None, None, 9999), ("—".to_string(), "—".to_string()));
     }
 
+
+    #[test]
+    fn fmt_datetime_utc_known_instants() {
+        assert_eq!(fmt_datetime_utc(0), "1970-01-01 00:00");
+        // 2021-01-01 00:00:00 UTC = 1609459200.
+        assert_eq!(fmt_datetime_utc(1_609_459_200), "2021-01-01 00:00");
+        // Minute precision: 2021-01-01 12:34:56 = 1609504496.
+        assert_eq!(fmt_datetime_utc(1_609_504_496), "2021-01-01 12:34");
+        // 2023-11-14 22:13:20 UTC.
+        assert_eq!(fmt_datetime_utc(1_700_000_000), "2023-11-14 22:13");
+    }
+
+    #[test]
+    fn statusline_aligns_and_pads_to_width() {
+        let s = statusline_at("0.21.1", "claude (sonnet)", 1_609_459_200, 80, false);
+        assert!(!s.contains('\x1b')); // plain mode: no ANSI
+        assert!(s.starts_with("aish v0.21.1 — AI-native shell · claude (sonnet)"));
+        assert!(s.ends_with("2021-01-01 00:00"));
+        // Dash/dot are single-column; char count fills exactly the width.
+        assert_eq!(s.chars().count(), 80);
+    }
+
+    #[test]
+    fn statusline_colored_wraps_in_dim() {
+        let s = statusline_at("0.21.1", "m", 0, 80, true);
+        assert!(s.starts_with("\x1b[2m"));
+        assert!(s.ends_with(RESET));
+    }
+
+    #[test]
+    fn statusline_narrow_width_floors_at_80() {
+        let s = statusline_at("0.21.1", "x", 0, 10, false);
+        assert!(s.chars().count() >= 80);
+        assert!(s.contains("  ")); // separating gap present
+    }
 
     #[test]
     fn no_color_override_forces_plain() {
