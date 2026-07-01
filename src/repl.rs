@@ -612,7 +612,14 @@ pub async fn run(
                     println!();
                     // The agent is escalating this work to a background worker on
                     // its own (a work-signal line, outside an explicit :dispatch).
-                    dispatch_background(&line, &mut session, true);
+                    // The worker boots with ONLY its task string and never sees
+                    // this conversation, so a line like "build a fix for THIS and
+                    // open a PR" would strand it — the antecedent of "this" lived
+                    // in turns it can't read. Prepend a short, bounded digest of
+                    // the most recent turns so deixis resolves. No-op when there's
+                    // no prior context (the digest adds nothing on a cold prompt).
+                    let task = enrich_task_with_context(&line, &session.history);
+                    dispatch_background(&task, &mut session, true);
                     continue;
                 }
 
@@ -2373,6 +2380,76 @@ const WORK_SIGNALS: &[&str] = &[
 /// stems are matched as token prefixes so inflected forms count without
 /// false-matching a signal buried mid-word (`prefix`/`suffix` never START a
 /// token with a signal stem, so they don't match).
+/// Clip a message to a single tidy line of at most `max` chars for a context
+/// digest: internal whitespace/newlines collapse to single spaces, and an
+/// over-long line is truncated on a char boundary with a trailing ellipsis.
+fn clip_for_digest(s: &str, max: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// Enrich a raw auto-offload line with a bounded digest of the most recent
+/// conversation turns.
+///
+/// The deterministic auto-offload path (a work-signal line typed at the prompt)
+/// spawns a background coordinator whose ONLY task-specific content is the raw
+/// typed line — it never inherits the interactive transcript. A line like
+/// "build a fix for this and open a PR" then loses its antecedent: whatever
+/// "this" referred to lived in turns the worker can't see. This prepends a short
+/// digest of recent turns so pronouns/deixis resolve, then appends the operator's
+/// actual instruction verbatim as the trailing (and therefore load-bearing) line.
+///
+/// Bounded on purpose: at most `MAX_CTX_MSGS` recent messages that carry visible
+/// text, each clipped to `MAX_CTX_CHARS`, so a huge session can't bloat the task
+/// string — which also feeds the coordinator's same-task dedup key and the
+/// `:workers` display. Returns `line` unchanged when there is no prior visible
+/// context to attach (a cold prompt), so a fresh session offloads exactly as
+/// before.
+fn enrich_task_with_context(line: &str, history: &[crate::backend::Msg]) -> String {
+    use crate::backend::Role;
+    const MAX_CTX_MSGS: usize = 6;
+    const MAX_CTX_CHARS: usize = 600;
+
+    // Walk newest→oldest, keeping messages with visible text (tool-result and
+    // prefill carriers have empty `text`) until the cap.
+    let mut picked: Vec<&crate::backend::Msg> = Vec::new();
+    for msg in history.iter().rev() {
+        if msg.text.trim().is_empty() {
+            continue;
+        }
+        picked.push(msg);
+        if picked.len() >= MAX_CTX_MSGS {
+            break;
+        }
+    }
+    if picked.is_empty() {
+        return line.to_string();
+    }
+    picked.reverse(); // restore chronological order for readability
+
+    let mut digest = String::from(
+        "=== Recent conversation context (for reference — the operator's request at the end may refer to it) ===\n",
+    );
+    for msg in picked {
+        let who = match msg.role {
+            Role::User => "Operator",
+            Role::Assistant => "Assistant",
+        };
+        digest.push_str(who);
+        digest.push_str(": ");
+        digest.push_str(&clip_for_digest(msg.text.trim(), MAX_CTX_CHARS));
+        digest.push('\n');
+    }
+    digest.push_str("=== End context ===\n\n");
+    digest.push_str(line);
+    digest
+}
+
 fn mentions_work_signal(line: &str) -> bool {
     if mentions_troubleshoot(line) {
         return true;
@@ -6039,6 +6116,68 @@ mod tests {
         // troubleshoot is folded in, and matching is case-insensitive.
         assert!(mentions_work_signal("troubleshoot the build"));
         assert!(mentions_work_signal("FIX the bug"));
+    }
+
+    #[test]
+    fn enrich_task_with_context_prepends_recent_turns() {
+        use crate::backend::{Msg, Role};
+        let history = vec![
+            Msg::user("the build fails with a borrow error in engine.rs"),
+            Msg {
+                role: Role::Assistant,
+                text: "It's a double mutable borrow at line 40.".into(),
+                tool_calls: vec![],
+                tool_results: vec![],
+                raw: None,
+            },
+        ];
+        let out = enrich_task_with_context("build a fix for this and open a PR", &history);
+        // The digest carries the antecedent the raw line's "this" referred to…
+        assert!(out.contains("Recent conversation context"), "{out}");
+        assert!(out.contains("borrow error"), "{out}");
+        assert!(out.contains("double mutable borrow"), "{out}");
+        assert!(out.contains("Operator:") && out.contains("Assistant:"), "{out}");
+        // …and the operator's actual instruction is the trailing, load-bearing line.
+        assert!(
+            out.trim_end().ends_with("build a fix for this and open a PR"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn enrich_task_with_context_noop_when_no_history() {
+        // A cold prompt (or history with no visible text) offloads exactly as
+        // before — the raw line is returned unchanged, no digest wrapper.
+        assert_eq!(enrich_task_with_context("fix the thing", &[]), "fix the thing");
+        let carriers = vec![crate::backend::Msg::tool_results(vec![])];
+        assert_eq!(
+            enrich_task_with_context("refactor it", &carriers),
+            "refactor it"
+        );
+    }
+
+    #[test]
+    fn enrich_task_with_context_caps_recent_messages() {
+        use crate::backend::Msg;
+        // One empty-text carrier (skipped) followed by 10 visible turns.
+        let mut history = vec![Msg::tool_results(vec![])];
+        for i in 0..10 {
+            history.push(Msg::user(format!("line {i} with some words")));
+        }
+        let out = enrich_task_with_context("refactor it", &history);
+        // At most 6 newest visible messages are included: line 9..=4 survive,
+        // the older ones (incl. "line 0") are dropped.
+        assert!(out.contains("line 9"), "{out}");
+        assert!(!out.contains("line 0"), "{out}");
+    }
+
+    #[test]
+    fn clip_for_digest_collapses_and_truncates() {
+        // Whitespace/newlines collapse to single spaces.
+        assert_eq!(clip_for_digest("a\n  b\t c", 100), "a b c");
+        // Over-long input is clipped on a char boundary with an ellipsis.
+        let clipped = clip_for_digest("abcdefghij", 4);
+        assert_eq!(clipped, "abcd…");
     }
 
     #[test]
