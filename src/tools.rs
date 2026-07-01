@@ -515,6 +515,30 @@ a repo name for a repo (repo filtering is not yet wired to the durable store)."
                 "required": ["id", "message"]
             }),
         });
+        // The harsh sibling of `tell`: `stop` doesn't steer a coordinator, it
+        // STANDS IT DOWN. Where a tell queues a message the coordinator folds in
+        // and keeps working, a stop raises a durable stand-down flag AND (for a
+        // worker in this session) interrupts its in-flight turn, so at the next
+        // round boundary it takes one final graceful wrap-up turn and terminates.
+        defs.push(ToolDef {
+            name: "stop".into(),
+            description: "STAND DOWN an in-flight background coordinator — a harsher \
+alternative to `tell`. Where `tell` only steers a coordinator and lets it keep working, `stop` \
+ends the run: it raises a durable stand-down flag and interrupts the coordinator's current turn, \
+so at its next round boundary it takes ONE final graceful wrap-up turn (preserve in-flight work — \
+commit/push/draft-PR — and report a status) and then terminates. Use it when a coordinator's work \
+is no longer needed, has gone off the rails, or you want to reclaim it promptly rather than wait \
+out its current turn (which a `tell` would). Call background_status to find the target run id. A \
+finished coordinator is refused (nothing to stop)."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The coordinator's run id, or an unambiguous prefix (e.g. the short 8-char id shown by background_status)."}
+                },
+                "required": ["id"]
+            }),
+        });
     }
     // Coordinator→console channel: only a background coordinator (`nested`) can
     // reach the operator's interactive terminal, so the tool is offered only
@@ -650,6 +674,7 @@ pub async fn execute(
         "batch_result" => batch_result(call, session),
         "background_status" => background_status(call, session),
         "tell" => tell(call, session),
+        "stop" => stop(call, session),
         "message_console" => message_console(call, session),
         "escalate" => escalate(call, session).await,
         "get_skill" => get_skill(call, session).await,
@@ -1762,6 +1787,99 @@ fn tell(call: &ToolCall, session: &Session) -> Result<String> {
             let ids = many
                 .iter()
                 .map(|(rid, _)| crate::batch::short_id(rid).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "'{id}' matches {} coordinators ({ids}) — use a longer id prefix",
+                many.len()
+            )
+        }
+    }
+}
+
+/// `stop` tool — the agent-facing side of the `:stop` stand-down channel, the
+/// harsh sibling of `tell`. Where `tell` queues a steering message a coordinator
+/// folds in and keeps working, `stop` ENDS the run: it raises the durable
+/// stand-down flag (read at the coordinator's next round boundary — see
+/// `coordinator::drive`) and, for a worker owned by THIS session, additionally
+/// SIGINTs its process group so the in-flight turn aborts and the boundary is
+/// reached promptly rather than after a possibly-long current turn. Candidate
+/// resolution mirrors `tell`: this session's in-memory workers first (whose pid
+/// is known for the interrupt), then every durable run (cross-session — flag
+/// only, no local pid); a terminal run is refused and an ambiguous prefix lists
+/// the matches.
+fn stop(call: &ToolCall, session: &Session) -> Result<String> {
+    let id = call.args["id"].as_str().unwrap_or_default().trim();
+    if id.is_empty() {
+        anyhow::bail!(
+            "stop requires `id` (a coordinator run id from background_status)"
+        );
+    }
+    let Some(store) = &session.coordinator_store else {
+        anyhow::bail!("coordinator store unavailable — can't stand down a coordinator");
+    };
+    let hit = |rid: &str| rid == id || rid.starts_with(id);
+
+    // (run_id, terminal?, pid). This session's in-memory workers first — capture
+    // the child pid so we can interrupt its current turn — then durable runs from
+    // any session (deduped on run_id; no local pid, so flag-only).
+    let mut candidates: Vec<(String, bool, Option<u32>)> = Vec::new();
+    for w in session.worker_jobs.lock().unwrap().iter() {
+        if hit(&w.id) {
+            let terminal = matches!(w.status().as_str(), "done" | "failed");
+            candidates.push((w.id.clone(), terminal, w.pid()));
+        }
+    }
+    if let Ok(rows) = store.load_all() {
+        for r in rows {
+            if hit(&r.run_id) && !candidates.iter().any(|(rid, _, _)| rid == &r.run_id) {
+                let terminal = matches!(r.phase.as_str(), "done" | "failed");
+                candidates.push((r.run_id.clone(), terminal, None));
+            }
+        }
+    }
+
+    match candidates.as_slice() {
+        [] => anyhow::bail!(
+            "no in-flight coordinator matching '{id}' — call background_status to list run ids"
+        ),
+        [(run_id, terminal, pid)] => {
+            let short = crate::batch::short_id(run_id);
+            if *terminal {
+                anyhow::bail!(
+                    "coordinator {short} has already finished — nothing to stand down"
+                );
+            }
+            // Durable flag first: this is the source of truth the coordinator
+            // reads at its next round boundary, and it works cross-session even
+            // when we hold no local pid to signal.
+            store.request_stand_down(run_id)?;
+            // Best-effort interrupt: for a worker in THIS session, SIGINT the
+            // process group (pgid == pid via the child's setsid()) so an in-flight
+            // turn rolls back and the boundary — where the flag is honored — is
+            // reached now instead of after the current turn finishes. A run in
+            // another session has no local pid; the flag alone still stands it
+            // down at its next round.
+            let interrupted = if let Some(pid) = pid {
+                unsafe { libc::kill(-(*pid as i32), libc::SIGINT) };
+                true
+            } else {
+                false
+            };
+            Ok(if interrupted {
+                format!(
+                    "🛑 stand-down ordered for coordinator {short} — turn interrupted; it will take one final wrap-up turn, then exit"
+                )
+            } else {
+                format!(
+                    "🛑 stand-down flag raised for coordinator {short} — it will wrap up and exit at its next round boundary"
+                )
+            })
+        }
+        many => {
+            let ids = many
+                .iter()
+                .map(|(rid, _, _)| crate::batch::short_id(rid).to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
             anyhow::bail!(
@@ -3712,6 +3830,9 @@ mod tests {
         assert!(has(&tool_defs(true, true, false), "tell"));
         assert!(!has(&tool_defs(false, false, false), "tell"));
         assert!(!has(&tool_defs(false, true, false), "tell"));
+        // `stop` (stand-down) rides the same batch-mode gate as `tell`.
+        assert!(has(&tool_defs(true, false, false), "stop"));
+        assert!(!has(&tool_defs(false, false, false), "stop"));
         // message_console is gated on `nested` (the 3rd flag), independent of
         // batch_mode / escalate — only a background coordinator gets it.
         assert!(has(&tool_defs(false, false, true), "message_console"));

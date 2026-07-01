@@ -597,6 +597,71 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
             eprintln!("✉ folded {folded} operator message(s) into this round");
         }
 
+        // ── stand-down: a parent raised the harsh `:stop` flag (harsher than a
+        // `:tell` — it doesn't just steer the run, it ENDS it). Honor it here at
+        // the round boundary: take ONE final graceful wrap-up turn so the worker
+        // can preserve in-flight work (commit/push/draft-PR) and report a status,
+        // then terminate as `done`. Any operator messages folded just above ride
+        // along in `next_input`, so a `:tell` sent alongside the stop is still
+        // seen. The immediacy over `:tell` (which also waits for the next round)
+        // comes from the parent additionally SIGINT-ing the worker's process
+        // group: that interrupts the in-flight turn and lands us here promptly
+        // instead of after a possibly-long current round.
+        let standing_down = store
+            .map(|s| s.stand_down_requested(run_id).unwrap_or(false))
+            .unwrap_or(false);
+        if standing_down {
+            eprintln!("🛑 stand-down ordered by parent — one final wrap-up turn, then exiting");
+            let directive = "[STAND DOWN] Your parent has ordered you to STAND DOWN now — this \
+overrides the task. Do NOT start or continue any substantive work. In this SINGLE final turn: \
+preserve whatever you have in flight (if you have uncommitted changes and a remote is available, \
+commit them to your branch, push, and open or refresh a DRAFT pull request), then give a brief \
+final status plus your best partial result. After this turn you are terminated.";
+            next_input = if next_input.trim().is_empty() {
+                directive.to_string()
+            } else {
+                format!("{directive}\n\n{next_input}")
+            };
+            if let Some(s) = store {
+                let _ = s.set_phase(run_id, Phase::Coordinating.as_str());
+            }
+            let mut allow = |_: &str| tools::Decision::AllowOnce;
+            let answer =
+                match crate::engine::run_turn(backend, session, next_input, &mut allow).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        let error = format!("stand-down wrap-up turn failed: {e:#}");
+                        if let Some(s) = store {
+                            let _ = s.set_failed(run_id, &error);
+                        }
+                        finalize_worker_store(run_id, "failed", None);
+                        return Outcome {
+                            phase: Phase::Failed,
+                            result: None,
+                            error: Some(error),
+                            rounds,
+                        };
+                    }
+                };
+            rounds += 1;
+            if let Some(a) = session.turn_audit.as_mut() {
+                a.synthesis(rounds as u64, &answer);
+            }
+            if let Some(w) = session.worker_transcript.as_mut() {
+                w.record_message("assistant", "synthesis", &answer);
+            }
+            if let Some(s) = store {
+                let _ = s.set_done(run_id, &answer);
+            }
+            finalize_worker_store(run_id, "done", Some(&answer));
+            return Outcome {
+                phase: Phase::Done,
+                result: Some(answer),
+                error: None,
+                rounds,
+            };
+        }
+
         // ── coordinating: one full-tool agentic turn ────────────────────────
         if let Some(s) = store {
             let _ = s.set_phase(run_id, Phase::Coordinating.as_str());

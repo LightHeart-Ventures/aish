@@ -843,7 +843,13 @@ impl CoordinatorStore {
                  session_id   TEXT,
                  session_name TEXT,
                  created_at   TEXT NOT NULL DEFAULT current_timestamp,
-                 heartbeat_at TEXT NOT NULL DEFAULT current_timestamp
+                 heartbeat_at TEXT NOT NULL DEFAULT current_timestamp,
+                 -- Stand-down control flag (the `:stop` / `stop` channel — a
+                 -- harsher sibling of `:tell`). When a parent raises it, the
+                 -- live coordinator takes ONE final graceful wrap-up turn at its
+                 -- next round boundary and then terminates (see
+                 -- `coordinator::drive`). 0 = run normally, 1 = stand down.
+                 stand_down   INTEGER NOT NULL DEFAULT 0
              );
              -- Operator → coordinator mailbox (the :tell / SendMessage channel).
              -- A row is a clarification/instruction queued for an in-flight run;
@@ -877,6 +883,13 @@ impl CoordinatorStore {
         // (session_id predates this; ignore the error when the column is present.)
         let _ = conn.execute(
             "ALTER TABLE coordinator_runs ADD COLUMN session_name TEXT",
+            [],
+        );
+        // Back-compat: add the stand-down control flag to a table created before
+        // it existed. Additive `ADD COLUMN` with a constant default — ignored
+        // (duplicate-column error swallowed) once present, so it's idempotent.
+        let _ = conn.execute(
+            "ALTER TABLE coordinator_runs ADD COLUMN stand_down INTEGER NOT NULL DEFAULT 0",
             [],
         );
         // S9.1: cross-reference the container backing a run (id + name + engine)
@@ -1073,6 +1086,43 @@ impl CoordinatorStore {
             [run_id],
             |r| r.get(0),
         )?)
+    }
+
+    /// Raise the STAND-DOWN flag on a run — the write side of the `:stop` /
+    /// `stop` channel, a harsher sibling of `:tell`. Where a tell queues a
+    /// message the coordinator folds in and keeps working, a stand-down orders
+    /// it to STOP: at its next round boundary the coordinator takes one final
+    /// graceful wrap-up turn (preserve in-flight work, report a status) and then
+    /// terminates (see `coordinator::drive`). Durable, so it survives a restart
+    /// and applies cross-session. Idempotent — raising an already-raised flag,
+    /// or one on a finished run, is a harmless no-op (a terminal run's loop has
+    /// already exited and will never read it). Also bumps the heartbeat, since
+    /// touching the row is itself proof the parent is alive.
+    pub fn request_stand_down(&self, run_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE coordinator_runs SET stand_down = 1, heartbeat_at = current_timestamp \
+             WHERE run_id = ?1",
+            [run_id],
+        )?;
+        Ok(())
+    }
+
+    /// Peek the stand-down flag for a run (no clear). The coordinator checks this
+    /// at every round boundary; once it's set the run wraps up and exits, so
+    /// there's nothing to clear. Returns `false` when the row is absent or the
+    /// flag was never raised.
+    pub fn stand_down_requested(&self, run_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT stand_down FROM coordinator_runs WHERE run_id = ?1",
+                [run_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|v| v != 0))
     }
 
     /// Bind `alias`->`run_id` ONCE at run creation (TASK-205 AC1). The write is
@@ -1490,6 +1540,30 @@ mod tests {
         // run, so its queued message has no owning run row → purged).
         reopened.clear_finished().unwrap();
         assert_eq!(reopened.pending_message_count("run_2").unwrap(), 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stand_down_flag_roundtrips_and_persists() {
+        let path = std::env::temp_dir().join(format!("aish_standdown_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+        store.insert("run_sd", "long task", "sess-a", None).unwrap();
+
+        // Freshly-inserted run defaults to NOT standing down.
+        assert!(!store.stand_down_requested("run_sd").unwrap());
+        // An unknown run reads false (not an error), so a stale id is harmless.
+        assert!(!store.stand_down_requested("nope").unwrap());
+
+        // Raise it; the peek now reports true, and it's idempotent.
+        store.request_stand_down("run_sd").unwrap();
+        store.request_stand_down("run_sd").unwrap();
+        assert!(store.stand_down_requested("run_sd").unwrap());
+
+        // Durable across a restart (fresh connection to the same file).
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        assert!(reopened.stand_down_requested("run_sd").unwrap());
 
         let _ = std::fs::remove_file(&path);
     }
