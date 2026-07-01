@@ -207,6 +207,15 @@ pub async fn run(
         crate::update::current_version(),
         backend.describe()
     );
+    // Live statusline: version + model on the left, current date/time on the
+    // right, padded to the terminal width. Interactive terminals only — skip it
+    // off a tty so it never leaks into piped/redirected output.
+    if unsafe { libc::isatty(1) } == 1 {
+        println!(
+            "{}",
+            crate::style::statusline(crate::update::current_version(), &backend.describe())
+        );
+    }
 
     let mut prev_dir: Option<PathBuf> = None;
     let mut needs_gap = false; // blank line between previous output and the prompt
@@ -407,7 +416,20 @@ pub async fn run(
                     );
                     continue;
                 }
-                crate::session::LoopTick::Idle => editor.read_line(&prompt),
+                crate::session::LoopTick::Idle => {
+                    // Refresh the live statusline (updated date/time + model)
+                    // directly above the prompt. Interactive terminals only.
+                    if unsafe { libc::isatty(1) } == 1 {
+                        println!(
+                            "{}",
+                            crate::style::statusline(
+                                crate::update::current_version(),
+                                &backend.describe()
+                            )
+                        );
+                    }
+                    editor.read_line(&prompt)
+                }
                 },
             },
         };
