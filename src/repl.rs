@@ -52,6 +52,9 @@ fn install_mcp_if_ready(
 /// call and persists the tool/command so it never prompts again.
 pub fn confirm_tty(prompt: &str) -> tools::Decision {
     use tools::Decision;
+    // If a mid-turn key watcher is active it holds stdin in cbreak (ECHO off);
+    // pause it for the length of this prompt so the answer echoes + line-edits.
+    let _pause = crate::keywatch::pause_for_prompt();
     print!("\x1b[33mrun?\x1b[0m {prompt} \x1b[33m[y/N/a/d]\x1b[0m ");
     std::io::stdout().flush().ok();
     let mut line = String::new();
@@ -90,10 +93,6 @@ fn clear_screen() {
     if unsafe { libc::isatty(1) } == 1 {
         print!("\x1b[2J\x1b[H");
         let _ = std::io::stdout().flush();
-        // If an anchored header is installed, the clear just wiped rows 1-2 and
-        // homed the cursor into the header region — re-home into the body and
-        // repaint the header so it stays pinned to the top.
-        crate::header::restore_after_clear();
     }
 }
 
@@ -209,18 +208,24 @@ pub async fn run(
     // Live statusline (version + model on the left, date/time on the right),
     // then the help hint. Interactive terminals only — never leak escape/status
     // noise into piped/redirected output. The statusline is anchored to the top
-    // and refreshed on each idle pass (see the LoopTick::Idle arm).
+    // noise into piped/redirected output. The statusline is refreshed inline,
+    // directly above the prompt, on each idle pass (see the LoopTick::Idle arm).
     if unsafe { libc::isatty(1) } == 1 {
-        // Anchor the statusline (bright white) + a solid white rule to the top
-        // two rows via a scroll region; all output + the prompt scroll below.
-        crate::header::install(
-            &crate::style::statusline(crate::update::current_version(), &backend.describe()),
-            crate::style::colors_enabled(),
+        println!(
+            "{}",
+            crate::style::statusline(crate::update::current_version(), &backend.describe())
         );
         println!(
             "\x1b[2m:help for commands — :workers to monitor background tasks\x1b[0m"
         );
     }
+
+    // The startup block above already printed the statusline, and the first
+    // `LoopTick::Idle` pass reprints it directly above the first prompt — which
+    // would show the header twice. Suppress exactly that first idle refresh so
+    // the header appears once at startup; every later idle pass refreshes it as
+    // usual (updated date/time above each prompt).
+    let mut suppress_statusline_once = unsafe { libc::isatty(1) } == 1;
 
     let mut prev_dir: Option<PathBuf> = None;
     let mut needs_gap = false; // blank line between previous output and the prompt
@@ -436,20 +441,24 @@ pub async fn run(
                     continue;
                 }
                 crate::session::LoopTick::Idle => {
-                    // Refresh the anchored top statusline (updated date/time +
-                    // model) + solid rule. Interactive terminals only.
+                    // Refresh the live statusline (updated date/time + model)
+                    // directly above the prompt. Interactive terminals only. The
+                    // startup block already printed it, so skip the very first
+                    // refresh to avoid a duplicated header (see
+                    // `suppress_statusline_once`).
                     if unsafe { libc::isatty(1) } == 1 {
-                        crate::header::repaint(
-                            &crate::style::statusline(
-                                crate::update::current_version(),
-                                &backend.describe(),
-                            ),
-                            crate::style::colors_enabled(),
-                        );
+                        if suppress_statusline_once {
+                            suppress_statusline_once = false;
+                        } else {
+                            println!(
+                                "{}",
+                                crate::style::statusline(
+                                    crate::update::current_version(),
+                                    &backend.describe()
+                                )
+                            );
+                        }
                     }
-                    // Prompt sits at the bottom of the scrolling output, one
-                    // blank line clear of the text above it.
-                    println!();
                     editor.read_line(&prompt)
                 }
                 },
@@ -462,9 +471,7 @@ pub async fn run(
                     continue;
                 }
                 editor.add_history(&line);
-                // The single blank line separating the next prompt from this
-                // command's output is emitted by the Idle arm (see above), so
-                // don't also gap here — that would double the separator.
+                needs_gap = true;
                 // Now working — hold background results until the next pause.
                 busy.store(true, Ordering::SeqCst);
 
@@ -655,16 +662,43 @@ pub async fn run(
                 let mut aborted = false;
                 let mut reply: Option<String> = None;
                 {
+                    // Clone the attach-cursor handles up front so a mid-turn
+                    // Shift-Tab can cycle the operator's view WITHOUT touching
+                    // `&mut session` (the running turn borrows it exclusively).
+                    let cyc_workers = session.worker_jobs.clone();
+                    let cyc_attached = session.attached.clone();
+                    let cyc_review = session.attach_review_announced.clone();
                     let mut confirm = confirm_tty;
+                    // Put stdin in cbreak for the turn so Shift-Tab is seen while
+                    // the model thinks / is mid tool-call. The RAII guard restores
+                    // cooked mode on drop; `confirm_tty` coordinates via the
+                    // keywatch gate so y/N prompts still echo + line-edit, and the
+                    // reader parks itself during `run_interactive` TTY hand-offs.
+                    let mut keywatch = crate::keywatch::TurnKeyWatch::install();
                     let turn = engine::run_turn(&backend, &mut session, line, &mut confirm);
                     tokio::pin!(turn);
-                    tokio::select! {
-                        res = &mut turn => match res {
-                            Ok(text) => reply = Some(text),
-                            Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e:#}"),
-                        },
-                        _ = tokio::signal::ctrl_c() => {
-                            aborted = true;
+                    loop {
+                        tokio::select! {
+                            res = &mut turn => {
+                                match res {
+                                    Ok(text) => reply = Some(text),
+                                    Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e:#}"),
+                                }
+                                break;
+                            }
+                            _ = tokio::signal::ctrl_c() => {
+                                aborted = true;
+                                break;
+                            }
+                            Some(k) = keywatch.recv() => match k {
+                                // Shift-Tab pressed mid-turn: cycle the attach
+                                // cursor live. No screen-clear/backfill here — the
+                                // turn is actively streaming — just flip the cursor
+                                // so the worker forwarder starts routing output.
+                                crate::keywatch::TurnKey::ShiftTab => {
+                                    cycle_worker_live(&cyc_workers, &cyc_attached, &cyc_review);
+                                }
+                            },
                         }
                     }
                 }
@@ -730,9 +764,6 @@ pub async fn run(
     }
 
     editor.save_history();
-    // Reset the scroll region so the user's terminal isn't left with a stuck
-    // two-row header after aish exits.
-    crate::header::teardown();
     println!("bye");
     Ok(())
 }
@@ -3421,6 +3452,70 @@ fn cycle_worker(session: &mut Session) {
         // subsequent line, so the operator gets the full session transcript
         // first and live output after, instead of only future output.
         backfill_attached(&run_id, session);
+    }
+}
+
+/// Mid-turn sibling of [`cycle_worker`]: cycle the attach cursor while a model
+/// turn is actively streaming (driven by [`crate::keywatch`] on a Shift-Tab
+/// press). It CANNOT take `&mut Session` — the in-flight turn borrows it — so it
+/// works off cloned attach-cursor handles and does the minimal, safe subset:
+/// advance the cursor and flip the `attached` / review markers so the worker
+/// forwarder begins routing that coordinator's output. Deliberately omits
+/// `clear_screen` (which would wipe the turn's in-flight output) and the
+/// backfill / result replay (those need `&Session` for the db); a post-turn
+/// Shift-Tab runs the full [`cycle_worker`] with backfill. Index math is the same
+/// pure, unit-tested [`next_attach_index`].
+fn cycle_worker_live(
+    workers: &crate::worker::WorkerJobs,
+    attached: &Arc<Mutex<Option<String>>>,
+    review: &Arc<Mutex<Option<String>>>,
+) {
+    let workers_v: Vec<(String, bool)> = workers
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .map(|w| {
+            (
+                w.id.clone(),
+                matches!(w.status().as_str(), "done" | "failed"),
+            )
+        })
+        .collect();
+    if workers_v.is_empty() {
+        println!(
+            "\x1b[2m⇄ no coordinators to cycle through — :dispatch <task> to launch one\x1b[0m"
+        );
+        return;
+    }
+    let ids: Vec<String> = workers_v.iter().map(|(id, _)| id.clone()).collect();
+    let current = attached.lock().unwrap().clone();
+    let next_idx = next_attach_index(&ids, current.as_deref());
+    if next_idx == 0 {
+        *attached.lock().unwrap() = None;
+        *review.lock().unwrap() = None;
+        println!(
+            "\x1b[2m⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)\x1b[0m"
+        );
+        return;
+    }
+    let (run_id, terminal) = workers_v[next_idx - 1].clone();
+    *attached.lock().unwrap() = Some(run_id.clone());
+    let short = crate::batch::short_id(&run_id);
+    if terminal {
+        *review.lock().unwrap() = Some(run_id.clone());
+        println!(
+            "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m \x1b[2m({}/{} · review mode: type a message to resume it, Shift-Tab to cycle, :detach to stop)\x1b[0m",
+            next_idx,
+            ids.len()
+        );
+    } else {
+        *review.lock().unwrap() = None;
+        println!(
+            "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({}/{} · Shift-Tab to cycle, :detach to stop)\x1b[0m",
+            next_idx,
+            ids.len()
+        );
     }
 }
 
