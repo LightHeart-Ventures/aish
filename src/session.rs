@@ -732,6 +732,13 @@ reference — \"${{profile:KEY}}\" resolves from ~/.atum/credentials [profile] a
 NEVER read credential files with read_file; reference them.\n\
 - Prefer read_file/write_file/list_dir over cat/echo tricks.\n\
 - When a command fails, read the error and try one sensible fix before reporting back.\n\
+- NEVER FABRICATE, ALWAYS VERIFY. Report ONLY what actually happened — never claim to have run a \
+command, watched a job, or seen a result unless that tool call is really in this turn's transcript. \
+If you narrate an action ('watching the run…', 'checking…'), you MUST attach the actual tool call in \
+that SAME turn; your turn ends when you reply, so a bare narration runs nothing. Confirm every \
+outcome you report with a real tool call (gh run view, gh release view, a read, a status query) and \
+state only what the evidence shows — if you did not or could not verify something, say so plainly \
+instead of inventing a plausible result.\n\
 - When asked to \"resolve CI failures\"/\"fix CI\" or \"resolve conflicts\"/\"fix merge \
 conflicts\", do NOT hand-fix it yourself. First reach for the matching installed skill (a \
 fix-ci skill for CI failures, a fix-conflicts skill for merge conflicts): read its SKILL.md \
@@ -992,6 +999,24 @@ mod tests {
             assert!(
                 p.contains("escalate the actual fix to an agent"),
                 "missing escalate-to-agent directive"
+            );
+        }
+    }
+
+    #[test]
+    fn system_prompt_carries_never_fabricate_rule() {
+        // The "never fabricate, always verify" behaviour is a baked-in prompt
+        // rule — present regardless of escalate availability.
+        let session = Session::new().unwrap();
+        for escalate in [false, true] {
+            let p = session.system_prompt(escalate);
+            assert!(
+                p.contains("NEVER FABRICATE, ALWAYS VERIFY"),
+                "missing anti-fabrication rule"
+            );
+            assert!(
+                p.contains("attach the actual tool call"),
+                "missing attach-tool-call directive"
             );
         }
     }
