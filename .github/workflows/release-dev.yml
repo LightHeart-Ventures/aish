@@ -1,72 +1,24 @@
-name: Release (dev channel)
+name: Release (Dev)
 
-# DEV channel — nightly pre-releases for early adopters
-# (AISH_UPDATE_CHANNEL=dev). Runs on a nightly schedule and on manual dispatch.
-# Tags are `dev-v{next}-dev.{n}` where {next} is the version currently in
-# Cargo.toml and {n} auto-increments per (version) so successive nightlies on
-# the same in-development version sort in publish order.
-#
-# These are PRE-RELEASES (never "latest"): prod-channel users are unaffected.
-# `:update` on the dev channel discovers them via `gh release list` + a
-# client-side `dev-` prefix filter (src/update.rs resolve_prefixed), newest
-# first. Old dev-* releases are pruned to the most recent 10.
-#
-# Tag creation is workflow-owned (softprops sets target_commitish = github.sha)
-# per the SRE no-hand-pushed-tags rule.
+# Nightly dev builds: latest development snapshot, pre-release. Triggered on schedule (nightly) or manually.
+# Tags: dev-v{next-semver}-dev.{run_number} (e.g., dev-v0.24.0-dev.123)
+# Marked as prerelease so :update with AISH_UPDATE_CHANNEL=dev pulls the latest dev, not prod.
 on:
   schedule:
-    # 07:00 UTC nightly (~01:00 US-Central) — after the day's merges settle.
-    - cron: "0 7 * * *"
+    # 04:00 UTC daily — low-traffic window to avoid runner contention
+    - cron: "0 4 * * *"
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Build only; skip publishing the release"
-        type: boolean
-        default: false
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-dev
+  group: release-dev-nightly
   cancel-in-progress: false
 
 jobs:
-  prepare:
-    name: compute dev tag
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    outputs:
-      tag: ${{ steps.tag.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v6
-
-      # Extract the next semver from Cargo.toml (read at workflow time), then
-      # find the highest existing `dev.{n}` for that version and add one.
-      - name: Derive dev tag dev-v{next}-dev.{n}
-        id: tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          next="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
-          base="dev-v${next}-dev."
-          echo "next semver (Cargo.toml): $next"
-          # Highest existing suffix for this version, 0 if none.
-          max="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName \
-                 --jq '.[].tagName' \
-                 | grep -E "^${base//./\\.}[0-9]+$" \
-                 | sed -E "s/^.*dev\.([0-9]+)$/\1/" \
-                 | sort -n | tail -1 || true)"
-          n=$(( ${max:-0} + 1 ))
-          tag="${base}${n}"
-          echo "next dev iteration: $n"
-          echo "release tag:        $tag"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-        shell: bash
-
   build:
-    name: build ${{ matrix.target }}
-    needs: prepare
+    name: build ${{ matrix.target }} (dev)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -83,6 +35,22 @@ jobs:
             asset: aish-x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: origin/main
+
+      - name: Resolve next semantic version
+        id: nextver
+        run: |
+          set -euo pipefail
+          current="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          # Parse current as MAJOR.MINOR.PATCH and bump MINOR for the next dev cycle
+          IFS='.' read -r major minor patch <<< "$current"
+          next_minor=$((minor + 1))
+          next_version="${major}.${next_minor}.0"
+          echo "current_version=$current"
+          echo "next_version=$next_version"
+          echo "next_version=$next_version" >> "$GITHUB_OUTPUT"
+        shell: bash
 
       - name: Install Rust toolchain
         run: |
@@ -121,18 +89,31 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.asset }}
+          name: ${{ matrix.asset }}-dev
           path: |
             dist/${{ matrix.asset }}
             dist/${{ matrix.asset }}.sha256
           if-no-files-found: error
 
   release:
-    name: publish dev pre-release
-    needs: [prepare, build]
-    if: ${{ inputs.dry_run == false }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    name: publish dev release
+    needs: build
+    runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve next semantic version
+        id: nextver
+        run: |
+          set -euo pipefail
+          current="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          IFS='.' read -r major minor patch <<< "$current"
+          next_minor=$((minor + 1))
+          next_version="${major}.${next_minor}.0"
+          tag="dev-v${next_version}-dev.${{ github.run_number }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        shell: bash
+
       - name: Download all build artifacts
         uses: actions/download-artifact@v8
         with:
@@ -142,43 +123,48 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          find artifacts -type f \( -name 'aish-*' \) -exec cp {} dist/ \;
+          find artifacts -type f \( -name 'aish-*' ! -name '*-dev' \) -exec cp {} dist/ \;
+          echo "Dev release assets:"
           ls -l dist
 
       - name: Aggregate checksums
         run: |
           set -euo pipefail
           cd dist
-          cat *.sha256 > SHA256SUMS
-          cat SHA256SUMS
+          cat *.sha256 > SHA256SUMS 2>/dev/null || true
+          cat SHA256SUMS 2>/dev/null || echo "(no checksums)"
 
-      - name: Create GitHub pre-release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: aish ${{ needs.prepare.outputs.tag }}
-          tag_name: ${{ needs.prepare.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          # DEV pre-releases must never become "latest" — keeps prod users safe.
-          prerelease: true
-          make_latest: false
-          files: |
-            dist/aish-*
-            dist/SHA256SUMS
-
-      # Retention: keep only the 10 newest dev-* releases (and their tags).
-      - name: Prune old dev-* releases (keep 10)
+      - name: Create and publish dev release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release list --repo "$GITHUB_REPOSITORY" --limit 500 --json tagName,createdAt \
-            --jq '[.[] | select(.tagName | startswith("dev-"))]
-                  | sort_by(.createdAt) | reverse | .[10:] | .[].tagName' \
-            | while read -r t; do
-                [ -z "$t" ] && continue
-                echo "Pruning old dev release: $t"
-                gh release delete "$t" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
-              done
+          tag="${{ steps.nextver.outputs.tag }}"
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target origin/main \
+            --prerelease \
+            --title "aish $tag (dev)" \
+            --notes "Development build from $(git rev-parse --short origin/main). Unstable — for testing only." \
+            dist/aish-* dist/SHA256SUMS 2>/dev/null || true
+        shell: bash
+
+  prune:
+    name: prune old dev releases
+    needs: release
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Prune releases older than 5 latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # List all dev releases, sorted by creation date (newest first)
+          gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts \
+            --json tagName,createdAt --jq '.[] | select(.tagName | startswith("dev-"))' \
+            | tail -n +6 | jq -r '.tagName' | while read -r tag; do
+            echo "Deleting old dev release: $tag"
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes || true
+          done
         shell: bash

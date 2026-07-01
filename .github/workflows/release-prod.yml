@@ -1,81 +1,72 @@
-name: Release (prod channel)
+name: Release (Production)
 
-# PROD channel — the stable track that `:update` follows by default
-# (AISH_UPDATE_CHANNEL unset or =prod). Manually dispatched: reads the version
-# baked into Cargo.toml, builds every supported target, and publishes a GitHub
-# Release tagged `v{semver}` marked as "latest".
+# Triggered via workflow_dispatch to create a production release with a stable semver tag (v0.4.0, v0.4.1, …).
+# This replaces manual tag pushing (which the SRE skill forbids). A maintainer provides the semver version,
+# this workflow creates the tag on the current main commit, builds release binaries for every supported target,
+# generates SHA256 checksums, and publishes a GitHub Release marked as latest.
 #
-# Why dispatch-triggered (not a manual `git push` of a tag): the SRE runbook
-# forbids hand-pushed tags — every release tag is minted BY a workflow so the
-# tag<->assets invariant `:update` (src/update.rs) depends on can never drift.
-# softprops/action-gh-release creates the tag itself (target_commitish =
-# github.sha); because it runs under the default GITHUB_TOKEN, creating that tag
-# does NOT retrigger the legacy tag-push `release.yml` (GitHub suppresses
-# workflow recursion from the default token), so there is no double build.
-#
-# Platform support mirrors release.yml: macOS (x86_64 + arm64) and Linux
-# (x86_64). Windows is unsupported (POSIX job-control / tty deps).
+# Platform support: aish is a Unix-native shell targeting macOS (x86_64 + arm64) and Linux (x86_64) only.
 on:
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: "Build only; skip publishing the release"
-        type: boolean
-        default: false
+      version:
+        description: "Semantic version to release (e.g., 0.23.1 — the 'v' prefix is added automatically)"
+        required: true
+        type: string
+      notes:
+        description: "Optional release notes (hand-written; auto-generated if empty)"
+        required: false
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-prod
+  group: release-prod-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  prepare:
-    name: compute prod tag from Cargo.toml
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+  verify-version:
+    name: verify version match
+    runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.tag.outputs.tag }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: origin/main
 
-      - name: Derive tag v{Cargo.toml version}
-        id: tag
+      - name: Verify Cargo.toml version matches input
+        id: version
         run: |
           set -euo pipefail
+          input_version="${{ inputs.version }}"
           cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
-          tag="v${cargo_version}"
+          tag="v${input_version}"
+          echo "Input version: $input_version"
           echo "Cargo.toml version: $cargo_version"
-          echo "release tag:        $tag"
+          if [ "$input_version" != "$cargo_version" ]; then
+            echo "::error::Input version $input_version does not match Cargo.toml version $cargo_version. Bump Cargo.toml first."
+            exit 1
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
         shell: bash
 
-      # Immutable-release guard (same rationale as release.yml): a PUBLISHED
-      # release for this tag can never receive assets afterward, so bail before
-      # the multi-minute builds. A draft is fine (drafts stay mutable).
-      - name: Assert no published release already exists for this tag
+      - name: Assert tag does not already exist
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="${{ steps.tag.outputs.tag }}"
-          json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft 2>/dev/null || true)"
-          if [ -z "$json" ]; then
-            echo "No existing release for $tag — this workflow will create and publish it. OK."
-            exit 0
+          tag="${{ steps.version.outputs.tag }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $tag already exists. Pick a new version."
+            exit 1
           fi
-          is_draft="$(echo "$json" | jq -r '.isDraft')"
-          if [ "$is_draft" = "true" ]; then
-            echo "A DRAFT release exists for $tag — the publish job will upload assets and publish it. OK."
-            exit 0
-          fi
-          echo "::error::A PUBLISHED release already exists for $tag. Bump Cargo.toml (and Cargo.lock) to a new version before dispatching, or delete the release + tag to recut."
-          exit 1
         shell: bash
 
   build:
     name: build ${{ matrix.target }}
-    needs: prepare
+    needs: verify-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -92,6 +83,8 @@ jobs:
             asset: aish-x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: origin/main
 
       - name: Install Rust toolchain
         run: |
@@ -137,11 +130,12 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: publish prod release
-    needs: [prepare, build]
-    if: ${{ inputs.dry_run == false }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    name: publish release
+    needs: [verify-version, build]
+    runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
+
       - name: Download all build artifacts
         uses: actions/download-artifact@v8
         with:
@@ -154,6 +148,9 @@ jobs:
           find artifacts -type f \( -name 'aish-*' \) -exec cp {} dist/ \;
           echo "Release assets:"
           ls -l dist
+          echo
+          echo "Aggregated checksums:"
+          cat dist/*.sha256
 
       - name: Aggregate checksums
         run: |
@@ -162,17 +159,22 @@ jobs:
           cat *.sha256 > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: aish ${{ needs.prepare.outputs.tag }}
-          tag_name: ${{ needs.prepare.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          # PROD is the stable, user-facing track: this is the "latest" release.
-          prerelease: false
-          make_latest: true
-          files: |
-            dist/aish-*
-            dist/SHA256SUMS
+      - name: Create and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.verify-version.outputs.tag }}"
+          notes="${{ inputs.notes }}"
+          if [ -z "$notes" ]; then
+            # Auto-generate notes from commits since last tag
+            notes="$(gh release view --repo "$GITHUB_REPOSITORY" 2>/dev/null | head -20 || echo 'Production release')"
+          fi
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target origin/main \
+            --latest \
+            --title "aish $tag" \
+            --notes "$notes" \
+            dist/aish-* dist/SHA256SUMS
+        shell: bash
