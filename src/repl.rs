@@ -980,7 +980,6 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ),
     ("backend", "switch backend (claude|grok|local)"),
     ("batch", "background batch mode (on|off|status)"),
-    ("channel", "show the active :update release channel (prod|dev|ci)"),
     (
         "close",
         "remove the attached (or named) coordinator from the worker list + Shift-Tab rotation",
@@ -4314,8 +4313,8 @@ async fn handle_colon(
                  :compact                            offload older history to long-term memory now\n\
                  :memories [organize]                list stored memories, or dedup them\n\
                  :version                            show aish version + backend (also `aish --version`)\n\
-                 :update                             check GitHub for a newer release and upgrade\n\
-                 :channel                            show the active :update channel (set via AISH_UPDATE_CHANNEL=prod|dev|ci)\n\
+                 :update [prod|dev|ci]               check GitHub for a newer release and upgrade;\n\
+                                                     optional channel is a one-off override of AISH_UPDATE_CHANNEL\n\
                  :batch <on|off|status|clear>        interactive batch mode: agent offloads deferrable\n\
                                                      work to background Anthropic batches (Opus, ~50%\n\
                                                      cheaper); jobs persist + reattach across restarts\n\
@@ -4885,8 +4884,7 @@ async fn handle_colon(
         }
         Some("allow") => handle_allow(parts.next(), parts.next(), session),
         Some("batch") => handle_batch(parts.next(), parts.next(), session),
-        Some("update") => handle_update(pending_update, session).await,
-        Some("channel") => handle_channel(parts.next()),
+        Some("update") => handle_update(pending_update, session, parts.next()).await,
         Some("mcp") => handle_mcp(parts.collect(), session).await,
         Some("skill" | "skills") => {
             let rest: Vec<&str> = parts.collect();
@@ -4953,44 +4951,70 @@ fn update_confirm_prompt(running: usize, version: &str) -> String {
     }
 }
 
-/// `:channel` — report the active `:update` release channel and how to change
-/// it. A stub for now (read-only): the channel is sourced from the
-/// `AISH_UPDATE_CHANNEL` env var, so switching is done in the environment rather
-/// than mutated here. A future revision may persist a per-session override.
-fn handle_channel(arg: Option<&str>) {
-    let ch = crate::update::channel();
-    let name = ch.as_str();
-    let blurb = match ch {
+/// Describe a channel in one short phrase for `:update` status lines.
+fn channel_blurb(ch: crate::update::Channel) -> &'static str {
+    match ch {
         crate::update::Channel::Prod => "stable v{semver} releases marked latest",
         crate::update::Channel::Dev => "nightly dev-v{next}-dev.{n} pre-releases",
         crate::update::Channel::Ci => "per-main-push ci-{run}-{sha} pre-releases",
-    };
-    println!("\x1b[1mupdate channel\x1b[0m → \x1b[36m{name}\x1b[0m \x1b[2m({blurb})\x1b[0m");
-    if arg.is_some() {
-        println!(
-            "\x1b[2mnote: :channel is read-only for now — set the channel with \
-             AISH_UPDATE_CHANNEL=prod|dev|ci before launching aish.\x1b[0m"
-        );
-    } else {
-        println!(
-            "\x1b[2mselect with AISH_UPDATE_CHANNEL=prod|dev|ci — see docs/RELEASE-CHANNELS.md\x1b[0m"
-        );
     }
 }
 
-async fn handle_update(pending_update: &mut Option<crate::update::UpdateInfo>, session: &Session) {
+/// `:update [prod|dev|ci]` — check GitHub for a newer release and, with
+/// confirmation, install it via the `gh` CLI.
+///
+/// With no argument it tracks the channel from `AISH_UPDATE_CHANNEL` (default
+/// `prod`). An optional channel argument is a ONE-OFF override for this single
+/// invocation — e.g. `:update dev` pulls the latest nightly without exporting
+/// the env var — so it doubles as the channel selector (there's no separate
+/// `:channel` command). A pending update discovered at startup is reused only
+/// when it matches the requested channel; otherwise a fresh check runs. Yolo
+/// mode skips the confirm.
+async fn handle_update(
+    pending_update: &mut Option<crate::update::UpdateInfo>,
+    session: &Session,
+    chan_arg: Option<&str>,
+) {
     if !crate::update::gh_available() {
         println!("update needs the GitHub CLI (`gh`) on PATH — see https://cli.github.com");
         return;
     }
-    let info = match pending_update.take() {
+    // Resolve the requested channel: an explicit arg overrides the env default
+    // for this invocation only. An unrecognised arg aborts loudly rather than
+    // silently falling back to prod.
+    let requested = match chan_arg {
+        None => None,
+        Some(s) => match crate::update::parse_channel(s) {
+            Some(c) => Some(c),
+            None => {
+                println!(
+                    "unknown channel '{s}' — valid channels: \x1b[36mprod\x1b[0m, \x1b[36mdev\x1b[0m, \x1b[36mci\x1b[0m"
+                );
+                return;
+            }
+        },
+    };
+    let active = requested.unwrap_or_else(crate::update::channel);
+    // The startup-cached pending update was checked against the env channel, so
+    // it only applies when no explicit channel was asked for (or it matches).
+    let cache_ok = requested.is_none() || requested == Some(crate::update::channel());
+    let cached = if cache_ok { pending_update.take() } else { None };
+    let info = match cached {
         Some(info) => info,
         None => {
-            println!("\x1b[2mchecking for updates…\x1b[0m");
-            match crate::update::check().await {
+            println!(
+                "\x1b[2mchecking \x1b[0m\x1b[36m{}\x1b[0m\x1b[2m channel ({}) for updates…\x1b[0m",
+                active.as_str(),
+                channel_blurb(active)
+            );
+            match crate::update::check_channel(active).await {
                 Ok(Some(info)) => info,
                 Ok(None) => {
-                    println!("aish is up to date ({}).", crate::update::current_version());
+                    println!(
+                        "aish is up to date ({}) on the {} channel.",
+                        crate::update::current_version(),
+                        active.as_str()
+                    );
                     return;
                 }
                 Err(e) => {
