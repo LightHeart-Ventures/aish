@@ -52,6 +52,9 @@ fn install_mcp_if_ready(
 /// call and persists the tool/command so it never prompts again.
 pub fn confirm_tty(prompt: &str) -> tools::Decision {
     use tools::Decision;
+    // If a mid-turn key watcher is active it holds stdin in cbreak (ECHO off);
+    // pause it for the length of this prompt so the answer echoes + line-edits.
+    let _pause = crate::keywatch::pause_for_prompt();
     print!("\x1b[33mrun?\x1b[0m {prompt} \x1b[33m[y/N/a/d]\x1b[0m ");
     std::io::stdout().flush().ok();
     let mut line = String::new();
@@ -642,16 +645,43 @@ pub async fn run(
                 let mut aborted = false;
                 let mut reply: Option<String> = None;
                 {
+                    // Clone the attach-cursor handles up front so a mid-turn
+                    // Shift-Tab can cycle the operator's view WITHOUT touching
+                    // `&mut session` (the running turn borrows it exclusively).
+                    let cyc_workers = session.worker_jobs.clone();
+                    let cyc_attached = session.attached.clone();
+                    let cyc_review = session.attach_review_announced.clone();
                     let mut confirm = confirm_tty;
+                    // Put stdin in cbreak for the turn so Shift-Tab is seen while
+                    // the model thinks / is mid tool-call. The RAII guard restores
+                    // cooked mode on drop; `confirm_tty` coordinates via the
+                    // keywatch gate so y/N prompts still echo + line-edit, and the
+                    // reader parks itself during `run_interactive` TTY hand-offs.
+                    let mut keywatch = crate::keywatch::TurnKeyWatch::install();
                     let turn = engine::run_turn(&backend, &mut session, line, &mut confirm);
                     tokio::pin!(turn);
-                    tokio::select! {
-                        res = &mut turn => match res {
-                            Ok(text) => reply = Some(text),
-                            Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e:#}"),
-                        },
-                        _ = tokio::signal::ctrl_c() => {
-                            aborted = true;
+                    loop {
+                        tokio::select! {
+                            res = &mut turn => {
+                                match res {
+                                    Ok(text) => reply = Some(text),
+                                    Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e:#}"),
+                                }
+                                break;
+                            }
+                            _ = tokio::signal::ctrl_c() => {
+                                aborted = true;
+                                break;
+                            }
+                            Some(k) = keywatch.recv() => match k {
+                                // Shift-Tab pressed mid-turn: cycle the attach
+                                // cursor live. No screen-clear/backfill here — the
+                                // turn is actively streaming — just flip the cursor
+                                // so the worker forwarder starts routing output.
+                                crate::keywatch::TurnKey::ShiftTab => {
+                                    cycle_worker_live(&cyc_workers, &cyc_attached, &cyc_review);
+                                }
+                            },
                         }
                     }
                 }
@@ -3408,6 +3438,70 @@ fn cycle_worker(session: &mut Session) {
         // subsequent line, so the operator gets the full session transcript
         // first and live output after, instead of only future output.
         backfill_attached(&run_id, session);
+    }
+}
+
+/// Mid-turn sibling of [`cycle_worker`]: cycle the attach cursor while a model
+/// turn is actively streaming (driven by [`crate::keywatch`] on a Shift-Tab
+/// press). It CANNOT take `&mut Session` — the in-flight turn borrows it — so it
+/// works off cloned attach-cursor handles and does the minimal, safe subset:
+/// advance the cursor and flip the `attached` / review markers so the worker
+/// forwarder begins routing that coordinator's output. Deliberately omits
+/// `clear_screen` (which would wipe the turn's in-flight output) and the
+/// backfill / result replay (those need `&Session` for the db); a post-turn
+/// Shift-Tab runs the full [`cycle_worker`] with backfill. Index math is the same
+/// pure, unit-tested [`next_attach_index`].
+fn cycle_worker_live(
+    workers: &crate::worker::WorkerJobs,
+    attached: &Arc<Mutex<Option<String>>>,
+    review: &Arc<Mutex<Option<String>>>,
+) {
+    let workers_v: Vec<(String, bool)> = workers
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .map(|w| {
+            (
+                w.id.clone(),
+                matches!(w.status().as_str(), "done" | "failed"),
+            )
+        })
+        .collect();
+    if workers_v.is_empty() {
+        println!(
+            "\x1b[2m⇄ no coordinators to cycle through — :dispatch <task> to launch one\x1b[0m"
+        );
+        return;
+    }
+    let ids: Vec<String> = workers_v.iter().map(|(id, _)| id.clone()).collect();
+    let current = attached.lock().unwrap().clone();
+    let next_idx = next_attach_index(&ids, current.as_deref());
+    if next_idx == 0 {
+        *attached.lock().unwrap() = None;
+        *review.lock().unwrap() = None;
+        println!(
+            "\x1b[2m⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)\x1b[0m"
+        );
+        return;
+    }
+    let (run_id, terminal) = workers_v[next_idx - 1].clone();
+    *attached.lock().unwrap() = Some(run_id.clone());
+    let short = crate::batch::short_id(&run_id);
+    if terminal {
+        *review.lock().unwrap() = Some(run_id.clone());
+        println!(
+            "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m \x1b[2m({}/{} · review mode: type a message to resume it, Shift-Tab to cycle, :detach to stop)\x1b[0m",
+            next_idx,
+            ids.len()
+        );
+    } else {
+        *review.lock().unwrap() = None;
+        println!(
+            "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({}/{} · Shift-Tab to cycle, :detach to stop)\x1b[0m",
+            next_idx,
+            ids.len()
+        );
     }
 }
 
