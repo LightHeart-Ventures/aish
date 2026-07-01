@@ -157,7 +157,7 @@ pub async fn run(
                 // the routing skills (interactive_mcp_skills), keeping the heavy
                 // code-work / agent-dispatch skills for background coordinators.
                 let skills_prompt = crate::skills::render_prompt_section(
-                    &crate::skills::load(&skills_dir),
+                    &crate::skills::load_catalog(&skills_dir),
                     &crate::skills::interactive_mcp_skills(&host.skills()),
                 );
                 let _ = tx.send((host, skills_prompt));

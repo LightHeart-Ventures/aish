@@ -1,0 +1,7 @@
+{
+  "id": "hello-world",
+  "name": "Hello World",
+  "version": "0.1.0",
+  "description": "The smallest possible aish plugin — contributes a single greeting skill to prove plugin discovery and skill-registry expansion work end to end.",
+  "enabled": true
+}
