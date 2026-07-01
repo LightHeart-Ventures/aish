@@ -502,6 +502,19 @@ mod tests {
     use super::render;
     use super::{fit_widths, visible_width, wrap_cell};
 
+    // Serializes every test that mutates the process-global `COLUMNS` env var.
+    // The test runner executes in parallel, so without this one test's
+    // `set_var("COLUMNS", ..)` could race another's `remove_var` between the set
+    // and the `render()` call — `term_width()` would then read the wrong width
+    // and the wrap/frame assertions flake (see `table_word_wraps_when_narrow`).
+    // Poison-tolerant: an assertion panic while the guard is held must not
+    // cascade-fail sibling tests, so we recover the guard from a poisoned lock.
+    static COLUMNS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_columns() -> std::sync::MutexGuard<'static, ()> {
+        COLUMNS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn fit_widths_shrinks_widest_first() {
         // Already fits → unchanged.
@@ -538,6 +551,7 @@ mod tests {
         // A table whose natural width exceeds COLUMNS should produce more lines
         // than rows (cells wrapped), with no physical line exceeding the width.
         // term_width() falls back to $COLUMNS when stdout isn't a tty (tests).
+        let _cols = lock_columns();
         unsafe { std::env::set_var("COLUMNS", "32") };
         let md = "| Key | Note |\n|---|---|\n| a | one two three four five six seven |";
         let out = render(md, "");
@@ -606,6 +620,7 @@ mod tests {
     #[test]
     fn horizontal_rule() {
         // A standalone rule renders as a dim line of ─; width is bounded.
+        let _cols = lock_columns();
         unsafe { std::env::set_var("COLUMNS", "20") };
         for src in ["---", "***", "___", "- - -"] {
             let out = render(src, "");
@@ -642,6 +657,7 @@ mod tests {
     fn table_is_boxed_and_aligned() {
         // term_width() falls back to $COLUMNS off-tty; keep it wide so the small
         // table renders at its natural widths.
+        let _cols = lock_columns();
         unsafe { std::env::set_var("COLUMNS", "200") };
         let out = render(
             "| Sprint | Pts |\n|---|---:|\n| SPR-036 | 16 |\n| **S2** | 5 |",
@@ -677,6 +693,7 @@ mod tests {
         // Mixes a single-codepoint emoji (🚀, 1 char / 2 cols) with a VS16
         // emoji-presentation sequence (⚙️ = U+2699 U+FE0F, 2 chars / 2 cols):
         // counting chars would under-pad 🚀 by one and the column would ragged.
+        let _cols = lock_columns();
         unsafe { std::env::set_var("COLUMNS", "200") };
         let out = render(
             "| Emoji | Module |\n|---|---|\n| 🚀 | main.rs |\n| ⚙️ | engine.rs |",
@@ -718,6 +735,7 @@ mod tests {
 
     #[test]
     fn escaped_pipe_stays_in_cell() {
+        let _cols = lock_columns();
         unsafe { std::env::set_var("COLUMNS", "200") };
         let out = render("| Cmd |\n|---|\n| a \\| b |", "");
         assert!(out.contains("a | b"));
