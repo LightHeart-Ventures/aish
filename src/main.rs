@@ -94,7 +94,7 @@ struct Args {
     update: bool,
 
     /// Re-run the hardware probe, pick the best-fitting local model for this
-    /// machine (whichllm-style), persist it to ~/.aish/local-model.json, and
+    /// machine (whichllm-style), persist it to ~/.aish/config/local-model.json, and
     /// exit. An operator-pinned model (AISH_LOCAL_MODEL_* / --model) is reported
     /// and left untouched. Mirrors the `:model-detect` REPL command.
     #[arg(long = "detect-local-model")]
@@ -376,7 +376,7 @@ async fn main() -> Result<()> {
     // model so a later `:backend local` (or `--local` launch) has a selection
     // ready. Cheap, best-effort, and only when nothing has been selected yet —
     // never overrides an operator pin, never blocks startup on failure.
-    if !hwdetect::selection_path().exists() {
+    if hwdetect::load_selection().is_none() {
         let _ = hwdetect::ensure_selected(false, None);
     }
 
