@@ -850,8 +850,10 @@ pub async fn run(
 /// Blank when not attached to any coordinator. When attached it mirrors the
 /// Shift-Tab attach announcement — `⇄ attached to <id> (i/n · Shift-Tab to
 /// cycle, :detach to stop)` — with a review-mode variant for a coordinator that
-/// has already finished. The returned string is plain text (no ANSI); the
-/// footer renderer owns styling and width-clipping.
+/// has already finished. The string carries its own ANSI styling — a bold
+/// yellow `⇄ attached to <id>` prefix with a dim parenthetical — so it matches
+/// the Shift-Tab attach announcement printed in the scroll area. The footer
+/// renderer paints it verbatim and clips on visible width (ANSI-aware).
 fn coordinator_status_message(session: &Session) -> String {
     let attached = match session.attached.lock().unwrap().clone() {
         Some(id) => id,
@@ -874,15 +876,15 @@ fn coordinator_status_message(session: &Session) -> String {
             let idx = i + 1;
             if workers[i].1 {
                 format!(
-                    "⇄ attached to {short} (finished) ({idx}/{n} · review mode: type to resume, Shift-Tab to cycle, :detach to stop)"
+                    "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m \x1b[2m({idx}/{n} · review mode: type to resume, Shift-Tab to cycle, :detach to stop)\x1b[0m"
                 )
             } else {
-                format!("⇄ attached to {short} ({idx}/{n} · Shift-Tab to cycle, :detach to stop)")
+                format!("\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({idx}/{n} · Shift-Tab to cycle, :detach to stop)\x1b[0m")
             }
         }
         // Attached to a run no longer in the local worker list (e.g. reattached
         // across a restart) — still reflect the attach state.
-        None => format!("⇄ attached to {short} (:detach to stop)"),
+        None => format!("\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m(:detach to stop)\x1b[0m"),
     }
 }
 
