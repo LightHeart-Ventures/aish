@@ -1,0 +1,167 @@
+name: Release (ci channel)
+
+# CI channel — bleeding-edge builds on every push to main
+# (AISH_UPDATE_CHANNEL=ci). Intended for maintainers/dogfooders who want the
+# tip of main as an installable binary the moment it merges. Tags are
+# `ci-{run_number}-{sha8}` (run number for monotonic ordering, short SHA for
+# provenance).
+#
+# These are PRE-RELEASES (never "latest"). `:update` on the ci channel finds
+# them via `gh release list` + a client-side `ci-` prefix filter
+# (src/update.rs resolve_prefixed), newest first. Old ci-* releases are pruned
+# to the most recent 10 so this high-frequency channel doesn't accumulate
+# hundreds of releases.
+#
+# Tag creation stays workflow-owned (softprops sets target_commitish =
+# github.sha) per the SRE no-hand-pushed-tags rule.
+on:
+  push:
+    branches:
+      - main
+    # Don't burn a full cross-target build on doc-only churn.
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+
+permissions:
+  contents: write
+
+concurrency:
+  # Serialize per-branch; do NOT cancel in progress (each merge deserves a build).
+  group: release-ci
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: compute ci tag
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Derive ci tag ci-{run_number}-{sha8}
+        id: tag
+        run: |
+          set -euo pipefail
+          sha8="$(echo '${{ github.sha }}' | cut -c1-8)"
+          tag="ci-${{ github.run_number }}-${sha8}"
+          echo "release tag: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: aish-x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: aish-aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: aish-x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+        shell: bash
+
+      - name: Cache cargo + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --features local --target ${{ matrix.target }}
+        shell: bash
+
+      - name: Package binary + checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/aish" "dist/${{ matrix.asset }}"
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+          cat "${{ matrix.asset }}.sha256"
+        shell: bash
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish ci pre-release
+    needs: [prepare, build]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name 'aish-*' \) -exec cp {} dist/ \;
+          ls -l dist
+
+      - name: Aggregate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: aish ${{ needs.prepare.outputs.tag }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # CI builds must never become "latest" — keeps prod users safe.
+          prerelease: true
+          make_latest: false
+          files: |
+            dist/aish-*
+            dist/SHA256SUMS
+
+      # Retention: keep only the 10 newest ci-* releases (and their tags).
+      - name: Prune old ci-* releases (keep 10)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 500 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("ci-"))]
+                  | sort_by(.createdAt) | reverse | .[10:] | .[].tagName' \
+            | while read -r t; do
+                [ -z "$t" ] && continue
+                echo "Pruning old ci release: $t"
+                gh release delete "$t" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+              done
+        shell: bash
