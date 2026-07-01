@@ -12,7 +12,7 @@ mod engine;
 mod git;
 mod git_repo;
 mod goal;
-mod header;
+
 mod hooks;
 mod hwdetect;
 mod jobs;
