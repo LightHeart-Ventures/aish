@@ -78,6 +78,115 @@ pub enum LoopTick {
     Idle,
 }
 
+/// Env knob gating the auto-resume-on-child-completion wake hook
+/// (`AISH_AUTO_RESUME_ON_CHILD_COMPLETE`). Default **ON**; disabled only when the
+/// var is set to a falsey token (`0`, `false`, `no`, `off`, case-insensitive).
+/// Read live (not cached) so it can be flipped per invocation. See
+/// [`ResumeState`].
+pub fn auto_resume_enabled() -> bool {
+    resume_enabled_from(std::env::var("AISH_AUTO_RESUME_ON_CHILD_COMPLETE").ok().as_deref())
+}
+
+/// Pure core of [`auto_resume_enabled`] — testable without mutating process env.
+fn resume_enabled_from(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+    }
+}
+
+/// Build the synthetic continuation turn the parent runs when its fanned-out
+/// background coordinators finish (see [`ResumeState`]). Phrased as an
+/// instruction to READ each completed worker's result and synthesize it for the
+/// user — explicitly NOT to re-dispatch already-done work (the failure mode a
+/// naive "continue" nudge invites). The REPL prefixes the returned string with
+/// `?` so it routes straight to the model turn, never shell-dispatched or
+/// re-offloaded. Pure, so the exact wording is unit-tested.
+fn resume_prompt(ids: &[String]) -> String {
+    let list = ids.join(", ");
+    let n = ids.len();
+    let plural = if n == 1 { "" } else { "s" };
+    let first = ids.first().map(String::as_str).unwrap_or("");
+    format!(
+        "[Auto-resume] {n} background worker{plural} you dispatched finished while you were idle: \
+{list}. Their results are ready. Retrieve each one now (call background_status, then job_output \
+for each id — e.g. job_output {{\"job\":\"{first}\"}}), read the output, and synthesize the \
+outcome for the user. Do NOT re-dispatch work that is already complete."
+    )
+}
+
+/// Coalescing state for the auto-resume-on-child-completion wake hook. When a
+/// top-level interactive session fans out background coordinators via
+/// `run_in_background`, their results "auto-deliver" only as one-line notices —
+/// nothing re-invokes the assistant to READ and synthesize them, so the human
+/// had to type "continue". This tracks which fanned-out children have gone
+/// terminal and, once the LAST outstanding child finishes, arms a single
+/// coalesced continuation turn the REPL consumes on its next idle pass (see
+/// [`Session::take_resume_tick`]) — the parent then reads the results itself.
+///
+/// Shared (`Arc<Mutex<_>>`) with the background-result presenter task, which
+/// `observe`s completions off the main thread; the main loop drains the armed
+/// resume with `take`. Session-local, never persisted. Deliberately coalescing:
+/// if N children finish close together the parent wakes ONCE with all ready ids,
+/// not N times.
+#[derive(Default)]
+pub struct ResumeState {
+    /// Terminal child ids observed but not yet consumed by a resume turn.
+    pending: Vec<String>,
+    /// Child ids already folded into `pending` — dedupes repeated observations
+    /// across the presenter's polling ticks so one completion arms exactly once,
+    /// and so a later re-observation after a drain never re-fires the same id.
+    seen: HashSet<String>,
+    /// Set once the LAST outstanding fanned-out child has gone terminal with
+    /// something pending; cleared when the REPL consumes the resume via `take`.
+    armed: bool,
+}
+
+impl ResumeState {
+    /// Fold newly-terminal `terminal_ids` into the pending set and, when the last
+    /// outstanding fanned-out child has finished (`outstanding == 0`) with
+    /// something pending, arm a coalesced resume. Returns true only on the call
+    /// that FRESHLY arms it, so the caller can announce the wake exactly once.
+    /// Idempotent: re-observing the same ids, or re-calling while already armed,
+    /// does not re-arm. A no-op (returns false, records nothing) when auto-resume
+    /// is disabled, so a disabled session never accrues state.
+    pub fn observe(&mut self, terminal_ids: &[String], outstanding: usize) -> bool {
+        if !auto_resume_enabled() {
+            return false;
+        }
+        for id in terminal_ids {
+            if self.seen.insert(id.clone()) {
+                self.pending.push(id.clone());
+            }
+        }
+        if outstanding == 0 && !self.pending.is_empty() && !self.armed {
+            self.armed = true;
+            return true;
+        }
+        false
+    }
+
+    /// Drain an armed resume: returns the ids to synthesize and clears both the
+    /// arm and the pending list (the `seen` set is RETAINED so an already-consumed
+    /// completion can never re-fire). `None` when nothing is armed.
+    pub fn take(&mut self) -> Option<Vec<String>> {
+        if !self.armed {
+            return None;
+        }
+        self.armed = false;
+        Some(std::mem::take(&mut self.pending))
+    }
+
+    /// Test-only peek at the pending count.
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+}
+
 /// Engine-side state, independent of any frontend (REPL today, login shell later).
 pub struct Session {
     /// The shell's working directory. Lives HERE, never in the process global —
@@ -269,6 +378,17 @@ pub struct Session {
     /// stopped by `:loop stop` or a Ctrl-C abort. Always `None` for a background
     /// coordinator — loops are an interactive affordance.
     pub loop_state: Option<LoopState>,
+    /// Auto-resume-on-child-completion state (the parent-wake hook). When a
+    /// top-level interactive session fans out background coordinators via
+    /// `run_in_background`, this coalesces their completions so that once the
+    /// LAST outstanding fanned-out child goes terminal the REPL synthesizes a
+    /// single continuation turn — the parent reads + synthesizes the results
+    /// itself, instead of the human having to type "continue". Shared
+    /// (`Arc<Mutex<_>>`) with the background-result presenter task, which
+    /// observes completions off the main thread; the main loop drains the armed
+    /// resume on its next idle pass (`take_resume_tick`). Session-local, never
+    /// persisted.
+    pub resume: Arc<Mutex<ResumeState>>,
 }
 
 impl Session {
@@ -316,6 +436,7 @@ impl Session {
             suppress_context_seed: false,
             task_anchor: None,
             loop_state: None,
+            resume: Arc::new(Mutex::new(ResumeState::default())),
         })
     }
 
@@ -369,6 +490,37 @@ impl Session {
                 "no loop running — `:loop <count> <prompt>` to start one".to_string()
             }
         }
+    }
+
+    /// Consume an armed auto-resume (see [`ResumeState`]). Returns the synthetic
+    /// continuation prompt to run as a model turn when the last outstanding
+    /// fanned-out child of this session has completed, or `None`. Two gates keep
+    /// it from firing surprisingly: it is skipped while `:attach`ed to a
+    /// coordinator (typed lines steer that worker — an auto-synthesis would fight
+    /// the attach), and when auto-resume is disabled via the env knob. The REPL
+    /// runs the returned prompt through its `?`-forced model route, exactly like
+    /// a `:loop` tick, so the turn is driven from the loop rather than blocked on
+    /// a poll — consistent with "the assistant's turn ends at reply".
+    pub fn take_resume_tick(&mut self) -> Option<String> {
+        if !auto_resume_enabled() {
+            return None;
+        }
+        // Attached to a coordinator → typed input is steered to it; don't also
+        // auto-synthesize here.
+        if self
+            .attached
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .is_some()
+        {
+            return None;
+        }
+        let ids = self.resume.lock().ok()?.take()?;
+        if ids.is_empty() {
+            return None;
+        }
+        Some(resume_prompt(&ids))
     }
 
     /// Load the lifecycle-hook registry from the user-global
@@ -895,6 +1047,85 @@ mod tests {
             session.skills_prompt
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resume_enabled_defaults_on_and_parses_falsey_marker() {
+        assert!(resume_enabled_from(None));
+        for v in ["0", "false", "no", "off", "  OFF ", "False"] {
+            assert!(!resume_enabled_from(Some(v)), "{v:?} should disable");
+        }
+        for v in ["1", "true", "yes", "on", ""] {
+            assert!(resume_enabled_from(Some(v)), "{v:?} should enable");
+        }
+    }
+
+    #[test]
+    fn resume_prompt_names_ids_and_forbids_redispatch() {
+        let p = resume_prompt(&["w_a".into(), "w_b".into()]);
+        assert!(p.contains("w_a") && p.contains("w_b"), "{p}");
+        assert!(p.contains("2 background workers"), "{p}");
+        assert!(p.contains("job_output"), "{p}");
+        assert!(p.contains("Do NOT re-dispatch"), "{p}");
+        let one = resume_prompt(&["w_a".into()]);
+        assert!(one.contains("1 background worker "), "{one}");
+    }
+
+    #[test]
+    fn resume_state_arms_only_when_last_child_done() {
+        if !auto_resume_enabled() {
+            return;
+        }
+        let mut r = ResumeState::default();
+        assert!(!r.observe(&["w_a".into()], 1));
+        assert_eq!(r.pending_len(), 1);
+        assert!(r.take().is_none());
+        assert!(r.observe(&["w_b".into()], 0));
+        assert_eq!(r.pending_len(), 2);
+        assert!(!r.observe(&["w_b".into()], 0));
+        let ids = r.take().unwrap();
+        assert_eq!(ids, vec!["w_a".to_string(), "w_b".to_string()]);
+        assert!(r.take().is_none());
+    }
+
+    #[test]
+    fn resume_state_dedupes_and_never_refires_consumed_ids() {
+        if !auto_resume_enabled() {
+            return;
+        }
+        let mut r = ResumeState::default();
+        assert!(r.observe(&["w_a".into(), "w_a".into()], 0));
+        assert_eq!(r.pending_len(), 1);
+        assert_eq!(r.take().unwrap(), vec!["w_a".to_string()]);
+        assert!(!r.observe(&["w_a".into()], 0));
+        assert!(r.take().is_none());
+        assert!(r.observe(&["w_c".into()], 0));
+        assert_eq!(r.take().unwrap(), vec!["w_c".to_string()]);
+    }
+
+    #[test]
+    fn resume_state_no_arm_without_pending() {
+        if !auto_resume_enabled() {
+            return;
+        }
+        let mut r = ResumeState::default();
+        assert!(!r.observe(&[], 0));
+        assert!(r.take().is_none());
+    }
+
+    #[test]
+    fn take_resume_tick_gated_by_attach() {
+        if !auto_resume_enabled() {
+            return;
+        }
+        let mut session = Session::new().unwrap();
+        assert!(session.resume.lock().unwrap().observe(&["w_a".into()], 0));
+        *session.attached.lock().unwrap() = Some("w_x".to_string());
+        assert!(session.take_resume_tick().is_none());
+        *session.attached.lock().unwrap() = None;
+        let body = session.take_resume_tick().expect("armed resume");
+        assert!(body.contains("w_a"), "{body}");
+        assert!(session.take_resume_tick().is_none());
     }
 
     #[test]
