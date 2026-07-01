@@ -229,6 +229,10 @@ pub async fn run(
         let worker_jobs = session.worker_jobs.clone();
         let attached = session.attached.clone();
         let attach_review_announced = session.attach_review_announced.clone();
+        // Shared with the auto-resume wake hook: this presenter observes child
+        // completions off the main thread and arms a coalesced resume; the main
+        // loop drains it on its next idle pass. See session::ResumeState.
+        let resume = session.resume.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(400));
             loop {
@@ -268,6 +272,40 @@ pub async fn run(
                 notices.extend(crate::worker::notify_pending(&worker_jobs));
                 for n in notices {
                     let _ = printer.print(format!("{n}\n"));
+                }
+                // Auto-resume wake hook: observe this session's fanned-out
+                // coordinators. Snapshot every worker's terminal-ness and the
+                // count still outstanding, then let ResumeState coalesce — it
+                // dedupes repeat observations and only ARMS once the LAST
+                // outstanding child has finished. Passing the full terminal set
+                // each tick is intentional: `observe` folds only newly-terminal
+                // ids into the pending list (see session::ResumeState). When it
+                // freshly arms, surface a one-line heads-up; the main loop drains
+                // the armed resume on its next idle pass (Session::take_resume_tick).
+                {
+                    let (terminal_ids, outstanding) = {
+                        let jobs = worker_jobs.lock().unwrap();
+                        let mut terminal = Vec::new();
+                        let mut outstanding = 0usize;
+                        for w in jobs.iter() {
+                            if matches!(w.status().as_str(), "done" | "failed") {
+                                terminal.push(w.id.clone());
+                            } else {
+                                outstanding += 1;
+                            }
+                        }
+                        (terminal, outstanding)
+                    };
+                    let freshly_armed = resume
+                        .lock()
+                        .map(|mut r| r.observe(&terminal_ids, outstanding))
+                        .unwrap_or(false);
+                    if freshly_armed {
+                        let _ = printer.print(
+                            "\x1b[2m⤵ background workers finished — resuming to synthesize their results…\x1b[0m\n"
+                                .to_string(),
+                        );
+                    }
                 }
             }
         });
@@ -342,7 +380,22 @@ pub async fn run(
         // turn — never shell-dispatched or auto-offloaded to a coordinator.
         let outcome = match injected.take() {
             Some(l) => ReadOutcome::Line(l),
-            None => match session.next_loop_tick() {
+            // Auto-resume drain: when the last fanned-out coordinator of this
+            // session has finished, the presenter armed a coalesced resume (see
+            // session::ResumeState). Consume it here — BEFORE the blocking
+            // read_line — and run the synthetic continuation as a model turn via
+            // the `?` route escape, exactly like a `:loop` tick, so the parent
+            // reads + synthesizes the workers' results without the human typing
+            // "continue". Known limitation: a session already blocked inside
+            // read_line only reaches this on its next pass (after the current turn
+            // ends or the next keypress); interrupting an idle read is a separate
+            // follow-up (see PR body).
+            None => match session.take_resume_tick() {
+                Some(body) => {
+                    println!("\x1b[2m⤵ auto-resume — reading finished background workers\x1b[0m");
+                    ReadOutcome::Line(format!("?{body}"))
+                }
+                None => match session.next_loop_tick() {
                 crate::session::LoopTick::Run { index, total, body } => {
                     println!("\x1b[2m↻ loop {index}/{total}\x1b[0m");
                     ReadOutcome::Line(format!("?{body}"))
@@ -355,6 +408,7 @@ pub async fn run(
                     continue;
                 }
                 crate::session::LoopTick::Idle => editor.read_line(&prompt),
+                },
             },
         };
         match outcome {
@@ -2410,6 +2464,39 @@ toolset; result auto-delivers. :workers to check.\x1b[0m"
 /// (emoji + "Shift-Tab to see work") and leaves the operator free to keep
 /// working in the interactive session, the newly-spawned worker (a `w_########`
 /// id) waiting one Shift-Tab away.
+/// Print the escalation banner, animating the leading arrow so it "lifts off"
+/// the way the work does — a right→up-right→curve-up glyph sweep that settles on
+/// the ⤴️ emoji, then the static banner text. The animation runs ONLY on an
+/// interactive terminal (a piped/redirected stdout gets the final frame in one
+/// clean write, no escape/`\r` noise — same TTY-gating contract as
+/// `clear_screen`). Each frame rewrites the line in place with `\r\x1b[2K`; the
+/// final frame is left on screen followed by a newline.
+fn print_escalation_banner(short: &str) {
+    // Body of the banner, minus the leading arrow glyph (which is what animates).
+    let body = format!(
+        "  escalated to background worker {short}\x1b[0m \x1b[2m— keep working here; Shift-Tab to see work.\x1b[0m"
+    );
+    // SAFETY: plain isatty query. Off a TTY, skip the motion entirely.
+    let is_tty = unsafe { libc::isatty(1) } == 1;
+    if !is_tty {
+        println!("\x1b[1;33m⤴\u{fe0f}{body}");
+        return;
+    }
+    // Liftoff frames: a flat arrow tilts upward, then curls into the final
+    // curve-up emoji — reads as the escalated work taking off.
+    const FRAMES: &[&str] = &["\u{2192}", "\u{2197}", "\u{2b06}\u{fe0f}", "\u{2934}\u{fe0f}"];
+    let mut out = std::io::stdout();
+    for frame in FRAMES {
+        let _ = write!(out, "\r\x1b[2K\x1b[1;33m{frame}{body}");
+        let _ = out.flush();
+        std::thread::sleep(Duration::from_millis(90));
+    }
+    // Leave the final frame on screen and terminate the line.
+    let _ = writeln!(out);
+    let _ = out.flush();
+}
+
+
 fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
     let Dispatched { id, message } = dispatch_coordinator(task, session);
     // A guard failure (empty/nested/no-credential/no-binary) carries no id —
@@ -2423,9 +2510,8 @@ fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
         // The agent escalated this on its own (or via a work-signal line). Run it
         // as a background worker, tell the operator they can keep working, and
         // point them at Shift-Tab to watch it — newest worker is one press away.
-        println!(
-            "\x1b[1;33m⤴\u{fe0f}  escalated to background worker {short}\x1b[0m \x1b[2m— keep working here; Shift-Tab to see work.\x1b[0m"
-        );
+        // The leading ⤴️ "lifts off" with a brief liftoff animation on a TTY.
+        print_escalation_banner(&short);
         return;
     }
     println!("{message}");
