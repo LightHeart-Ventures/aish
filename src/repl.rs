@@ -324,6 +324,16 @@ pub async fn run(
                             "\x1b[2m⤵ background workers finished — resuming to synthesize their results…\x1b[0m\n"
                                 .to_string(),
                         );
+                        // Hands-free drain: if the main loop is parked inside a
+                        // blocking read_line right now, arming alone won't fire
+                        // the resume until the human presses a key. Push a
+                        // newline into the terminal's input queue so read_line
+                        // returns and the next loop pass drains the armed resume
+                        // via take_resume_tick. Best-effort (see
+                        // editor::nudge_terminal_return): a no-op on kernels that
+                        // gate TIOCSTI or when stdin isn't a tty, in which case
+                        // we fall back to resuming on the user's next Enter.
+                        crate::editor::nudge_terminal_return();
                     }
                 }
             }
@@ -406,10 +416,13 @@ pub async fn run(
             // read_line — and run the synthetic continuation as a model turn via
             // the `?` route escape, exactly like a `:loop` tick, so the parent
             // reads + synthesizes the workers' results without the human typing
-            // "continue". Known limitation: a session already blocked inside
-            // read_line only reaches this on its next pass (after the current turn
-            // ends or the next keypress); interrupting an idle read is a separate
-            // follow-up (see PR body).
+            // "continue". A session parked inside a blocking read_line when the
+            // resume arms is woken hands-free by the presenter, which pushes a
+            // newline into the terminal via editor::nudge_terminal_return()
+            // (TIOCSTI) so read_line returns and this drain runs on the next pass.
+            // Residual: on kernels that gate TIOCSTI (Linux ≥6.2
+            // dev.tty.legacy_tiocsti=0) or when stdin isn't a tty, the nudge is a
+            // no-op and the resume still drains on the user's next keypress.
             None => match session.take_resume_tick() {
                 Some(body) => {
                     println!("\x1b[2m⤵ auto-resume — reading finished background workers\x1b[0m");
