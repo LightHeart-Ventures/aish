@@ -6,6 +6,27 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 _Nothing yet._
 
+## [0.21.0] - 2026-07-01
+
+### Added
+- **Lifecycle hooks — `PreToolUse` blocking gate**: hooks can now act on lifecycle events and *block* a tool call before it runs, not just observe it (builds on the observe-phase hook foundation).
+- **`:stop` coordinator stand-down channel**: a harder-than-`:tell` control channel that tells a running background coordinator to stand down, distinct from queuing a mid-flight steering message.
+- **Parent session wakes when fanned-out coordinators complete**: when a session's fanned-out background coordinators finish, the parent session is woken to consume the results instead of requiring a manual "continue" prompt.
+- **`read_file` 1-based line-range slicing**: read a bounded line range of a file instead of re-reading the whole thing — cuts the large-file re-read loop-guard trips seen in coordinator runs.
+- **Ctrl-C interrupts an attached worker's current turn**: interrupt the in-flight turn of an attached worker without killing the whole run.
+- **Local backend auto-downloads the detected GGUF from Hugging Face on first use**: the `local` inference path fetches the hardware-appropriate model on demand rather than requiring a manual download.
+
+### Changed
+- **Coordinator re-evaluates its fan-out plan after triage**: stops over-decomposing — a coordinator that has already isolated a single root cause no longer blindly fans out N sub-agents.
+- **Animated ⤴️ escalation banner** in the REPL.
+- **`:output` pane polish**: wrapped pane rows are hang-indented and glyphs are aligned to the rocket column.
+- **Blank line before always-surfaced console notes** for clearer worker → operator console output.
+
+### Fixed
+- **Retrievable sub-job output + deterministic fan-out retrieval**: fanned-out sub-job results are now retrievable by id deterministically (with tiered routing), closing the "children reported success but output was unretrievable" gap.
+- **Worker memory rlimit floored** so V8/Node-based tools (e.g. `neonctl`) can start under a background worker instead of being aborted at startup by a too-low `RLIMIT_AS`.
+- **Attached coordinator's final result is surfaced live** and no longer truncated in live-attach review mode.
+
 ## [0.20.0] - 2026-06-30
 
 ### Changed
