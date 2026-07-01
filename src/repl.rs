@@ -90,6 +90,10 @@ fn clear_screen() {
     if unsafe { libc::isatty(1) } == 1 {
         print!("\x1b[2J\x1b[H");
         let _ = std::io::stdout().flush();
+        // If a bottom-anchored footer is installed, the clear just wiped its
+        // rows and homed the cursor to the top — re-assert the region and
+        // repaint the footer so it stays pinned to the bottom.
+        crate::terminal::restore_after_clear();
     }
 }
 
@@ -202,16 +206,59 @@ pub async fn run(
 
     // Start on a clean screen (interactive terminals only — keep piped output clean).
     clear_screen();
+
+    // Bottom-anchored footer (S: DECSTBM scroll region). On a tall enough
+    // interactive terminal we pin a three-row footer to the bottom: a solid rule,
+    // a coordinator status message, and the live statusline. Everything else
+    // scrolls above it. On a short terminal (height ≤ 4) or off a tty, `term` is
+    // `None`/disabled and we fall back to inline statusline printing (the prior
+    // behavior). A panic hook resets the region on unwind; `Drop` resets it on a
+    // clean exit. A SIGWINCH watcher flips `resized` so the loop re-establishes
+    // the region on the next idle pass (and every `draw_footer` re-asserts it too).
+    let mut term = crate::terminal::Terminal::detect();
+    let footer_active = term.as_ref().map(|t| t.footer_enabled()).unwrap_or(false);
+    let resized = Arc::new(AtomicBool::new(false));
+    if footer_active {
+        crate::terminal::install_panic_hook();
+        if let Some(t) = term.as_mut() {
+            t.init_scroll_region();
+        }
+        // SIGWINCH → set the resize flag; the loop drains it before the prompt.
+        let resized_sig = resized.clone();
+        tokio::spawn(async move {
+            if let Ok(mut sig) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+            {
+                loop {
+                    if sig.recv().await.is_none() {
+                        break;
+                    }
+                    resized_sig.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+    }
+
     // Live statusline (version + model on the left, date/time on the right),
     // then the help hint. Interactive terminals only — never leak escape/status
-    // noise into piped/redirected output. The statusline is anchored to the top
-    // noise into piped/redirected output. The statusline is refreshed inline,
-    // directly above the prompt, on each idle pass (see the LoopTick::Idle arm).
+    // noise into piped/redirected output. With the footer active the statusline
+    // lives in the pinned bottom row; otherwise it's refreshed inline directly
+    // above the prompt on each idle pass (see the LoopTick::Idle arm).
     if unsafe { libc::isatty(1) } == 1 {
-        println!(
-            "{}",
-            crate::style::statusline(crate::update::current_version(), &backend.describe())
-        );
+        if footer_active {
+            if let Some(t) = term.as_mut() {
+                let statusline = crate::style::statusline(
+                    crate::update::current_version(),
+                    &backend.describe(),
+                );
+                t.draw_footer(&coordinator_status_message(&session), &statusline);
+            }
+        } else {
+            println!(
+                "{}",
+                crate::style::statusline(crate::update::current_version(), &backend.describe())
+            );
+        }
         println!(
             "\x1b[2m:help for commands — :workers to monitor background tasks\x1b[0m"
         );
@@ -221,8 +268,9 @@ pub async fn run(
     // `LoopTick::Idle` pass reprints it directly above the first prompt — which
     // would show the header twice. Suppress exactly that first idle refresh so
     // the header appears once at startup; every later idle pass refreshes it as
-    // usual (updated date/time above each prompt).
-    let mut suppress_statusline_once = unsafe { libc::isatty(1) } == 1;
+    // usual (updated date/time above each prompt). Irrelevant in footer mode
+    // (the footer is idempotent and never scrolls into the body).
+    let mut suppress_statusline_once = unsafe { libc::isatty(1) } == 1 && !footer_active;
 
     let mut prev_dir: Option<PathBuf> = None;
     let mut needs_gap = false; // blank line between previous output and the prompt
@@ -425,13 +473,34 @@ pub async fn run(
                     continue;
                 }
                 crate::session::LoopTick::Idle => {
-                    // Refresh the live statusline (updated date/time + model)
-                    // directly above the prompt. Interactive terminals only. The
-                    // startup block already printed it, so skip the very first
-                    // refresh to avoid a duplicated header (see
-                    // `suppress_statusline_once`).
+                    // Refresh the live statusline (updated date/time + model).
+                    // Interactive terminals only.
+                    //
+                    // Footer mode: the statusline + coordinator status live in the
+                    // pinned bottom rows. Re-draw them here (cheap, idempotent) so
+                    // the clock and attach state stay current above each prompt,
+                    // and re-establish the scroll region first if a SIGWINCH fired.
+                    //
+                    // Inline mode (short terminal / non-footer): print the
+                    // statusline directly above the prompt. The startup block
+                    // already printed it, so skip the very first refresh to avoid a
+                    // duplicated header (see `suppress_statusline_once`).
                     if unsafe { libc::isatty(1) } == 1 {
-                        if suppress_statusline_once {
+                        if footer_active {
+                            if let Some(t) = term.as_mut() {
+                                if resized.swap(false, Ordering::SeqCst) {
+                                    t.handle_resize();
+                                }
+                                let statusline = crate::style::statusline(
+                                    crate::update::current_version(),
+                                    &backend.describe(),
+                                );
+                                t.draw_footer(
+                                    &coordinator_status_message(&session),
+                                    &statusline,
+                                );
+                            }
+                        } else if suppress_statusline_once {
                             suppress_statusline_once = false;
                         } else {
                             println!(
@@ -720,9 +789,58 @@ pub async fn run(
             .await;
     }
 
+    // Tear down the bottom-anchored footer before we print the parting line, so
+    // "bye" lands in a normal full-height screen instead of above a stale pinned
+    // footer. `Drop` would also reset it, but doing it explicitly here keeps the
+    // exit output clean and ordered.
+    if let Some(mut t) = term.take() {
+        t.reset_scroll_region();
+    }
+
     editor.save_history();
     println!("bye");
     Ok(())
+}
+
+/// Build the coordinator status line shown in the footer's middle row (row H-1).
+///
+/// Blank when not attached to any coordinator. When attached it mirrors the
+/// Shift-Tab attach announcement — `⇄ attached to <id> (i/n · Shift-Tab to
+/// cycle, :detach to stop)` — with a review-mode variant for a coordinator that
+/// has already finished. The returned string is plain text (no ANSI); the
+/// footer renderer owns styling and width-clipping.
+fn coordinator_status_message(session: &Session) -> String {
+    let attached = match session.attached.lock().unwrap().clone() {
+        Some(id) => id,
+        None => return String::new(),
+    };
+    // Same ordering as `cycle_worker`: newest coordinator first (spawn order
+    // reversed), each paired with a terminal (done/failed) flag.
+    let workers: Vec<(String, bool)> = session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .map(|w| (w.id.clone(), matches!(w.status().as_str(), "done" | "failed")))
+        .collect();
+    let n = workers.len();
+    let short = crate::batch::short_id(&attached);
+    match workers.iter().position(|(id, _)| id == &attached) {
+        Some(i) => {
+            let idx = i + 1;
+            if workers[i].1 {
+                format!(
+                    "⇄ attached to {short} (finished) ({idx}/{n} · review mode: type to resume, Shift-Tab to cycle, :detach to stop)"
+                )
+            } else {
+                format!("⇄ attached to {short} ({idx}/{n} · Shift-Tab to cycle, :detach to stop)")
+            }
+        }
+        // Attached to a run no longer in the local worker list (e.g. reattached
+        // across a restart) — still reflect the attach state.
+        None => format!("⇄ attached to {short} (:detach to stop)"),
+    }
 }
 
 // ---------------------------------------------------------------------------
