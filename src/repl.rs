@@ -216,6 +216,13 @@ pub async fn run(
         );
     }
 
+    // The startup block above already printed the statusline, and the first
+    // `LoopTick::Idle` pass reprints it directly above the first prompt — which
+    // would show the header twice. Suppress exactly that first idle refresh so
+    // the header appears once at startup; every later idle pass refreshes it as
+    // usual (updated date/time above each prompt).
+    let mut suppress_statusline_once = unsafe { libc::isatty(1) } == 1;
+
     let mut prev_dir: Option<PathBuf> = None;
     let mut needs_gap = false; // blank line between previous output and the prompt
     // A command the user accepted from a rewrite preview (S6.4 / TASK-138) is
@@ -418,15 +425,22 @@ pub async fn run(
                 }
                 crate::session::LoopTick::Idle => {
                     // Refresh the live statusline (updated date/time + model)
-                    // directly above the prompt. Interactive terminals only.
+                    // directly above the prompt. Interactive terminals only. The
+                    // startup block already printed it, so skip the very first
+                    // refresh to avoid a duplicated header (see
+                    // `suppress_statusline_once`).
                     if unsafe { libc::isatty(1) } == 1 {
-                        println!(
-                            "{}",
-                            crate::style::statusline(
-                                crate::update::current_version(),
-                                &backend.describe()
-                            )
-                        );
+                        if suppress_statusline_once {
+                            suppress_statusline_once = false;
+                        } else {
+                            println!(
+                                "{}",
+                                crate::style::statusline(
+                                    crate::update::current_version(),
+                                    &backend.describe()
+                                )
+                            );
+                        }
                     }
                     editor.read_line(&prompt)
                 }

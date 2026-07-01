@@ -156,16 +156,10 @@ impl McpHost {
                 }
                 match McpServer::start(name, spec).await {
                     Ok(s) => {
-                        let skills = match s.prompts.len() {
-                            0 => String::new(),
-                            n => format!(", {n} skill{}", if n == 1 { "" } else { "s" }),
-                        };
-                        eprintln!(
-                            "\x1b[2mmcp: {} up ({} tool{}{skills})\x1b[0m",
-                            name,
-                            s.tools.len(),
-                            if s.tools.len() == 1 { "" } else { "s" }
-                        );
+                        // No per-server startup line — it duplicated the
+                        // `mcp: ready — N servers connected` summary and cluttered
+                        // the header. `:mcp reload` reports newly-connected servers
+                        // from the returned `added` names instead.
                         self.servers.push(s);
                         added.push(name.clone());
                     }
