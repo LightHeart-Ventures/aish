@@ -808,6 +808,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ),
     ("skill", "manage skills (add|search|list|remove)"),
     (
+        "stop",
+        "stand down an in-flight coordinator — harsher than :tell (--any: cross-session)",
+    ),
+    (
         "suggest",
         "AI-suggest the next command from context (edit/accept before run)",
     ),
@@ -3518,6 +3522,116 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
     }
 }
 
+/// `:stop` — stand down an in-flight coordinator: the harsh sibling of `:tell`.
+/// Where `:tell` queues a message the coordinator folds in and keeps working,
+/// `:stop` ENDS the run — it raises the durable stand-down flag (honored at the
+/// coordinator's next round boundary; see `coordinator::drive`) and, for a worker
+/// this session owns, additionally SIGINTs its process group so the in-flight
+/// turn aborts and the boundary is reached promptly. Candidate resolution and the
+/// AC7 `--any` ownership gate mirror `tell_coordinator`.
+fn stop_coordinator(id: Option<&str>, any: bool, session: &mut Session) {
+    let Some(id) = id else {
+        println!(
+            "usage: :stop [--any] <worker-id>   — stand down an in-flight coordinator (--any: across sessions)"
+        );
+        return;
+    };
+    let Some(store) = session.coordinator_store.clone() else {
+        println!("coordinator store unavailable — can't stand down a coordinator");
+        return;
+    };
+    let hit = |rid: &str| rid == id || rid.starts_with(id);
+
+    // Candidates: (run_id, terminal?, owner, pid). This session's in-memory
+    // workers first — their pid is known so we can interrupt the current turn —
+    // then durable runs from any session (deduped on run_id; flag-only, no pid).
+    let mut candidates: Vec<(String, bool, Option<String>, Option<u32>)> = Vec::new();
+    for w in session.worker_jobs.lock().unwrap().iter() {
+        if hit(&w.id) {
+            candidates.push((
+                w.id.clone(),
+                matches!(w.status().as_str(), "done" | "failed"),
+                Some(session.session_id.clone()),
+                w.pid(),
+            ));
+        }
+    }
+    if let Ok(rows) = store.load_all() {
+        for r in rows {
+            if hit(&r.run_id) && !candidates.iter().any(|(rid, _, _, _)| rid == &r.run_id) {
+                candidates.push((
+                    r.run_id.clone(),
+                    matches!(r.phase.as_str(), "done" | "failed"),
+                    r.session_id.clone(),
+                    None,
+                ));
+            }
+        }
+    }
+
+    // AC7 ownership gate: by default you may only stand down coordinators your OWN
+    // session launched; `--any` opts into another session's coordinator.
+    let owned: Vec<(String, bool, Option<String>, Option<u32>)> = candidates
+        .iter()
+        .filter(|(_, _, owner, _)| {
+            matches!(
+                owner_gate(owner.as_deref(), &session.session_id, any),
+                OwnerGate::Allow
+            )
+        })
+        .cloned()
+        .collect();
+    if owned.is_empty() {
+        if candidates.is_empty() {
+            println!("no background coordinator matching '{id}' (see :workers)");
+        } else {
+            println!(
+                "'{id}' matches a coordinator launched by another session — re-run as `:stop --any {id}` to stand it down"
+            );
+        }
+        return;
+    }
+
+    match owned.as_slice() {
+        [(run_id, terminal, _, pid)] => {
+            let short = crate::batch::short_id(run_id);
+            if *terminal {
+                println!(
+                    "coordinator {short} has already finished — nothing to stand down (`:result {short}` to view its result)"
+                );
+                return;
+            }
+            if let Err(e) = store.request_stand_down(run_id) {
+                println!("couldn't raise stand-down flag: {e}");
+                return;
+            }
+            // Best-effort interrupt of the in-flight turn for a worker we own, so
+            // the round boundary (where the flag is honored) is reached now rather
+            // than after the current turn. Negated pid targets the whole process
+            // group (pgid == pid via the child's setsid()).
+            if let Some(pid) = pid {
+                unsafe { libc::kill(-(*pid as i32), libc::SIGINT) };
+                println!(
+                    "\x1b[33m🛑 stand-down ordered for {short}\x1b[0m — turn interrupted; one final wrap-up turn, then it exits"
+                );
+            } else {
+                println!(
+                    "\x1b[33m🛑 stand-down flag raised for {short}\x1b[0m — it will wrap up and exit at its next round boundary"
+                );
+            }
+        }
+        many => {
+            println!(
+                "'{id}' matches {} coordinators — be more specific:",
+                many.len()
+            );
+            for (rid, _, _, _) in many {
+                println!("  {rid}");
+            }
+        }
+    }
+}
+
 /// `:context` — show how full the model's context window is, plus the history
 /// and stored-memory counts. The usage figure is the running estimate the engine
 /// maintains from each turn's reported token usage (see `crate::context`).
@@ -3865,6 +3979,7 @@ async fn handle_colon(
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (runs quietly; :attach <id> to watch/steer)\n\
                  :tell [--any] <id> <message>        send instructions to an in-flight coordinator (folded in next round; --any steers another session's)\n\
+                 :stop [--any] <id>                  stand down an in-flight coordinator — harsher than :tell (ends it; --any: cross-session)\n\
                  :attach <id>|goal                   watch a running coordinator live + steer it (typed lines go to it); `goal` watches the active :goal\n\
                  :detach                             stop watching the attached coordinator (it keeps running)\n\
                  :forget <id>|--all-exited           remove an exited worker's container + state dir + run record (refuses a running one)\n\
@@ -4187,6 +4302,16 @@ async fn handle_colon(
             let target = rest.first().copied();
             let message = rest.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
             tell_coordinator(target, message.trim(), any, session);
+        }
+        Some("stop" | "standdown" | "stand-down") => {
+            // Stand down an in-flight coordinator — the harsh sibling of :tell.
+            // Raises the durable stand-down flag AND interrupts the running turn,
+            // so the coordinator takes one final graceful wrap-up turn and exits.
+            // A leading `--any`/`-a` opts into standing down another session's
+            // coordinator (same cross-session ownership override as :tell).
+            let toks: Vec<&str> = parts.collect();
+            let (any, rest) = take_any_flag(&toks);
+            stop_coordinator(rest.first().copied(), any, session);
         }
         Some("rename") => {
             let rest = parts.collect::<Vec<_>>().join(" ");
