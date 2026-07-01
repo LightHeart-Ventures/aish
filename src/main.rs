@@ -40,6 +40,7 @@ mod skill_provider;
 mod skills;
 mod style;
 mod suggest;
+mod terminal;
 mod tools;
 mod turn_audit;
 mod update;
