@@ -790,6 +790,36 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
 /// Override with `AISH_WORKER_MEM_MB`.
 const DEFAULT_WORKER_MEM_MB: u64 = 4096;
 
+/// Hard floor (MB) on the memory cap we will EVER impose on a worker, no matter
+/// how low `AISH_WORKER_MEM_MB` is set. Modern language runtimes reserve a large
+/// *virtual* address-space region up front — V8/Node maps a multi-GB
+/// "cage"/CodeRange, and Go / the JVM reserve comparably large arenas — and that
+/// reservation counts against `RLIMIT_AS` (and, on Linux ≥ 4.7, against
+/// `RLIMIT_DATA` too, since it now also bounds anonymous `mmap`). Cap a worker
+/// below this and those reservations fail *fatally at startup*: `neonctl` (Node)
+/// aborts with "Failed to reserve virtual memory for CodeRange" under a ~1 GB
+/// cap, and even `node --version`-class tools die once real work initialises an
+/// isolate. Empirically Node needs ≳ 2 GB of address space just to start, so we
+/// never apply a tighter limit — otherwise a well-meaning low `AISH_WORKER_MEM_MB`
+/// would silently break EVERY Node/Go/JVM tool the coordinator tries to run
+/// (e.g. `neonctl`, the reported failure). This is a functional floor, not a
+/// policy knob: `0` ("no limit") is still honoured; the floor only raises a
+/// positive, too-small value.
+const MIN_WORKER_MEM_MB: u64 = 2048;
+
+/// Apply the [`MIN_WORKER_MEM_MB`] floor to a requested worker memory cap. `0`
+/// means "no limit" and passes through unchanged; any positive value is raised
+/// to at least the floor so a modern runtime (V8/Node, Go, JVM) can still
+/// reserve its large virtual address space. Pure integer math (async-signal-safe,
+/// so it's callable from the post-fork `pre_exec` child) → unit-tested.
+fn effective_worker_mem_mb(mem_mb: u64) -> u64 {
+    if mem_mb == 0 {
+        0
+    } else {
+        mem_mb.max(MIN_WORKER_MEM_MB)
+    }
+}
+
 /// Default PID cap for a worker CONTAINER (AC6), mapped to `--pids-limit`.
 /// Bounds fork-bomb blast radius. Override with `AISH_WORKER_PIDS`; 0 = no limit.
 const DEFAULT_WORKER_PIDS: u64 = 512;
@@ -911,6 +941,13 @@ fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str, cwd: &std::path::
 /// footprint. This is harm-reduction (it bounds the worst single-process
 /// runaways and is a real cap), NOT a guarantee against signal-9 on macOS.
 fn apply_rlimits(mem_mb: u64, cpu_secs: u64) {
+    // Runtime-compat floor (see MIN_WORKER_MEM_MB / effective_worker_mem_mb):
+    // capping virtual address space below what a modern runtime needs to reserve
+    // its cage (V8/Node CodeRange, Go/JVM arenas) makes those tools abort at
+    // startup, so a too-small AISH_WORKER_MEM_MB would silently break every
+    // Node-based tool (e.g. neonctl) the coordinator runs. 0 ("no limit") passes
+    // through untouched; a positive value is raised to at least the floor.
+    let mem_mb = effective_worker_mem_mb(mem_mb);
     // 0 == "no limit" for either knob.
     if mem_mb > 0 {
         // Saturate the byte count so a huge MB value can't wrap around.
@@ -3480,6 +3517,33 @@ mod tests {
         let msg = describe_failure(exited, "goal worker", "boom");
         assert!(msg.contains("exited unsuccessfully"), "got: {msg}");
         assert!(!msg.contains("killed by the OS"), "got: {msg}");
+    }
+
+    #[test]
+    fn effective_worker_mem_mb_floors_low_values_for_v8() {
+        // 0 == "no limit" is passed through untouched — the floor only lifts a
+        // positive, too-small cap.
+        assert_eq!(effective_worker_mem_mb(0), 0);
+        // Anything below the runtime floor is raised so V8/Node (and Go/JVM) can
+        // reserve their virtual cage — otherwise `neonctl` aborts at startup with
+        // "Failed to reserve virtual memory for CodeRange".
+        assert_eq!(effective_worker_mem_mb(1), MIN_WORKER_MEM_MB);
+        assert_eq!(effective_worker_mem_mb(256), MIN_WORKER_MEM_MB);
+        assert_eq!(effective_worker_mem_mb(1024), MIN_WORKER_MEM_MB);
+        assert_eq!(
+            effective_worker_mem_mb(MIN_WORKER_MEM_MB - 1),
+            MIN_WORKER_MEM_MB
+        );
+        // At or above the floor the operator's value is honoured exactly.
+        assert_eq!(effective_worker_mem_mb(MIN_WORKER_MEM_MB), MIN_WORKER_MEM_MB);
+        assert_eq!(
+            effective_worker_mem_mb(DEFAULT_WORKER_MEM_MB),
+            DEFAULT_WORKER_MEM_MB
+        );
+        assert_eq!(effective_worker_mem_mb(8192), 8192);
+        // Sanity: the default cap must itself be runnable (never below the floor),
+        // so out-of-the-box coordinators can always launch Node-based tools.
+        assert!(DEFAULT_WORKER_MEM_MB >= MIN_WORKER_MEM_MB);
     }
 
     #[test]
