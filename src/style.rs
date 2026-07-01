@@ -352,7 +352,8 @@ pub fn statusline_at(version: &str, model: &str, epoch: i64, width: usize, color
     let gap = width.saturating_sub(lw + rw).max(1);
     let spaces = " ".repeat(gap);
     if color_on {
-        format!("\x1b[2m{left}{spaces}{right}{RESET}")
+        // Bright white (bold + white) — the statusline is the anchored top bar.
+        format!("\x1b[1;37m{left}{spaces}{right}{RESET}")
     } else {
         format!("{left}{spaces}{right}")
     }
@@ -438,9 +439,9 @@ mod tests {
     }
 
     #[test]
-    fn statusline_colored_wraps_in_dim() {
+    fn statusline_colored_wraps_in_bright_white() {
         let s = statusline_at("0.21.1", "m", 0, 80, true);
-        assert!(s.starts_with("\x1b[2m"));
+        assert!(s.starts_with("\x1b[1;37m")); // bright white, not dim
         assert!(s.ends_with(RESET));
     }
 
