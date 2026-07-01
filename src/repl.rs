@@ -798,7 +798,14 @@ pub async fn run(
             ReadOutcome::ShiftTab => {
                 // Shift-Tab cycles the attach cursor across this session's
                 // running coordinators (interactive → worker₁ → … → interactive).
+                // `cycle_worker` prints the attach status line, the backfilled
+                // tail (last 40 transcript rows), and any finished-result pane —
+                // ALL of it must land BEFORE the next prompt. Arm `needs_gap` so
+                // the loop emits a blank line between that last output row and the
+                // redrawn prompt, matching the command path (never a prompt jammed
+                // flush against the cycled coordinator's output).
                 cycle_worker(&mut session);
+                needs_gap = true;
                 continue;
             }
             ReadOutcome::Interrupted => {
