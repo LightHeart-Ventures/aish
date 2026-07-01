@@ -84,6 +84,28 @@ declare a concrete blocker ("I'm blocked because <reason>", what it tried, best
 partial result). A clearly-stated blocker is framed as a **successful** terminal
 outcome; an endless retry loop is a failure.
 
+### 5b. Re-evaluate-after-triage decision point (over-decomposition)
+
+A companion decision point targets a different loop pathology surfaced by a
+fan-out review: **over-decomposition**. In the reviewed incident a coordinator
+investigating 8 failing endpoints correctly collapsed them to a *single* root
+cause (one Postgres connection-pool `Query read timeout`) during initial triage
+— and then *still* fanned out 4 parallel sub-agents on the pre-planned,
+independent-looking angles. The parallel work was pure redundancy because the
+root cause was already known (and, that run, its results were unretrievable —
+double waste).
+
+The coordinator's leading prompt now includes a `RE-EVALUATE THE PLAN AFTER
+TRIAGE — don't over-decompose` block instructing the model to, before fanning
+out with `run_in_background`: re-check the plan against what triage just learned;
+if triage narrowed/collapsed the suspected causes to a single root cause, **not**
+dispatch the pre-planned parallel fan-out but handle it solo or narrow the
+fan-out to only the genuinely-independent open questions; fan out only when
+sub-problems are truly independent and parallelism yields marginal new
+information; and, if a redundant fan-out is already in flight when triage has
+since collapsed the problem, use `tell` to narrow/cancel the now-pointless peers
+rather than letting redundant work run.
+
 ## Deferred to the Atum platform
 
 - **#4 Enrich invoke payloads (ISS-2001):** role / cardTitle / description /

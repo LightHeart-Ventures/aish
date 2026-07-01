@@ -519,6 +519,14 @@ pub async fn drive(
     // failing approach and instead declare a concrete blocker, which is a
     // *successful* terminal outcome here — spinning is not.
     //
+    // The RE-EVALUATE THE PLAN AFTER TRIAGE block is a companion anti-loop
+    // directive aimed at *over-decomposition* rather than repetition (per the
+    // fan-out review): a coordinator that has already collapsed a problem to one
+    // root cause during triage should NOT still fire the parallel fan-out it
+    // pre-planned. It tells the model to re-check the plan before dispatching —
+    // root cause found → stop parallelizing — and to `tell`-narrow/cancel a
+    // redundant fan-out that is already in flight.
+    //
     // The WRAPPING UP block nudges the agent to finish PR-worthy work the way a
     // human would: commit on its (already dedicated) branch, push, and open a
     // DRAFT pull request via `gh` — it has the same git+gh auth as the launching
@@ -536,7 +544,14 @@ fact you already have, STOP and change approach. After about 3 failed attempts a
 sub-problem, do NOT keep retrying the same way — either try a materially different approach or \
 stop and report explicitly: say \"I'm blocked because <specific reason>\", list what you tried \
 and what you observed, and give your best partial result. A clearly-stated blocker is a \
-successful outcome; an endless retry loop is a failure.\n\nCOORDINATING WITH OTHER AGENTS — the `:tell` channel: an [Operator interjection] you receive mid-run arrived through this channel — the human (or another agent) steering you; treat it as updated instructions. You can steer ANOTHER in-flight coordinator the same way: call the `tell` tool with its run id (find ids with background_status) and a message, and it is folded into that coordinator's next round. Use it to hand off a finding, correct a peer's course, or narrow its scope.\n\nWRAPPING UP — open a draft PR for \
+successful outcome; an endless retry loop is a failure.\n\nRE-EVALUATE THE PLAN AFTER TRIAGE — don't over-decompose: \
+Before you fan work out with `run_in_background`, re-check the plan against what triage just learned. If initial \
+triage narrowed or COLLAPSED the suspected causes to a single root cause, do NOT dispatch the parallel fan-out you \
+pre-planned — the independent-looking angles are now redundant. Root cause found → stop parallelizing: handle it \
+solo, or narrow the fan-out to only the sub-problems that are still genuinely independent and where parallelism \
+yields marginal new information. Only fan out when sub-problems are truly independent. If a redundant fan-out is \
+ALREADY in flight when triage has since collapsed the problem, use `tell` to narrow or cancel the now-pointless \
+peers rather than letting redundant work run.\n\nCOORDINATING WITH OTHER AGENTS — the `:tell` channel: an [Operator interjection] you receive mid-run arrived through this channel — the human (or another agent) steering you; treat it as updated instructions. You can steer ANOTHER in-flight coordinator the same way: call the `tell` tool with its run id (find ids with background_status) and a message, and it is folded into that coordinator's next round. Use it to hand off a finding, correct a peer's course, or narrow its scope.\n\nWRAPPING UP — open a draft PR for \
 PR-worthy work: When you finish, if you created or changed files that are meant to land (a fix, \
 feature, refactor, or docs) — as opposed to a read-only investigation, question, or analysis that \
 produced no committable changes — do NOT leave the work uncommitted or stranded on a local branch. \
