@@ -204,6 +204,23 @@ async fn run_turn_inner(
     let mut repeat_guard = crate::loopguard::RepeatGuard::default();
 
     for iteration in 1..=MAX_ITERATIONS {
+        // ── Operator interrupt seam (Ctrl-C on an `:attach`ed worker). A
+        // coordinator installs a SIGINT handler that latches an interrupt flag
+        // (see `coordinator::drive`); check+clear it here, at the clean top of an
+        // iteration where history is consistent (the previous iteration fully
+        // appended its tool_use + tool_results, so there is no dangling
+        // tool_use). End the turn with an `interrupted` banner — the drive loop
+        // turns that into a "reassess" round while keeping the coordinator alive.
+        // Gated on `session.nested`: interactive sessions never install the
+        // handler, so this is a no-op for them (and the flag is never set).
+        if session.nested && crate::coordinator::take_interrupt() {
+            let reason = crate::loopguard::ExitReason::Interrupted;
+            eprintln!("\x1b[2maish: {}\x1b[0m", reason.log_line());
+            return Ok(crate::loopguard::with_banner(
+                &reason,
+                "[turn interrupted by the operator before it finished]",
+            ));
+        }
         // Context-awareness INSIDE the agentic loop. The pre-loop `maybe_compact`
         // above only fires between TURNS, but a single long turn — the
         // coordinator's bread-and-butter, and any tool-heavy interactive turn —

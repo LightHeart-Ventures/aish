@@ -591,7 +591,14 @@ pub async fn run(
                 cycle_worker(&mut session);
                 continue;
             }
-            ReadOutcome::Interrupted => continue, // Ctrl-C: clear the line, loop
+            ReadOutcome::Interrupted => {
+                // Ctrl-C at the prompt. When `:attach`ed to a LIVE coordinator,
+                // forward it to that worker's process group so its in-flight turn
+                // aborts (mirrors the local model-turn abort). Otherwise it just
+                // clears the current line and loops, as before.
+                interrupt_attached_worker(&session);
+                continue;
+            }
             ReadOutcome::Eof => break,            // Ctrl-D: exit
             ReadOutcome::Error(e) => {
                 eprintln!("aish: readline error: {e}");
@@ -2839,6 +2846,45 @@ fn forget_all_exited(session: &mut Session) {
         println!("{}", do_forget(id, session));
     }
     println!("\x1b[2mforgot {n} exited worker(s)\x1b[0m");
+}
+
+/// Ctrl-C at the prompt while `:attach`ed to a LIVE coordinator: forward SIGINT
+/// to the worker's process group so its in-flight model turn aborts. The child
+/// called `setsid()`, so its pgid == pid and `kill(-pid, SIGINT)` reaches the
+/// whole worker group (the coordinator plus any tool children); the coordinator's
+/// own `tokio::signal::ctrl_c` select arm then rolls back the half-finished turn,
+/// exactly as an interactive Ctrl-C does locally. Returns true when a signal was
+/// delivered — the caller then skips the default "clear the line" behaviour.
+/// A no-op (false) when not attached, attached to the goal (watch-only, no
+/// process), attached to a TERMINAL worker (nothing running to interrupt), or the
+/// child pid isn't known yet (spawn hasn't recorded it).
+fn interrupt_attached_worker(session: &Session) -> bool {
+    let Some(run_id) = session.attached.lock().unwrap().clone() else {
+        return false;
+    };
+    if run_id == GOAL_ATTACH_ID {
+        return false;
+    }
+    let target = {
+        let jobs = session.worker_jobs.lock().unwrap();
+        jobs.iter()
+            .find(|w| w.id == run_id)
+            // Only a live (non-terminal) worker with a known child pid can be
+            // interrupted; capture the pid while holding the lock, then drop it
+            // before signalling.
+            .filter(|w| !matches!(w.status().as_str(), "done" | "failed"))
+            .and_then(|w| w.pid())
+    };
+    let Some(pid) = target else {
+        return false;
+    };
+    // Negated pid targets the whole process group (pgid == pid via setsid()).
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGINT);
+    }
+    let short = crate::batch::short_id(&run_id);
+    println!("\x1b[33m^C\x1b[0m interrupting {short}'s turn");
+    true
 }
 
 /// Handle a typed operator line while attached. For a LIVE coordinator this

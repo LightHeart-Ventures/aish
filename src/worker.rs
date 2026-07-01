@@ -1436,6 +1436,12 @@ pub struct WorkerJob {
 struct JobInner {
     /// "running" | "done" | "failed".
     status: String,
+    /// OS process id of the currently-running coordinator subprocess (the child
+    /// `aish --coordinator`, which `setsid()`s so its pgid == this pid). `Some`
+    /// only while a run task has a live child; set right after spawn in
+    /// `run_worker` and re-set on each in-place resume. Read by the REPL to
+    /// forward a Ctrl-C (SIGINT) to an `:attach`ed worker's process group.
+    pid: Option<u32>,
     result: Option<String>,
     error: Option<String>,
     /// Whether this job's result was already surfaced, so the flush doesn't
@@ -1749,6 +1755,18 @@ impl WorkerJob {
     pub fn status(&self) -> String {
         self.inner.lock().unwrap().status.clone()
     }
+    /// Record the OS pid of the live coordinator subprocess (or clear it with
+    /// `None`). Called right after spawn in `run_worker`, and again on each
+    /// in-place resume as a fresh child takes over.
+    pub fn set_pid(&self, pid: Option<u32>) {
+        self.inner.lock().unwrap().pid = pid;
+    }
+    /// The pid of the currently-running coordinator subprocess, if any. `None`
+    /// once the run has finished (or before the child has spawned). Used by the
+    /// REPL to forward Ctrl-C (SIGINT) to an `:attach`ed worker's process group.
+    pub fn pid(&self) -> Option<u32> {
+        self.inner.lock().unwrap().pid
+    }
     fn is_terminal(&self) -> bool {
         matches!(
             self.inner.lock().unwrap().status.as_str(),
@@ -2022,6 +2040,7 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
         id: id.clone(),
         task: task.clone(),
         inner: Mutex::new(JobInner {
+            pid: None,
             status: "running".into(),
             resumes: 0,
             result: None,
@@ -2138,6 +2157,11 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, run_id: String, task:
             return;
         }
     };
+
+    // Record the child's pid so the REPL can forward Ctrl-C (SIGINT) to the
+    // worker's process group while `:attach`ed. The child called `setsid()`, so
+    // its pgid == pid and `kill(-pid, SIGINT)` reaches the whole worker group.
+    job.set_pid(child.id());
 
     // Drain stdout and stderr concurrently (sequential reads can deadlock if the
     // child fills the other pipe's buffer). stdout is the final answer (capped);
@@ -2510,6 +2534,7 @@ mod tests {
             task: "scan repo".into(),
             inner: Mutex::new(JobInner {
                 status: "running".into(),
+                pid: None,
             resumes: 0,
                 result: None,
                 error: None,
@@ -2536,6 +2561,7 @@ mod tests {
             task: "x".into(),
             inner: Mutex::new(JobInner {
                 status: "running".into(),
+                pid: None,
             resumes: 0,
                 result: None,
                 error: None,
@@ -2861,6 +2887,7 @@ mod tests {
             task: "t".into(),
             inner: Mutex::new(JobInner {
                 status: "running".into(),
+                pid: None,
             resumes: 0,
                 result: None,
                 error: None,
@@ -3004,6 +3031,7 @@ mod tests {
             task: "t".into(),
             inner: Mutex::new(JobInner {
                 status: "running".into(),
+                pid: None,
             resumes: 0,
                 result: None,
                 error: None,
@@ -3071,6 +3099,7 @@ mod tests {
             task: "t".into(),
             inner: Mutex::new(JobInner {
                 status: "running".into(),
+                pid: None,
             resumes: 0,
                 result: None,
                 error: None,
@@ -3109,6 +3138,7 @@ mod tests {
                 task: "t".into(),
                 inner: Mutex::new(JobInner {
                     status: "running".into(),
+                pid: None,
             resumes: 0,
                     result: None,
                     error: None,
