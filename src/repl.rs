@@ -2708,8 +2708,8 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
             };
             let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
             let message = format!(
-                "\x1b[2mdispatched background coordinator {id} — runs here with the full \
-toolset; result auto-delivers. :workers to check.\x1b[0m"
+                "\x1b[2mdispatched background coordinator \x1b[0m\x1b[1;36m{id}\x1b[0m\x1b[2m \
+— runs here with the full toolset; result auto-delivers. \x1b[0m\x1b[36m:workers\x1b[0m\x1b[2m to check.\x1b[0m"
             );
             Dispatched {
                 id: Some(id),
@@ -2793,7 +2793,7 @@ fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
     // Fire-and-forget: unlike the old behaviour we do NOT auto-attach or
     // turn `:output` on — surface how to opt into watching/steering instead.
     println!(
-        "\x1b[2m:attach {short} to watch + steer it · :output on to stream coordinator activity\x1b[0m"
+        "\x1b[1;36m:attach {short}\x1b[0m\x1b[2m to watch + steer it · \x1b[0m\x1b[36m:output on\x1b[0m\x1b[2m to stream coordinator activity\x1b[0m"
     );
 }
 
