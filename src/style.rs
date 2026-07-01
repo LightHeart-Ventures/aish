@@ -48,6 +48,7 @@ pub enum Color {
     Yellow,
     Red,
     Blue,
+    Cyan,
     Dim,
 }
 
@@ -59,6 +60,7 @@ impl Color {
             Color::Yellow => "\x1b[33m",
             Color::Red => "\x1b[31m",
             Color::Blue => "\x1b[34m",
+            Color::Cyan => "\x1b[36m",
             Color::Dim => "\x1b[2m",
         }
     }
