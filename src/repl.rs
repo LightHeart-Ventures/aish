@@ -202,18 +202,17 @@ pub async fn run(
 
     // Start on a clean screen (interactive terminals only — keep piped output clean).
     clear_screen();
-    // Print the live statusline (top of screen) with version and backend model.
-    println!("{}", crate::style::statusline(crate::update::current_version(), &backend.describe()));
-    println!(
-        "\x1b[2m:help for commands — :workers to monitor background tasks\x1b[0m"
-    );
-    // Live statusline: version + model on the left, current date/time on the
-    // right, padded to the terminal width. Interactive terminals only — skip it
-    // off a tty so it never leaks into piped/redirected output.
+    // Live statusline (version + model on the left, date/time on the right),
+    // then the help hint. Interactive terminals only — never leak escape/status
+    // noise into piped/redirected output. The statusline is refreshed inline,
+    // directly above the prompt, on each idle pass (see the LoopTick::Idle arm).
     if unsafe { libc::isatty(1) } == 1 {
         println!(
             "{}",
             crate::style::statusline(crate::update::current_version(), &backend.describe())
+        );
+        println!(
+            "\x1b[2m:help for commands — :workers to monitor background tasks\x1b[0m"
         );
     }
 
@@ -383,13 +382,6 @@ pub async fn run(
             "{name}{attach}{badge}\x1b[36m{}\x1b[0m ❯ ",
             short_cwd(&session)
         );
-        
-        // Print the live statusline before idle (refreshes the time every loop iteration).
-        // Only on first iteration or when colors_enabled (avoid cluttering piped output).
-        if crate::style::colors_enabled() {
-            print!("\x1b[H"); // Home cursor to top (ANSI escape)
-            println!("{}", crate::style::statusline(crate::update::current_version(), &backend.describe()));
-        }
         
         // Consume an accepted-rewrite line first, then an active `:loop`
         // iteration, before falling back to the editor. A loop iteration is fed

@@ -7,7 +7,10 @@ The aish plugin system extends the shell with modular, composable capabilities. 
 - **Skills** (prompts/playbooks) for specialized workflows
 - **Tools** (Rust-native functions) for performance-critical operations
 - **Webhooks** to listen for events from external services (GitHub, Slack, etc.)
-- **Hooks** (lifecycle callbacks) to react to shell events
+- **Lifecycle hooks** (`on_init`, `on_shell_ready`, `on_shutdown`, …) to react to *plugin* lifecycle points
+- **Event-catalog hooks** — entries a plugin contributes to the shell's real **33-event agent-lifecycle hook catalog** (`src/hooks.rs`: `PreToolUse`, `TurnEnd`, `MemoryStored`, …). *See the [Enterprise Addendum](#enterprise-addendum-plugin-contributions-to-the-agent-lifecycle-hook-catalog).* **These two "hook" concepts are distinct — do not conflate them.**
+- **Config / env injection** — a plugin can merge servers into the client `.mcp.json`, export session env, and point managed subsystems (skill registry) at a URL
+- **Login / auth commands** — a plugin can register a top-level command (e.g. `aish login`) and persist a credential its other capabilities reuse
 - **Persistent memory** for state, cache, and configuration
 - **JSON schemas** for structured data validation
 - **Documentation** and metadata
@@ -866,6 +869,136 @@ so a manifest can grow into the richer schema without breaking existing plugins.
 - **Phase 6 (GitHub):** Sprint S11 (weeks 1–2) — 13 SP
 - **Phase 7 (aish.sh):** Sprint S11 (week 2) — 8 SP (optional, deferrable)
 - **Phases 8–12 (Polish):** Sprint S12 (weeks 1–2) — 23 SP
+
+---
+
+## Enterprise Addendum: Plugin Contributions to the Agent-Lifecycle Hook Catalog
+
+> **Status:** draft-evolving. Added while designing the first commercial plugin,
+> `aish_enterprise` (the aish.sh control-plane integration). This addendum closes the
+> single biggest gap between this design and a shippable enterprise plugin: **plugins
+> cannot currently contribute to the shell's real event catalog**, which is precisely
+> the seam every control-plane feature (managed memory, LLM tracing, governance,
+> fleet observability) attaches to.
+
+### The two meanings of "hook" — reconciled
+
+This document (and the initial GitHub plugin) uses **hook** to mean a *plugin
+lifecycle* shell script. But the shipped shell already has a **second, unrelated**
+hook system: the **33-event agent-lifecycle catalog** in `src/hooks.rs`, merged from
+`~/.aish/hooks.json` (user) and `.aish/hooks.json` (project). They are different
+mechanisms and must not be conflated:
+
+| | **Lifecycle hook** | **Event-catalog hook** |
+|---|---|---|
+| What fires it | plugin load/unload | the agent loop (per turn / tool / memory / session) |
+| Events | `on_init`, `on_shell_ready`, `on_webhook_url_changed`, `on_shutdown` | `PreToolUse`, `PostToolUse`, `TurnEnd`, `MemoryStored`, `PreCompact`, `SessionStart`, `WorkerStart`, … (33 total) |
+| Declared in | `plugin.json → provides.hooks` (rename → `lifecycle_hooks`) | `~/.aish/hooks.json` catalog (`src/hooks.rs`) |
+| Dispatch | plugin loader, at lifecycle points | `src/hooks.rs` dispatcher, fork/exec, JSON on stdin |
+| Can block a turn? | no | **yes** — `PreToolUse` returns `Decision::Deny(reason)` |
+
+**The enterprise plugin needs the second kind.** Its entire job is to observe/govern
+the agent loop, which only the `src/hooks.rs` catalog exposes.
+
+### New capability: `event_hooks_file` (required for enterprise)
+
+A plugin may ship a `hooks.json` fragment whose entries are **merged into the client's
+`src/hooks.rs` catalog** at load time.
+
+```jsonc
+// plugin.json
+"provides": {
+  "lifecycle_hooks": ["on_init", "on_shell_ready", "on_shutdown"],  // renamed from "hooks"
+  "event_hooks": true
+},
+"event_hooks_file": "hooks.json"   // merged into the 33-event catalog
+```
+
+**Merge & precedence rules:**
+- Precedence is **user (`~/.aish/hooks.json`) > project (`.aish/hooks.json`) >
+  plugin**. Plugin entries are lowest, so a user/org can always override or disable a
+  plugin-contributed hook by name.
+- Multiple plugins may register on the same event; all fire (observe entries in
+  parallel, error-isolated). This mirrors Open Question #4's resolution.
+- **Only one blocking entry per event is honored** for `PreToolUse`-class events; if
+  several are present, the highest-precedence wins and the rest degrade to observe.
+- Plugin entries carry an implicit `source: "plugin:<id>"` tag for audit and for
+  `:hooks list` provenance.
+- The existing trust model is unchanged and **must** hold for plugin entries too:
+  fork/exec (no shell), **no credential values in payloads** (export names only), the
+  `AISH_IN_HOOK` recursion guard, and per-event timeouts.
+
+### New capability: `provides.config` (config / env injection) (required)
+
+A plugin may inject three kinds of client configuration at load:
+
+1. **MCP servers** — a plugin `.mcp.json` is merged into the client MCP set
+   (`src/mcp.rs`), same schema as the user's own `.mcp.json`. This is how the
+   enterprise gateway is added with zero manual edits.
+2. **Session env exports** — a lifecycle hook may emit `KEY=VALUE` lines on stdout
+   that the loader adds to the session environment. Used to point the OSS skill
+   provider at an org registry (`AISH_SKILL_REGISTRY`) and to pass the gateway URL /
+   tenant into the injected `.mcp.json` and event-hook forwarder.
+3. **Staged managed config** — a plugin may write a `managed.json` that the client
+   merges (e.g. an org-pushed `hooks.json`/policy bundle) at `SessionStart`.
+
+Declared via `provides.config: ["mcp_gateway", "skill_registry", "managed_hooks"]`.
+All injected env still resolves `${env:…}` / credential-profile refs through the
+existing substitution path — **secret values never enter plugin.json or payloads.**
+
+### New capability: `provides.login` (auth command) (required)
+
+A plugin may register a top-level command (e.g. `aish login`) and persist a
+credential (to `~/.aish/credentials` under a plugin profile) that its MCP server,
+event-hook forwarder, and lifecycle hooks reuse. Device-code / browser flows are the
+plugin's concern; the client only needs to (a) route the command to the plugin and
+(b) expose the credential to the plugin's own capabilities via the profile ref
+mechanism already used by `.mcp.json`.
+
+### What is explicitly NOT required for the enterprise plugin
+
+The **webhook broker / dynamic-forwarding apparatus (Phases 4, 5, 7, 10)** is *not* a
+prerequisite. `aish_enterprise` consumes the **existing agent-lifecycle event
+catalog**, not a new outbound-webhook subsystem. Keep those phases on their own
+track; they are orthogonal to shipping the control-plane plugin.
+
+### Phase 0.5: Minimal Viable Plugin Capabilities (the enterprise unlock)
+
+**Scope:** the three generic capabilities above — useful to *every* plugin author, not
+just enterprise. **Estimate:** ~8 SP. Slots **before** Phase 4.
+
+- [ ] 0.5.1 Rename `provides.hooks` → `provides.lifecycle_hooks` (keep `hooks` as a
+      deprecated alias for one release) to free the word "hooks" for the event catalog.
+- [ ] 0.5.2 Implement `event_hooks_file` merge into `src/hooks.rs` (precedence,
+      multi-plugin fan-out, single-blocking-winner, `source` tagging).
+- [ ] 0.5.3 Implement `.mcp.json` merge from plugins into the client MCP set.
+- [ ] 0.5.4 Implement session-env injection from lifecycle-hook stdout (`KEY=VALUE`).
+- [ ] 0.5.5 Implement `provides.login` command registration + credential-profile
+      persistence.
+- [ ] 0.5.6 `:hooks list` shows plugin-contributed entries with provenance; `:plugin
+      info <id>` shows which catalog events it registers.
+- [ ] 0.5.7 Tests: catalog merge + precedence, blocking-veto from a plugin entry,
+      `.mcp.json` merge, env injection, login round-trip, override/disable a plugin hook.
+
+**Why 0.5 is the true unlock:** with 0.5.2–0.5.5 in place, the entire commercial
+client footprint collapses to *one plugin install + `aish login`* — the enterprise
+plugin (`aish_enterprise`) ships without any enterprise-specific code upstream. The
+control-plane's "first 5 to build" (trace capture, org skill registry, usage caps,
+tiered memory, `aish doctor`) all attach to catalog events the plugin now contributes.
+
+### Open questions (addendum)
+
+1. **Blocking-hook trust from plugins.** Should a plugin-contributed `PreToolUse`
+   veto require explicit user opt-in at install (since it can deny tool calls)?
+   *Leaning:* yes — surface "this plugin can block tool use" in the install consent,
+   and gate it behind a `policy_enforcement` config the user controls.
+2. **Catalog-event allow-list per plugin.** Should `plugin.json` have to *declare*
+   which of the 33 events it registers (auditable), and the loader reject undeclared
+   entries? *Leaning:* yes — declare in `provides.event_hooks` as an array of event
+   names rather than a bare `true`.
+3. **Managed-config push cadence.** Pull-at-`SessionStart` vs a live channel for org
+   policy updates. *Leaning:* start with pull; a live channel can reuse the broker
+   work from Phase 4 later.
 
 ---
 
