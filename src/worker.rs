@@ -217,8 +217,10 @@ fn forward_decision(line: &str, show_output: bool) -> Option<String> {
         return Some(activity);
     }
     if let Some(text) = strip_sentinel(line, "💭") {
-        // Thinking notice: a plain `[label] thinking…` row — no ·thinking suffix.
-        return Some(text);
+        // Thinking notice: the 💭 glyph rides AFTER the worker-id gutter, padded
+        // by NARRATION_ALIGN_PAD so it lines up under the tool glyph / 🚀 rocket
+        // (the shared "rocket alignment" column) → `[label]   💭 …`.
+        return Some(format!("{NARRATION_ALIGN_PAD}💭 {text}"));
     }
     if let Some(text) = strip_sentinel(line, "🗨") {
         // Turn narration: the 🚀 rocket rides AFTER the worker-id gutter, as a
@@ -269,8 +271,216 @@ const NARRATION_ALIGN_PAD: &str = "  ";
 /// line, the `🛠️`/`🔧` source glyph, the turn/batch narration. The shared left
 /// border on every row is what CONTAINS the stream as a bordered column distinct
 /// from the user's interleaved shell output. Pure — unit-tested.
+/// Max leading visible columns of a body treated as the glyph/status "prefix"
+/// (e.g. `✓ 🛠️ ` or the 2-col NARRATION_ALIGN_PAD + `🚀 `). Continuation lines
+/// hang-indent under the column right after this prefix — i.e. under the first
+/// letter of the message. Capped so a real message that merely opens with a
+/// glyph can never be swallowed wholesale.
+const MSG_INDENT_CAP: usize = 6;
+
+/// Below this many columns available for the message, don't hang-indent — the
+/// sliver would look worse than letting the terminal soft-wrap the whole row.
+const MIN_WRAP_COLS: usize = 24;
+
+/// Terminal width for pane wrapping. A tty (stderr preferred — that's where pane
+/// rows print — then stdout) is queried via TIOCGWINSZ. Off a tty we honor an
+/// explicit `$COLUMNS` and otherwise return `usize::MAX` so captured/piped output
+/// (and unit tests) is emitted as a single line, byte-identical to before — the
+/// wrapping only kicks in when a real terminal renders it.
+fn pane_cols() -> usize {
+    // SAFETY: isatty + a read-only TIOCGWINSZ ioctl on fd 2 / fd 1.
+    unsafe {
+        for fd in [2, 1] {
+            if libc::isatty(fd) == 1 {
+                let mut ws: libc::winsize = std::mem::zeroed();
+                if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+                    return ws.ws_col as usize;
+                }
+            }
+        }
+    }
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(usize::MAX)
+}
+
+/// Visible display width of `s` with ANSI SGR sequences discounted (zero-width).
+fn vis_cols(s: &str) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    let mut w = 0usize;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip a CSI escape: ESC '[' … final alpha byte.
+            if chars.next() == Some('[') {
+                for c2 in chars.by_ref() {
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        w += UnicodeWidthChar::width(c).unwrap_or(0);
+    }
+    w
+}
+
+/// Is `c` part of a leading glyph/status prefix (not message text)? Covers the
+/// status marks (✓/✗), the source & narration glyphs (🛠 🔧 🤝 🚀 🐌 💬 💭 …),
+/// their VS16/ZWJ joiners, the braille spinner frames, and spaces/pad.
+fn is_glyph_skip(c: char) -> bool {
+    matches!(c,
+        ' '
+        | '\u{2713}' | '\u{2717}'            // ✓ ✗
+        | '\u{FE0F}' | '\u{200D}'            // VS16, ZWJ
+    )
+        || ('\u{2800}'..='\u{28FF}').contains(&c)   // braille spinner frames
+        || ('\u{2600}'..='\u{27BF}').contains(&c)   // misc symbols & dingbats
+        || ('\u{1F300}'..='\u{1FAFF}').contains(&c) // emoji (🚀 🐌 💬 💭 🔧 🛠 🤝 …)
+}
+
+/// Split a pane body into its leading glyph/status PREFIX and the MESSAGE that
+/// follows. ANSI SGR runs are always folded into the prefix (zero visible
+/// width); glyph/space codepoints are folded up to `MSG_INDENT_CAP` visible
+/// columns. The message is what a wrapped continuation line hang-indents under.
+fn split_body_glyph(body: &str) -> (&str, &str) {
+    use unicode_width::UnicodeWidthChar;
+    let mut vis = 0usize;
+    let mut cut = 0usize;
+    let mut it = body.char_indices().peekable();
+    while let Some(&(_, c)) = it.peek() {
+        if c == '\x1b' {
+            it.next();
+            while let Some(&(_, cc)) = it.peek() {
+                it.next();
+                if cc.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            cut = it.peek().map(|&(k, _)| k).unwrap_or(body.len());
+            continue;
+        }
+        if is_glyph_skip(c) {
+            let w = UnicodeWidthChar::width(c).unwrap_or(0);
+            if vis + w > MSG_INDENT_CAP {
+                break;
+            }
+            vis += w;
+            it.next();
+            cut = it.peek().map(|&(k, _)| k).unwrap_or(body.len());
+            continue;
+        }
+        break;
+    }
+    (&body[..cut], &body[cut..])
+}
+
+/// Word-wrap plain `msg` into chunks each ≤ `width` visible columns. Prefers
+/// breaking at spaces; hard-breaks a single word longer than `width` by display
+/// column. Callers guard against ANSI-bearing messages (which must not wrap).
+fn wrap_visible(msg: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let cw = |s: &str| s.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum::<usize>();
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in msg.split(' ') {
+        let ww = cw(word);
+        if !cur.is_empty() && cur_w + 1 + ww > width {
+            lines.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        if ww > width {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            let mut chunk = String::new();
+            let mut chw = 0usize;
+            for ch in word.chars() {
+                let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if chw + w > width && !chunk.is_empty() {
+                    lines.push(std::mem::take(&mut chunk));
+                    chw = 0;
+                }
+                chunk.push(ch);
+                chw += w;
+            }
+            cur = chunk;
+            cur_w = chw;
+        } else {
+            if !cur.is_empty() {
+                cur.push(' ');
+                cur_w += 1;
+            }
+            cur.push_str(word);
+            cur_w += ww;
+        }
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// Render one forwarded coordinator line as a row of the contained `:output`
+/// pane: `┃ [label] text`. The border + `[label]` gutter are chrome (cyan
+/// border, dim label); `text` is emitted verbatim so it keeps whatever inline
+/// colour the coordinator produced — the green `✓`/red `✗` on a tool RESULT
+/// line, the `🛠️`/`🔧` source glyph, the turn/batch narration. The shared left
+/// border on every row is what CONTAINS the stream as a bordered column distinct
+/// from the user's interleaved shell output.
+///
+/// When the row is too wide for the terminal, the message is HANG-INDENTED: it
+/// wraps onto continuation rows that carry the same cyan border and are padded so
+/// each wrapped line begins under the FIRST LETTER of the message on the opening
+/// row (the column right after the glyph prefix). Off a tty (piped/tests) the
+/// width is unknown → the row is returned as a single line, unchanged. Pure —
+/// unit-tested.
 pub fn pane_row(label: &str, text: &str) -> String {
-    format!("{PANE_BORDER} \x1b[2m[{label}]\x1b[0m {text}")
+    pane_row_cols(label, text, pane_cols())
+}
+
+/// Width-parameterized core of [`pane_row`] — pure, so wrapping is unit-tested
+/// without touching the terminal or global `$COLUMNS`. `cols == usize::MAX`
+/// means "unknown width" → never wrap (single line, byte-identical to the
+/// pre-wrap behaviour).
+fn pane_row_cols(label: &str, text: &str, cols: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let first = format!("{PANE_BORDER} \x1b[2m[{label}]\x1b[0m {text}");
+    if cols == usize::MAX {
+        return first; // unknown width (piped/tests): never wrap
+    }
+    // Column where the message begins on the opening row:
+    //   "┃ [label] " = ┃(1) + space(1) + '['(1) + label + ']'(1) + space(1)
+    let gutter_w = 5 + UnicodeWidthStr::width(label);
+    let (prefix, message) = split_body_glyph(text);
+    let indent = gutter_w + vis_cols(prefix);
+    let avail = cols.saturating_sub(indent);
+    // Whole row already fits, or too narrow to hang-indent, or the message
+    // carries inline ANSI we must not break across lines → single line.
+    if gutter_w + vis_cols(text) <= cols || avail < MIN_WRAP_COLS || message.contains('\x1b') {
+        return first;
+    }
+    let chunks = wrap_visible(message, avail);
+    if chunks.len() <= 1 {
+        return first;
+    }
+    // Continuation rows: border + pad so the message column lines up under the
+    // opening row's first message letter (┃ is 1 col, then indent-1 spaces).
+    let cont = format!("{PANE_BORDER}{}", " ".repeat(indent.saturating_sub(1)));
+    let mut out = format!(
+        "{PANE_BORDER} \x1b[2m[{label}]\x1b[0m {prefix}{}",
+        chunks[0]
+    );
+    for chunk in &chunks[1..] {
+        out.push('\n');
+        out.push_str(&cont);
+        out.push_str(chunk);
+    }
+    out
 }
 
 /// The pane's TOP frame, printed once when `:output` is switched on so the rows
@@ -419,8 +629,11 @@ impl ThinkingSpinner {
                 // Cyan braille frame + dim "thinking…", mirroring the interactive
                 // spinner's look, framed as a pane row so it carries the same
                 // border + `[label]` gutter as every other streamed line.
+                // NARRATION_ALIGN_PAD lands the braille frame in the same
+                // column as the 🚀 rocket / tool glyph so the animated thinking
+                // row aligns with every other streamed glyph (rocket alignment).
                 let body = format!(
-                    "\x1b[36m{}\x1b[0m \x1b[2;36mthinking…\x1b[0m",
+                    "{NARRATION_ALIGN_PAD}\x1b[36m{}\x1b[0m \x1b[2;36mthinking…\x1b[0m",
                     THINKING_FRAMES[i % THINKING_FRAMES.len()]
                 );
                 eprint!("\r\x1b[2K{}", pane_row(&label, &body));
@@ -465,7 +678,12 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
             if let Some(spin) = thinking.take() {
                 spin.stop();
             }
-            crate::tools::announce_raw(&console_row(label, &note));
+            // Prefix a blank line so the always-surfaced console note is set
+            // visually apart from whatever printed immediately before it (a
+            // coordinator `·result`, a tool row, or the prompt) rather than
+            // abutting it. `announce_raw` clears only the CURRENT line, so
+            // without this the 📣 note butts straight up against the prior text.
+            crate::tools::announce_raw(&format!("\n{}", console_row(label, &note)));
             if tail.len() == STDERR_TAIL_LINES {
                 tail.pop_front();
             }
@@ -571,6 +789,36 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
 /// for a real agentic task but bounded so a runaway can't exhaust host memory.
 /// Override with `AISH_WORKER_MEM_MB`.
 const DEFAULT_WORKER_MEM_MB: u64 = 4096;
+
+/// Hard floor (MB) on the memory cap we will EVER impose on a worker, no matter
+/// how low `AISH_WORKER_MEM_MB` is set. Modern language runtimes reserve a large
+/// *virtual* address-space region up front — V8/Node maps a multi-GB
+/// "cage"/CodeRange, and Go / the JVM reserve comparably large arenas — and that
+/// reservation counts against `RLIMIT_AS` (and, on Linux ≥ 4.7, against
+/// `RLIMIT_DATA` too, since it now also bounds anonymous `mmap`). Cap a worker
+/// below this and those reservations fail *fatally at startup*: `neonctl` (Node)
+/// aborts with "Failed to reserve virtual memory for CodeRange" under a ~1 GB
+/// cap, and even `node --version`-class tools die once real work initialises an
+/// isolate. Empirically Node needs ≳ 2 GB of address space just to start, so we
+/// never apply a tighter limit — otherwise a well-meaning low `AISH_WORKER_MEM_MB`
+/// would silently break EVERY Node/Go/JVM tool the coordinator tries to run
+/// (e.g. `neonctl`, the reported failure). This is a functional floor, not a
+/// policy knob: `0` ("no limit") is still honoured; the floor only raises a
+/// positive, too-small value.
+const MIN_WORKER_MEM_MB: u64 = 2048;
+
+/// Apply the [`MIN_WORKER_MEM_MB`] floor to a requested worker memory cap. `0`
+/// means "no limit" and passes through unchanged; any positive value is raised
+/// to at least the floor so a modern runtime (V8/Node, Go, JVM) can still
+/// reserve its large virtual address space. Pure integer math (async-signal-safe,
+/// so it's callable from the post-fork `pre_exec` child) → unit-tested.
+fn effective_worker_mem_mb(mem_mb: u64) -> u64 {
+    if mem_mb == 0 {
+        0
+    } else {
+        mem_mb.max(MIN_WORKER_MEM_MB)
+    }
+}
 
 /// Default PID cap for a worker CONTAINER (AC6), mapped to `--pids-limit`.
 /// Bounds fork-bomb blast radius. Override with `AISH_WORKER_PIDS`; 0 = no limit.
@@ -693,6 +941,13 @@ fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str, cwd: &std::path::
 /// footprint. This is harm-reduction (it bounds the worst single-process
 /// runaways and is a real cap), NOT a guarantee against signal-9 on macOS.
 fn apply_rlimits(mem_mb: u64, cpu_secs: u64) {
+    // Runtime-compat floor (see MIN_WORKER_MEM_MB / effective_worker_mem_mb):
+    // capping virtual address space below what a modern runtime needs to reserve
+    // its cage (V8/Node CodeRange, Go/JVM arenas) makes those tools abort at
+    // startup, so a too-small AISH_WORKER_MEM_MB would silently break every
+    // Node-based tool (e.g. neonctl) the coordinator runs. 0 ("no limit") passes
+    // through untouched; a positive value is raised to at least the floor.
+    let mem_mb = effective_worker_mem_mb(mem_mb);
     // 0 == "no limit" for either knob.
     if mem_mb > 0 {
         // Saturate the byte count so a huge MB value can't wrap around.
@@ -2713,15 +2968,16 @@ mod tests {
     fn forward_decision_surfaces_thinking_when_output_on() {
         // A coordinator emits a 💭 sentinel when it enters its model-reasoning
         // phase. Like every other coordinator line it is gated behind
-        // :worker-output: suppressed by default, and surfaced as a plain
-        // `[label] thinking…` row (no ·thinking suffix) when the toggle is on.
+        // :worker-output: suppressed by default, and surfaced when the toggle is
+        // on with the 💭 glyph padded to the shared "rocket alignment" column
+        // (under the 🚀 narration / tool glyph) → `  💭 thinking…`.
         let thinking = "💭 thinking…";
         // OFF (default): suppressed with everything else.
         assert_eq!(forward_decision(thinking, false), None);
-        // ON: forwarded as plain text (no ·thinking suffix).
+        // ON: forwarded with the NARRATION_ALIGN_PAD so 💭 lines up under 🚀.
         assert_eq!(
             forward_decision(thinking, true),
-            Some("thinking…".to_string())
+            Some("  💭 thinking…".to_string())
         );
         // The 💭 sentinel is a turn-ish narration, not a 🔧 tool line, so it must
         // NOT be classified as a tool-activity line.
@@ -2813,6 +3069,58 @@ mod tests {
             colored.contains("\x1b[32m✓\x1b[0m 🔧 read /etc/hosts"),
             "inline colour preserved: {colored}"
         );
+    }
+
+    #[test]
+    fn pane_row_hang_indents_wrapped_message_under_first_letter() {
+        let label = "w_abc12345";
+        let msg = "the quick brown fox jumps over the lazy dog again and again";
+        // Pure core with an explicit narrow width → wraps deterministically.
+        // (indent = 15 gutter + 3 for "🚀 " = 18; avail = 60-18 = 42 ≥ MIN_WRAP.)
+        let row = pane_row_cols(label, &format!("🚀 {msg}"), 60);
+
+        let lines: Vec<&str> = row.split('\n').collect();
+        assert!(lines.len() >= 2, "message should wrap to >=2 rows: {row:?}");
+
+        // Every row carries the cyan border.
+        for l in &lines {
+            assert!(l.starts_with(PANE_BORDER), "row keeps the border: {l:?}");
+        }
+        // Opening row: "┃ [w_abc12345] " = 5 + 10 = 15 cols, then "🚀 " (3 cols)
+        // → the message starts at column 18. A continuation row is
+        // "┃" + 17 spaces so its text begins in that SAME column (the rocket /
+        // first-letter alignment the user asked for).
+        let cont = &lines[1];
+        let after_border = cont.strip_prefix(PANE_BORDER).unwrap();
+        let spaces = after_border.chars().take_while(|c| *c == ' ').count();
+        assert_eq!(
+            spaces, 17,
+            "continuation hangs under the first letter: {cont:?}"
+        );
+        // No row exceeds the terminal width.
+        for l in &lines {
+            assert!(vis_cols(l) <= 60, "row within width: {l:?} ({})", vis_cols(l));
+        }
+    }
+
+    #[test]
+    fn pane_row_single_line_when_width_unknown() {
+        // usize::MAX means "unknown width" → never wrap; long line emitted
+        // verbatim (back-compat with the pre-wrap behaviour).
+        let long = "x".repeat(500);
+        let row = pane_row_cols("w_a7k3m2pQ", &format!("🚀 {long}"), usize::MAX);
+        assert!(!row.contains('\n'), "no wrapping when width is unknown");
+        assert!(row.ends_with(&long), "text preserved verbatim");
+    }
+
+    #[test]
+    fn pane_row_ansi_message_not_wrapped() {
+        // A message carrying inline ANSI (the thinking row) must never be split
+        // across lines — colour codes would be orphaned. Emitted single-line
+        // even at a narrow width.
+        let body = "\x1b[2;36mthinking… a very long status that would otherwise wrap across the terminal width here\x1b[0m";
+        let row = pane_row_cols("w_a7k3m2pQ", body, 30);
+        assert!(!row.contains('\n'), "ANSI-bearing message stays on one line");
     }
 
     #[test]
@@ -3209,6 +3517,33 @@ mod tests {
         let msg = describe_failure(exited, "goal worker", "boom");
         assert!(msg.contains("exited unsuccessfully"), "got: {msg}");
         assert!(!msg.contains("killed by the OS"), "got: {msg}");
+    }
+
+    #[test]
+    fn effective_worker_mem_mb_floors_low_values_for_v8() {
+        // 0 == "no limit" is passed through untouched — the floor only lifts a
+        // positive, too-small cap.
+        assert_eq!(effective_worker_mem_mb(0), 0);
+        // Anything below the runtime floor is raised so V8/Node (and Go/JVM) can
+        // reserve their virtual cage — otherwise `neonctl` aborts at startup with
+        // "Failed to reserve virtual memory for CodeRange".
+        assert_eq!(effective_worker_mem_mb(1), MIN_WORKER_MEM_MB);
+        assert_eq!(effective_worker_mem_mb(256), MIN_WORKER_MEM_MB);
+        assert_eq!(effective_worker_mem_mb(1024), MIN_WORKER_MEM_MB);
+        assert_eq!(
+            effective_worker_mem_mb(MIN_WORKER_MEM_MB - 1),
+            MIN_WORKER_MEM_MB
+        );
+        // At or above the floor the operator's value is honoured exactly.
+        assert_eq!(effective_worker_mem_mb(MIN_WORKER_MEM_MB), MIN_WORKER_MEM_MB);
+        assert_eq!(
+            effective_worker_mem_mb(DEFAULT_WORKER_MEM_MB),
+            DEFAULT_WORKER_MEM_MB
+        );
+        assert_eq!(effective_worker_mem_mb(8192), 8192);
+        // Sanity: the default cap must itself be runnable (never below the floor),
+        // so out-of-the-box coordinators can always launch Node-based tools.
+        assert!(DEFAULT_WORKER_MEM_MB >= MIN_WORKER_MEM_MB);
     }
 
     #[test]
