@@ -1,0 +1,184 @@
+name: Release (dev channel)
+
+# DEV channel — nightly pre-releases for early adopters
+# (AISH_UPDATE_CHANNEL=dev). Runs on a nightly schedule and on manual dispatch.
+# Tags are `dev-v{next}-dev.{n}` where {next} is the version currently in
+# Cargo.toml and {n} auto-increments per (version) so successive nightlies on
+# the same in-development version sort in publish order.
+#
+# These are PRE-RELEASES (never "latest"): prod-channel users are unaffected.
+# `:update` on the dev channel discovers them via `gh release list` + a
+# client-side `dev-` prefix filter (src/update.rs resolve_prefixed), newest
+# first. Old dev-* releases are pruned to the most recent 10.
+#
+# Tag creation is workflow-owned (softprops sets target_commitish = github.sha)
+# per the SRE no-hand-pushed-tags rule.
+on:
+  schedule:
+    # 07:00 UTC nightly (~01:00 US-Central) — after the day's merges settle.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build only; skip publishing the release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-dev
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: compute dev tag
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # Extract the next semver from Cargo.toml (read at workflow time), then
+      # find the highest existing `dev.{n}` for that version and add one.
+      - name: Derive dev tag dev-v{next}-dev.{n}
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          next="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          base="dev-v${next}-dev."
+          echo "next semver (Cargo.toml): $next"
+          # Highest existing suffix for this version, 0 if none.
+          max="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName \
+                 --jq '.[].tagName' \
+                 | grep -E "^${base//./\\.}[0-9]+$" \
+                 | sed -E "s/^.*dev\.([0-9]+)$/\1/" \
+                 | sort -n | tail -1 || true)"
+          n=$(( ${max:-0} + 1 ))
+          tag="${base}${n}"
+          echo "next dev iteration: $n"
+          echo "release tag:        $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: aish-x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: aish-aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: aish-x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+        shell: bash
+
+      - name: Cache cargo + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --features local --target ${{ matrix.target }}
+        shell: bash
+
+      - name: Package binary + checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/aish" "dist/${{ matrix.asset }}"
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+          cat "${{ matrix.asset }}.sha256"
+        shell: bash
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish dev pre-release
+    needs: [prepare, build]
+    if: ${{ inputs.dry_run == false }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name 'aish-*' \) -exec cp {} dist/ \;
+          ls -l dist
+
+      - name: Aggregate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: aish ${{ needs.prepare.outputs.tag }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # DEV pre-releases must never become "latest" — keeps prod users safe.
+          prerelease: true
+          make_latest: false
+          files: |
+            dist/aish-*
+            dist/SHA256SUMS
+
+      # Retention: keep only the 10 newest dev-* releases (and their tags).
+      - name: Prune old dev-* releases (keep 10)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 500 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("dev-"))]
+                  | sort_by(.createdAt) | reverse | .[10:] | .[].tagName' \
+            | while read -r t; do
+                [ -z "$t" ] && continue
+                echo "Pruning old dev release: $t"
+                gh release delete "$t" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+              done
+        shell: bash

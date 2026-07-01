@@ -980,6 +980,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ),
     ("backend", "switch backend (claude|grok|local)"),
     ("batch", "background batch mode (on|off|status)"),
+    ("channel", "show the active :update release channel (prod|dev|ci)"),
     (
         "close",
         "remove the attached (or named) coordinator from the worker list + Shift-Tab rotation",
@@ -4314,6 +4315,7 @@ async fn handle_colon(
                  :memories [organize]                list stored memories, or dedup them\n\
                  :version                            show aish version + backend (also `aish --version`)\n\
                  :update                             check GitHub for a newer release and upgrade\n\
+                 :channel                            show the active :update channel (set via AISH_UPDATE_CHANNEL=prod|dev|ci)\n\
                  :batch <on|off|status|clear>        interactive batch mode: agent offloads deferrable\n\
                                                      work to background Anthropic batches (Opus, ~50%\n\
                                                      cheaper); jobs persist + reattach across restarts\n\
@@ -4884,6 +4886,7 @@ async fn handle_colon(
         Some("allow") => handle_allow(parts.next(), parts.next(), session),
         Some("batch") => handle_batch(parts.next(), parts.next(), session),
         Some("update") => handle_update(pending_update, session).await,
+        Some("channel") => handle_channel(parts.next()),
         Some("mcp") => handle_mcp(parts.collect(), session).await,
         Some("skill" | "skills") => {
             let rest: Vec<&str> = parts.collect();
@@ -4947,6 +4950,31 @@ fn update_confirm_prompt(running: usize, version: &str) -> String {
         format!(
             "\u{26a0} {running} background job{plural} (workers/batches/coordinators) still on the current binary. Updating now leaves them on the OLD version while new work spawns on the NEW one (version skew). Download and install aish {version} anyway?"
         )
+    }
+}
+
+/// `:channel` — report the active `:update` release channel and how to change
+/// it. A stub for now (read-only): the channel is sourced from the
+/// `AISH_UPDATE_CHANNEL` env var, so switching is done in the environment rather
+/// than mutated here. A future revision may persist a per-session override.
+fn handle_channel(arg: Option<&str>) {
+    let ch = crate::update::channel();
+    let name = ch.as_str();
+    let blurb = match ch {
+        crate::update::Channel::Prod => "stable v{semver} releases marked latest",
+        crate::update::Channel::Dev => "nightly dev-v{next}-dev.{n} pre-releases",
+        crate::update::Channel::Ci => "per-main-push ci-{run}-{sha} pre-releases",
+    };
+    println!("\x1b[1mupdate channel\x1b[0m → \x1b[36m{name}\x1b[0m \x1b[2m({blurb})\x1b[0m");
+    if arg.is_some() {
+        println!(
+            "\x1b[2mnote: :channel is read-only for now — set the channel with \
+             AISH_UPDATE_CHANNEL=prod|dev|ci before launching aish.\x1b[0m"
+        );
+    } else {
+        println!(
+            "\x1b[2mselect with AISH_UPDATE_CHANNEL=prod|dev|ci — see docs/RELEASE-CHANNELS.md\x1b[0m"
+        );
     }
 }
 

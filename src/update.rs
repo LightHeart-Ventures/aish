@@ -34,6 +34,73 @@ fn repo() -> String {
         .unwrap_or_else(|| DEFAULT_REPO.to_string())
 }
 
+/// Release channels `:update` can track. A channel decides HOW the target
+/// release is discovered (see [`resolve_release`]) while every channel funnels
+/// into the SAME download/verify/apply path ([`perform`]):
+///
+/// * [`Channel::Prod`] — stable `v{semver}` releases marked "latest". Discovered
+///   with `gh release view` (no tag ⇒ the repo's latest published release). This
+///   is the historical, backward-compatible behaviour and the default.
+/// * [`Channel::Dev`] — nightly pre-releases tagged `dev-v{next}-dev.{n}`.
+/// * [`Channel::Ci`] — per-main-push pre-releases tagged `ci-{run}-{sha}`.
+///
+/// Dev/Ci tags are NOT strict semver, so they can't be discovered via
+/// `gh release view` (which only knows "latest"); instead we `gh release list`
+/// and client-side filter by the channel's tag prefix, newest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Channel {
+    /// Stable `v{semver}` releases (default).
+    Prod,
+    /// Nightly `dev-v{next}-dev.{n}` pre-releases.
+    Dev,
+    /// Per-commit `ci-{run}-{sha}` pre-releases.
+    Ci,
+}
+
+impl Channel {
+    /// The tag prefix that identifies this channel's releases when scanning
+    /// `gh release list`. `Prod` has no prefix (it uses the "latest" pointer).
+    pub fn tag_prefix(self) -> Option<&'static str> {
+        match self {
+            Channel::Prod => None,
+            Channel::Dev => Some("dev-"),
+            Channel::Ci => Some("ci-"),
+        }
+    }
+
+    /// The lowercase channel name as accepted by `AISH_UPDATE_CHANNEL`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Channel::Prod => "prod",
+            Channel::Dev => "dev",
+            Channel::Ci => "ci",
+        }
+    }
+}
+
+/// Parse a channel name (case-insensitive). Recognises `prod`/`stable`,
+/// `dev`/`nightly`, and `ci`; anything else (including unset) is `None` so the
+/// caller can fall back to the default.
+fn parse_channel(s: &str) -> Option<Channel> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "prod" | "stable" | "release" => Some(Channel::Prod),
+        "dev" | "nightly" => Some(Channel::Dev),
+        "ci" => Some(Channel::Ci),
+        _ => None,
+    }
+}
+
+/// The active update channel, read from `AISH_UPDATE_CHANNEL`. Defaults to
+/// [`Channel::Prod`] when the var is unset, empty, or unrecognised — existing
+/// users keep tracking stable releases with zero configuration.
+pub fn channel() -> Channel {
+    std::env::var("AISH_UPDATE_CHANNEL")
+        .ok()
+        .as_deref()
+        .and_then(parse_channel)
+        .unwrap_or(Channel::Prod)
+}
+
 /// The version compiled into this binary (Cargo package version, e.g.
 /// `0.4.0-dev`). This is automatically baked in from Cargo.toml at compile
 /// time via `env!("CARGO_PKG_VERSION")`. **IMPORTANT: Always keep Cargo.toml's
@@ -66,6 +133,21 @@ struct GhRelease {
     tag_name: String,
     #[serde(default)]
     assets: Vec<GhAsset>,
+}
+
+/// A lightweight `gh release list` row — just the tag, used to find the newest
+/// release matching a channel's prefix before we fetch its full asset list.
+#[derive(Deserialize)]
+struct GhReleaseSummary {
+    #[serde(rename = "tagName")]
+    tag_name: String,
+}
+
+/// Given tags in `gh release list` order (newest first), return the first whose
+/// name starts with `prefix`. Pure so the Dev/Ci discovery filter is unit-tested
+/// without hitting the network.
+fn first_with_prefix<'a>(tags: &'a [String], prefix: &str) -> Option<&'a str> {
+    tags.iter().map(|s| s.as_str()).find(|t| t.starts_with(prefix))
 }
 
 /// Rust target triples whose release asset would run on this host, most-preferred
@@ -144,18 +226,29 @@ pub fn gh_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Query the latest GitHub release and decide whether it's an upgrade for this
-/// platform. Returns `Ok(None)` for "you're up to date / nothing installable",
-/// and `Err` only for a genuine failure the caller might want to surface (used
-/// by the on-demand `:update` path; the startup check swallows errors).
-pub async fn check() -> Result<Option<UpdateInfo>> {
-    let repo = repo();
+/// Resolve the target release for `channel` on `repo`, returning its tag + full
+/// asset list (or `Ok(None)` when the channel has no matching release yet).
+///
+/// * `Prod` keeps the historical `gh release view` path (the repo's "latest"
+///   published release) verbatim — full backward compatibility.
+/// * `Dev`/`Ci` `gh release list` and client-side filter by the channel's tag
+///   prefix (newest first), then `gh release view <tag>` for the asset list.
+async fn resolve_release(repo: &str, channel: Channel) -> Result<Option<GhRelease>> {
+    match channel.tag_prefix() {
+        None => resolve_latest(repo).await,
+        Some(prefix) => resolve_prefixed(repo, prefix).await,
+    }
+}
+
+/// Prod discovery: `gh release view` with no tag returns the repo's latest
+/// published (non-pre-release) release. Unchanged from the original `check()`.
+async fn resolve_latest(repo: &str) -> Result<Option<GhRelease>> {
     let out = tokio::process::Command::new("gh")
         .args([
             "release",
             "view",
             "--repo",
-            &repo,
+            repo,
             "--json",
             "tagName,assets",
         ])
@@ -172,6 +265,77 @@ pub async fn check() -> Result<Option<UpdateInfo>> {
     }
     let release: GhRelease =
         serde_json::from_slice(&out.stdout).context("parsing `gh release view` JSON")?;
+    Ok(Some(release))
+}
+
+/// Dev/Ci discovery: list releases, pick the newest whose tag starts with
+/// `prefix`, then fetch that release's assets. Pre-releases are included by
+/// `gh release list` by default, which is exactly what dev/ci channels want.
+async fn resolve_prefixed(repo: &str, prefix: &str) -> Result<Option<GhRelease>> {
+    let out = tokio::process::Command::new("gh")
+        .args([
+            "release",
+            "list",
+            "--repo",
+            repo,
+            "--limit",
+            "100",
+            "--json",
+            "tagName",
+        ])
+        .output()
+        .await
+        .context("running `gh release list` (is the GitHub CLI installed?)")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("release not found") || err.contains("no releases") {
+            return Ok(None);
+        }
+        bail!("gh release list failed: {}", err.trim());
+    }
+    let summaries: Vec<GhReleaseSummary> =
+        serde_json::from_slice(&out.stdout).context("parsing `gh release list` JSON")?;
+    let tags: Vec<String> = summaries.into_iter().map(|s| s.tag_name).collect();
+    let Some(tag) = first_with_prefix(&tags, prefix) else {
+        // Channel opted into, but no release published for it yet — quiet no-op.
+        return Ok(None);
+    };
+    view_release(repo, tag).await.map(Some)
+}
+
+/// Fetch a specific release's tag + assets by tag name.
+async fn view_release(repo: &str, tag: &str) -> Result<GhRelease> {
+    let out = tokio::process::Command::new("gh")
+        .args([
+            "release",
+            "view",
+            tag,
+            "--repo",
+            repo,
+            "--json",
+            "tagName,assets",
+        ])
+        .output()
+        .await
+        .context("running `gh release view <tag>`")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        bail!("gh release view {tag} failed: {}", err.trim());
+    }
+    serde_json::from_slice(&out.stdout).context("parsing `gh release view <tag>` JSON")
+}
+
+/// Query the target release for the active [`channel`] and decide whether it's
+/// an upgrade for this platform. Returns `Ok(None)` for "you're up to date /
+/// nothing installable", and `Err` only for a genuine failure the caller might
+/// want to surface (used by the on-demand `:update` path; the startup check
+/// swallows errors). All three channels converge here and hand a single
+/// [`UpdateInfo`] to the existing download/apply path.
+pub async fn check() -> Result<Option<UpdateInfo>> {
+    let repo = repo();
+    let Some(release) = resolve_release(&repo, channel()).await? else {
+        return Ok(None);
+    };
 
     if !is_newer(&release.tag_name, current_version()) {
         return Ok(None);
@@ -762,6 +926,46 @@ mod tests {
         assert!(!is_newer("v0.3.0", "0.3.0"));
         // Older release than the running build → no downgrade.
         assert!(!is_newer("v0.2.0", "0.4.0-dev"));
+    }
+
+    #[test]
+    fn channel_parses_case_insensitively_with_default() {
+        assert_eq!(parse_channel("prod"), Some(Channel::Prod));
+        assert_eq!(parse_channel("STABLE"), Some(Channel::Prod));
+        assert_eq!(parse_channel(" Dev "), Some(Channel::Dev));
+        assert_eq!(parse_channel("nightly"), Some(Channel::Dev));
+        assert_eq!(parse_channel("CI"), Some(Channel::Ci));
+        assert_eq!(parse_channel("bogus"), None);
+        assert_eq!(parse_channel(""), None);
+    }
+
+    #[test]
+    fn channel_tag_prefixes() {
+        assert_eq!(Channel::Prod.tag_prefix(), None);
+        assert_eq!(Channel::Dev.tag_prefix(), Some("dev-"));
+        assert_eq!(Channel::Ci.tag_prefix(), Some("ci-"));
+    }
+
+    #[test]
+    fn first_with_prefix_picks_newest_match() {
+        // gh release list returns newest-first; first match wins.
+        let tags = vec![
+            "ci-42-abc12345".to_string(),
+            "dev-v0.24.0-dev.3".to_string(),
+            "dev-v0.24.0-dev.2".to_string(),
+            "v0.23.0".to_string(),
+        ];
+        assert_eq!(first_with_prefix(&tags, "dev-"), Some("dev-v0.24.0-dev.3"));
+        assert_eq!(first_with_prefix(&tags, "ci-"), Some("ci-42-abc12345"));
+        assert_eq!(first_with_prefix(&tags, "nope-"), None);
+        assert_eq!(first_with_prefix(&[], "dev-"), None);
+    }
+
+    #[test]
+    fn dev_ci_tags_trigger_update_via_string_fallback() {
+        // Non-semver dev/ci tags fall back to string inequality in is_newer.
+        assert!(is_newer("dev-v0.24.0-dev.3", "0.23.0"));
+        assert!(is_newer("ci-42-abc12345", "0.23.0"));
     }
 
     #[test]

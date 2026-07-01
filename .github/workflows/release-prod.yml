@@ -1,0 +1,178 @@
+name: Release (prod channel)
+
+# PROD channel — the stable track that `:update` follows by default
+# (AISH_UPDATE_CHANNEL unset or =prod). Manually dispatched: reads the version
+# baked into Cargo.toml, builds every supported target, and publishes a GitHub
+# Release tagged `v{semver}` marked as "latest".
+#
+# Why dispatch-triggered (not a manual `git push` of a tag): the SRE runbook
+# forbids hand-pushed tags — every release tag is minted BY a workflow so the
+# tag<->assets invariant `:update` (src/update.rs) depends on can never drift.
+# softprops/action-gh-release creates the tag itself (target_commitish =
+# github.sha); because it runs under the default GITHUB_TOKEN, creating that tag
+# does NOT retrigger the legacy tag-push `release.yml` (GitHub suppresses
+# workflow recursion from the default token), so there is no double build.
+#
+# Platform support mirrors release.yml: macOS (x86_64 + arm64) and Linux
+# (x86_64). Windows is unsupported (POSIX job-control / tty deps).
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build only; skip publishing the release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-prod
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: compute prod tag from Cargo.toml
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Derive tag v{Cargo.toml version}
+        id: tag
+        run: |
+          set -euo pipefail
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          tag="v${cargo_version}"
+          echo "Cargo.toml version: $cargo_version"
+          echo "release tag:        $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      # Immutable-release guard (same rationale as release.yml): a PUBLISHED
+      # release for this tag can never receive assets afterward, so bail before
+      # the multi-minute builds. A draft is fine (drafts stay mutable).
+      - name: Assert no published release already exists for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft 2>/dev/null || true)"
+          if [ -z "$json" ]; then
+            echo "No existing release for $tag — this workflow will create and publish it. OK."
+            exit 0
+          fi
+          is_draft="$(echo "$json" | jq -r '.isDraft')"
+          if [ "$is_draft" = "true" ]; then
+            echo "A DRAFT release exists for $tag — the publish job will upload assets and publish it. OK."
+            exit 0
+          fi
+          echo "::error::A PUBLISHED release already exists for $tag. Bump Cargo.toml (and Cargo.lock) to a new version before dispatching, or delete the release + tag to recut."
+          exit 1
+        shell: bash
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: aish-x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: aish-aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: aish-x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+        shell: bash
+
+      - name: Cache cargo + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --features local --target ${{ matrix.target }}
+        shell: bash
+
+      - name: Package binary + checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/aish" "dist/${{ matrix.asset }}"
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+          cat "${{ matrix.asset }}.sha256"
+        shell: bash
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish prod release
+    needs: [prepare, build]
+    if: ${{ inputs.dry_run == false }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name 'aish-*' \) -exec cp {} dist/ \;
+          echo "Release assets:"
+          ls -l dist
+
+      - name: Aggregate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: aish ${{ needs.prepare.outputs.tag }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # PROD is the stable, user-facing track: this is the "latest" release.
+          prerelease: false
+          make_latest: true
+          files: |
+            dist/aish-*
+            dist/SHA256SUMS
