@@ -90,6 +90,10 @@ fn clear_screen() {
     if unsafe { libc::isatty(1) } == 1 {
         print!("\x1b[2J\x1b[H");
         let _ = std::io::stdout().flush();
+        // If an anchored header is installed, the clear just wiped rows 1-2 and
+        // homed the cursor into the header region — re-home into the body and
+        // repaint the header so it stays pinned to the top.
+        crate::header::restore_after_clear();
     }
 }
 
@@ -204,24 +208,19 @@ pub async fn run(
     clear_screen();
     // Live statusline (version + model on the left, date/time on the right),
     // then the help hint. Interactive terminals only — never leak escape/status
-    // noise into piped/redirected output. The statusline is refreshed inline,
-    // directly above the prompt, on each idle pass (see the LoopTick::Idle arm).
+    // noise into piped/redirected output. The statusline is anchored to the top
+    // and refreshed on each idle pass (see the LoopTick::Idle arm).
     if unsafe { libc::isatty(1) } == 1 {
-        println!(
-            "{}",
-            crate::style::statusline(crate::update::current_version(), &backend.describe())
+        // Anchor the statusline (bright white) + a solid white rule to the top
+        // two rows via a scroll region; all output + the prompt scroll below.
+        crate::header::install(
+            &crate::style::statusline(crate::update::current_version(), &backend.describe()),
+            crate::style::colors_enabled(),
         );
         println!(
             "\x1b[2m:help for commands — :workers to monitor background tasks\x1b[0m"
         );
     }
-
-    // The startup block above already printed the statusline, and the first
-    // `LoopTick::Idle` pass reprints it directly above the first prompt — which
-    // would show the header twice. Suppress exactly that first idle refresh so
-    // the header appears once at startup; every later idle pass refreshes it as
-    // usual (updated date/time above each prompt).
-    let mut suppress_statusline_once = unsafe { libc::isatty(1) } == 1;
 
     let mut prev_dir: Option<PathBuf> = None;
     let mut needs_gap = false; // blank line between previous output and the prompt
@@ -424,24 +423,20 @@ pub async fn run(
                     continue;
                 }
                 crate::session::LoopTick::Idle => {
-                    // Refresh the live statusline (updated date/time + model)
-                    // directly above the prompt. Interactive terminals only. The
-                    // startup block already printed it, so skip the very first
-                    // refresh to avoid a duplicated header (see
-                    // `suppress_statusline_once`).
+                    // Refresh the anchored top statusline (updated date/time +
+                    // model) + solid rule. Interactive terminals only.
                     if unsafe { libc::isatty(1) } == 1 {
-                        if suppress_statusline_once {
-                            suppress_statusline_once = false;
-                        } else {
-                            println!(
-                                "{}",
-                                crate::style::statusline(
-                                    crate::update::current_version(),
-                                    &backend.describe()
-                                )
-                            );
-                        }
+                        crate::header::repaint(
+                            &crate::style::statusline(
+                                crate::update::current_version(),
+                                &backend.describe(),
+                            ),
+                            crate::style::colors_enabled(),
+                        );
                     }
+                    // Prompt sits at the bottom of the scrolling output, one
+                    // blank line clear of the text above it.
+                    println!();
                     editor.read_line(&prompt)
                 }
                 },
@@ -454,7 +449,9 @@ pub async fn run(
                     continue;
                 }
                 editor.add_history(&line);
-                needs_gap = true;
+                // The single blank line separating the next prompt from this
+                // command's output is emitted by the Idle arm (see above), so
+                // don't also gap here — that would double the separator.
                 // Now working — hold background results until the next pause.
                 busy.store(true, Ordering::SeqCst);
 
@@ -720,6 +717,9 @@ pub async fn run(
     }
 
     editor.save_history();
+    // Reset the scroll region so the user's terminal isn't left with a stuck
+    // two-row header after aish exits.
+    crate::header::teardown();
     println!("bye");
     Ok(())
 }
