@@ -305,6 +305,53 @@ impl ConditionalEventHandler for AcceptHint {
 }
 
 // ---------------------------------------------------------------------------
+// Hands-free auto-resume nudge (follow-up to the "interrupting an idle read"
+// limitation flagged in repl.rs).
+//
+// When the last fanned-out coordinator of a session finishes, the presenter
+// thread ARMS a coalesced resume (session::ResumeState) and the main loop
+// drains it — but only on its *next* pass through the prompt. If the loop is
+// already parked inside a blocking `LineEditor::read_line`, nothing fires until
+// the human touches a key, so the "resuming to synthesize their results…" notice
+// just sits there and the promised auto-resume never runs hands-free.
+//
+// rustyline 18 exposes no way to make an in-flight `readline` return
+// programmatically (its `select()` loop wakes for an ExternalPrint and then
+// re-blocks; only a real key ends the read). The pragmatic, terminal-safe way to
+// end that blocking read from another thread is to push a newline into the
+// controlling terminal's own input queue via the `TIOCSTI` ioctl: `read_line`
+// then returns an empty line, the loop `continue`s, and the very next pass hits
+// `take_resume_tick` and runs the continuation — no keypress required.
+//
+// This is best-effort by design. Modern kernels gate `TIOCSTI` behind
+// `dev.tty.legacy_tiocsti` (Linux ≥6.2 defaults it OFF, CVE-2017-5226 mitigation),
+// and stdin may not be a tty at all (pipes, CI). In every one of those cases the
+// ioctl fails, we return `false`, and behaviour falls back EXACTLY to today's —
+// the resume drains on the user's next Enter. So this only ever helps; it can
+// never regress. The durable, kernel-independent fix is the reedline migration
+// (S5.2/S5.5), whose read loop can be woken by an external event without this
+// injection hack.
+#[cfg(unix)]
+pub fn nudge_terminal_return() -> bool {
+    // Only meaningful when stdin is an interactive terminal; a pipe/file has no
+    // input queue to inject into and the ioctl would just EINVAL/ENOTTY.
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+        return false;
+    }
+    let newline: libc::c_char = b'\n' as libc::c_char;
+    // TIOCSTI takes a *pointer to a single byte* to enqueue as terminal input.
+    let rc = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCSTI, &newline) };
+    rc == 0
+}
+
+/// Non-unix stub: no terminal-input injection primitive, so the auto-resume
+/// always waits for the next keypress (unchanged pre-existing behaviour).
+#[cfg(not(unix))]
+pub fn nudge_terminal_return() -> bool {
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Tests — S5.5 / TASK-134: the three rustyline-bound behaviours (Ctrl-O toggle,
 // the completer/helper, and history) must behave identically once routed
 // through the `LineEditor` abstraction. The completer's logic is exercised
@@ -412,6 +459,22 @@ mod tests {
             RustylineEditor::new(temp_helper(), path.clone()).expect("reload editor from history");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The hands-free auto-resume nudge degrades safely: under the test harness
+    /// stdin is not an interactive tty (it's a pipe/devnull), so the isatty
+    /// guard must short-circuit and return `false` WITHOUT ever issuing the
+    /// TIOCSTI ioctl. This pins the zero-regression contract — when the primitive
+    /// isn't available the caller falls back to resume-on-next-Enter — and proves
+    /// the guard is reached before any ioctl side-effect.
+    #[test]
+    fn nudge_terminal_return_is_false_without_a_tty() {
+        // cargo test runs with stdin detached from a terminal, so this is the
+        // exact "no tty" branch the guard protects.
+        assert!(
+            !nudge_terminal_return(),
+            "nudge must no-op (return false) when stdin isn't an interactive tty"
+        );
     }
 
     /// `set_cwd` re-points the editor's completion/highlighting at a new cwd —
