@@ -98,7 +98,16 @@ impl JobScope {
 /// repo name. Pure.
 fn looks_like_job_id(token: &str) -> bool {
     const JOB_PREFIXES: &[&str] = &["w_", "worker_", "run_", "batch", "msgbatch"];
-    JOB_PREFIXES.iter().any(|p| token.starts_with(p))
+    if JOB_PREFIXES.iter().any(|p| token.starts_with(p)) {
+        return true;
+    }
+    // Durable/batch coordinator children are bare uuids (e.g. `33e3439b` or the
+    // full `33e3439b-1c2d-…`) with NO machine prefix — so a status/output query
+    // by that id used to fall through to `Repo` and hit the "not wired yet"
+    // dead-end (DEFECT 1). Treat a hex-only token (dashes allowed, uuid-length)
+    // as a job id: repo names contain non-hex letters, so this won't swallow them.
+    let hex: String = token.chars().filter(|c| *c != '-').collect();
+    (8..=32).contains(&hex.len()) && hex.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Case-insensitive substring test (ASCII). Lets `status of aish` match a

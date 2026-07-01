@@ -475,7 +475,8 @@ a backend or worry about batches — just describe the task and offload it."
                 "properties": {
                     "task": {"type": "string", "description": "The self-contained task to run in the background. It has no access to THIS conversation — include everything it needs. It CAN read the project files and use tools/MCP in the current directory."},
                     "isolate": {"type": "boolean", "description": "Set TRUE for any task that WRITES or EDITS files or runs builds/tests — it then runs in its own dedicated git worktree (a fresh branch) so it can't clobber the working tree of other parallel background jobs or your live session. Set FALSE for read-only / analysis tasks (search, summarize, inspect) that change nothing. Defaults to TRUE (isolation is free when no changes are made — the worktree is auto-removed). When an isolated job makes changes, its branch is left intact and reported back for you to review/merge; nothing is auto-merged."},
-                    "base": {"type": "string", "enum": ["main", "head"], "description": "Which baseline an ISOLATED job branches from (ignored when isolate is false). \"main\" (default) = a CLEAN trunk baseline (latest origin/main when there's a remote, else local main) — use it for independent/new work so the job doesn't inherit unrelated in-progress changes. \"head\" = branch from the CURRENT checkout (including all uncommitted and committed changes on your current branch) — pass this when you're working interactively and want a worker to CONTINUE your work from where you are, building on your existing changes. The worker gets its own isolated worktree so it won't interfere with your interactive session, and if it makes changes they'll land on a separate branch you can review and merge."}
+                    "base": {"type": "string", "enum": ["main", "head"], "description": "Which baseline an ISOLATED job branches from (ignored when isolate is false). \"main\" (default) = a CLEAN trunk baseline (latest origin/main when there's a remote, else local main) — use it for independent/new work so the job doesn't inherit unrelated in-progress changes. \"head\" = branch from the CURRENT checkout (including all uncommitted and committed changes on your current branch) — pass this when you're working interactively and want a worker to CONTINUE your work from where you are, building on your existing changes. The worker gets its own isolated worktree so it won't interfere with your interactive session, and if it makes changes they'll land on a separate branch you can review and merge."},
+                    "tier": {"type": "string", "enum": ["auto", "interactive", "batch"], "description": "Execution latency tier for a fan-out from INSIDE a coordinator (ignored at the top level, which always uses an interactive worker). \"auto\" (default) and \"interactive\" spawn a full-tool interactive sub-coordinator — use for urgent/time-sensitive sub-work. \"batch\" uses the cheaper Anthropic Batches API (~minutes latency) — reserve for large, non-urgent, parallel-independent sets. Urgent work is NEVER auto-routed to batch. Overridable via the AISH_FANOUT_TIER env var."}
                 },
                 "required": ["task"]
             }),
@@ -1416,25 +1417,88 @@ where
 }
 
 fn job_output(call: &ToolCall, session: &Session) -> Result<String> {
-    let id = call.args["job"]
-        .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("missing job id"))? as usize;
-    let jobs = session.jobs.lock().unwrap();
-    let job = jobs
-        .iter()
-        .find(|j| j.id == id)
-        .ok_or_else(|| anyhow::anyhow!("no such job: {id} (see :jobs)"))?;
-    let buf = job.output();
-    Ok(format!(
-        "[job {id}: {}] {}\n{}",
-        job.status(),
-        job.desc,
-        if buf.is_empty() {
-            "(no output yet)"
-        } else {
-            buf.as_str()
+    // A numeric `job` is an in-session foreground background job (the original
+    // contract). A STRING `job` is a durable/batch coordinator-child id (e.g.
+    // `33e3439b`) — DEFECT 1: those used to return "missing job id" because the
+    // tool only knew about `session.jobs`. Fall through to the same worker /
+    // batch / durable-store resolution `batch_result` uses so a fanned-out
+    // sub-job's result is retrievable by id even after the coordinator's context
+    // was compacted and it only has the id left.
+    if let Some(n) = call.args["job"].as_u64() {
+        let id = n as usize;
+        let jobs = session.jobs.lock().unwrap();
+        let job = jobs
+            .iter()
+            .find(|j| j.id == id)
+            .ok_or_else(|| anyhow::anyhow!("no such job: {id} (see :jobs)"))?;
+        let buf = job.output();
+        return Ok(format!(
+            "[job {id}: {}] {}\n{}",
+            job.status(),
+            job.desc,
+            if buf.is_empty() {
+                "(no output yet)"
+            } else {
+                buf.as_str()
+            }
+        ));
+    }
+    let raw = call.args["job"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing job id (pass a numeric :job id or a durable/batch job id)"))?;
+    durable_job_output(raw, session)
+}
+
+/// Resolve a durable/batch/worker job by full id or unambiguous prefix and
+/// return its accumulated result/output. Checks in-memory handles first (live
+/// status), then the shared durable stores so a job started by ANOTHER session
+/// (or in a prior, since-compacted turn) is still retrievable. Shared by
+/// `job_output` (string id) — the deterministic retrieval path for fanned-out
+/// sub-jobs (DEFECT 1/2).
+fn durable_job_output(q: &str, session: &Session) -> Result<String> {
+    let hit = |id: &str| id == q || id.starts_with(q);
+
+    // In-memory workers / batches (this session) — freshest state, live result.
+    if let Some(w) = session.worker_jobs.lock().unwrap().iter().find(|j| hit(&j.id)) {
+        return Ok(format!("[{} {}]\n{}", crate::batch::short_id(&w.id), w.status(), w.fetch()));
+    }
+    if let Some(j) = session.batch_jobs.lock().unwrap().iter().find(|j| hit(&j.id)) {
+        return Ok(format!("[{} {}]\n{}", crate::batch::short_id(&j.id), j.status(), j.fetch()));
+    }
+
+    // Durable coordinator runs from the shared store (any session, survives
+    // restart/compaction).
+    if let Some(store) = &session.coordinator_store {
+        if let Ok(rows) = store.load_all() {
+            if let Some(r) = rows.iter().find(|r| hit(&r.run_id)) {
+                let body = r
+                    .result
+                    .clone()
+                    .or_else(|| r.error.clone())
+                    .unwrap_or_else(|| format!("(no result yet — phase: {})", r.phase));
+                return Ok(format!("[{} {}]\n{}", crate::batch::short_id(&r.run_id), r.phase, body));
+            }
         }
-    ))
+    }
+    // Durable Anthropic batches from the shared store.
+    if let Some(store) = &session.batch_store {
+        if let Ok(rows) = store.load_all() {
+            if let Some(r) = rows.iter().find(|r| hit(&r.local_id)) {
+                let body = r
+                    .result
+                    .clone()
+                    .or_else(|| r.error.clone())
+                    .unwrap_or_else(|| format!("(no result yet — status: {})", r.status));
+                return Ok(format!("[{} {}]\n{}", crate::batch::short_id(&r.local_id), r.status, body));
+            }
+        }
+    }
+    anyhow::bail!(
+        "no background job matching '{q}' — call background_status (scope:\"all\") to list ids; \
+durable/batch children are retrievable by their id or an unambiguous prefix"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1523,7 +1587,24 @@ ANTHROPIC_API_KEY; Grok needs a Grok CLI login (~/.grok/auth.json) or XAI_API_KE
     // infinite re-exec recursion). When we ARE a coordinator (`session.nested`),
     // a deferred offload degrades to the in-process tool-less batch — the one
     // internal use of the batch path on this model-facing route.
-    if session.nested {
+    // DEFECT 3 — execution-tier selection for a nested (coordinator) fan-out.
+    // Historically a nested `run_in_background` ALWAYS degraded to the Anthropic
+    // Batches API (~minutes latency), which is wrong for urgent/interactive
+    // sub-work. The `tier` arg (or the `AISH_FANOUT_TIER` env fallback) now
+    // selects the latency tier: "interactive" spawns a full-tool sub-coordinator
+    // (interactive latency); "batch" keeps the cheap deferred Batches path; and
+    // "auto" (the default) picks interactive — we never auto-route urgent work to
+    // batch. Non-nested (top-level) calls always spawn a worker regardless.
+    let tier = call.args["tier"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .or_else(|| std::env::var("AISH_FANOUT_TIER").ok().map(|s| s.trim().to_ascii_lowercase()))
+        .unwrap_or_else(|| "auto".to_string());
+    let want_batch = matches!(tier.as_str(), "batch" | "deferred" | "cheap");
+
+    if session.nested && want_batch {
         // The tool-less Batches API needs a metered key; a subscription OAuth
         // token can't reach it. Look in ~/.aishrc exports first, then the process
         // env. If that's all we have, this nested fan-out can't run — say so
@@ -1552,8 +1633,10 @@ ANTHROPIC_API_KEY — a Claude subscription token (CLAUDE_CODE_OAUTH_TOKEN) can'
             session.name.clone(),
         );
         return Ok(
-            "Queued in the background. Now reply with one short, natural sentence that \
-you're working on it and the answer will appear here when ready — no job id, no restating the task."
+            "Queued in the background (batch tier). The result auto-delivers here when done; if \
+your context is compacted before you consume it, retrieve it deterministically with \
+`job_output {job: \"<id>\"}` (ids from `background_status scope:\"session\"`). Now reply with one \
+short, natural sentence that you're working on it and the answer will appear here when ready."
                 .to_string(),
         );
     }
@@ -1575,12 +1658,22 @@ you're working on it and the answer will appear here when ready — no job id, n
         Some(b) if b.eq_ignore_ascii_case("head") => "head",
         _ => "main",
     };
+    // Recursion cap for a nested-interactive fan-out (DEFECT 3): when a
+    // coordinator spawns an interactive sub-coordinator, force THAT child's own
+    // fan-out to the batch tier so the tree can't recurse into interactive
+    // workers without bound (coordinator → interactive sub-coordinator → batch).
+    // Top-level calls leave the session env untouched.
+    let mut child_env = session.env.clone();
+    if session.nested {
+        child_env.retain(|(k, _)| k != "AISH_FANOUT_TIER");
+        child_env.push(("AISH_FANOUT_TIER".to_string(), "batch".to_string()));
+    }
     let spec = crate::worker::WorkerSpec {
         exe,
         cwd: session.cwd.clone(),
         backend: session.backend_kind.clone(),
         model: crate::worker::coordinator_model(&session.backend_kind, &session.batch_model),
-        env: session.env.clone(),
+        env: child_env,
         isolate,
         base: base.to_string(),
         launch_session_id: session.session_id.clone(),
@@ -1588,12 +1681,15 @@ you're working on it and the answer will appear here when ready — no job id, n
         show_output: session.show_worker_output.clone(),
         attached: session.attached.clone(),
     };
-    let _id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
-    Ok("Queued a background coordinator (full toolset + MCP in this directory; it can fan parallel \
-sub-work out on its own). The result auto-delivers here when it's done — do NOT try to fetch it. \
-Now reply to the user with one short, natural sentence that you're on it and the answer will appear \
-when ready — no job id, no restating the task."
-        .to_string())
+    let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
+    let short = crate::batch::short_id(&id);
+    Ok(format!(
+        "Queued a background coordinator (full toolset + MCP in this directory; it can fan parallel \
+sub-work out on its own). The result auto-delivers here when it's done — do NOT poll for it. If your \
+context is compacted before you consume the delivered result, retrieve it deterministically with \
+`job_output {{job: \"{short}\"}}` (or list ids with `background_status scope:\"session\"`). Now reply \
+to the user with one short, natural sentence that you're on it and the answer will appear when ready."
+    ))
 }
 
 /// Live status of every background job the session can see — its own full-tool
