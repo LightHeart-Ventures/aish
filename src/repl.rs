@@ -227,12 +227,40 @@ pub async fn run(
         let busy = busy.clone();
         let batch_jobs = session.batch_jobs.clone();
         let worker_jobs = session.worker_jobs.clone();
+        let attached = session.attached.clone();
+        let attach_review_announced = session.attach_review_announced.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(400));
             loop {
                 tick.tick().await;
                 if busy.load(Ordering::SeqCst) {
                     continue; // mid-command/turn — hold results until a pause
+                }
+                // A live `:attach` leaves the main loop BLOCKED in `read_line`, so
+                // `announce_attach_review` (which prints the coordinator's FINAL
+                // answer + review notice) can't run until the operator presses
+                // Enter. Surface it HERE instead — the moment the attached worker
+                // goes terminal — via the ExternalPrinter, so the last message is
+                // never "cut off" while watching. The atomic claim de-dupes
+                // against the main-loop path (whichever observes the finish first
+                // prints; the other no-ops).
+                if let Some(run_id) = attached.lock().unwrap().clone() {
+                    let terminal = worker_jobs
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|w| w.id == run_id)
+                        .map(|w| matches!(w.status().as_str(), "done" | "failed"))
+                        .unwrap_or(false);
+                    if terminal && claim_attach_announce(&attach_review_announced, &run_id) {
+                        for line in attached_result_lines(&run_id, &worker_jobs) {
+                            let _ = printer.print(format!("{line}\n"));
+                        }
+                        let short = crate::batch::short_id(&run_id);
+                        let _ = printer.print(format!(
+                            "\x1b[2m⇄ {short} finished — review mode: type a message to resume it, or :detach to return to your shell.\x1b[0m\n"
+                        ));
+                    }
                 }
                 // Notify (one line per finished job), don't dump the full result
                 // over the prompt — the user views it on demand with `:result`.
@@ -2543,6 +2571,55 @@ fn backfill_attached(run_id: &str, session: &Session) {
 /// Print a finished coordinator's final result inside the attach pane, so an
 /// operator who `:attach`es a done/failed worker sees the work they're about to
 /// continue from. A no-op when the worker isn't in this session.
+/// Atomically CLAIM the "attach review already announced" marker for `run_id`.
+/// Returns `true` exactly once per (marker, run_id) transition — the caller that
+/// gets `true` is the one responsible for printing the finished coordinator's
+/// result + review notice. Shared by the blocking main-loop path
+/// (`announce_attach_review`) and the non-blocking presenter tick task so the
+/// final result is printed EXACTLY ONCE no matter which path observes the finish
+/// first (the presenter surfaces it live while the main loop is blocked in
+/// `read_line`; whichever wins the claim prints, the other no-ops).
+fn claim_attach_announce(marker: &Arc<Mutex<Option<String>>>, run_id: &str) -> bool {
+    let mut g = marker.lock().unwrap();
+    if g.as_deref() == Some(run_id) {
+        return false;
+    }
+    *g = Some(run_id.to_string());
+    true
+}
+
+/// Build the attach-pane rows for a finished coordinator's FINAL answer (stdout)
+/// — the same content `print_attached_result` prints, returned as lines so both
+/// the blocking main-loop path and the presenter task can emit it (the latter
+/// via the ExternalPrinter, without waiting for the operator to press Enter).
+fn attached_result_lines(run_id: &str, jobs: &crate::worker::WorkerJobs) -> Vec<String> {
+    let job = jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|w| w.id == *run_id)
+        .cloned();
+    let Some(job) = job else {
+        return Vec::new();
+    };
+    let rendered = crate::md::render_stdout(job.fetch().trim());
+    let mut out = Vec::new();
+    let mut lines = rendered.split('\n');
+    match lines.next() {
+        Some(first) => {
+            out.push(crate::worker::pane_row(
+                run_id,
+                &format!("·result {first}"),
+            ));
+            for line in lines {
+                out.push(crate::worker::pane_row(run_id, line));
+            }
+        }
+        None => out.push(crate::worker::pane_row(run_id, "·result (empty result)")),
+    }
+    out
+}
+
 fn print_attached_result(run_id: &str, session: &Session) {
     let job = session
         .worker_jobs
@@ -2826,24 +2903,22 @@ fn announce_attach_review(session: &mut Session) {
         .map(|w| w.status());
     match status.as_deref() {
         Some("done") | Some("failed") => {
-            let already =
-                session.attach_review_announced.lock().unwrap().as_deref() == Some(run_id.as_str());
-            if !already {
+            if claim_attach_announce(&session.attach_review_announced, &run_id) {
                 // The coordinator's FINAL answer is written to stdout — NOT the
                 // streamed stderr we forward live — so a live `:attach` that runs
                 // through to completion would otherwise never show the last
                 // (result) turn: it gets "cut off" at the last tool/narration
                 // line. Replay the captured result into the attach pane before
                 // the review notice, exactly as attaching to an already-finished
-                // worker does (`print_attached_result`). The de-dupe marker below
+                // worker does (`print_attached_result`). The atomic claim above
                 // means an `:attach` of an already-terminal worker (which already
-                // printed the result) does not print it a second time here.
+                // printed the result) — or the presenter task racing us — does
+                // not print it a second time here.
                 print_attached_result(&run_id, session);
                 let short = crate::batch::short_id(&run_id);
                 println!(
                     "\x1b[2m⇄ {short} finished — review mode: type a message to resume it, or :detach to return to your shell.\x1b[0m"
                 );
-                *session.attach_review_announced.lock().unwrap() = Some(run_id);
             }
         }
         // Still live (or resumed into a new live state) — clear so a later finish
@@ -4625,6 +4700,25 @@ fn dirs_history_path() -> std::path::PathBuf {
 mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
+
+    // The attach-review claim is once-only per (marker, run_id): the first caller
+    // to observe a finished attached worker prints its final result; the racing
+    // path (presenter task vs. blocked main loop) no-ops. Re-attaching a
+    // different run re-arms the claim.
+    #[test]
+    fn claim_attach_announce_is_once_only_per_run() {
+        let marker = Arc::new(Mutex::new(None));
+        assert!(claim_attach_announce(&marker, "run-a"), "first claim wins");
+        assert!(
+            !claim_attach_announce(&marker, "run-a"),
+            "second claim for same run no-ops"
+        );
+        assert!(
+            claim_attach_announce(&marker, "run-b"),
+            "a different run re-arms the claim"
+        );
+        assert!(!claim_attach_announce(&marker, "run-b"));
+    }
 
     // S4.2 — `source` folds a file's exports into the session env.
     #[test]
