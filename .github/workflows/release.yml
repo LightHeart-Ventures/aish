@@ -36,7 +36,7 @@ jobs:
   # makes that drift impossible to release.
   verify-version:
     name: verify tag matches Cargo.toml version
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
       - name: Assert tag == Cargo.toml package version
@@ -157,7 +157,7 @@ jobs:
   release:
     name: publish release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Download all build artifacts
         uses: actions/download-artifact@v8
