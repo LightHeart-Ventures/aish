@@ -3051,6 +3051,9 @@ fn print_attached_result(run_id: &str, session: &Session) {
 /// `:detach` — stop watching the attached coordinator. It keeps running in the
 /// background; its result still auto-delivers and shows in `:workers`.
 fn detach_worker(session: &mut Session) {
+    // Stop any live "thinking…" spinner now so it can't erase the next prompt
+    // (and restore the cursor it hid) — same race guarded in `cycle_worker`.
+    crate::worker::quiesce_thinking_spinners();
     match session.attached.lock().unwrap().take() {
         Some(run_id) => {
             let short = crate::batch::short_id(&run_id);
@@ -3502,6 +3505,13 @@ fn cycle_worker(session: &mut Session) {
     // view (status line + any backfilled activity / result) opens at the top of
     // a fresh screen instead of scrolling under the previous prompt and output.
     clear_screen();
+    // Synchronously tear down any live worker "thinking…" spinner BEFORE we
+    // print this view and the REPL redraws the prompt. The spinner polls its
+    // forward gate only every ~80 ms, so a spinner for the worker we're leaving
+    // would otherwise self-erase (`\r\x1b[2K`) a beat later — right on top of the
+    // freshly-drawn interactive prompt (the "prompt doesn't always show after
+    // Shift-Tab" bug). Aborting the tasks here also un-hides the cursor.
+    crate::worker::quiesce_thinking_spinners();
     // All coordinators this session launched, in listing order — LIVE and
     // TERMINAL — paired with a `terminal` flag so the attach branch can choose
     // review-mode vs live-stream. Shift-Tab rotates through finished/failed

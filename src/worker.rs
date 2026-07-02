@@ -17,7 +17,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -583,7 +583,52 @@ fn is_thinking_notice(raw: &str) -> bool {
 /// vanishes when output begins. TTY-gated: `start` returns `None` off a terminal,
 /// and the caller then falls back to a one-shot static row.
 struct ThinkingSpinner {
+    /// Registry id — lets [`quiesce_thinking_spinners`] abort exactly this
+    /// spinner's task and lets `stop`/natural-exit unregister itself.
+    id: u64,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// Monotonic id source for live thinking spinners.
+static SPINNER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Abort handles for every currently-animating thinking spinner, keyed by id.
+/// The REPL drains this synchronously via [`quiesce_thinking_spinners`] on a
+/// Shift-Tab cycle/detach so a spinner's async self-erase can't land on — and
+/// wipe — the interactive prompt the REPL is about to redraw.
+static ACTIVE_SPINNERS: Mutex<Vec<(u64, tokio::task::AbortHandle)>> = Mutex::new(Vec::new());
+
+fn register_spinner(id: u64, handle: tokio::task::AbortHandle) {
+    ACTIVE_SPINNERS.lock().unwrap().push((id, handle));
+}
+
+fn unregister_spinner(id: u64) {
+    if let Ok(mut g) = ACTIVE_SPINNERS.lock() {
+        g.retain(|(i, _)| *i != id);
+    }
+}
+
+/// Synchronously stop every in-flight worker "thinking…" spinner and restore the
+/// cursor, then clear the current line. Called by the REPL immediately after a
+/// Shift-Tab cycle/detach and BEFORE it redraws the prompt: the spinner tasks
+/// poll their forward gate only every ~80 ms, so without this an about-to-close
+/// spinner would erase (`\r\x1b[2K`) the freshly-drawn prompt line a beat later —
+/// the "prompt doesn't always show after Shift-Tab" bug. Aborting the tasks here
+/// guarantees no spinner emits again after the prompt is painted; the `\x1b[?25h`
+/// also un-hides the cursor a mid-think spinner had hidden. No-op when idle.
+pub fn quiesce_thinking_spinners() {
+    let handles: Vec<(u64, tokio::task::AbortHandle)> =
+        std::mem::take(&mut *ACTIVE_SPINNERS.lock().unwrap());
+    if handles.is_empty() {
+        return;
+    }
+    for (_, h) in handles {
+        h.abort();
+    }
+    if stderr_is_tty() {
+        eprint!("\r\x1b[2K\x1b[?25h");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
 }
 
 impl ThinkingSpinner {
@@ -608,6 +653,7 @@ impl ThinkingSpinner {
         }
         eprint!("\x1b[?25l"); // hide the cursor while the spinner turns
         let label = label.to_string();
+        let id = SPINNER_SEQ.fetch_add(1, Ordering::Relaxed);
         let task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(80));
             for i in 0.. {
@@ -638,8 +684,12 @@ impl ThinkingSpinner {
                 );
                 eprint!("\r\x1b[2K{}", pane_row(&label, &body));
             }
+            // Natural exit (gate closed): drop our registry entry so
+            // `quiesce_thinking_spinners` doesn't abort an already-finished task.
+            unregister_spinner(id);
         });
-        Some(Self { task })
+        register_spinner(id, task.abort_handle());
+        Some(Self { id, task })
     }
 
     /// Stop animating and erase the spinner row, restoring the cursor. The next
@@ -648,6 +698,7 @@ impl ThinkingSpinner {
     /// interactive spinner being replaced by output.
     fn stop(self) {
         self.task.abort();
+        unregister_spinner(self.id);
         eprint!("\r\x1b[2K\x1b[?25h");
     }
 }
