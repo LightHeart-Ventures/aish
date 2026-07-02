@@ -354,7 +354,14 @@ pub fn statusline_at(version: &str, model: &str, epoch: i64, width: usize, color
     let gap = width.saturating_sub(lw + rw).max(1);
     let spaces = " ".repeat(gap);
     if color_on {
-        format!("\x1b[2m{left}{spaces}{right}{RESET}")
+        // Subtle accents rather than one flat dim wash: a cyan version badge,
+        // a dim tagline/model frame, and a dim right-justified clock. The gap
+        // above is computed from the PLAIN char widths, so coloring the halves
+        // never disturbs the alignment.
+        let badge = format!("\x1b[36maish v{version}{RESET}");
+        let frame = format!("\x1b[2m — AI-native shell · {model}{RESET}");
+        let clock = format!("\x1b[2m{right}{RESET}");
+        format!("{badge}{frame}{spaces}{clock}")
     } else {
         format!("{left}{spaces}{right}")
     }
@@ -440,10 +447,14 @@ mod tests {
     }
 
     #[test]
-    fn statusline_colored_wraps_in_dim() {
+    fn statusline_colored_has_subtle_accents() {
         let s = statusline_at("0.21.1", "m", 0, 80, true);
-        assert!(s.starts_with("\x1b[2m"));
+        // Cyan version badge up front, a dim frame after it, RESET at the end.
+        assert!(s.starts_with("\x1b[36maish v0.21.1"));
+        assert!(s.contains("\x1b[2m")); // dim tagline/clock present
         assert!(s.ends_with(RESET));
+        // Plain visible text is unchanged (strip SGR and compare width intent).
+        assert!(s.contains("AI-native shell"));
     }
 
     #[test]
