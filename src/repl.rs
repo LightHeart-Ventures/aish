@@ -1024,13 +1024,19 @@ fn coordinator_status_message(session: &Session) -> String {
     let attached = session.attached.lock().unwrap().clone();
     // Same ordering as `cycle_worker`: newest coordinator first (spawn order
     // reversed), each paired with a terminal (done/failed) flag.
-    let workers: Vec<(String, bool)> = session
+    let workers: Vec<(String, bool, String)> = session
         .worker_jobs
         .lock()
         .unwrap()
         .iter()
         .rev()
-        .map(|w| (w.id.clone(), matches!(w.status().as_str(), "done" | "failed")))
+        .map(|w| {
+            (
+                w.id.clone(),
+                matches!(w.status().as_str(), "done" | "failed"),
+                w.task.clone(),
+            )
+        })
         .collect();
     let color_on = crate::style::colors_enabled();
     let left = coordinator_status_line(attached.as_deref(), &workers, color_on);
@@ -1044,13 +1050,44 @@ fn coordinator_status_message(session: &Session) -> String {
     )
 }
 
+/// Max visible width of the task-hint suffix appended to an attached
+/// coordinator's status line (`… - <hint>`). Kept short so the footer row stays
+/// readable; [`clip_visible`] handles the hard terminal-width clamp afterward.
+const TASK_HINT_MAX: usize = 48;
+
+/// Compress a worker's task into a compact one-line hint for the attach status
+/// line: collapse all internal whitespace/newlines to single spaces, trim, and
+/// truncate to `max` chars with a trailing ellipsis. Returns an empty string for
+/// an empty/whitespace-only task (caller then omits the ` - <hint>` suffix).
+fn short_task_hint(task: &str, max: usize) -> String {
+    let collapsed = task.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max {
+        collapsed
+    } else {
+        let truncated: String = collapsed.chars().take(max.saturating_sub(1)).collect();
+        format!("{}…", truncated.trim_end())
+    }
+}
+
+/// The ` - <hint>` suffix appended to a Shift-Tab / cycle attach announcement,
+/// or an empty string when the task is blank. Shares [`short_task_hint`] with the
+/// footer status line so both surfaces render the same compact task snippet.
+fn attach_task_suffix(task: &str) -> String {
+    let hint = short_task_hint(task, TASK_HINT_MAX);
+    if hint.is_empty() {
+        String::new()
+    } else {
+        format!(" - {hint}")
+    }
+}
+
 /// Pure form of [`coordinator_status_message`]: caller supplies the attach
 /// cursor, the worker list, and the color decision so the rendering (including
 /// the detached-back-to-interactive hint and colorization) is unit-testable
 /// without a live `Session` or a TTY.
 fn coordinator_status_line(
     attached: Option<&str>,
-    workers: &[(String, bool)],
+    workers: &[(String, bool, String)],
     color_on: bool,
 ) -> String {
     use crate::style::{paint_with, Color};
@@ -1072,10 +1109,10 @@ fn coordinator_status_line(
         }
         Some(id) => {
             let short = crate::batch::short_id(id);
-            let msg = match workers.iter().position(|(w, _)| w == id) {
+            let msg = match workers.iter().position(|(w, _, _)| w == id) {
                 Some(i) => {
                     let idx = i + 1;
-                    if workers[i].1 {
+                    let base = if workers[i].1 {
                         format!(
                             "⇄ attached to {short} (finished) ({idx}/{n} · review mode: type to resume, Shift-Tab to cycle, :detach to stop)"
                         )
@@ -1083,6 +1120,14 @@ fn coordinator_status_line(
                         format!(
                             "⇄ attached to {short} ({idx}/{n} · Shift-Tab to cycle, :detach to stop)"
                         )
+                    };
+                    // Append a compact hint of the task this worker is on, so the
+                    // 2nd statusline says WHAT you're attached to, not just which id.
+                    let hint = short_task_hint(&workers[i].2, TASK_HINT_MAX);
+                    if hint.is_empty() {
+                        base
+                    } else {
+                        format!("{base} - {hint}")
                     }
                 }
                 // Attached to a run no longer in the local worker list (e.g.
@@ -1283,13 +1328,39 @@ fn complete_colon(after: &str) -> (usize, Vec<Pair>) {
     (0, pairs)
 }
 
+/// Rows the `:`-palette hint may occupy, derived from the live terminal height.
+///
+/// The prompt is anchored to the bottom body row, so a hint of N rows below it
+/// scrolls the body up by N. If N reaches the body height the prompt itself
+/// scrolls off-screen and rustyline's *relative* cursor arithmetic (it never
+/// uses absolute positioning) desyncs — the redraw then clears the wrong rows
+/// and the prompt "disappears" until the palette clears on the next cursor move.
+/// Capping the palette to the body height less a safety margin keeps the prompt
+/// on-screen so the relative math stays consistent. Falls back to a conservative
+/// constant off a tty (tests, pipes).
+fn palette_max_rows() -> usize {
+    const FALLBACK: usize = 12;
+    const MARGIN: u16 = 2; // keep the prompt row + one line of breathing room
+    match crate::terminal::screen_rows() {
+        Some(rows) => rows
+            .saturating_sub(crate::terminal::FOOTER_ROWS)
+            .saturating_sub(MARGIN)
+            .max(1) as usize,
+        None => FALLBACK,
+    }
+}
+
 /// Build the live `:`-command palette shown as an inline hint below the prompt.
 /// Returns the menu text — a leading newline, then one dim row per matching
 /// command (`:name   description`) — when the buffer is a bare `:`-token with the
 /// cursor at its end, or `None` otherwise. rustyline recomputes this on every
 /// keystroke and redraws the hint in place (clearing the prior rows), so the
 /// list filters as you type WITHOUT re-printing the prompt or stacking menus.
-fn palette_hint(line: &str, pos: usize) -> Option<String> {
+///
+/// `max_rows` bounds how tall the menu may grow (see [`palette_max_rows`]): when
+/// the match set overflows the cap, the last row becomes a dim `… and N more`
+/// summary so the hint never scrolls the bottom-anchored prompt off-screen.
+fn palette_hint(line: &str, pos: usize, max_rows: usize) -> Option<String> {
     // Only while typing the command name: cursor at the end of a bare `:`-token
     // (no space yet — once an argument starts, the palette is done).
     if pos != line.len() {
@@ -1303,15 +1374,29 @@ fn palette_hint(line: &str, pos: usize) -> Option<String> {
     if names.is_empty() {
         return None;
     }
+    let max_rows = max_rows.max(1);
+    // When the list overflows the cap, reserve the final row for the summary.
+    let overflow = names.len() > max_rows;
+    let shown = if overflow {
+        max_rows.saturating_sub(1)
+    } else {
+        names.len()
+    };
     let mut out = String::new();
-    for name in names {
+    for name in names.iter().take(shown) {
         let desc = COLON_COMMANDS
             .iter()
-            .find(|(n, _)| *n == name)
+            .find(|(n, _)| n == name)
             .map_or("", |(_, d)| *d);
         // The leading newline drops each row onto its own line below the input;
         // the whole row is dim so it reads as a hint, not as typed text.
         out.push_str(&format!("\n\x1b[2m:{name:<14} {desc}\x1b[0m"));
+    }
+    if overflow {
+        let more = names.len() - shown;
+        out.push_str(&format!(
+            "\n\x1b[2m… and {more} more (keep typing to filter)\x1b[0m"
+        ));
     }
     Some(out)
 }
@@ -1507,7 +1592,7 @@ impl Hinter for AishHelper {
     /// applies, leaving ordinary input untouched. rustyline recomputes this each
     /// keystroke and redraws the hint in place.
     fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<AishHint> {
-        if let Some(menu) = palette_hint(line, pos) {
+        if let Some(menu) = palette_hint(line, pos, palette_max_rows()) {
             return Some(AishHint {
                 display: menu,
                 completion: None,
@@ -3719,9 +3804,10 @@ fn resume_coordinator(prev_run_id: &str, message: &str, session: &mut Session) {
     // so there's nothing to re-bind — just clear the review marker so the next
     // finish re-announces. Activity for the new thread streams into this same pane.
     *session.attach_review_announced.lock().unwrap() = None;
-    println!(
-        "\x1b[1;33m↻ resuming {prev_short} (thread {thread})\x1b[0m — folding in your message; its activity streams here. \x1b[2m:detach to stop.\x1b[0m"
-    );
+    // Silently continue per the operator's input — no resume banner. The new
+    // thread's activity streams into this same pane; there's no need to notify
+    // the operator that the worker is resuming.
+    let _ = (prev_short, thread);
 }
 
 /// Build the seed task for a resumed coordinator: the prior run's task + final
@@ -3802,7 +3888,7 @@ fn cycle_worker(session: &mut Session) -> bool {
     // so `.rev()` puts the most recently spawned coordinator at slot 1 — the
     // first Shift-Tab from the interactive prompt lands on the newest worker and
     // each further press walks back toward the oldest, then wraps to interactive.
-    let workers: Vec<(String, bool)> = session
+    let workers: Vec<(String, bool, String)> = session
         .worker_jobs
         .lock()
         .unwrap()
@@ -3812,6 +3898,7 @@ fn cycle_worker(session: &mut Session) -> bool {
             (
                 w.id.clone(),
                 matches!(w.status().as_str(), "done" | "failed"),
+                w.task.clone(),
             )
         })
         .collect();
@@ -3822,7 +3909,7 @@ fn cycle_worker(session: &mut Session) -> bool {
     // detached interactive prompt. The index math is factored into the pure,
     // unit-tested `next_attach_index` so it stays verifiable without spawning
     // real coordinators.
-    let ids: Vec<String> = workers.iter().map(|(id, _)| id.clone()).collect();
+    let ids: Vec<String> = workers.iter().map(|(id, _, _)| id.clone()).collect();
     let current = session.attached.lock().unwrap().clone();
     let next_idx = next_attach_index(&ids, current.as_deref());
 
@@ -3850,9 +3937,10 @@ fn cycle_worker(session: &mut Session) -> bool {
     } else {
         crate::terminal::enter_alt_screen();
     }
-    let (run_id, terminal) = workers[next_idx - 1].clone();
+    let (run_id, terminal, task) = workers[next_idx - 1].clone();
     *session.attached.lock().unwrap() = Some(run_id.clone());
     let short = crate::batch::short_id(&run_id);
+    let task_suffix = attach_task_suffix(&task);
     if terminal {
         // Finished agent: review mode (mirrors `attach_worker`'s terminal
         // branch). Pre-seed the review marker so `announce_attach_review`
@@ -3860,9 +3948,10 @@ fn cycle_worker(session: &mut Session) -> bool {
         // A typed line resumes it (see `send_to_attached` → `resume_coordinator`).
         *session.attach_review_announced.lock().unwrap() = Some(run_id.clone());
         println!(
-            "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m \x1b[2m({}/{} · review mode: type a message to resume it, Shift-Tab to cycle, :detach to stop)\x1b[0m",
+            "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m \x1b[2m({}/{} · review mode: type a message to resume it, Shift-Tab to cycle, :detach to stop){}\x1b[0m",
             next_idx,
-            ids.len()
+            ids.len(),
+            task_suffix
         );
         backfill_attached(&run_id, session);
         print_attached_result(&run_id, session);
@@ -3871,9 +3960,10 @@ fn cycle_worker(session: &mut Session) -> bool {
         // announced exactly once (mirrors `attach_worker`'s live branch).
         *session.attach_review_announced.lock().unwrap() = None;
         println!(
-            "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({}/{} · Shift-Tab to cycle, :detach to stop)\x1b[0m",
+            "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({}/{} · Shift-Tab to cycle, :detach to stop){}\x1b[0m",
             next_idx,
-            ids.len()
+            ids.len(),
+            task_suffix
         );
         // Replay the input + activity captured so far, THEN the live stream
         // continues — the same backfill `:attach` performs. The worker's
@@ -3900,7 +3990,7 @@ fn cycle_worker_live(
     attached: &Arc<Mutex<Option<String>>>,
     review: &Arc<Mutex<Option<String>>>,
 ) {
-    let workers_v: Vec<(String, bool)> = workers
+    let workers_v: Vec<(String, bool, String)> = workers
         .lock()
         .unwrap()
         .iter()
@@ -3909,6 +3999,7 @@ fn cycle_worker_live(
             (
                 w.id.clone(),
                 matches!(w.status().as_str(), "done" | "failed"),
+                w.task.clone(),
             )
         })
         .collect();
@@ -3917,7 +4008,7 @@ fn cycle_worker_live(
         // matching the idle-prompt `cycle_worker` no-op.
         return;
     }
-    let ids: Vec<String> = workers_v.iter().map(|(id, _)| id.clone()).collect();
+    let ids: Vec<String> = workers_v.iter().map(|(id, _, _)| id.clone()).collect();
     let current = attached.lock().unwrap().clone();
     let next_idx = next_attach_index(&ids, current.as_deref());
     if next_idx == 0 {
@@ -3928,22 +4019,25 @@ fn cycle_worker_live(
         // so printing it again would just be redundant noise in the scrollback.
         return;
     }
-    let (run_id, terminal) = workers_v[next_idx - 1].clone();
+    let (run_id, terminal, task) = workers_v[next_idx - 1].clone();
     *attached.lock().unwrap() = Some(run_id.clone());
     let short = crate::batch::short_id(&run_id);
+    let task_suffix = attach_task_suffix(&task);
     if terminal {
         *review.lock().unwrap() = Some(run_id.clone());
         println!(
-            "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m \x1b[2m({}/{} · review mode: type a message to resume it, Shift-Tab to cycle, :detach to stop)\x1b[0m",
+            "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m \x1b[2m({}/{} · review mode: type a message to resume it, Shift-Tab to cycle, :detach to stop){}\x1b[0m",
             next_idx,
-            ids.len()
+            ids.len(),
+            task_suffix
         );
     } else {
         *review.lock().unwrap() = None;
         println!(
-            "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({}/{} · Shift-Tab to cycle, :detach to stop)\x1b[0m",
+            "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({}/{} · Shift-Tab to cycle, :detach to stop){}\x1b[0m",
             next_idx,
-            ids.len()
+            ids.len(),
+            task_suffix
         );
     }
 }
@@ -6912,7 +7006,7 @@ mod tests {
     fn palette_hint_filters_in_place() {
         // A bare `:` shows the whole catalog as a multi-line hint (one row per
         // command), each row carrying its name and description.
-        let full = palette_hint(":", 1).expect("bare `:` yields the palette");
+        let full = palette_hint(":", 1, usize::MAX).expect("bare `:` yields the palette");
         assert_eq!(full.matches('\n').count(), COLON_COMMANDS.len());
         assert!(
             full.starts_with('\n'),
@@ -6922,7 +7016,7 @@ mod tests {
         assert!(full.contains("confirmation"));
 
         // Typing narrows it in place: `:re` -> reasoning + rename + restart + result + rewrite.
-        let re = palette_hint(":re", 3)
+        let re = palette_hint(":re", 3, usize::MAX)
             .expect("`:re` matches reasoning + rename + restart + result + rewrite");
         assert_eq!(re.matches('\n').count(), 5);
         assert!(re.contains(":reasoning"));
@@ -6932,13 +7026,46 @@ mod tests {
         assert!(re.contains(":rewrite"));
 
         // No hint once an argument starts (a space ends the command name)...
-        assert!(palette_hint(":mode dev", 9).is_none());
+        assert!(palette_hint(":mode dev", 9, usize::MAX).is_none());
         // ...when the cursor isn't at the end of the buffer...
-        assert!(palette_hint(":mode", 2).is_none());
+        assert!(palette_hint(":mode", 2, usize::MAX).is_none());
         // ...for a non-`:` line...
-        assert!(palette_hint("ls -la", 6).is_none());
+        assert!(palette_hint("ls -la", 6, usize::MAX).is_none());
         // ...or when nothing matches.
-        assert!(palette_hint(":zzz", 4).is_none());
+        assert!(palette_hint(":zzz", 4, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn palette_hint_caps_rows_so_prompt_never_scrolls_off() {
+        // Regression (prompt-disappears): a bare `:` offers the whole catalog,
+        // which on any real terminal is taller than the body. Capping keeps the
+        // hint short enough that the bottom-anchored prompt stays on-screen and
+        // rustyline's relative cursor math stays in sync.
+        let total = COLON_COMMANDS.len();
+        assert!(total > 5, "catalog large enough to exercise the cap");
+
+        // Cap at 5 rows => 4 command rows + 1 "… and N more" summary row.
+        let capped = palette_hint(":", 1, 5).expect("bare `:` yields the palette");
+        assert_eq!(
+            capped.matches('\n').count(),
+            5,
+            "hint occupies exactly the cap, never more"
+        );
+        let more = total - 4;
+        assert!(
+            capped.contains(&format!("… and {more} more")),
+            "overflow summary names the hidden remainder"
+        );
+
+        // A cap at least as large as the match set prints every row, no summary.
+        let uncapped = palette_hint(":", 1, total).expect("palette");
+        assert_eq!(uncapped.matches('\n').count(), total);
+        assert!(!uncapped.contains("more (keep typing"));
+
+        // Degenerate cap of 1 still yields a single, safe summary row.
+        let one = palette_hint(":", 1, 1).expect("palette");
+        assert_eq!(one.matches('\n').count(), 1);
+        assert!(one.contains("more (keep typing"));
     }
 
     // ---- S6.2 / TASK-136: fish-style history ghost text -----------------
@@ -7084,8 +7211,17 @@ mod tests {
     }
 
     // ---- 2nd-statusline coordinator status message ----------------------
-    fn workers(xs: &[(&str, bool)]) -> Vec<(String, bool)> {
-        xs.iter().map(|(id, done)| (id.to_string(), *done)).collect()
+    fn workers(xs: &[(&str, bool)]) -> Vec<(String, bool, String)> {
+        xs.iter()
+            .map(|(id, done)| (id.to_string(), *done, String::new()))
+            .collect()
+    }
+
+    // Same as `workers` but with an explicit task per row, for the task-hint tests.
+    fn workers_with_task(xs: &[(&str, bool, &str)]) -> Vec<(String, bool, String)> {
+        xs.iter()
+            .map(|(id, done, task)| (id.to_string(), *done, task.to_string()))
+            .collect()
     }
 
     #[test]
@@ -7121,6 +7257,43 @@ mod tests {
         assert!(s.ends_with("\x1b[0m"));
         assert!(s.contains("attached to"));
         assert!(s.contains("(1/2 · Shift-Tab to cycle, :detach to stop)"));
+    }
+
+    #[test]
+    fn status_line_attached_shows_task_hint() {
+        let ws = workers_with_task(&[("w_a", false, "fix the release workflow")]);
+        let s = coordinator_status_line(Some("w_a"), &ws, false);
+        assert!(
+            s.contains("(1/1 · Shift-Tab to cycle, :detach to stop) - fix the release workflow"),
+            "unexpected status line: {s}"
+        );
+    }
+
+    #[test]
+    fn status_line_attached_no_task_has_no_suffix() {
+        let ws = workers(&[("w_a", false)]);
+        let s = coordinator_status_line(Some("w_a"), &ws, false);
+        assert!(s.ends_with("(1/1 · Shift-Tab to cycle, :detach to stop)"));
+        assert!(!s.contains(" - "));
+    }
+
+    #[test]
+    fn short_task_hint_collapses_and_truncates() {
+        assert_eq!(
+            short_task_hint("fix   the\n release\tworkflow", 48),
+            "fix the release workflow"
+        );
+        let long = "a".repeat(100);
+        let hint = short_task_hint(&long, 10);
+        assert_eq!(hint.chars().count(), 10);
+        assert!(hint.ends_with('…'));
+        assert_eq!(short_task_hint("   \n\t ", 48), "");
+    }
+
+    #[test]
+    fn attach_task_suffix_formats_or_empties() {
+        assert_eq!(attach_task_suffix("do a thing"), " - do a thing");
+        assert_eq!(attach_task_suffix("   "), "");
     }
 
     #[test]
