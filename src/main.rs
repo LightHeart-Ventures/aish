@@ -484,7 +484,17 @@ async fn main() -> Result<()> {
         session.skills_prompt = skills::render_prompt_section(&local, &[]);
         session.skills = local;
     } else {
-        session.mcp = mcp::McpHost::start(&[project_mcp.as_path(), mcp_config.as_path()]).await;
+        // Phase 0.5.3: merge plugin-contributed `.mcp.json` servers into the set.
+        let (plugin_mcp, mcp_warns) =
+            plugins::discover_mcp_servers(&plugins::default_plugins_dir());
+        for w in &mcp_warns {
+            eprintln!("\x1b[33maish:\x1b[0m {w}");
+        }
+        session.mcp = mcp::McpHost::start_with_plugins(
+            &[project_mcp.as_path(), mcp_config.as_path()],
+            plugin_mcp,
+        )
+        .await;
         timer.mark("MCP connect");
         let local = skills::load_catalog(&skills_dir);
         session.skills_prompt = skills::render_prompt_section(&local, &session.mcp.skills());

@@ -184,14 +184,23 @@ pub async fn run(
     // the prompt is live and everything except MCP tools works. `engine::run_turn`
     // reads `session.mcp.tool_defs()` fresh each turn, so a late arrival simply
     // becomes available on the next turn.
+    // Phase 0.5.3: gather plugin-contributed `.mcp.json` servers up front so the
+    // background MCP connect merges them in. Plugins can inject servers even when
+    // there is no project/user `.mcp.json`, so the connect branch runs whenever
+    // there are config paths OR plugin servers.
+    let (plugin_mcp, plugin_mcp_warns) =
+        crate::plugins::discover_mcp_servers(&crate::plugins::default_plugins_dir());
+    for w in &plugin_mcp_warns {
+        eprintln!("\x1b[33maish:\x1b[0m {w}");
+    }
     let mut mcp_rx: Option<tokio::sync::oneshot::Receiver<(crate::mcp::McpHost, String)>> =
-        if mcp_config_paths.is_empty() {
+        if mcp_config_paths.is_empty() && plugin_mcp.is_empty() {
             None
         } else {
             let (tx, rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
                 let refs: Vec<&Path> = mcp_config_paths.iter().map(|p| p.as_path()).collect();
-                let host = crate::mcp::McpHost::start(&refs).await;
+                let host = crate::mcp::McpHost::start_with_plugins(&refs, plugin_mcp).await;
                 // The interactive REPL is a light-touch router: advertise only
                 // the routing skills (interactive_mcp_skills), keeping the heavy
                 // code-work / agent-dispatch skills for background coordinators.

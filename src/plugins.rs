@@ -449,6 +449,270 @@ pub fn plugin_skills(dir: &Path) -> Vec<Skill> {
     discover(dir).into_iter().flat_map(|p| p.skills).collect()
 }
 
+// ===================================================================
+// Phase 0.5.3 — plugin `.mcp.json` merge into the client MCP set
+// ===================================================================
+
+/// One MCP server a plugin injects into the client's runtime set, resolved and
+/// ready for [`crate::mcp::McpHost::start_with_plugins`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginMcpServer {
+    /// Server name (the `mcpServers` object key).
+    pub name: String,
+    /// The server spec (url/command/headers/env/args) with `${env:…}` and
+    /// `${profile:…}` refs already expanded.
+    pub spec: Value,
+    /// The plugin id that contributed the server — provenance for `:plugin info`.
+    pub plugin_id: String,
+}
+
+/// Discover plugins under `dir` and return their resolved MCP servers as
+/// `(name, spec)` pairs for the MCP host, plus any warnings (unresolved refs,
+/// malformed files, name collisions). The caller prints the warnings.
+///
+/// **Collision policy:** first-plugin-by-id wins (plugins are id-sorted); a
+/// later plugin registering an already-claimed name is skipped with a warning.
+/// Project/user `.mcp.json` servers still shadow ALL plugin servers — the MCP
+/// host connects plugin servers last (see `mcp::McpHost::connect_missing`).
+pub fn discover_mcp_servers(dir: &Path) -> (Vec<(String, Value)>, Vec<String>) {
+    let plugins = discover(dir);
+    let (servers, warnings) = collect_mcp_servers(&plugins);
+    (
+        servers.into_iter().map(|s| (s.name, s.spec)).collect(),
+        warnings,
+    )
+}
+
+/// Collect every plugin's `.mcp.json` MCP servers, resolving `${env:VAR}` and
+/// `${profile:<login>[:FIELD]}` references against the process environment and
+/// the `~/.aish/credentials` store. First-plugin-by-id wins on a name clash.
+pub fn collect_mcp_servers(plugins: &[Plugin]) -> (Vec<PluginMcpServer>, Vec<String>) {
+    collect_mcp_servers_with(
+        plugins,
+        &|var| std::env::var(var).ok(),
+        &profile_field,
+    )
+}
+
+/// [`collect_mcp_servers`] with injectable env + profile lookups — the seam the
+/// tests drive so they never touch the real environment or credentials file.
+fn collect_mcp_servers_with<E, P>(
+    plugins: &[Plugin],
+    get_env: &E,
+    get_profile: &P,
+) -> (Vec<PluginMcpServer>, Vec<String>)
+where
+    E: Fn(&str) -> Option<String>,
+    P: Fn(&str, Option<&str>) -> Option<String>,
+{
+    let mut out: Vec<PluginMcpServer> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    // name -> winning plugin id (for the collision warning).
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    for plugin in plugins {
+        let path = plugin.dir.join(".mcp.json");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => continue, // no `.mcp.json` — most plugins don't ship one.
+        };
+        let parsed: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                warnings.push(format!(
+                    "plugin `{}`: .mcp.json is not valid JSON: {e} — skipped",
+                    plugin.manifest.id
+                ));
+                continue;
+            }
+        };
+        let Some(servers) = parsed.get("mcpServers").and_then(|m| m.as_object()) else {
+            warnings.push(format!(
+                "plugin `{}`: .mcp.json has no `mcpServers` object — skipped",
+                plugin.manifest.id
+            ));
+            continue;
+        };
+        // Deterministic order within a plugin.
+        let mut names: Vec<&String> = servers.keys().collect();
+        names.sort();
+        for name in names {
+            if let Some(winner) = seen.get(name) {
+                warnings.push(format!(
+                    "plugin `{}`: MCP server `{name}` already contributed by plugin `{winner}` \
+                     — keeping first, skipping duplicate",
+                    plugin.manifest.id
+                ));
+                continue;
+            }
+            let mut spec = servers[name].clone();
+            resolve_mcp_refs(&mut spec, plugin, get_env, get_profile, &mut warnings);
+            seen.insert(name.clone(), plugin.manifest.id.clone());
+            out.push(PluginMcpServer {
+                name: name.clone(),
+                spec,
+                plugin_id: plugin.manifest.id.clone(),
+            });
+        }
+    }
+    (out, warnings)
+}
+
+/// Real credential-profile lookup: read `[profile:<login>]` from
+/// `~/.aish/credentials`. `field=Some(k)` → that field; `field=None` → the
+/// primary credential (see [`primary_credential`]).
+fn profile_field(login: &str, field: Option<&str>) -> Option<String> {
+    let path = crate::plugin_auth::credentials_path();
+    let vars = crate::mcp::load_profile(
+        &path.to_string_lossy(),
+        &crate::plugin_auth::profile_section(login),
+    );
+    match field {
+        Some(k) => vars.get(k).cloned(),
+        None => primary_credential(&vars),
+    }
+}
+
+/// Pick the "primary" credential from a profile for a bare `${profile:<login>}`
+/// ref: prefer the well-known token field names, else the alphabetically-first
+/// key (deterministic). `None` when the profile is empty/absent.
+fn primary_credential(vars: &std::collections::HashMap<String, String>) -> Option<String> {
+    for k in ["token", "access_token", "api_key", "apikey", "key"] {
+        if let Some(v) = vars.get(k) {
+            return Some(v.clone());
+        }
+    }
+    vars.iter()
+        .min_by(|a, b| a.0.cmp(b.0))
+        .map(|(_, v)| v.clone())
+}
+
+/// Recursively resolve `${…}` refs in every string within an MCP server spec.
+fn resolve_mcp_refs<E, P>(
+    v: &mut Value,
+    plugin: &Plugin,
+    get_env: &E,
+    get_profile: &P,
+    warnings: &mut Vec<String>,
+) where
+    E: Fn(&str) -> Option<String>,
+    P: Fn(&str, Option<&str>) -> Option<String>,
+{
+    match v {
+        Value::String(s) => {
+            *s = resolve_mcp_str(s, plugin, get_env, get_profile, warnings);
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                resolve_mcp_refs(item, plugin, get_env, get_profile, warnings);
+            }
+        }
+        Value::Object(map) => {
+            for (_, item) in map.iter_mut() {
+                resolve_mcp_refs(item, plugin, get_env, get_profile, warnings);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Resolve every `${…}` occurrence in one string. Recognized prefixes:
+///   * `${env:VAR}`                    → process env var `VAR`
+///   * `${profile:<login>}`            → primary credential of `[profile:<login>]`
+///   * `${profile:<login>:<FIELD>}`    → that field of `[profile:<login>]`
+///
+/// A bare `${NAME}` (no recognized prefix) is left **verbatim** — it belongs to
+/// the existing `mcp` credentials-block interpolation that runs at connect time.
+/// An unset `env:`/`profile:` ref is also left verbatim and a warning recorded
+/// (graceful — one bad ref never blocks startup).
+fn resolve_mcp_str<E, P>(
+    s: &str,
+    plugin: &Plugin,
+    get_env: &E,
+    get_profile: &P,
+    warnings: &mut Vec<String>,
+) -> String
+where
+    E: Fn(&str) -> Option<String>,
+    P: Fn(&str, Option<&str>) -> Option<String>,
+{
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                let inner = &after[..end];
+                match resolve_ref_token(inner, plugin, get_env, get_profile, warnings) {
+                    Some(v) => out.push_str(&v),
+                    None => {
+                        // Leave the ref untouched.
+                        out.push_str("${");
+                        out.push_str(inner);
+                        out.push('}');
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                // Unterminated `${` — emit the remainder verbatim and stop.
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Resolve one ref token (the text between `${` and `}`). `None` means "leave
+/// verbatim": either an unrecognized prefix (bare `${NAME}`) or an unresolved
+/// `env:`/`profile:` ref (a warning is pushed for the latter).
+fn resolve_ref_token<E, P>(
+    inner: &str,
+    plugin: &Plugin,
+    get_env: &E,
+    get_profile: &P,
+    warnings: &mut Vec<String>,
+) -> Option<String>
+where
+    E: Fn(&str) -> Option<String>,
+    P: Fn(&str, Option<&str>) -> Option<String>,
+{
+    if let Some(var) = inner.strip_prefix("env:") {
+        match get_env(var) {
+            Some(v) => Some(v),
+            None => {
+                warnings.push(format!(
+                    "plugin `{}`: ${{env:{var}}} is unset — left unresolved",
+                    plugin.manifest.id
+                ));
+                None
+            }
+        }
+    } else if let Some(rest) = inner.strip_prefix("profile:") {
+        let (login, field) = match rest.split_once(':') {
+            Some((l, f)) => (l, Some(f)),
+            None => (rest, None),
+        };
+        match get_profile(login, field) {
+            Some(v) => Some(v),
+            None => {
+                warnings.push(format!(
+                    "plugin `{}`: ${{profile:{rest}}} did not resolve \
+                     (run `login {login}`?) — left unresolved",
+                    plugin.manifest.id
+                ));
+                None
+            }
+        }
+    } else {
+        // Bare ${NAME}: not ours — the mcp credentials-block interpolation owns it.
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,5 +1104,163 @@ mod tests {
         p.push(uniq);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    // ---- Phase 0.5.3: plugin `.mcp.json` merge ----
+
+    /// Write a plugin at `<root>/<id>/` with a minimal manifest and a `.mcp.json`.
+    fn write_mcp(root: &Path, id: &str, mcp_json: &str) {
+        let pdir = root.join(id);
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(pdir.join("plugin.json"), format!(r#"{{"id":"{id}"}}"#)).unwrap();
+        fs::write(pdir.join(".mcp.json"), mcp_json).unwrap();
+    }
+
+    /// env lookup that resolves nothing.
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+    /// profile lookup that resolves nothing.
+    fn no_profile(_: &str, _: Option<&str>) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn mcp_basic_merge_one_plugin_one_server() {
+        let tmp = tempdir();
+        write_mcp(
+            &tmp,
+            "acme",
+            r#"{"mcpServers":{"docs":{"url":"https://example.com/mcp"}}}"#,
+        );
+        let (servers, warnings) =
+            collect_mcp_servers_with(&discover(&tmp), &no_env, &no_profile);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "docs");
+        assert_eq!(servers[0].plugin_id, "acme");
+        assert_eq!(servers[0].spec["url"], "https://example.com/mcp");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn mcp_env_ref_is_resolved() {
+        let tmp = tempdir();
+        write_mcp(
+            &tmp,
+            "acme",
+            r#"{"mcpServers":{"api":{"url":"https://${env:HOST}/mcp","env":{"TOKEN":"${env:TK}"}}}}"#,
+        );
+        let env = |v: &str| match v {
+            "HOST" => Some("api.acme.test".to_string()),
+            "TK" => Some("sekret".to_string()),
+            _ => None,
+        };
+        let (servers, warnings) = collect_mcp_servers_with(&discover(&tmp), &env, &no_profile);
+        assert_eq!(servers[0].spec["url"], "https://api.acme.test/mcp");
+        assert_eq!(servers[0].spec["env"]["TOKEN"], "sekret");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn mcp_profile_refs_bare_and_field() {
+        let tmp = tempdir();
+        write_mcp(
+            &tmp,
+            "acme",
+            r#"{"mcpServers":{"api":{"headers":{"Authorization":"Bearer ${profile:acme}","X-Refresh":"${profile:acme:refresh_token}"}}}}"#,
+        );
+        // bare ${profile:acme} → primary; explicit field → that field.
+        let profile = |login: &str, field: Option<&str>| {
+            if login != "acme" {
+                return None;
+            }
+            match field {
+                None => Some("primary-tok".to_string()),
+                Some("refresh_token") => Some("refresh-tok".to_string()),
+                Some(_) => None,
+            }
+        };
+        let (servers, warnings) = collect_mcp_servers_with(&discover(&tmp), &no_env, &profile);
+        assert_eq!(
+            servers[0].spec["headers"]["Authorization"],
+            "Bearer primary-tok"
+        );
+        assert_eq!(servers[0].spec["headers"]["X-Refresh"], "refresh-tok");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn mcp_collision_first_plugin_by_id_wins() {
+        let tmp = tempdir();
+        // "aaa" sorts before "bbb" → aaa wins.
+        write_mcp(
+            &tmp,
+            "aaa",
+            r#"{"mcpServers":{"shared":{"url":"https://aaa.test/mcp"}}}"#,
+        );
+        write_mcp(
+            &tmp,
+            "bbb",
+            r#"{"mcpServers":{"shared":{"url":"https://bbb.test/mcp"}}}"#,
+        );
+        let (servers, warnings) =
+            collect_mcp_servers_with(&discover(&tmp), &no_env, &no_profile);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].plugin_id, "aaa");
+        assert_eq!(servers[0].spec["url"], "https://aaa.test/mcp");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("already contributed by plugin `aaa`"));
+    }
+
+    #[test]
+    fn mcp_malformed_json_is_graceful() {
+        let tmp = tempdir();
+        write_mcp(&tmp, "broken", "{ not valid json");
+        write_mcp(
+            &tmp,
+            "good",
+            r#"{"mcpServers":{"ok":{"url":"https://ok.test/mcp"}}}"#,
+        );
+        let (servers, warnings) =
+            collect_mcp_servers_with(&discover(&tmp), &no_env, &no_profile);
+        // The good plugin still loads; the broken one warns and is skipped.
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].plugin_id, "good");
+        assert!(warnings.iter().any(|w| w.contains("broken")
+            && w.contains("not valid JSON")));
+    }
+
+    #[test]
+    fn mcp_unset_env_ref_left_verbatim_with_warning() {
+        let tmp = tempdir();
+        write_mcp(
+            &tmp,
+            "acme",
+            r#"{"mcpServers":{"api":{"url":"https://${env:MISSING}/mcp"}}}"#,
+        );
+        let (servers, warnings) =
+            collect_mcp_servers_with(&discover(&tmp), &no_env, &no_profile);
+        assert_eq!(servers[0].spec["url"], "https://${env:MISSING}/mcp");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("${env:MISSING}") && warnings[0].contains("unset"));
+    }
+
+    #[test]
+    fn mcp_bare_ref_untouched_for_credentials_block() {
+        let tmp = tempdir();
+        // A bare ${access_token} + a credentials block: our resolver must leave
+        // the bare ref alone so mcp::start_http interpolates it at connect time.
+        write_mcp(
+            &tmp,
+            "acme",
+            r#"{"mcpServers":{"api":{"url":"https://acme.test/mcp","credentials":{"file":"~/.aish/credentials","profile":"profile:acme"},"headers":{"Authorization":"Bearer ${access_token}"}}}}"#,
+        );
+        let (servers, warnings) =
+            collect_mcp_servers_with(&discover(&tmp), &no_env, &no_profile);
+        assert_eq!(
+            servers[0].spec["headers"]["Authorization"],
+            "Bearer ${access_token}"
+        );
+        assert!(warnings.is_empty(), "bare refs must not warn: {warnings:?}");
     }
 }

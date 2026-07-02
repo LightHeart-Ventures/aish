@@ -48,6 +48,12 @@ pub struct McpHost {
     /// `:mcp reload` can re-scan them and connect servers added to the file
     /// since startup.
     config_paths: Vec<PathBuf>,
+    /// Phase 0.5.3: plugin-contributed MCP servers, already resolved (name →
+    /// spec with `${env:…}`/`${profile:…}` refs expanded by the plugin loader).
+    /// Connected AFTER the file-based configs in [`Self::connect_missing`], so a
+    /// project/user `.mcp.json` server always wins a name collision against a
+    /// plugin's. First-plugin-by-id wins among plugins (the loader dedups).
+    plugin_servers: Vec<(String, Value)>,
 }
 
 /// One server's state for the `:mcp` listing.
@@ -116,11 +122,26 @@ impl McpHost {
     /// name collision — pass project config before user config). A server
     /// that fails to start or handshake is skipped with a warning — one bad
     /// entry must not take the shell down.
+    #[allow(dead_code)] // back-compat wrapper; callers use start_with_plugins (0.5.3)
     pub async fn start(config_paths: &[&Path]) -> Self {
+        Self::start_with_plugins(config_paths, Vec::new()).await
+    }
+
+    /// Like [`Self::start`], but also merges plugin-contributed MCP servers
+    /// (Phase 0.5.3) into the runtime set. `plugin_servers` are `(name,
+    /// resolved-spec)` pairs the plugin loader produced from each plugin's
+    /// `.mcp.json` (refs already expanded). They connect AFTER the file configs,
+    /// so a project/user `.mcp.json` server always shadows a plugin server of the
+    /// same name.
+    pub async fn start_with_plugins(
+        config_paths: &[&Path],
+        plugin_servers: Vec<(String, Value)>,
+    ) -> Self {
         let mut host = Self::default();
         // Last path is user scope (project precedes user) — adds/removes land there.
         host.user_config = config_paths.last().map(|p| p.to_path_buf());
         host.config_paths = config_paths.iter().map(|p| p.to_path_buf()).collect();
+        host.plugin_servers = plugin_servers;
         host.connect_missing().await;
         host
     }
@@ -164,6 +185,24 @@ impl McpHost {
                         added.push(name.clone());
                     }
                     Err(e) => eprintln!("\x1b[33maish:\x1b[0m mcp server {name} skipped: {e:#}"),
+                }
+            }
+        }
+        // Phase 0.5.3: connect plugin-contributed servers last. A file-config
+        // server of the same name (connected above) always wins — the guard
+        // skips any name already present.
+        let plugin_servers = self.plugin_servers.clone();
+        for (name, spec) in &plugin_servers {
+            if self.servers.iter().any(|s| s.name == *name) || added.contains(name) {
+                continue;
+            }
+            match McpServer::start(name, spec).await {
+                Ok(s) => {
+                    self.servers.push(s);
+                    added.push(name.clone());
+                }
+                Err(e) => {
+                    eprintln!("\x1b[33maish:\x1b[0m mcp server {name} (plugin) skipped: {e:#}")
                 }
             }
         }

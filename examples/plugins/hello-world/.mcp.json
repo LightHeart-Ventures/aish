@@ -1,0 +1,15 @@
+{
+  "//": "Phase 0.5.3 demo — a plugin can inject MCP servers into aish's runtime MCP set at load time. Same schema as the user/project .mcp.json. Refs: ${env:VAR} resolves from the process env; ${profile:<login>[:FIELD]} resolves from ~/.aish/credentials ([profile:<login>] section, populated by `login <plugin>`); a bare ${NAME} is left verbatim for the mcp credentials-block interpolation at connect time. Collision policy: first-plugin-by-id wins; project/user .mcp.json servers always shadow plugin servers.",
+  "mcpServers": {
+    "hello-world-docs": {
+      "url": "https://mcp.example.com/hello-world",
+      "headers": {
+        "Authorization": "Bearer ${profile:hello-world}",
+        "X-Client": "aish-plugin-hello-world"
+      },
+      "env": {
+        "HELLO_WORLD_USER": "${env:USER}"
+      }
+    }
+  }
+}
