@@ -854,6 +854,15 @@ pub async fn run(
     // (jobs hung up, SessionEnd fired, footer torn down, history saved), by
     // replacing this process image with a fresh aish carrying the SAME argv.
     // `reexec_aish` only returns if the exec fails.
+    // End-of-session dispatch-efficiency digest: if this session offloaded any
+    // background work, print a one-block summary so the loop closes without the
+    // operator having to remember `:dispatch-stats`. Best-effort + silent when
+    // nothing was dispatched (feature 3). Skipped on `:restart` (a reload, not a
+    // session end) — and it must run before the drop(session) below.
+    if !session.restart_requested {
+        print_session_dispatch_digest(&session);
+    }
+
     if session.restart_requested {
         drop(session); // close the DB / release locks before handing off the image
         reexec_aish();
@@ -861,6 +870,30 @@ pub async fn run(
 
     println!("bye");
     Ok(())
+}
+
+/// Print the end-of-session dispatch-efficiency digest for THIS session's
+/// background jobs, or nothing when the session dispatched none / the store is
+/// unavailable. Kept separate from `:dispatch-stats` so the exit path stays
+/// terse (no scope hint, no "unavailable" chatter).
+fn print_session_dispatch_digest(session: &Session) {
+    let Some(store) = &session.coordinator_store else {
+        return;
+    };
+    let Ok(rows) = store.load_all() else {
+        return;
+    };
+    let refs: Vec<&crate::db::CoordinatorRow> = rows
+        .iter()
+        .filter(|r| r.session_id.as_deref() == Some(session.session_id.as_str()))
+        .collect();
+    if refs.is_empty() {
+        return;
+    }
+    let st = crate::dispatch_stats::summarize(&refs);
+    for line in crate::dispatch_stats::render(&st, "this session") {
+        println!("{line}");
+    }
 }
 
 /// Reload aish in place: replace the current process image with a fresh run of
@@ -1076,6 +1109,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("context", "show context-window usage"),
     ("detach", "stop watching the attached coordinator"),
     ("dispatch", "launch a background coordinator"),
+    (
+        "dispatch-stats",
+        "background-job dispatch efficiency report (all = every session)",
+    ),
     (
         "forget",
         "remove an exited worker (--all-exited: every exited one)",
@@ -4452,6 +4489,8 @@ async fn handle_colon(
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
                  :workers [all]                      list this session's background coordinators (all = every session)\n\
+                 :dispatch-stats [all]               background-job dispatch efficiency: outcomes, latency\n\
+                                                     distribution + missed-inline heuristic (alias :dstats)\n\
                  :output [on|off]             stream background coordinators' activity (💭 thinking + 🛠️/🔧 tool + 🚀 standard/🐌 batch lines) in a contained bordered pane; off (default) keeps them quiet\n\
                  :startup-digest [on|off]            show/suppress the boot-time coordinator digest (completed-result walls + salvage/reattach lines); off (default). env: AISH_STARTUP_DIGEST\n\
                  \n\
@@ -4689,6 +4728,42 @@ async fn handle_colon(
                 println!(
                     "no background workers in this session — :workers all to see every session"
                 );
+            }
+        }
+        Some("dispatch-stats" | "dstats") => {
+            // Dispatch-efficiency report: reads the durable coordinator store and
+            // shows how offloading is paying off — outcomes (done/failed/running),
+            // latency distribution, and a missed-inline heuristic. Scoped to THIS
+            // session by default; `all` widens to every session's runs.
+            let show_all = matches!(parts.next(), Some("all"));
+            let scope = if show_all { "all sessions" } else { "this session" };
+            match &session.coordinator_store {
+                Some(store) => match store.load_all() {
+                    Ok(rows) => {
+                        let refs: Vec<&crate::db::CoordinatorRow> = rows
+                            .iter()
+                            .filter(|r| {
+                                show_all
+                                    || r.session_id.as_deref()
+                                        == Some(session.session_id.as_str())
+                            })
+                            .collect();
+                        let st = crate::dispatch_stats::summarize(&refs);
+                        for line in crate::dispatch_stats::render(&st, scope) {
+                            println!("{line}");
+                        }
+                        if !show_all {
+                            println!(
+                                "{}",
+                                crate::style::dim(
+                                    "this session only — :dispatch-stats all for every session"
+                                )
+                            );
+                        }
+                    }
+                    Err(e) => println!("dispatch stats unavailable: {e}"),
+                },
+                None => println!("dispatch stats unavailable: no coordinator store"),
             }
         }
         Some("result") => {
