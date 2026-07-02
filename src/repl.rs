@@ -213,7 +213,7 @@ pub async fn run(
         if crate::update::gh_available() {
             let (tx, rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
-                if let Ok(Some(info)) = crate::update::check().await {
+                if let Ok(Some(info)) = crate::update::check_cached().await {
                     let _ = tx.send(info);
                 }
             });
