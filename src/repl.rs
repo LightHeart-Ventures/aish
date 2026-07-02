@@ -4623,6 +4623,12 @@ async fn handle_colon(
                 .unwrap_or_else(|| crate::batch::short_id(&session.session_id).to_string());
 
             let mut table = String::from(WORKERS_TABLE_HEADER);
+            // Accumulate rendered rows keyed by their start epoch so the whole
+            // listing — in-memory + durable, both sources interleaved — is
+            // sorted newest-first before it's emitted. Without this the two
+            // sources each appear in their own insertion order (oldest-first),
+            // which reads as an arbitrary jumble to the operator.
+            let mut rows_out: Vec<(i64, String)> = Vec::new();
             // Epoch-seconds "now", computed once so every row's Started/Runtime
             // cell is reconciled against the same instant.
             let now_epoch = std::time::SystemTime::now()
@@ -4648,16 +4654,19 @@ async fn handle_colon(
                 } else {
                     w.id.clone()
                 };
-                table.push_str(&format!(
-                    "| {} {} | {} * | {} | {} | {} | {} | {} |\n",
-                    crate::style::job_type_emoji("worker"),
-                    id_cell,
-                    me_label,
-                    crate::style::styled_status(&w.status()),
-                    started_cell,
-                    runtime_cell,
-                    one_line(&w.task),
-                    crate::style::styled_result(&w.result_cell())
+                rows_out.push((
+                    w.started_epoch().unwrap_or(0),
+                    format!(
+                        "| {} {} | {} * | {} | {} | {} | {} | {} |\n",
+                        crate::style::job_type_emoji("worker"),
+                        id_cell,
+                        me_label,
+                        crate::style::styled_status(&w.status()),
+                        started_cell,
+                        runtime_cell,
+                        one_line(&w.task),
+                        crate::style::styled_result(&w.result_cell())
+                    ),
                 ));
             }
             // Durable runs from the shared store — every session's, so workers
@@ -4719,19 +4728,28 @@ async fn handle_colon(
                         };
                         let (started_cell, runtime_cell) =
                             crate::style::time_cells(started, finished, now_epoch);
-                        table.push_str(&format!(
-                            "| {} {} | {} | {} | {} | {} | {} | {} |\n",
-                            crate::style::job_type_emoji("coordinator"),
-                            crate::batch::short_id(&r.run_id),
-                            session_cell,
-                            crate::style::styled_status(&r.phase),
-                            started_cell,
-                            runtime_cell,
-                            one_line(&r.task),
-                            crate::style::styled_result(&result_cell)
+                        rows_out.push((
+                            started.unwrap_or(0),
+                            format!(
+                                "| {} {} | {} | {} | {} | {} | {} | {} |\n",
+                                crate::style::job_type_emoji("coordinator"),
+                                crate::batch::short_id(&r.run_id),
+                                session_cell,
+                                crate::style::styled_status(&r.phase),
+                                started_cell,
+                                runtime_cell,
+                                one_line(&r.task),
+                                crate::style::styled_result(&result_cell)
+                            ),
                         ));
                     }
                 }
+            }
+            // Sort the merged listing newest-first (largest start epoch first),
+            // then emit. A stable sort keeps same-epoch rows in insertion order.
+            rows_out.sort_by(|a, b| b.0.cmp(&a.0));
+            for (_, row) in &rows_out {
+                table.push_str(row);
             }
             if any {
                 println!("{}", crate::md::render_stdout(table.trim()));
