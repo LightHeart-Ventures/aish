@@ -742,6 +742,37 @@ pub fn collect_lifecycle_env(
     hook: &str,
     session_env: &[(String, String)],
 ) -> HookEnv {
+    collect_lifecycle_env_at(
+        dir,
+        hook,
+        session_env,
+        &crate::plugin_auth::credentials_path(),
+    )
+}
+
+/// [`collect_lifecycle_env`] against an explicit credentials path — the seam the
+/// tests drive so credential→hook injection is exercised without touching the
+/// real `~/.aish/credentials`.
+///
+/// **Phase 0.5.5 — credential→lifecycle-hook injection.** Before a plugin's hook
+/// is fork/exec'd, that plugin's OWN logged-in credentials (persisted by
+/// `aish login <id>` under `[profile:<id>]`) are exported into the hook's
+/// environment as `AISH_PROFILE_<ID>_<FIELD>` via
+/// [`crate::plugin_auth::profile_env_at`]. This lets `on_init.sh` use the token
+/// for setup. Scope + safety:
+///   * **hook-process-only** — the credential vars are handed to the child
+///     process; they are NEVER merged into the shared session env (`merged`).
+///   * **own-profile-only** — plugin `<id>` only ever sees `[profile:<id>]`; one
+///     plugin cannot read another's credentials.
+///   * a hook that echoes a credential back on stdout under a credential-like
+///     key is still rejected by [`parse_hook_env`], so tokens can't leak into
+///     the session env through the KEY=VALUE channel.
+pub fn collect_lifecycle_env_at(
+    dir: &Path,
+    hook: &str,
+    session_env: &[(String, String)],
+    cred_path: &Path,
+) -> HookEnv {
     use std::collections::HashSet;
     let mut merged = HookEnv::default();
     if env_injection_disabled() {
@@ -754,7 +785,12 @@ pub fn collect_lifecycle_env(
             continue;
         }
         let id = plugin.manifest.id.clone();
-        let Some(stdout) = run_lifecycle_hook(&plugin.dir, hook, session_env) else {
+        // Phase 0.5.5: export this plugin's own logged-in credentials to its
+        // hook as AISH_PROFILE_<ID>_<FIELD>. Passed to the hook process ONLY —
+        // never merged into `merged` (the shared session env).
+        let mut hook_env: Vec<(String, String)> = session_env.to_vec();
+        hook_env.extend(crate::plugin_auth::profile_env_at(cred_path, &id));
+        let Some(stdout) = run_lifecycle_hook(&plugin.dir, hook, &hook_env) else {
             continue;
         };
         let parsed = parse_hook_env(&stdout);
@@ -1637,6 +1673,94 @@ mod tests {
         write_plugin(&tmp, "off", r#"{"id":"off","enabled":false}"#, None);
         write_hook(&tmp, "off", "on_init", "#!/bin/sh\necho FOO=bar\n");
         assert!(collect_lifecycle_env(&tmp, "on_init", &[]).vars.is_empty());
+    }
+
+    // ---- Phase 0.5.5: credential→lifecycle-hook injection tests ----
+
+    /// Write a `[profile:<login>]` INI section (mode 0600) to a temp credentials
+    /// file and return its path.
+    fn write_credentials(root: &Path, login: &str, fields: &[(&str, &str)]) -> PathBuf {
+        let path = root.join("credentials");
+        let mut body = format!("[profile:{login}]\n");
+        for (k, v) in fields {
+            body.push_str(&format!("{k} = {v}\n"));
+        }
+        fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        path
+    }
+
+    /// A plugin's own logged-in credentials are exported into its `on_init` hook
+    /// as `AISH_PROFILE_<ID>_<FIELD>`. The hook re-exports one under a benign key
+    /// to prove it saw the value; the raw token never lands in the session env.
+    #[test]
+    fn hook_sees_own_profile_credentials() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "acme", r#"{"id":"acme"}"#, None);
+        // Hook echoes the injected region back under a non-credential-like key.
+        write_hook(
+            &tmp,
+            "acme",
+            "on_init",
+            "#!/bin/sh\necho HOOK_SAW_REGION=$AISH_PROFILE_ACME_REGION\n",
+        );
+        let cred = write_credentials(&tmp, "acme", &[("region", "us-east-1"), ("access_token", "s3cr3t")]);
+
+        let env = collect_lifecycle_env_at(&tmp, "on_init", &[], &cred);
+        // The hook received AISH_PROFILE_ACME_REGION and echoed it back.
+        assert_eq!(
+            env.vars,
+            vec![("HOOK_SAW_REGION".to_string(), "us-east-1".to_string())]
+        );
+        // The credential token itself was NEVER merged into the session env.
+        assert!(!env.vars.iter().any(|(_, v)| v.contains("s3cr3t")));
+    }
+
+    /// A hook that tries to re-export a credential under a credential-like key
+    /// is rejected by `parse_hook_env`, so tokens can't leak into session env
+    /// via the KEY=VALUE channel even though the hook process saw the value.
+    #[test]
+    fn hook_cannot_leak_credential_into_session_env() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "acme", r#"{"id":"acme"}"#, None);
+        write_hook(
+            &tmp,
+            "acme",
+            "on_init",
+            "#!/bin/sh\necho ACCESS_TOKEN=$AISH_PROFILE_ACME_ACCESS_TOKEN\n",
+        );
+        let cred = write_credentials(&tmp, "acme", &[("access_token", "s3cr3t")]);
+
+        let env = collect_lifecycle_env_at(&tmp, "on_init", &[], &cred);
+        // Nothing merged — the credential-like key was rejected + warned.
+        assert!(env.vars.is_empty());
+        assert!(env
+            .warnings
+            .iter()
+            .any(|w| w.contains("credential-like")));
+    }
+
+    /// A plugin only ever sees ITS OWN profile — never another plugin's.
+    #[test]
+    fn hook_does_not_see_other_plugins_credentials() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "acme", r#"{"id":"acme"}"#, None);
+        // acme's hook probes for a DIFFERENT plugin's profile var — must be empty.
+        write_hook(
+            &tmp,
+            "acme",
+            "on_init",
+            "#!/bin/sh\necho OTHER=[$AISH_PROFILE_OTHER_REGION]\n",
+        );
+        // Credentials exist only for `other`, not for `acme`.
+        let cred = write_credentials(&tmp, "other", &[("region", "eu-west-1")]);
+
+        let env = collect_lifecycle_env_at(&tmp, "on_init", &[], &cred);
+        assert_eq!(env.vars, vec![("OTHER".to_string(), "[]".to_string())]);
     }
 
     /// A private, dependency-free temp dir (the crate doesn't pull in the
