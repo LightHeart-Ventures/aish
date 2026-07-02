@@ -103,6 +103,7 @@ First boot drops you straight into the aish REPL as the login shell.
 | `aish-postinstall.sh` | in-target hook: installs runtime deps, fetches + verifies the aish binary, registers `/etc/shells`, sets aish as the default shell for the user + root, seeds config |
 | `build-netinst-iso.sh` | remasters an official Debian netinst ISO so the preseed + post-install are baked in and auto-selected (fully hands-off boot media) |
 | `pxe-netboot.md` | how to serve the *same* preseed over PXE/TFTP + HTTP for diskless network installs |
+| `hyper-v-install.md` | step-by-step install of the built ISO on Microsoft Hyper-V (Gen 1 & Gen 2, PowerShell + GUI) |
 
 ---
 
