@@ -1074,7 +1074,6 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ),
     ("compact", "compact history, offload to memory"),
     ("context", "show context-window usage"),
-    ("reasoning", "show reasoning-quality telemetry (escalate vs guess)"),
     ("detach", "stop watching the attached coordinator"),
     ("dispatch", "launch a background coordinator"),
     (
@@ -1094,6 +1093,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("new", "clear conversation history"),
     ("output", "stream coordinators' activity"),
     ("quit", "exit aish"),
+    ("reasoning", "show reasoning-quality telemetry (escalate vs guess)"),
     ("rename", "rename this session"),
     (
         "restart",
@@ -6344,9 +6344,11 @@ mod tests {
         assert!(full.contains(":mode"));
         assert!(full.contains("confirmation"));
 
-        // Typing narrows it in place: `:re` -> rename + restart + result + rewrite.
-        let re = palette_hint(":re", 3).expect("`:re` matches rename + restart + result + rewrite");
-        assert_eq!(re.matches('\n').count(), 4);
+        // Typing narrows it in place: `:re` -> reasoning + rename + restart + result + rewrite.
+        let re = palette_hint(":re", 3)
+            .expect("`:re` matches reasoning + rename + restart + result + rewrite");
+        assert_eq!(re.matches('\n').count(), 5);
+        assert!(re.contains(":reasoning"));
         assert!(re.contains(":rename"));
         assert!(re.contains(":restart"));
         assert!(re.contains(":result"));
