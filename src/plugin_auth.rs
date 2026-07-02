@@ -139,19 +139,39 @@ pub fn run_login_handler(
         );
     }
 
-    let mut cmd = Command::new(&handler);
-    cmd.current_dir(plugin_dir)
-        .env("AISH_PLUGIN_ID", plugin_id)
-        .env("AISH_LOGIN_NAME", login_name)
-        .env("AISH_TENANT_ID", tenant_id.unwrap_or_default())
-        .env("AISH_CREDENTIALS_FILE", credentials_path())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .stdin(std::process::Stdio::inherit());
+    // Freshly-written handler scripts can race the kernel's ETXTBSY guard: if
+    // any thread in this process forked (for another spawn) while the handler's
+    // write fd was still open, the forked child holds that fd and execve() of
+    // the handler fails with `Text file busy` (os error 26). It's transient —
+    // retry a few times with a short backoff before giving up.
+    let build_cmd = || {
+        let mut cmd = Command::new(&handler);
+        cmd.current_dir(plugin_dir)
+            .env("AISH_PLUGIN_ID", plugin_id)
+            .env("AISH_LOGIN_NAME", login_name)
+            .env("AISH_TENANT_ID", tenant_id.unwrap_or_default())
+            .env("AISH_CREDENTIALS_FILE", credentials_path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .stdin(std::process::Stdio::inherit());
+        cmd
+    };
 
-    let output = cmd
-        .output()
-        .with_context(|| format!("failed to run login handler {}", handler.display()))?;
+    let mut attempt = 0;
+    let output = loop {
+        match build_cmd().output() {
+            Ok(out) => break out,
+            Err(e) if e.raw_os_error() == Some(26) && attempt < 5 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20 * attempt));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("failed to run login handler {}", handler.display())
+                });
+            }
+        }
+    };
 
     if !output.status.success() {
         let code = output
