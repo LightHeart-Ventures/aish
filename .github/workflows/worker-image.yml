@@ -1,0 +1,112 @@
+name: Worker Image
+
+# Builds and publishes the background-worker container image (Dockerfile.worker)
+# to the GitHub Container Registry. A "worker" is `aish` re-exec'd in
+# --coordinator mode inside this image (see src/container.rs); the image simply
+# bakes a prebuilt linux/glibc `aish` binary over a debian:bookworm-slim base.
+#
+# This is the CI counterpart of the Makefile's `worker-image-multiarch` target
+# (AC5). It leverages Blacksmith's Docker builder actions, which are drop-in
+# replacements for docker/setup-buildx-action + docker/build-push-action but run
+# on Blacksmith's fast, cache-backed builders (the repo already runs on
+# blacksmith-* runners):
+#   - useblacksmith/setup-docker-builder@v1  (buildx builder w/ sticky cache)
+#   - useblacksmith/build-push-action@v2     (build + push, native layer cache)
+#
+# Dockerfile.worker INJECTS the binary from the build context
+# (ARG AISH_BIN=target/release/aish), so we compile aish on the runner first,
+# then hand the context to the builder. The binary must match the image's
+# platform + libc; the Blacksmith runner is linux/amd64 glibc, matching the
+# debian:bookworm-slim base, so we publish linux/amd64. `default = []` in
+# Cargo.toml means a plain `cargo build --release` is already lean (the heavy
+# `local` llama.cpp feature is opt-in and unneeded for a worker).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push the image to GHCR (unchecked = build only)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: worker-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ${{ github.repository }}/aish-worker
+
+jobs:
+  worker-image:
+    name: build & push worker image
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+        shell: bash
+
+      - name: Cache cargo + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-worker-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Compile the glibc/amd64 aish binary Dockerfile.worker copies from the
+      # build context. default = [] keeps this lean (no local llama.cpp build).
+      - name: Build aish release binary
+        run: cargo build --release --locked
+        shell: bash
+
+      # Blacksmith's drop-in for docker/setup-buildx-action: provisions a buildx
+      # builder backed by Blacksmith's sticky layer cache.
+      - name: Set up Docker builder (Blacksmith)
+        uses: useblacksmith/setup-docker-builder@v1
+
+      - name: Log in to GHCR
+        # Only needed when we actually push (tag pushes, or dispatch with push=true).
+        if: github.event_name != 'workflow_dispatch' || inputs.push
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags & labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+            type=sha
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      # Blacksmith's drop-in for docker/build-push-action: identical inputs, with
+      # native layer caching (no cache-from/cache-to plumbing required).
+      - name: Build & push worker image
+        uses: useblacksmith/build-push-action@v2
+        with:
+          context: .
+          file: Dockerfile.worker
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            AISH_BIN=target/release/aish
