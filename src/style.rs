@@ -341,6 +341,60 @@ pub fn statusline(version: &str, model: &str) -> String {
     statusline_at(version, model, epoch, statusline_width(), colors_enabled())
 }
 
+/// Current terminal width used for footer rows (floored at 80). Public so the
+/// 2nd statusline can right-justify against the same width as the main bar.
+pub fn footer_width() -> usize {
+    statusline_width()
+}
+
+/// Visible column width of a possibly-ANSI-styled string: SGR/CSI escapes count
+/// as zero width, everything else by its unicode display width. Used to align
+/// the 2nd statusline when its left half carries color codes.
+pub fn visible_cols(s: &str) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    let mut width = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip a CSI escape: ESC [ ... final byte in 0x40..=0x7e.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for n in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        width += c.width().unwrap_or(0);
+    }
+    width
+}
+
+/// Compose the footer's 2nd statusline (row H-1): the already-styled `left`
+/// coordinator message stays on the LEFT and the session `name` (set via
+/// `:rename`) is right-justified on the RIGHT, in the same dim style as the
+/// clock directly below it. When there's no name the `left` is returned
+/// unchanged. Pure — width/color are supplied so it's unit-testable.
+pub fn second_statusline_at(left: &str, name: Option<&str>, width: usize, color_on: bool) -> String {
+    let name = match name {
+        Some(n) if !n.is_empty() => n,
+        _ => return left.to_string(),
+    };
+    let width = width.max(80);
+    let lw = visible_cols(left);
+    let rw = name.chars().count();
+    let gap = width.saturating_sub(lw + rw).max(1);
+    let spaces = " ".repeat(gap);
+    if color_on {
+        // Dim, matching the right-justified clock on the row below.
+        format!("{left}{spaces}\x1b[2m{name}{RESET}")
+    } else {
+        format!("{left}{spaces}{name}")
+    }
+}
+
 /// Pure form of [`statusline`]: the caller supplies the instant, width, and
 /// color decision, so alignment + padding are unit-testable without a TTY.
 pub fn statusline_at(version: &str, model: &str, epoch: i64, width: usize, color_on: bool) -> String {
@@ -462,6 +516,38 @@ mod tests {
         let s = statusline_at("0.21.1", "x", 0, 10, false);
         assert!(s.chars().count() >= 80);
         assert!(s.contains("  ")); // separating gap present
+    }
+
+    #[test]
+    fn visible_cols_ignores_ansi() {
+        assert_eq!(visible_cols("abc"), 3);
+        assert_eq!(visible_cols("\x1b[36mabc\x1b[0m"), 3);
+        assert_eq!(visible_cols("\x1b[1;33m⇄x \x1b[0m"), 3); // arrow + 'x' + space
+        assert_eq!(visible_cols(""), 0);
+    }
+
+    #[test]
+    fn second_statusline_right_justifies_name() {
+        // No name → left returned unchanged.
+        assert_eq!(second_statusline_at("left", None, 80, false), "left");
+        assert_eq!(second_statusline_at("left", Some(""), 80, false), "left");
+        // Plain: name flush right, whole row exactly `width` columns.
+        let s = second_statusline_at("left", Some("myproj"), 80, false);
+        assert!(s.starts_with("left"));
+        assert!(s.ends_with("myproj"));
+        assert_eq!(s.chars().count(), 80);
+    }
+
+    #[test]
+    fn second_statusline_colored_name_is_dim() {
+        let left = "\x1b[36m⇄ detached\x1b[0m";
+        let s = second_statusline_at(left, Some("proj"), 80, true);
+        assert!(s.starts_with(left)); // left half untouched
+        assert!(s.contains("\x1b[2mproj")); // name dim, same as clock
+        assert!(s.ends_with(RESET));
+        // Alignment is computed from VISIBLE columns, so ANSI in `left` doesn't
+        // push the name off the right edge.
+        assert_eq!(visible_cols(&s), 80);
     }
 
     #[test]
