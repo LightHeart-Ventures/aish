@@ -464,9 +464,31 @@ impl McpHost {
     }
 }
 
+/// Resolve the credentials-profile variable map for a server spec's optional
+/// `credentials: { file, profile }` block. Empty map when no block is present;
+/// errors only when a block IS present but the profile can't be found — so a
+/// misconfigured secret ref fails loudly instead of silently connecting
+/// unauthenticated. Shared by both the stdio and HTTP transports (Phase 0.5.3).
+fn resolve_vars(spec: &Value) -> Result<HashMap<String, String>> {
+    match (
+        spec["credentials"]["file"].as_str(),
+        spec["credentials"]["profile"].as_str(),
+    ) {
+        (Some(file), Some(profile)) => {
+            let vars = load_profile(file, profile);
+            if vars.is_empty() {
+                anyhow::bail!("credentials profile [{profile}] not found in {file}");
+            }
+            Ok(vars)
+        }
+        _ => Ok(HashMap::new()),
+    }
+}
+
 /// Resolve `${NAME}` placeholders from a credentials profile (INI section),
-/// falling back to the process environment. Unresolvable names are left
-/// verbatim so the error surfaces at the server, not silently.
+/// falling back to the process environment. Also honors the explicit
+/// `${env:VAR}` and `${profile:KEY}` forms (Phase 0.5.3). Unresolvable names are
+/// left verbatim so the error surfaces at the server, not silently.
 fn interpolate(s: &str, vars: &HashMap<String, String>) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -476,7 +498,19 @@ fn interpolate(s: &str, vars: &HashMap<String, String>) -> String {
         match after.find('}') {
             Some(end) => {
                 let name = &after[..end];
-                match vars.get(name).cloned().or_else(|| std::env::var(name).ok()) {
+                // Three reference forms, all non-secret-on-disk (resolved here,
+                // at connect, from the process env or the credentials profile):
+                //   ${env:VAR}     — explicit process-environment variable
+                //   ${profile:KEY} — explicit key from the `credentials` profile
+                //   ${NAME}        — legacy: profile-then-env (back-compat)
+                let resolved = if let Some(var) = name.strip_prefix("env:") {
+                    std::env::var(var).ok()
+                } else if let Some(key) = name.strip_prefix("profile:") {
+                    vars.get(key).cloned()
+                } else {
+                    vars.get(name).cloned().or_else(|| std::env::var(name).ok())
+                };
+                match resolved {
                     Some(v) => out.push_str(&v),
                     None => {
                         out.push_str("${");
@@ -637,9 +671,18 @@ impl McpServer {
 
     async fn start_stdio(spec: &Value) -> Result<Transport> {
         let command = spec["command"].as_str().expect("checked");
-        let args: Vec<&str> = spec["args"]
+        // Same credentials-profile resolution as HTTP so a plugin (or user)
+        // stdio server can reference secrets via ${profile:KEY} / ${env:VAR} in
+        // its args and env values without writing them to disk.
+        let vars = resolve_vars(spec)?;
+        let args: Vec<String> = spec["args"]
             .as_array()
-            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| interpolate(s, &vars))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let mut cmd = tokio::process::Command::new(command);
@@ -651,7 +694,7 @@ impl McpServer {
         if let Some(env) = spec["env"].as_object() {
             for (k, v) in env {
                 if let Some(v) = v.as_str() {
-                    cmd.env(k, v);
+                    cmd.env(k, interpolate(v, &vars));
                 }
             }
         }
@@ -670,19 +713,7 @@ impl McpServer {
     fn start_http(spec: &Value) -> Result<Transport> {
         // Secrets come from the referenced credentials profile (or env) via
         // ${NAME} interpolation — never from the config file itself.
-        let vars = match (
-            spec["credentials"]["file"].as_str(),
-            spec["credentials"]["profile"].as_str(),
-        ) {
-            (Some(file), Some(profile)) => {
-                let vars = load_profile(file, profile);
-                if vars.is_empty() {
-                    anyhow::bail!("credentials profile [{profile}] not found in {file}");
-                }
-                vars
-            }
-            _ => HashMap::new(),
-        };
+        let vars = resolve_vars(spec)?;
         let url = interpolate(spec["url"].as_str().expect("checked"), &vars);
         let headers: Vec<(String, String)> = spec["headers"]
             .as_object()
@@ -1032,6 +1063,50 @@ for line in sys.stdin:
         assert_eq!(interpolate("${KEY}", &vars), "k123");
         assert_eq!(interpolate("${UNSET_XYZ}", &vars), "${UNSET_XYZ}"); // left for the server to reject
         let _ = std::fs::remove_file(&creds);
+    }
+
+    #[test]
+    fn interpolate_explicit_profile_and_env_forms() {
+        // Phase 0.5.3: plugin (and user) .mcp.json may use the explicit
+        // ${profile:KEY} and ${env:VAR} reference forms in addition to ${NAME}.
+        let mut vars = HashMap::new();
+        vars.insert("API_KEY".to_string(), "secret-123".to_string());
+
+        // ${profile:KEY} pulls from the resolved credentials profile.
+        assert_eq!(
+            interpolate("Bearer ${profile:API_KEY}", &vars),
+            "Bearer secret-123"
+        );
+        // A profile key that isn't present is left verbatim (fails at the server).
+        assert_eq!(interpolate("${profile:NOPE}", &vars), "${profile:NOPE}");
+
+        // ${env:VAR} pulls from the process environment.
+        let ev = format!("AISH_TEST_MCP_{}", std::process::id());
+        unsafe { std::env::set_var(&ev, "env-val") };
+        assert_eq!(
+            interpolate(&format!("${{env:{ev}}}"), &vars),
+            "env-val"
+        );
+        unsafe { std::env::remove_var(&ev) };
+        // Unset env var → verbatim.
+        assert_eq!(
+            interpolate("${env:AISH_DEFINITELY_UNSET_XYZ}", &vars),
+            "${env:AISH_DEFINITELY_UNSET_XYZ}"
+        );
+    }
+
+    #[test]
+    fn resolve_vars_empty_without_credentials_block() {
+        // No credentials block → empty map, no error.
+        assert!(resolve_vars(&json!({"url": "https://h/mcp"}))
+            .unwrap()
+            .is_empty());
+        // A credentials block pointing at a missing profile fails loudly.
+        assert!(resolve_vars(&json!({
+            "url": "https://h/mcp",
+            "credentials": {"file": "/nonexistent/creds", "profile": "x"}
+        }))
+        .is_err());
     }
 
     #[test]

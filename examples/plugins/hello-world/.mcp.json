@@ -1,0 +1,20 @@
+{
+  "//": "Phase 0.5.3 demo: a plugin may ship a `.mcp.json` (same schema as the",
+  "//1": "user's ~/.aish/.mcp.json). At startup aish merges these servers into the",
+  "//2": "client MCP set. Collision policy is first-one-wins: project/user config",
+  "//3": "outranks plugins, and among plugins the alphabetically-first id wins.",
+  "//4": "Secret refs (${env:VAR}, ${profile:KEY}, ${NAME}) are resolved by aish's",
+  "//5": "McpHost at connect time — they never land resolved on disk.",
+  "mcpServers": {
+    "hello-world-demo": {
+      "//": "A stdio MCP server. `command` is fork/exec'd; this dummy `echo` is",
+      "//1": "a placeholder — swap in a real MCP binary to actually connect.",
+      "command": "echo",
+      "args": ["hello-world plugin MCP server placeholder"],
+      "env": {
+        "HELLO_WORLD_TOKEN": "${env:HELLO_WORLD_TOKEN}",
+        "HELLO_WORLD_PROFILE_KEY": "${profile:hello-world}"
+      }
+    }
+  }
+}

@@ -1024,8 +1024,19 @@ just enterprise. **Estimate:** ~8 SP. Slots **before** Phase 4.
       when only the old key is present.*
 - [ ] 0.5.2 Implement `event_hooks_file` merge into `src/hooks.rs` (precedence,
       multi-plugin fan-out, single-blocking-winner, `source` tagging).
-- [ ] 0.5.3 Implement `.mcp.json` merge from plugins into the client MCP set.
-- [ ] 0.5.4 Implement session-env injection from lifecycle-hook stdout (`KEY=VALUE`).
+- [x] 0.5.3 Implement `.mcp.json` merge from plugins into the client MCP set.
+      *Done — see "0.5.3 detail" below. `plugins::plugin_mcp_paths` feeds each
+      `<plugin>/.mcp.json` into `mcp::McpHost::start` after project + user scope;
+      `collect_plugin_mcp_servers` models the same first-one-wins policy for
+      diagnostics; `mcp::interpolate` gained explicit `${env:VAR}` / `${profile:KEY}`
+      forms resolved at connect time on both stdio and HTTP transports.*
+- [x] 0.5.4 Implement session-env injection from lifecycle-hook stdout (`KEY=VALUE`).
+      *Done: `plugins::collect_lifecycle_env` fork/execs each enabled plugin's
+      `hooks/on_init.sh` (NO shell, `AISH_IN_HOOK=1`, bounded timeout), parses the
+      `KEY=VALUE` stdout via `parse_hook_env`, rejects credential-like keys, and
+      injects survivors into the session env in `main.rs` (ambient/user env wins;
+      alphabetically-first plugin wins on a clash; `AISH_ENV_INJECTION_DISABLED=1`
+      disables). Covered by `plugins::tests` parse/run/collect cases.*
 - [x] 0.5.5 Implement `provides.login` command registration + credential-profile
       persistence. *Done: `src/plugin_auth.rs` routes `login <plugin-id>`, invokes the
       plugin's auth handler, and persists its JSON output to `~/.aish/credentials` under
@@ -1042,6 +1053,76 @@ client footprint collapses to *one plugin install + `aish login`* — the enterp
 plugin (`aish_enterprise`) ships without any enterprise-specific code upstream. The
 control-plane's "first 5 to build" (trace capture, org skill registry, usage caps,
 tiered memory, `aish doctor`) all attach to catalog events the plugin now contributes.
+
+### 0.5.3 detail: plugin `.mcp.json` merge
+
+**What a plugin ships.** A plugin may place a `.mcp.json` at its root using the
+**same schema** as the user's `~/.aish/.mcp.json`:
+
+```jsonc
+{
+  "mcpServers": {
+    "hello-world-demo": {
+      "command": "some-mcp-binary",
+      "args": ["--stdio"],
+      "env": { "TOKEN": "${env:HELLO_WORLD_TOKEN}", "KEY": "${profile:hello-world}" }
+    }
+  }
+}
+```
+
+Both stdio (`command`/`args`/`env`) and HTTP (`url`/`headers` + optional
+`credentials: { file, profile }`) server shapes are accepted — identical to the
+user config, so there is nothing new for authors to learn.
+
+**Load path.** At startup (`main.rs`, before the REPL) the MCP path list is
+assembled as:
+
+```
+[ ./.mcp.json (project),  ~/.aish/.mcp.json (user),  <plugin>/.mcp.json … (id-sorted) ]
+```
+
+`plugins::plugin_mcp_paths(&plugins_dir)` appends every existing
+`<plugin>/.mcp.json` in **plugin-id (alphabetical) order** after the two config
+scopes, then the whole list is handed to `mcp::McpHost::start`.
+
+**Collision policy — first-one-wins.** `McpHost::start` connects paths in order
+and **skips any server name already connected**, so the earliest path to claim a
+name keeps it. Effective precedence:
+
+```
+project config  >  user config  >  plugin (alphabetically-first id)  >  later plugins
+```
+
+Rationale: a plugin can *offer* a server but never silently *override* an
+operator's explicitly-configured one, and the policy is deterministic across
+runs (id-sorted) rather than filesystem-order-dependent. `collect_plugin_mcp_servers`
+returns the same `(servers, collisions)` decision without connecting, so `:plugin
+info` / diagnostics can show exactly what merged and what lost (and to whom).
+
+**Malformed / absent files** never abort startup: a missing file is skipped, and
+a syntactically-broken `.mcp.json` earns a warning from `McpHost` and is skipped
+(mirrors the forgiving `discover` contract). `read_plugin_mcp` returns `None`.
+
+**Credential-ref resolution (never on disk).** Secret references are resolved by
+`mcp::interpolate` **at connect time**, from the process environment or the
+server's referenced credentials profile — the config file only ever holds the
+reference, never the secret. Three forms are supported on both transports:
+
+| Form              | Resolves from                                              |
+|-------------------|------------------------------------------------------------|
+| `${env:VAR}`      | process environment variable `VAR`                         |
+| `${profile:KEY}`  | key `KEY` in the server's `credentials` profile (INI)      |
+| `${NAME}`         | legacy: profile first, then process env (back-compat)      |
+
+An unresolvable ref is left **verbatim** so the failure surfaces loudly at the
+server rather than silently connecting unauthenticated; a `credentials` block
+pointing at a missing profile hard-errors before connect. As of 0.5.3 stdio
+`args` and `env` values are interpolated too (previously HTTP-only), so a plugin
+stdio server can reference secrets without writing them to disk.
+
+**Example fixture:** `examples/plugins/hello-world/.mcp.json`.
+
 
 ### Open questions (addendum)
 
