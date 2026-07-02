@@ -4348,20 +4348,33 @@ fn handle_hooks(sub: Option<&str>, session: &mut Session) {
 /// `:plugin [list|info <id>]` — plugin provenance introspection (Phase 0.5.6).
 /// `list` enumerates discovered plugins; `info <id>` renders one plugin's full
 /// capability report (metadata, login, lifecycle + event hooks, MCP servers,
-/// skills). Bare `:plugin` is an alias for `list`.
-fn handle_plugin(sub: Option<&str>, id: Option<&str>) {
+/// schemas, skills). `info <id> --schema` (Phase 3.5) renders the plugin's
+/// JSON-Schema shapes instead. Bare `:plugin` is an alias for `list`.
+fn handle_plugin(args: Vec<&str>) {
     let dir = crate::plugins::default_plugins_dir();
+    let sub = args.first().copied();
+    let id = args.get(1).copied();
+    let flag = args.get(2).copied();
     match sub {
         Some("info") => {
             let Some(id) = id else {
-                println!("usage: :plugin info <id>");
+                println!("usage: :plugin info <id> [--schema]");
                 return;
             };
+            // Phase 3.5: `--schema` drills into the plugin's shipped schemas.
+            if matches!(flag, Some("--schema") | Some("--schemas")) {
+                match crate::plugins::format_plugin_schemas(&dir, id) {
+                    Some(report) => println!("{report}"),
+                    None => println!("no such plugin `{id}` — try :plugin list"),
+                }
+                return;
+            }
             match crate::plugins::format_plugin_info(&dir, id) {
                 Some(report) => println!("{report}"),
                 None => println!("no such plugin `{id}` — try :plugin list"),
             }
         }
+        Some("memory" | "mem") => handle_plugin_memory(&args[1..]),
         Some("list") | None => {
             let plugins = crate::plugins::discover(&dir);
             if plugins.is_empty() {
@@ -4379,6 +4392,125 @@ fn handle_plugin(sub: Option<&str>, id: Option<&str>) {
         }
         Some(other) => println!("unknown :plugin subcommand `{other}` — try :plugin list"),
     }
+}
+
+/// `:plugin memory …` — inspect and manage a plugin's file-based memory
+/// (`src/plugin_memory.rs`). Secret `auth` namespace values are ALWAYS redacted
+/// on display. `args` is the token stream *after* `memory`.
+///
+/// Forms:
+///   :plugin memory list                                  # namespaces + key counts, per plugin
+///   :plugin memory <id> <namespace>                      # dump a namespace (auth redacted)
+///   :plugin memory <id> get <namespace> <key>            # one key
+///   :plugin memory <id> set <namespace> <key> <value…>   # value parsed as JSON, else string
+///   :plugin memory <id> delete <namespace> <key>         # remove a key
+///   :plugin memory <id> clear <namespace> [yes]          # empty a namespace (needs `yes`)
+fn handle_plugin_memory(args: &[&str]) {
+    let mem = crate::plugin_memory::global();
+    let verbs = ["get", "set", "delete", "del", "clear"];
+
+    match args {
+        // ---- list ----------------------------------------------------------
+        [] | ["list" | "ls"] => {
+            let dir = crate::plugins::default_plugins_dir();
+            let plugins = crate::plugins::discover(&dir);
+            if plugins.is_empty() {
+                println!("no plugins installed ({})", dir.display());
+                return;
+            }
+            for p in &plugins {
+                let id = &p.manifest.id;
+                let counts: Vec<String> = crate::plugin_memory::MemoryNamespace::ALL
+                    .iter()
+                    .map(|ns| {
+                        let n = mem.key_count(id, *ns).unwrap_or(0);
+                        format!("{ns}={n}")
+                    })
+                    .collect();
+                println!("  {:<20} {}", id, counts.join("  "));
+            }
+            println!("\n:plugin memory <id> <namespace> to inspect (auth is redacted)");
+        }
+
+        // ---- get -----------------------------------------------------------
+        [id, "get", ns, key] => match mem.get(id, ns, key) {
+            Ok(v) => println!("{}", pretty_json(&v)),
+            Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e}"),
+        },
+
+        // ---- set -----------------------------------------------------------
+        [id, "set", ns, key, value_toks @ ..] if !value_toks.is_empty() => {
+            let raw = value_toks.join(" ");
+            // Try to parse as JSON; fall back to a plain string literal.
+            let value = serde_json::from_str(&raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.clone()));
+            match mem.set(id, ns, key, value) {
+                Ok(()) => println!("set {id}/{ns}.{key}"),
+                Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e}"),
+            }
+        }
+
+        // ---- delete --------------------------------------------------------
+        [id, "delete" | "del", ns, key] => match mem.delete(id, ns, key) {
+            Ok(()) => println!("deleted {id}/{ns}.{key}"),
+            Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e}"),
+        },
+
+        // ---- clear (needs explicit confirmation) ---------------------------
+        [id, "clear", ns] => {
+            let n = crate::plugin_memory::MemoryNamespace::parse(ns)
+                .and_then(|namespace| mem.key_count(id, namespace))
+                .unwrap_or(0);
+            println!(
+                "this will clear {n} key(s) from {id}/{ns}. Re-run with `yes` to confirm:\n  :plugin memory {id} clear {ns} yes"
+            );
+        }
+        [id, "clear", ns, "yes" | "--yes" | "-y"] => match mem.clear(id, ns) {
+            Ok(()) => println!("cleared {id}/{ns}"),
+            Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e}"),
+        },
+
+        // ---- display a whole namespace: `<id> <namespace>` -----------------
+        [id, ns] if !verbs.contains(ns) => {
+            match mem.display_namespace(id, match crate::plugin_memory::MemoryNamespace::parse(ns) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("\x1b[31maish:\x1b[0m {e}");
+                    return;
+                }
+            }) {
+                Ok(v) => {
+                    let redacted = crate::plugin_memory::MemoryNamespace::parse(ns)
+                        .map(|n| n.is_secret())
+                        .unwrap_or(false);
+                    if redacted {
+                        println!("# {id}/{ns} (values redacted)");
+                    }
+                    println!("{}", pretty_json(&v));
+                }
+                Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e}"),
+            }
+        }
+
+        _ => {
+            println!(
+                "usage:\n  \
+                 :plugin memory list\n  \
+                 :plugin memory <id> <namespace>\n  \
+                 :plugin memory <id> get <namespace> <key>\n  \
+                 :plugin memory <id> set <namespace> <key> <value>\n  \
+                 :plugin memory <id> delete <namespace> <key>\n  \
+                 :plugin memory <id> clear <namespace> [yes]\n\
+                 namespaces: auth (redacted), cache, webhooks, prefs"
+            );
+        }
+    }
+}
+
+/// Pretty-print a JSON value for REPL display, falling back to `Debug` if
+/// serialization somehow fails.
+fn pretty_json(v: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_else(|_| format!("{v:?}"))
 }
 
 /// `:telemetry [clear]` — show aggregated tool-call failure & retry-recovery
@@ -5449,7 +5581,7 @@ async fn handle_colon(
         Some("compact") => handle_compact(backend, session),
         Some("memories" | "memory") => handle_memories(parts.next(), session),
         Some("hooks") => handle_hooks(parts.next(), session),
-        Some("plugin" | "plugins") => handle_plugin(parts.next(), parts.next()),
+        Some("plugin" | "plugins") => handle_plugin(parts.collect()),
         Some("telemetry" | "tool-stats") => handle_telemetry(parts.next(), session),
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}

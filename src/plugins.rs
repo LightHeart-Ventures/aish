@@ -140,6 +140,40 @@ pub struct Plugin {
     /// startup" contract. The concrete failure is available on demand via
     /// [`load_config`].
     pub config: Option<Value>,
+    /// The JSON Schemas this plugin ships under `<plugin>/schemas/*.json`
+    /// (Phase 3). Each file's stem is the schema name; the parsed body is a
+    /// JSON-Schema document used to validate structured tool/skill output via
+    /// [`validate_json_schema`]. Malformed schema files are skipped at
+    /// discovery (forgiving, like everything else here). Empty when the plugin
+    /// ships no `schemas/` directory.
+    pub schemas: Vec<PluginSchema>,
+}
+
+impl Plugin {
+    /// This plugin's schema with the given name (file stem), or `None`.
+    #[allow(dead_code)] // Phase 3.4 runtime seam — see schema section note.
+    pub fn schema(&self, name: &str) -> Option<&PluginSchema> {
+        self.schemas.iter().find(|s| s.name == name)
+    }
+
+    /// Validate a structured value against one of this plugin's named schemas
+    /// (Phase 3.4 runtime seam). `Err(SchemaValidationError::UnknownSchema)`
+    /// when the plugin ships no schema by that name; `Err(Failed)` with the
+    /// collected violations when the value doesn't conform.
+    #[allow(dead_code)] // Phase 3.4 runtime seam — see schema section note.
+    pub fn validate(&self, schema_name: &str, value: &Value) -> Result<(), SchemaValidationError> {
+        match self.schema(schema_name) {
+            None => Err(SchemaValidationError::UnknownSchema(schema_name.to_string())),
+            Some(s) => {
+                let violations = validate_json_schema(&s.schema, value);
+                if violations.is_empty() {
+                    Ok(())
+                } else {
+                    Err(SchemaValidationError::Failed(violations))
+                }
+            }
+        }
+    }
 }
 
 /// Why a plugin's configuration could not be resolved (Phase 1.4). Kept as a
@@ -431,11 +465,14 @@ pub fn discover(dir: &Path) -> Vec<Plugin> {
         // the plugin — its skills still load, preserving the "a broken plugin
         // never blocks startup" contract.
         let config = load_config(&pdir, &manifest).ok();
+        // Phase 3.1: load every JSON Schema the plugin ships under `schemas/`.
+        let schemas = load_schemas(&pdir);
         plugins.push(Plugin {
             manifest,
             dir: pdir,
             skills,
             config,
+            schemas,
         });
     }
     plugins.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
@@ -546,6 +583,388 @@ pub fn collect_plugin_mcp_servers(
         }
     }
     (servers, collisions)
+}
+
+// ---- Phase 3: schemas & structured-data validation ------------------------
+//
+// A plugin may ship JSON Schema documents under `<plugin>/schemas/*.json`. Each
+// file's stem is the schema *name* (`schemas/issue.json` → `"issue"`); the body
+// is a JSON-Schema document. These describe the shape of structured data a
+// plugin's tools/skills return, so aish can validate that output at runtime
+// (Phase 3.4) and surface schema provenance in `:plugin info --schema`
+// (Phase 3.5). Discovery is forgiving — a malformed schema file is skipped, not
+// fatal, mirroring the rest of the loader.
+//
+// NOTE: `validate_json_schema` and the `Plugin::validate` /
+// `validate_against_plugin_schema` seam are the Phase-3.4 "validate tool output
+// at runtime" entry points. They are exercised by the unit tests below and are
+// intentionally landed ahead of the tool-return dispatch wiring, so they read
+// as dead code in a non-test build (the `#[allow(dead_code)]` on each keeps the
+// warning set clean without silencing the rest of the module).
+//
+// The validator ([`validate_json_schema`]) is a pragmatic subset of JSON Schema
+// draft-07 covering the keywords structured tool output actually uses:
+//   type (incl. type arrays), enum, const, required, properties,
+//   additionalProperties (bool | schema), items, min/maxItems, min/maxLength,
+//   minimum/maximum (+ exclusive*), and pattern (regex). Unknown keywords are
+//   ignored (permissive), and every violation is collected (not fail-fast) so
+//   error reports point at *all* the problems at once.
+
+/// One JSON Schema a plugin contributes under `<plugin>/schemas/<name>.json`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginSchema {
+    /// Schema name — the file stem (`schemas/issue.json` → `"issue"`).
+    pub name: String,
+    /// The parsed JSON-Schema document.
+    pub schema: Value,
+}
+
+/// Load every `<plugin_dir>/schemas/*.json` into a name→schema list, sorted by
+/// name. Absent `schemas/` dir → empty. Unreadable or non-object / invalid-JSON
+/// files are skipped silently (forgiving discovery). Only files with a `.json`
+/// extension are considered.
+pub fn load_schemas(plugin_dir: &Path) -> Vec<PluginSchema> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(plugin_dir.join("schemas")) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(schema) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        // A schema document must be a JSON object (or `true`/`false`); reject
+        // arrays/strings/etc. so a stray non-schema file doesn't masquerade.
+        if !schema.is_object() && !schema.is_boolean() {
+            continue;
+        }
+        out.push(PluginSchema {
+            name: stem.to_string(),
+            schema,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// A single schema-validation failure: a JSON-pointer-ish `path` into the
+/// instance (`""` = root, `/items/0/name` = nested) plus a human `message`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct SchemaViolation {
+    pub path: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for SchemaViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let at = if self.path.is_empty() { "(root)" } else { &self.path };
+        write!(f, "{at}: {}", self.message)
+    }
+}
+
+/// The outcome of [`Plugin::validate`] / [`validate_against_plugin_schema`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SchemaValidationError {
+    /// The plugin ships no schema by that name.
+    UnknownSchema(String),
+    /// The value did not conform; carries every collected violation.
+    Failed(Vec<SchemaViolation>),
+}
+
+impl std::fmt::Display for SchemaValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaValidationError::UnknownSchema(n) => write!(f, "no such schema `{n}`"),
+            SchemaValidationError::Failed(v) => {
+                write!(f, "{} schema violation(s):", v.len())?;
+                for x in v {
+                    write!(f, "\n  - {x}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for SchemaValidationError {}
+
+/// Validate a JSON `instance` against a JSON-Schema `schema`, returning every
+/// violation found (empty vec = valid). Pragmatic draft-07 subset — see the
+/// module section comment for the covered keyword set. A boolean schema is
+/// honored (`true` = accept anything, `false` = reject everything).
+#[allow(dead_code)] // Phase 3.4 runtime seam — see section note; used by tests.
+pub fn validate_json_schema(schema: &Value, instance: &Value) -> Vec<SchemaViolation> {
+    let mut violations = Vec::new();
+    validate_at("", schema, instance, &mut violations);
+    violations
+}
+
+#[allow(dead_code)]
+fn validate_at(path: &str, schema: &Value, instance: &Value, out: &mut Vec<SchemaViolation>) {
+    // Boolean schemas: `true` accepts, `false` rejects.
+    match schema {
+        Value::Bool(true) => return,
+        Value::Bool(false) => {
+            push(out, path, "schema `false` rejects all values");
+            return;
+        }
+        Value::Object(_) => {}
+        // A non-object, non-bool "schema" can't constrain anything.
+        _ => return,
+    }
+
+    // enum
+    if let Some(Value::Array(allowed)) = schema.get("enum") {
+        if !allowed.iter().any(|a| a == instance) {
+            push(out, path, &format!("value not in enum {}", compact(&Value::Array(allowed.clone()))));
+        }
+    }
+    // const
+    if let Some(expected) = schema.get("const") {
+        if expected != instance {
+            push(out, path, &format!("value must equal const {}", compact(expected)));
+        }
+    }
+
+    // type (string or array of strings)
+    if let Some(t) = schema.get("type") {
+        let ok = match t {
+            Value::String(s) => json_type_matches(s, instance),
+            Value::Array(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|s| json_type_matches(s, instance)),
+            _ => true,
+        };
+        if !ok {
+            push(
+                out,
+                path,
+                &format!("expected type {}, got {}", compact(t), json_type_name(instance)),
+            );
+        }
+    }
+
+    match instance {
+        Value::Object(map) => validate_object(path, schema, map, out),
+        Value::Array(arr) => validate_array(path, schema, arr, out),
+        Value::String(s) => validate_string(path, schema, s, out),
+        Value::Number(_) => validate_number(path, schema, instance, out),
+        _ => {}
+    }
+}
+
+#[allow(dead_code)]
+fn validate_object(
+    path: &str,
+    schema: &Value,
+    map: &serde_json::Map<String, Value>,
+    out: &mut Vec<SchemaViolation>,
+) {
+    // required
+    if let Some(Value::Array(req)) = schema.get("required") {
+        for r in req {
+            if let Some(name) = r.as_str() {
+                if !map.contains_key(name) {
+                    push(out, path, &format!("missing required property `{name}`"));
+                }
+            }
+        }
+    }
+    let props = schema.get("properties").and_then(|p| p.as_object());
+    // properties → recurse
+    if let Some(props) = props {
+        for (k, sub) in props {
+            if let Some(v) = map.get(k) {
+                validate_at(&child(path, k), sub, v, out);
+            }
+        }
+    }
+    // additionalProperties: false → reject unknowns; object → validate extras.
+    match schema.get("additionalProperties") {
+        Some(Value::Bool(false)) => {
+            for k in map.keys() {
+                let known = props.map(|p| p.contains_key(k)).unwrap_or(false);
+                if !known {
+                    push(out, path, &format!("additional property `{k}` is not allowed"));
+                }
+            }
+        }
+        Some(sub @ Value::Object(_)) => {
+            for (k, v) in map {
+                let known = props.map(|p| p.contains_key(k)).unwrap_or(false);
+                if !known {
+                    validate_at(&child(path, k), sub, v, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[allow(dead_code)]
+fn validate_array(path: &str, schema: &Value, arr: &[Value], out: &mut Vec<SchemaViolation>) {
+    if let Some(min) = schema.get("minItems").and_then(|v| v.as_u64()) {
+        if (arr.len() as u64) < min {
+            push(out, path, &format!("array has {} item(s), minItems is {min}", arr.len()));
+        }
+    }
+    if let Some(max) = schema.get("maxItems").and_then(|v| v.as_u64()) {
+        if (arr.len() as u64) > max {
+            push(out, path, &format!("array has {} item(s), maxItems is {max}", arr.len()));
+        }
+    }
+    // items: single schema applied to every element.
+    if let Some(items) = schema.get("items") {
+        if items.is_object() || items.is_boolean() {
+            for (i, v) in arr.iter().enumerate() {
+                validate_at(&child(path, &i.to_string()), items, v, out);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn validate_string(path: &str, schema: &Value, s: &str, out: &mut Vec<SchemaViolation>) {
+    let len = s.chars().count() as u64;
+    if let Some(min) = schema.get("minLength").and_then(|v| v.as_u64()) {
+        if len < min {
+            push(out, path, &format!("string length {len} is below minLength {min}"));
+        }
+    }
+    if let Some(max) = schema.get("maxLength").and_then(|v| v.as_u64()) {
+        if len > max {
+            push(out, path, &format!("string length {len} exceeds maxLength {max}"));
+        }
+    }
+    if let Some(pat) = schema.get("pattern").and_then(|v| v.as_str()) {
+        match regex::Regex::new(pat) {
+            Ok(re) => {
+                if !re.is_match(s) {
+                    push(out, path, &format!("string does not match pattern `{pat}`"));
+                }
+            }
+            // An invalid pattern in the schema is the author's bug, not the
+            // instance's — report it against the path so it's visible.
+            Err(_) => push(out, path, &format!("schema has invalid regex pattern `{pat}`")),
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn validate_number(path: &str, schema: &Value, instance: &Value, out: &mut Vec<SchemaViolation>) {
+    let Some(n) = instance.as_f64() else { return };
+    if let Some(min) = schema.get("minimum").and_then(|v| v.as_f64()) {
+        if n < min {
+            push(out, path, &format!("{n} is below minimum {min}"));
+        }
+    }
+    if let Some(max) = schema.get("maximum").and_then(|v| v.as_f64()) {
+        if n > max {
+            push(out, path, &format!("{n} exceeds maximum {max}"));
+        }
+    }
+    if let Some(exmin) = schema.get("exclusiveMinimum").and_then(|v| v.as_f64()) {
+        if n <= exmin {
+            push(out, path, &format!("{n} must be > exclusiveMinimum {exmin}"));
+        }
+    }
+    if let Some(exmax) = schema.get("exclusiveMaximum").and_then(|v| v.as_f64()) {
+        if n >= exmax {
+            push(out, path, &format!("{n} must be < exclusiveMaximum {exmax}"));
+        }
+    }
+}
+
+/// JSON-pointer child path: `child("/a", "b") == "/a/b"`, `child("", "b") == "/b"`.
+#[allow(dead_code)]
+fn child(parent: &str, key: &str) -> String {
+    // Escape per RFC 6901 (~ → ~0, / → ~1) so keys with slashes stay unambiguous.
+    let esc = key.replace('~', "~0").replace('/', "~1");
+    format!("{parent}/{esc}")
+}
+
+#[allow(dead_code)]
+fn push(out: &mut Vec<SchemaViolation>, path: &str, message: &str) {
+    out.push(SchemaViolation {
+        path: path.to_string(),
+        message: message.to_string(),
+    });
+}
+
+/// Compact single-line JSON rendering for error messages.
+fn compact(v: &Value) -> String {
+    serde_json::to_string(v).unwrap_or_else(|_| "?".to_string())
+}
+
+/// Validate `value` against `<plugins_dir>/<plugin_id>/schemas/<schema_name>.json`
+/// (Phase 3.4 runtime entry point). Discovers the plugin fresh so callers need
+/// only the plugins dir + ids. `UnknownSchema` when the plugin (or schema) is
+/// absent; `Failed` with all violations otherwise.
+#[allow(dead_code)] // Phase 3.4 runtime seam — see section note; used by tests.
+pub fn validate_against_plugin_schema(
+    plugins_dir: &Path,
+    plugin_id: &str,
+    schema_name: &str,
+    value: &Value,
+) -> Result<(), SchemaValidationError> {
+    let plugins = discover(plugins_dir);
+    match plugins.iter().find(|p| p.manifest.id == plugin_id) {
+        Some(p) => p.validate(schema_name, value),
+        None => Err(SchemaValidationError::UnknownSchema(schema_name.to_string())),
+    }
+}
+
+/// Render the `:plugin info <id> --schema` detail block: every schema the plugin
+/// ships, with its declared top-level `type`, `required` keys, and `properties`
+/// names — enough to see the shape without dumping the whole document. `None`
+/// when no such plugin exists.
+pub fn format_plugin_schemas(dir: &Path, id: &str) -> Option<String> {
+    let plugins = discover(dir);
+    let plugin = plugins.iter().find(|p| p.manifest.id == id)?;
+    let mut out = format!("plugin `{}` schemas\n", plugin.manifest.id);
+    if plugin.schemas.is_empty() {
+        out.push_str("  (none)\n");
+        return Some(out.trim_end().to_string());
+    }
+    for s in &plugin.schemas {
+        let ty = s
+            .schema
+            .get("type")
+            .map(compact)
+            .unwrap_or_else(|| "-".to_string());
+        let required: Vec<String> = s
+            .schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let props: Vec<String> = s
+            .schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        out.push_str(&format!("  {} (type {ty})\n", s.name));
+        if !props.is_empty() {
+            out.push_str(&format!("    properties: {}\n", props.join(", ")));
+        }
+        if !required.is_empty() {
+            out.push_str(&format!("    required:   {}\n", required.join(", ")));
+        }
+    }
+    Some(out.trim_end().to_string())
 }
 
 // ---- Phase 0.5.4: session-env injection from lifecycle-hook stdout ----
@@ -922,6 +1341,23 @@ pub fn format_plugin_info(dir: &Path, id: &str) -> Option<String> {
             "-".to_string()
         } else {
             event_hooks.join(", ")
+        },
+    );
+
+    // Schemas the plugin ships (Phase 3) — names only; use
+    // `:plugin info <id> --schema` for the shape breakdown.
+    field(
+        &mut out,
+        "schemas",
+        &if plugin.schemas.is_empty() {
+            "-".to_string()
+        } else {
+            plugin
+                .schemas
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
         },
     );
 
@@ -1761,6 +2197,183 @@ mod tests {
 
         let env = collect_lifecycle_env_at(&tmp, "on_init", &[], &cred);
         assert_eq!(env.vars, vec![("OTHER".to_string(), "[]".to_string())]);
+    }
+
+    // ---- Phase 3: schema loading & validation ---------------------------
+
+    /// Write `<root>/<id>/schemas/<name>.json` with the given body.
+    fn write_schema(root: &Path, id: &str, name: &str, body: &str) {
+        let sdir = root.join(id).join("schemas");
+        fs::create_dir_all(&sdir).unwrap();
+        fs::write(sdir.join(format!("{name}.json")), body).unwrap();
+    }
+
+    #[test]
+    fn load_schemas_reads_json_sorted_and_skips_junk() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "p", r#"{"id":"p"}"#, None);
+        write_schema(&tmp, "p", "zeta", r#"{"type":"object"}"#);
+        write_schema(&tmp, "p", "alpha", r#"{"type":"string"}"#);
+        // Malformed JSON — skipped.
+        write_schema(&tmp, "p", "broken", "{not json");
+        // Non-.json file in schemas/ — ignored.
+        fs::write(tmp.join("p").join("schemas").join("readme.txt"), "hi").unwrap();
+        // Array body (not a schema object) — skipped.
+        write_schema(&tmp, "p", "arr", r#"[1,2,3]"#);
+
+        let schemas = load_schemas(&tmp.join("p"));
+        let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn load_schemas_absent_dir_is_empty() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "p", r#"{"id":"p"}"#, None);
+        assert!(load_schemas(&tmp.join("p")).is_empty());
+    }
+
+    #[test]
+    fn validate_type_required_and_additional_properties() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": { "type": "string" },
+                "count": { "type": "integer" }
+            },
+            "additionalProperties": false
+        });
+        // Valid.
+        assert!(validate_json_schema(&schema, &serde_json::json!({"name":"a","count":2})).is_empty());
+        // Missing required + wrong type + extra prop → 3 violations.
+        let v = validate_json_schema(
+            &schema,
+            &serde_json::json!({"count":"nope","extra":1}),
+        );
+        assert_eq!(v.len(), 3, "violations: {v:?}");
+        assert!(v.iter().any(|x| x.message.contains("missing required property `name`")));
+        assert!(v.iter().any(|x| x.path == "/count" && x.message.contains("expected type")));
+        assert!(v.iter().any(|x| x.message.contains("additional property `extra`")));
+    }
+
+    #[test]
+    fn validate_enum_const_and_number_bounds() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "status": { "enum": ["open", "closed"] },
+                "kind":   { "const": "issue" },
+                "score":  { "type": "number", "minimum": 0, "maximum": 100 }
+            }
+        });
+        assert!(validate_json_schema(
+            &schema,
+            &serde_json::json!({"status":"open","kind":"issue","score":50})
+        )
+        .is_empty());
+        let v = validate_json_schema(
+            &schema,
+            &serde_json::json!({"status":"weird","kind":"bug","score":150}),
+        );
+        assert_eq!(v.len(), 3, "violations: {v:?}");
+        assert!(v.iter().any(|x| x.path == "/status" && x.message.contains("enum")));
+        assert!(v.iter().any(|x| x.path == "/kind" && x.message.contains("const")));
+        assert!(v.iter().any(|x| x.path == "/score" && x.message.contains("maximum")));
+    }
+
+    #[test]
+    fn validate_array_items_and_string_pattern() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tags": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "string", "pattern": "^[a-z]+$" }
+                }
+            }
+        });
+        assert!(validate_json_schema(&schema, &serde_json::json!({"tags":["ok","fine"]})).is_empty());
+        let v = validate_json_schema(&schema, &serde_json::json!({"tags":["OK9"]}));
+        assert_eq!(v.len(), 1, "violations: {v:?}");
+        assert_eq!(v[0].path, "/tags/0");
+        assert!(v[0].message.contains("pattern"));
+        // Empty array trips minItems.
+        let v2 = validate_json_schema(&schema, &serde_json::json!({"tags":[]}));
+        assert!(v2.iter().any(|x| x.message.contains("minItems")));
+    }
+
+    #[test]
+    fn validate_boolean_schema_false_rejects_everything() {
+        assert!(validate_json_schema(&Value::Bool(true), &serde_json::json!(1)).is_empty());
+        let v = validate_json_schema(&Value::Bool(false), &serde_json::json!(1));
+        assert_eq!(v.len(), 1);
+        assert!(v[0].message.contains("rejects all"));
+    }
+
+    #[test]
+    fn plugin_validate_and_unknown_schema() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "p", r#"{"id":"p"}"#, None);
+        write_schema(
+            &tmp,
+            "p",
+            "issue",
+            r#"{"type":"object","required":["title"],"properties":{"title":{"type":"string"}}}"#,
+        );
+        let plugins = discover(&tmp);
+        let p = plugins.iter().find(|p| p.manifest.id == "p").unwrap();
+        assert_eq!(p.schemas.len(), 1);
+        assert!(p.validate("issue", &serde_json::json!({"title":"x"})).is_ok());
+        assert!(matches!(
+            p.validate("issue", &serde_json::json!({})),
+            Err(SchemaValidationError::Failed(_))
+        ));
+        assert!(matches!(
+            p.validate("nope", &serde_json::json!({})),
+            Err(SchemaValidationError::UnknownSchema(_))
+        ));
+    }
+
+    #[test]
+    fn validate_against_plugin_schema_end_to_end() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "p", r#"{"id":"p"}"#, None);
+        write_schema(&tmp, "p", "ping", r#"{"type":"object","required":["ok"]}"#);
+        assert!(validate_against_plugin_schema(&tmp, "p", "ping", &serde_json::json!({"ok":true})).is_ok());
+        assert!(matches!(
+            validate_against_plugin_schema(&tmp, "p", "ping", &serde_json::json!({})),
+            Err(SchemaValidationError::Failed(_))
+        ));
+        // Unknown plugin id.
+        assert!(matches!(
+            validate_against_plugin_schema(&tmp, "ghost", "ping", &serde_json::json!({})),
+            Err(SchemaValidationError::UnknownSchema(_))
+        ));
+    }
+
+    #[test]
+    fn format_plugin_info_and_schemas_render() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "p", r#"{"id":"p","name":"P"}"#, None);
+        write_schema(
+            &tmp,
+            "p",
+            "issue",
+            r#"{"type":"object","required":["title"],"properties":{"title":{"type":"string"},"body":{"type":"string"}}}"#,
+        );
+        let info = format_plugin_info(&tmp, "p").unwrap();
+        assert!(info.contains("schemas"), "info missing schemas row: {info}");
+        assert!(info.contains("issue"));
+
+        let detail = format_plugin_schemas(&tmp, "p").unwrap();
+        assert!(detail.contains("issue (type \"object\")"), "detail: {detail}");
+        assert!(detail.contains("properties: body, title"));
+        assert!(detail.contains("required:   title"));
+
+        // No-such-plugin → None.
+        assert!(format_plugin_schemas(&tmp, "ghost").is_none());
     }
 
     /// A private, dependency-free temp dir (the crate doesn't pull in the

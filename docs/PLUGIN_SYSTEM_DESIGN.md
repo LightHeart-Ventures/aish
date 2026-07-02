@@ -620,12 +620,14 @@ pub fn webhook_status() -> Result<WebhookStatus> {
 ### Phase 3: Schemas & Structured Data Validation
 **Scope:** JSON Schema validation for tool returns. **Estimate:** 5 SP
 
-- [ ] 3.1 Load schemas from `plugins/{id}/schemas/*.json`
-- [ ] 3.2 Implement JSON Schema validator
-- [ ] 3.3 Attach schemas to SkillManifest / ToolManifest
-- [ ] 3.4 Validate tool returns against schema at runtime
-- [ ] 3.5 Add `:plugin info --schema` to list schemas
-- [ ] 3.6 Tests: validation, schema discovery, error reporting
+- [x] 3.1 Load schemas from `plugins/{id}/schemas/*.json`
+- [x] 3.2 Implement JSON Schema validator
+- [x] 3.3 Attach schemas to the `Plugin` struct (`Plugin.schemas`)
+- [x] 3.4 Validate structured data against schema (`Plugin::validate` / `validate_against_plugin_schema`)
+- [x] 3.5 Add `:plugin info <id> --schema` to list schemas
+- [x] 3.6 Tests: validation, schema discovery, error reporting
+
+> **Implementation note (Phase 3).** See the "Phase 3 detail: Schemas & validation" detail section below.
 
 ### Phase 4: Self-Hosted Webhook Broker
 **Scope:** Broker service + aish client integration. **Estimate:** 13 SP
@@ -1172,6 +1174,92 @@ pointing at a missing profile hard-errors before connect. As of 0.5.3 stdio
 stdio server can reference secrets without writing them to disk.
 
 **Example fixture:** `examples/plugins/hello-world/.mcp.json`.
+
+
+### Phase 3 detail: Schemas & validation
+
+**Goal.** A plugin can ship JSON-Schema documents that describe the *structured
+output* of its tools/skills, and aish can validate a value against one of them by
+name — so a plugin author gets a machine-checkable contract for what their tool
+returns, and the REPL can introspect the shapes.
+
+**Schema discovery.** `plugins::load_schemas(<plugin_dir>)` reads every
+`<plugin>/schemas/*.json` into a `Vec<PluginSchema>` (`{ name, schema }`), where
+`name` is the file stem (`schemas/greeting.json` → `greeting`). The list is
+**sorted by name**. Discovery is forgiving, matching the rest of the plugin
+loader: an absent `schemas/` dir yields an empty list, and any file that is
+unreadable, not `.json`, invalid JSON, or not a JSON object/boolean is **skipped
+silently** so one stray file never voids the set. `discover()` attaches the
+result to each `Plugin` as `Plugin.schemas` (§3.1, §3.3).
+
+**Validator (§3.2) — pragmatic draft-07 subset.** `validate_json_schema(schema,
+instance) -> Vec<SchemaViolation>` walks the instance and collects **every**
+violation (empty vec = valid) rather than bailing on the first. A boolean schema
+is honored (`true` accepts anything, `false` rejects everything). Covered
+keywords:
+
+| Applies to | Keywords |
+|---|---|
+| any       | `type` (string or array), `enum`, `const` |
+| object    | `required`, `properties` (recurse), `additionalProperties` (`false` → reject unknowns; object → validate extras) |
+| array     | `minItems`, `maxItems`, `items` (single sub-schema applied to every element) |
+| string    | `minLength`, `maxLength`, `pattern` (regex; an invalid pattern is reported as the *author's* bug against the path) |
+| number    | `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum` |
+
+Not (yet) implemented: `$ref`/`$defs`, `allOf`/`anyOf`/`oneOf`/`not`, `format`,
+`propertyNames`, tuple-form `items`+`additionalItems`, `patternProperties`,
+`uniqueItems`, `multipleOf`. These are intentionally out of scope for the MVP —
+the subset covers the shapes plugin authors actually write for tool returns.
+
+**Error reporting.** Each `SchemaViolation` carries a **JSON-pointer-ish `path`**
+into the instance (`""` = root, `/items/0/name` = nested; keys are RFC-6901
+escaped so slashes/tildes stay unambiguous) plus a human `message`. `Display`
+renders `"(root): …"` / `"/a/b: …"`. The aggregate `SchemaValidationError` has two
+variants: `UnknownSchema(name)` (the plugin ships no schema by that name) and
+`Failed(Vec<SchemaViolation>)` (rendered as a numbered violation list).
+
+**Validation entry points (§3.4).** Two seams, both returning
+`Result<(), SchemaValidationError>`:
+
+- `Plugin::validate(schema_name, value)` — validate against an already-loaded
+  plugin's named schema.
+- `plugins::validate_against_plugin_schema(plugins_dir, plugin_id, schema_name,
+  value)` — the runtime entry point: discovers the plugin fresh so a caller needs
+  only the plugins dir + ids. `UnknownSchema` when the plugin or schema is absent.
+
+These are the wiring seam for a future "validate this tool's structured return
+against the plugin's declared schema" enforcement point; today they are exercised
+by the test suite and reachable programmatically.
+
+**CLI introspection (§3.5).** `:plugin info <id> --schema` (alias `--schemas`)
+renders each shipped schema with its top-level `type`, `properties` names, and
+`required` keys — enough to see the shape without dumping the whole document:
+
+```
+plugin `hello-world` schemas
+  greeting (type "object")
+    properties: greeting, audience, tone, repeat
+    required:   greeting, audience
+```
+
+A plugin with no `schemas/` prints `(none)`; an unknown id prints
+`no such plugin \`<id>\` — try :plugin list`. Bare `:plugin info <id>` (without the
+flag) still shows the full provenance report from 0.5.6.
+
+**Example fixture.** `examples/plugins/hello-world/schemas/greeting.json` — a
+draft-07 object schema for the hello-world greeting tool (`required`
+`greeting`/`audience`, an `enum` `tone`, a bounded-integer `repeat`, a
+`pattern`-constrained `audience`, `additionalProperties: false`), demonstrating
+every validator keyword the MVP covers.
+
+**Tests (§3.6).** In `src/plugins.rs`: schema discovery
+(`load_schemas_reads_json_sorted_and_skips_junk`, `load_schemas_absent_dir_is_empty`),
+validator keyword coverage (`validate_type_required_and_additional_properties`,
+`validate_array_items_and_string_pattern`, `validate_enum_const_and_number_bounds`,
+`validate_boolean_schema_false_rejects_everything`), the plugin-level seam
+(`plugin_validate_and_unknown_schema`, `validate_against_plugin_schema_end_to_end`),
+CLI rendering (`format_plugin_info_and_schemas_render`), and the example fixture
+(`example_hello_world_plugin_config_resolves`).
 
 
 ### Open questions (addendum)
