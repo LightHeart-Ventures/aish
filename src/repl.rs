@@ -1189,6 +1189,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ),
     ("goal", "pursue a goal in the background"),
     ("help", "show command help"),
+    ("hooks", "list lifecycle hooks + provenance (list|reload)"),
     ("jobs", "list background jobs"),
     ("kill", "kill a background job"),
     ("loop", "re-run a prompt N times inline (status|stop)"),
@@ -1199,6 +1200,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("model-detect", "pick the best local model for this machine"),
     ("new", "clear conversation history"),
     ("output", "stream coordinators' activity"),
+    ("plugin", "plugin provenance (list|info <id>)"),
     ("quit", "exit aish"),
     ("reasoning", "show reasoning-quality telemetry (escalate vs guess)"),
     ("rename", "rename this session"),
@@ -4328,6 +4330,57 @@ fn handle_memories(sub: Option<&str>, session: &Session) {
     }
 }
 
+/// `:hooks [list|reload]` — show the merged lifecycle-hook set with per-hook
+/// provenance (`local` / `plugin:<id>`), or reload the user + project + plugin
+/// hook layers mid-session (Phase 0.5.6). Bare `:hooks` is an alias for `list`.
+fn handle_hooks(sub: Option<&str>, session: &mut Session) {
+    match sub {
+        Some("reload") => {
+            session.load_hooks();
+            println!("hooks reloaded");
+            println!("{}", session.hooks.format_list());
+        }
+        Some("list") | None => println!("{}", session.hooks.format_list()),
+        Some(other) => println!("unknown :hooks subcommand `{other}` — try :hooks list"),
+    }
+}
+
+/// `:plugin [list|info <id>]` — plugin provenance introspection (Phase 0.5.6).
+/// `list` enumerates discovered plugins; `info <id>` renders one plugin's full
+/// capability report (metadata, login, lifecycle + event hooks, MCP servers,
+/// skills). Bare `:plugin` is an alias for `list`.
+fn handle_plugin(sub: Option<&str>, id: Option<&str>) {
+    let dir = crate::plugins::default_plugins_dir();
+    match sub {
+        Some("info") => {
+            let Some(id) = id else {
+                println!("usage: :plugin info <id>");
+                return;
+            };
+            match crate::plugins::format_plugin_info(&dir, id) {
+                Some(report) => println!("{report}"),
+                None => println!("no such plugin `{id}` — try :plugin list"),
+            }
+        }
+        Some("list") | None => {
+            let plugins = crate::plugins::discover(&dir);
+            if plugins.is_empty() {
+                println!("no plugins installed ({})", dir.display());
+                return;
+            }
+            for p in &plugins {
+                let m = &p.manifest;
+                let name = if m.name.is_empty() { &m.id } else { &m.name };
+                let ver = if m.version.is_empty() { "-" } else { &m.version };
+                let state = if m.is_enabled() { "" } else { " (disabled)" };
+                println!("  {:<20} {name} v{ver}{state}", m.id);
+            }
+            println!("\n:plugin info <id> for full provenance");
+        }
+        Some(other) => println!("unknown :plugin subcommand `{other}` — try :plugin list"),
+    }
+}
+
 /// `:telemetry [clear]` — show aggregated tool-call failure & retry-recovery
 /// stats (which tools fail most, with what error class, and whether retries
 /// recover), or wipe the telemetry table. Feeds the "is this error worth
@@ -5395,6 +5448,8 @@ async fn handle_colon(
         Some("reasoning") => handle_reasoning(),
         Some("compact") => handle_compact(backend, session),
         Some("memories" | "memory") => handle_memories(parts.next(), session),
+        Some("hooks") => handle_hooks(parts.next(), session),
+        Some("plugin" | "plugins") => handle_plugin(parts.next(), parts.next()),
         Some("telemetry" | "tool-stats") => handle_telemetry(parts.next(), session),
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}

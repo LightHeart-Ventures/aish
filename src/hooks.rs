@@ -441,16 +441,68 @@ impl HookSet {
         !self.is_empty() && self.hooks.iter().any(|h| h.event == event)
     }
 
-    /// Read-only view of the registered hooks (for `:hooks list`, forthcoming).
-    #[allow(dead_code)]
+    /// Read-only view of the registered hooks (for `:hooks list`).
     pub fn hooks(&self) -> &[Hook] {
         &self.hooks
+    }
+
+    /// Render the `:hooks list` table — one row per registered hook with its
+    /// event, optional name, dispatch class, provenance, and lifetime match
+    /// count. Pure (no I/O), so the REPL command and the unit tests share the
+    /// exact same code path. Rows are sorted by (event, source, name) for a
+    /// deterministic listing. `Status` is `observe` when a plugin blocking hook
+    /// lost the one-winner-per-event contest and was demoted (Phase 0.5.2),
+    /// otherwise `enabled`.
+    pub fn format_list(&self) -> String {
+        if self.hooks.is_empty() {
+            return "no hooks registered".to_string();
+        }
+        let headers = ["Event", "Name", "Status", "Source", "Matched"];
+        let mut rows: Vec<[String; 5]> = self
+            .hooks
+            .iter()
+            .map(|h| {
+                [
+                    h.event.as_str().to_string(),
+                    h.name.clone().unwrap_or_else(|| "-".to_string()),
+                    if h.observe_only { "observe" } else { "enabled" }.to_string(),
+                    h.source.label(),
+                    h.matched.load(Ordering::Relaxed).to_string(),
+                ]
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a[0].cmp(&b[0]).then(a[3].cmp(&b[3])).then(a[1].cmp(&b[1]))
+        });
+        let mut widths = headers.map(str::len);
+        for row in &rows {
+            for (i, cell) in row.iter().enumerate() {
+                widths[i] = widths[i].max(cell.len());
+            }
+        }
+        let render = |cells: &[String; 5]| -> String {
+            cells
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{c:<width$}", width = widths[i]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        };
+        let header_row = headers.map(str::to_string);
+        let mut out = vec![render(&header_row)];
+        for row in &rows {
+            out.push(render(row));
+        }
+        out.join("\n")
     }
 
     /// Load + merge the user-global (`~/.aish/hooks.json`) and project-local
     /// (`<cwd>/.aish/hooks.json`) config. A missing file is fine (empty); a
     /// malformed file is reported to stderr and skipped, so one bad project file
     /// never wedges startup.
+    #[allow(dead_code)] // superseded by load_with_plugins (0.5.6); retained for the tests + external callers
     pub fn load(home: Option<&Path>, cwd: &Path) -> Self {
         // Route through the layered merge (with no plugins) so name-based
         // override/disable and the one-blocking-winner rule apply to the
