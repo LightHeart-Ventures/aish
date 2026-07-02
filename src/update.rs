@@ -20,7 +20,7 @@
 //! noise — auto-update must never get in the way of starting a shell.
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Default upstream repo. Overridable with `AISH_UPDATE_REPO=owner/name` (handy
@@ -337,6 +337,10 @@ async fn view_release(repo: &str, tag: &str) -> Result<GhRelease> {
 /// want to surface (used by the on-demand `:update` path; the startup check
 /// swallows errors). All three channels converge here and hand a single
 /// [`UpdateInfo`] to the existing download/apply path.
+///
+/// This is the network (uncached) path — every successful resolve refreshes the
+/// on-disk TTL cache ([`cache_path`]) as a side effect, so a manual `:update`
+/// also primes the cache the next startup reads.
 pub async fn check() -> Result<Option<UpdateInfo>> {
     check_channel(channel()).await
 }
@@ -344,25 +348,186 @@ pub async fn check() -> Result<Option<UpdateInfo>> {
 /// Same as [`check`] but for an explicitly-chosen [`Channel`], bypassing the
 /// `AISH_UPDATE_CHANNEL` env default. Backs `:update <channel>`, letting a user
 /// pull from dev/ci for a single invocation without exporting the env var.
+/// Always hits the network; writes the result to the TTL cache best-effort.
 pub async fn check_channel(ch: Channel) -> Result<Option<UpdateInfo>> {
+    let (info, cache) = resolve_channel_network(ch).await?;
+    // Best-effort cache write: a filesystem hiccup must never fail an update
+    // check. The cache is a startup optimisation, not a source of truth.
+    if let Some(c) = cache {
+        let _ = write_cache(&cache_path(), &c);
+    }
+    Ok(info)
+}
+
+/// Resolve the target release over the network and split the answer into (a) the
+/// caller-facing [`UpdateInfo`] (Some only when a newer release with a matching
+/// asset exists) and (b) a [`CachedCheck`] snapshot of the LATEST release for
+/// this channel (Some whenever a release was found, regardless of whether it's
+/// an upgrade). Keeping the raw latest — not just the upgrade decision — lets a
+/// later cache read re-evaluate `is_newer` against a freshly-updated
+/// `current_version()` without another network round-trip.
+async fn resolve_channel_network(
+    ch: Channel,
+) -> Result<(Option<UpdateInfo>, Option<CachedCheck>)> {
     let repo = repo();
     let Some(release) = resolve_release(&repo, ch).await? else {
-        return Ok(None);
-    };
-
-    if !is_newer(&release.tag_name, current_version()) {
-        return Ok(None);
-    }
-    let Some(asset) = match_asset(&release.assets) else {
-        // Newer release exists but ships no asset for this OS/arch — nothing to do.
-        return Ok(None);
+        // No release published for this channel yet — nothing to cache.
+        return Ok((None, None));
     };
     let version = release.tag_name.trim_start_matches('v').to_string();
-    Ok(Some(UpdateInfo {
-        tag: release.tag_name.clone(),
-        version,
-        asset_name: asset.to_string(),
-    }))
+    let asset = match_asset(&release.assets).map(|s| s.to_string());
+    let cache = CachedCheck {
+        last_check_ts: now_secs(),
+        latest_tag: release.tag_name.clone(),
+        latest_version: version.clone(),
+        asset_name: asset.clone(),
+        channel: ch.as_str().to_string(),
+    };
+    let info = cached_to_info(&cache, current_version());
+    Ok((info, Some(cache)))
+}
+
+// ---------------------------------------------------------------------------
+// TASK-248 / FR-305 — 24h TTL update-check cache
+// ---------------------------------------------------------------------------
+//
+// The startup self-update check used to shell out to `gh release view` on EVERY
+// launch — a network round-trip on the critical path of opening a shell. This
+// cache eliminates ~99% of those calls: the newest-release answer is persisted
+// to `~/.aish/config/update-check.json` and reused while it's younger than the
+// TTL (default 24h). A miss / stale / corrupt cache falls back to the network
+// path, which rewrites the cache. All of it is best-effort and silent: a cache
+// or filesystem failure degrades to "check the network", never an error.
+
+/// Default staleness window for the update-check cache: 24 hours. Overridable
+/// via `AISH_UPDATE_CHECK_TTL` (whole seconds; `0` forces a fresh check).
+pub const DEFAULT_UPDATE_CHECK_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// The persisted latest-release snapshot. Stores the raw latest tag/version (not
+/// just the upgrade decision) plus the platform asset name resolved at check
+/// time and the channel it was checked for, so a read can re-derive an
+/// [`UpdateInfo`] offline and correctly go quiet once the user upgrades.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CachedCheck {
+    /// Unix seconds when this check ran (used for the TTL comparison).
+    pub last_check_ts: u64,
+    /// The latest release's git tag (e.g. `v0.27.0`).
+    pub latest_tag: String,
+    /// Normalized numeric version (e.g. `0.27.0`).
+    pub latest_version: String,
+    /// The platform asset matched at check time, if any. `None` means the latest
+    /// release shipped nothing installable for this OS/arch — cached so we don't
+    /// re-query only to reach the same dead end.
+    #[serde(default)]
+    pub asset_name: Option<String>,
+    /// The channel this snapshot was taken for; a read only trusts the cache when
+    /// it matches the active channel (switching channels forces a fresh check).
+    #[serde(default)]
+    pub channel: String,
+}
+
+/// Current Unix time in whole seconds (0 on a clock error — best-effort).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The cache staleness window in seconds. Reads `AISH_UPDATE_CHECK_TTL` (whole
+/// seconds); `0` is honoured verbatim (always fetch fresh). Falls back to
+/// [`DEFAULT_UPDATE_CHECK_TTL_SECS`] only when the var is unset or unparseable.
+pub fn check_ttl() -> u64 {
+    std::env::var("AISH_UPDATE_CHECK_TTL")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_UPDATE_CHECK_TTL_SECS)
+}
+
+/// Where the cache lives: `AISH_UPDATE_CHECK_CACHE_PATH` if set (and non-empty),
+/// else `~/.aish/config/update-check.json` (alongside the local-model
+/// selection, via [`crate::hwdetect::config_dir`] which creates the dir).
+pub fn cache_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("AISH_UPDATE_CHECK_CACHE_PATH") {
+        let p = PathBuf::from(p);
+        if !p.as_os_str().is_empty() {
+            return p;
+        }
+    }
+    crate::hwdetect::config_dir().join("update-check.json")
+}
+
+/// Pure TTL predicate: is a cache written at `last_check_ts` still fresh at
+/// `now` given `ttl` seconds? A `ttl` of 0 is never fresh (always refetch). A
+/// clock that went backwards (now < last_check_ts) is treated as stale via the
+/// saturating subtraction. Split out so the freshness logic is unit-tested with
+/// mocked time, no filesystem or clock involved (AC1).
+pub fn is_cache_fresh(now: u64, last_check_ts: u64, ttl: u64) -> bool {
+    if ttl == 0 || now < last_check_ts {
+        return false;
+    }
+    now - last_check_ts < ttl
+}
+
+/// Re-derive the caller-facing [`UpdateInfo`] from a cached snapshot against a
+/// given `current` version. Returns `Some` only when the cached latest is
+/// strictly newer than `current` AND a platform asset was recorded — matching
+/// the live [`check_channel`] semantics, but with zero network. Pure over
+/// `current` so upgrade-decision behaviour is unit-tested without env/globals.
+fn cached_to_info(c: &CachedCheck, current: &str) -> Option<UpdateInfo> {
+    let asset = c.asset_name.clone()?;
+    if is_newer(&c.latest_tag, current) {
+        Some(UpdateInfo {
+            tag: c.latest_tag.clone(),
+            version: c.latest_version.clone(),
+            asset_name: asset,
+        })
+    } else {
+        None
+    }
+}
+
+/// Read + parse the cache at `path`. `None` on a missing, unreadable, or corrupt
+/// file — a corrupt cache is indistinguishable from a miss and both fall back to
+/// the network (AC2). Pure over the path so tests point it at a temp file.
+pub fn read_cache(path: &Path) -> Option<CachedCheck> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Write the cache to `path` (pretty JSON), creating the parent directory if
+/// needed. Returns `Err` only so callers can log; every call site treats a
+/// write failure as non-fatal (the cache is an optimisation).
+pub fn write_cache(path: &Path, cache: &CachedCheck) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let json = serde_json::to_string_pretty(cache).context("serializing update-check cache")?;
+    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Cache-aware startup update check for the active [`channel`]. This is the
+/// entry point the REPL spawns off the startup critical path.
+///
+/// Fast path (AC1): when the cache is younger than the TTL and was taken for the
+/// active channel, the answer is served from disk with NO network call. Slow
+/// path (AC2): a miss / stale / corrupt cache — or `TTL=0` (AC3) — falls through
+/// to [`check_channel`], which hits the network and rewrites the cache. Silent /
+/// best-effort throughout (AC4): the caller swallows any `Err`.
+pub async fn check_cached() -> Result<Option<UpdateInfo>> {
+    let ch = channel();
+    let ttl = check_ttl();
+    if ttl > 0 {
+        if let Some(c) = read_cache(&cache_path()) {
+            if c.channel == ch.as_str() && is_cache_fresh(now_secs(), c.last_check_ts, ttl) {
+                // Fresh cache hit for this channel — serve offline, no `gh`.
+                return Ok(cached_to_info(&c, current_version()));
+            }
+        }
+    }
+    // Miss / stale / corrupt / TTL=0 — fetch fresh (and rewrite the cache).
+    check_channel(ch).await
 }
 
 /// Format a byte count for human eyes (`24.7 MB`, `512 B`). Used by the download
@@ -1190,5 +1355,93 @@ mod drain_tests {
         let many = host_drain_warning(3);
         assert!(many.contains('3'));
         assert!(many.contains("jobs ")); // plural
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-248 — update-check cache
+    // -----------------------------------------------------------------------
+
+    fn sample_cache() -> CachedCheck {
+        CachedCheck {
+            last_check_ts: 1_000,
+            latest_tag: "v0.30.0".into(),
+            latest_version: "0.30.0".into(),
+            asset_name: Some("aish-x86_64-unknown-linux-gnu".into()),
+            channel: "prod".into(),
+        }
+    }
+
+    #[test]
+    fn cache_freshness_is_pure_over_mocked_time() {
+        let ttl = 24 * 60 * 60; // 86400
+        // Written at t=1000; still fresh a few hours later.
+        assert!(is_cache_fresh(1_000 + 3_600, 1_000, ttl));
+        // Exactly at the boundary → stale (strictly-less-than window).
+        assert!(!is_cache_fresh(1_000 + ttl, 1_000, ttl));
+        // Well past the window → stale.
+        assert!(!is_cache_fresh(1_000 + ttl + 1, 1_000, ttl));
+        // Clock ran backwards (now < last_check) → treated as stale, no panic.
+        assert!(!is_cache_fresh(500, 1_000, ttl));
+    }
+
+    #[test]
+    fn ttl_zero_is_never_fresh() {
+        // AC3: TTL=0 forces a fresh network check regardless of timestamps.
+        assert!(!is_cache_fresh(1_000, 1_000, 0));
+        assert!(!is_cache_fresh(0, 0, 0));
+    }
+
+    #[test]
+    fn cached_to_info_flags_newer_and_goes_quiet_when_current() {
+        let c = sample_cache();
+        // Current build older than cached latest → surface the upgrade.
+        let info = cached_to_info(&c, "0.29.0").expect("upgrade available");
+        assert_eq!(info.tag, "v0.30.0");
+        assert_eq!(info.version, "0.30.0");
+        assert_eq!(info.asset_name, "aish-x86_64-unknown-linux-gnu");
+        // Current build == cached latest → no notice (user already upgraded).
+        assert!(cached_to_info(&c, "0.30.0").is_none());
+        // Current build newer than cached latest → no downgrade notice.
+        assert!(cached_to_info(&c, "0.31.0").is_none());
+    }
+
+    #[test]
+    fn cached_to_info_none_when_no_platform_asset() {
+        // A latest release with nothing installable for this platform must not
+        // produce a phantom upgrade, even when strictly newer.
+        let mut c = sample_cache();
+        c.asset_name = None;
+        assert!(cached_to_info(&c, "0.1.0").is_none());
+    }
+
+    #[test]
+    fn write_then_read_cache_roundtrips_via_filesystem() {
+        let dir = std::env::temp_dir().join(format!("aish-cache-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("update-check.json");
+        let original = sample_cache();
+        write_cache(&path, &original).expect("write cache");
+        let read = read_cache(&path).expect("read back cache");
+        assert_eq!(read.last_check_ts, original.last_check_ts);
+        assert_eq!(read.latest_tag, original.latest_tag);
+        assert_eq!(read.latest_version, original.latest_version);
+        assert_eq!(read.asset_name, original.asset_name);
+        assert_eq!(read.channel, original.channel);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_cache_missing_or_corrupt_is_none() {
+        // AC2: a missing file reads as None (→ network fallback).
+        let missing = std::env::temp_dir().join("aish-cache-does-not-exist-xyz.json");
+        let _ = std::fs::remove_file(&missing);
+        assert!(read_cache(&missing).is_none());
+        // A corrupt file also reads as None rather than erroring.
+        let dir = std::env::temp_dir().join(format!("aish-cache-corrupt-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("update-check.json");
+        std::fs::write(&path, b"{ not valid json ]").expect("write corrupt");
+        assert!(read_cache(&path).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
