@@ -80,6 +80,20 @@ impl Db {
              CREATE TABLE IF NOT EXISTS settings (
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL
+             );
+             -- Tool-call failure & fallback telemetry (crate::tool_telemetry).
+             -- One row per executed tool call; feeds `:telemetry` aggregation so
+             -- the repair heuristic can learn which errors are worth retrying.
+             CREATE TABLE IF NOT EXISTS tool_telemetry (
+                 id          INTEGER PRIMARY KEY,
+                 ts          TEXT NOT NULL DEFAULT current_timestamp,
+                 tool        TEXT NOT NULL,
+                 is_error    INTEGER NOT NULL,
+                 error_class TEXT,
+                 is_retry    INTEGER NOT NULL DEFAULT 0,
+                 recovered   INTEGER NOT NULL DEFAULT 0,
+                 prev_class  TEXT,
+                 session_id  TEXT
              );",
         )
         .context("schema init failed")?;
@@ -386,6 +400,90 @@ impl Db {
         Ok(self
             .conn
             .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))?)
+    }
+
+    // -- Tool-call telemetry (crate::tool_telemetry) ------------------------
+
+    /// Append one tool-call telemetry row. Best-effort; callers ignore errors.
+    pub fn record_tool_event(&self, ev: &crate::tool_telemetry::ToolEvent) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO tool_telemetry
+                 (tool, is_error, error_class, is_retry, recovered, prev_class, session_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                ev.tool,
+                ev.is_error as i64,
+                ev.error_class,
+                ev.is_retry as i64,
+                ev.recovered as i64,
+                ev.prev_class,
+                ev.session_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Total number of recorded tool-call events.
+    pub fn tool_telemetry_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT count(*) FROM tool_telemetry", [], |r| r.get(0))?)
+    }
+
+    /// Per-tool call totals + failure counts.
+    pub fn tool_telemetry_totals(&self) -> Result<Vec<crate::tool_telemetry::ToolTotals>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tool, count(*), coalesce(sum(is_error), 0)
+                 FROM tool_telemetry GROUP BY tool",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::tool_telemetry::ToolTotals {
+                tool: r.get(0)?,
+                calls: r.get(1)?,
+                failures: r.get(2)?,
+            })
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Per-(tool, error-class) failure counts.
+    pub fn tool_telemetry_class_failures(&self) -> Result<Vec<crate::tool_telemetry::ClassFailure>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tool, coalesce(error_class, 'other'), count(*)
+                 FROM tool_telemetry WHERE is_error = 1
+                 GROUP BY tool, error_class",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::tool_telemetry::ClassFailure {
+                tool: r.get(0)?,
+                class: r.get(1)?,
+                count: r.get(2)?,
+            })
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Per-(tool, prior-error-class) retry & recovery counts.
+    pub fn tool_telemetry_retry_stats(&self) -> Result<Vec<crate::tool_telemetry::RetryStat>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tool, coalesce(prev_class, 'other'), count(*), coalesce(sum(recovered), 0)
+                 FROM tool_telemetry WHERE is_retry = 1
+                 GROUP BY tool, prev_class",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::tool_telemetry::RetryStat {
+                tool: r.get(0)?,
+                prev_class: r.get(1)?,
+                retries: r.get(2)?,
+                recovered: r.get(3)?,
+            })
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Wipe all telemetry rows (`:telemetry clear`). Returns rows deleted.
+    pub fn clear_tool_telemetry(&self) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM tool_telemetry", [])?)
     }
 
     /// Every stored memory (id ascending) — the input to an organization pass.

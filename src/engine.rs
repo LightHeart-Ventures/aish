@@ -555,6 +555,10 @@ async fn run_turn_inner(
             // escalation is surfaced — a ✓/✗ header (already drawn by the spinner
             // finish above) with a short streamed tail beneath it.
             session.tool_calls_total = session.tool_calls_total.saturating_add(1);
+            // Tool-call failure & fallback telemetry: classify a failure, detect
+            // a retry of a previously-failed tool, and record whether the retry
+            // recovered. Best-effort — never sinks the turn. See tool_telemetry.
+            crate::tool_telemetry::record(session, &call.name, &result);
             emit_activity_stream(session, &result);
             // Observe hooks: PostToolUse (always) + PostToolUseFailure (on error).
             // Carry the tool name, program/path, and the error flag so an audit
