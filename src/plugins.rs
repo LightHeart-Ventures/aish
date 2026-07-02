@@ -779,6 +779,135 @@ pub fn collect_lifecycle_env(
     merged
 }
 
+// ===================================================================
+// Phase 0.5.6 — plugin/hook provenance introspection (`:plugin info`,
+// and the plugin event-hook fragments consumed by `:hooks list`).
+// ===================================================================
+
+/// Build the [`crate::hooks::PluginHookFragment`] list for every discovered
+/// plugin that ships a `hooks.json` — the seam that lets the session merge
+/// plugin-contributed event hooks (tagged `HookSource::Plugin(id)`) into the
+/// runtime `HookSet` so `:hooks list` can show their provenance. Plugins with
+/// no `hooks.json` contribute nothing. Ordered by plugin id (discovery order).
+pub fn plugin_hook_fragments(dir: &Path) -> Vec<crate::hooks::PluginHookFragment> {
+    discover(dir)
+        .into_iter()
+        .filter_map(|p| {
+            let path = p.dir.join("hooks.json");
+            path.is_file().then(|| crate::hooks::PluginHookFragment {
+                plugin_id: p.manifest.id.clone(),
+                path,
+            })
+        })
+        .collect()
+}
+
+/// Render the `:plugin info <id>` provenance report for the plugin with id
+/// `id` under `dir`, or `None` when no such (enabled) plugin exists. Pure apart
+/// from reading the plugin's own on-disk files (`.mcp.json`, `hooks.json`), so
+/// the REPL command and the unit tests share one code path.
+///
+/// The report surfaces every capability the plugin contributes: manifest
+/// metadata (name/version/description/enabled), the login command it handles,
+/// its plugin-lifecycle hooks (`on_init`, …), the MCP servers it injects (with
+/// refs redacted — names only), the event-catalog hooks from its `hooks.json`,
+/// and the skills it expands into the registry.
+pub fn format_plugin_info(dir: &Path, id: &str) -> Option<String> {
+    let plugins = discover(dir);
+    let plugin = plugins.iter().find(|p| p.manifest.id == id)?;
+    let m = &plugin.manifest;
+    let mut out = String::new();
+    let field = |out: &mut String, k: &str, v: &str| {
+        out.push_str(&format!("  {k:<14} {v}\n"));
+    };
+
+    out.push_str(&format!("plugin `{}`\n", m.id));
+    field(&mut out, "name", if m.name.is_empty() { &m.id } else { &m.name });
+    field(&mut out, "version", if m.version.is_empty() { "-" } else { &m.version });
+    field(
+        &mut out,
+        "description",
+        if m.description.is_empty() { "-" } else { &m.description },
+    );
+    field(&mut out, "enabled", if m.is_enabled() { "yes" } else { "no" });
+    field(&mut out, "dir", &plugin.dir.display().to_string());
+    field(&mut out, "login", m.login_command().unwrap_or("-"));
+
+    // Plugin-lifecycle hooks (on_init, on_shell_ready, …).
+    let lifecycle = m.lifecycle_hooks();
+    field(
+        &mut out,
+        "lifecycle",
+        &if lifecycle.is_empty() {
+            "-".to_string()
+        } else {
+            lifecycle.join(", ")
+        },
+    );
+
+    // MCP servers this plugin injects (names only — never echo resolved refs).
+    let mut mcp_names: Vec<String> = read_plugin_mcp(&plugin.dir)
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default();
+    mcp_names.sort();
+    field(
+        &mut out,
+        "mcp servers",
+        &if mcp_names.is_empty() {
+            "-".to_string()
+        } else {
+            mcp_names.join(", ")
+        },
+    );
+
+    // Event-catalog hooks from this plugin's hooks.json — reuse the real
+    // HookSet loader (single-plugin fragment) so parsing stays identical.
+    let hooks_path = plugin.dir.join("hooks.json");
+    let event_hooks: Vec<String> = if hooks_path.is_file() {
+        let frag = crate::hooks::PluginHookFragment {
+            plugin_id: m.id.clone(),
+            path: hooks_path,
+        };
+        crate::hooks::HookSet::load_layered(&[], std::slice::from_ref(&frag))
+            .hooks()
+            .iter()
+            .map(|h| match &h.name {
+                Some(n) => format!("{} ({n})", h.event.as_str()),
+                None => h.event.as_str().to_string(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    field(
+        &mut out,
+        "event hooks",
+        &if event_hooks.is_empty() {
+            "-".to_string()
+        } else {
+            event_hooks.join(", ")
+        },
+    );
+
+    // Skills contributed to the registry.
+    field(
+        &mut out,
+        "skills",
+        &if plugin.skills.is_empty() {
+            "-".to_string()
+        } else {
+            plugin
+                .skills
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    );
+
+    Some(out.trim_end().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,6 +928,59 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn plugin_hook_fragments_only_for_plugins_with_hooks_json() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "with-hooks", r#"{"id":"with-hooks"}"#, None);
+        write_plugin(&tmp, "no-hooks", r#"{"id":"no-hooks"}"#, None);
+        fs::write(
+            tmp.join("with-hooks").join("hooks.json"),
+            r#"{"hooks":[{"event":"PreToolUse","action":{"type":"observe"}}]}"#,
+        )
+        .unwrap();
+        let frags = plugin_hook_fragments(&tmp);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(frags[0].plugin_id, "with-hooks");
+    }
+
+    #[test]
+    fn format_plugin_info_unknown_id_is_none() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "hello", r#"{"id":"hello"}"#, None);
+        assert!(format_plugin_info(&tmp, "nope").is_none());
+    }
+
+    #[test]
+    fn format_plugin_info_reports_full_provenance() {
+        let tmp = tempdir();
+        write_plugin(
+            &tmp,
+            "enterprise",
+            r#"{"id":"enterprise","name":"Enterprise","version":"1.2.0",
+                "description":"corp plugin",
+                "provides":{"lifecycle_hooks":["on_init"],"login":"mycompany"}}"#,
+            Some(("audit", "Audit things.")),
+        );
+        fs::write(
+            tmp.join("enterprise").join("hooks.json"),
+            r#"{"hooks":[{"event":"PreToolUse","name":"observe","action":{"type":"command","program":"true"}}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("enterprise").join(".mcp.json"),
+            r#"{"mcpServers":{"corp":{"url":"https://mcp.example.com"}}}"#,
+        )
+        .unwrap();
+        let report = format_plugin_info(&tmp, "enterprise").expect("plugin exists");
+        assert!(report.contains("Enterprise"));
+        assert!(report.contains("1.2.0"));
+        assert!(report.contains("mycompany"));
+        assert!(report.contains("on_init"));
+        assert!(report.contains("corp"));
+        assert!(report.contains("PreToolUse (observe)"));
+        assert!(report.contains("audit"));
     }
 
     #[test]

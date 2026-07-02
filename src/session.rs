@@ -571,7 +571,13 @@ impl Session {
     /// in place. `:hooks reload` re-invokes this to pick up edits mid-session.
     pub fn load_hooks(&mut self) {
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        self.hooks = crate::hooks::HookSet::load(home.as_deref(), &self.cwd);
+        // Merge plugin-contributed event-hook fragments (Phase 0.5.6) so
+        // `:hooks list` shows their `plugin:<id>` provenance and they actually
+        // dispatch. Plugins with no `hooks.json` contribute nothing.
+        let fragments =
+            crate::plugins::plugin_hook_fragments(&crate::plugins::default_plugins_dir());
+        self.hooks =
+            crate::hooks::HookSet::load_with_plugins(home.as_deref(), &self.cwd, &fragments);
     }
 
     /// The autonomy descriptor stamped on every hook payload (design §3.1): a
