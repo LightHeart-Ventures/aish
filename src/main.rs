@@ -461,7 +461,35 @@ async fn main() -> Result<()> {
     }
     // Project-scope .mcp.json (cwd) outranks the user-scope one on name clashes.
     let project_mcp = session.cwd.join(".mcp.json");
-    let mcp_paths = vec![project_mcp.clone(), mcp_config.clone()];
+    // Phase 0.5.3: plugin-contributed `.mcp.json` servers merge into the client
+    // MCP set. Plugin paths are appended AFTER project + user scope, so on a
+    // server-name clash the earlier (config) path wins — see `McpHost::start`'s
+    // earlier-path-wins contract. Between plugins, discovery is id-sorted, so the
+    // alphabetically-first plugin wins (first-one-wins). Secret refs
+    // (`${env:…}` / `${profile:…}`) inside a plugin spec are resolved by
+    // `McpHost` at connect time, never on disk.
+    let mut mcp_paths = vec![project_mcp.clone(), mcp_config.clone()];
+    mcp_paths.extend(plugins::plugin_mcp_paths(&aish_dir.join("plugins")));
+
+    // Phase 0.5.4: session-env injection from lifecycle-hook stdout. Each enabled
+    // plugin's `hooks/on_init.sh` may print `KEY=VALUE` lines on stdout; we
+    // fork/exec it (NO shell, `AISH_IN_HOOK=1`, bounded timeout), parse the
+    // exports, reject credential-like keys, and inject the survivors into the
+    // session env BEFORE the REPL starts so every spawned child sees them.
+    // Precedence: ambient/user env wins on a clash; between plugins the
+    // alphabetically-first wins (first-plugin-wins). Operators can disable the
+    // whole mechanism with `AISH_ENV_INJECTION_DISABLED=1`.
+    {
+        let ambient: Vec<(String, String)> = std::env::vars().collect();
+        let injected =
+            plugins::collect_lifecycle_env(&aish_dir.join("plugins"), "on_init", &ambient);
+        for w in &injected.warnings {
+            eprintln!("\x1b[33maish:\x1b[0m {w}");
+        }
+        for (k, v) in injected.vars {
+            session.set_var(&k, v);
+        }
+    }
 
     // MCP connect is the dominant startup cost (a remote HTTP server's
     // initialize → tools/list → prompts/list handshake can take many seconds —
@@ -484,7 +512,8 @@ async fn main() -> Result<()> {
         session.skills_prompt = skills::render_prompt_section(&local, &[]);
         session.skills = local;
     } else {
-        session.mcp = mcp::McpHost::start(&[project_mcp.as_path(), mcp_config.as_path()]).await;
+        let refs: Vec<&Path> = mcp_paths.iter().map(|p| p.as_path()).collect();
+        session.mcp = mcp::McpHost::start(&refs).await;
         timer.mark("MCP connect");
         let local = skills::load_catalog(&skills_dir);
         session.skills_prompt = skills::render_prompt_section(&local, &session.mcp.skills());
