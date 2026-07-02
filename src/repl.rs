@@ -625,15 +625,24 @@ pub async fn run(
                                 std::io::stdout().flush().ok();
                             }
                         };
-                        crate::rewrite::rewrite_to_command_streaming(
-                            &backend, &session, &intent, &mut on_text,
+                        // S8.3 / TASK-145: race the stream against a stdin cancel
+                        // watcher — a new keystroke drops the future and returns
+                        // to the prompt cleanly.
+                        crate::stream_cancel::with_cancel(
+                            crate::rewrite::rewrite_to_command_streaming(
+                                &backend, &session, &intent, &mut on_text,
+                            ),
                         )
                         .await
                     };
                     print!("{}", crate::stream_render::CLEAR_LINE); // wipe the transient preview line
                     std::io::stdout().flush().ok();
                     match candidate {
-                        Ok(Some(cmd)) => {
+                        crate::stream_cancel::StreamOutcome::Cancelled => {
+                            println!("\x1b[33m^C\x1b[0m rewrite cancelled");
+                            continue;
+                        }
+                        crate::stream_cancel::StreamOutcome::Done(Ok(Some(cmd))) => {
                             println!(
                                 "\x1b[2m  candidate — edit, Enter to run, Ctrl-C to cancel:\x1b[0m"
                             );
@@ -656,10 +665,12 @@ pub async fn run(
                                 ReadOutcome::Error(e) => eprintln!("aish: readline error: {e}"),
                             }
                         }
-                        Ok(None) => println!(
+                        crate::stream_cancel::StreamOutcome::Done(Ok(None)) => println!(
                             "\x1b[2m  couldn't express that as a single command — try \x1b[0m?{intent}\x1b[2m to let the model work it out\x1b[0m"
                         ),
-                        Err(e) => eprintln!("\x1b[31maish:\x1b[0m rewrite failed: {e:#}"),
+                        crate::stream_cancel::StreamOutcome::Done(Err(e)) => {
+                            eprintln!("\x1b[31maish:\x1b[0m rewrite failed: {e:#}")
+                        }
                     }
                     continue;
                 }
@@ -690,15 +701,23 @@ pub async fn run(
                                 std::io::stdout().flush().ok();
                             }
                         };
-                        crate::suggest::suggest_next_command_streaming(
-                            &backend, &session, &hint, &mut on_text,
+                        // S8.3 / TASK-145: race the stream against a stdin cancel
+                        // watcher — a new keystroke drops the future cleanly.
+                        crate::stream_cancel::with_cancel(
+                            crate::suggest::suggest_next_command_streaming(
+                                &backend, &session, &hint, &mut on_text,
+                            ),
                         )
                         .await
                     };
                     print!("{}", crate::stream_render::CLEAR_LINE); // wipe the transient preview line
                     std::io::stdout().flush().ok();
                     match candidate {
-                        Ok(Some(cmd)) => {
+                        crate::stream_cancel::StreamOutcome::Cancelled => {
+                            println!("\x1b[33m^C\x1b[0m suggestion dismissed");
+                            continue;
+                        }
+                        crate::stream_cancel::StreamOutcome::Done(Ok(Some(cmd))) => {
                             println!(
                                 "\x1b[2m  suggestion — edit, Enter to run, Ctrl-C to cancel:\x1b[0m"
                             );
@@ -721,10 +740,12 @@ pub async fn run(
                                 ReadOutcome::Error(e) => eprintln!("aish: readline error: {e}"),
                             }
                         }
-                        Ok(None) => println!(
+                        crate::stream_cancel::StreamOutcome::Done(Ok(None)) => println!(
                             "\x1b[2m  no next-command suggestion from the current context — keep going, or \x1b[0m?<intent>\x1b[2m to ask the model\x1b[0m"
                         ),
-                        Err(e) => eprintln!("\x1b[31maish:\x1b[0m suggestion failed: {e:#}"),
+                        crate::stream_cancel::StreamOutcome::Done(Err(e)) => {
+                            eprintln!("\x1b[31maish:\x1b[0m suggestion failed: {e:#}")
+                        }
                     }
                     continue;
                 }
