@@ -869,8 +869,13 @@ pub async fn run(
                 // the loop emits a blank line between that last output row and the
                 // redrawn prompt, matching the command path (never a prompt jammed
                 // flush against the cycled coordinator's output).
-                cycle_worker(&mut session);
-                needs_gap = true;
+                //
+                // With no workers to attach to, `cycle_worker` is a silent
+                // no-op (returns false) — DON'T arm the gap or otherwise
+                // disturb the prompt in that case.
+                if cycle_worker(&mut session) {
+                    needs_gap = true;
+                }
                 continue;
             }
             ReadOutcome::Interrupted => {
@@ -3685,13 +3690,26 @@ fn next_attach_index(running: &[String], current: Option<&str>) -> usize {
 /// activity + steering input to it,
 /// exactly like `:attach`), and one more press past the last detaches back to
 /// the interactive prompt. With a single worker it toggles attach/detach of that
-/// one; with none it's a no-op with a hint.
+/// one; with none it's a silent no-op (no screen redraw, no hint).
+///
+/// Returns `true` when the cursor actually moved (screen was redrawn and a new
+/// view was printed), `false` when it was a no-op because this session has no
+/// coordinators to cycle through — the caller uses this to decide whether the
+/// prompt needs a gap/redraw afterward.
 ///
 /// FINISHED (done/failed) coordinators are part of the rotation too — landing on
 /// one drops into review mode (replay its work + result; a typed line resumes
 /// it), mirroring `attach_worker`'s terminal branch. This makes Shift-Tab a way
 /// to flip back through completed/failed agents, not just the still-running ones.
-fn cycle_worker(session: &mut Session) {
+fn cycle_worker(session: &mut Session) -> bool {
+    // No coordinators launched by this session → nothing to attach to. Take
+    // NO action: don't clear/redraw the screen, don't quiesce spinners, don't
+    // print a hint. A Shift-Tab with no workers is a silent no-op that leaves
+    // the operator's prompt exactly as it was. This check MUST come before the
+    // screen clear below (otherwise an empty cycle still wipes the screen).
+    if session.worker_jobs.lock().unwrap().is_empty() {
+        return false;
+    }
     // Wipe the screen first, so this cycle's attach/detach view (status line +
     // any backfilled activity / result) opens on a fresh screen instead of
     // scrolling under the previous prompt and output. Anchor the cursor to the
@@ -3726,12 +3744,8 @@ fn cycle_worker(session: &mut Session) {
             )
         })
         .collect();
-    if workers.is_empty() {
-        println!(
-            "\x1b[2m⇄ no coordinators to cycle through — :dispatch <task> to launch one\x1b[0m"
-        );
-        return;
-    }
+    // `worker_jobs` was non-empty at the top guard, so `workers` is non-empty
+    // here too — there is always at least one slot to cycle to.
 
     // The cycle is [interactive, workers[0], workers[1], …]; index 0 is the
     // detached interactive prompt. The index math is factored into the pure,
@@ -3748,7 +3762,7 @@ fn cycle_worker(session: &mut Session) {
         println!(
             "\x1b[36m⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)\x1b[0m"
         );
-        return;
+        return true;
     }
 
     let (run_id, terminal) = workers[next_idx - 1].clone();
@@ -3783,6 +3797,7 @@ fn cycle_worker(session: &mut Session) {
         // first and live output after, instead of only future output.
         backfill_attached(&run_id, session);
     }
+    true
 }
 
 /// Mid-turn sibling of [`cycle_worker`]: cycle the attach cursor while a model
@@ -3813,9 +3828,8 @@ fn cycle_worker_live(
         })
         .collect();
     if workers_v.is_empty() {
-        println!(
-            "\x1b[2m⇄ no coordinators to cycle through — :dispatch <task> to launch one\x1b[0m"
-        );
+        // No coordinators to attach to — take no action (no hint, no redraw),
+        // matching the idle-prompt `cycle_worker` no-op.
         return;
     }
     let ids: Vec<String> = workers_v.iter().map(|(id, _)| id.clone()).collect();
