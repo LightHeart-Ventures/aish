@@ -56,7 +56,7 @@ impl Runtime {
         }
     }
 
-    /// Parse the `AISH_CONTAINER_RUNTIME` selector value. `podman`/`docker` pick
+    /// Parse the `AISH_WORKER_RUNTIME` selector value. `podman`/`docker` pick
     /// that engine explicitly; `none` (or `host`) forces the host-subprocess
     /// path; anything else (incl. unset) is `None` → auto-detect. Pure.
     pub fn parse_selector(raw: Option<&str>) -> SelectorPref {
@@ -69,7 +69,7 @@ impl Runtime {
     }
 }
 
-/// The parsed intent of the `AISH_CONTAINER_RUNTIME` knob (pre-PATH-probe).
+/// The parsed intent of the `AISH_WORKER_RUNTIME` knob (pre-PATH-probe).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SelectorPref {
     /// Use this engine, no auto-detection.
@@ -103,9 +103,9 @@ pub fn runtime_on_path(rt: Runtime) -> bool {
 
 /// Auto-detect the preferred runtime on PATH per AC1: prefer **podman** (rootless,
 /// daemonless), else **docker**, else `None` (no engine → host path). Honors an
-/// explicit `AISH_CONTAINER_RUNTIME=none` by short-circuiting to `None`.
+/// explicit `AISH_WORKER_RUNTIME=none` by short-circuiting to `None`.
 pub fn detect_runtime() -> Option<Runtime> {
-    match Runtime::parse_selector(std::env::var("AISH_CONTAINER_RUNTIME").ok().as_deref()) {
+    match Runtime::parse_selector(std::env::var("AISH_WORKER_RUNTIME").ok().as_deref()) {
         SelectorPref::Force(rt) => runtime_on_path(rt).then_some(rt),
         SelectorPref::Host => None,
         SelectorPref::Auto => {
@@ -496,7 +496,7 @@ pub fn rm(rt: Runtime, id: &str, force: bool) -> bool {
 /// `:forget` (S9.5) container cleanup: find the worker's container by its
 /// `aish.worker_id` label and remove it WITHOUT force, so a still-running
 /// container is left intact (the engine refuses a no-force `rm` on a live
-/// container). Honors `AISH_CONTAINER_RUNTIME` for engine selection and is a
+/// container). Honors `AISH_WORKER_RUNTIME` for engine selection and is a
 /// no-op (returns `false`) when no runtime is available — the common case today,
 /// since the default backend is the host subprocess. Returns `true` when a
 /// container was actually removed.

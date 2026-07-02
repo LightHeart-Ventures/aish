@@ -100,6 +100,38 @@ fn clear_screen() {
     }
 }
 
+/// Like [`clear_screen`], but leaves the cursor anchored at the BOTTOM of the
+/// body so the view drawn next (the Shift-Tab attach header + backfilled tail +
+/// redrawn prompt) grows UP from the bottom instead of stranding at the top of
+/// an otherwise-blank screen.
+///
+/// In footer mode [`crate::terminal::restore_after_clear`] already homes the
+/// cursor to the bottom body row (just above the pinned footer), so the attach
+/// view naturally trails the last output. In inline mode (no footer region —
+/// short terminals, or footer disabled) nothing homed the cursor after
+/// `ESC[2J ESC[H`, so it sat at row 1 and the backfill anchored at the TOP with
+/// a blank screen beneath it — the "prompt anchors at the top instead of 2
+/// lines below the last output" bug. Homing to the last row makes inline mode
+/// match footer mode: printing at the bottom row scrolls the screen up, so the
+/// output + prompt stay pinned to the bottom.
+fn clear_screen_anchor_bottom() {
+    // SAFETY: plain isatty query.
+    if unsafe { libc::isatty(1) } != 1 {
+        return;
+    }
+    print!("\x1b[2J\x1b[H");
+    let _ = std::io::stdout().flush();
+    if crate::terminal::footer_active() {
+        // Footer mode: re-assert the region + repaint the footer; this homes the
+        // cursor to the bottom body row.
+        crate::terminal::restore_after_clear();
+    } else if let Some(rows) = crate::terminal::screen_rows() {
+        // Inline mode: home to the last row so the view grows up from the bottom.
+        print!("{}", crate::terminal::bottom_home_seq(rows));
+        let _ = std::io::stdout().flush();
+    }
+}
+
 pub async fn run(
     mut backend: Backend,
     mut session: Session,
@@ -541,6 +573,13 @@ pub async fn run(
                 },
             },
         };
+        // The in-place Ctrl-O toggle block (engine::render_raw_toggle) can only
+        // erase itself while it's still the last thing on screen — i.e. the
+        // prompt sits directly below it. Any other outcome scrolls fresh output
+        // in, so drop the erase anchor; only a follow-up Ctrl-O keeps it.
+        if !matches!(outcome, ReadOutcome::CtrlO) {
+            session.raw_view_rows = 0;
+        }
         match outcome {
             ReadOutcome::Line(line) => {
                 let line = line.trim().to_string();
@@ -2646,13 +2685,10 @@ pub(crate) fn resolve_program(cmd: &str, cwd: &Path, path_var: &str) -> Option<P
 /// collapsed views.
 fn toggle_raw_output(session: &mut Session) {
     session.raw_tool_output = !session.raw_tool_output;
-    if session.raw_tool_output {
-        println!("\x1b[2mraw tool output on\x1b[0m");
-        engine::reveal_last_turn(session);
-    } else {
-        println!("\x1b[2mraw tool output off\x1b[0m");
-        engine::collapse_last_turn(session);
-    }
+    // Flip the last turn's tool output in place (expand ⇆ collapse), erasing the
+    // previously-rendered block so a second Ctrl-O truly re-collapses instead of
+    // appending a summary below the still-visible expanded text.
+    engine::render_raw_toggle(session, session.raw_tool_output);
 }
 
 /// True when a prompt line mentions "troubleshoot" (case-insensitive). Such a
@@ -3124,7 +3160,8 @@ fn attached_result_lines(run_id: &str, jobs: &crate::worker::WorkerJobs) -> Vec<
     let Some(job) = job else {
         return Vec::new();
     };
-    let rendered = crate::md::render_stdout(job.fetch().trim());
+    let rendered =
+        crate::md::render_stdout_within(job.fetch().trim(), crate::worker::pane_content_cols(run_id));
     let mut out = Vec::new();
     let mut lines = rendered.split('\n');
     match lines.next() {
@@ -3161,7 +3198,10 @@ fn print_attached_result(run_id: &str, session: &Session) {
         // (e.g. only `·result Diagnosis complete. …` with the rest of the
         // markdown missing). Splitting per line is the same shape
         // `backfill_attached` uses for the streamed activity rows.
-        let rendered = crate::md::render_stdout(job.fetch().trim());
+        let rendered = crate::md::render_stdout_within(
+            job.fetch().trim(),
+            crate::worker::pane_content_cols(run_id),
+        );
         let mut lines = rendered.split('\n');
         match lines.next() {
             Some(first) => {
@@ -3634,10 +3674,12 @@ fn next_attach_index(running: &[String], current: Option<&str>) -> usize {
 /// it), mirroring `attach_worker`'s terminal branch. This makes Shift-Tab a way
 /// to flip back through completed/failed agents, not just the still-running ones.
 fn cycle_worker(session: &mut Session) {
-    // Wipe the screen and home the cursor first, so this cycle's attach/detach
-    // view (status line + any backfilled activity / result) opens at the top of
-    // a fresh screen instead of scrolling under the previous prompt and output.
-    clear_screen();
+    // Wipe the screen first, so this cycle's attach/detach view (status line +
+    // any backfilled activity / result) opens on a fresh screen instead of
+    // scrolling under the previous prompt and output. Anchor the cursor to the
+    // BOTTOM so the view + redrawn prompt trail the last output (2 lines below)
+    // rather than stranding at the top of an otherwise-blank screen.
+    clear_screen_anchor_bottom();
     // Synchronously tear down any live worker "thinking…" spinner BEFORE we
     // print this view and the REPL redraws the prompt. The spinner polls its
     // forward gate only every ~80 ms, so a spinner for the worker we're leaving
@@ -4512,6 +4554,7 @@ async fn handle_colon(
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
                  :workers [all]                      list this session's background coordinators (all = every session)\n\
+                 :runtime [host|podman|docker|status] show/select the worker execution runtime (host vs container); sets AISH_WORKER_RUNTIME for the next coordinator\n\
                  :dispatch-stats [all]               background-job dispatch efficiency: outcomes, latency\n\
                                                      distribution + missed-inline heuristic (alias :dstats)\n\
                  :output [on|off]             stream background coordinators' activity (💭 thinking + 🛠️/🔧 tool + 🚀 standard/🐌 batch lines) in a contained bordered pane; off (default) keeps them quiet\n\
@@ -4600,6 +4643,91 @@ async fn handle_colon(
                 None => println!("usage: :output [on|off]"),
             }
         }
+        Some("runtime") => {
+            // Report or select the WORKER execution runtime: the host subprocess
+            // (default) vs a podman/docker container. Read-only display + a
+            // selector that sets AISH_WORKER_RUNTIME for the NEXT coordinator
+            // launched from this session — it does NOT retroactively move
+            // already-running workers (they keep the vehicle they started with).
+            let podman_avail =
+                crate::container::runtime_on_path(crate::container::Runtime::Podman);
+            let docker_avail =
+                crate::container::runtime_on_path(crate::container::Runtime::Docker);
+            let yn = |b: bool| {
+                if b {
+                    "\x1b[32m✓ on PATH\x1b[0m"
+                } else {
+                    "\x1b[2m✗ not found\x1b[0m"
+                }
+            };
+            let show_status = || {
+                let raw = std::env::var("AISH_WORKER_RUNTIME").ok();
+                let current = match crate::container::Runtime::parse_selector(raw.as_deref()) {
+                    crate::container::SelectorPref::Force(crate::container::Runtime::Podman) => {
+                        "Podman (container)"
+                    }
+                    crate::container::SelectorPref::Force(crate::container::Runtime::Docker) => {
+                        "Docker (container)"
+                    }
+                    crate::container::SelectorPref::Host => "Host (no container)",
+                    crate::container::SelectorPref::Auto => {
+                        "Host (auto — report-only until cutover)"
+                    }
+                };
+                let raw_disp = raw.as_deref().unwrap_or("unset → auto");
+                println!("\x1b[1mworker runtime\x1b[0m");
+                println!("  current:   {current}   \x1b[2m(AISH_WORKER_RUNTIME={raw_disp})\x1b[0m");
+                println!(
+                    "  available: podman {}   docker {}",
+                    yn(podman_avail),
+                    yn(docker_avail)
+                );
+                println!(
+                    "  \x1b[2mset for the next coordinator:  :runtime host | :runtime podman | :runtime docker\x1b[0m"
+                );
+                println!(
+                    "  \x1b[2mpersist across sessions:       export AISH_WORKER_RUNTIME=<host|podman|docker>\x1b[0m"
+                );
+            };
+            match parts.next() {
+                None | Some("status") => show_status(),
+                Some("host") | Some("none") => {
+                    unsafe { std::env::set_var("AISH_WORKER_RUNTIME", "host") };
+                    println!(
+                        "\x1b[36m⇄\x1b[0m worker runtime forced to \x1b[1mHost\x1b[0m for the next coordinator."
+                    );
+                    show_status();
+                }
+                Some("podman") => {
+                    unsafe { std::env::set_var("AISH_WORKER_RUNTIME", "podman") };
+                    if !podman_avail {
+                        println!(
+                            "\x1b[33m!\x1b[0m podman not on PATH — workers fall back to the host path until it's installed."
+                        );
+                    }
+                    println!(
+                        "\x1b[36m⇄\x1b[0m worker runtime set to \x1b[1mPodman\x1b[0m for the next coordinator."
+                    );
+                    show_status();
+                }
+                Some("docker") => {
+                    unsafe { std::env::set_var("AISH_WORKER_RUNTIME", "docker") };
+                    if !docker_avail {
+                        println!(
+                            "\x1b[33m!\x1b[0m docker not on PATH — workers fall back to the host path until it's installed."
+                        );
+                    }
+                    println!(
+                        "\x1b[36m⇄\x1b[0m worker runtime set to \x1b[1mDocker\x1b[0m for the next coordinator."
+                    );
+                    show_status();
+                }
+                Some(other) => {
+                    println!("usage: :runtime [host|podman|docker|status]  (got '{other}')")
+                }
+            }
+        }
+
         Some("workers") => {
             // `:workers` lists THIS session's coordinators by default — the ones
             // launched from this terminal — so a busy multi-terminal host never
@@ -4623,6 +4751,12 @@ async fn handle_colon(
                 .unwrap_or_else(|| crate::batch::short_id(&session.session_id).to_string());
 
             let mut table = String::from(WORKERS_TABLE_HEADER);
+            // Accumulate rendered rows keyed by their start epoch so the whole
+            // listing — in-memory + durable, both sources interleaved — is
+            // sorted newest-first before it's emitted. Without this the two
+            // sources each appear in their own insertion order (oldest-first),
+            // which reads as an arbitrary jumble to the operator.
+            let mut rows_out: Vec<(i64, String)> = Vec::new();
             // Epoch-seconds "now", computed once so every row's Started/Runtime
             // cell is reconciled against the same instant.
             let now_epoch = std::time::SystemTime::now()
@@ -4651,16 +4785,19 @@ async fn handle_colon(
                 } else {
                     w.id.clone()
                 };
-                table.push_str(&format!(
-                    "| {} {} | {} * | {} | {} | {} | {} | {} |\n",
-                    crate::style::job_type_emoji("worker"),
-                    id_cell,
-                    me_label,
-                    crate::style::styled_status(&w.status()),
-                    started_cell,
-                    runtime_cell,
-                    one_line(&w.task),
-                    crate::style::styled_result(&w.result_cell())
+                rows_out.push((
+                    w.started_epoch().unwrap_or(0),
+                    format!(
+                        "| {} {} | {} * | {} | {} | {} | {} | {} |\n",
+                        crate::style::job_type_emoji("worker"),
+                        id_cell,
+                        me_label,
+                        crate::style::styled_status(&w.status()),
+                        started_cell,
+                        runtime_cell,
+                        one_line(&w.task),
+                        crate::style::styled_result(&w.result_cell())
+                    ),
                 ));
             }
             // Durable runs from the shared store — every session's, so workers
@@ -4729,19 +4866,28 @@ async fn handle_colon(
                         };
                         let (started_cell, runtime_cell) =
                             crate::style::time_cells(started, finished, now_epoch);
-                        table.push_str(&format!(
-                            "| {} {} | {} | {} | {} | {} | {} | {} |\n",
-                            crate::style::job_type_emoji("coordinator"),
-                            crate::batch::short_id(&r.run_id),
-                            session_cell,
-                            crate::style::styled_status(&r.phase),
-                            started_cell,
-                            runtime_cell,
-                            one_line(&r.task),
-                            crate::style::styled_result(&result_cell)
+                        rows_out.push((
+                            started.unwrap_or(0),
+                            format!(
+                                "| {} {} | {} | {} | {} | {} | {} | {} |\n",
+                                crate::style::job_type_emoji("coordinator"),
+                                crate::batch::short_id(&r.run_id),
+                                session_cell,
+                                crate::style::styled_status(&r.phase),
+                                started_cell,
+                                runtime_cell,
+                                one_line(&r.task),
+                                crate::style::styled_result(&result_cell)
+                            ),
                         ));
                     }
                 }
+            }
+            // Sort the merged listing newest-first (largest start epoch first),
+            // then emit. A stable sort keeps same-epoch rows in insertion order.
+            rows_out.sort_by(|a, b| b.0.cmp(&a.0));
+            for (_, row) in &rows_out {
+                table.push_str(row);
             }
             if any {
                 println!("{}", crate::md::render_stdout(table.trim()));
