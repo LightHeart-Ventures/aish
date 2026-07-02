@@ -93,6 +93,14 @@ pub fn footer_seq(
     let bar = clip_visible(statusline, max);
     let mut s = String::with_capacity(sep.len() + msg.len() + bar.len() + 48);
     s.push_str("\x1b7"); // DECSC — save cursor + attrs
+    // Re-assert the scroll region INSIDE the save/restore. DECSTBM homes the
+    // cursor to the top-left as a documented side effect, so it MUST run after
+    // the DECSC save above — otherwise the DECRC below restores the homed
+    // (top-left) position instead of the caller's real cursor, stranding the
+    // next prompt at the top of the screen instead of two lines below the last
+    // output. Re-asserting every paint also makes a resize between prompts
+    // self-healing without depending on the SIGWINCH watcher.
+    s.push_str(&scroll_region_seq(rows));
     s.push_str(&format!("\x1b[{sep_row};1H\x1b[2K{sep}"));
     s.push_str(&format!("\x1b[{msg_row};1H\x1b[2K{msg}"));
     s.push_str(&format!("\x1b[{bar_row};1H\x1b[2K{bar}"));
@@ -227,9 +235,9 @@ impl Terminal {
         }
         let sep = separator_line(self.cols, self.utf8, crate::style::colors_enabled());
         let mut buf = String::new();
-        // Re-assert the region every paint so a resize between prompts is picked
-        // up even if we missed the SIGWINCH.
-        buf.push_str(&scroll_region_seq(self.rows));
+        // footer_seq re-asserts the scroll region internally, INSIDE its
+        // DECSC/DECRC save-restore, so the DECSTBM cursor-home side effect never
+        // leaks out and strands the next prompt at the top of the screen.
         buf.push_str(&footer_seq(self.rows, self.cols, &sep, status_msg, statusline));
         let mut out = std::io::stdout();
         let _ = write!(out, "{buf}");
@@ -286,7 +294,9 @@ pub fn restore_after_clear() {
     let sep = separator_line(cols, utf8, crate::style::colors_enabled());
     let body_bottom = rows.saturating_sub(FOOTER_ROWS).max(1);
     let mut buf = String::new();
-    buf.push_str(&scroll_region_seq(rows));
+    // footer_seq re-asserts the scroll region internally (inside its DECSC/DECRC
+    // save-restore); we then override the restored cursor with an explicit home
+    // into the body so the post-clear view grows up from the bottom.
     buf.push_str(&footer_seq(rows, cols, &sep, &msg, &bar));
     // Home the cursor back into the body after the repaint.
     buf.push_str(&format!("\x1b[{body_bottom};1H"));
@@ -414,6 +424,14 @@ mod tests {
         let seq = footer_seq(24, 10, "----------", "msg", "bar");
         assert!(seq.starts_with("\x1b7")); // DECSC
         assert!(seq.ends_with("\x1b8")); // DECRC
+        // The scroll-region re-assert (DECSTBM) must be saved-then-emitted: it
+        // homes the cursor, so it has to sit AFTER the DECSC save and BEFORE the
+        // first absolute row paint, or DECRC would restore the homed position
+        // and strand the next prompt at the top of the screen.
+        let decsc = seq.find("\x1b7").unwrap();
+        let region = seq.find("\x1b[1;21r").expect("region re-asserted"); // 24 - 3 = 21
+        let first_paint = seq.find("\x1b[22;1H").unwrap();
+        assert!(decsc < region && region < first_paint);
         assert!(seq.contains("\x1b[22;1H")); // separator row = H-2
         assert!(seq.contains("\x1b[23;1H")); // status message row = H-1
         assert!(seq.contains("\x1b[24;1H")); // statusline row = H
