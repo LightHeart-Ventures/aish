@@ -3,11 +3,27 @@ name: Release (Dev)
 # Nightly dev builds: latest development snapshot, pre-release. Triggered on schedule (nightly) or manually.
 # Tags: dev-v{next-semver}-dev.{run_number} (e.g., dev-v0.24.0-dev.123)
 # Marked as prerelease so :update with AISH_UPDATE_CHANNEL=dev pulls the latest dev, not prod.
+#
+# Platform selection (the `platforms` dispatch input, default `linux`):
+#   linux  — Linux x86_64 only            (fast; the default for nightly + manual runs)
+#   macos  — both macOS targets (x86_64 + arm64)
+#   all    — Linux x86_64 + both macOS targets (parity with prod)
+# Scheduled nightly runs have no input, so they fall back to `linux` — we only
+# build Linux for dev by default and opt into macOS/all on demand.
 on:
   schedule:
     # 04:00 UTC daily — low-traffic window to avoid runner contention
     - cron: "0 4 * * *"
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Which platforms to build (dev)"
+        type: choice
+        default: linux
+        options:
+          - linux
+          - macos
+          - all
 
 permissions:
   contents: write
@@ -17,22 +33,55 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  setup:
+    name: resolve build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      expected_assets: ${{ steps.set.outputs.expected_assets }}
+      platforms: ${{ steps.set.outputs.platforms }}
+    steps:
+      - name: Compute build matrix from platform selection
+        id: set
+        run: |
+          set -euo pipefail
+          # Scheduled runs carry no input → default to linux-only.
+          platforms="${{ github.event.inputs.platforms || 'linux' }}"
+
+          linux='{"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","asset":"aish-x86_64-unknown-linux-gnu"}'
+          macos_x86='{"os":"macos-latest","target":"x86_64-apple-darwin","asset":"aish-x86_64-apple-darwin"}'
+          macos_arm='{"os":"macos-latest","target":"aarch64-apple-darwin","asset":"aish-aarch64-apple-darwin"}'
+
+          case "$platforms" in
+            linux) include="$linux" ;;
+            macos) include="$macos_x86,$macos_arm" ;;
+            all)   include="$linux,$macos_x86,$macos_arm" ;;
+            *)
+              echo "::error::Unknown platforms selection '$platforms' (expected linux|macos|all)."
+              exit 1
+              ;;
+          esac
+
+          matrix="{\"include\":[$include]}"
+          # Each platform ships a binary + its .sha256; the release job adds one
+          # aggregate SHA256SUMS → expected = 2 * platform_count + 1.
+          count="$(echo "$matrix" | jq '.include | length')"
+          expected_assets=$((2 * count + 1))
+
+          echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "expected_assets=$expected_assets" >> "$GITHUB_OUTPUT"
+          echo "Selection '$platforms' → $count target(s), expecting $expected_assets assets."
+          echo "$matrix" | jq .
+        shell: bash
+
   build:
     name: build ${{ matrix.target }} (dev)
+    needs: setup
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            asset: aish-x86_64-apple-darwin
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            asset: aish-aarch64-apple-darwin
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            asset: aish-x86_64-unknown-linux-gnu
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -97,7 +146,7 @@ jobs:
 
   release:
     name: publish dev release
-    needs: build
+    needs: [setup, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -142,10 +191,10 @@ jobs:
           tag="${{ steps.nextver.outputs.tag }}"
           gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
-            --target origin/main \
+            --target main \
             --prerelease \
             --title "aish $tag (dev)" \
-            --notes "Development build from $(git rev-parse --short origin/main). Unstable — for testing only." \
+            --notes "Development build (${{ needs.setup.outputs.platforms }}) from $(git rev-parse --short origin/main). Unstable — for testing only." \
             dist/aish-* dist/SHA256SUMS
         shell: bash
 
@@ -154,17 +203,19 @@ jobs:
       # upload, which 422s on this immutable-release repo — see run 28553643115),
       # but masking publish errors with `|| true` previously let zero-asset
       # releases ship green and silently break `:update --channel dev`. Assert the
-      # 7 expected assets (3 binaries + 3 .sha256 + SHA256SUMS) exist.
+      # expected asset count for the selected platform set (2 per target + 1
+      # aggregate SHA256SUMS), computed by the setup job.
       - name: Verify release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="${{ steps.nextver.outputs.tag }}"
+          expected="${{ needs.setup.outputs.expected_assets }}"
           count="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')"
-          echo "Published $tag with $count assets."
-          if [ "$count" -lt 7 ]; then
-            echo "::error::Dev release $tag published with $count assets (expected 7). ':update --channel dev' would break. Failing so this surfaces instead of shipping silently."
+          echo "Published $tag with $count assets (expected $expected)."
+          if [ "$count" -lt "$expected" ]; then
+            echo "::error::Dev release $tag published with $count assets (expected $expected). ':update --channel dev' would break. Failing so this surfaces instead of shipping silently."
             exit 1
           fi
         shell: bash
