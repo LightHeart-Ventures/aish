@@ -49,6 +49,13 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// primary buffer on unwind.
 static ALT_SCREEN: AtomicBool = AtomicBool::new(false);
 
+/// True once we have XTSAVE'd + disabled xterm "alternate scroll" mode (DECSET
+/// 1007) for the footer scroll region. Guards the save so region re-asserts
+/// (resize / resume) don't clobber the saved *original* setting with the
+/// already-disabled value, and gates the paired restore on teardown. See
+/// [`suppress_alt_scroll_seq`] for the why.
+static ALT_SCROLL_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+
 /// Last footer content painted `(status_msg, statusline)`, so a screen-clear
 /// (Shift-Tab worker cycle, etc.) can repaint the footer without the caller
 /// threading the strings back through.
@@ -195,6 +202,56 @@ pub fn scroll_region_seq(rows: u16) -> String {
 /// Reset the scroll region to the full screen (`DECSTBM` with no params).
 pub const RESET_REGION: &str = "\x1b[r";
 
+// ---------------------------------------------------------------------------
+// Mouse-wheel scrollback fix (xterm "alternate scroll", DECSET 1007).
+//
+// aish enables NO mouse tracking of its own, but the bottom-anchored footer
+// keeps a DECSTBM scroll region installed for the whole session. On terminals
+// where xterm "alternate scroll" mode (private mode 1007) is enabled — the
+// default on VTE / gnome-terminal and several others — a live, less-than-full
+// screen scroll region makes the terminal translate mouse-wheel ticks into
+// cursor-key (Up / Down) events instead of scrolling its own scrollback. Those
+// arrow keys land in rustyline at the prompt, so every wheel tick scrolled
+// *input history* instead of the output area — the "mouse scroll scrolls
+// history" complaint.
+//
+// The fix: while the footer region is installed, disable mode 1007 so the wheel
+// drives the terminal's native scrollback (the output field the user wants to
+// scroll). We XTSAVE the user's prior setting first and XTRESTORE it when the
+// region is torn down (session exit, foreground-child suspend, panic) so we
+// never permanently change the terminal's wheel behavior for child programs.
+// Terminals that don't implement 1007 / XTSAVE simply ignore these sequences.
+// ---------------------------------------------------------------------------
+
+/// XTRESTORE private mode 1007 (pop the alternate-scroll setting pushed by the
+/// paired XTSAVE `\x1b[?1007s` in [`suppress_alt_scroll_seq`]). The suppress
+/// side XTSAVEs (`\x1b[?1007s`) then DECRSTs (`\x1b[?1007l`, disable) mode 1007.
+const ALT_SCROLL_RESTORE: &str = "\x1b[?1007r";
+
+/// The escape sequence to suppress alternate-scroll for the footer region: on
+/// the FIRST call (per suppression cycle) it XTSAVEs the user's setting then
+/// disables mode 1007; on subsequent calls (region re-asserted on resize /
+/// resume) it returns `""` so the already-saved original is preserved rather
+/// than overwritten with the disabled value.
+fn suppress_alt_scroll_seq() -> &'static str {
+    if ALT_SCROLL_SUPPRESSED.swap(true, Ordering::Relaxed) {
+        "" // already suppressed — re-saving would clobber the real original
+    } else {
+        concat!("\x1b[?1007s", "\x1b[?1007l") // = ALT_SCROLL_SAVE + ALT_SCROLL_OFF
+    }
+}
+
+/// The escape sequence to restore the pre-suppression alternate-scroll setting
+/// when the footer region is torn down. Returns the XTRESTORE only when we had
+/// actually suppressed (so a spurious teardown never emits a stray restore).
+fn restore_alt_scroll_seq() -> &'static str {
+    if ALT_SCROLL_SUPPRESSED.swap(false, Ordering::Relaxed) {
+        ALT_SCROLL_RESTORE
+    } else {
+        ""
+    }
+}
+
 /// A solid horizontal rule `cols` wide. Uses `─` (U+2500) when `utf8`, else the
 /// ASCII `-`. Wrapped in dim SGR when `color_on`.
 pub fn separator_line(cols: u16, utf8: bool, color_on: bool) -> String {
@@ -335,7 +392,15 @@ impl Terminal {
         }
         let body_bottom = self.rows.saturating_sub(FOOTER_ROWS).max(1);
         let mut out = std::io::stdout();
-        let _ = write!(out, "{}\x1b[{body_bottom};1H", scroll_region_seq(self.rows));
+        // Install the region, suppress alternate-scroll (so the mouse wheel
+        // scrolls native scrollback instead of emitting Up/Down into rustyline),
+        // then home into the body.
+        let _ = write!(
+            out,
+            "{}{}\x1b[{body_bottom};1H",
+            scroll_region_seq(self.rows),
+            suppress_alt_scroll_seq(),
+        );
         let _ = out.flush();
         self.active = true;
         ACTIVE.store(true, Ordering::Relaxed);
@@ -349,9 +414,13 @@ impl Terminal {
         }
         let sep_row = self.rows.saturating_sub(2).max(1);
         let mut out = std::io::stdout();
-        // Reset region first, then clear from the footer's top row to end of
-        // screen so no stale statusline is left behind.
-        let _ = write!(out, "{RESET_REGION}\x1b[{sep_row};1H\x1b[J");
+        // Restore alternate-scroll, reset region, then clear from the footer's
+        // top row to end of screen so no stale statusline is left behind.
+        let _ = write!(
+            out,
+            "{}{RESET_REGION}\x1b[{sep_row};1H\x1b[J",
+            restore_alt_scroll_seq(),
+        );
         let _ = out.flush();
         self.active = false;
         ACTIVE.store(false, Ordering::Relaxed);
@@ -443,9 +512,13 @@ pub fn suspend_footer_region() -> bool {
         return false;
     };
     let sep_row = rows.saturating_sub(2).max(1);
-    // DECSC → reset region to full screen → clear the footer rows → DECRC, so
-    // the cursor stays exactly where the command line left it.
-    let seq = format!("\x1b7{RESET_REGION}\x1b[{sep_row};1H\x1b[J\x1b8");
+    // DECSC → restore alternate-scroll (child gets normal wheel behavior) →
+    // reset region to full screen → clear the footer rows → DECRC, so the
+    // cursor stays exactly where the command line left it.
+    let seq = format!(
+        "\x1b7{}{RESET_REGION}\x1b[{sep_row};1H\x1b[J\x1b8",
+        restore_alt_scroll_seq(),
+    );
     let mut out = std::io::stdout();
     let _ = write!(out, "{seq}");
     let _ = out.flush();
@@ -470,7 +543,12 @@ pub fn resume_footer_region() {
     // drop the cursor into the last body row so subsequent output stays above
     // the footer instead of stranding at the top of the screen.
     let body_bottom = rows.saturating_sub(FOOTER_ROWS).max(1);
-    let seq = format!("{}\x1b[{body_bottom};1H", scroll_region_seq(rows));
+    // Re-suppress alternate-scroll alongside re-asserting the region.
+    let seq = format!(
+        "{}{}\x1b[{body_bottom};1H",
+        scroll_region_seq(rows),
+        suppress_alt_scroll_seq(),
+    );
     let mut out = std::io::stdout();
     let _ = write!(out, "{seq}");
     let _ = out.flush();
@@ -583,7 +661,7 @@ pub fn install_panic_hook() {
         }
         if ACTIVE.load(Ordering::Relaxed) {
             let mut out = std::io::stdout();
-            let _ = write!(out, "{RESET_REGION}\r\n");
+            let _ = write!(out, "{}{RESET_REGION}\r\n", restore_alt_scroll_seq());
             let _ = out.flush();
             ACTIVE.store(false, Ordering::Relaxed);
         }
@@ -624,6 +702,39 @@ fn utf8_locale() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alt_scroll_suppress_saves_once_then_restores() {
+        // Deterministic starting point: not yet suppressed.
+        ALT_SCROLL_SUPPRESSED.store(false, Ordering::Relaxed);
+
+        // First suppress: XTSAVE (1007s) then disable (1007l), so the wheel
+        // drives native scrollback instead of arrowing rustyline history.
+        let first = suppress_alt_scroll_seq();
+        assert_eq!(first, "\x1b[?1007s\x1b[?1007l");
+        assert!(ALT_SCROLL_SUPPRESSED.load(Ordering::Relaxed));
+
+        // Re-assert (resize/resume) must NOT re-save — that would clobber the
+        // user's real original with the already-disabled value.
+        assert_eq!(suppress_alt_scroll_seq(), "");
+        assert!(ALT_SCROLL_SUPPRESSED.load(Ordering::Relaxed));
+
+        // Teardown restores exactly once (XTRESTORE 1007r) and clears the flag.
+        assert_eq!(restore_alt_scroll_seq(), "\x1b[?1007r");
+        assert!(!ALT_SCROLL_SUPPRESSED.load(Ordering::Relaxed));
+
+        // A spurious second restore emits nothing (never a stray XTRESTORE).
+        assert_eq!(restore_alt_scroll_seq(), "");
+
+        // The disable half is DECRST of private mode 1007 — the mode that,
+        // when enabled, turns wheel ticks into cursor keys under a scroll
+        // region. Assert the byte-level shape of the restore constant too.
+        assert!(suppress_alt_scroll_seq().contains("\x1b[?1007l"));
+        assert_eq!(ALT_SCROLL_RESTORE, "\x1b[?1007r");
+
+        // Reset shared state so sibling tests that touch this global start clean.
+        ALT_SCROLL_SUPPRESSED.store(false, Ordering::Relaxed);
+    }
 
     #[test]
     fn scroll_region_reserves_three_bottom_rows() {
