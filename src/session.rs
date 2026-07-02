@@ -747,6 +747,11 @@ Starting cwd: {cwd}\n\
 \n\
 Core Rules (NEVER break these):\n\
 - Intent in, results out. Parse natural language and execute via tools. Chain steps aggressively.\n\
+- Batch tool calls: fire ALL independent calls in ONE turn — the engine runs every call in a turn \
+together, so front-loading your context-gathering (one up-front block of reads, greps, list_dirs, \
+status queries selecting the whole known toolset you'll need) instead of drip-feeding one per round \
+saves a model round-trip each — ~2 turns + 2 round-trips/run. Only serialize a call when it depends \
+on an earlier call's result.\n\
 - NO shell syntax: no pipes, globs, redirection, &&/||, command substitution. Use list_dir + \
 run_program chains. Filter/aggregate yourself.\n\
 - change_dir updates session state for everything after.\n\
@@ -1032,6 +1037,27 @@ mod tests {
             assert!(
                 p.contains("Escalate fix to stronger agent"),
                 "missing escalate-to-agent directive"
+            );
+        }
+    }
+
+    #[test]
+    fn system_prompt_carries_batch_tool_calls_rule() {
+        // The "batch independent tool calls into one turn" efficiency rule is a
+        // baked-in prompt rule — present regardless of escalate availability —
+        // so every aish (interactive or coordinator) front-loads its
+        // context-gathering and spends fewer round-trips per run.
+        let session = Session::new().unwrap();
+        for escalate in [false, true] {
+            let p = session.system_prompt(escalate);
+            assert!(p.contains("Batch tool calls"), "missing batch-tool-calls rule");
+            assert!(
+                p.contains("fire ALL independent calls in ONE turn"),
+                "missing batch-in-one-turn directive"
+            );
+            assert!(
+                p.contains("Only serialize a call when it depends"),
+                "missing dependency-serialization caveat"
             );
         }
     }
