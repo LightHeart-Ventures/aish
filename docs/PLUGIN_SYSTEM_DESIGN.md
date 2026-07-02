@@ -1021,6 +1021,36 @@ write.
 **Example.** `examples/plugins/hello-world/login.sh` is a minimal device-code-style
 handler that emits a fake token object, demonstrating the stdout JSON contract.
 
+### 0.5.7 consolidation tests
+
+`src/plugin_phase05_consolidation_tests.rs` is the Phase-0.5 acceptance harness: six
+tests that exercise the whole plugin surface **together** against real on-disk fixtures
+(`tempfile` plugin roots + a `credentials` file), rather than re-testing any single
+module in isolation. Every test builds a fixture with an enterprise-style plugin
+(`enterprise`: `.mcp.json` with a `${profile:enterprise}` ref, a `login.sh` handler, an
+`on_init.sh` env emitter, and a `hooks.json` fragment) plus a second `team` plugin used
+to force cross-plugin collisions.
+
+| Test | Covers (checklist item) |
+|---|---|
+| `end_to_end_single_plugin_install_and_login_unlock` | The headline unlock — one install + `login` wires login round-trip → credential persistence → `${profile:…}` MCP resolution → `AISH_PROFILE_*` hook env → `KEY=VALUE` session-env injection, all in sequence. |
+| `catalog_merge_precedence_and_override_from_disk` | Hook catalog merge + precedence, multi-source `observe` fan-out, **override-by-name** (local wins over plugin), and **disable-via-tombstone** (`enabled:false`). |
+| `blocking_veto_composition_structural` | Blocking-veto from a plugin hook entry — single-blocking-winner composition. |
+| `mcp_collision_against_config_scope` | `.mcp.json` merge with the first-one-wins collision policy against the user/config scope; surviving vs. shadowed servers. |
+| `login_roundtrip_profile_readback` | `login <id>` handler → `[profile:<id>]` persisted at 0600 → read back via the profile loader. |
+| `env_injection_rejects_credential_like_from_hook` | Security guardrail — a hook emitting a credential-like `KEY=VALUE` is rejected before it can reach the session env. |
+
+**Fixture note / gotchas encoded in the tests:** hook `action` types are `command`
+(observe / non-blocking) or `rule` (blocking) — there is no `observe` action type;
+event names are PascalCase and validated at load (a bad name voids the whole fragment
+file); and plugin discovery is **id-sorted ascending**, so on an MCP-server-name
+collision the alphabetically-first plugin id keeps the name (`enterprise` < `team`).
+
+Run: `cargo test --no-default-features --locked plugin_phase05_consolidation_tests`
+(6 passed). The full `plugins:: hooks:: mcp:: plugin_auth::` surface is 115 passed / 0
+failed.
+
+
 ### What is explicitly NOT required for the enterprise plugin
 
 The **webhook broker / dynamic-forwarding apparatus (Phases 4, 5, 7, 10)** is *not* a
@@ -1062,8 +1092,11 @@ just enterprise. **Estimate:** ~8 SP. Slots **before** Phase 4.
       `AISH_PROFILE_<PLUGIN>_<FIELD>`. See "0.5.5 implementation notes" below.*
 - [ ] 0.5.6 `:hooks list` shows plugin-contributed entries with provenance; `:plugin
       info <id>` shows which catalog events it registers.
-- [ ] 0.5.7 Tests: catalog merge + precedence, blocking-veto from a plugin entry,
+- [x] 0.5.7 Tests: catalog merge + precedence, blocking-veto from a plugin entry,
       `.mcp.json` merge, env injection, login round-trip, override/disable a plugin hook.
+      *Done: `src/plugin_phase05_consolidation_tests.rs` (6 cross-cutting tests) wires
+      the whole 0.5.x surface end-to-end against on-disk fixtures rather than any single
+      module in isolation — see "0.5.7 consolidation tests" below.*
 
 **Why 0.5 is the true unlock:** with 0.5.2–0.5.5 in place, the entire commercial
 client footprint collapses to *one plugin install + `aish login`* — the enterprise
