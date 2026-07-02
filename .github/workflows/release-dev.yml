@@ -36,7 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: origin/main
+          ref: main
 
       - name: Resolve next semantic version
         id: nextver
@@ -142,10 +142,10 @@ jobs:
           tag="${{ steps.nextver.outputs.tag }}"
           gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
-            --target origin/main \
+            --target "$GITHUB_SHA" \
             --prerelease \
             --title "aish $tag (dev)" \
-            --notes "Development build from $(git rev-parse --short origin/main). Unstable — for testing only." \
+            --notes "Development build from $(git rev-parse --short "$GITHUB_SHA"). Unstable — for testing only." \
             dist/aish-* dist/SHA256SUMS
         shell: bash
 
