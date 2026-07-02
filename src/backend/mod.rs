@@ -219,6 +219,25 @@ pub struct ToolDef {
     pub schema: Value,
 }
 
+/// One incremental piece of a streamed completion, handed to a [`StreamSink`]
+/// the instant it is decoded off the wire (S8.1). `Text` is visible answer
+/// prose; `Thinking` is the model's extended-thinking trace, which a caller may
+/// render dimmed or ignore entirely. Deltas are NOT line-buffered — a sink may
+/// receive a single character or a whole paragraph in one call — so the
+/// acceptance criterion "tokens arrive incrementally" is satisfied at whatever
+/// granularity the provider emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamDelta<'a> {
+    Text(&'a str),
+    Thinking(&'a str),
+}
+
+/// A synchronous callback the backend invokes for every [`StreamDelta`] as a
+/// streamed completion is decoded. It runs on the task driving the stream,
+/// BETWEEN `await`s (never held across one), so it must not block — the typical
+/// sink writes the delta straight to stderr; a test sink pushes onto a `Vec`.
+pub type StreamSink<'a> = &'a mut dyn FnMut(StreamDelta<'_>);
+
 /// Enum dispatch — three backends.
 pub enum Backend {
     Claude(claude::ClaudeBackend),
@@ -281,6 +300,33 @@ impl Backend {
             Backend::Grok(b) => b.complete(system, history, tools).await,
             #[cfg(feature = "local")]
             Backend::Local(b) => b.complete(system, history, tools).await,
+        }
+    }
+
+    /// Stream a completion, delivering output to `sink` incrementally as tokens
+    /// arrive, and returning the same normalized [`Turn`] as [`Backend::complete`]
+    /// once the response finishes (S8.1). Claude decodes the Anthropic SSE token
+    /// stream and emits each text/thinking delta the moment it lands — this is
+    /// the path the acceptance criterion ("tokens arrive incrementally through
+    /// the backend trait") is about. The other backends expose no native token
+    /// stream here yet, so they degrade to a single deferred emission: run
+    /// `complete`, then hand the whole answer to the sink once. Callers get a
+    /// uniform streaming API regardless of provider, and the returned `Turn` is
+    /// byte-identical to what `complete` would have produced.
+    pub async fn complete_streaming(
+        &self,
+        system: &str,
+        history: &[Msg],
+        tools: &[ToolDef],
+        sink: StreamSink<'_>,
+    ) -> Result<Turn> {
+        match self {
+            Backend::Claude(b) => b.complete_streaming(system, history, tools, sink).await,
+            Backend::Grok(b) => deferred_stream(b.complete(system, history, tools).await?, sink),
+            #[cfg(feature = "local")]
+            Backend::Local(b) => {
+                deferred_stream(b.complete(system, history, tools).await?, sink)
+            }
         }
     }
 
@@ -352,6 +398,17 @@ impl Backend {
             }
         }
     }
+}
+
+/// Fallback streaming for backends without a native token stream: the whole
+/// answer already exists on `turn`, so emit it to the sink in one shot (only
+/// when non-empty) and return the turn unchanged. Keeps `complete_streaming`
+/// uniform across providers without pretending to stream token-by-token.
+fn deferred_stream(turn: Turn, sink: StreamSink<'_>) -> Result<Turn> {
+    if !turn.text.is_empty() {
+        sink(StreamDelta::Text(&turn.text));
+    }
+    Ok(turn)
 }
 
 /// Pure escalation policy, split out so it's unit-testable without constructing
