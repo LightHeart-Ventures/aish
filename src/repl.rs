@@ -929,9 +929,11 @@ pub async fn run(
                 // redrawn prompt, matching the command path (never a prompt jammed
                 // flush against the cycled coordinator's output).
                 //
-                // With no workers to attach to, `cycle_worker` is a silent
-                // no-op (returns false) — DON'T arm the gap or otherwise
-                // disturb the prompt in that case.
+                // `cycle_worker` returns false when there's nothing to separate
+                // from the next prompt — no workers to attach to (silent no-op),
+                // OR the hop that wraps back to the interactive prompt (it prints
+                // nothing and re-anchors the cursor itself). Either way, DON'T arm
+                // the gap in those cases.
                 if cycle_worker(&mut session) {
                     needs_gap = true;
                 }
@@ -3980,7 +3982,13 @@ fn cycle_worker(session: &mut Session) -> bool {
         // No output-field hint here: the detached "back to interactive" state is
         // already reflected on the 2nd statusline (see `coordinator_status_line`),
         // so printing it again would just be redundant noise in the scrollback.
-        return true;
+        //
+        // Return false so the caller does NOT arm `needs_gap`: this branch prints
+        // no output, and `leave_alt_screen` already restored the primary buffer +
+        // anchored the cursor to the bottom body row, so the prompt should redraw
+        // right there. Arming the gap would inject blank lines that scroll the
+        // restored interactive output up two rows on every return trip.
+        return false;
     }
 
     // Switch the screen to the worker view WITHOUT destroying interactive
@@ -3991,6 +3999,12 @@ fn cycle_worker(session: &mut Session) -> bool {
     if crate::terminal::on_alt_screen() {
         clear_screen_anchor_bottom();
     } else {
+        // Erase the ephemeral interactive prompt row BEFORE `enter_alt_screen`'s
+        // `ESC[?1049h` snapshots the primary buffer — otherwise that stale prompt
+        // is saved, restored verbatim on the way back to interactive, and the
+        // REPL's freshly-drawn prompt stacks below it, piling up one empty prompt
+        // per Shift-Tab round-trip (the "loads up with prompts" bug).
+        crate::terminal::erase_current_line();
         crate::terminal::enter_alt_screen();
     }
     let (run_id, terminal, task) = workers[next_idx - 1].clone();
