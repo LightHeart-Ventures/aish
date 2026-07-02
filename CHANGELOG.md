@@ -4,6 +4,9 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Changed
+- **Collapsed tool-output activity stream + symmetric Ctrl-O toggle**: after a tool/worker call the interactive activity stream no longer echoes the last 5 output lines — it shows a single `… N lines of output — Ctrl-O to expand` summary above the running status line. Ctrl-O is now a true toggle: pressing it expands the last turn's tool results verbatim (`reveal_last_turn`), and pressing it again re-collapses them back to the line-count summary (new `engine::collapse_last_turn`). The full output is always one keystroke away instead of consuming scrollback on every call.
+
 ### Added
 - **Plugin system — skill-registry expansion (first slice)**: aish now discovers plugins under `~/.aish/plugins/<id>/` and merges each enabled plugin's skills into the same catalog it advertises for `~/.aish/skills`. A plugin is any directory with a readable `plugin.json`; its skills use the standard `skills/<name>/SKILL.md` layout. Installed skills win on a name collision; disabled/malformed plugins are skipped silently. New `src/plugins.rs` + `skills::load_catalog`, wired into startup, the deferred interactive MCP handshake, and `:skill` reloads. Ships a runnable `examples/plugins/hello-world/` plugin that contributes one greeting skill as an end-to-end proof. See `docs/PLUGIN_SYSTEM_DESIGN.md` § Implementation status.
 
