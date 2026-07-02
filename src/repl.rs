@@ -478,10 +478,9 @@ pub async fn run(
         // completion), fading back to dim ⟳N after worker::PULSE_FADE.
         let pulse = crate::worker::fresh_pulse(&session.worker_jobs);
         let badge = crate::worker::pulse_badge(running, pulse);
-        let name = match &session.name {
-            Some(n) => format!("\x1b[1;35m[{n}]\x1b[0m | "), // bold magenta, set apart from the cyan path
-            None => String::new(),
-        };
+        // The session name (`:rename`) is no longer shown in the prompt — it's
+        // right-justified on the 2nd statusline instead (see
+        // `coordinator_status_message`).
         // `:attach`ed coordinator indicator — bold yellow `⇄<id>` makes it obvious
         // that what you type is steered to that coordinator, not run here.
         let attach = match &*session.attached.lock().unwrap() {
@@ -489,7 +488,7 @@ pub async fn run(
             None => String::new(),
         };
         let prompt = format!(
-            "{name}{attach}{badge}\x1b[36m{}\x1b[0m ❯ ",
+            "{attach}{badge}\x1b[36m{}\x1b[0m ❯ ",
             short_cwd(&session)
         );
         
@@ -1024,7 +1023,16 @@ fn coordinator_status_message(session: &Session) -> String {
         .rev()
         .map(|w| (w.id.clone(), matches!(w.status().as_str(), "done" | "failed")))
         .collect();
-    coordinator_status_line(attached.as_deref(), &workers, crate::style::colors_enabled())
+    let color_on = crate::style::colors_enabled();
+    let left = coordinator_status_line(attached.as_deref(), &workers, color_on);
+    // Right-justify the session name (`:rename`) on this row, directly above the
+    // clock on the statusline below — same dim color. Blank when unnamed.
+    crate::style::second_statusline_at(
+        &left,
+        session.name.as_deref(),
+        crate::style::footer_width(),
+        color_on,
+    )
 }
 
 /// Pure form of [`coordinator_status_message`]: caller supplies the attach
