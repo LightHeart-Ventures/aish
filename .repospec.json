@@ -1,7 +1,7 @@
 {
   "schema": "repospec/v1",
   "name": "aish",
-  "version": "0.25.2",
+  "version": "0.26.0",
   "description": "An AI-native Linux shell that routes commands and intent to Claude or local LLMs",
   "repository": "https://github.com/LightHeart-Ventures/aish",
   "license": "Apache-2.0",
