@@ -85,6 +85,14 @@ fn gate() -> &'static Gate {
     })
 }
 
+/// Whether a mid-turn key watcher is currently installed (owns stdin in cbreak
+/// mode). Other stdin consumers that flip termios themselves — e.g. the S8.3
+/// stream-cancel watcher — consult this so they stay inert rather than fighting
+/// the turn watcher over the tty.
+pub fn installed() -> bool {
+    gate().installed.load(Ordering::Acquire)
+}
+
 fn stdin_is_tty() -> bool {
     // SAFETY: plain isatty query on fd 0.
     unsafe { libc::isatty(0) == 1 }
