@@ -45,6 +45,12 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// A callback the reader thread invokes DIRECTLY on a mid-turn Shift-Tab, so the
+/// worker-cycle happens even when the async turn task is blocked and can't drain
+/// the channel. It must only touch `Send + Sync` shared state (the attach-cursor
+/// `Arc<Mutex>` handles) — it runs on the keywatch reader thread.
+pub type ShiftTabFn = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// A key event surfaced by the mid-turn watcher. An enum (rather than a bare
 /// unit) so future mid-turn keys can be added without reshaping the channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,7 +186,7 @@ fn scan_csi_z(mut state: u8, bytes: &[u8]) -> (u8, usize) {
 /// The reader loop, run on a dedicated std thread for the life of one turn.
 /// Owns cbreak↔cooked flips for the foreground-pgrp handoff; never touches
 /// termios while `suspend` is set (the confirm path owns it then).
-fn reader_loop(tx: mpsc::UnboundedSender<TurnKey>) {
+fn reader_loop(tx: mpsc::UnboundedSender<TurnKey>, on_shift_tab: Option<ShiftTabFn>) {
     let g = gate();
     // We applied cbreak at install; track it so we only flip on transitions.
     let mut have_cbreak = true;
@@ -237,8 +243,16 @@ fn reader_loop(tx: mpsc::UnboundedSender<TurnKey>) {
         let (next_state, hits) = scan_csi_z(state, &buf[..n as usize]);
         state = next_state;
         for _ in 0..hits {
-            // Shift-Tab. Best-effort send; a full/closed channel just drops the
-            // event (the guard is being torn down).
+            // Shift-Tab. Act on it TWO ways so it lands regardless of whether the
+            // hosting `select!` gets re-polled: (1) invoke the direct callback on
+            // THIS thread — it only touches `Arc<Mutex>` attach-cursor handles, so
+            // it cycles the view even while the async turn task is stuck in a
+            // blocking / CPU-bound stretch that never yields to drain the channel;
+            // (2) also push onto the channel for any `select!` consumer that still
+            // wants the event. Best-effort send; a closed channel just drops it.
+            if let Some(cb) = on_shift_tab.as_ref() {
+                cb();
+            }
             let _ = tx.send(TurnKey::ShiftTab);
         }
     }
@@ -261,7 +275,12 @@ impl TurnKeyWatch {
     /// Install the watcher for the current turn. A no-op inert guard when stdin
     /// isn't a tty, when termios can't be read, or when a watcher is somehow
     /// already installed (re-entrancy guard).
-    pub fn install() -> Self {
+    ///
+    /// `on_shift_tab` (when `Some`) is invoked DIRECTLY on the reader thread for
+    /// each mid-turn Shift-Tab, so the worker-cycle fires even while the async
+    /// turn task is stuck in a blocking / CPU-bound stretch that never yields to
+    /// drain the channel `select!` awaits. The channel event is still emitted.
+    pub fn install(on_shift_tab: Option<ShiftTabFn>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let g = gate();
         if !stdin_is_tty() || g.installed.load(Ordering::Acquire) {
@@ -288,7 +307,7 @@ impl TurnKeyWatch {
         let reader_tx = tx.clone();
         let handle = std::thread::Builder::new()
             .name("aish-keywatch".into())
-            .spawn(move || reader_loop(reader_tx))
+            .spawn(move || reader_loop(reader_tx, on_shift_tab))
             .ok();
         TurnKeyWatch {
             active: handle.is_some(),

@@ -791,7 +791,22 @@ pub async fn run(
                     // cooked mode on drop; `confirm_tty` coordinates via the
                     // keywatch gate so y/N prompts still echo + line-edit, and the
                     // reader parks itself during `run_interactive` TTY hand-offs.
-                    let mut keywatch = crate::keywatch::TurnKeyWatch::install();
+                    // Hand the reader thread a direct Shift-Tab action bound to
+                    // cloned attach-cursor handles. It fires on the reader thread
+                    // itself, so cycling works even during a blocking/CPU-bound
+                    // stretch of the turn (heavy escalate/tool work) that never
+                    // yields to let `select!` drain the channel — the class of
+                    // "Shift-Tab does nothing while thinking/escalating/long tool
+                    // run" the channel-only path missed.
+                    let cb_workers = cyc_workers.clone();
+                    let cb_attached = cyc_attached.clone();
+                    let cb_review = cyc_review.clone();
+                    let on_shift_tab: crate::keywatch::ShiftTabFn =
+                        std::sync::Arc::new(move || {
+                            cycle_worker_live(&cb_workers, &cb_attached, &cb_review);
+                        });
+                    let mut keywatch =
+                        crate::keywatch::TurnKeyWatch::install(Some(on_shift_tab));
                     let turn = engine::run_turn(&backend, &mut session, line, &mut confirm);
                     tokio::pin!(turn);
                     loop {
@@ -808,13 +823,15 @@ pub async fn run(
                                 break;
                             }
                             Some(k) = keywatch.recv() => match k {
-                                // Shift-Tab pressed mid-turn: cycle the attach
-                                // cursor live. No screen-clear/backfill here — the
-                                // turn is actively streaming — just flip the cursor
-                                // so the worker forwarder starts routing output.
-                                crate::keywatch::TurnKey::ShiftTab => {
-                                    cycle_worker_live(&cyc_workers, &cyc_attached, &cyc_review);
-                                }
+                                // Shift-Tab pressed mid-turn. The reader thread's
+                                // direct callback (installed above) already ran
+                                // `cycle_worker_live`, so this branch just drains
+                                // the mirrored channel event to keep the receiver
+                                // empty — cycling here too would double-advance the
+                                // attach cursor. Kept so the branch stays wired for
+                                // any future mid-turn key that needs `&mut turn`
+                                // ownership the reader thread can't take.
+                                crate::keywatch::TurnKey::ShiftTab => {}
                             },
                         }
                     }
