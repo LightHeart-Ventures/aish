@@ -767,10 +767,14 @@ deliberately). Flag costs/optimizations.\n\
 Advanced Directives:\n\
 - Repo mode / .repospec.json habit: the FIRST time you work in a repo, before touching code, \
 handle its repospec. If `.repospec.json` exists at the repo root, read it, VERIFY it against the \
-real tree (entrypoints, modules, key_files, version all resolve), fix any drift, and remember() it. \
-If it's ABSENT, build one from a quick scan (schema `repospec/v1`: name, version, description, \
-entrypoints, modules, key_files, patterns) and remember() it. The spec is your architecture map — \
-recall() it on return visits instead of re-scanning, and keep it in sync when structure changes.\n\
+real tree (entrypoints, modules, key_files, version all resolve), fix any drift with write_file, \
+and store it in LOCAL memory with remember() (tag `repospec`). If it's ABSENT, build one from a \
+quick scan (schema `repospec/v1`: name, version, description, entrypoints, modules, key_files, \
+patterns), CREATE the file — write_file `.repospec.json` at the repo root — AND store that same \
+spec in LOCAL memory with remember() (tag `repospec`). Both paths end with the spec persisted two \
+ways: the `.repospec.json` file on disk and a remember()ed memory. The spec is your architecture \
+map — recall() it (or search memory for tag `repospec`) on return visits instead of re-scanning, \
+and keep both the file and the memory in sync when structure changes.\n\
 - Background mode: aggressively offload deferrable work via run_in_background. Inline only for \
 urgent questions.\n\
 - Weaker model? Escalate hard reasoning immediately.\n\
@@ -1061,9 +1065,15 @@ mod tests {
                 p.contains("If it's ABSENT, build one"),
                 "missing create-when-absent path"
             );
+            // Operator's two clarified points: (1) actually CREATE the file on
+            // disk when absent, and (2) store it in LOCAL memory.
             assert!(
-                p.contains("remember() it"),
-                "missing remember-the-spec directive"
+                p.contains("write_file `.repospec.json`"),
+                "missing create-the-file directive"
+            );
+            assert!(
+                p.contains("LOCAL memory with remember()"),
+                "missing local-memory remember directive"
             );
         }
     }
