@@ -422,6 +422,65 @@ pub fn restore_after_clear() {
     paint_cached_footer(true);
 }
 
+/// Suspend the bottom-anchored footer scroll region for the duration of a
+/// foreground child that inherits the terminal (`sudo`, `vim`, `less`, …).
+/// Resets DECSTBM to the full screen and erases the three footer rows so the
+/// child sees an ordinary terminal with no reserved bottom rows — otherwise a
+/// program that writes near the bottom of the screen (most visibly sudo's
+/// echo-off password prompt) collides with the footer zone and its output is
+/// intermittently hidden until an extra keystroke forces a repaint. The current
+/// cursor is preserved: DECSTBM reset homes the cursor to the top-left as a
+/// documented side effect, so the reset is wrapped in DECSC/DECRC and the
+/// child's first output continues exactly where the command line left off.
+/// Returns `true` when a region was actually torn down, so the caller knows to
+/// pair it with [`resume_footer_region`] on the way out. No-op (returns `false`)
+/// when no footer region is installed.
+pub fn suspend_footer_region() -> bool {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some((rows, _cols)) = term_size() else {
+        return false;
+    };
+    let sep_row = rows.saturating_sub(2).max(1);
+    // DECSC → reset region to full screen → clear the footer rows → DECRC, so
+    // the cursor stays exactly where the command line left it.
+    let seq = format!("\x1b7{RESET_REGION}\x1b[{sep_row};1H\x1b[J\x1b8");
+    let mut out = std::io::stdout();
+    let _ = write!(out, "{seq}");
+    let _ = out.flush();
+    ACTIVE.store(false, Ordering::Relaxed);
+    true
+}
+
+/// Re-establish the footer scroll region and repaint the cached footer after a
+/// foreground child that inherited the full terminal exits. Pairs with
+/// [`suspend_footer_region`]. Homes the cursor into the last body row so the
+/// next prompt grows up from just above the footer (mirrors
+/// [`Terminal::init_scroll_region`]). No-op when the terminal is now too short
+/// to host the footer (e.g. it was resized smaller while the child ran).
+pub fn resume_footer_region() {
+    let Some((rows, _cols)) = term_size() else {
+        return;
+    };
+    if rows < MIN_FOOTER_ROWS {
+        return;
+    }
+    // Re-assert DECSTBM (homes the cursor to top-left as a side effect), then
+    // drop the cursor into the last body row so subsequent output stays above
+    // the footer instead of stranding at the top of the screen.
+    let body_bottom = rows.saturating_sub(FOOTER_ROWS).max(1);
+    let seq = format!("{}\x1b[{body_bottom};1H", scroll_region_seq(rows));
+    let mut out = std::io::stdout();
+    let _ = write!(out, "{seq}");
+    let _ = out.flush();
+    ACTIVE.store(true, Ordering::Relaxed);
+    // Repaint the pinned footer rows from cache (cursor-safe: footer_seq wraps
+    // its paint in DECSC/DECRC).
+    paint_cached_footer(false);
+}
+
+
 /// Whether a bottom-anchored footer scroll region is currently installed. Lets
 /// the REPL decide, after a screen clear, whether the cursor was already homed
 /// into the body by [`restore_after_clear`] (footer mode) or still needs to be
@@ -579,6 +638,17 @@ mod tests {
         assert_eq!(bottom_home_seq(24), "\x1b[24;1H");
         // Degenerate zero height clamps to row 1 (never emits ESC[0;1H).
         assert_eq!(bottom_home_seq(0), "\x1b[1;1H");
+    }
+
+    #[test]
+    fn suspend_footer_region_is_noop_when_inactive() {
+        // No footer region installed (the state on every non-interactive
+        // `run_on_tty` call path — scripts, pipelines, tests) → suspend is a
+        // pure no-op that returns false, so the FooterRegionGuard skips its
+        // resume and never emits stray escapes into a child's output stream.
+        ACTIVE.store(false, Ordering::Relaxed);
+        assert!(!suspend_footer_region());
+        assert!(!ACTIVE.load(Ordering::Relaxed));
     }
 
     #[test]
