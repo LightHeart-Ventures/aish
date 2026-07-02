@@ -2532,6 +2532,14 @@ pub async fn run_on_tty(
     use std::os::unix::process::CommandExt;
 
     let _guard = TtyGuard::engage();
+    // Suspend aish's bottom-anchored footer scroll region so the child inherits
+    // a full-screen terminal with no reserved rows. Without this, a foreground
+    // program that writes at the bottom of the screen — most visibly sudo's
+    // echo-off password prompt — collides with the footer zone and its prompt
+    // is intermittently hidden until an extra keystroke forces a repaint. The
+    // region + footer are re-established on every exit path by the guard's Drop
+    // (including a Ctrl-C that drops this future mid-await).
+    let _footer = FooterRegionGuard::engage();
 
     // Subscribe to SIGCHLD *before* spawning so an instant-exit child can't fire
     // before we are listening. tokio::signal multiplexes the handler, so tokio's
@@ -2674,6 +2682,34 @@ fn reset_job_control_signals() {
         unsafe { libc::signal(sig, libc::SIG_DFL) };
     }
 }
+
+/// RAII guard that suspends aish's bottom-anchored footer scroll region while a
+/// foreground child owns the terminal, restoring it (and repainting the footer)
+/// on drop. Pairs [`crate::terminal::suspend_footer_region`] with
+/// [`crate::terminal::resume_footer_region`] so every `run_on_tty` exit path —
+/// a normal return or a dropped future (Ctrl-C mid-await) — re-establishes the
+/// footer. A no-op when no footer region was installed (non-interactive runs,
+/// short terminals), so it's safe on every call path into `run_on_tty`.
+struct FooterRegionGuard {
+    was_active: bool,
+}
+
+impl FooterRegionGuard {
+    fn engage() -> Self {
+        Self {
+            was_active: crate::terminal::suspend_footer_region(),
+        }
+    }
+}
+
+impl Drop for FooterRegionGuard {
+    fn drop(&mut self) {
+        if self.was_active {
+            crate::terminal::resume_footer_region();
+        }
+    }
+}
+
 
 /// Owns the foreground child's pid for the lifetime of `run_on_tty`. On the
 /// normal exit path the SIGCHLD task has already reaped it (`reaped = true`); if
