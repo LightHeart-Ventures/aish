@@ -5336,9 +5336,9 @@ async fn handle_colon(
                     }
                 }
             }
-            // Sort the merged listing newest-first (largest start epoch first),
+            // Sort the merged listing oldest-first (smallest start epoch first),
             // then emit. A stable sort keeps same-epoch rows in insertion order.
-            rows_out.sort_by(|a, b| b.0.cmp(&a.0));
+            rows_out.sort_by(|a, b| a.0.cmp(&b.0));
             for (_, row) in &rows_out {
                 table.push_str(row);
             }
