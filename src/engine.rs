@@ -169,6 +169,11 @@ async fn run_turn_inner(
     }
     session.history.push(Msg::user(input));
     session.last_turn_tools.clear();
+    // One logical turn begins here — tally it for the interactive activity-stream
+    // status line (`turns: …`). Counts the LOGICAL turn once (this body runs per
+    // `run_turn`), so a prefill-continuation spanning several rounds isn't
+    // double-counted.
+    session.turns_total = session.turns_total.saturating_add(1);
 
     // Observe hook: UserPromptSubmit — the turn has begun (after compaction +
     // skill-hint folding, the prompt is now the trailing history message). Phase
@@ -277,6 +282,14 @@ async fn run_turn_inner(
             Some(u) => u.total(),
             None => crate::context::estimate_history_tokens(&session.history),
         };
+        // Accumulate this round's token usage into the session totals that feed
+        // the interactive activity-stream status line. Only real backend-reported
+        // usage is summed (the estimate fallback above is a window gauge, not a
+        // billed figure), so `tokens in/out` stays an honest running tally.
+        if let Some(u) = usage {
+            session.tokens_in = session.tokens_in.saturating_add(u.input_tokens);
+            session.tokens_out = session.tokens_out.saturating_add(u.output_tokens);
+        }
 
         // ── Forced summarize: graceful degradation before the hard limit. The
         // model had no tools this step, so `turn.text` is its best final answer.
@@ -536,6 +549,13 @@ async fn run_turn_inner(
                     }
                     result
                 };
+            // Tally this completed tool call and paint the interactive activity
+            // stream: up to the last 5 lines of the call's output, then a running
+            // status line (tokens in/out, tool calls, turns). Mirrors how an
+            // escalation is surfaced — a ✓/✗ header (already drawn by the spinner
+            // finish above) with a short streamed tail beneath it.
+            session.tool_calls_total = session.tool_calls_total.saturating_add(1);
+            emit_activity_stream(session, &result);
             // Observe hooks: PostToolUse (always) + PostToolUseFailure (on error).
             // Carry the tool name, program/path, and the error flag so an audit
             // sink sees the outcome of every call. Zero-cost when unconfigured.
@@ -726,6 +746,51 @@ fn emit_thinking(session: &Session) {
     if session.nested {
         eprintln!("💭 thinking…");
     }
+}
+
+/// Paint the interactive activity stream beneath a just-finished tool call:
+/// up to the last 5 lines of that call's output (dimmed, each clamped to one
+/// physical row) followed by a running status line — `tokens in/out`, the
+/// cumulative `tool calls`, and `turns`. This is the terminal-only companion to
+/// the ✓/✗ header the [`ToolSpinner`] already drew on finish, mirroring how an
+/// escalation surfaces its tail. Silent unless stderr is a TTY (so `aish -c`
+/// piped mode and non-tty background coordinators stay clean), and skipped when
+/// `raw_tool_output` is on (the full result is already being printed verbatim).
+fn emit_activity_stream(session: &Session, result: &ToolResult) {
+    if !stderr_is_tty() || session.raw_tool_output {
+        return;
+    }
+    let cols = stderr_cols();
+    let lines = activity_stream_lines(
+        &result.content,
+        session.tokens_in,
+        session.tokens_out,
+        session.tool_calls_total,
+        session.turns_total,
+    );
+    for line in lines {
+        eprintln!("\x1b[2m{}\x1b[0m", truncate_to_cols(&line, cols));
+    }
+}
+
+/// Pure builder for the interactive activity-stream lines beneath a tool
+/// header: up to the last 5 non-blank output lines (oldest-first, indented),
+/// then the running status line. Kept free of ANSI/terminal I/O so the format
+/// contract is unit-testable; the caller dims + width-clamps each line.
+fn activity_stream_lines(
+    output: &str,
+    tokens_in: usize,
+    tokens_out: usize,
+    tool_calls: usize,
+    turns: usize,
+) -> Vec<String> {
+    let tail: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = tail.len().saturating_sub(5);
+    let mut lines: Vec<String> = tail[start..].iter().map(|l| format!("    {l}")).collect();
+    lines.push(format!(
+        "    tokens in: {tokens_in}, tokens out: {tokens_out}, tool calls: {tool_calls}, turns: {turns}"
+    ));
+    lines
 }
 
 /// When no INSTALLED skill matched a substantial task, fold in an OFFLINE
@@ -1495,6 +1560,36 @@ mod tests {
         assert_eq!(flatten_ws("  a   b\t c \n"), "a b c");
         assert_eq!(flatten_ws("single"), "single");
         assert_eq!(flatten_ws("\n\n"), "");
+    }
+
+    #[test]
+    fn activity_stream_caps_tail_at_five_and_appends_status() {
+        let output = "l1\nl2\n\nl3\nl4\nl5\nl6\nl7";
+        let lines = activity_stream_lines(output, 120, 34, 7, 3);
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[0], "    l3");
+        assert_eq!(lines[4], "    l7");
+        assert_eq!(
+            lines[5],
+            "    tokens in: 120, tokens out: 34, tool calls: 7, turns: 3"
+        );
+    }
+
+    #[test]
+    fn activity_stream_handles_short_and_empty_output() {
+        let lines = activity_stream_lines("only", 1, 2, 3, 4);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "    only");
+        assert_eq!(
+            lines[1],
+            "    tokens in: 1, tokens out: 2, tool calls: 3, turns: 4"
+        );
+        let lines = activity_stream_lines("", 0, 0, 0, 0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0],
+            "    tokens in: 0, tokens out: 0, tool calls: 0, turns: 0"
+        );
     }
 
     #[test]
