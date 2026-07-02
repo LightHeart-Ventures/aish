@@ -3505,7 +3505,7 @@ mod tests {
                    through the backend trait implements streaming end to end";
         let text = format!("\u{2713} \u{1F6E0}\u{FE0F} {msg}");
         let cols = 72;
-        let row = pane_row_cols(label, &text, cols);
+        let row = pane_row_cols(label, &text, cols, PANE_BORDER);
         let lines: Vec<&str> = row.split('\n').collect();
         assert!(lines.len() >= 2, "long tool-result should wrap: {row:?}");
         for l in &lines {
