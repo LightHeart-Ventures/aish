@@ -374,8 +374,8 @@ pub fn visible_cols(s: &str) -> usize {
 
 /// Compose the footer's 2nd statusline (row H-1): the already-styled `left`
 /// coordinator message stays on the LEFT and the session `name` (set via
-/// `:rename`) is right-justified on the RIGHT, in the same dim style as the
-/// clock directly below it. When there's no name the `left` is returned
+/// `:rename`) is right-justified on the RIGHT, in bold magenta (the accent it
+/// carried as the prompt `[name]` prefix). When there's no name the `left` is returned
 /// unchanged. Pure — width/color are supplied so it's unit-testable.
 pub fn second_statusline_at(left: &str, name: Option<&str>, width: usize, color_on: bool) -> String {
     let name = match name {
@@ -388,8 +388,9 @@ pub fn second_statusline_at(left: &str, name: Option<&str>, width: usize, color_
     let gap = width.saturating_sub(lw + rw).max(1);
     let spaces = " ".repeat(gap);
     if color_on {
-        // Dim, matching the right-justified clock on the row below.
-        format!("{left}{spaces}\x1b[2m{name}{RESET}")
+        // Bold magenta — same accent the name carried as the prompt `[name]`
+        // prefix before it moved onto this row (kept deliberately, not dimmed).
+        format!("{left}{spaces}\x1b[1;35m{name}{RESET}")
     } else {
         format!("{left}{spaces}{name}")
     }
@@ -539,11 +540,11 @@ mod tests {
     }
 
     #[test]
-    fn second_statusline_colored_name_is_dim() {
+    fn second_statusline_colored_name_is_magenta() {
         let left = "\x1b[36m⇄ detached\x1b[0m";
         let s = second_statusline_at(left, Some("proj"), 80, true);
         assert!(s.starts_with(left)); // left half untouched
-        assert!(s.contains("\x1b[2mproj")); // name dim, same as clock
+        assert!(s.contains("\x1b[1;35mproj")); // name bold magenta (kept accent)
         assert!(s.ends_with(RESET));
         // Alignment is computed from VISIBLE columns, so ANSI in `left` doesn't
         // push the name off the right edge.

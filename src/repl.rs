@@ -1076,7 +1076,7 @@ fn coordinator_status_message(session: &Session) -> String {
     let color_on = crate::style::colors_enabled();
     let left = coordinator_status_line(attached.as_deref(), &workers, color_on);
     // Right-justify the session name (`:rename`) on this row, directly above the
-    // clock on the statusline below — same dim color. Blank when unnamed.
+    // clock on the statusline below — in bold magenta. Blank when unnamed.
     crate::style::second_statusline_at(
         &left,
         session.name.as_deref(),
