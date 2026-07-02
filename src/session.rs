@@ -423,6 +423,35 @@ pub struct Session {
     /// worked). Session-local, never persisted — only the aggregatable event
     /// rows land in SQLite.
     pub tool_failures: std::collections::HashMap<String, String>,
+    /// Ring buffer of tool-telemetry events awaiting a batched write
+    /// (`crate::tool_telemetry`). Tool-heavy turns collapse N per-call inserts
+    /// into one transaction: `record` appends here and `flush` drains the whole
+    /// buffer in a single commit. Flushed on capacity, on the flush timer, and
+    /// on `Drop`. Session-local; never itself persisted.
+    pub tool_telemetry_buf: Vec<crate::tool_telemetry::ToolEvent>,
+    /// Buffer capacity — flush once this many events accumulate. Resolved from
+    /// `AISH_TELEMETRY_BATCH_SIZE` at construction.
+    pub tool_telemetry_batch_size: usize,
+    /// Max staleness for buffered events — flush when this elapses since the
+    /// last flush. Resolved from `AISH_TELEMETRY_FLUSH_SECS` at construction.
+    pub tool_telemetry_flush: std::time::Duration,
+    /// When true, every `record` flushes immediately (legacy per-call insert
+    /// path). Resolved from `AISH_TELEMETRY_UNBUFFERED` at construction.
+    pub tool_telemetry_unbuffered: bool,
+    /// Instant of the last telemetry flush; drives the interval check.
+    pub tool_telemetry_last_flush: std::time::Instant,
+}
+
+impl Drop for Session {
+    /// Best-effort flush of any buffered tool-telemetry so a graceful shutdown
+    /// (normal REPL exit, `:restart`, coordinator completion) doesn't silently
+    /// drop the buffered tail. Never panics — a write error is swallowed inside
+    /// `flush`. A hard SIGKILL still can't run destructors, so the small
+    /// in-flight window (bounded by the flush interval/capacity) is the
+    /// documented best-effort trade-off.
+    fn drop(&mut self) {
+        crate::tool_telemetry::flush(self);
+    }
 }
 
 impl Session {
@@ -478,6 +507,19 @@ impl Session {
             loop_state: None,
             resume: Arc::new(Mutex::new(ResumeState::default())),
             tool_failures: std::collections::HashMap::new(),
+            tool_telemetry_buf: Vec::new(),
+            tool_telemetry_batch_size: crate::tool_telemetry::parse_batch_size(
+                std::env::var("AISH_TELEMETRY_BATCH_SIZE").ok().as_deref(),
+            ),
+            tool_telemetry_flush: std::time::Duration::from_secs(
+                crate::tool_telemetry::parse_flush_secs(
+                    std::env::var("AISH_TELEMETRY_FLUSH_SECS").ok().as_deref(),
+                ),
+            ),
+            tool_telemetry_unbuffered: crate::tool_telemetry::parse_unbuffered(
+                std::env::var("AISH_TELEMETRY_UNBUFFERED").ok().as_deref(),
+            ),
+            tool_telemetry_last_flush: std::time::Instant::now(),
         })
     }
 
