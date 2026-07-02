@@ -1324,13 +1324,39 @@ fn complete_colon(after: &str) -> (usize, Vec<Pair>) {
     (0, pairs)
 }
 
+/// Rows the `:`-palette hint may occupy, derived from the live terminal height.
+///
+/// The prompt is anchored to the bottom body row, so a hint of N rows below it
+/// scrolls the body up by N. If N reaches the body height the prompt itself
+/// scrolls off-screen and rustyline's *relative* cursor arithmetic (it never
+/// uses absolute positioning) desyncs — the redraw then clears the wrong rows
+/// and the prompt "disappears" until the palette clears on the next cursor move.
+/// Capping the palette to the body height less a safety margin keeps the prompt
+/// on-screen so the relative math stays consistent. Falls back to a conservative
+/// constant off a tty (tests, pipes).
+fn palette_max_rows() -> usize {
+    const FALLBACK: usize = 12;
+    const MARGIN: u16 = 2; // keep the prompt row + one line of breathing room
+    match crate::terminal::screen_rows() {
+        Some(rows) => rows
+            .saturating_sub(crate::terminal::FOOTER_ROWS)
+            .saturating_sub(MARGIN)
+            .max(1) as usize,
+        None => FALLBACK,
+    }
+}
+
 /// Build the live `:`-command palette shown as an inline hint below the prompt.
 /// Returns the menu text — a leading newline, then one dim row per matching
 /// command (`:name   description`) — when the buffer is a bare `:`-token with the
 /// cursor at its end, or `None` otherwise. rustyline recomputes this on every
 /// keystroke and redraws the hint in place (clearing the prior rows), so the
 /// list filters as you type WITHOUT re-printing the prompt or stacking menus.
-fn palette_hint(line: &str, pos: usize) -> Option<String> {
+///
+/// `max_rows` bounds how tall the menu may grow (see [`palette_max_rows`]): when
+/// the match set overflows the cap, the last row becomes a dim `… and N more`
+/// summary so the hint never scrolls the bottom-anchored prompt off-screen.
+fn palette_hint(line: &str, pos: usize, max_rows: usize) -> Option<String> {
     // Only while typing the command name: cursor at the end of a bare `:`-token
     // (no space yet — once an argument starts, the palette is done).
     if pos != line.len() {
@@ -1344,15 +1370,29 @@ fn palette_hint(line: &str, pos: usize) -> Option<String> {
     if names.is_empty() {
         return None;
     }
+    let max_rows = max_rows.max(1);
+    // When the list overflows the cap, reserve the final row for the summary.
+    let overflow = names.len() > max_rows;
+    let shown = if overflow {
+        max_rows.saturating_sub(1)
+    } else {
+        names.len()
+    };
     let mut out = String::new();
-    for name in names {
+    for name in names.iter().take(shown) {
         let desc = COLON_COMMANDS
             .iter()
-            .find(|(n, _)| *n == name)
+            .find(|(n, _)| n == name)
             .map_or("", |(_, d)| *d);
         // The leading newline drops each row onto its own line below the input;
         // the whole row is dim so it reads as a hint, not as typed text.
         out.push_str(&format!("\n\x1b[2m:{name:<14} {desc}\x1b[0m"));
+    }
+    if overflow {
+        let more = names.len() - shown;
+        out.push_str(&format!(
+            "\n\x1b[2m… and {more} more (keep typing to filter)\x1b[0m"
+        ));
     }
     Some(out)
 }
@@ -1548,7 +1588,7 @@ impl Hinter for AishHelper {
     /// applies, leaving ordinary input untouched. rustyline recomputes this each
     /// keystroke and redraws the hint in place.
     fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<AishHint> {
-        if let Some(menu) = palette_hint(line, pos) {
+        if let Some(menu) = palette_hint(line, pos, palette_max_rows()) {
             return Some(AishHint {
                 display: menu,
                 completion: None,
@@ -6962,7 +7002,7 @@ mod tests {
     fn palette_hint_filters_in_place() {
         // A bare `:` shows the whole catalog as a multi-line hint (one row per
         // command), each row carrying its name and description.
-        let full = palette_hint(":", 1).expect("bare `:` yields the palette");
+        let full = palette_hint(":", 1, usize::MAX).expect("bare `:` yields the palette");
         assert_eq!(full.matches('\n').count(), COLON_COMMANDS.len());
         assert!(
             full.starts_with('\n'),
@@ -6972,7 +7012,7 @@ mod tests {
         assert!(full.contains("confirmation"));
 
         // Typing narrows it in place: `:re` -> reasoning + rename + restart + result + rewrite.
-        let re = palette_hint(":re", 3)
+        let re = palette_hint(":re", 3, usize::MAX)
             .expect("`:re` matches reasoning + rename + restart + result + rewrite");
         assert_eq!(re.matches('\n').count(), 5);
         assert!(re.contains(":reasoning"));
@@ -6982,13 +7022,46 @@ mod tests {
         assert!(re.contains(":rewrite"));
 
         // No hint once an argument starts (a space ends the command name)...
-        assert!(palette_hint(":mode dev", 9).is_none());
+        assert!(palette_hint(":mode dev", 9, usize::MAX).is_none());
         // ...when the cursor isn't at the end of the buffer...
-        assert!(palette_hint(":mode", 2).is_none());
+        assert!(palette_hint(":mode", 2, usize::MAX).is_none());
         // ...for a non-`:` line...
-        assert!(palette_hint("ls -la", 6).is_none());
+        assert!(palette_hint("ls -la", 6, usize::MAX).is_none());
         // ...or when nothing matches.
-        assert!(palette_hint(":zzz", 4).is_none());
+        assert!(palette_hint(":zzz", 4, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn palette_hint_caps_rows_so_prompt_never_scrolls_off() {
+        // Regression (prompt-disappears): a bare `:` offers the whole catalog,
+        // which on any real terminal is taller than the body. Capping keeps the
+        // hint short enough that the bottom-anchored prompt stays on-screen and
+        // rustyline's relative cursor math stays in sync.
+        let total = COLON_COMMANDS.len();
+        assert!(total > 5, "catalog large enough to exercise the cap");
+
+        // Cap at 5 rows => 4 command rows + 1 "… and N more" summary row.
+        let capped = palette_hint(":", 1, 5).expect("bare `:` yields the palette");
+        assert_eq!(
+            capped.matches('\n').count(),
+            5,
+            "hint occupies exactly the cap, never more"
+        );
+        let more = total - 4;
+        assert!(
+            capped.contains(&format!("… and {more} more")),
+            "overflow summary names the hidden remainder"
+        );
+
+        // A cap at least as large as the match set prints every row, no summary.
+        let uncapped = palette_hint(":", 1, total).expect("palette");
+        assert_eq!(uncapped.matches('\n').count(), total);
+        assert!(!uncapped.contains("more (keep typing"));
+
+        // Degenerate cap of 1 still yields a single, safe summary row.
+        let one = palette_hint(":", 1, 1).expect("palette");
+        assert_eq!(one.matches('\n').count(), 1);
+        assert!(one.contains("more (keep typing"));
     }
 
     // ---- S6.2 / TASK-136: fish-style history ghost text -----------------
