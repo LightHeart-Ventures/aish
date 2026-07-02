@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "greeting",
+  "description": "Structured output shape for the hello-world plugin's greeting tool. Phase 3 example: aish validates a tool/skill's structured result against this schema by name (`:plugin info hello-world --schema`).",
+  "type": "object",
+  "required": ["greeting", "audience"],
+  "additionalProperties": false,
+  "properties": {
+    "greeting": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "The salutation text, e.g. \"Hello, World!\""
+    },
+    "audience": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9 ,.!'-]+$",
+      "description": "Who the greeting is addressed to."
+    },
+    "tone": {
+      "enum": ["friendly", "formal", "excited"],
+      "description": "Optional delivery tone."
+    },
+    "repeat": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10,
+      "description": "How many times to emit the greeting."
+    }
+  }
+}

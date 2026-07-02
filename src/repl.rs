@@ -4348,15 +4348,24 @@ fn handle_hooks(sub: Option<&str>, session: &mut Session) {
 /// `:plugin [list|info <id>]` — plugin provenance introspection (Phase 0.5.6).
 /// `list` enumerates discovered plugins; `info <id>` renders one plugin's full
 /// capability report (metadata, login, lifecycle + event hooks, MCP servers,
-/// skills). Bare `:plugin` is an alias for `list`.
-fn handle_plugin(sub: Option<&str>, id: Option<&str>) {
+/// schemas, skills). `info <id> --schema` (Phase 3.5) renders the plugin's
+/// JSON-Schema shapes instead. Bare `:plugin` is an alias for `list`.
+fn handle_plugin(sub: Option<&str>, id: Option<&str>, flag: Option<&str>) {
     let dir = crate::plugins::default_plugins_dir();
     match sub {
         Some("info") => {
             let Some(id) = id else {
-                println!("usage: :plugin info <id>");
+                println!("usage: :plugin info <id> [--schema]");
                 return;
             };
+            // Phase 3.5: `--schema` drills into the plugin's shipped schemas.
+            if matches!(flag, Some("--schema") | Some("--schemas")) {
+                match crate::plugins::format_plugin_schemas(&dir, id) {
+                    Some(report) => println!("{report}"),
+                    None => println!("no such plugin `{id}` — try :plugin list"),
+                }
+                return;
+            }
             match crate::plugins::format_plugin_info(&dir, id) {
                 Some(report) => println!("{report}"),
                 None => println!("no such plugin `{id}` — try :plugin list"),
@@ -5449,7 +5458,7 @@ async fn handle_colon(
         Some("compact") => handle_compact(backend, session),
         Some("memories" | "memory") => handle_memories(parts.next(), session),
         Some("hooks") => handle_hooks(parts.next(), session),
-        Some("plugin" | "plugins") => handle_plugin(parts.next(), parts.next()),
+        Some("plugin" | "plugins") => handle_plugin(parts.next(), parts.next(), parts.next()),
         Some("telemetry" | "tool-stats") => handle_telemetry(parts.next(), session),
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
