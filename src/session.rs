@@ -229,6 +229,13 @@ pub struct Session {
     /// Tool calls + results of the most recent turn, kept for the retroactive
     /// reveal when raw output is switched on after a surprising answer.
     pub last_turn_tools: Vec<(String, ToolResult)>,
+    /// Physical terminal rows occupied by the Ctrl-O toggle block (header +
+    /// reveal/collapse body) most recently printed below the prompt. 0 means no
+    /// live block. Lets the NEXT Ctrl-O erase the prior block in place so the
+    /// view truly toggles (expand ⇆ collapse) instead of appending forever. Only
+    /// valid while that block is the last thing printed; the REPL resets it to 0
+    /// on any non-Ctrl-O outcome (fresh output invalidates the erase anchor).
+    pub raw_view_rows: usize,
     /// Background jobs (run_program background:true). Output streams to the
     /// terminal live; the model reads it via job_output. Die with the shell.
     pub jobs: crate::tools::Jobs,
@@ -436,6 +443,7 @@ impl Session {
             db: None,
             raw_tool_output: false,
             last_turn_tools: Vec::new(),
+            raw_view_rows: 0,
             jobs: Default::default(),
             last_status: 0,
             session_allows: HashSet::new(),
