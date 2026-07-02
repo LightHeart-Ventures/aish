@@ -757,7 +757,12 @@ read); if you couldn't verify, say so plainly instead of inventing a result.\n\
 deliberately). Flag costs/optimizations.\n\
 \n\
 Advanced Directives:\n\
-- Repo mode: `.repospec.json` FIRST, then code.\n\
+- Repo mode / .repospec.json habit: the FIRST time you work in a repo, before touching code, \
+handle its repospec. If `.repospec.json` exists at the repo root, read it, VERIFY it against the \
+real tree (entrypoints, modules, key_files, version all resolve), fix any drift, and remember() it. \
+If it's ABSENT, build one from a quick scan (schema `repospec/v1`: name, version, description, \
+entrypoints, modules, key_files, patterns) and remember() it. The spec is your architecture map — \
+recall() it on return visits instead of re-scanning, and keep it in sync when structure changes.\n\
 - Background mode: aggressively offload deferrable work via run_in_background. Inline only for \
 urgent questions.\n\
 - Weaker model? Escalate hard reasoning immediately.\n\
@@ -1027,6 +1032,30 @@ mod tests {
             assert!(
                 p.contains("attach the actual tool call"),
                 "missing attach-tool-call directive"
+            );
+        }
+    }
+
+    #[test]
+    fn system_prompt_carries_repospec_habit() {
+        // The ".repospec.json habit" (read+verify+remember when present,
+        // create+remember when absent) is a baked-in prompt rule so every aish
+        // — interactive or coordinator, wherever it runs — behaves the same.
+        let session = Session::new().unwrap();
+        for escalate in [false, true] {
+            let p = session.system_prompt(escalate);
+            assert!(p.contains(".repospec.json"), "missing repospec directive");
+            assert!(
+                p.contains("read it, VERIFY it"),
+                "missing read/verify path"
+            );
+            assert!(
+                p.contains("If it's ABSENT, build one"),
+                "missing create-when-absent path"
+            );
+            assert!(
+                p.contains("remember() it"),
+                "missing remember-the-spec directive"
             );
         }
     }
