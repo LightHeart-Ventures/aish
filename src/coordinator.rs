@@ -244,6 +244,69 @@ fn reap_failed_runs_with(
     store.delete_runs(&plan).unwrap_or(0)
 }
 
+/// Bounded retention for terminal `done` rows — the mirror of
+/// [`reap_failed_runs`] for the completed side. Only exercised when the startup
+/// digest is SUPPRESSED (the default): `rehydrate` then KEEPS `done` rows
+/// (instead of clearing them the moment they're loaded) so a completed
+/// background result stays retrievable via `:workers all` / `background_status`
+/// / `:result <id>` rather than being surfaced-and-dropped over the prompt.
+/// Without this the kept rows would accumulate on every restart, so we apply the
+/// same keep-recent + max-age window used for `failed` rows. Best-effort; a
+/// store read/write error yields 0.
+fn reap_done_runs(store: &CoordinatorStore) -> usize {
+    let keep = failed_retention_keep();
+    let max_age = failed_retention_max_age_secs();
+    let now = now_unix_secs();
+    let rows = match store.load_all() {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    let done: Vec<(String, Option<i64>)> = rows
+        .into_iter()
+        .filter(|r| Phase::parse(&r.phase) == Phase::Done)
+        .map(|r| {
+            (
+                r.run_id,
+                r.created_at.as_deref().and_then(parse_sqlite_timestamp),
+            )
+        })
+        .collect();
+    let plan = failed_retention_plan(&done, now, keep, max_age);
+    store.delete_runs(&plan).unwrap_or(0)
+}
+
+/// Parse a truthy/falsey flag string (`1/true/on/yes` → true, `0/false/off/no`
+/// → false); anything else is `None`. Shared by the `AISH_STARTUP_DIGEST` env
+/// override and the `:startup-digest` REPL toggle.
+pub fn parse_flag(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" | "y" => Some(true),
+        "0" | "false" | "off" | "no" | "n" => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether the verbose startup coordinator digest is shown at boot — the
+/// completed-result walls, the per-salvage lines, and the `reattached
+/// coordinator runs (…)` summary. Suppressed by DEFAULT so a fresh terminal
+/// doesn't open onto a wall of prior workers' output. Re-enable per-invocation
+/// with the `AISH_STARTUP_DIGEST` env var (truthy), or durably with
+/// `:startup-digest on` (persisted `startup_digest` setting). The env override
+/// wins over the persisted setting; absent both, the default is `false`.
+fn startup_digest_enabled(session: &Session) -> bool {
+    if let Ok(v) = std::env::var("AISH_STARTUP_DIGEST") {
+        if let Some(b) = parse_flag(&v) {
+            return b;
+        }
+    }
+    if let Some(db) = session.db.as_ref() {
+        if let Ok(Some(v)) = db.get_setting("startup_digest") {
+            return parse_flag(&v).unwrap_or(false);
+        }
+    }
+    false
+}
+
 /// Read a `usize` from environment variable `var`, accept it only when it parses
 /// and falls within `[min, max]`, otherwise fall back to `default`. Keeps the
 /// runtime knobs above forgiving: a typo'd or wild value silently reverts to the
@@ -901,6 +964,11 @@ pub fn rehydrate(session: &mut Session) {
             return;
         }
     };
+    // Whether to emit the verbose startup digest (completed-result walls,
+    // per-salvage lines, reattach summary). Suppressed by DEFAULT — a fresh
+    // terminal shouldn't open onto a wall of prior workers' output. All the
+    // state bookkeeping below still runs; only the human-facing prints are gated.
+    let digest = startup_digest_enabled(session);
     let own = session.session_id.clone();
     let mut surfaced = 0usize;
     let mut reaped = 0usize;
@@ -908,11 +976,16 @@ pub fn rehydrate(session: &mut Session) {
         let phase = Phase::parse(&row.phase);
         match phase {
             Phase::Done => {
-                // Surface a completed background coordinator result once, then
-                // clear it so we don't re-announce on the next start.
+                // Surface a completed background coordinator result. When the
+                // digest is shown, print the full wall and (below) clear the row.
+                // When suppressed, print nothing and KEEP the row so the result
+                // stays retrievable via `:workers all` / `background_status` /
+                // `:result <id>` instead of being surfaced-and-dropped.
                 if let Some(result) = &row.result {
                     if !result.trim().is_empty() {
-                        print_completed(&row.run_id, result);
+                        if digest {
+                            print_completed(&row.run_id, result);
+                        }
                         surfaced += 1;
                     }
                 }
@@ -933,10 +1006,20 @@ pub fn rehydrate(session: &mut Session) {
             }
         }
     }
-    // Drop terminal `done` rows (the just-surfaced results) and purge orphaned
-    // mailbox messages. `failed` rows are RETAINED for forensics (#129 item 5)
-    // so a reaped/errored run stays visible in `:workers` instead of vanishing.
-    let _ = store.clear_finished();
+    // Terminal `done` rows: when the digest was shown, the result was delivered
+    // to the terminal, so drop it (historical behavior) — `clear_finished` also
+    // purges orphaned mailbox messages. When suppressed (the default), KEEP the
+    // `done` rows so their results stay retrievable, and instead bound them like
+    // `failed` rows (keep-recent + max-age) so the table can't grow without
+    // bound; purge orphaned mailbox messages directly since `clear_finished`
+    // didn't run. `failed` rows are RETAINED for forensics (#129 item 5) either
+    // way so a reaped/errored run stays visible in `:workers`.
+    if digest {
+        let _ = store.clear_finished();
+    } else {
+        store.purge_orphan_messages();
+        let _ = reap_done_runs(&store);
+    }
     // Bound the now-retained `failed` rows: keep a recent, age-limited window so
     // the forensic trail survives a restart without the table growing unbounded.
     // Runs BEFORE salvage and BEFORE the post-sweep id snapshot, so a work-bearing
@@ -952,8 +1035,8 @@ pub fn rehydrate(session: &mut Session) {
         .load_all()
         .map(|rows| rows.into_iter().map(|r| r.run_id).collect())
         .unwrap_or_default();
-    let salvaged = salvage_orphaned_worktrees(&session.cwd, &store, &known_after);
-    if surfaced > 0 || reaped > 0 || salvaged > 0 || reaped_failed > 0 {
+    let salvaged = salvage_orphaned_worktrees(&session.cwd, &store, &known_after, digest);
+    if digest && (surfaced > 0 || reaped > 0 || salvaged > 0 || reaped_failed > 0) {
         eprintln!(
             "\x1b[2maish: reattached coordinator runs ({surfaced} delivered, {reaped} reaped, {salvaged} salvaged, {reaped_failed} failed-pruned)\x1b[0m"
         );
@@ -979,6 +1062,7 @@ fn salvage_orphaned_worktrees(
     cwd: &std::path::Path,
     store: &CoordinatorStore,
     known: &HashSet<String>,
+    announce: bool,
 ) -> usize {
     let mut salvaged = 0usize;
     for w in crate::worker::work_bearing_worktrees(cwd) {
@@ -998,12 +1082,14 @@ fn salvage_orphaned_worktrees(
             )
             .is_ok()
         {
-            eprintln!(
-                "\x1b[2maish: salvaged orphaned worker {} — work on branch `{}` ({})\x1b[0m",
-                w.id,
-                w.branch,
-                w.path.display(),
-            );
+            if announce {
+                eprintln!(
+                    "\x1b[2maish: salvaged orphaned worker {} — work on branch `{}` ({})\x1b[0m",
+                    w.id,
+                    w.branch,
+                    w.path.display(),
+                );
+            }
             salvaged += 1;
         }
     }
@@ -1260,6 +1346,19 @@ mod tests {
         // No work in the leaf → nothing to recover, regardless of row state.
         assert!(!is_salvageable(false, false));
         assert!(!is_salvageable(true, false));
+    }
+
+    #[test]
+    fn parse_flag_recognizes_truthy_falsey_and_rejects_junk() {
+        for s in ["1", "true", "on", "yes", "y", "TRUE", " On "] {
+            assert_eq!(parse_flag(s), Some(true), "{s:?} should be truthy");
+        }
+        for s in ["0", "false", "off", "no", "n", "OFF", " No "] {
+            assert_eq!(parse_flag(s), Some(false), "{s:?} should be falsey");
+        }
+        for s in ["", "maybe", "2", "onoff"] {
+            assert_eq!(parse_flag(s), None, "{s:?} should be unrecognized");
+        }
     }
 
     #[test]

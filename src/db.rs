@@ -1208,6 +1208,20 @@ impl CoordinatorStore {
         Ok(n)
     }
 
+    /// Purge mailbox messages whose target run no longer exists. `clear_finished`
+    /// does this as a side effect, but the startup rehydrate path skips
+    /// `clear_finished` when the digest is suppressed (it retains `done` rows so
+    /// their results stay retrievable), so it calls this directly to keep the
+    /// mailbox from growing unbounded. Best-effort — a store error is ignored.
+    pub fn purge_orphan_messages(&self) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "DELETE FROM coordinator_messages \
+             WHERE run_id NOT IN (SELECT run_id FROM coordinator_runs)",
+            [],
+        );
+    }
+
     /// Delete the given runs by id (and purge any now-orphaned mailbox
     /// messages). Backs the bounded `failed`-row retention sweep
     /// (`coordinator::reap_failed_runs`): `clear_finished` keeps `failed` rows
