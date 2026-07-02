@@ -893,7 +893,7 @@ mechanisms and must not be conflated:
 |---|---|---|
 | What fires it | plugin load/unload | the agent loop (per turn / tool / memory / session) |
 | Events | `on_init`, `on_shell_ready`, `on_webhook_url_changed`, `on_shutdown` | `PreToolUse`, `PostToolUse`, `TurnEnd`, `MemoryStored`, `PreCompact`, `SessionStart`, `WorkerStart`, … (33 total) |
-| Declared in | `plugin.json → provides.hooks` (rename → `lifecycle_hooks`) | `~/.aish/hooks.json` catalog (`src/hooks.rs`) |
+| Declared in | `plugin.json → provides.lifecycle_hooks` (was `provides.hooks`, now a deprecated alias) | `~/.aish/hooks.json` catalog (`src/hooks.rs`) |
 | Dispatch | plugin loader, at lifecycle points | `src/hooks.rs` dispatcher, fork/exec, JSON on stdin |
 | Can block a turn? | no | **yes** — `PreToolUse` returns `Decision::Deny(reason)` |
 
@@ -967,8 +967,12 @@ track; they are orthogonal to shipping the control-plane plugin.
 **Scope:** the three generic capabilities above — useful to *every* plugin author, not
 just enterprise. **Estimate:** ~8 SP. Slots **before** Phase 4.
 
-- [ ] 0.5.1 Rename `provides.hooks` → `provides.lifecycle_hooks` (keep `hooks` as a
+- [x] 0.5.1 Rename `provides.hooks` → `provides.lifecycle_hooks` (keep `hooks` as a
       deprecated alias for one release) to free the word "hooks" for the event catalog.
+      *Done: `Provides` struct in `src/plugins.rs` parses `lifecycle_hooks` (canonical)
+      and the deprecated `hooks` alias; `PluginManifest::lifecycle_hooks()` resolves the
+      effective list (canonical wins) and `discover` emits a one-time deprecation warning
+      when only the old key is present.*
 - [ ] 0.5.2 Implement `event_hooks_file` merge into `src/hooks.rs` (precedence,
       multi-plugin fan-out, single-blocking-winner, `source` tagging).
 - [ ] 0.5.3 Implement `.mcp.json` merge from plugins into the client MCP set.
