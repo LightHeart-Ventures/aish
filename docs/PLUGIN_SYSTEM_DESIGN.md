@@ -1030,7 +1030,13 @@ just enterprise. **Estimate:** ~8 SP. Slots **before** Phase 4.
       `collect_plugin_mcp_servers` models the same first-one-wins policy for
       diagnostics; `mcp::interpolate` gained explicit `${env:VAR}` / `${profile:KEY}`
       forms resolved at connect time on both stdio and HTTP transports.*
-- [ ] 0.5.4 Implement session-env injection from lifecycle-hook stdout (`KEY=VALUE`).
+- [x] 0.5.4 Implement session-env injection from lifecycle-hook stdout (`KEY=VALUE`).
+      *Done: `plugins::collect_lifecycle_env` fork/execs each enabled plugin's
+      `hooks/on_init.sh` (NO shell, `AISH_IN_HOOK=1`, bounded timeout), parses the
+      `KEY=VALUE` stdout via `parse_hook_env`, rejects credential-like keys, and
+      injects survivors into the session env in `main.rs` (ambient/user env wins;
+      alphabetically-first plugin wins on a clash; `AISH_ENV_INJECTION_DISABLED=1`
+      disables). Covered by `plugins::tests` parse/run/collect cases.*
 - [x] 0.5.5 Implement `provides.login` command registration + credential-profile
       persistence. *Done: `src/plugin_auth.rs` routes `login <plugin-id>`, invokes the
       plugin's auth handler, and persists its JSON output to `~/.aish/credentials` under
