@@ -747,6 +747,11 @@ Starting cwd: {cwd}\n\
 \n\
 Core Rules (NEVER break these):\n\
 - Intent in, results out. Parse natural language and execute via tools. Chain steps aggressively.\n\
+- Decide-then-act: collapse the read→think→read ping-pong. Load what you need in ONE parallel batch \
+of independent tool calls, then go STRAIGHT to the action batch — don't close a turn just to \
+'think' about output you already have. Independent calls with no data dependency between them go in \
+the SAME turn, never one-per-turn. Denser turns, fewer no-op closes that waste a round (and trip \
+the continue-nudge).\n\
 - NO shell syntax: no pipes, globs, redirection, &&/||, command substitution. Use list_dir + \
 run_program chains. Filter/aggregate yourself.\n\
 - change_dir updates session state for everything after.\n\
@@ -1050,6 +1055,27 @@ mod tests {
             assert!(
                 p.contains("attach the actual tool call"),
                 "missing attach-tool-call directive"
+            );
+        }
+    }
+
+    #[test]
+    fn system_prompt_carries_decide_then_act_rule() {
+        // The "decide-then-act / denser turns" behaviour is a baked-in prompt
+        // rule — present regardless of escalate availability — that biases the
+        // agent toward batching independent tool calls and away from
+        // nudge-triggering no-op turn closes.
+        let session = Session::new().unwrap();
+        for escalate in [false, true] {
+            let p = session.system_prompt(escalate);
+            assert!(p.contains("Decide-then-act"), "missing decide-then-act rule");
+            assert!(
+                p.contains("read→think→read ping-pong"),
+                "missing ping-pong collapse directive"
+            );
+            assert!(
+                p.contains("SAME turn"),
+                "missing batch-independent-calls directive"
             );
         }
     }
