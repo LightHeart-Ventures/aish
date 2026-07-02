@@ -1405,10 +1405,71 @@ branch, and open a pull request (gh pr create) instead."
 
 pub use crate::jobs::{Job, Jobs};
 
+// ---------------------------------------------------------------------------
+// Above-the-prompt printing (#354).
+//
+// Lines from background sources — finished-job notices, MCP notifications, and
+// (crucially) the LIVE `:attach` / Shift-Tab coordinator stream — must print
+// ABOVE the interactive prompt without trampling the user's in-progress input.
+// rustyline's `ExternalPrinter` does exactly that: it prints the text and
+// redraws the prompt underneath afterwards. But `announce`/`announce_raw` used
+// to write raw `\r\x1b[2K…\n` straight to stderr, which BYPASSES rustyline —
+// it erases the prompt line in place and never redraws it, so the prompt ends
+// up stranded ABOVE the stream with output scrolling below it (the reported
+// bug). The fix: the REPL installs its single `ExternalPrinter` into this
+// process-wide slot at startup; when one is present, `announce`/`announce_raw`
+// route through it (prompt-preserving). When none is installed (headless, no
+// TTY, or a terminal that can't provide a printer) they fall back to the
+// original raw-stderr write, so non-interactive behaviour is unchanged.
+//
+// A `std::sync::Mutex` serialises the presenter task and the N worker-stream
+// tasks that now share the one printer. The lock is only ever held for the
+// duration of a single `print` (no `.await` across it), so it cannot deadlock
+// the async runtime.
+static EXTERNAL_PRINTER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Box<dyn crate::editor::LinePrinter>>>,
+> = std::sync::OnceLock::new();
+
+fn printer_slot() -> &'static std::sync::Mutex<Option<Box<dyn crate::editor::LinePrinter>>> {
+    EXTERNAL_PRINTER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Install the REPL's above-the-prompt printer for the whole process. Called
+/// once at interactive startup with the editor's `ExternalPrinter`; after this,
+/// [`announce`] / [`announce_raw`] emit prompt-preserving lines through it
+/// instead of clobbering the prompt with a raw stderr write.
+pub fn install_external_printer(printer: Box<dyn crate::editor::LinePrinter>) {
+    if let Ok(mut slot) = printer_slot().lock() {
+        *slot = Some(printer);
+    }
+}
+
+/// Print `text` (which must carry its own trailing newline) above the prompt
+/// via the installed [`crate::editor::LinePrinter`], returning `true` when a
+/// printer was present and used. When none is installed, returns `false` and
+/// prints nothing — the caller does the raw-stderr fallback. Used by
+/// [`announce`] / [`announce_raw`] and directly by the background-result
+/// presenter so every above-the-prompt write shares the one serialised printer.
+pub fn print_above_prompt(text: String) -> bool {
+    if let Ok(mut slot) = printer_slot().lock() {
+        if let Some(printer) = slot.as_mut() {
+            printer.print(text);
+            return true;
+        }
+    }
+    false
+}
+
 /// Print one line from a background source (job output, MCP notification)
-/// over the top of whatever is on the current terminal line — rustyline
-/// redraws its prompt on the next keypress.
+/// over the top of whatever is on the current terminal line. When the REPL has
+/// installed an [`ExternalPrinter`](crate::editor::LinePrinter) the line is
+/// routed through it so the prompt is redrawn underneath; otherwise it falls
+/// back to a raw stderr write (rustyline redraws its prompt on the next
+/// keypress).
 pub fn announce(prefix: &str, line: &str) {
+    if print_above_prompt(format!("\x1b[2m{prefix} {line}\x1b[0m\n")) {
+        return;
+    }
     eprint!("\r\x1b[2K\x1b[2m{prefix} {line}\x1b[0m\n");
 }
 
@@ -1416,10 +1477,14 @@ pub fn announce(prefix: &str, line: &str) {
 /// terminal line, like [`announce`] but WITHOUT the dim wrapper or trailing-
 /// space prefix join. The caller has already framed the line — e.g. the
 /// contained `:output` pane rows (`worker::pane_row`), which supply their own
-/// box-drawing border + label gutter. As with `announce`, the `\r\x1b[2K`
-/// erases whatever was on the line (the prompt) and rustyline redraws it on
-/// the next keypress.
+/// box-drawing border + label gutter. When an [`ExternalPrinter`](crate::editor::LinePrinter)
+/// is installed the row is routed through it (prompt-preserving); otherwise the
+/// `\r\x1b[2K` fallback erases whatever was on the line (the prompt) and
+/// rustyline redraws it on the next keypress.
 pub fn announce_raw(line: &str) {
+    if print_above_prompt(format!("{line}\n")) {
+        return;
+    }
     eprint!("\r\x1b[2K{line}\n");
 }
 
