@@ -608,11 +608,29 @@ pub async fn run(
                         );
                         continue;
                     }
-                    print!("\x1b[2m  ⚙ rewriting…\x1b[0m");
+                    // S8.2 / TASK-144: stream the rewrite token-by-token where the
+                    // static `⚙ rewriting…` spinner used to sit, so the candidate
+                    // assembles live before it lands in the editor.
+                    let label = "rewriting…";
+                    let mut preview = crate::stream_render::LivePreview::new(
+                        label,
+                        crate::stream_render::preview_width(5 + label.chars().count()),
+                    );
+                    print!("{}", crate::stream_render::frame(label, ""));
                     std::io::stdout().flush().ok();
-                    let candidate =
-                        crate::rewrite::rewrite_to_command(&backend, &session, &intent).await;
-                    print!("\r\x1b[2K"); // wipe the transient spinner line
+                    let candidate = {
+                        let mut on_text = |t: &str| {
+                            if let Some(fr) = preview.push(t) {
+                                print!("{fr}");
+                                std::io::stdout().flush().ok();
+                            }
+                        };
+                        crate::rewrite::rewrite_to_command_streaming(
+                            &backend, &session, &intent, &mut on_text,
+                        )
+                        .await
+                    };
+                    print!("{}", crate::stream_render::CLEAR_LINE); // wipe the transient preview line
                     std::io::stdout().flush().ok();
                     match candidate {
                         Ok(Some(cmd)) => {
@@ -656,11 +674,28 @@ pub async fn run(
                 // unconfirmed: the candidate is only ever placed in the buffer.
                 if let Some(hint) = crate::suggest::parse_invocation(&line) {
                     let hint = hint.to_string();
-                    print!("\x1b[2m  ⚙ suggesting…\x1b[0m");
+                    // S8.2 / TASK-144: stream the suggestion token-by-token where the
+                    // static `⚙ suggesting…` spinner used to sit.
+                    let label = "suggesting…";
+                    let mut preview = crate::stream_render::LivePreview::new(
+                        label,
+                        crate::stream_render::preview_width(5 + label.chars().count()),
+                    );
+                    print!("{}", crate::stream_render::frame(label, ""));
                     std::io::stdout().flush().ok();
-                    let candidate =
-                        crate::suggest::suggest_next_command(&backend, &session, &hint).await;
-                    print!("\r\x1b[2K"); // wipe the transient spinner line
+                    let candidate = {
+                        let mut on_text = |t: &str| {
+                            if let Some(fr) = preview.push(t) {
+                                print!("{fr}");
+                                std::io::stdout().flush().ok();
+                            }
+                        };
+                        crate::suggest::suggest_next_command_streaming(
+                            &backend, &session, &hint, &mut on_text,
+                        )
+                        .await
+                    };
+                    print!("{}", crate::stream_render::CLEAR_LINE); // wipe the transient preview line
                     std::io::stdout().flush().ok();
                     match candidate {
                         Ok(Some(cmd)) => {

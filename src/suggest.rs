@@ -22,7 +22,7 @@
 //! here is pure and unit-tested; the interactive prefill loop lives in
 //! `repl::run`, which owns the editor.
 
-use crate::backend::{Backend, Msg};
+use crate::backend::{Backend, Msg, StreamDelta};
 use crate::rewrite::sanitize_candidate;
 use crate::session::Session;
 use anyhow::Result;
@@ -132,14 +132,18 @@ fn head_chars(s: &str, max: usize) -> String {
 }
 
 /// Ask the active backend for the most plausible NEXT command given the session
-/// context. Pulls the recent command history + last output from the session,
-/// issues a single tool-less `complete` call (works on every backend), and
-/// sanitises the reply with the shared rewrite sanitiser. Returns `Ok(None)`
-/// when the model declines (`NONE`) or returns nothing usable.
-pub async fn suggest_next_command(
+/// context, streaming the reply token-by-token to `on_text` as it decodes off
+/// the wire (S8.2). Pulls the recent command history + last output from the
+/// session, issues a single tool-less `complete_streaming` call (uniform across
+/// every backend), and sanitises the finished reply with the shared rewrite
+/// sanitiser. `on_text` receives each visible TEXT delta; thinking deltas are
+/// swallowed. Returns `Ok(None)` when the model declines (`NONE`) or returns
+/// nothing usable.
+pub async fn suggest_next_command_streaming(
     backend: &Backend,
     session: &Session,
     hint: &str,
+    on_text: &mut dyn FnMut(&str),
 ) -> Result<Option<String>> {
     let recent = session
         .db
@@ -148,11 +152,17 @@ pub async fn suggest_next_command(
         .unwrap_or_default();
     let last_output = session.last_output();
     let prompt = build_user_prompt(&session.cwd, &recent, last_output.as_deref(), hint);
+    let mut sink = |delta: StreamDelta<'_>| {
+        if let StreamDelta::Text(t) = delta {
+            on_text(t);
+        }
+    };
     let turn = backend
-        .complete(SUGGEST_SYSTEM, &[Msg::user(prompt)], &[])
+        .complete_streaming(SUGGEST_SYSTEM, &[Msg::user(prompt)], &[], &mut sink)
         .await?;
     Ok(sanitize_candidate(&turn.text))
 }
+
 
 #[cfg(test)]
 mod tests {

@@ -11,7 +11,7 @@
 //! The interactive prefill/accept/edit loop lives in `repl::run`, which owns the
 //! line editor; everything decision-shaped here is pure and unit-tested.
 
-use crate::backend::{Backend, Msg};
+use crate::backend::{Backend, Msg, StreamDelta};
 use crate::session::Session;
 use anyhow::Result;
 use std::path::Path;
@@ -92,20 +92,32 @@ fn strip_code_fences(raw: &str) -> String {
         .join("\n")
 }
 
-/// Ask the active backend to rewrite `intent` into ONE concrete command. Issues
-/// a single tool-less `complete` call (works on every backend) and sanitises the
-/// reply. Returns `Ok(None)` when the model declines or returns nothing usable.
-pub async fn rewrite_to_command(
+/// Ask the active backend to rewrite `intent` into ONE concrete command,
+/// streaming the reply token-by-token to `on_text` as it decodes off the wire
+/// (S8.2). Issues a single tool-less streaming `complete_streaming` call (uniform
+/// across every backend — Claude streams natively, others deliver the whole
+/// answer once) and sanitises the finished reply. `on_text` receives each visible
+/// TEXT delta; thinking deltas are swallowed (a command preview shows the command,
+/// not the reasoning). Returns `Ok(None)` when the model declines (`NONE`) or
+/// returns nothing usable.
+pub async fn rewrite_to_command_streaming(
     backend: &Backend,
     session: &Session,
     intent: &str,
+    on_text: &mut dyn FnMut(&str),
 ) -> Result<Option<String>> {
     let prompt = build_user_prompt(&session.cwd, intent);
+    let mut sink = |delta: StreamDelta<'_>| {
+        if let StreamDelta::Text(t) = delta {
+            on_text(t);
+        }
+    };
     let turn = backend
-        .complete(REWRITE_SYSTEM, &[Msg::user(prompt)], &[])
+        .complete_streaming(REWRITE_SYSTEM, &[Msg::user(prompt)], &[], &mut sink)
         .await?;
     Ok(sanitize_candidate(&turn.text))
 }
+
 
 #[cfg(test)]
 mod tests {
