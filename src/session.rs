@@ -229,6 +229,13 @@ pub struct Session {
     /// Tool calls + results of the most recent turn, kept for the retroactive
     /// reveal when raw output is switched on after a surprising answer.
     pub last_turn_tools: Vec<(String, ToolResult)>,
+    /// Physical terminal rows occupied by the Ctrl-O toggle block (header +
+    /// reveal/collapse body) most recently printed below the prompt. 0 means no
+    /// live block. Lets the NEXT Ctrl-O erase the prior block in place so the
+    /// view truly toggles (expand ⇆ collapse) instead of appending forever. Only
+    /// valid while that block is the last thing printed; the REPL resets it to 0
+    /// on any non-Ctrl-O outcome (fresh output invalidates the erase anchor).
+    pub raw_view_rows: usize,
     /// Background jobs (run_program background:true). Output streams to the
     /// terminal live; the model reads it via job_output. Die with the shell.
     pub jobs: crate::tools::Jobs,
@@ -436,6 +443,7 @@ impl Session {
             db: None,
             raw_tool_output: false,
             last_turn_tools: Vec::new(),
+            raw_view_rows: 0,
             jobs: Default::default(),
             last_status: 0,
             session_allows: HashSet::new(),
@@ -757,7 +765,16 @@ read); if you couldn't verify, say so plainly instead of inventing a result.\n\
 deliberately). Flag costs/optimizations.\n\
 \n\
 Advanced Directives:\n\
-- Repo mode: `.repospec.json` FIRST, then code.\n\
+- Repo mode / .repospec.json habit: the FIRST time you work in a repo, before touching code, \
+handle its repospec. If `.repospec.json` exists at the repo root, read it, VERIFY it against the \
+real tree (entrypoints, modules, key_files, version all resolve), fix any drift with write_file, \
+and store it in LOCAL memory with remember() (tag `repospec`). If it's ABSENT, build one from a \
+quick scan (schema `repospec/v1`: name, version, description, entrypoints, modules, key_files, \
+patterns), CREATE the file — write_file `.repospec.json` at the repo root — AND store that same \
+spec in LOCAL memory with remember() (tag `repospec`). Both paths end with the spec persisted two \
+ways: the `.repospec.json` file on disk and a remember()ed memory. The spec is your architecture \
+map — recall() it (or search memory for tag `repospec`) on return visits instead of re-scanning, \
+and keep both the file and the memory in sync when structure changes.\n\
 - Background mode: aggressively offload deferrable work via run_in_background. Inline only for \
 urgent questions.\n\
 - Weaker model? Escalate hard reasoning immediately.\n\
@@ -1027,6 +1044,36 @@ mod tests {
             assert!(
                 p.contains("attach the actual tool call"),
                 "missing attach-tool-call directive"
+            );
+        }
+    }
+
+    #[test]
+    fn system_prompt_carries_repospec_habit() {
+        // The ".repospec.json habit" (read+verify+remember when present,
+        // create+remember when absent) is a baked-in prompt rule so every aish
+        // — interactive or coordinator, wherever it runs — behaves the same.
+        let session = Session::new().unwrap();
+        for escalate in [false, true] {
+            let p = session.system_prompt(escalate);
+            assert!(p.contains(".repospec.json"), "missing repospec directive");
+            assert!(
+                p.contains("read it, VERIFY it"),
+                "missing read/verify path"
+            );
+            assert!(
+                p.contains("If it's ABSENT, build one"),
+                "missing create-when-absent path"
+            );
+            // Operator's two clarified points: (1) actually CREATE the file on
+            // disk when absent, and (2) store it in LOCAL memory.
+            assert!(
+                p.contains("write_file `.repospec.json`"),
+                "missing create-the-file directive"
+            );
+            assert!(
+                p.contains("LOCAL memory with remember()"),
+                "missing local-memory remember directive"
             );
         }
     }

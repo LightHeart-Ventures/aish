@@ -19,10 +19,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-/// Minimal `plugin.json` manifest. Only the fields the skill-expansion slice
-/// needs are parsed; every other key in the design doc (webhooks, hooks,
-/// config_schema, provides, …) is ignored via serde's default
-/// unknown-field-dropping so a fuller manifest still deserializes.
+/// Minimal `plugin.json` manifest. Only the fields the current phases need are
+/// parsed; every other key in the design doc (tools, schemas, …) is ignored via
+/// serde's default unknown-field-dropping so a fuller manifest still
+/// deserializes.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)] // name/version/description are parsed manifest surface, consumed by later plugin phases (docs/PLUGIN_SYSTEM_DESIGN.md)
 pub struct PluginManifest {
@@ -53,12 +53,59 @@ pub struct PluginManifest {
     /// the plugin takes no configuration and `load_config` yields `{}`.
     #[serde(default)]
     pub config_schema: Option<Value>,
+    /// The capabilities a plugin contributes to the shell — lifecycle hooks,
+    /// event hooks, config/env injection, login command, … (see
+    /// `docs/PLUGIN_SYSTEM_DESIGN.md` § Enterprise Addendum). Only the fields
+    /// modeled on [`Provides`] are understood today; unknown keys are dropped.
+    #[serde(default)]
+    pub provides: Option<Provides>,
+}
+
+/// The `provides` block of a `plugin.json` manifest: the capabilities a plugin
+/// contributes to the shell. Only the fields the current phase understands are
+/// modeled; unknown keys are dropped by serde so a richer manifest still loads.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Provides {
+    /// Plugin **lifecycle** hook names — `on_init`, `on_shell_ready`,
+    /// `on_shutdown`, `on_webhook_url_changed`, … — the plugin registers. These
+    /// are the *plugin-loader* lifecycle points, distinct from the shell's
+    /// 33-event agent-lifecycle hook catalog (`src/hooks.rs`). Canonical key as
+    /// of Phase 0.5.1.
+    #[serde(default)]
+    pub lifecycle_hooks: Vec<String>,
+    /// **Deprecated** alias for [`Self::lifecycle_hooks`], retained for one
+    /// release so manifests written against the old schema keep loading. Prefer
+    /// `lifecycle_hooks`; a manifest that still sets `hooks` triggers a one-time
+    /// deprecation warning at [`discover`] time. Renamed (Phase 0.5.1) to free
+    /// the word "hooks" for the event-catalog contribution surface.
+    #[serde(default)]
+    pub hooks: Vec<String>,
 }
 
 impl PluginManifest {
     /// A plugin ships enabled unless it opts out with `"enabled": false`.
     pub fn is_enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
+    }
+
+    /// The effective plugin-lifecycle hook list. Prefers the canonical
+    /// `provides.lifecycle_hooks`; falls back to the deprecated `provides.hooks`
+    /// alias only when the canonical key is absent/empty (Phase 0.5.1
+    /// migration). Empty slice when the plugin declares no `provides` block.
+    #[allow(dead_code)] // canonical accessor consumed by the Phase 0.5.2 lifecycle-hook dispatch
+    pub fn lifecycle_hooks(&self) -> &[String] {
+        match &self.provides {
+            Some(p) if !p.lifecycle_hooks.is_empty() => &p.lifecycle_hooks,
+            Some(p) => &p.hooks,
+            None => &[],
+        }
+    }
+
+    /// True when the manifest relies on the deprecated `provides.hooks` alias —
+    /// i.e. `hooks` is populated and the canonical `lifecycle_hooks` is not.
+    /// Drives the one-release deprecation warning emitted at [`discover`] time.
+    pub fn uses_deprecated_hooks_key(&self) -> bool {
+        matches!(&self.provides, Some(p) if p.lifecycle_hooks.is_empty() && !p.hooks.is_empty())
     }
 }
 
@@ -354,6 +401,16 @@ pub fn discover(dir: &Path) -> Vec<Plugin> {
         if !manifest.is_enabled() {
             continue;
         }
+        // Phase 0.5.1: `provides.hooks` was renamed to `provides.lifecycle_hooks`.
+        // The old key still resolves (see `lifecycle_hooks`) but earns a one-time
+        // deprecation warning so authors migrate within the one-release window.
+        if manifest.uses_deprecated_hooks_key() {
+            eprintln!(
+                "aish: plugin `{}`: `provides.hooks` is deprecated and will be removed in a \
+                 future release — rename it to `provides.lifecycle_hooks`.",
+                manifest.id
+            );
+        }
         let skills = crate::skills::load(&pdir.join("skills"));
         // Phase 1.4: resolve config best-effort. A config error (unset
         // `${env:VAR}`, missing required key, …) yields `None` but never drops
@@ -641,6 +698,81 @@ mod tests {
         let plugins = discover(&tmp);
         assert_eq!(plugins.len(), 1);
         assert!(plugins[0].config.is_none());
+        assert_eq!(plugins[0].skills.len(), 1, "skills still load");
+    }
+
+    #[test]
+    fn provides_lifecycle_hooks_no_provides_is_empty() {
+        let m = manifest(r#"{"id":"p"}"#);
+        assert!(m.provides.is_none());
+        assert!(m.lifecycle_hooks().is_empty());
+        assert!(!m.uses_deprecated_hooks_key());
+    }
+
+    #[test]
+    fn provides_canonical_lifecycle_hooks_parses() {
+        let m = manifest(r#"{"id":"p","provides":{"lifecycle_hooks":["on_init","on_shutdown"]}}"#);
+        assert_eq!(m.lifecycle_hooks(), &["on_init", "on_shutdown"]);
+        assert!(!m.uses_deprecated_hooks_key());
+    }
+
+    #[test]
+    fn provides_deprecated_hooks_alias_parses_and_is_flagged() {
+        let m = manifest(r#"{"id":"p","provides":{"hooks":["on_init","on_shell_ready"]}}"#);
+        // The old key still resolves to the effective lifecycle-hook list…
+        assert_eq!(m.lifecycle_hooks(), &["on_init", "on_shell_ready"]);
+        // …but is flagged so discovery emits a one-time deprecation warning.
+        assert!(m.uses_deprecated_hooks_key());
+    }
+
+    #[test]
+    fn provides_canonical_key_takes_precedence_over_deprecated_alias() {
+        // When both are present, the canonical `lifecycle_hooks` wins and the
+        // manifest is NOT treated as using the deprecated alias.
+        let m =
+            manifest(r#"{"id":"p","provides":{"lifecycle_hooks":["on_shutdown"],"hooks":["on_init"]}}"#);
+        assert_eq!(m.lifecycle_hooks(), &["on_shutdown"]);
+        assert!(!m.uses_deprecated_hooks_key());
+    }
+
+    #[test]
+    fn provides_empty_block_yields_no_lifecycle_hooks() {
+        let m = manifest(r#"{"id":"p","provides":{}}"#);
+        assert!(m.provides.is_some());
+        assert!(m.lifecycle_hooks().is_empty());
+        assert!(!m.uses_deprecated_hooks_key());
+    }
+
+    #[test]
+    fn discover_resolves_provides_lifecycle_hooks() {
+        let tmp = tempdir();
+        write_plugin(
+            &tmp,
+            "hooked",
+            r#"{"id":"hooked","provides":{"lifecycle_hooks":["on_init"]}}"#,
+            Some(("s", "d")),
+        );
+        let plugins = discover(&tmp);
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].manifest.lifecycle_hooks(), &["on_init"]);
+        assert!(!plugins[0].manifest.uses_deprecated_hooks_key());
+    }
+
+    #[test]
+    fn discover_still_loads_plugin_using_deprecated_hooks_key() {
+        // A manifest on the old schema must keep loading (its skills too) —
+        // deprecation is a warning, never a hard failure.
+        let tmp = tempdir();
+        write_plugin(
+            &tmp,
+            "legacy",
+            r#"{"id":"legacy","provides":{"hooks":["on_init"]}}"#,
+            Some(("s", "d")),
+        );
+        let plugins = discover(&tmp);
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].manifest.lifecycle_hooks(), &["on_init"]);
+        assert!(plugins[0].manifest.uses_deprecated_hooks_key());
         assert_eq!(plugins[0].skills.len(), 1, "skills still load");
     }
 
