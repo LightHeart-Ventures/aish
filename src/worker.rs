@@ -254,7 +254,16 @@ fn forward_decision(line: &str, show_output: bool) -> Option<String> {
 // the one shared border, so interleaving stays readable.
 
 /// The cyan box-drawing left border every pane row carries — the pane's "wall".
+/// Used for the global `:worker-output` stream and for an `:attach` backfill
+/// (the cyan "output to date" replay).
 const PANE_BORDER: &str = "\x1b[36m┃\x1b[0m";
+
+/// The GREEN left border for a worker's LIVE stream once you've `:attach`ed to
+/// it. It marks NEW output produced AFTER the attach point, distinguishing fresh
+/// activity from the cyan "output to date" replay (`pane_replay_header` + the
+/// backfilled tail) that precedes it. Same glyph, different colour — so the
+/// stream reads as one continuous column that flips cyan → green at the live edge.
+const PANE_BORDER_LIVE: &str = "\x1b[32m┃\x1b[0m";
 
 /// Two-column pad that aligns a turn/batch narration glyph (🚀/🐌)
 /// under the tool glyph (🛠️/🔧) on the preceding RESULT lines. A tool
@@ -572,7 +581,14 @@ fn wrap_visible_ansi(msg: &str, width: usize, seed: &str) -> Vec<String> {
 /// width is unknown → the row is returned as a single line, unchanged. Pure —
 /// unit-tested.
 pub fn pane_row(label: &str, text: &str) -> String {
-    pane_row_cols(label, text, pane_cols())
+    pane_row_cols(label, text, pane_cols(), PANE_BORDER)
+}
+
+/// Like [`pane_row`], but with the GREEN [`PANE_BORDER_LIVE`] wall — used for a
+/// worker's LIVE stream after you `:attach` to it, so new activity is set apart
+/// from the cyan "output to date" replay. Same layout/wrapping as `pane_row`.
+pub fn pane_row_live(label: &str, text: &str) -> String {
+    pane_row_cols(label, text, pane_cols(), PANE_BORDER_LIVE)
 }
 
 /// Display columns available for CONTENT inside a pane row, after the
@@ -595,9 +611,9 @@ pub fn pane_content_cols(label: &str) -> usize {
 /// without touching the terminal or global `$COLUMNS`. `cols == usize::MAX`
 /// means "unknown width" → never wrap (single line, byte-identical to the
 /// pre-wrap behaviour).
-fn pane_row_cols(label: &str, text: &str, cols: usize) -> String {
+fn pane_row_cols(label: &str, text: &str, cols: usize, border: &str) -> String {
     use unicode_width::UnicodeWidthStr;
-    let first = format!("{PANE_BORDER} \x1b[2m[{label}]\x1b[0m {text}");
+    let first = format!("{border} \x1b[2m[{label}]\x1b[0m {text}");
     if cols == usize::MAX {
         return first; // unknown width (piped/tests): never wrap
     }
@@ -628,9 +644,9 @@ fn pane_row_cols(label: &str, text: &str, cols: usize) -> String {
     }
     // Continuation rows: border + pad so the message column lines up under the
     // opening row's first message letter (┃ is 1 col, then indent-1 spaces).
-    let cont = format!("{PANE_BORDER}{}", " ".repeat(indent.saturating_sub(1)));
+    let cont = format!("{border}{}", " ".repeat(indent.saturating_sub(1)));
     let mut out = format!(
-        "{PANE_BORDER} \x1b[2m[{label}]\x1b[0m {prefix}{}",
+        "{border} \x1b[2m[{label}]\x1b[0m {prefix}{}",
         chunks[0]
     );
     for chunk in &chunks[1..] {
@@ -840,7 +856,16 @@ impl ThinkingSpinner {
                     "{NARRATION_ALIGN_PAD}\x1b[36m{}\x1b[0m \x1b[2;36mthinking…\x1b[0m",
                     THINKING_FRAMES[i % THINKING_FRAMES.len()]
                 );
-                eprint!("\r\x1b[2K{}", pane_row(&label, &body));
+                // Green wall for the LIVE post-attach thinking row (this worker
+                // is the one `:attach`ed to), cyan for the global `:output` pane —
+                // matching the border the forwarded activity rows use.
+                let live = attached_id.as_deref() == Some(&label);
+                let row = if live {
+                    pane_row_live(&label, &body)
+                } else {
+                    pane_row(&label, &body)
+                };
+                eprint!("\r\x1b[2K{}", row);
             }
             // Natural exit (gate closed): drop our registry entry so
             // `quiesce_thinking_spinners` doesn't abort an already-finished task.
@@ -930,6 +955,14 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                 attached_id.as_deref(),
                 label,
             );
+            // This forwarded line is LIVE post-attach output when THIS worker is
+            // the one currently `:attach`ed to — render it with the green wall
+            // (`pane_row_live`) so it's set apart from the cyan "output to date"
+            // replay. A line forwarded only because the global `:worker-output`
+            // toggle is on (not attached) keeps the cyan `pane_row`.
+            let live = attached_id.as_deref() == Some(label);
+            let render_row =
+                |t: &str| if live { pane_row_live(label, t) } else { pane_row(label, t) };
             if on {
                 // This worker's first forwarded line after an `:attach` replaces
                 // any attach-time "thinking…" placeholder spinner — stop + erase
@@ -953,7 +986,7 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                     thinking =
                         ThinkingSpinner::start(label, show_output.clone(), attached.clone());
                     if thinking.is_none() {
-                        crate::tools::announce_raw(&pane_row(label, &text));
+                        crate::tools::announce_raw(&render_row(&text));
                     }
                 } else {
                     // Any other forwarded line ENDS the thinking phase: stop +
@@ -968,7 +1001,7 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                     // so coordinator activity reads as a bordered column rather
                     // than blending into the user's shell scroll. `announce_raw`
                     // prints the pre-framed row (which carries its own colour).
-                    crate::tools::announce_raw(&pane_row(label, &text));
+                    crate::tools::announce_raw(&render_row(&text));
                 }
             } else if let Some(spin) = thinking.take() {
                 // Forwarding just turned off for this worker (e.g. `:detach`
@@ -3295,7 +3328,7 @@ mod tests {
         let msg = "the quick brown fox jumps over the lazy dog again and again";
         // Pure core with an explicit narrow width → wraps deterministically.
         // (indent = 15 gutter + 3 for "🚀 " = 18; avail = 60-18 = 42 ≥ MIN_WRAP.)
-        let row = pane_row_cols(label, &format!("🚀 {msg}"), 60);
+        let row = pane_row_cols(label, &format!("🚀 {msg}"), 60, PANE_BORDER);
 
         let lines: Vec<&str> = row.split('\n').collect();
         assert!(lines.len() >= 2, "message should wrap to >=2 rows: {row:?}");
@@ -3326,7 +3359,7 @@ mod tests {
         // usize::MAX means "unknown width" → never wrap; long line emitted
         // verbatim (back-compat with the pre-wrap behaviour).
         let long = "x".repeat(500);
-        let row = pane_row_cols("w_a7k3m2pQ", &format!("🚀 {long}"), usize::MAX);
+        let row = pane_row_cols("w_a7k3m2pQ", &format!("🚀 {long}"), usize::MAX, PANE_BORDER);
         assert!(!row.contains('\n'), "no wrapping when width is unknown");
         assert!(row.ends_with(&long), "text preserved verbatim");
     }
@@ -3337,7 +3370,7 @@ mod tests {
         // never wrapped — even an ANSI-bearing message is emitted single-line.
         // ("w_a7k3m2pQ" gutter = 15; cols = 30 ⇒ avail = 15 < MIN_WRAP_COLS.)
         let body = "\x1b[2;36mthinking… a very long status that would otherwise wrap across the terminal width here\x1b[0m";
-        let row = pane_row_cols("w_a7k3m2pQ", body, 30);
+        let row = pane_row_cols("w_a7k3m2pQ", body, 30, PANE_BORDER);
         assert!(!row.contains('\n'), "too narrow to hang-indent → single line");
     }
 
@@ -3350,7 +3383,7 @@ mod tests {
         // colour and reset, and stay within the width.
         let label = "w_abc12345"; // gutter = 15
         let msg = "CI gate clean: cargo \x1b[2mtest --no-default-features --locked\x1b[0m — 768 lib + 26 memory + 5 routing pass here";
-        let row = pane_row_cols(label, &format!("🚀 {msg}"), 50);
+        let row = pane_row_cols(label, &format!("🚀 {msg}"), 50, PANE_BORDER);
 
         let lines: Vec<&str> = row.split('\n').collect();
         assert!(lines.len() >= 2, "ANSI message should wrap: {row:?}");
