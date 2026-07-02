@@ -1140,8 +1140,8 @@ impl AishHelper {
 
 /// Builtins aish handles itself — always offered as command-name completions.
 const BUILTINS: &[&str] = &[
-    "cd", "exit", "logout", "jobs", "fg", "bg", "wait", "pwd", "unset", "set", "umask", "source",
-    ".", "exec",
+    "cd", "exit", "logout", "login", "jobs", "fg", "bg", "wait", "pwd", "unset", "set", "umask",
+    "source", ".", "exec",
 ];
 
 /// How long a PATH scan stays cached before it's re-scanned (picks up newly
@@ -2228,6 +2228,10 @@ async fn dispatch(
 
     match words[0].as_str() {
         "exit" | "logout" => Dispatch::Quit,
+        "login" => {
+            builtin_login(words.get(1).map(String::as_str));
+            Dispatch::Handled
+        }
         "cd" => {
             builtin_cd(words.get(1).map(String::as_str), session, prev_dir);
             Dispatch::Handled
@@ -2360,6 +2364,42 @@ fn builtin_pwd(session: &Session) {
     // (last_status left to the caller’s default success.)
 }
 
+/// `login <plugin-id>` — route to the plugin that declares
+/// `provides.login == <plugin-id>`, run its `login.sh` auth handler, and persist
+/// the returned credentials to `~/.aish/credentials` under `[profile:<id>]`
+/// (Phase 0.5.5). Secret values are never echoed — only the profile name and the
+/// field names that were stored. Tenant id is best-effort from `AISH_TENANT_ID`.
+fn builtin_login(name: Option<&str>) {
+    let Some(name) = name else {
+        eprintln!("login: usage: login <plugin-id>");
+        eprintln!("  routes to the plugin declaring \"provides\": {{ \"login\": \"<plugin-id>\" }}");
+        return;
+    };
+    let plugins_dir = crate::plugins::default_plugins_dir();
+    let tenant = std::env::var("AISH_TENANT_ID").ok();
+    match crate::plugin_auth::login(name, &plugins_dir, tenant.as_deref()) {
+        Ok(out) => {
+            println!(
+                "login: {} authenticated — stored [{}] in {} ({} field(s): {})",
+                out.plugin_id,
+                out.profile,
+                out.path.display(),
+                out.field_names.len(),
+                out.field_names.join(", "),
+            );
+            println!(
+                "  reference it as ${{profile:{name}}} in this plugin's .mcp.json, \
+                 or read $AISH_PROFILE_{} in its lifecycle hooks",
+                name.chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+                    .collect::<String>()
+            );
+        }
+        Err(e) => eprintln!("login: {e:#}"),
+    }
+}
+
+/// `unset NAME...` — drop each variable from the session env so later spawns no
 /// `unset NAME...` — drop each variable from the session env so later spawns no
 /// longer carry it. Unknown names are a no-op, as in POSIX.
 fn builtin_unset(names: &[String], session: &mut Session) {
@@ -4558,6 +4598,9 @@ async fn handle_colon(
                 "type a command (first word in PATH) to run it directly — anything else goes to the model\n\
                  prefix ! to force direct execution, ? to force the model\n\
                  type : (then a letter, or TAB) to pop up the :command palette\n\
+                 login <plugin-id>                   run a plugin's auth handler; stores its credential in\n\
+                                                     ~/.aish/credentials as [profile:<plugin-id>], reusable via\n\
+                                                     ${{profile:<plugin-id>}} in the plugin's .mcp.json\n\
                  :mode <paranoid|careful|normal|yolo> confirmation level (paranoid asks for everything,\n\
                                                      normal only for write/create/delete, yolo never)\n\
                  :model <opus|sonnet|haiku|full-id>  switch model\n\

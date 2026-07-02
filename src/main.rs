@@ -26,6 +26,7 @@ mod modelfetch;
 #[cfg(test)]
 mod oracle;
 mod pipeline;
+mod plugin_auth;
 mod plugin_dispatcher;
 mod plugin_state;
 mod plugins;

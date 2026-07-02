@@ -955,6 +955,55 @@ plugin's concern; the client only needs to (a) route the command to the plugin a
 (b) expose the credential to the plugin's own capabilities via the profile ref
 mechanism already used by `.mcp.json`.
 
+#### 0.5.5 implementation notes (login routing + credential persistence)
+
+**Command routing.** The REPL command dispatcher recognizes a bare
+`login <plugin-id>` line (both as `aish login <id>` at launch and `login <id>` at the
+prompt). It scans the discovered plugin manifests for one whose
+`provides.login == <plugin-id>` (see `PluginManifest::login_command()` in
+`src/plugins.rs`) and invokes that plugin's auth handler. Unknown ids fail loudly with
+`no plugin provides \`login <id>\`` and write nothing.
+
+**Auth handler contract.** The handler is `~/.aish/plugins/<plugin-id>/login.sh`
+(falls back to `login` if no `.sh`). It is spawned with:
+
+- `AISH_PLUGIN_ID`, `AISH_LOGIN_NAME` — the plugin id / profile name
+- `AISH_TENANT_ID` — the current tenant id when known (else empty)
+- `AISH_CREDENTIALS_FILE` — absolute path aish will persist the profile to
+
+stdin/stderr are inherited, so the handler can print a device-code URL to stderr and
+read interactive input while keeping stdout clean for the JSON result.
+
+On success it prints a **flat JSON object** of credential fields to stdout and exits 0:
+
+```json
+{"access_token":"…","refresh_token":"…","expires_at":"2025-01-01T00:00:00Z"}
+```
+
+`string` values are stored verbatim; `number`/`bool` are stringified; `null` is
+dropped; nested objects/arrays are rejected (`malformed handler output`). A non-zero
+exit (or non-JSON stdout) aborts the login and persists nothing — stderr is surfaced
+to the user.
+
+**Credential persistence.** Fields are written to `~/.aish/credentials` under an INI
+section `[profile:<plugin-id>]` (the same format `.mcp.json` `${profile:…}` refs read
+via `crate::mcp::load_profile`). Existing sections are preserved; only the target
+profile is rewritten. The file is created / re-chmod'd to **0600** (user-only) on every
+write.
+
+**Credential-ref resolution.** Two consumers reuse the stored profile:
+
+- **`.mcp.json`** — `${profile:<plugin-id>}` in an MCP server's `url`/headers resolves
+  through the existing profile loader (unchanged from 0.5.3).
+- **Lifecycle hooks** — `profile_env(<plugin-id>)` flattens the profile into
+  `AISH_PROFILE_<PLUGIN>_<FIELD>=value` env pairs (name + field folded to
+  `[A-Z0-9]`→`_`, upper-cased), e.g. `AISH_PROFILE_MYCOMPANY_ACCESS_TOKEN`. A hook's
+  `on_init.sh` reads these directly. (Wiring into the live hook runner lands with
+  0.5.4; the resolver + round-trip are covered by tests now.)
+
+**Example.** `examples/plugins/hello-world/login.sh` is a minimal device-code-style
+handler that emits a fake token object, demonstrating the stdout JSON contract.
+
 ### What is explicitly NOT required for the enterprise plugin
 
 The **webhook broker / dynamic-forwarding apparatus (Phases 4, 5, 7, 10)** is *not* a
@@ -977,8 +1026,12 @@ just enterprise. **Estimate:** ~8 SP. Slots **before** Phase 4.
       multi-plugin fan-out, single-blocking-winner, `source` tagging).
 - [ ] 0.5.3 Implement `.mcp.json` merge from plugins into the client MCP set.
 - [ ] 0.5.4 Implement session-env injection from lifecycle-hook stdout (`KEY=VALUE`).
-- [ ] 0.5.5 Implement `provides.login` command registration + credential-profile
-      persistence.
+- [x] 0.5.5 Implement `provides.login` command registration + credential-profile
+      persistence. *Done: `src/plugin_auth.rs` routes `login <plugin-id>`, invokes the
+      plugin's auth handler, and persists its JSON output to `~/.aish/credentials` under
+      `[profile:<plugin-id>]` at mode 0600; the credential is reusable via
+      `${profile:<plugin-id>}` in `.mcp.json` and exported to lifecycle hooks as
+      `AISH_PROFILE_<PLUGIN>_<FIELD>`. See "0.5.5 implementation notes" below.*
 - [ ] 0.5.6 `:hooks list` shows plugin-contributed entries with provenance; `:plugin
       info <id>` shows which catalog events it registers.
 - [ ] 0.5.7 Tests: catalog merge + precedence, blocking-veto from a plugin entry,

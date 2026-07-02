@@ -80,6 +80,13 @@ pub struct Provides {
     /// the word "hooks" for the event-catalog contribution surface.
     #[serde(default)]
     pub hooks: Vec<String>,
+    /// The **login command** this plugin handles (Phase 0.5.5): declaring
+    /// `"login": "mycompany"` makes `aish login mycompany` route to this
+    /// plugin's `login.sh` auth handler, whose JSON output is persisted to
+    /// `~/.aish/credentials` under `[profile:mycompany]`. Absent → the plugin
+    /// contributes no login command. See [`crate::plugin_auth`].
+    #[serde(default)]
+    pub login: Option<String>,
 }
 
 impl PluginManifest {
@@ -100,6 +107,13 @@ impl PluginManifest {
             None => &[],
         }
     }
+
+    /// The login command this plugin handles, if any (`provides.login`). When
+    /// `Some("mycompany")`, `aish login mycompany` routes here (Phase 0.5.5).
+    pub fn login_command(&self) -> Option<&str> {
+        self.provides.as_ref().and_then(|p| p.login.as_deref())
+    }
+
 
     /// True when the manifest relies on the deprecated `provides.hooks` alias —
     /// i.e. `hooks` is populated and the canonical `lifecycle_hooks` is not.
