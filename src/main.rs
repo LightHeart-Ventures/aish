@@ -44,6 +44,7 @@ mod session;
 mod skill_match;
 mod skill_provider;
 mod skills;
+mod stream_render;
 mod style;
 mod suggest;
 mod terminal;
