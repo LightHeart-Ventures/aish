@@ -28,6 +28,48 @@
 use crate::backend::ToolResult;
 use crate::session::Session;
 
+// -- Batching configuration (TASK-249 / FR-305) ---------------------------
+//
+// Tool-heavy turns previously issued one INSERT (one transaction, one fsync)
+// per tool call. The Session now holds a small ring buffer; `record` appends to
+// it and the buffer is flushed as ONE transaction when it fills, when the flush
+// interval elapses, or on session Drop. The knobs below are resolved from the
+// environment ONCE at `Session::new` (so a live turn does no env lookups) and
+// cached on the Session. Parsing is factored into pure `parse_*` helpers so it
+// can be unit-tested without mutating process env.
+
+/// Default ring-buffer capacity: flush after this many buffered events.
+pub const DEFAULT_BATCH_SIZE: usize = 20;
+/// Default flush interval: buffered events at most this many seconds stale.
+pub const DEFAULT_FLUSH_SECS: u64 = 5;
+
+/// Parse `AISH_TELEMETRY_BATCH_SIZE`. A positive integer sets the buffer
+/// capacity; anything unset/unparseable/zero falls back to the default (0 would
+/// mean "never flush on size", which is a footgun — coerced to the default).
+pub fn parse_batch_size(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_BATCH_SIZE)
+}
+
+/// Parse `AISH_TELEMETRY_FLUSH_SECS`. `0` is honoured verbatim (flush on the
+/// very next record — effectively no time-buffering); unset/unparseable falls
+/// back to the default.
+pub fn parse_flush_secs(v: Option<&str>) -> u64 {
+    v.and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FLUSH_SECS)
+}
+
+/// Parse `AISH_TELEMETRY_UNBUFFERED`. Truthy (`1`/`true`/`yes`/`on`, case-
+/// insensitive) restores the legacy per-call insert path — every `record`
+/// flushes immediately. Anything else keeps buffering on.
+pub fn parse_unbuffered(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
 /// A coarse bucket for a failed tool call. Deliberately small: the point is to
 /// spot *patterns* ("atum_list_* timeouts recover 80% of the time"), not to
 /// preserve every error string. Ordered most-specific-first in [`classify`].
@@ -194,9 +236,11 @@ pub struct RetryStat {
 }
 
 /// Record one completed tool call. Best-effort: updates the session's
-/// last-unresolved-failure map (for retry detection) and appends a row to the
-/// telemetry table. A DB write failure is swallowed — telemetry must never
-/// break a real turn. No-op when no persistent store is attached.
+/// last-unresolved-failure map (for retry detection) and appends the event to
+/// the session ring buffer, flushing to SQLite as one transaction when the
+/// buffer fills or the flush interval elapses. A DB write failure is swallowed —
+/// telemetry must never break a real turn. No-op when no persistent store is
+/// attached. Set `AISH_TELEMETRY_UNBUFFERED=1` to restore per-call inserts.
 pub fn record(session: &mut Session, tool: &str, result: &ToolResult) {
     let prev = session.tool_failures.get(tool).cloned();
     let is_retry = prev.is_some();
@@ -209,16 +253,19 @@ pub fn record(session: &mut Session, tool: &str, result: &ToolResult) {
     let recovered = is_retry && !result.is_error;
 
     // Update the pending-failure map: a failure (re)arms it, a success clears it.
+    // This is session-local retry state and must update whether or not a store
+    // is attached, so it happens BEFORE the early return.
     if let Some(cls) = &error_class {
         session.tool_failures.insert(tool.to_string(), cls.clone());
     } else {
         session.tool_failures.remove(tool);
     }
 
-    let session_id = session.session_id.clone();
-    let Some(db) = session.db.as_ref() else {
+    // No store ⇒ nothing to persist or buffer.
+    if session.db.is_none() {
         return;
-    };
+    }
+
     let ev = ToolEvent {
         tool: tool.to_string(),
         is_error: result.is_error,
@@ -226,9 +273,45 @@ pub fn record(session: &mut Session, tool: &str, result: &ToolResult) {
         is_retry,
         recovered,
         prev_class: prev,
-        session_id,
+        session_id: session.session_id.clone(),
     };
-    let _ = db.record_tool_event(&ev);
+
+    // Legacy per-call insert path: persist immediately, bypassing the buffer, so
+    // behaviour is byte-for-byte the pre-batching one.
+    if session.tool_telemetry_unbuffered {
+        if let Some(db) = session.db.as_ref() {
+            let _ = db.record_tool_event(&ev);
+        }
+        return;
+    }
+
+    session.tool_telemetry_buf.push(ev);
+
+    // Flush when the buffer reaches capacity or the flush interval has elapsed
+    // since the last flush. The timer is checked here (piggy-backing on tool
+    // activity) rather than on a background task — the tail is caught by the
+    // Drop flush at shutdown.
+    let full = session.tool_telemetry_buf.len() >= session.tool_telemetry_batch_size;
+    let timed = session.tool_telemetry_last_flush.elapsed() >= session.tool_telemetry_flush;
+    if full || timed {
+        flush(session);
+    }
+}
+
+/// Drain the session's tool-telemetry ring buffer to SQLite as ONE transaction.
+/// Best-effort: a write failure is swallowed (the buffer is still cleared so a
+/// persistent DB error can't wedge an ever-growing buffer). No-op when the
+/// buffer is empty or no store is attached. Called on buffer-full, on the flush
+/// timer, at graceful shutdown, and from `Session`'s `Drop`.
+pub fn flush(session: &mut Session) {
+    if session.tool_telemetry_buf.is_empty() {
+        return;
+    }
+    if let Some(db) = session.db.as_ref() {
+        let _ = db.record_tool_events_batch(&session.tool_telemetry_buf);
+    }
+    session.tool_telemetry_buf.clear();
+    session.tool_telemetry_last_flush = std::time::Instant::now();
 }
 
 /// Render the `:telemetry` report from the aggregated tables. Pure so it can be
@@ -385,5 +468,113 @@ mod tests {
         assert!(s.contains("RECOVERED"));
         // 8/10 recovered ⇒ 80%.
         assert!(s.contains("80%"));
+    }
+
+    // -- batching (TASK-249 / FR-305) -------------------------------------
+
+    #[test]
+    fn parse_helpers_honor_env_strings() {
+        assert_eq!(parse_batch_size(None), DEFAULT_BATCH_SIZE);
+        assert_eq!(parse_batch_size(Some("50")), 50);
+        assert_eq!(parse_batch_size(Some(" 8 ")), 8);
+        // 0 is a footgun ("never flush on size") ⇒ coerced to default.
+        assert_eq!(parse_batch_size(Some("0")), DEFAULT_BATCH_SIZE);
+        assert_eq!(parse_batch_size(Some("nope")), DEFAULT_BATCH_SIZE);
+
+        assert_eq!(parse_flush_secs(None), DEFAULT_FLUSH_SECS);
+        assert_eq!(parse_flush_secs(Some("0")), 0); // honoured verbatim
+        assert_eq!(parse_flush_secs(Some("30")), 30);
+        assert_eq!(parse_flush_secs(Some("x")), DEFAULT_FLUSH_SECS);
+
+        assert!(parse_unbuffered(Some("1")));
+        assert!(parse_unbuffered(Some("TRUE")));
+        assert!(parse_unbuffered(Some("yes")));
+        assert!(parse_unbuffered(Some("On")));
+        assert!(!parse_unbuffered(Some("0")));
+        assert!(!parse_unbuffered(Some("")));
+        assert!(!parse_unbuffered(None));
+    }
+
+    fn tele_tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "aish_tele_{tag}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn tele_session(dir: &std::path::Path) -> Session {
+        let mut s = Session::new().unwrap();
+        s.db = Some(crate::db::Db::open(&dir.join("t.db")).unwrap());
+        s.tool_telemetry_buf.clear();
+        s.tool_telemetry_unbuffered = false;
+        s.tool_telemetry_flush = std::time::Duration::from_secs(3600); // disable timer
+        s.tool_telemetry_last_flush = std::time::Instant::now();
+        s
+    }
+
+    #[test]
+    fn record_buffers_then_flushes_as_one_batch() {
+        let dir = tele_tmp("buf");
+        let mut s = tele_session(&dir);
+        s.tool_telemetry_batch_size = 3;
+
+        let ok = ToolResult::text("t", "done", false);
+        record(&mut s, "run_program", &ok);
+        record(&mut s, "run_program", &ok);
+        // Two buffered, nothing persisted yet (batch not full, timer disabled).
+        assert_eq!(s.tool_telemetry_buf.len(), 2);
+        assert_eq!(s.db.as_ref().unwrap().tool_telemetry_count().unwrap(), 0);
+
+        // Third hits capacity → a single batched flush of all three.
+        record(&mut s, "run_program", &ok);
+        assert!(s.tool_telemetry_buf.is_empty());
+        assert_eq!(s.db.as_ref().unwrap().tool_telemetry_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn high_throughput_collapses_transactions() {
+        // 100 tool calls with batch 20 ⇒ 5 flushes, all 100 rows persisted.
+        let dir = tele_tmp("hot");
+        let mut s = tele_session(&dir);
+        s.tool_telemetry_batch_size = 20;
+        let ok = ToolResult::text("t", "done", false);
+        for _ in 0..100 {
+            record(&mut s, "run_program", &ok);
+        }
+        // 100 is a multiple of 20 ⇒ buffer drained exactly, nothing stranded.
+        assert!(s.tool_telemetry_buf.is_empty());
+        assert_eq!(s.db.as_ref().unwrap().tool_telemetry_count().unwrap(), 100);
+    }
+
+    #[test]
+    fn drop_flushes_buffered_tail() {
+        let dir = tele_tmp("drop");
+        let dbpath = dir.join("t.db");
+        {
+            let mut s = tele_session(&dir);
+            s.tool_telemetry_batch_size = 100; // never reached
+            let ok = ToolResult::text("t", "done", false);
+            record(&mut s, "glob_expand", &ok);
+            record(&mut s, "glob_expand", &ok);
+            assert_eq!(s.tool_telemetry_buf.len(), 2);
+            // `s` drops here → Drop for Session flushes the tail.
+        }
+        let db2 = crate::db::Db::open(&dbpath).unwrap();
+        assert_eq!(db2.tool_telemetry_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn unbuffered_mode_persists_immediately() {
+        let dir = tele_tmp("unbuf");
+        let mut s = tele_session(&dir);
+        s.tool_telemetry_unbuffered = true;
+        let ok = ToolResult::text("t", "done", false);
+        record(&mut s, "read_file", &ok);
+        assert!(s.tool_telemetry_buf.is_empty());
+        assert_eq!(s.db.as_ref().unwrap().tool_telemetry_count().unwrap(), 1);
     }
 }

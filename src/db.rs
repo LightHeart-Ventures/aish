@@ -423,6 +423,45 @@ impl Db {
         Ok(())
     }
 
+    /// Append many tool-call telemetry rows in a SINGLE transaction (one fsync
+    /// instead of one-per-row). This is the batched path behind the Session ring
+    /// buffer (TASK-249 / FR-305): a tool-heavy turn buffers events and flushes
+    /// them here as one commit, collapsing N inserts + N fsyncs into 1. A prepared
+    /// statement is reused across the batch. Best-effort at the call site — a
+    /// telemetry write must never sink a real turn — but transactional here so a
+    /// mid-batch failure rolls back cleanly rather than persisting a torn prefix.
+    pub fn record_tool_events_batch(
+        &self,
+        events: &[crate::tool_telemetry::ToolEvent],
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        // `unchecked_transaction` gives us a transaction from `&self` (the shared
+        // borrow the telemetry path holds); we never nest, so it's safe.
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO tool_telemetry
+                     (tool, is_error, error_class, is_retry, recovered, prev_class, session_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for ev in events {
+                stmt.execute(rusqlite::params![
+                    ev.tool,
+                    ev.is_error as i64,
+                    ev.error_class,
+                    ev.is_retry as i64,
+                    ev.recovered as i64,
+                    ev.prev_class,
+                    ev.session_id,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Total number of recorded tool-call events.
     pub fn tool_telemetry_count(&self) -> Result<i64> {
         Ok(self
