@@ -289,8 +289,16 @@ pub async fn run(
     // or the user's typing. ExternalPrinter redraws the prompt after printing.
     // If the terminal can't provide a printer, we leave inline printing on.
     let busy = Arc::new(AtomicBool::new(false));
-    if let Some(mut printer) = editor.take_printer() {
+    if let Some(printer) = editor.take_printer() {
         crate::present::enable_deferred();
+        // Share the one ExternalPrinter process-wide (#354). The live `:attach`
+        // / Shift-Tab coordinator stream forwards through `tools::announce_raw`;
+        // installing the printer here makes that path prompt-preserving too,
+        // instead of the raw `\r\x1b[2K` write that stranded the prompt above
+        // the stream. This presenter then prints its own notices through the
+        // same slot (`tools::print_above_prompt`), so both share one serialised
+        // printer.
+        crate::tools::install_external_printer(printer);
         let busy = busy.clone();
         let batch_jobs = session.batch_jobs.clone();
         let worker_jobs = session.worker_jobs.clone();
@@ -325,10 +333,10 @@ pub async fn run(
                         .unwrap_or(false);
                     if terminal && claim_attach_announce(&attach_review_announced, &run_id) {
                         for line in attached_result_lines(&run_id, &worker_jobs) {
-                            let _ = printer.print(format!("{line}\n"));
+                            crate::tools::print_above_prompt(format!("{line}\n"));
                         }
                         let short = crate::batch::short_id(&run_id);
-                        let _ = printer.print(format!(
+                        crate::tools::print_above_prompt(format!(
                             "\x1b[2m⇄ {short} finished — review mode: type a message to resume it, or :detach to return to your shell.\x1b[0m\n"
                         ));
                     }
@@ -338,7 +346,7 @@ pub async fn run(
                 let mut notices = crate::batch::notify_pending(&batch_jobs);
                 notices.extend(crate::worker::notify_pending(&worker_jobs));
                 for n in notices {
-                    let _ = printer.print(format!("{n}\n"));
+                    crate::tools::print_above_prompt(format!("{n}\n"));
                 }
                 // Auto-resume wake hook: observe this session's fanned-out
                 // coordinators. Snapshot every worker's terminal-ness and the
@@ -368,7 +376,7 @@ pub async fn run(
                         .map(|mut r| r.observe(&terminal_ids, outstanding))
                         .unwrap_or(false);
                     if freshly_armed {
-                        let _ = printer.print(
+                        crate::tools::print_above_prompt(
                             "\x1b[2m⤵ background workers finished — resuming to synthesize their results…\x1b[0m\n"
                                 .to_string(),
                         );
