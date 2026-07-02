@@ -193,6 +193,24 @@ pub async fn run(
     for w in &plugin_mcp_warns {
         eprintln!("\x1b[33maish:\x1b[0m {w}");
     }
+    // Phase 0.5.4: run plugin `on_init` lifecycle hooks BEFORE the REPL starts
+    // and inject any KEY=VALUE lines they print on stdout into the session env.
+    // Merge order: existing session/user env always wins — plugin vars only fill
+    // gaps. Credential-like payloads are rejected by the redaction guard. Set
+    // AISH_ENV_INJECTION_DISABLED to skip this entirely.
+    {
+        let plugins = crate::plugins::discover(&crate::plugins::default_plugins_dir());
+        let (env_pairs, env_warns) =
+            crate::plugins::collect_lifecycle_env(&plugins, "on_init");
+        for w in &env_warns {
+            eprintln!("\x1b[33maish:\x1b[0m {w}");
+        }
+        for (k, v) in env_pairs {
+            if !session.env.iter().any(|(ek, _)| ek == &k) {
+                session.set_var(&k, v);
+            }
+        }
+    }
     let mut mcp_rx: Option<tokio::sync::oneshot::Receiver<(crate::mcp::McpHost, String)>> =
         if mcp_config_paths.is_empty() && plugin_mcp.is_empty() {
             None

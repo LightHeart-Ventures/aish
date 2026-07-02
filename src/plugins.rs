@@ -713,6 +713,233 @@ where
     }
 }
 
+// ===================================================================
+// Phase 0.5.4 — session-env injection from lifecycle-hook stdout
+// ===================================================================
+//
+// A plugin lifecycle hook is a script at `<plugin_dir>/<hook>.sh` (e.g.
+// `on_init.sh`). At plugin-load time — BEFORE the REPL starts — the shell
+// fork/execs the script, captures its **stdout**, and parses any `KEY=VALUE`
+// lines into the session environment. Lines that aren't `KEY=VALUE`, blank
+// lines, and `#` comments are ignored. Credential-looking payloads are rejected
+// by a redaction guard (see [`looks_like_secret`]).
+//
+// **Merge order (documented decision):** existing session/user env ALWAYS wins.
+// Plugin-emitted vars only *fill gaps* — the caller skips any key already present
+// in `session.env` (which is seeded from the real process env). Among plugins,
+// first-plugin-by-id wins on a key clash (plugins are id-sorted), matching the
+// 0.5.3 MCP collision policy; the loser is skipped with a warning.
+//
+// **Escape hatch:** set `AISH_ENV_INJECTION_DISABLED` (to anything other than
+// empty/`0`/`false`) to disable injection entirely — hooks are not even run.
+
+/// The environment variable that, when truthy, disables lifecycle-hook env
+/// injection wholesale (operators' kill switch).
+const ENV_INJECTION_DISABLED_VAR: &str = "AISH_ENV_INJECTION_DISABLED";
+
+/// Substrings that mark a key or value as credential-like. If a `KEY=VALUE`
+/// pair's key OR value contains any of these (case-insensitive), the pair is
+/// rejected with a warning and never injected. Kept intentionally broad —
+/// lifecycle-hook stdout is the wrong channel for secrets (use `${profile:…}`
+/// credential refs instead).
+const SECRET_MARKERS: &[&str] = &[
+    "secret",
+    "password",
+    "passwd",
+    "token",
+    "credential",
+    "api_key",
+    "apikey",
+    "private_key",
+    "access_key",
+    "secret_key",
+];
+
+/// Hard cap on a lifecycle hook's runtime. A hook that neither exits nor closes
+/// stdout within this window is killed and its output discarded (startup must
+/// not wedge on a hung plugin). Documented caveat: a hook emitting more than a
+/// pipe buffer (~64 KB) of output without exiting can also hit this cap.
+const LIFECYCLE_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Is a `KEY=VALUE` pair credential-like (and therefore refused)? Matches the
+/// [`SECRET_MARKERS`] denylist as a case-insensitive substring on either the key
+/// or the value, plus any key that *is* `key` or ends in `_key` (catches
+/// `API_KEY`, `AWS_SECRET_KEY`, … without tripping on innocent words like
+/// `MONKEY` that merely contain "key").
+fn looks_like_secret(key: &str, value: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    let v = value.to_ascii_lowercase();
+    if SECRET_MARKERS.iter().any(|m| k.contains(m) || v.contains(m)) {
+        return true;
+    }
+    k == "key" || k.ends_with("_key")
+}
+
+/// A syntactically valid environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Parse a lifecycle hook's stdout into `(KEY, VALUE)` pairs plus warnings.
+///
+/// Rules:
+///   * Blank lines and `#` comments are skipped.
+///   * A line without `=` (or with an invalid key) is **silently ignored** —
+///     hooks routinely print human-readable status lines.
+///   * A pair whose key/value looks like a credential is **rejected with a
+///     warning** ([`looks_like_secret`]).
+/// Surrounding whitespace on both key and value is trimmed.
+pub fn parse_env_lines(stdout: &str, plugin_id: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let mut pairs = Vec::new();
+    let mut warnings = Vec::new();
+    for raw in stdout.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue; // not KEY=VALUE — ignore
+        };
+        let key = k.trim();
+        let val = v.trim();
+        if !is_valid_env_key(key) {
+            continue; // junk key — ignore
+        }
+        if looks_like_secret(key, val) {
+            warnings.push(format!(
+                "plugin `{plugin_id}`: refusing to inject env var `{key}` — name/value looks \
+                 like a credential (blocked by the env-injection redaction guard)"
+            ));
+            continue;
+        }
+        pairs.push((key.to_string(), val.to_string()));
+    }
+    (pairs, warnings)
+}
+
+/// True when the operator kill switch [`ENV_INJECTION_DISABLED_VAR`] is set to a
+/// truthy value.
+fn env_injection_disabled() -> bool {
+    std::env::var(ENV_INJECTION_DISABLED_VAR)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false"
+        })
+        .unwrap_or(false)
+}
+
+/// Fork/exec a plugin's `<hook>.sh` and capture its stdout. Returns `None` when
+/// the script does not exist (most plugins ship no lifecycle hook) or fails to
+/// spawn. The child runs with `cwd = plugin.dir`, stdin closed, stderr
+/// discarded, and `AISH_PLUGIN_ID` / `AISH_PLUGIN_DIR` exported. A hook that
+/// outruns [`LIFECYCLE_HOOK_TIMEOUT`] is killed and its output discarded.
+fn run_lifecycle_hook_script(plugin: &Plugin, hook: &str) -> Option<String> {
+    let script = plugin.dir.join(format!("{hook}.sh"));
+    if !script.is_file() {
+        return None;
+    }
+    let mut child = std::process::Command::new(&script)
+        .current_dir(&plugin.dir)
+        .env("AISH_PLUGIN_ID", &plugin.manifest.id)
+        .env("AISH_PLUGIN_DIR", plugin.dir.to_string_lossy().to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = std::time::Instant::now() + LIFECYCLE_HOOK_TIMEOUT;
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    timed_out = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => break,
+        }
+    }
+    if timed_out {
+        eprintln!(
+            "\x1b[33maish:\x1b[0m plugin `{}`: lifecycle hook `{hook}` timed out after {}s — \
+             output discarded",
+            plugin.manifest.id,
+            LIFECYCLE_HOOK_TIMEOUT.as_secs()
+        );
+        return None;
+    }
+    let mut buf = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        use std::io::Read;
+        let _ = out.read_to_string(&mut buf);
+    }
+    Some(buf)
+}
+
+/// Run `hook` for every plugin and collect the env vars they emit, resolving the
+/// collision + redaction policy. Real entry point; uses [`run_lifecycle_hook_script`]
+/// to fork/exec and the process env to check the kill switch.
+pub fn collect_lifecycle_env(plugins: &[Plugin], hook: &str) -> (Vec<(String, String)>, Vec<String>) {
+    collect_lifecycle_env_with(
+        plugins,
+        hook,
+        env_injection_disabled(),
+        &run_lifecycle_hook_script,
+    )
+}
+
+/// [`collect_lifecycle_env`] with an injectable hook runner + disabled flag — the
+/// seam the tests drive so they never fork a real process. `run` returns the
+/// hook's stdout, or `None` when the plugin has no such hook.
+fn collect_lifecycle_env_with<R>(
+    plugins: &[Plugin],
+    hook: &str,
+    disabled: bool,
+    run: &R,
+) -> (Vec<(String, String)>, Vec<String>)
+where
+    R: Fn(&Plugin, &str) -> Option<String>,
+{
+    let mut warnings = Vec::new();
+    if disabled {
+        return (Vec::new(), warnings);
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    // key -> winning plugin id (for the collision warning).
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for plugin in plugins {
+        let Some(stdout) = run(plugin, hook) else {
+            continue; // plugin ships no such lifecycle hook
+        };
+        let (pairs, mut w) = parse_env_lines(&stdout, &plugin.manifest.id);
+        warnings.append(&mut w);
+        for (k, v) in pairs {
+            if let Some(winner) = seen.get(&k) {
+                warnings.push(format!(
+                    "plugin `{}`: env var `{k}` already set by plugin `{winner}` \
+                     — keeping first, skipping duplicate",
+                    plugin.manifest.id
+                ));
+                continue;
+            }
+            seen.insert(k.clone(), plugin.manifest.id.clone());
+            out.push((k, v));
+        }
+    }
+    (out, warnings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1262,5 +1489,143 @@ mod tests {
             "Bearer ${access_token}"
         );
         assert!(warnings.is_empty(), "bare refs must not warn: {warnings:?}");
+    }
+
+    // ---- Phase 0.5.4: session-env injection from lifecycle-hook stdout ----
+
+    /// Build a bare `Plugin` value (no on-disk files needed) for the injectable
+    /// `collect_lifecycle_env_with` seam.
+    fn bare_plugin(id: &str) -> Plugin {
+        Plugin {
+            manifest: manifest(&format!(r#"{{"id":"{id}"}}"#)),
+            dir: PathBuf::from("/nonexistent").join(id),
+            skills: Vec::new(),
+            config: None,
+        }
+    }
+
+    #[test]
+    fn parse_env_lines_basic() {
+        let (pairs, warns) = parse_env_lines("FOO=bar\nBAZ=qux\n", "p");
+        assert_eq!(pairs, vec![("FOO".into(), "bar".into()), ("BAZ".into(), "qux".into())]);
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn parse_env_lines_ignores_non_kv_and_comments() {
+        // Human status lines, blanks, and comments are silently dropped.
+        let (pairs, warns) =
+            parse_env_lines("Hello from the plugin\n\n# a comment\nREADY=1\nnot a pair\n", "p");
+        assert_eq!(pairs, vec![("READY".into(), "1".into())]);
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn parse_env_lines_trims_and_validates_keys() {
+        // Whitespace trimmed; a value may itself contain '='; invalid keys dropped.
+        let (pairs, _) = parse_env_lines("  FOO = a=b=c \n1BAD=x\nGOOD_1=y\n", "p");
+        assert_eq!(
+            pairs,
+            vec![("FOO".into(), "a=b=c".into()), ("GOOD_1".into(), "y".into())]
+        );
+    }
+
+    #[test]
+    fn parse_env_lines_rejects_credentials() {
+        // Key or value looking secret-y is refused with a warning.
+        let (pairs, warns) = parse_env_lines(
+            "API_KEY=abc123\nDB_PASSWORD=hunter2\nMY_SECRET=x\nSAFE=ok\nSESSION_TOKEN=zzz\n",
+            "p",
+        );
+        assert_eq!(pairs, vec![("SAFE".into(), "ok".into())]);
+        assert_eq!(warns.len(), 4, "four credential-like pairs rejected: {warns:?}");
+        assert!(warns.iter().all(|w| w.contains("redaction")));
+    }
+
+    #[test]
+    fn parse_env_lines_secret_value_rejected_even_with_safe_key() {
+        let (pairs, warns) = parse_env_lines("CONFIG=my-password-is-hunter2\n", "p");
+        assert!(pairs.is_empty());
+        assert_eq!(warns.len(), 1);
+    }
+
+    #[test]
+    fn collect_lifecycle_env_single_plugin_multiple_vars() {
+        let plugins = vec![bare_plugin("solo")];
+        let run = |_p: &Plugin, _h: &str| Some("A=1\nB=2\n".to_string());
+        let (pairs, warns) = collect_lifecycle_env_with(&plugins, "on_init", false, &run);
+        assert_eq!(pairs, vec![("A".into(), "1".into()), ("B".into(), "2".into())]);
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn collect_lifecycle_env_multi_plugin_collision_first_wins() {
+        // Plugins are id-sorted (a < b); first contributor of SHARED wins.
+        let plugins = vec![bare_plugin("a"), bare_plugin("b")];
+        let run = |p: &Plugin, _h: &str| {
+            Some(match p.manifest.id.as_str() {
+                "a" => "SHARED=from_a\nONLY_A=1\n".to_string(),
+                "b" => "SHARED=from_b\nONLY_B=2\n".to_string(),
+                _ => String::new(),
+            })
+        };
+        let (pairs, warns) = collect_lifecycle_env_with(&plugins, "on_init", false, &run);
+        assert_eq!(
+            pairs,
+            vec![
+                ("SHARED".into(), "from_a".into()),
+                ("ONLY_A".into(), "1".into()),
+                ("ONLY_B".into(), "2".into()),
+            ]
+        );
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("SHARED") && warns[0].contains("keeping first"));
+    }
+
+    #[test]
+    fn collect_lifecycle_env_disabled_escape_hatch() {
+        let plugins = vec![bare_plugin("solo")];
+        let run = |_p: &Plugin, _h: &str| Some("A=1\n".to_string());
+        let (pairs, warns) = collect_lifecycle_env_with(&plugins, "on_init", true, &run);
+        assert!(pairs.is_empty(), "kill switch suppresses all injection");
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn collect_lifecycle_env_skips_plugins_without_hook() {
+        // `run` returns None for a plugin that ships no such hook script.
+        let plugins = vec![bare_plugin("has"), bare_plugin("hasnt")];
+        let run = |p: &Plugin, _h: &str| {
+            (p.manifest.id == "has").then(|| "X=1\n".to_string())
+        };
+        let (pairs, _) = collect_lifecycle_env_with(&plugins, "on_init", false, &run);
+        assert_eq!(pairs, vec![("X".into(), "1".into())]);
+    }
+
+    #[test]
+    fn run_lifecycle_hook_script_captures_stdout() {
+        // End-to-end fork/exec of a real on_init.sh, then parse.
+        let tmp = tempdir();
+        let pdir = tmp.join("greeter");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(pdir.join("plugin.json"), r#"{"id":"greeter"}"#).unwrap();
+        let script = pdir.join("on_init.sh");
+        fs::write(
+            &script,
+            "#!/usr/bin/env bash\necho GREETING=hi\necho status line not a pair\necho READY=1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugins = discover(&tmp);
+        let (pairs, warns) = collect_lifecycle_env(&plugins, "on_init");
+        assert_eq!(
+            pairs,
+            vec![("GREETING".into(), "hi".into()), ("READY".into(), "1".into())]
+        );
+        assert!(warns.is_empty());
     }
 }
