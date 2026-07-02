@@ -7,6 +7,53 @@
 /// `base` is the style to re-assert after a reset (e.g. "\x1b[2m" when the
 /// caller prints the whole line dim) — SGR 22 turns off bold *and* dim, so a
 /// plain bold-off would otherwise un-dim the rest of the line.
+use std::cell::Cell;
+
+thread_local! {
+    /// When set, `term_width()` returns this instead of querying the tty/$COLUMNS
+    /// — the mechanism `render_within` / `render_pane` use to fit tables & rules
+    /// to a width other than the raw terminal (e.g. terminal-minus-pane-gutter).
+    /// `None` = query the terminal as usual.
+    static WIDTH_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Columns to assume for pane-bound markdown when the terminal width is unknown
+/// (a headless coordinator with no `$COLUMNS`). Conservative on purpose so a
+/// forwarded table wraps its cells rather than running off a typical terminal.
+const DEFAULT_PANE_COLS: usize = 100;
+
+/// Columns the coordinator-output pane gutter (`┃ [label] `) steals from every
+/// row. Reserved when rendering markdown destined for a pane so tables/rules fit
+/// the REMAINING width — otherwise the gutter pushes each row past the terminal
+/// edge and the terminal hard-wraps the whole box. Short run-id labels
+/// (`w_` + 8 hex ⇒ gutter 15); 16 leaves a column of slack.
+const PANE_GUTTER_COLS: usize = 16;
+
+/// Like [`render`], but fits tables & horizontal rules within `max_cols` display
+/// columns instead of the full terminal width. Restores the previous width on
+/// return, so it nests safely.
+pub fn render_within(text: &str, base: &str, max_cols: usize) -> String {
+    let prev = WIDTH_OVERRIDE.with(|c| c.replace(Some(max_cols)));
+    let out = render(text, base);
+    WIDTH_OVERRIDE.with(|c| c.set(prev));
+    out
+}
+
+/// Render markdown to ANSI for placement inside the coordinator-output pane:
+/// tables/rules fit within the terminal width MINUS the pane gutter, so the
+/// `┃ [label] ` border prepended to every line doesn't push the box past the
+/// edge (which makes the terminal hard-wrap the whole table — the bug this
+/// avoids). Falls back to a bounded default width when the terminal width is
+/// unknown (headless coordinator with no `$COLUMNS`) so a forwarded table is
+/// never rendered unbounded-wide.
+pub fn render_pane(text: &str, base: &str) -> String {
+    let term = match term_width() {
+        usize::MAX => DEFAULT_PANE_COLS,
+        w => w,
+    };
+    render_within(text, base, term.saturating_sub(PANE_GUTTER_COLS).max(24))
+}
+
 pub fn render(text: &str, base: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
@@ -255,6 +302,11 @@ fn render_table(block: &[&str], indent: &str, base: &str, out: &mut Vec<String>)
 /// return a huge width so captured output is never wrapped — the wrapping then
 /// happens later when a tty actually renders it.
 fn term_width() -> usize {
+    // A caller inside `render_within` / `render_pane` pins the fitting width so
+    // markdown bound for a bordered pane fits the width LEFT after the gutter.
+    if let Some(w) = WIDTH_OVERRIDE.with(|c| c.get()) {
+        return w;
+    }
     // SAFETY: isatty + a TIOCGWINSZ ioctl on stdout, both read-only.
     unsafe {
         if libc::isatty(1) == 1 {
@@ -406,6 +458,21 @@ pub fn render_stdout(text: &str) -> String {
     }
 }
 
+/// Width-aware [`render_stdout`]: when stdout is a TTY, fits tables/rules within
+/// `max_cols` (use for markdown that will be re-framed inside a bordered pane so
+/// the gutter doesn't push rows past the edge); when piped, emits raw markdown
+/// unchanged. `max_cols == usize::MAX` reproduces `render_stdout`'s full-width
+/// fitting.
+pub fn render_stdout_within(text: &str, max_cols: usize) -> String {
+    // SAFETY: plain isatty query.
+    if unsafe { libc::isatty(1) } == 1 {
+        render_within(text, "", max_cols)
+    } else {
+        text.to_string()
+    }
+}
+
+
 /// Inline spans: `code`, **bold**, *italic*, ~~strike~~, [text](url). Underscore
 /// emphasis is skipped on purpose — it would mangle snake_case identifiers.
 fn inline(s: &str, base: &str) -> String {
@@ -500,7 +567,10 @@ fn render_link(rest: &str, base: &str, out: &mut String) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::render;
-    use super::{fit_widths, visible_width, wrap_cell};
+    use super::{
+        fit_widths, render_pane, render_within, visible_width, wrap_cell, DEFAULT_PANE_COLS,
+        PANE_GUTTER_COLS,
+    };
 
     // Serializes every test that mutates the process-global `COLUMNS` env var.
     // The test runner executes in parallel, so without this one test's
@@ -559,6 +629,47 @@ mod tests {
         // framed (top + header + mid + ≥2 wrapped body lines + bottom)
         assert!(lines.len() >= 6, "expected wrapped+framed rows, got {lines:#?}");
         unsafe { std::env::remove_var("COLUMNS") };
+    }
+
+    #[test]
+    fn render_within_bounds_table_below_terminal_width() {
+        // A table whose natural width dwarfs the budget must be fit to the
+        // budget regardless of the real terminal width — this is what keeps a
+        // coordinator's forwarded table from overflowing the pane gutter and
+        // hard-wrapping. Every physical line must be ≤ the requested width.
+        let _cols = lock_columns();
+        unsafe { std::env::set_var("COLUMNS", "500") }; // wide "terminal"
+        let md = "| Test run | Trigger | What it proves |\n|---|---|---|\n| Reuse path | workflow_dispatch default linux on a commit with a matching release | The setup job detects the existing CI build and skips recompilation entirely |";
+        let out = render_within(md, "", 60);
+        for line in out.lines() {
+            assert!(
+                visible_width(line) <= 60,
+                "line exceeds 60 cols: {} → {line:?}",
+                visible_width(line)
+            );
+        }
+        // Sanity: without the bound the same table blows past 60 (proving the
+        // override, not a coincidentally-narrow table, did the work).
+        assert!(render(md, "").lines().any(|l| visible_width(l) > 60));
+        unsafe { std::env::remove_var("COLUMNS") };
+    }
+
+    #[test]
+    fn render_pane_reserves_gutter_and_falls_back_when_width_unknown() {
+        // No terminal + no $COLUMNS → render_pane uses its bounded default
+        // (never usize::MAX), so a forwarded table is never rendered
+        // unbounded-wide. Every line fits the default minus the gutter reserve.
+        let _cols = lock_columns();
+        unsafe { std::env::remove_var("COLUMNS") };
+        let md = "| A | B |\n|---|---|\n| one two three four five | six seven eight nine ten eleven twelve |";
+        let out = render_pane(md, "");
+        let budget = DEFAULT_PANE_COLS - PANE_GUTTER_COLS;
+        for line in out.lines() {
+            assert!(
+                visible_width(line) <= budget,
+                "pane line exceeds {budget}: {line:?}"
+            );
+        }
     }
 
     #[test]

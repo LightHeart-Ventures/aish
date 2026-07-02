@@ -443,6 +443,22 @@ pub fn pane_row(label: &str, text: &str) -> String {
     pane_row_cols(label, text, pane_cols())
 }
 
+/// Display columns available for CONTENT inside a pane row, after the
+/// `┃ [label] ` gutter, at the live terminal width. Feed this to
+/// `md::render_stdout_within` so markdown (esp. tables) rendered for a pane fits
+/// the remaining width and the terminal doesn't hard-wrap the box. Returns
+/// `usize::MAX` when the width is unknown (piped/tests) so rendering stays
+/// unbounded — byte-identical to the pre-wrap behaviour there.
+pub fn pane_content_cols(label: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    match pane_cols() {
+        usize::MAX => usize::MAX,
+        cols => cols
+            .saturating_sub(5 + UnicodeWidthStr::width(label))
+            .max(24),
+    }
+}
+
 /// Width-parameterized core of [`pane_row`] — pure, so wrapping is unit-tested
 /// without touching the terminal or global `$COLUMNS`. `cols == usize::MAX`
 /// means "unknown width" → never wrap (single line, byte-identical to the
@@ -945,6 +961,15 @@ fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str, cwd: &std::path::
         .stderr(Stdio::piped());
     if let Some(name) = &spec.launch_session_name {
         cmd.env("AISH_LAUNCH_SESSION_NAME", name);
+    }
+    // Hand the coordinator the launching terminal's width so its narration
+    // (rendered non-TTY, then re-framed by us as pane rows) fits tables to the
+    // real width minus the pane gutter instead of an unbounded default. Only set
+    // when we actually know the width — off a tty the child keeps its bounded
+    // fallback, and pane rows are single-line there anyway.
+    let term_cols = pane_cols();
+    if term_cols != usize::MAX {
+        cmd.env("COLUMNS", term_cols.to_string());
     }
     for (k, v) in &spec.env {
         cmd.env(k, v);
