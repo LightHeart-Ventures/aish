@@ -753,20 +753,27 @@ fn emit_thinking(session: &Session) {
 }
 
 /// Paint the interactive activity stream beneath a just-finished tool call:
-/// up to the last 5 lines of that call's output (dimmed, each clamped to one
-/// physical row) followed by a running status line — `tokens in/out`, the
-/// cumulative `tool calls`, and `turns`. This is the terminal-only companion to
-/// the ✓/✗ header the [`ToolSpinner`] already drew on finish, mirroring how an
-/// escalation surfaces its tail. Silent unless stderr is a TTY (so `aish -c`
-/// piped mode and non-tty background coordinators stay clean), and skipped when
-/// `raw_tool_output` is on (the full result is already being printed verbatim).
+/// a single collapsed summary line — how many lines the call produced plus a
+/// `Ctrl-O to expand` hint (instead of echoing the last few output lines) —
+/// followed by a running status line: `tokens in/out`, the cumulative `tool
+/// calls`, and `turns`. This is the terminal-only companion to the ✓/✗ header
+/// the [`ToolSpinner`] already drew on finish. The full output is one keystroke
+/// away: Ctrl-O expands every tool result verbatim ([`reveal_last_turn`]) and a
+/// second Ctrl-O collapses back to this summary ([`collapse_last_turn`]). Silent
+/// unless stderr is a TTY (so `aish -c` piped mode and non-tty background
+/// coordinators stay clean), and skipped when `raw_tool_output` is on (the full
+/// result is already being printed verbatim).
 fn emit_activity_stream(session: &Session, result: &ToolResult) {
     if !stderr_is_tty() || session.raw_tool_output {
         return;
     }
     let cols = stderr_cols();
+    // Count against the same body Ctrl-O would reveal so the summary and the
+    // expanded view agree (raw_body substitutes a placeholder / pretty JSON for
+    // an empty `content`).
+    let line_count = raw_body(result).lines().count();
     let lines = activity_stream_lines(
-        &result.content,
+        line_count,
         session.tokens_in,
         session.tokens_out,
         session.tool_calls_total,
@@ -778,19 +785,24 @@ fn emit_activity_stream(session: &Session, result: &ToolResult) {
 }
 
 /// Pure builder for the interactive activity-stream lines beneath a tool
-/// header: up to the last 5 non-blank output lines (oldest-first, indented),
-/// then the running status line. Kept free of ANSI/terminal I/O so the format
-/// contract is unit-testable; the caller dims + width-clamps each line.
+/// header: a collapsed `N lines of output — Ctrl-O to expand` summary (omitted
+/// when the call produced nothing), then the running status line. Kept free of
+/// ANSI/terminal I/O so the format contract is unit-testable; the caller dims +
+/// width-clamps each line.
 fn activity_stream_lines(
-    output: &str,
+    line_count: usize,
     tokens_in: usize,
     tokens_out: usize,
     tool_calls: usize,
     turns: usize,
 ) -> Vec<String> {
-    let tail: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
-    let start = tail.len().saturating_sub(5);
-    let mut lines: Vec<String> = tail[start..].iter().map(|l| format!("    {l}")).collect();
+    let mut lines: Vec<String> = Vec::new();
+    if line_count > 0 {
+        let noun = if line_count == 1 { "line" } else { "lines" };
+        lines.push(format!(
+            "    … {line_count} {noun} of output — Ctrl-O to expand"
+        ));
+    }
     lines.push(format!(
         "    tokens in: {tokens_in}, tokens out: {tokens_out}, tool calls: {tool_calls}, turns: {turns}"
     ));
@@ -1297,6 +1309,25 @@ pub fn reveal_last_turn(session: &Session) {
     }
 }
 
+/// Re-print the most recent turn's tool calls in COLLAPSED form — each tool's
+/// ✓/✗ header followed by a one-line `N lines of output — Ctrl-O to expand`
+/// summary rather than the verbatim body. The symmetric counterpart to
+/// [`reveal_last_turn`]: toggling raw output back OFF re-collapses the reveal so
+/// Ctrl-O flips between the expanded and collapsed views of the same turn.
+pub fn collapse_last_turn(session: &Session) {
+    for (desc, result) in &session.last_turn_tools {
+        eprintln!(
+            "\x1b[2m  {}\x1b[0m",
+            tool_result_line(desc, result.is_error)
+        );
+        let count = raw_body(result).lines().count();
+        if count > 0 {
+            let noun = if count == 1 { "line" } else { "lines" };
+            eprintln!("\x1b[2m     … {count} {noun} of output — Ctrl-O to expand\x1b[0m");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1567,28 +1598,30 @@ mod tests {
     }
 
     #[test]
-    fn activity_stream_caps_tail_at_five_and_appends_status() {
-        let output = "l1\nl2\n\nl3\nl4\nl5\nl6\nl7";
-        let lines = activity_stream_lines(output, 120, 34, 7, 3);
-        assert_eq!(lines.len(), 6);
-        assert_eq!(lines[0], "    l3");
-        assert_eq!(lines[4], "    l7");
+    fn activity_stream_summarizes_output_and_appends_status() {
+        // Instead of echoing the tail, the stream now shows a single collapsed
+        // summary line (line count + Ctrl-O hint) then the running status line.
+        let lines = activity_stream_lines(8, 120, 34, 7, 3);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "    … 8 lines of output — Ctrl-O to expand");
         assert_eq!(
-            lines[5],
+            lines[1],
             "    tokens in: 120, tokens out: 34, tool calls: 7, turns: 3"
         );
     }
 
     #[test]
-    fn activity_stream_handles_short_and_empty_output() {
-        let lines = activity_stream_lines("only", 1, 2, 3, 4);
+    fn activity_stream_handles_single_and_empty_output() {
+        // One line → singular noun.
+        let lines = activity_stream_lines(1, 1, 2, 3, 4);
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "    only");
+        assert_eq!(lines[0], "    … 1 line of output — Ctrl-O to expand");
         assert_eq!(
             lines[1],
             "    tokens in: 1, tokens out: 2, tool calls: 3, turns: 4"
         );
-        let lines = activity_stream_lines("", 0, 0, 0, 0);
+        // No output → only the status line, no summary row.
+        let lines = activity_stream_lines(0, 0, 0, 0, 0);
         assert_eq!(lines.len(), 1);
         assert_eq!(
             lines[0],

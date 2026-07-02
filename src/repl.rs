@@ -2639,8 +2639,11 @@ pub(crate) fn resolve_program(cmd: &str, cwd: &Path, path_var: &str) -> Option<P
     None
 }
 
-/// Flip raw tool output, print one-line status, and — when switching on —
-/// reveal the most recent turn's raw results.
+/// Flip raw tool output and print a one-line status. Ctrl-O is a symmetric
+/// toggle: switching ON reveals the most recent turn's raw results verbatim,
+/// switching OFF re-collapses them to the `N lines of output — Ctrl-O to expand`
+/// summary — so repeated Ctrl-O flips the last turn between expanded and
+/// collapsed views.
 fn toggle_raw_output(session: &mut Session) {
     session.raw_tool_output = !session.raw_tool_output;
     if session.raw_tool_output {
@@ -2648,6 +2651,7 @@ fn toggle_raw_output(session: &mut Session) {
         engine::reveal_last_turn(session);
     } else {
         println!("\x1b[2mraw tool output off\x1b[0m");
+        engine::collapse_last_turn(session);
     }
 }
 
@@ -4533,7 +4537,7 @@ async fn handle_colon(
                  :allow remove <tool>|<perm>:<dir>   revoke a tool or a directory grant\n\
                  a at a prompt                       always-allow this tool (see :allow)\n\
                  d at a read/write/delete prompt     allow that permission for the whole dir, recursively\n\
-                 Ctrl-O                              toggle raw tool output (show/squelch tool results)\n\
+                 Ctrl-O                              expand/collapse tool output (verbatim results ⇄ line-count summary)\n\
                  Shift-Tab                           cycle attach across all coordinators incl. finished/failed, newest first (interactive → newest → … → oldest → back)\n\
                  :quit                               exit (also Ctrl-D or `exit`)"
             );
