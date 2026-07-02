@@ -409,6 +409,13 @@ pub struct Session {
     /// resume on its next idle pass (`take_resume_tick`). Session-local, never
     /// persisted.
     pub resume: Arc<Mutex<ResumeState>>,
+    /// Retry-detection state for tool-call telemetry (`crate::tool_telemetry`).
+    /// Maps a tool name → the error class of its most recent UNRESOLVED failure.
+    /// A subsequent call to that tool is a "retry"; if it succeeds the entry is
+    /// cleared and the retry is recorded as *recovered* (the one smart fix
+    /// worked). Session-local, never persisted — only the aggregatable event
+    /// rows land in SQLite.
+    pub tool_failures: std::collections::HashMap<String, String>,
 }
 
 impl Session {
@@ -462,6 +469,7 @@ impl Session {
             task_anchor: None,
             loop_state: None,
             resume: Arc::new(Mutex::new(ResumeState::default())),
+            tool_failures: std::collections::HashMap::new(),
         })
     }
 
