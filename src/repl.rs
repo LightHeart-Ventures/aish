@@ -4155,6 +4155,33 @@ fn handle_memories(sub: Option<&str>, session: &Session) {
     }
 }
 
+/// `:telemetry [clear]` — show aggregated tool-call failure & retry-recovery
+/// stats (which tools fail most, with what error class, and whether retries
+/// recover), or wipe the telemetry table. Feeds the "is this error worth
+/// retrying vs. escalating?" repair heuristic (see crate::tool_telemetry).
+fn handle_telemetry(sub: Option<&str>, session: &Session) {
+    let Some(db) = &session.db else {
+        println!("telemetry store unavailable");
+        return;
+    };
+    match sub {
+        Some("clear" | "reset" | "wipe") => match db.clear_tool_telemetry() {
+            Ok(n) => println!("telemetry cleared — {n} row(s) removed"),
+            Err(e) => println!("clear failed: {e:#}"),
+        },
+        _ => {
+            let total = db.tool_telemetry_count().unwrap_or(0);
+            let totals = db.tool_telemetry_totals().unwrap_or_default();
+            let class_failures = db.tool_telemetry_class_failures().unwrap_or_default();
+            let retries = db.tool_telemetry_retry_stats().unwrap_or_default();
+            print!(
+                "{}",
+                crate::tool_telemetry::render_report(total, &totals, &class_failures, &retries)
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // :skill — install, search, list, remove skill.fish skills (Phase 2)
 // ---------------------------------------------------------------------------
@@ -4414,6 +4441,7 @@ async fn handle_colon(
                  :context                            show context-window usage (tokens, %, memories)\n\
                  :compact                            offload older history to long-term memory now\n\
                  :memories [organize]                list stored memories, or dedup them\n\
+                 :telemetry [clear]                  tool-call failure/retry-recovery stats (or wipe them)\n\
                  :version                            show aish version + backend (also `aish --version`)\n\
                  :update [prod|dev|ci]               check GitHub for a newer release and upgrade;\n\
                                                      optional channel is a one-off override of AISH_UPDATE_CHANNEL\n\
@@ -5037,6 +5065,7 @@ async fn handle_colon(
         Some("context") => handle_context(backend, session),
         Some("compact") => handle_compact(backend, session),
         Some("memories" | "memory") => handle_memories(parts.next(), session),
+        Some("telemetry" | "tool-stats") => handle_telemetry(parts.next(), session),
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
     }

@@ -42,6 +42,7 @@ mod style;
 mod suggest;
 mod terminal;
 mod tools;
+mod tool_telemetry;
 mod turn_audit;
 mod update;
 mod worker;
