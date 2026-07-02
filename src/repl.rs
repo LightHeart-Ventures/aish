@@ -100,6 +100,38 @@ fn clear_screen() {
     }
 }
 
+/// Like [`clear_screen`], but leaves the cursor anchored at the BOTTOM of the
+/// body so the view drawn next (the Shift-Tab attach header + backfilled tail +
+/// redrawn prompt) grows UP from the bottom instead of stranding at the top of
+/// an otherwise-blank screen.
+///
+/// In footer mode [`crate::terminal::restore_after_clear`] already homes the
+/// cursor to the bottom body row (just above the pinned footer), so the attach
+/// view naturally trails the last output. In inline mode (no footer region —
+/// short terminals, or footer disabled) nothing homed the cursor after
+/// `ESC[2J ESC[H`, so it sat at row 1 and the backfill anchored at the TOP with
+/// a blank screen beneath it — the "prompt anchors at the top instead of 2
+/// lines below the last output" bug. Homing to the last row makes inline mode
+/// match footer mode: printing at the bottom row scrolls the screen up, so the
+/// output + prompt stay pinned to the bottom.
+fn clear_screen_anchor_bottom() {
+    // SAFETY: plain isatty query.
+    if unsafe { libc::isatty(1) } != 1 {
+        return;
+    }
+    print!("\x1b[2J\x1b[H");
+    let _ = std::io::stdout().flush();
+    if crate::terminal::footer_active() {
+        // Footer mode: re-assert the region + repaint the footer; this homes the
+        // cursor to the bottom body row.
+        crate::terminal::restore_after_clear();
+    } else if let Some(rows) = crate::terminal::screen_rows() {
+        // Inline mode: home to the last row so the view grows up from the bottom.
+        print!("{}", crate::terminal::bottom_home_seq(rows));
+        let _ = std::io::stdout().flush();
+    }
+}
+
 pub async fn run(
     mut backend: Backend,
     mut session: Session,
@@ -3642,10 +3674,12 @@ fn next_attach_index(running: &[String], current: Option<&str>) -> usize {
 /// it), mirroring `attach_worker`'s terminal branch. This makes Shift-Tab a way
 /// to flip back through completed/failed agents, not just the still-running ones.
 fn cycle_worker(session: &mut Session) {
-    // Wipe the screen and home the cursor first, so this cycle's attach/detach
-    // view (status line + any backfilled activity / result) opens at the top of
-    // a fresh screen instead of scrolling under the previous prompt and output.
-    clear_screen();
+    // Wipe the screen first, so this cycle's attach/detach view (status line +
+    // any backfilled activity / result) opens on a fresh screen instead of
+    // scrolling under the previous prompt and output. Anchor the cursor to the
+    // BOTTOM so the view + redrawn prompt trail the last output (2 lines below)
+    // rather than stranding at the top of an otherwise-blank screen.
+    clear_screen_anchor_bottom();
     // Synchronously tear down any live worker "thinking…" spinner BEFORE we
     // print this view and the REPL redraws the prompt. The spinner polls its
     // forward gate only every ~80 ms, so a spinner for the worker we're leaving
