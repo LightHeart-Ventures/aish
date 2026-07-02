@@ -595,6 +595,35 @@ Escalating beats guessing."
             }),
         });
     }
+    // Reasoning-quality telemetry (always available, weak or strong frontend).
+    // Purely observational: it logs a data point about a judgment call so the
+    // escalate-vs-guess boundary can be measured over time. Never blocks or
+    // changes behavior.
+    defs.push(ToolDef {
+        name: "reasoning_note".into(),
+        description: "Log a reasoning-quality data point so the escalate-vs-guess boundary can be \
+MEASURED instead of flown blind. Call it when you hit a judgment call (an ambiguous, complex, or risky \
+step): pass `topic` (what you're reasoning about), `decision` (\"escalated\" if you handed it to the \
+stronger model, \"guessed\" if you reasoned it yourself), and the `complexity`/`ambiguity`/`risk` levels \
+(low|medium|high). It returns an `event_id`. Once you learn how it panned out, call it AGAIN with that \
+`event_id` and an `outcome` (\"correct\" or \"wrong_turn\") to close the loop. Over time this builds a \
+ground-truth model of when your own reasoning is good enough vs. when to always reach for escalate. \
+Purely observational — it never blocks, gates, or changes what you do."
+            .into(),
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string", "description": "What you're reasoning about (short phrase). Required for a new event."},
+                "decision": {"type": "string", "enum": ["escalated", "guessed"], "description": "Whether you escalated to the stronger model or guessed on your own. Required for a new event."},
+                "complexity": {"type": "string", "enum": ["low", "medium", "high"], "description": "How complex the reasoning is. Defaults to medium."},
+                "ambiguity": {"type": "string", "enum": ["low", "medium", "high"], "description": "How ambiguous/underspecified the step is. Defaults to medium."},
+                "risk": {"type": "string", "enum": ["low", "medium", "high"], "description": "Blast radius if you get it wrong. Defaults to medium."},
+                "rationale": {"type": "string", "description": "Optional one-line justification for the decision."},
+                "event_id": {"type": "string", "description": "To CLOSE THE LOOP on a prior event: pass the id it returned, plus `outcome`."},
+                "outcome": {"type": "string", "enum": ["correct", "wrong_turn", "unknown"], "description": "How a prior decision panned out. Use with `event_id`."}
+            }
+        }),
+    });
     defs
 }
 
@@ -684,6 +713,7 @@ pub async fn execute(
         "stop" => stop(call, session),
         "message_console" => message_console(call, session),
         "escalate" => escalate(call, session).await,
+        "reasoning_note" => reasoning_note(call, session),
         "get_skill" => get_skill(call, session).await,
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
     };
@@ -1657,7 +1687,68 @@ the strong model sees nothing else"
     if answer.is_empty() {
         anyhow::bail!("the strong model returned no usable text");
     }
+    // Reasoning-quality telemetry: every escalate is, by definition, a decision
+    // to reach for the stronger model rather than guess — record it (best-effort,
+    // never fails the consult) so the escalate-vs-guess boundary is measurable.
+    let _ = crate::reasoning_telemetry::record_escalation(task);
     Ok(answer.to_string())
+}
+
+/// `reasoning_note` — log one reasoning-quality data point (or close the loop on
+/// a prior one). Purely observational; see `crate::reasoning_telemetry`.
+fn reasoning_note(call: &ToolCall, _session: &Session) -> Result<String> {
+    use crate::reasoning_telemetry as rt;
+
+    let get = |k: &str| call.args[k].as_str().map(str::trim).filter(|s| !s.is_empty());
+
+    // Mode 1 — close the loop on a prior event: `event_id` + `outcome`.
+    if let Some(id) = get("event_id") {
+        let outcome_str = get("outcome").ok_or_else(|| {
+            anyhow::anyhow!("`outcome` (correct|wrong_turn|unknown) is required with `event_id`")
+        })?;
+        let outcome = rt::Outcome::parse(outcome_str).ok_or_else(|| {
+            anyhow::anyhow!("unknown outcome '{outcome_str}' — use correct | wrong_turn | unknown")
+        })?;
+        if rt::update_outcome(id, outcome) {
+            Ok(format!(
+                "recorded outcome '{}' for reasoning event {id}",
+                outcome.as_str()
+            ))
+        } else {
+            // Best-effort store: report but don't error the turn.
+            Ok(format!(
+                "note: couldn't persist the outcome for {id} (telemetry store unwritable) — continuing"
+            ))
+        }
+    } else {
+        // Mode 2 — record a fresh decision: `topic` + `decision` required.
+        let topic = get("topic")
+            .ok_or_else(|| anyhow::anyhow!("`topic` is required for a new reasoning note"))?;
+        let decision_str = get("decision").ok_or_else(|| {
+            anyhow::anyhow!("`decision` (escalated|guessed) is required for a new reasoning note")
+        })?;
+        let decision = rt::Decision::parse(decision_str).ok_or_else(|| {
+            anyhow::anyhow!("unknown decision '{decision_str}' — use escalated | guessed")
+        })?;
+        let complexity = get("complexity").map(rt::Level::parse).unwrap_or(rt::Level::Medium);
+        let ambiguity = get("ambiguity").map(rt::Level::parse).unwrap_or(rt::Level::Medium);
+        let risk = get("risk").map(rt::Level::parse).unwrap_or(rt::Level::Medium);
+        let event = rt::ReasoningEvent::new(decision, topic, "self_report")
+            .with_levels(complexity, ambiguity, risk)
+            .with_rationale(get("rationale").map(str::to_string));
+        match rt::record(&event) {
+            Some(id) => Ok(format!(
+                "logged reasoning note {id} ({}, complexity={}, risk={}). Close the loop later with \
+event_id={id} + outcome=correct|wrong_turn.",
+                decision.as_str(),
+                complexity.as_str(),
+                risk.as_str()
+            )),
+            None => Ok(
+                "note: telemetry store unwritable — reasoning note not persisted, continuing".into(),
+            ),
+        }
+    }
 }
 
 fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
@@ -3911,6 +4002,19 @@ mod tests {
     fn edit_file_tool_is_offered() {
         let defs = tool_defs(false, false, false);
         assert!(defs.iter().any(|d| d.name == "edit_file"), "edit_file must be in the tool set");
+    }
+
+    #[test]
+    fn reasoning_note_tool_is_always_offered() {
+        // Reasoning-quality telemetry is observational and offered regardless of
+        // frontend strength or escalate availability.
+        for (batch, esc, nested) in [(false, false, false), (true, true, true)] {
+            let defs = tool_defs(batch, esc, nested);
+            assert!(
+                defs.iter().any(|d| d.name == "reasoning_note"),
+                "reasoning_note must always be offered (batch={batch}, esc={esc}, nested={nested})"
+            );
+        }
     }
 
     #[test]

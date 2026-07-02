@@ -1074,6 +1074,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ),
     ("compact", "compact history, offload to memory"),
     ("context", "show context-window usage"),
+    ("reasoning", "show reasoning-quality telemetry (escalate vs guess)"),
     ("detach", "stop watching the attached coordinator"),
     ("dispatch", "launch a background coordinator"),
     (
@@ -4107,6 +4108,15 @@ fn handle_context(backend: &Backend, session: &Session) {
     }
 }
 
+/// `:reasoning` — render the reasoning-quality telemetry summary: the escalate
+/// rate, the guess→wrong-turn rate, and both broken down by complexity and risk.
+/// This is the ground-truth model of *when aish's own reasoning is good enough*
+/// vs. *when to reach for the stronger model* (see `crate::reasoning_telemetry`).
+fn handle_reasoning() {
+    let summary = crate::reasoning_telemetry::summarize();
+    println!("{}", crate::reasoning_telemetry::render_report(&summary));
+}
+
 /// `:compact` — force a context compaction now: offload the oldest slice of the
 /// conversation to the SQLite memories table (recoverable via the recall tool,
 /// tagged `context-offload`) and replace it with a short in-context summary.
@@ -4412,6 +4422,7 @@ async fn handle_colon(
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
                  :context                            show context-window usage (tokens, %, memories)\n\
+                 :reasoning                          reasoning-quality telemetry: escalate-vs-guess rate + outcomes by complexity/risk\n\
                  :compact                            offload older history to long-term memory now\n\
                  :memories [organize]                list stored memories, or dedup them\n\
                  :version                            show aish version + backend (also `aish --version`)\n\
@@ -5035,6 +5046,7 @@ async fn handle_colon(
             }
         }
         Some("context") => handle_context(backend, session),
+        Some("reasoning") => handle_reasoning(),
         Some("compact") => handle_compact(backend, session),
         Some("memories" | "memory") => handle_memories(parts.next(), session),
         Some(other) => println!("unknown command :{other} — try :help"),

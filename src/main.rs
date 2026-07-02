@@ -30,6 +30,7 @@ mod plugin_state;
 mod plugins;
 mod present;
 mod rc;
+mod reasoning_telemetry;
 mod repl;
 mod rewrite;
 mod scope;
