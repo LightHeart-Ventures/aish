@@ -26,8 +26,9 @@
 //! margins — DECSC/DECRC is the portable pair.
 
 use std::io::Write;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Rows reserved at the bottom for the footer: separator + status message +
 /// statusline.
@@ -52,6 +53,133 @@ static ALT_SCREEN: AtomicBool = AtomicBool::new(false);
 /// (Shift-Tab worker cycle, etc.) can repaint the footer without the caller
 /// threading the strings back through.
 static LAST_FOOTER: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
+
+// ---------------------------------------------------------------------------
+// Heartbeat footer repaint (idle-timeout self-heal).
+//
+// A terminal *scroll* (mouse wheel, trackpad, PageUp) moves the viewport
+// without sending aish any input, so the shell never learns the footer scrolled
+// out of view — the classic "I scrolled and the footer disappeared" complaint.
+// The fix is a low-frequency heartbeat: while the REPL is parked at the prompt
+// (a blocking line read) and nothing has repainted the footer for
+// `HEARTBEAT_IDLE`, a background thread repaints it from the cached content. The
+// repaint is cursor-safe (DECSC/DECRC in `footer_seq` saves + restores the
+// caller's cursor, so the in-progress input line is untouched) and only fires in
+// the idle-at-prompt window, so it never races the engine's output writes.
+// ---------------------------------------------------------------------------
+
+/// Idle gap after which the heartbeat repaints the footer. Chosen at 3s: long
+/// enough to be invisible during normal typing/output, short enough that a
+/// scrolled-away footer snaps back almost immediately.
+pub const HEARTBEAT_IDLE: Duration = Duration::from_secs(3);
+
+/// True only while the REPL is blocked in a line read (idle at the prompt). The
+/// heartbeat repaints ONLY in this window, so it can never interleave with the
+/// engine's output writes on the main thread. Toggled by [`set_reading_line`].
+static READING_LINE: AtomicBool = AtomicBool::new(false);
+
+/// Millis since the process heartbeat epoch of the last footer paint (via
+/// [`note_footer_activity`]). The heartbeat compares `now - this >= HEARTBEAT_IDLE`.
+static LAST_FOOTER_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Ensures the heartbeat thread is spawned at most once per process.
+static HEARTBEAT_SPAWNED: AtomicBool = AtomicBool::new(false);
+
+/// Monotonic milliseconds since a fixed process epoch — cheap, thread-shared,
+/// and immune to wall-clock jumps (unlike `SystemTime`).
+fn heartbeat_now_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Record that the footer was just painted, resetting the idle timer so the
+/// heartbeat defers its next repaint by a full [`HEARTBEAT_IDLE`].
+pub fn note_footer_activity() {
+    LAST_FOOTER_ACTIVITY_MS.store(heartbeat_now_ms(), Ordering::Relaxed);
+}
+
+/// Mark whether the REPL is parked in a blocking line read. The editor calls
+/// this `true` immediately before reading and `false` after. Entering a read
+/// also refreshes the idle timer so the heartbeat waits a full interval before
+/// its first repaint at a fresh prompt.
+pub fn set_reading_line(reading: bool) {
+    READING_LINE.store(reading, Ordering::Relaxed);
+    if reading {
+        note_footer_activity();
+    }
+}
+
+/// Spawn the footer heartbeat thread (idempotent — only the first call spawns).
+/// The thread wakes on a short cadence and repaints the cached footer whenever
+/// the REPL has been idle at the prompt for [`HEARTBEAT_IDLE`], self-healing a
+/// footer that scrolled out of view. No-op unless a footer region is installed;
+/// safe to call once at REPL startup.
+pub fn spawn_footer_heartbeat() {
+    if HEARTBEAT_SPAWNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("aish-footer-heartbeat".into())
+        .spawn(|| {
+            // Poll well under HEARTBEAT_IDLE so the actual repaint lands within
+            // ~half a second of the 3s idle mark.
+            let tick = Duration::from_millis(500);
+            let idle_ms = HEARTBEAT_IDLE.as_millis() as u64;
+            loop {
+                std::thread::sleep(tick);
+                // Only when a footer region is live, we're parked at the prompt,
+                // and no worker alt-screen view owns the terminal.
+                if !ACTIVE.load(Ordering::Relaxed)
+                    || !READING_LINE.load(Ordering::Relaxed)
+                    || ALT_SCREEN.load(Ordering::Relaxed)
+                {
+                    continue;
+                }
+                let idle =
+                    heartbeat_now_ms().saturating_sub(LAST_FOOTER_ACTIVITY_MS.load(Ordering::Relaxed));
+                if idle >= idle_ms {
+                    // Cursor-safe repaint (no body-home): DECSC/DECRC restores
+                    // the input cursor exactly where the user left it.
+                    paint_cached_footer(false);
+                }
+            }
+        })
+        .ok();
+}
+
+/// Repaint the footer from cached content. When `home_body` is true the cursor
+/// is dropped into the last body row afterwards (post-clear / alt-screen use);
+/// when false the cursor is left wherever `footer_seq`'s DECSC/DECRC restored it
+/// — the cursor-safe form the idle heartbeat uses so it never disturbs an
+/// in-progress input line. No-op when no region is installed or the terminal is
+/// too short. Records footer activity so the heartbeat re-arms.
+fn paint_cached_footer(home_body: bool) {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some((rows, cols)) = term_size() else {
+        return;
+    };
+    if rows < MIN_FOOTER_ROWS {
+        return;
+    }
+    let (msg, bar) = LAST_FOOTER.lock().map(|l| l.clone()).unwrap_or_default();
+    let utf8 = utf8_locale();
+    let sep = separator_line(cols, utf8, crate::style::colors_enabled());
+    // footer_seq re-asserts the scroll region internally (inside its DECSC/DECRC
+    // save-restore).
+    let mut buf = footer_seq(rows, cols, &sep, &msg, &bar);
+    if home_body {
+        // Override the restored cursor with an explicit home into the body so
+        // the post-clear view grows up from the bottom.
+        let body_bottom = rows.saturating_sub(FOOTER_ROWS).max(1);
+        buf.push_str(&format!("\x1b[{body_bottom};1H"));
+    }
+    let mut out = std::io::stdout();
+    let _ = write!(out, "{buf}");
+    let _ = out.flush();
+    note_footer_activity();
+}
 
 // ---------------------------------------------------------------------------
 // Pure escape-sequence builders (unit-tested without a real terminal).
@@ -248,6 +376,9 @@ impl Terminal {
         let mut out = std::io::stdout();
         let _ = write!(out, "{buf}");
         let _ = out.flush();
+        // Reset the heartbeat idle timer — a fresh paint just landed, so the
+        // idle repaint defers a full interval.
+        note_footer_activity();
     }
 
     /// Re-query the terminal size (after a SIGWINCH) and re-establish or tear
@@ -286,29 +417,9 @@ impl Drop for Terminal {
 /// cursor homed to row 1 (top of the region). Repaint the footer from the cached
 /// content. No-op when no region is installed.
 pub fn restore_after_clear() {
-    if !ACTIVE.load(Ordering::Relaxed) {
-        return;
-    }
-    let Some((rows, cols)) = term_size() else {
-        return;
-    };
-    if rows < MIN_FOOTER_ROWS {
-        return;
-    }
-    let (msg, bar) = LAST_FOOTER.lock().map(|l| l.clone()).unwrap_or_default();
-    let utf8 = utf8_locale();
-    let sep = separator_line(cols, utf8, crate::style::colors_enabled());
-    let body_bottom = rows.saturating_sub(FOOTER_ROWS).max(1);
-    let mut buf = String::new();
-    // footer_seq re-asserts the scroll region internally (inside its DECSC/DECRC
-    // save-restore); we then override the restored cursor with an explicit home
-    // into the body so the post-clear view grows up from the bottom.
-    buf.push_str(&footer_seq(rows, cols, &sep, &msg, &bar));
-    // Home the cursor back into the body after the repaint.
-    buf.push_str(&format!("\x1b[{body_bottom};1H"));
-    let mut out = std::io::stdout();
-    let _ = write!(out, "{buf}");
-    let _ = out.flush();
+    // Home the cursor into the body after the repaint so the post-clear view
+    // grows up from the bottom (the idle heartbeat uses the cursor-safe form).
+    paint_cached_footer(true);
 }
 
 /// Whether a bottom-anchored footer scroll region is currently installed. Lets
@@ -543,6 +654,42 @@ mod tests {
         // 4 → stop. Into max 3 for "世x": 世(2)+x(1)=3 → both fit.
         assert_eq!(clip_visible("世界x", 3), "世");
         assert_eq!(clip_visible("世x", 3), "世x");
+    }
+
+    #[test]
+    fn heartbeat_activity_resets_idle_timer() {
+        // A fresh activity note zeroes the measured idle gap; the heartbeat only
+        // repaints once that gap crosses HEARTBEAT_IDLE.
+        note_footer_activity();
+        let idle =
+            heartbeat_now_ms().saturating_sub(LAST_FOOTER_ACTIVITY_MS.load(Ordering::Relaxed));
+        assert!(
+            idle < HEARTBEAT_IDLE.as_millis() as u64,
+            "just-noted activity must read as well under the idle threshold, got {idle}ms"
+        );
+    }
+
+    #[test]
+    fn set_reading_line_toggles_and_arms_timer() {
+        // Entering a read marks the idle-at-prompt window AND refreshes the
+        // timer (so the first heartbeat waits a full interval at a new prompt).
+        set_reading_line(true);
+        assert!(READING_LINE.load(Ordering::Relaxed));
+        let idle =
+            heartbeat_now_ms().saturating_sub(LAST_FOOTER_ACTIVITY_MS.load(Ordering::Relaxed));
+        assert!(idle < HEARTBEAT_IDLE.as_millis() as u64);
+        // Leaving the read clears the window so the heartbeat stops repainting
+        // the moment a line is submitted / an engine turn begins.
+        set_reading_line(false);
+        assert!(!READING_LINE.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn spawn_footer_heartbeat_is_idempotent() {
+        // Guarded by an atomic swap — only the first call spawns; repeats no-op
+        // (and never panic), so a re-init on resize can't leak threads.
+        spawn_footer_heartbeat();
+        spawn_footer_heartbeat();
     }
 
     #[test]
