@@ -456,6 +456,7 @@ pub async fn run(
         }
         if needs_gap {
             println!();
+            println!();
             needs_gap = false;
         }
         // If the coordinator we're attached to has reached a terminal state,
