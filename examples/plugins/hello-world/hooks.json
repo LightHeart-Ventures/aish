@@ -1,0 +1,14 @@
+{
+  "hooks": [
+    {
+      "name": "hello-world-session-banner",
+      "event": "SessionStart",
+      "action": {
+        "type": "command",
+        "program": "/bin/echo",
+        "args": ["hello-world plugin: session started"],
+        "timeout_ms": 1000
+      }
+    }
+  ]
+}

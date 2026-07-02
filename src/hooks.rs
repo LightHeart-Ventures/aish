@@ -177,6 +177,54 @@ impl HookEvent {
         ];
         ALL.into_iter().find(|e| e.as_str() == s)
     }
+
+    /// True for the sync/blocking-class events (the `evaluate` gate can veto a
+    /// turn on these). Used by the plugin merge (Phase 0.5.2) to enforce
+    /// "one blocking winner per event": a plugin-contributed entry on a blocking
+    /// event degrades to observe when a higher-precedence entry already owns the
+    /// veto. Mirrors the sync subset called out in this module's header.
+    pub fn is_blocking(self) -> bool {
+        matches!(
+            self,
+            Self::PreToolUse | Self::PermissionRequest | Self::PreCompact | Self::ModeChanged
+        )
+    }
+}
+
+/// Provenance of a registered hook (Phase 0.5.2). `Local` covers the user
+/// (`~/.aish/hooks.json`) and project (`.aish/hooks.json`) catalogs; `Plugin`
+/// carries the contributing plugin's id for `:hooks list` provenance and for
+/// the blocking-precedence rule (local outranks plugin).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum HookSource {
+    #[default]
+    Local,
+    Plugin(String),
+}
+
+impl HookSource {
+    /// The stable label shown in `:hooks list` / `:plugin info` — `"local"` or
+    /// `"plugin:<id>"`.
+    pub fn label(&self) -> String {
+        match self {
+            HookSource::Local => "local".to_string(),
+            HookSource::Plugin(id) => format!("plugin:{id}"),
+        }
+    }
+
+    /// True when contributed by a plugin.
+    pub fn is_plugin(&self) -> bool {
+        matches!(self, HookSource::Plugin(_))
+    }
+}
+
+/// A plugin's event-hook fragment to merge into the catalog (Phase 0.5.2): the
+/// contributing plugin id (for `source` tagging) and the path to its
+/// `hooks.json`.
+#[derive(Debug, Clone)]
+pub struct PluginHookFragment {
+    pub plugin_id: String,
+    pub path: PathBuf,
 }
 
 /// The autonomy descriptor carried on every payload so a consumer can tell a
@@ -320,6 +368,25 @@ pub struct Hook {
     #[serde(default)]
     pub matcher: Matcher,
     pub action: Action,
+    /// Optional stable name (Phase 0.5.2). A higher-precedence catalog can
+    /// **override** a lower one by re-declaring the same `name`, or **disable**
+    /// it with a same-named tombstone (`"enabled": false`). Unnamed hooks can
+    /// never be overridden or disabled (there's no handle to reference them).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Tri-state enable flag (Phase 0.5.2). `None`/`Some(true)` register the
+    /// hook; `Some(false)` makes it a **tombstone** — it registers nothing but
+    /// suppresses any lower-precedence hook sharing its `name`.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Provenance (Phase 0.5.2). Set during the layered merge, never from JSON.
+    #[serde(skip)]
+    pub source: HookSource,
+    /// Set during the merge when a plugin blocking entry loses the
+    /// one-winner-per-event contest and is demoted to observe (Phase 0.5.2):
+    /// the `evaluate` gate still runs it for side effects but ignores its veto.
+    #[serde(skip)]
+    pub observe_only: bool,
     /// Lifetime dispatch counter (observability; not serialized).
     #[serde(skip)]
     pub matched: AtomicU64,
@@ -385,12 +452,11 @@ impl HookSet {
     /// malformed file is reported to stderr and skipped, so one bad project file
     /// never wedges startup.
     pub fn load(home: Option<&Path>, cwd: &Path) -> Self {
-        let mut paths: Vec<PathBuf> = Vec::new();
-        if let Some(home) = home {
-            paths.push(home.join(".aish").join("hooks.json"));
-        }
-        paths.push(cwd.join(".aish").join("hooks.json"));
-        Self::load_from(&paths)
+        // Route through the layered merge (with no plugins) so name-based
+        // override/disable and the one-blocking-winner rule apply to the
+        // user>project stack too. Configs without `name`/`enabled` behave
+        // exactly as the legacy append merge did.
+        Self::load_with_plugins(home, cwd, &[])
     }
 
     /// Load + merge an explicit, ordered list of config files. Earlier files
@@ -409,6 +475,123 @@ impl HookSet {
         }
         Self {
             hooks: Arc::new(hooks),
+        }
+    }
+
+    /// Load + merge the user/project catalogs **and** any plugin-contributed
+    /// `event_hooks_file` fragments (Phase 0.5.2). Precedence is
+    /// **user > project > plugin**; within plugins, fragment order (as passed)
+    /// decides ties. Each plugin entry is tagged `source: plugin:<id>`.
+    ///
+    /// Two cross-layer rules are applied after the raw parse:
+    ///   * **override / disable by name** — a higher-precedence hook that
+    ///     re-declares a `name` replaces the lower one; a same-named tombstone
+    ///     (`"enabled": false`) suppresses it entirely. Unnamed hooks are never
+    ///     overridden (all fire — observe fan-out).
+    ///   * **one blocking winner per event** — on a blocking-class event
+    ///     ([`HookEvent::is_blocking`]) only the highest-precedence entry keeps
+    ///     the veto; lower ones (including every plugin entry when a local hook
+    ///     owns the event) are demoted to observe (`observe_only`).
+    pub fn load_with_plugins(
+        home: Option<&Path>,
+        cwd: &Path,
+        plugins: &[PluginHookFragment],
+    ) -> Self {
+        let mut local_paths: Vec<PathBuf> = Vec::new();
+        if let Some(home) = home {
+            local_paths.push(home.join(".aish").join("hooks.json"));
+        }
+        local_paths.push(cwd.join(".aish").join("hooks.json"));
+        Self::load_layered(&local_paths, plugins)
+    }
+
+    /// The testable core of [`load_with_plugins`]: `local_paths` are read in
+    /// precedence order (highest first — i.e. user, then project) and tagged
+    /// [`HookSource::Local`]; each plugin fragment is tagged
+    /// [`HookSource::Plugin`]. A missing file is skipped; a malformed one is
+    /// reported and skipped (one bad fragment never wedges startup).
+    pub fn load_layered(local_paths: &[PathBuf], plugins: &[PluginHookFragment]) -> Self {
+        // (source, parsed hooks) in strict precedence order, highest first.
+        let mut layers: Vec<(HookSource, Vec<Hook>)> = Vec::new();
+        let read_layer = |path: &Path| -> Option<Vec<Hook>> {
+            match std::fs::read_to_string(path) {
+                Ok(text) => match parse_hooks(&text) {
+                    Ok(parsed) => Some(parsed),
+                    Err(e) => {
+                        eprintln!("aish: ignoring {} — {e}", path.display());
+                        None
+                    }
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    eprintln!("aish: cannot read {} — {e}", path.display());
+                    None
+                }
+            }
+        };
+        for path in local_paths {
+            if let Some(hooks) = read_layer(path) {
+                layers.push((HookSource::Local, hooks));
+            }
+        }
+        for pf in plugins {
+            if let Some(hooks) = read_layer(&pf.path) {
+                layers.push((HookSource::Plugin(pf.plugin_id.clone()), hooks));
+            }
+        }
+        Self::merge_layers(layers)
+    }
+
+    /// Apply the override/disable-by-name and one-blocking-winner rules to the
+    /// precedence-ordered `layers` (highest first) and return the merged set.
+    /// Factored out so tests can drive the merge from in-memory layers.
+    fn merge_layers(layers: Vec<(HookSource, Vec<Hook>)>) -> Self {
+        use std::collections::HashSet;
+        // Pass 1: override / disable by name, walking highest precedence first.
+        let mut seen_names: HashSet<String> = HashSet::new();
+        let mut out: Vec<Hook> = Vec::new();
+        for (source, hooks) in layers {
+            for mut hook in hooks {
+                hook.source = source.clone();
+                let disabled = hook.enabled == Some(false);
+                if let Some(name) = hook.name.clone() {
+                    if seen_names.contains(&name) {
+                        // A higher-precedence catalog already owns this name.
+                        continue;
+                    }
+                    seen_names.insert(name);
+                    if disabled {
+                        // Tombstone: registers nothing, but now suppresses any
+                        // lower-precedence hook sharing the name (recorded above).
+                        continue;
+                    }
+                } else if disabled {
+                    // Unnamed + disabled: nothing to reference it, just drop it.
+                    continue;
+                }
+                out.push(hook);
+            }
+        }
+        // Pass 2: one blocking winner per event — but only ever demote PLUGIN
+        // entries. Local (user+project) hooks keep the legacy most-restrictive-
+        // wins semantics of the `evaluate` gate. A plugin blocking entry keeps
+        // its veto only when it is the FIRST entry seen on that event (no local
+        // hook and no earlier plugin owns it); otherwise it degrades to observe.
+        // Because `out` is precedence ordered (local first, then plugins in
+        // fragment order), a single forward scan gives "highest precedence wins".
+        let mut blocking_seen: HashSet<HookEvent> = HashSet::new();
+        for hook in out.iter_mut() {
+            if !hook.event.is_blocking() {
+                continue;
+            }
+            if hook.source.is_plugin() && blocking_seen.contains(&hook.event) {
+                hook.observe_only = true;
+            } else {
+                blocking_seen.insert(hook.event);
+            }
+        }
+        Self {
+            hooks: Arc::new(out),
         }
     }
 
@@ -469,6 +652,7 @@ impl HookSet {
                 hook.matched.fetch_add(1, Ordering::Relaxed);
                 out.push(Arc::new(HookMatch {
                     action: hook.action.clone(),
+                    observe_only: hook.observe_only,
                 }));
             }
         }
@@ -479,6 +663,9 @@ impl HookSet {
 /// A snapshot of a matched hook's action, detached from the `HookSet` borrow.
 struct HookMatch {
     action: Action,
+    /// When true this entry lost the blocking one-winner contest (Phase 0.5.2):
+    /// the gate runs it for side effects but its veto is ignored.
+    observe_only: bool,
 }
 
 fn hook_action(m: &Arc<HookMatch>) -> Action {
@@ -609,6 +796,11 @@ impl HookSet {
                     }
                 },
             };
+            // A demoted plugin entry (Phase 0.5.2 one-winner rule) still ran for
+            // its side effects above, but cannot veto — its decision is ignored.
+            if hook.observe_only {
+                continue;
+            }
             if decision.is_deny() {
                 return decision;
             }
@@ -1459,5 +1651,181 @@ mod tests {
             .await;
         unsafe { std::env::remove_var(RECURSION_GUARD) };
         assert_eq!(d, Decision::Allow, "inside a hook, the gate must not veto");
+    }
+
+    // ---- Phase 0.5.2: plugin catalog merge, precedence, provenance --------
+
+    /// Parse a `hooks.json` body into a `Vec<Hook>` (merge-layer test helper).
+    fn hooks_from(json: &str) -> Vec<Hook> {
+        parse_hooks(json).unwrap()
+    }
+
+    #[test]
+    fn plugin_merge_tags_source_and_all_observe_fire() {
+        // Observe fan-out: a local and a plugin hook on the same event BOTH
+        // register (all fire), and each carries its provenance tag.
+        let local = hooks_from(
+            r#"{ "hooks": [ { "event": "SessionStart", "action": { "type": "command", "program": "u" } } ] }"#,
+        );
+        let plugin = hooks_from(
+            r#"{ "hooks": [ { "event": "SessionStart", "action": { "type": "command", "program": "p" } } ] }"#,
+        );
+        let set = HookSet::merge_layers(vec![
+            (HookSource::Local, local),
+            (HookSource::Plugin("demo".into()), plugin),
+        ]);
+        assert_eq!(set.len(), 2, "observe hooks fan out: both registered");
+        let sources: Vec<String> = set.hooks().iter().map(|h| h.source.label()).collect();
+        assert!(sources.contains(&"local".to_string()));
+        assert!(sources.contains(&"plugin:demo".to_string()));
+    }
+
+    #[test]
+    fn plugin_override_by_name_prefers_higher_precedence() {
+        // A user hook and a plugin hook share a name → user wins, plugin dropped.
+        let user = hooks_from(
+            r#"{ "hooks": [ { "name": "guard", "event": "PostToolUse", "action": { "type": "command", "program": "user-guard" } } ] }"#,
+        );
+        let plugin = hooks_from(
+            r#"{ "hooks": [ { "name": "guard", "event": "PostToolUse", "action": { "type": "command", "program": "plugin-guard" } } ] }"#,
+        );
+        let set = HookSet::merge_layers(vec![
+            (HookSource::Local, user),
+            (HookSource::Plugin("demo".into()), plugin),
+        ]);
+        assert_eq!(set.len(), 1);
+        assert_eq!(set.hooks()[0].source, HookSource::Local);
+    }
+
+    #[test]
+    fn plugin_disable_via_user_tombstone() {
+        // A user tombstone (enabled:false) named like the plugin hook removes it.
+        let user = hooks_from(
+            r#"{ "hooks": [ { "name": "noisy", "enabled": false, "event": "PostToolUse", "action": { "type": "command", "program": "x" } } ] }"#,
+        );
+        let plugin = hooks_from(
+            r#"{ "hooks": [ { "name": "noisy", "event": "PostToolUse", "action": { "type": "command", "program": "plugin-noisy" } } ] }"#,
+        );
+        let set = HookSet::merge_layers(vec![
+            (HookSource::Local, user),
+            (HookSource::Plugin("demo".into()), plugin),
+        ]);
+        assert!(
+            set.is_empty(),
+            "tombstone suppresses the plugin hook and registers nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_blocking_veto_is_honored_when_alone() {
+        let _env = env_lock();
+        // A lone plugin blocking entry keeps its veto (no local hook contends).
+        let plugin = hooks_from(
+            r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "rule", "deny_if": "always" } } ] }"#,
+        );
+        let set = HookSet::merge_layers(vec![(HookSource::Plugin("sec".into()), plugin)]);
+        assert!(!set.hooks()[0].observe_only);
+        let d = set
+            .evaluate(HookEvent::PreToolUse, payload(HookEvent::PreToolUse))
+            .await;
+        assert!(d.is_deny(), "a lone plugin blocking entry vetoes: {d:?}");
+    }
+
+    #[tokio::test]
+    async fn plugin_blocking_degrades_when_local_owns_event() {
+        let _env = env_lock();
+        // Local ALLOWS (never); plugin would DENY (always) but is demoted to
+        // observe because a local hook owns the blocking event → allowed.
+        let local = hooks_from(
+            r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "rule", "deny_if": "never" } } ] }"#,
+        );
+        let plugin = hooks_from(
+            r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "rule", "deny_if": "always" } } ] }"#,
+        );
+        let set = HookSet::merge_layers(vec![
+            (HookSource::Local, local),
+            (HookSource::Plugin("sec".into()), plugin),
+        ]);
+        let demoted = set.hooks().iter().find(|h| h.source.is_plugin()).unwrap();
+        assert!(demoted.observe_only, "plugin entry must be demoted to observe");
+        let d = set
+            .evaluate(HookEvent::PreToolUse, payload(HookEvent::PreToolUse))
+            .await;
+        assert_eq!(
+            d,
+            Decision::Allow,
+            "local owns the veto; demoted plugin cannot deny"
+        );
+    }
+
+    #[test]
+    fn plugin_blocking_single_winner_across_two_plugins() {
+        // Two plugins on the same blocking event: the first keeps the veto, the
+        // second is demoted to observe (one winner per event).
+        let a = hooks_from(
+            r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "rule", "deny_if": "always" } } ] }"#,
+        );
+        let b = hooks_from(
+            r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "rule", "deny_if": "always" } } ] }"#,
+        );
+        let set = HookSet::merge_layers(vec![
+            (HookSource::Plugin("a".into()), a),
+            (HookSource::Plugin("b".into()), b),
+        ]);
+        let demoted: Vec<bool> = set.hooks().iter().map(|h| h.observe_only).collect();
+        assert_eq!(
+            demoted,
+            vec![false, true],
+            "first plugin keeps veto, second demoted"
+        );
+    }
+
+    #[test]
+    fn load_layered_reads_plugin_fragment_files() {
+        let dir = std::env::temp_dir().join(format!("aish-plugmerge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let frag = dir.join("plugin-hooks.json");
+        std::fs::write(
+            &frag,
+            r#"{ "hooks": [ { "event": "SessionStart", "action": { "type": "command", "program": "p" } } ] }"#,
+        )
+        .unwrap();
+        let set = HookSet::load_layered(
+            &[],
+            &[PluginHookFragment {
+                plugin_id: "demo".into(),
+                path: frag,
+            }],
+        );
+        assert_eq!(set.len(), 1);
+        assert_eq!(set.hooks()[0].source, HookSource::Plugin("demo".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_precedence_local_over_plugin_ordering() {
+        // Precedence walk is highest-first: user, then project, then plugins.
+        // The kept, precedence-ordered set is exactly what `evaluate` iterates.
+        let user = hooks_from(
+            r#"{ "hooks": [ { "name": "n", "event": "PostToolUse", "action": { "type": "command", "program": "user" } } ] }"#,
+        );
+        let project = hooks_from(
+            r#"{ "hooks": [ { "name": "n", "event": "PostToolUse", "action": { "type": "command", "program": "project" } } ] }"#,
+        );
+        let plugin = hooks_from(
+            r#"{ "hooks": [ { "name": "n", "event": "PostToolUse", "action": { "type": "command", "program": "plugin" } } ] }"#,
+        );
+        let set = HookSet::merge_layers(vec![
+            (HookSource::Local, user),
+            (HookSource::Local, project),
+            (HookSource::Plugin("p".into()), plugin),
+        ]);
+        // All three share name "n" → only the highest-precedence (user) survives.
+        assert_eq!(set.len(), 1);
+        match &set.hooks()[0].action {
+            Action::Command { program, .. } => assert_eq!(program, "user"),
+            _ => panic!("expected command"),
+        }
     }
 }
