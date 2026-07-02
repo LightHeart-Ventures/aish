@@ -190,7 +190,7 @@ jobs:
   build:
     name: build ${{ matrix.target }} (dev)
     needs: setup
-    if: needs.setup.outputs.reuse != 'true'
+    if: 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -262,12 +262,7 @@ jobs:
   release:
     name: publish dev release
     needs: [setup, build]
-    # Run whenever setup succeeded and build either succeeded (fresh compile) or
-    # was skipped (same-commit CI reuse). Without always() a skipped `build`
-    # dependency would skip this job too.
-    if: >-
-      always() && needs.setup.result == 'success' &&
-      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    if: needs.setup.result == 'success' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -279,42 +274,18 @@ jobs:
           echo "tag=${{ needs.setup.outputs.release_tag }}" >> "$GITHUB_OUTPUT"
         shell: bash
 
-      # --- Fresh-compile path: gather the matrix build artifacts ---
       - name: Download all build artifacts
-        if: needs.setup.outputs.reuse != 'true'
         uses: actions/download-artifact@v8
         with:
           path: artifacts
 
       - name: Flatten artifacts
-        if: needs.setup.outputs.reuse != 'true'
         run: |
           set -euo pipefail
           mkdir -p dist
           find artifacts -type f \( -name 'aish-*' ! -name '*-dev' \) -exec cp {} dist/ \;
-          echo "Dev release assets (fresh compile):"
+          echo "Dev release assets:"
           ls -l dist
-
-      # --- Reuse path: download the same-commit CI build's assets ---
-      - name: Reuse same-commit CI build assets
-        if: needs.setup.outputs.reuse == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          cd dist
-          reuse_tag="${{ needs.setup.outputs.reuse_tag }}"
-          echo "Reusing assets from CI release: $reuse_tag"
-          # Pull only the binaries + checksums for the selected platform set. The
-          # aggregate SHA256SUMS is regenerated below so a platform subset stays
-          # self-consistent (CI always builds all three; dev may want fewer).
-          for a in ${{ needs.setup.outputs.assets }}; do
-            gh release download "$reuse_tag" --repo "$GITHUB_REPOSITORY" \
-              --pattern "$a" --pattern "$a.sha256"
-          done
-          echo "Dev release assets (reused from $reuse_tag):"
-          ls -l
 
       - name: Aggregate checksums
         run: |
@@ -329,13 +300,8 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ steps.nextver.outputs.tag }}"
-          reuse_tag="${{ needs.setup.outputs.reuse_tag }}"
           shortsha="$(git rev-parse --short "$GITHUB_SHA")"
-          if [ "${{ needs.setup.outputs.reuse }}" = "true" ]; then
-            notes="Development build (${{ needs.setup.outputs.platforms }}) from ${shortsha}. Reused byte-identical binaries from CI build ${reuse_tag} (same commit — no recompile). Unstable — for testing only."
-          else
-            notes="Development build (${{ needs.setup.outputs.platforms }}) from ${shortsha}. Unstable — for testing only."
-          fi
+          notes="Development build (${{ needs.setup.outputs.platforms }}) from ${shortsha}. Unstable — for testing only."
           gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
