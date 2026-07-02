@@ -158,7 +158,19 @@ impl ClaudeBackend {
         })
     }
 
-    pub async fn complete(&self, system: &str, history: &[Msg], tools: &[ToolDef]) -> Result<Turn> {
+    /// Build the `/messages` request body shared by the buffered
+    /// ([`complete`](Self::complete)) and streaming
+    /// ([`complete_streaming`](Self::complete_streaming)) paths. The two differ
+    /// only by the `stream` flag, so keeping one builder means the model,
+    /// token cap, system shaping, tool schemas, prompt caching, and adaptive-
+    /// thinking policy can never drift between them.
+    fn build_body(
+        &self,
+        system: &str,
+        history: &[Msg],
+        tools: &[ToolDef],
+        stream: bool,
+    ) -> Value {
         let messages = render_messages(history);
         let tool_defs: Vec<Value> = tools
             .iter()
@@ -188,6 +200,9 @@ impl ClaudeBackend {
             // exactly the multi-turn shape prompt caching is for.
             "cache_control": {"type": "ephemeral"},
         });
+        if stream {
+            body["stream"] = json!(true);
+        }
         // Adaptive thinking is the 4.6+ Opus/Sonnet surface; Haiku doesn't take
         // it — AND it is incompatible with assistant-prefill, so it's suppressed
         // whenever the request ends with an assistant message (our truncation
@@ -195,8 +210,38 @@ impl ClaudeBackend {
         if wants_thinking(&self.model, history) {
             body["thinking"] = json!({"type": "adaptive"});
         }
+        body
+    }
 
+    pub async fn complete(&self, system: &str, history: &[Msg], tools: &[ToolDef]) -> Result<Turn> {
+        let body = self.build_body(system, history, tools, false);
         let v = self.post_with_retry(&body).await?;
+        parse_response(&v)
+    }
+
+    /// Streaming counterpart to [`complete`](Self::complete): opens an SSE
+    /// stream against the Messages API and delivers each text/thinking token to
+    /// `sink` as it decodes, then returns the same normalized [`Turn`]
+    /// buffered-mode would (S8.1). The accumulated events are reassembled into
+    /// the identical response envelope `parse_response` consumes, so ALL of the
+    /// hard-won buffered-path behaviour — max_tokens truncation handling, empty
+    /// tool-call dropping, usage/cache accounting, thinking-block preservation —
+    /// is reused verbatim rather than re-implemented for the stream.
+    ///
+    /// Connection establishment is retried on the same transient classes as the
+    /// buffered path (network errors, 429 with `Retry-After`, 5xx). A failure
+    /// that occurs AFTER the first byte is surfaced (not retried) — some tokens
+    /// have already reached the sink and replaying them would double-render; the
+    /// caller may fall back to `complete`.
+    pub async fn complete_streaming(
+        &self,
+        system: &str,
+        history: &[Msg],
+        tools: &[ToolDef],
+        sink: super::StreamSink<'_>,
+    ) -> Result<Turn> {
+        let body = self.build_body(system, history, tools, true);
+        let v = self.stream_with_retry(&body, sink).await?;
         parse_response(&v)
     }
 
@@ -327,6 +372,388 @@ please refresh your token with `claude setup-token`"
             }
         }
         unreachable!()
+    }
+
+    /// Establish the SSE stream, retrying only the CONNECTION on the same
+    /// transient classes as [`post_with_retry`](Self::post_with_retry). Once a
+    /// 200 response is streaming, decoding is handed to
+    /// [`consume_stream`](Self::consume_stream); a mid-stream error there is
+    /// returned as-is (see `complete_streaming` for why we don't replay).
+    async fn stream_with_retry(
+        &self,
+        body: &Value,
+        sink: super::StreamSink<'_>,
+    ) -> Result<Value> {
+        const MAX_ATTEMPTS: u32 = 8;
+        const MAX_DELAY: Duration = Duration::from_secs(60);
+        const RATE_LIMIT_MAX_DELAY: Duration = Duration::from_secs(90);
+        let mut delay = Duration::from_secs(2);
+        for attempt in 0..MAX_ATTEMPTS {
+            let last = attempt + 1 == MAX_ATTEMPTS;
+            let req = self
+                .client
+                .post(API_URL)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream");
+            let resp = match self.cred.apply(req).json(body).send().await {
+                Ok(r) => r,
+                Err(e) if !last => {
+                    eprintln!("\x1b[2m  network error ({e}), retrying…\x1b[0m");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(MAX_DELAY);
+                    continue;
+                }
+                Err(e) => return Err(e).context("request to claude api (stream) failed"),
+            };
+
+            let status = resp.status().as_u16();
+            if status == 200 {
+                // Headers are in; the body streams from here. Any failure now is
+                // post-first-byte and must NOT be retried (tokens already sank).
+                return self.consume_stream(resp, sink).await;
+            }
+
+            // Non-200: the error body is a normal (non-streamed) JSON document —
+            // classify it exactly as the buffered path does.
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(Duration::from_secs);
+            let (status, parsed) = match super::read_status_and_json(resp).await {
+                Ok(p) => p,
+                Err(e) if !last => {
+                    eprintln!("\x1b[2m  network error reading body ({e}), retrying…\x1b[0m");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(MAX_DELAY);
+                    continue;
+                }
+                Err(e) => return Err(e).context("reading claude api (stream) response body"),
+            };
+            let v = match parsed {
+                Ok(v) => v,
+                Err(snippet) => {
+                    if !last {
+                        eprintln!("\x1b[2m  api returned non-JSON ({status}), retrying…\x1b[0m");
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(MAX_DELAY);
+                        continue;
+                    }
+                    bail!("claude api ({status}): non-JSON response: {snippet}");
+                }
+            };
+            let msg = v["error"]["message"].as_str().unwrap_or("unknown error");
+            let kind = v["error"]["type"].as_str().unwrap_or("error");
+            let is_auth_error = matches!(status, 401 | 403)
+                || (status == 400 && {
+                    let m = msg.to_ascii_lowercase();
+                    m.contains("invalid") || m.contains("expired") || m.contains("unauthorized")
+                });
+            if is_auth_error && matches!(self.cred.auth, Auth::Oauth(_)) && !last {
+                eprintln!("\x1b[1m\n⚠ Claude OAuth token expired\x1b[0m");
+                eprintln!(
+                    "  Your Claude Max/Pro subscription token needs to be refreshed.\n\
+  Run: \x1b[1mclaude setup-token\x1b[0m\n\
+  Then set CLAUDE_CODE_OAUTH_TOKEN in your shell or ~/.aishrc"
+                );
+                eprintln!();
+                bail!(
+                    "claude api authentication failed ({status}): {msg} — \
+please refresh your token with `claude setup-token`"
+                );
+            }
+            if (status == 429 || status >= 500) && !last {
+                let wait = if status == 429 {
+                    retry_after.unwrap_or(delay).min(RATE_LIMIT_MAX_DELAY)
+                } else {
+                    delay
+                };
+                eprintln!(
+                    "\x1b[2m  api {kind} ({status}), retrying in {}s…\x1b[0m",
+                    wait.as_secs()
+                );
+                tokio::time::sleep(wait).await;
+                delay = (delay * 2).min(MAX_DELAY);
+                continue;
+            }
+            bail!("claude api {kind} ({status}): {msg}");
+        }
+        unreachable!()
+    }
+
+    /// Drive a 200 SSE body to completion: frame raw bytes into events
+    /// ([`SseDecoder`]), fold each into a [`StreamAccumulator`], and forward
+    /// text/thinking deltas to `sink` as they arrive. Returns the reassembled
+    /// response envelope for `parse_response`.
+    async fn consume_stream(
+        &self,
+        resp: reqwest::Response,
+        sink: super::StreamSink<'_>,
+    ) -> Result<Value> {
+        use futures_util::StreamExt;
+        let mut acc = StreamAccumulator::new();
+        let mut decoder = SseDecoder::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("reading claude stream chunk")?;
+            decoder.push(&chunk, &mut |data| acc.push_event(&data, &mut *sink))?;
+        }
+        // Flush a trailing event that lacked its terminating blank line.
+        decoder.finish(&mut |data| acc.push_event(&data, &mut *sink))?;
+        Ok(acc.finish())
+    }
+}
+
+/// Server-Sent-Events line framer for the Claude token stream. Accumulates raw
+/// bytes across arbitrary chunk boundaries (a TCP read can split a line — or a
+/// multi-byte UTF-8 sequence — anywhere) and yields one parsed `data:` JSON
+/// document per event. Dispatch is driven off the JSON's own `type` field, so
+/// the `event:` framing line is not needed and is ignored, as are heartbeat
+/// comments (`:` lines). Pure (no IO), so the framing is unit-testable against
+/// hand-split byte chunks.
+struct SseDecoder {
+    /// Undecoded bytes not yet forming a complete `\n`-terminated line.
+    buf: Vec<u8>,
+    /// The `data:` payload of the event currently being assembled (SSE allows
+    /// an event to span multiple `data:` lines, joined with `\n`).
+    data: String,
+}
+
+impl SseDecoder {
+    fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            data: String::new(),
+        }
+    }
+
+    /// Feed a chunk of raw stream bytes, invoking `f` once per complete event.
+    fn push(
+        &mut self,
+        bytes: &[u8],
+        f: &mut dyn FnMut(Value) -> Result<()>,
+    ) -> Result<()> {
+        self.buf.extend_from_slice(bytes);
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            // A complete line (through the `\n`) is always valid UTF-8: the JSON
+            // payload never contains a bare newline, so no multi-byte sequence is
+            // split at the boundary we cut on.
+            let line = String::from_utf8_lossy(&line);
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                // Blank line = event terminator: dispatch what we've gathered.
+                self.dispatch(f)?;
+            } else if line.starts_with(':') {
+                // SSE comment / heartbeat — ignore.
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                let rest = rest.strip_prefix(' ').unwrap_or(rest);
+                if !self.data.is_empty() {
+                    self.data.push('\n');
+                }
+                self.data.push_str(rest);
+            }
+            // `event:`, `id:`, `retry:` fields are irrelevant here — dispatch is
+            // on the data payload's own `type` — so they're skipped.
+        }
+        Ok(())
+    }
+
+    /// Parse and emit the buffered event data (if any), then reset it.
+    fn dispatch(&mut self, f: &mut dyn FnMut(Value) -> Result<()>) -> Result<()> {
+        if self.data.is_empty() {
+            return Ok(());
+        }
+        let data: Value = serde_json::from_str(&self.data)
+            .with_context(|| format!("parsing SSE data line: {}", self.data))?;
+        self.data.clear();
+        f(data)
+    }
+
+    /// Flush a final event that arrived without a terminating blank line.
+    fn finish(&mut self, f: &mut dyn FnMut(Value) -> Result<()>) -> Result<()> {
+        self.dispatch(f)
+    }
+}
+
+/// One in-progress content block as the stream builds it up.
+enum StreamBlock {
+    Text(String),
+    Thinking { thinking: String, signature: String },
+    ToolUse { id: String, name: String, json: String },
+}
+
+/// Folds the Anthropic streaming event sequence back into the same response
+/// envelope the buffered Messages API returns, so [`parse_response`] can be
+/// reused unchanged. Text and thinking deltas are forwarded to the sink as they
+/// land (the incremental-delivery guarantee); tool-call input JSON and thinking
+/// signatures are accumulated silently and only surface in the final envelope.
+struct StreamAccumulator {
+    blocks: Vec<StreamBlock>,
+    stop_reason: Option<String>,
+    input_tokens: u64,
+    cache_read: u64,
+    cache_creation: u64,
+    output_tokens: u64,
+}
+
+impl StreamAccumulator {
+    fn new() -> Self {
+        Self {
+            blocks: Vec::new(),
+            stop_reason: None,
+            input_tokens: 0,
+            cache_read: 0,
+            cache_creation: 0,
+            output_tokens: 0,
+        }
+    }
+
+    /// Ensure `blocks[idx]` exists (filling any gap with empty text blocks),
+    /// then place `block` there.
+    fn set_block(&mut self, idx: usize, block: StreamBlock) {
+        while self.blocks.len() <= idx {
+            self.blocks.push(StreamBlock::Text(String::new()));
+        }
+        self.blocks[idx] = block;
+    }
+
+    /// Fold one decoded SSE event into the accumulator, forwarding any visible
+    /// text/thinking delta to `sink`.
+    fn push_event(&mut self, data: &Value, sink: super::StreamSink<'_>) -> Result<()> {
+        let get = |o: &Value, k: &str| o.get(k).and_then(Value::as_u64).unwrap_or(0);
+        match data["type"].as_str().unwrap_or("") {
+            "message_start" => {
+                let u = &data["message"]["usage"];
+                self.input_tokens = get(u, "input_tokens");
+                self.cache_read = get(u, "cache_read_input_tokens");
+                self.cache_creation = get(u, "cache_creation_input_tokens");
+                self.output_tokens = get(u, "output_tokens");
+            }
+            "content_block_start" => {
+                let idx = data["index"].as_u64().unwrap_or(0) as usize;
+                let block = &data["content_block"];
+                let new = match block["type"].as_str().unwrap_or("") {
+                    "tool_use" => StreamBlock::ToolUse {
+                        id: block["id"].as_str().unwrap_or_default().to_string(),
+                        name: block["name"].as_str().unwrap_or_default().to_string(),
+                        json: String::new(),
+                    },
+                    "thinking" => StreamBlock::Thinking {
+                        thinking: block["thinking"].as_str().unwrap_or_default().to_string(),
+                        signature: block["signature"].as_str().unwrap_or_default().to_string(),
+                    },
+                    // "text" and anything unrecognized start as a text block.
+                    _ => StreamBlock::Text(block["text"].as_str().unwrap_or_default().to_string()),
+                };
+                self.set_block(idx, new);
+            }
+            "content_block_delta" => {
+                let idx = data["index"].as_u64().unwrap_or(0) as usize;
+                let delta = &data["delta"];
+                match delta["type"].as_str().unwrap_or("") {
+                    "text_delta" => {
+                        if let Some(t) = delta["text"].as_str() {
+                            match self.blocks.get_mut(idx) {
+                                Some(StreamBlock::Text(s)) => s.push_str(t),
+                                _ => self.set_block(idx, StreamBlock::Text(t.to_string())),
+                            }
+                            sink(super::StreamDelta::Text(t));
+                        }
+                    }
+                    "thinking_delta" => {
+                        if let Some(t) = delta["thinking"].as_str() {
+                            match self.blocks.get_mut(idx) {
+                                Some(StreamBlock::Thinking { thinking, .. }) => {
+                                    thinking.push_str(t)
+                                }
+                                _ => self.set_block(
+                                    idx,
+                                    StreamBlock::Thinking {
+                                        thinking: t.to_string(),
+                                        signature: String::new(),
+                                    },
+                                ),
+                            }
+                            sink(super::StreamDelta::Thinking(t));
+                        }
+                    }
+                    "signature_delta" => {
+                        if let Some(sig) = delta["signature"].as_str() {
+                            if let Some(StreamBlock::Thinking { signature, .. }) =
+                                self.blocks.get_mut(idx)
+                            {
+                                signature.push_str(sig);
+                            }
+                        }
+                    }
+                    "input_json_delta" => {
+                        if let Some(pj) = delta["partial_json"].as_str() {
+                            if let Some(StreamBlock::ToolUse { json, .. }) = self.blocks.get_mut(idx)
+                            {
+                                json.push_str(pj);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_stop" => {}
+            "message_delta" => {
+                if let Some(sr) = data["delta"]["stop_reason"].as_str() {
+                    self.stop_reason = Some(sr.to_string());
+                }
+                // Cumulative output token count is reported here.
+                if let Some(ot) = data["usage"]["output_tokens"].as_u64() {
+                    self.output_tokens = ot;
+                }
+            }
+            "message_stop" => {}
+            "error" => {
+                let msg = data["error"]["message"]
+                    .as_str()
+                    .unwrap_or("unknown streaming error");
+                bail!("claude streaming error: {msg}");
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Reassemble the buffered-mode response envelope from the accumulated
+    /// blocks + stop reason + usage, ready for [`parse_response`]. A tool_use
+    /// block whose accumulated JSON failed to complete (mid-call max_tokens
+    /// truncation) degrades to an empty `{}` input, which `parse_response`
+    /// then drops and flags as a truncated tool call — identical to the
+    /// buffered path.
+    fn finish(self) -> Value {
+        let content: Vec<Value> = self
+            .blocks
+            .into_iter()
+            .map(|b| match b {
+                StreamBlock::Text(t) => json!({"type": "text", "text": t}),
+                StreamBlock::Thinking {
+                    thinking,
+                    signature,
+                } => json!({"type": "thinking", "thinking": thinking, "signature": signature}),
+                StreamBlock::ToolUse { id, name, json } => {
+                    let input: Value = serde_json::from_str(&json).unwrap_or_else(|_| json!({}));
+                    json!({"type": "tool_use", "id": id, "name": name, "input": input})
+                }
+            })
+            .collect();
+        json!({
+            "stop_reason": self.stop_reason.unwrap_or_default(),
+            "content": content,
+            "usage": {
+                "input_tokens": self.input_tokens,
+                "cache_read_input_tokens": self.cache_read,
+                "cache_creation_input_tokens": self.cache_creation,
+                "output_tokens": self.output_tokens,
+            }
+        })
     }
 }
 
@@ -996,5 +1423,221 @@ mod tests {
         assert!(matches!(api_key_cred.auth, Auth::ApiKey(_)));
         // The auth error path in post_with_retry checks `matches!(self.cred.auth, Auth::Oauth(_))`,
         // so API keys would NOT enter the OAuth-specific error path.
+    }
+
+    // ---- Streaming (S8.1) ------------------------------------------------
+
+    /// Feed a sequence of decoded SSE events through a fresh accumulator,
+    /// recording every delta the sink receives (`'t'` = text, `'k'` = thinking)
+    /// in arrival order, then reassemble + parse the final `Turn`. The recorded
+    /// deltas are the proof that tokens arrive INCREMENTALLY — one entry per
+    /// emitted delta, not a single coalesced blob.
+    fn drive(events: &[Value]) -> (Vec<(char, String)>, Turn) {
+        let mut acc = StreamAccumulator::new();
+        let mut got: Vec<(char, String)> = Vec::new();
+        {
+            let mut sink = |d: crate::backend::StreamDelta<'_>| match d {
+                crate::backend::StreamDelta::Text(t) => got.push(('t', t.to_string())),
+                crate::backend::StreamDelta::Thinking(t) => got.push(('k', t.to_string())),
+            };
+            for e in events {
+                acc.push_event(e, &mut sink).unwrap();
+            }
+        }
+        let turn = parse_response(&acc.finish()).unwrap();
+        (got, turn)
+    }
+
+    #[test]
+    fn stream_delivers_text_tokens_incrementally() {
+        // AC (S8.1): tokens arrive incrementally through the backend trait. The
+        // three text_deltas must reach the sink as THREE separate deltas, in
+        // order — not one merged string — and the final Turn must equal the
+        // concatenation with usage (incl. cache buckets) accounted.
+        let events = vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":5,"cache_creation_input_tokens":0,"output_tokens":1}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}),
+            json!({"type":"message_stop"}),
+        ];
+        let (got, turn) = drive(&events);
+        assert_eq!(
+            got,
+            vec![
+                ('t', "Hel".to_string()),
+                ('t', "lo".to_string()),
+                ('t', " world".to_string()),
+            ],
+            "each text_delta must surface incrementally, in order"
+        );
+        assert_eq!(turn.text, "Hello world");
+        assert!(!turn.truncated_tool_call && !turn.truncated_text);
+        let u = turn.usage.expect("usage reassembled from stream");
+        assert_eq!(u.input_tokens, 15); // 10 + 5 + 0
+        assert_eq!(u.output_tokens, 3); // updated by message_delta
+        // raw is preserved so the assistant turn echoes back into history.
+        assert!(turn.raw.is_some());
+    }
+
+    #[test]
+    fn stream_reassembles_tool_use_from_input_json_deltas() {
+        // A tool call streams its input as partial_json fragments; the
+        // accumulator must stitch them into valid JSON and NOT leak any of it to
+        // the sink as visible text.
+        let events = vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":1}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu1","name":"read_file"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":".txt\"}"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}),
+        ];
+        let (got, turn) = drive(&events);
+        assert!(got.is_empty(), "tool-call JSON must not stream as text");
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].id, "tu1");
+        assert_eq!(turn.tool_calls[0].name, "read_file");
+        assert_eq!(turn.tool_calls[0].args, json!({"path": "a.txt"}));
+        assert!(!turn.truncated_tool_call);
+    }
+
+    #[test]
+    fn stream_emits_thinking_and_text_as_distinct_deltas() {
+        // Thinking deltas surface as StreamDelta::Thinking, text as Text; the
+        // final envelope preserves the thinking block (with its signature) in
+        // `raw` so adaptive-thinking history stays intact.
+        let events = vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":2}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"let me"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" think"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}),
+        ];
+        let (got, turn) = drive(&events);
+        assert_eq!(
+            got,
+            vec![
+                ('k', "let me".to_string()),
+                ('k', " think".to_string()),
+                ('t', "answer".to_string()),
+            ]
+        );
+        assert_eq!(turn.text, "answer");
+        let raw = turn.raw.expect("raw kept for thinking history");
+        let arr = raw.as_array().unwrap();
+        assert_eq!(arr[0]["type"], "thinking");
+        assert_eq!(arr[0]["thinking"], "let me think");
+        assert_eq!(arr[0]["signature"], "sig");
+        assert_eq!(arr[1]["type"], "text");
+        assert_eq!(arr[1]["text"], "answer");
+    }
+
+    #[test]
+    fn stream_truncated_tool_call_degrades_like_buffered_path() {
+        // A max_tokens cut mid-tool-call leaves the accumulated input JSON
+        // incomplete. finish() degrades it to `{}`, and parse_response then
+        // drops the call + flags truncation — identical to the buffered path,
+        // so the agentic loop's retry-smaller behaviour is preserved.
+        let events = vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":3}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu1","name":"write_file"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"big.rs\",\"content\":\"fn main() {"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":32000}}),
+        ];
+        let (_got, turn) = drive(&events);
+        assert!(turn.tool_calls.is_empty(), "truncated tool call not executed");
+        assert!(turn.truncated_tool_call);
+        assert!(turn.text.contains("cut off mid-tool-call"));
+    }
+
+    #[test]
+    fn sse_decoder_frames_events_split_across_chunk_boundaries() {
+        // The SSE framer must reassemble events regardless of where the TCP
+        // chunk boundary falls — mid-line, mid-field, anywhere.
+        let raw = "event: message_start\n\
+data: {\"type\":\"message_start\"}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\"}\n\
+\n";
+        let collect = |chunks: &[&[u8]]| -> Vec<String> {
+            let mut dec = SseDecoder::new();
+            let mut types = Vec::new();
+            let mut on = |d: Value| {
+                types.push(d["type"].as_str().unwrap_or("").to_string());
+                Ok(())
+            };
+            for c in chunks {
+                dec.push(c, &mut on).unwrap();
+            }
+            dec.finish(&mut on).unwrap();
+            types
+        };
+        let bytes = raw.as_bytes();
+        // Whole blob in one push.
+        assert_eq!(
+            collect(&[bytes]),
+            vec!["message_start".to_string(), "content_block_delta".to_string()]
+        );
+        // Split at three awkward interior offsets (mid-line each).
+        for cut in [10usize, 33, 60] {
+            let (a, b) = bytes.split_at(cut.min(bytes.len()));
+            assert_eq!(
+                collect(&[a, b]),
+                vec!["message_start".to_string(), "content_block_delta".to_string()],
+                "framing must survive a chunk boundary at byte {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_decoder_reassembles_multibyte_utf8_across_boundaries() {
+        // A multi-byte UTF-8 sequence (é = 0xC3 0xA9) can be split across chunk
+        // boundaries. Because the framer buffers raw bytes and only decodes a
+        // COMPLETE `\n`-terminated line, the sequence is rejoined before decode.
+        // Feeding one byte at a time is the worst case and must still parse.
+        let raw = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"café\"}}\n\n";
+        let mut dec = SseDecoder::new();
+        let mut texts = Vec::new();
+        let mut on = |d: Value| {
+            if let Some(t) = d["delta"]["text"].as_str() {
+                texts.push(t.to_string());
+            }
+            Ok(())
+        };
+        for b in raw.as_bytes() {
+            dec.push(&[*b], &mut on).unwrap();
+        }
+        assert_eq!(texts, vec!["café".to_string()]);
+    }
+
+    #[test]
+    fn sse_decoder_ignores_comments_and_blank_only_frames() {
+        // Heartbeat comment lines (`:`), unknown fields, and stray blank lines
+        // must not produce spurious events.
+        let raw = ": ping\n\
+\n\
+id: 1\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\
+\n";
+        let mut dec = SseDecoder::new();
+        let mut types = Vec::new();
+        let mut on = |d: Value| {
+            types.push(d["type"].as_str().unwrap_or("").to_string());
+            Ok(())
+        };
+        dec.push(raw.as_bytes(), &mut on).unwrap();
+        dec.finish(&mut on).unwrap();
+        assert_eq!(types, vec!["message_stop".to_string()]);
     }
 }

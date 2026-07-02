@@ -10,7 +10,11 @@ clap = { version = "4.6.1", features = ["derive"] }
 libc = "0.2"
 llama-cpp-2 = { version = "0.1", optional = true }
 regex = "1"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
+# Stream combinators (StreamExt::next) for decoding the Claude SSE token stream
+# (backend streaming completions, S8.1). Already in the tree via reqwest, so
+# adding it as a direct dep is essentially free.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Browser-impersonating HTTP client (wreq) for bypassing bot protection
 # Used selectively for mcpmarket searches; standard reqwest for everything else
 wreq = { version = "6.0.0-rc", features = ["json"] }
