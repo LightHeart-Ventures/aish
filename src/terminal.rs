@@ -295,6 +295,29 @@ pub fn restore_after_clear() {
     let _ = out.flush();
 }
 
+/// Whether a bottom-anchored footer scroll region is currently installed. Lets
+/// the REPL decide, after a screen clear, whether the cursor was already homed
+/// into the body by [`restore_after_clear`] (footer mode) or still needs to be
+/// moved to the bottom row for a bottom-anchored view (inline / no-footer mode).
+pub fn footer_active() -> bool {
+    ACTIVE.load(Ordering::Relaxed)
+}
+
+/// The terminal's row count via `TIOCGWINSZ`, or `None` off a tty. Public so the
+/// REPL can home the cursor to the bottom row when no footer region is installed.
+pub fn screen_rows() -> Option<u16> {
+    term_size().map(|(rows, _)| rows)
+}
+
+/// Cursor-home sequence to the bottom row, column 1 (`ESC[<rows>;1H`). Used by
+/// the inline-mode attach clear to anchor the view to the bottom of the screen
+/// (mirroring footer mode, where [`restore_after_clear`] homes to the bottom
+/// body row) so the backfill + redrawn prompt trail the last output instead of
+/// stranding at the top. Clamped to row 1 for degenerate zero heights.
+pub fn bottom_home_seq(rows: u16) -> String {
+    format!("\x1b[{};1H", rows.max(1))
+}
+
 /// Install a panic hook that resets the scroll region on unwind, so a crash
 /// mid-session doesn't leave the user's terminal with a stuck footer region.
 /// Chains the previous hook.
@@ -349,6 +372,15 @@ mod tests {
     fn scroll_region_reserves_three_bottom_rows() {
         // 24-row terminal → region rows 1..=21, footer at 22/23/24.
         assert_eq!(scroll_region_seq(24), "\x1b[1;21r");
+    }
+
+    #[test]
+    fn bottom_home_targets_last_row() {
+        // Anchors the inline-mode attach view to the bottom row (col 1).
+        assert_eq!(bottom_home_seq(50), "\x1b[50;1H");
+        assert_eq!(bottom_home_seq(24), "\x1b[24;1H");
+        // Degenerate zero height clamps to row 1 (never emits ESC[0;1H).
+        assert_eq!(bottom_home_seq(0), "\x1b[1;1H");
     }
 
     #[test]

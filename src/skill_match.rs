@@ -174,6 +174,26 @@ read the best-fitting one FIRST with read_file and follow it:",
     }
 }
 
+/// The filename aish treats as a repo's machine-readable spec. When present in
+/// the working directory it captures repo conventions (build/test commands,
+/// layout, guardrails) the model should honor before touching code — see the
+/// "Repo mode: `.repospec.json` FIRST, then code" system-prompt rule.
+pub const REPOSPEC_FILE: &str = ".repospec.json";
+
+/// A short reminder to fold in ALONGSIDE a skill-awareness hint when a
+/// [`REPOSPEC_FILE`] exists in the working directory. A matched skill's SKILL.md
+/// steps are generic; the repo's `.repospec.json` carries the project-specific
+/// conventions that should shape HOW those steps are applied here. The engine
+/// does the cwd existence check (keeping [`hint`] pure) and appends this note so
+/// the model reads the spec first and keeps it in mind while following the skill.
+pub fn repospec_reminder() -> String {
+    format!(
+        "[aish skill-awareness] This repo has a `{REPOSPEC_FILE}` — read it FIRST and keep its \
+conventions (build/test commands, layout, guardrails) in mind while applying the skill above; \
+let the repo spec win where it conflicts with the skill's generic steps."
+    )
+}
+
 /// Minimum number of SIGNIFICANT tokens (after stopword/short-word filtering) a
 /// task must carry to be "skill-worthy" — substantial enough that recommending
 /// an installable skill is worth the interruption. A one- or two-word command
@@ -385,6 +405,14 @@ mod tests {
         assert!(h.contains("\n- `"), "{h}");
         // Never more than MAX_HINTS bullets.
         assert!(h.matches("\n- `").count() <= MAX_HINTS, "{h}");
+    }
+
+    #[test]
+    fn repospec_reminder_names_the_spec_file_and_is_a_skill_awareness_note() {
+        let r = repospec_reminder();
+        assert!(r.starts_with("[aish skill-awareness]"), "{r}");
+        assert!(r.contains(REPOSPEC_FILE), "{r}");
+        assert_eq!(REPOSPEC_FILE, ".repospec.json");
     }
 
     // ---- registry recommendation (no installed skill matched) -----------

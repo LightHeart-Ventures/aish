@@ -157,6 +157,21 @@ async fn run_turn_inner(
                         .fire_observe(crate::hooks::HookEvent::SkillMatched, p);
                 }
             }
+            // Repo-awareness: when a skill fits AND the working directory has a
+            // `.repospec.json`, remind the model to read that spec first and keep
+            // its conventions in mind while applying the skill. The skill's steps
+            // are generic; the repo spec is project-specific and should win. The
+            // fs check lives here (not in the pure, unit-tested `hint`) since it
+            // depends on `session.cwd`.
+            let note = if session
+                .cwd
+                .join(crate::skill_match::REPOSPEC_FILE)
+                .exists()
+            {
+                format!("{note}\n{}", crate::skill_match::repospec_reminder())
+            } else {
+                note
+            };
             format!("{note}\n\n{input}")
         }
         None => maybe_recommend_skill(&task, input, session),
@@ -723,7 +738,15 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
 /// A coordinator turn is always a standard (Messages API) model call, hence the
 /// `[standard]` label the parent attaches; batch fan-out is announced separately.
 fn emit_narration(session: &mut Session, text: &str) {
-    let rendered = crate::md::render(text.trim(), "");
+    // In a coordinator each rendered line is re-framed by the parent as a pane
+    // row (`┃ [label] …`); render tables/rules narrow enough to survive that
+    // gutter so the parent's terminal doesn't hard-wrap the box. Interactively
+    // there's no gutter — render at full terminal width.
+    let rendered = if session.nested {
+        crate::md::render_pane(text.trim(), "")
+    } else {
+        crate::md::render(text.trim(), "")
+    };
     if session.nested {
         for line in rendered.lines() {
             eprintln!("🗨 {line}");
@@ -1297,35 +1320,126 @@ fn print_raw_result(result: &ToolResult) {
     }
 }
 
-/// Re-print the most recent turn's tool calls and their raw results. Drives the
-/// retroactive reveal when raw output is toggled on after an answer.
-pub fn reveal_last_turn(session: &Session) {
+/// Build the most recent turn's tool calls and their raw results as EXPANDED,
+/// fully-formatted (dim, indented) lines — each tool's ✓/✗ header followed by
+/// its verbatim output body. The reveal half of the Ctrl-O toggle. Returns the
+/// lines rather than printing them so [`render_raw_toggle`] can measure them for
+/// in-place erasure.
+pub fn reveal_last_turn(session: &Session) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
     for (desc, result) in &session.last_turn_tools {
-        eprintln!(
-            "\x1b[2m  {}\x1b[0m",
-            tool_result_line(desc, result.is_error)
-        );
-        print_raw_result(result);
+        out.push(format!("\x1b[2m  {}\x1b[0m", tool_result_line(desc, result.is_error)));
+        for line in raw_body(result).lines() {
+            out.push(format!("\x1b[2m     {line}\x1b[0m"));
+        }
     }
+    out
 }
 
-/// Re-print the most recent turn's tool calls in COLLAPSED form — each tool's
-/// ✓/✗ header followed by a one-line `N lines of output — Ctrl-O to expand`
-/// summary rather than the verbatim body. The symmetric counterpart to
+/// Build the most recent turn's tool calls in COLLAPSED form — each tool's ✓/✗
+/// header followed by a one-line `N lines of output — Ctrl-O to expand` summary
+/// rather than the verbatim body. The symmetric counterpart to
 /// [`reveal_last_turn`]: toggling raw output back OFF re-collapses the reveal so
 /// Ctrl-O flips between the expanded and collapsed views of the same turn.
-pub fn collapse_last_turn(session: &Session) {
+pub fn collapse_last_turn(session: &Session) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
     for (desc, result) in &session.last_turn_tools {
-        eprintln!(
-            "\x1b[2m  {}\x1b[0m",
-            tool_result_line(desc, result.is_error)
-        );
+        out.push(format!("\x1b[2m  {}\x1b[0m", tool_result_line(desc, result.is_error)));
         let count = raw_body(result).lines().count();
         if count > 0 {
             let noun = if count == 1 { "line" } else { "lines" };
-            eprintln!("\x1b[2m     … {count} {noun} of output — Ctrl-O to expand\x1b[0m");
+            out.push(format!(
+                "\x1b[2m     … {count} {noun} of output — Ctrl-O to expand\x1b[0m"
+            ));
         }
     }
+    out
+}
+
+/// Display width of `s` with any CSI (`ESC [ … <letter>`) escape sequences
+/// stripped, so a dim/coloured line measures by its VISIBLE glyphs only. Wide
+/// glyphs count as two columns (via `unicode-width`).
+fn ansi_stripped_width(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    let mut clean = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.next() == Some('[') {
+                for c2 in chars.by_ref() {
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        clean.push(c);
+    }
+    clean.width()
+}
+
+/// How many physical terminal rows a single logical (newline-free) line
+/// occupies once the terminal soft-wraps it at `cols`. A blank/zero-width line
+/// still occupies one row. `cols == 0` (unknown width) degrades to 1 row.
+fn physical_rows(formatted_line: &str, cols: usize) -> usize {
+    if cols == 0 {
+        return 1;
+    }
+    let w = ansi_stripped_width(formatted_line);
+    w.div_ceil(cols).max(1)
+}
+
+/// Perform the Ctrl-O raw-output toggle, rendering the last turn's tool output
+/// as an EXPANDED (`now_on`) or COLLAPSED view directly beneath the prompt — and
+/// crucially, ERASING the previously-rendered toggle block first so the view
+/// flips **in place** instead of stacking a new block on every keypress (the
+/// bug: collapse used to append below the still-visible expanded text, so it
+/// read as "never collapses").
+///
+/// The erase math: after rustyline handles Ctrl-O it abandons the prompt line
+/// and leaves the cursor on the next row, so between the cursor and the top of
+/// the prior block sit exactly `raw_view_rows` block rows + 1 prompt row. We
+/// move the cursor up that many rows to column 1 (`CSI n F`) and clear to end of
+/// screen (`CSI 0 J`), then paint the new view and record its physical height in
+/// `session.raw_view_rows` for the next toggle. The anchor is only valid while
+/// the block is the last thing printed; the REPL zeroes `raw_view_rows` on any
+/// non-Ctrl-O outcome. Non-TTY (piped / background coordinator) just prints the
+/// header + body with no cursor games.
+pub fn render_raw_toggle(session: &mut Session, now_on: bool) {
+    let header = if now_on {
+        "\x1b[2mraw tool output on\x1b[0m".to_string()
+    } else {
+        "\x1b[2mraw tool output off\x1b[0m".to_string()
+    };
+    let mut lines = vec![header];
+    lines.extend(if now_on {
+        reveal_last_turn(session)
+    } else {
+        collapse_last_turn(session)
+    });
+
+    if !stderr_is_tty() {
+        for line in &lines {
+            eprintln!("{line}");
+        }
+        session.raw_view_rows = 0;
+        return;
+    }
+
+    let cols = stderr_cols();
+    // Erase the prior in-place block (block rows + the intervening prompt row)
+    // before repainting, so the toggle flips the same region rather than
+    // appending. Skipped on the first toggle of a turn (raw_view_rows == 0).
+    if session.raw_view_rows > 0 {
+        eprint!("\x1b[{}F\x1b[0J", session.raw_view_rows + 1);
+    }
+    let mut rows = 0usize;
+    for line in &lines {
+        eprintln!("{line}");
+        rows += physical_rows(line, cols);
+    }
+    session.raw_view_rows = rows;
 }
 
 #[cfg(test)]
@@ -1643,5 +1757,32 @@ mod tests {
         // No prior output, or an empty one → untouched.
         assert_eq!(seed_context(true, None, "hi".into()), "hi");
         assert_eq!(seed_context(true, Some("   \n".into()), "hi".into()), "hi");
+    }
+
+    #[test]
+    fn ansi_stripped_width_ignores_csi_escapes() {
+        // Dim wrapper contributes zero visible width.
+        assert_eq!(ansi_stripped_width("\x1b[2mhello\x1b[0m"), 5);
+        // Bare text unchanged.
+        assert_eq!(ansi_stripped_width("abcd"), 4);
+        // Wide glyphs count as two columns.
+        assert_eq!(ansi_stripped_width("\x1b[2m你好\x1b[0m"), 4);
+        // Pure escape sequence → zero visible width.
+        assert_eq!(ansi_stripped_width("\x1b[0m"), 0);
+    }
+
+    #[test]
+    fn physical_rows_accounts_for_softwrap_and_escapes() {
+        // Fits on one row.
+        assert_eq!(physical_rows("hello", 80), 1);
+        // Exactly fills → one row; one over → two rows.
+        assert_eq!(physical_rows("abcd", 4), 1);
+        assert_eq!(physical_rows("abcde", 4), 2);
+        // Escape codes don't inflate the wrap math (5 visible cols / 4 = 2 rows).
+        assert_eq!(physical_rows("\x1b[2mabcde\x1b[0m", 4), 2);
+        // Empty line still occupies a row.
+        assert_eq!(physical_rows("", 80), 1);
+        // Unknown width degrades to a single row.
+        assert_eq!(physical_rows("anything at all", 0), 1);
     }
 }
