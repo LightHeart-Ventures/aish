@@ -42,6 +42,12 @@ pub const MIN_FOOTER_ROWS: u16 = 5;
 /// decide whether it must reset margins on unwind) and by [`restore_after_clear`].
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Whether the alternate screen buffer is currently active — a worker attach
+/// view has taken over the screen via [`enter_alt_screen`]. Tracked so the
+/// enter/leave transitions are idempotent and the panic hook can restore the
+/// primary buffer on unwind.
+static ALT_SCREEN: AtomicBool = AtomicBool::new(false);
+
 /// Last footer content painted `(status_msg, statusline)`, so a screen-clear
 /// (Shift-Tab worker cycle, etc.) can repaint the footer without the caller
 /// threading the strings back through.
@@ -313,6 +319,69 @@ pub fn footer_active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
+/// Whether the alternate screen buffer is currently active (a worker attach view
+/// owns the screen). See [`enter_alt_screen`].
+pub fn on_alt_screen() -> bool {
+    ALT_SCREEN.load(Ordering::Relaxed)
+}
+
+/// Re-anchor the cursor into the bottom of the body after a screen wipe / buffer
+/// switch: footer mode re-asserts the region + repaints the footer (which homes
+/// into the bottom body row); inline mode homes to the last row. Shared by the
+/// alt-screen enter/leave so a worker view grows up from the bottom exactly like
+/// a plain clear.
+fn anchor_bottom_after_wipe() {
+    if ACTIVE.load(Ordering::Relaxed) {
+        restore_after_clear();
+    } else if let Some((rows, _)) = term_size() {
+        let mut out = std::io::stdout();
+        let _ = write!(out, "{}", bottom_home_seq(rows));
+        let _ = out.flush();
+    }
+}
+
+/// Enter the alternate screen buffer so a worker attach view can take over the
+/// screen WITHOUT destroying the interactive scrollback. `ESC[?1049h` saves the
+/// primary buffer (all prior interactive output + cursor); [`leave_alt_screen`]
+/// restores it verbatim, so detaching returns the operator to exactly the output
+/// that was on screen when they attached. Idempotent — a no-op when already on
+/// the alt screen or off a tty.
+pub fn enter_alt_screen() {
+    // SAFETY: plain isatty query.
+    if unsafe { libc::isatty(1) } != 1 {
+        return;
+    }
+    if ALT_SCREEN.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b[?1049h");
+    let _ = out.flush();
+    // Fresh alt buffer: re-assert the footer region + anchor to the bottom so
+    // the worker view trails the last row like a clear does.
+    anchor_bottom_after_wipe();
+}
+
+/// Leave the alternate screen buffer, restoring the primary buffer (the
+/// interactive scrollback + cursor as they were before [`enter_alt_screen`]).
+/// Idempotent — a no-op when not on the alt screen or off a tty.
+pub fn leave_alt_screen() {
+    // SAFETY: plain isatty query.
+    if unsafe { libc::isatty(1) } != 1 {
+        return;
+    }
+    if !ALT_SCREEN.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b[?1049l");
+    let _ = out.flush();
+    // Restored primary buffer: some terminals drop the DECSTBM margins across a
+    // 1049 switch, so re-assert the region + repaint the footer and home into
+    // the body — the detached line + next prompt then trail the restored output.
+    anchor_bottom_after_wipe();
+}
+
 /// The terminal's row count via `TIOCGWINSZ`, or `None` off a tty. Public so the
 /// REPL can home the cursor to the bottom row when no footer region is installed.
 pub fn screen_rows() -> Option<u16> {
@@ -334,6 +403,14 @@ pub fn bottom_home_seq(rows: u16) -> String {
 pub fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // Restore the primary screen buffer first (if a worker attach view had
+        // taken over the alt buffer), so the crash + backtrace land on the
+        // operator's real scrollback rather than a stranded alt screen.
+        if ALT_SCREEN.swap(false, Ordering::Relaxed) {
+            let mut out = std::io::stdout();
+            let _ = write!(out, "\x1b[?1049l");
+            let _ = out.flush();
+        }
         if ACTIVE.load(Ordering::Relaxed) {
             let mut out = std::io::stdout();
             let _ = write!(out, "{RESET_REGION}\r\n");

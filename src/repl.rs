@@ -909,6 +909,11 @@ pub async fn run(
             .await;
     }
 
+    // If the operator exits while attached to a worker view, restore the primary
+    // screen buffer first so the parting line + shell prompt land on their real
+    // scrollback rather than a stranded alt screen.
+    crate::terminal::leave_alt_screen();
+
     // Tear down the bottom-anchored footer before we print the parting line, so
     // "bye" lands in a normal full-height screen instead of above a stale pinned
     // footer. `Drop` would also reset it, but doing it explicitly here keeps the
@@ -3066,6 +3071,11 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
     if id == GOAL_ATTACH_ID {
         match &session.goal {
             Some(g) if g.is_active() => {
+                if crate::terminal::on_alt_screen() {
+                    clear_screen_anchor_bottom();
+                } else {
+                    crate::terminal::enter_alt_screen();
+                }
                 *session.attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
                 println!(
                     "\x1b[1;33m⇄ attached to the goal\x1b[0m — streaming its turns live. \x1b[2mgoals are watch-only; :goal clear to stop it, :detach to stop watching.\x1b[0m"
@@ -3092,6 +3102,15 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
     match matches.as_slice() {
         [] => println!("no coordinator in this session matching '{id}' (see :workers)"),
         [(run_id, terminal)] => {
+            // Take over the screen on the alt buffer WITHOUT destroying the
+            // interactive scrollback (mirrors Shift-Tab): the first attach saves
+            // the primary buffer so `:detach` restores it verbatim; re-attaching
+            // while already on the alt buffer just wipes it for a fresh view.
+            if crate::terminal::on_alt_screen() {
+                clear_screen_anchor_bottom();
+            } else {
+                crate::terminal::enter_alt_screen();
+            }
             *session.attached.lock().unwrap() = Some(run_id.clone());
             let short = crate::batch::short_id(run_id);
             if *terminal {
@@ -3294,6 +3313,10 @@ fn detach_worker(session: &mut Session) {
     crate::worker::quiesce_thinking_spinners();
     match session.attached.lock().unwrap().take() {
         Some(run_id) => {
+            // Leave the alt screen buffer, restoring the primary buffer: the
+            // operator returns to exactly the interactive output that was on
+            // screen when they attached, with the detach line trailing it.
+            crate::terminal::leave_alt_screen();
             let short = crate::batch::short_id(&run_id);
             println!(
                 "\x1b[2m⇄ detached from {short} — it keeps running; :workers to check, :result {short} when done\x1b[0m"
@@ -3752,12 +3775,6 @@ fn cycle_worker(session: &mut Session) -> bool {
     if session.worker_jobs.lock().unwrap().is_empty() {
         return false;
     }
-    // Wipe the screen first, so this cycle's attach/detach view (status line +
-    // any backfilled activity / result) opens on a fresh screen instead of
-    // scrolling under the previous prompt and output. Anchor the cursor to the
-    // BOTTOM so the view + redrawn prompt trail the last output (2 lines below)
-    // rather than stranding at the top of an otherwise-blank screen.
-    clear_screen_anchor_bottom();
     // Synchronously tear down any live worker "thinking…" spinner BEFORE we
     // print this view and the REPL redraws the prompt. The spinner polls its
     // forward gate only every ~80 ms, so a spinner for the worker we're leaving
@@ -3798,7 +3815,11 @@ fn cycle_worker(session: &mut Session) -> bool {
     let next_idx = next_attach_index(&ids, current.as_deref());
 
     if next_idx == 0 {
-        // Wrapped past the last worker — back to the interactive prompt.
+        // Wrapped past the last worker — back to the interactive prompt. Leave
+        // the alt screen buffer, restoring the primary buffer: the operator
+        // returns to exactly the interactive output that was on screen when
+        // they first attached, and the detached line trails it.
+        crate::terminal::leave_alt_screen();
         *session.attached.lock().unwrap() = None;
         *session.attach_review_announced.lock().unwrap() = None;
         println!(
@@ -3807,6 +3828,16 @@ fn cycle_worker(session: &mut Session) -> bool {
         return true;
     }
 
+    // Switch the screen to the worker view WITHOUT destroying interactive
+    // scrollback. Interactive→worker (first hop off the prompt) enters the alt
+    // screen buffer, saving the primary buffer so the eventual detach restores
+    // it verbatim. Worker→worker hops are already on the alt buffer, so just
+    // wipe it for a fresh view (anchored to the bottom).
+    if crate::terminal::on_alt_screen() {
+        clear_screen_anchor_bottom();
+    } else {
+        crate::terminal::enter_alt_screen();
+    }
     let (run_id, terminal) = workers[next_idx - 1].clone();
     *session.attached.lock().unwrap() = Some(run_id.clone());
     let short = crate::batch::short_id(&run_id);
