@@ -6191,10 +6191,11 @@ mod tests {
         assert!(full.contains(":mode"));
         assert!(full.contains("confirmation"));
 
-        // Typing narrows it in place: `:re` -> rename + result only.
-        let re = palette_hint(":re", 3).expect("`:re` matches rename + result + rewrite");
-        assert_eq!(re.matches('\n').count(), 3);
+        // Typing narrows it in place: `:re` -> rename + restart + result + rewrite.
+        let re = palette_hint(":re", 3).expect("`:re` matches rename + restart + result + rewrite");
+        assert_eq!(re.matches('\n').count(), 4);
         assert!(re.contains(":rename"));
+        assert!(re.contains(":restart"));
         assert!(re.contains(":result"));
         assert!(re.contains(":rewrite"));
 
