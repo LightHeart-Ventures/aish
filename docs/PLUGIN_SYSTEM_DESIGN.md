@@ -1004,6 +1004,104 @@ write.
 **Example.** `examples/plugins/hello-world/login.sh` is a minimal device-code-style
 handler that emits a fake token object, demonstrating the stdout JSON contract.
 
+#### 0.5.3 implementation notes (`.mcp.json` merge)
+
+**Load point.** Plugin MCP servers are collected at plugin-load time (before the REPL
+starts) by `collect_mcp_servers(&[Plugin])` in `src/plugins.rs`, then merged into the
+runtime MCP set alongside the user's own `~/.mcp.json` / project `.mcp.json`. Each
+plugin's file lives at `~/.aish/plugins/<id>/.mcp.json` and uses the **same schema** as
+the user file (`{ "mcpServers": { "<name>": { … } } }`).
+
+**Ref resolution.** Two ref forms are resolved as the servers are read:
+
+- `${env:VAR}` / `${env:VAR:-default}` — resolved from the process environment; an
+  unset var with no default is left verbatim and a warning is emitted (never a hard
+  failure, so one bad ref can't wedge startup).
+- `${profile:<name>}` (bare) and `${profile:<name>.<field>}` (field) — resolved through
+  the shared `crate::mcp::load_profile` loader against `~/.aish/credentials`
+  `[profile:<name>]`. A bare ref inside a dedicated credentials block is left untouched
+  for the MCP client to expand at connect time.
+
+**Collision policy.** *First-plugin-by-id wins.* Plugins are processed in id-sorted
+order; if two plugins declare a server with the same name, the earlier id keeps it and
+the loser is warned. A **user-defined** server of the same name always wins over any
+plugin's (plugins fill gaps, never override the operator).
+
+**Tests** (`src/plugins.rs`): `mcp_basic_merge_one_plugin_one_server`,
+`mcp_env_ref_is_resolved`, `mcp_unset_env_ref_left_verbatim_with_warning`,
+`mcp_profile_refs_bare_and_field`, `mcp_bare_ref_untouched_for_credentials_block`,
+`mcp_collision_first_plugin_by_id_wins`, `mcp_malformed_json_is_graceful`.
+
+#### 0.5.4 implementation notes (session-env injection)
+
+**Capture point.** `collect_lifecycle_env(&[Plugin])` fork/execs each plugin's
+`on_init.sh` (falls back to any `<plugin>/<hook>.sh`) before the REPL starts, with a 5s
+per-hook timeout, and captures stdout. Each line is parsed: `KEY=VALUE` pairs are
+extracted; blank lines, `#comments`, and non-`KEY=VALUE` lines are silently ignored.
+Keys are trimmed and validated (`[A-Za-z_][A-Za-z0-9_]*`).
+
+**Merge order.** *Existing session/user env always wins* — plugin vars only fill unset
+keys. Among plugins, id-sorted first-by-id wins a key clash (loser warned), matching the
+0.5.3 collision policy.
+
+**Security.** A redaction guard rejects credential-like keys/values (substrings
+`secret`, `password`, `token`, `api_key`, `*_key`, …) with a warning — hooks must route
+secrets through the `${profile:…}` mechanism (0.5.5), never raw env. The
+`AISH_ENV_INJECTION_DISABLED` env var is an operator kill switch that skips injection
+entirely.
+
+**Tests** (`src/plugins.rs`): `parse_env_lines_basic`,
+`parse_env_lines_ignores_non_kv_and_comments`, `parse_env_lines_trims_and_validates_keys`,
+`parse_env_lines_rejects_credentials`,
+`parse_env_lines_secret_value_rejected_even_with_safe_key`,
+`collect_lifecycle_env_single_plugin_multiple_vars`,
+`collect_lifecycle_env_multi_plugin_collision_first_wins`,
+`collect_lifecycle_env_disabled_escape_hatch`,
+`collect_lifecycle_env_skips_plugins_without_hook`,
+`run_lifecycle_hook_script_captures_stdout`.
+
+#### 0.5.6 implementation notes (provenance CLI)
+
+**`:hooks [list|reload]`.** `list` (the bare-`:hooks` default) prints the merged
+lifecycle-hook set via the pure `HookSet::format_list()` (`src/hooks.rs`): one row per
+hook, columns `Event | Name | Status | Source | Matched`, sorted by (event, source,
+name). `Source` is the provenance label (`local`, `project`, `plugin:<id>`) from
+`HookSource::label()`; `Status` is `enabled`, or `observe` when a plugin blocking hook
+was demoted by the one-winner-per-event rule (0.5.2); `Matched` is the lifetime match
+count. `reload` re-merges the user + project + plugin hook layers mid-session.
+
+```
+Event       Name     Status   Source             Matched
+FileChanged rustfmt  enabled  local              3
+PreToolUse  observe  observe  plugin:enterprise  17
+```
+
+**`:plugin [list|info <id>]`.** `list` (the bare-`:plugin` default) enumerates
+discovered plugins (`id  name vX.Y.Z`). `info <id>` renders one plugin's full
+capability report via the pure `plugins::format_plugin_info()` — manifest metadata
+(name/version/description/enabled/dir), login command, plugin-lifecycle hooks, injected
+MCP server **names** (refs redacted — never echoed), event-catalog hooks parsed from the
+plugin's `hooks.json` (via the real `HookSet` loader so parsing stays identical), and
+expanded skills. An unknown id degrades to `no such plugin \`<id>\``.
+
+```
+plugin `enterprise`
+  name           Enterprise
+  version        1.2.0
+  description    corp plugin
+  enabled        yes
+  login          mycompany
+  lifecycle      on_init
+  mcp servers    corp
+  event hooks    PreToolUse (observe)
+  skills         audit
+```
+
+**Tests** (`src/plugins.rs`): `plugin_hook_fragments_only_for_plugins_with_hooks_json`,
+`format_plugin_info_unknown_id_is_none`, `format_plugin_info_reports_full_provenance`;
+the `:hooks`/`:plugin` colon entries are covered by the existing repl catalog +
+completion tests.
+
 ### What is explicitly NOT required for the enterprise plugin
 
 The **webhook broker / dynamic-forwarding apparatus (Phases 4, 5, 7, 10)** is *not* a
@@ -1024,16 +1122,30 @@ just enterprise. **Estimate:** ~8 SP. Slots **before** Phase 4.
       when only the old key is present.*
 - [ ] 0.5.2 Implement `event_hooks_file` merge into `src/hooks.rs` (precedence,
       multi-plugin fan-out, single-blocking-winner, `source` tagging).
-- [ ] 0.5.3 Implement `.mcp.json` merge from plugins into the client MCP set.
-- [ ] 0.5.4 Implement session-env injection from lifecycle-hook stdout (`KEY=VALUE`).
+- [x] 0.5.3 Implement `.mcp.json` merge from plugins into the client MCP set.
+      *Done: `collect_mcp_servers` in `src/plugins.rs` reads each plugin's `.mcp.json`
+      (same schema as the user file), resolves `${env:…}` / `${profile:…}` refs, and
+      merges the servers into the runtime set before the REPL starts. Collision policy:
+      first-plugin-by-id wins; a user-defined server of the same name always wins over a
+      plugin's. See "0.5.3 implementation notes" below.*
+- [x] 0.5.4 Implement session-env injection from lifecycle-hook stdout (`KEY=VALUE`).
+      *Done: `collect_lifecycle_env` in `src/plugins.rs` fork/execs each plugin's
+      `on_init.sh` before the REPL starts, parses `KEY=VALUE` lines from stdout, and
+      merges valid pairs into the session env. Merge order: existing session/user env
+      always wins; among plugins first-by-id wins a clash. Credential-like keys/values
+      are rejected; `AISH_ENV_INJECTION_DISABLED` is a kill switch. See "0.5.4
+      implementation notes" below.*
 - [x] 0.5.5 Implement `provides.login` command registration + credential-profile
       persistence. *Done: `src/plugin_auth.rs` routes `login <plugin-id>`, invokes the
       plugin's auth handler, and persists its JSON output to `~/.aish/credentials` under
       `[profile:<plugin-id>]` at mode 0600; the credential is reusable via
       `${profile:<plugin-id>}` in `.mcp.json` and exported to lifecycle hooks as
       `AISH_PROFILE_<PLUGIN>_<FIELD>`. See "0.5.5 implementation notes" below.*
-- [ ] 0.5.6 `:hooks list` shows plugin-contributed entries with provenance; `:plugin
-      info <id>` shows which catalog events it registers.
+- [x] 0.5.6 `:hooks list` shows plugin-contributed entries with provenance; `:plugin
+      info <id>` shows which catalog events it registers. *Done: `:hooks [list|reload]`
+      and `:plugin [list|info <id>]` in `src/repl.rs`, backed by pure helpers
+      `HookSet::format_list()` (src/hooks.rs) and `plugins::format_plugin_info()` /
+      `plugin_hook_fragments()` (src/plugins.rs). See "0.5.6 implementation notes" below.*
 - [ ] 0.5.7 Tests: catalog merge + precedence, blocking-veto from a plugin entry,
       `.mcp.json` merge, env injection, login round-trip, override/disable a plugin hook.
 
