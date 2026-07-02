@@ -588,6 +588,24 @@ fn anchor_bottom_after_wipe() {
     }
 }
 
+/// Erase the current terminal line in place: carriage-return to column 1, then
+/// `ESC[2K` (clear entire line). Used right before [`enter_alt_screen`] on the
+/// interactive→worker Shift-Tab hop to wipe the ephemeral interactive prompt row
+/// that rustyline's `Cmd::Interrupt` leaves on screen (cursor parked at
+/// end-of-input, i.e. just past an empty prompt on the SAME row). Without this,
+/// `ESC[?1049h` snapshots that stale prompt into the primary buffer, restores it
+/// verbatim on detach, and the REPL's freshly-drawn prompt stacks below it —
+/// piling up one empty prompt per Shift-Tab round-trip. No-op off a tty.
+pub fn erase_current_line() {
+    // SAFETY: plain isatty query.
+    if unsafe { libc::isatty(1) } != 1 {
+        return;
+    }
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\r\x1b[2K");
+    let _ = out.flush();
+}
+
 /// Enter the alternate screen buffer so a worker attach view can take over the
 /// screen WITHOUT destroying the interactive scrollback. `ESC[?1049h` saves the
 /// primary buffer (all prior interactive output + cursor); [`leave_alt_screen`]
