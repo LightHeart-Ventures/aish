@@ -251,6 +251,20 @@ pub struct Session {
     /// reported usage (or a char-based estimate). Drives auto-compaction and the
     /// `:context` readout. Starts at 0 (no turn taken yet). Session-local.
     pub context_used: usize,
+    /// Cumulative prompt (input) tokens the model has been billed this session,
+    /// summed from each turn's reported [`crate::context::Usage`]. Drives the
+    /// interactive activity-stream status line (`tokens in: …`). Session-local.
+    pub tokens_in: usize,
+    /// Cumulative completion (output) tokens the model has produced this session
+    /// (companion to [`tokens_in`]). Feeds the status line's `tokens out: …`.
+    pub tokens_out: usize,
+    /// Count of tool calls executed this session — every `escalate`, dispatch
+    /// (`run_in_background`), and ordinary tool run tallied once when it finishes.
+    /// Feeds the status line's `tool calls: …`.
+    pub tool_calls_total: usize,
+    /// Count of logical agentic turns taken this session (one per `run_turn`).
+    /// Feeds the status line's `turns: …`.
+    pub turns_total: usize,
     /// Interactive background mode (on by default, persisted; toggle with `:batch`).
     /// When on, the agent gets the run_in_background/background_status tools and a
     /// system-prompt nudge to offload deferrable work to a full background
@@ -420,6 +434,10 @@ impl Session {
             session_allows: HashSet::new(),
             session_dir_allows: HashSet::new(),
             context_used: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            tool_calls_total: 0,
+            turns_total: 0,
             batch_mode: true,
             batch_model: crate::batch::DEFAULT_BATCH_MODEL.to_string(),
             batch_force_batches: false,

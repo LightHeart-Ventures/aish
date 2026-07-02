@@ -798,7 +798,14 @@ pub async fn run(
             ReadOutcome::ShiftTab => {
                 // Shift-Tab cycles the attach cursor across this session's
                 // running coordinators (interactive → worker₁ → … → interactive).
+                // `cycle_worker` prints the attach status line, the backfilled
+                // tail (last 40 transcript rows), and any finished-result pane —
+                // ALL of it must land BEFORE the next prompt. Arm `needs_gap` so
+                // the loop emits a blank line between that last output row and the
+                // redrawn prompt, matching the command path (never a prompt jammed
+                // flush against the cycled coordinator's output).
                 cycle_worker(&mut session);
+                needs_gap = true;
                 continue;
             }
             ReadOutcome::Interrupted => {
@@ -893,8 +900,10 @@ fn reexec_aish() {
 /// Blank when not attached to any coordinator. When attached it mirrors the
 /// Shift-Tab attach announcement — `⇄ attached to <id> (i/n · Shift-Tab to
 /// cycle, :detach to stop)` — with a review-mode variant for a coordinator that
-/// has already finished. The returned string is plain text (no ANSI); the
-/// footer renderer owns styling and width-clipping.
+/// has already finished. The string carries its own ANSI styling — a bold
+/// yellow `⇄ attached to <id>` prefix with a dim parenthetical — so it matches
+/// the Shift-Tab attach announcement printed in the scroll area. The footer
+/// renderer paints it verbatim and clips on visible width (ANSI-aware).
 fn coordinator_status_message(session: &Session) -> String {
     let attached = match session.attached.lock().unwrap().clone() {
         Some(id) => id,
@@ -917,15 +926,15 @@ fn coordinator_status_message(session: &Session) -> String {
             let idx = i + 1;
             if workers[i].1 {
                 format!(
-                    "⇄ attached to {short} (finished) ({idx}/{n} · review mode: type to resume, Shift-Tab to cycle, :detach to stop)"
+                    "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m \x1b[2m({idx}/{n} · review mode: type to resume, Shift-Tab to cycle, :detach to stop)\x1b[0m"
                 )
             } else {
-                format!("⇄ attached to {short} ({idx}/{n} · Shift-Tab to cycle, :detach to stop)")
+                format!("\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({idx}/{n} · Shift-Tab to cycle, :detach to stop)\x1b[0m")
             }
         }
         // Attached to a run no longer in the local worker list (e.g. reattached
         // across a restart) — still reflect the attach state.
-        None => format!("⇄ attached to {short} (:detach to stop)"),
+        None => format!("\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m(:detach to stop)\x1b[0m"),
     }
 }
 
@@ -2755,8 +2764,8 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
             };
             let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
             let message = format!(
-                "\x1b[2mdispatched background coordinator {id} — runs here with the full \
-toolset; result auto-delivers. :workers to check.\x1b[0m"
+                "\x1b[2mdispatched background coordinator \x1b[0m\x1b[1;36m{id}\x1b[0m\x1b[2m \
+— runs here with the full toolset; result auto-delivers. \x1b[0m\x1b[36m:workers\x1b[0m\x1b[2m to check.\x1b[0m"
             );
             Dispatched {
                 id: Some(id),
@@ -2840,7 +2849,7 @@ fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
     // Fire-and-forget: unlike the old behaviour we do NOT auto-attach or
     // turn `:output` on — surface how to opt into watching/steering instead.
     println!(
-        "\x1b[2m:attach {short} to watch + steer it · :output on to stream coordinator activity\x1b[0m"
+        "\x1b[1;36m:attach {short}\x1b[0m\x1b[2m to watch + steer it · \x1b[0m\x1b[36m:output on\x1b[0m\x1b[2m to stream coordinator activity\x1b[0m"
     );
 }
 
@@ -3089,6 +3098,9 @@ fn print_attached_result(run_id: &str, session: &Session) {
 /// `:detach` — stop watching the attached coordinator. It keeps running in the
 /// background; its result still auto-delivers and shows in `:workers`.
 fn detach_worker(session: &mut Session) {
+    // Stop any live "thinking…" spinner now so it can't erase the next prompt
+    // (and restore the cursor it hid) — same race guarded in `cycle_worker`.
+    crate::worker::quiesce_thinking_spinners();
     match session.attached.lock().unwrap().take() {
         Some(run_id) => {
             let short = crate::batch::short_id(&run_id);
@@ -3540,6 +3552,13 @@ fn cycle_worker(session: &mut Session) {
     // view (status line + any backfilled activity / result) opens at the top of
     // a fresh screen instead of scrolling under the previous prompt and output.
     clear_screen();
+    // Synchronously tear down any live worker "thinking…" spinner BEFORE we
+    // print this view and the REPL redraws the prompt. The spinner polls its
+    // forward gate only every ~80 ms, so a spinner for the worker we're leaving
+    // would otherwise self-erase (`\r\x1b[2K`) a beat later — right on top of the
+    // freshly-drawn interactive prompt (the "prompt doesn't always show after
+    // Shift-Tab" bug). Aborting the tasks here also un-hides the cursor.
+    crate::worker::quiesce_thinking_spinners();
     // All coordinators this session launched, in listing order — LIVE and
     // TERMINAL — paired with a `terminal` flag so the attach branch can choose
     // review-mode vs live-stream. Shift-Tab rotates through finished/failed
@@ -4370,6 +4389,7 @@ async fn handle_colon(
                  :kill <id>                          kill a background job\n\
                  :workers [all]                      list this session's background coordinators (all = every session)\n\
                  :output [on|off]             stream background coordinators' activity (💭 thinking + 🛠️/🔧 tool + 🚀 standard/🐌 batch lines) in a contained bordered pane; off (default) keeps them quiet\n\
+                 :startup-digest [on|off]            show/suppress the boot-time coordinator digest (completed-result walls + salvage/reattach lines); off (default). env: AISH_STARTUP_DIGEST\n\
                  \n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (runs quietly; :attach <id> to watch/steer)\n\
@@ -4634,7 +4654,33 @@ async fn handle_colon(
                 });
             match found {
                 Some(r) => println!("{}", crate::md::render_stdout(r.trim())),
-                None => println!("no background job matching '{id}' (see :workers)"),
+                None => {
+                    // Store fallback: a completed background coordinator from a
+                    // prior session (retained in the durable store because the
+                    // startup digest is suppressed) has no in-memory job here, so
+                    // read its full result/error body straight from the store.
+                    let store_hit = session.coordinator_store.as_ref().and_then(|s| {
+                        s.load_all().ok().and_then(|rows| {
+                            rows.into_iter().find(|r| hit(&r.run_id)).map(|r| {
+                                r.result
+                                    .clone()
+                                    .filter(|s| !s.trim().is_empty())
+                                    .or_else(|| r.error.clone())
+                                    .unwrap_or_else(|| {
+                                        format!(
+                                            "coordinator {} — phase {}, no result yet",
+                                            crate::batch::short_id(&r.run_id),
+                                            r.phase
+                                        )
+                                    })
+                            })
+                        })
+                    });
+                    match store_hit {
+                        Some(body) => println!("{}", crate::md::render_stdout(body.trim())),
+                        None => println!("no background job matching '{id}' (see :workers)"),
+                    }
+                }
             }
         }
         Some("results") => {
@@ -4931,6 +4977,7 @@ async fn handle_colon(
         }
         Some("allow") => handle_allow(parts.next(), parts.next(), session),
         Some("batch") => handle_batch(parts.next(), parts.next(), session),
+        Some("startup-digest") => handle_startup_digest(parts.next(), session),
         Some("update") => {
             // handle_update returns true when the user opted to auto-restart onto
             // the freshly-installed binary — propagate it as the REPL break signal.
@@ -5407,6 +5454,64 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
             println!(
                 "unknown :batch subcommand '{other}' — usage: :batch [on|off|status|clear|model <id>]"
             )
+        }
+    }
+}
+
+/// `:startup-digest [on|off|status]` controls whether aish surfaces the verbose
+/// coordinator digest at boot — the completed-result walls, per-salvage lines,
+/// and the `reattached coordinator runs (…)` summary. Suppressed by default so a
+/// fresh terminal doesn't open onto a wall of prior workers' output; completed
+/// results stay retrievable via `:workers all` / `background_status` /
+/// `:result <id>`. The persisted `startup_digest` setting is read at the next
+/// startup; the `AISH_STARTUP_DIGEST` env var overrides it for a single run.
+fn handle_startup_digest(sub: Option<&str>, session: &mut Session) {
+    let persisted = session
+        .db
+        .as_ref()
+        .and_then(|db| db.get_setting("startup_digest").ok().flatten())
+        .and_then(|v| crate::coordinator::parse_flag(&v));
+    let env_override = std::env::var("AISH_STARTUP_DIGEST")
+        .ok()
+        .and_then(|v| crate::coordinator::parse_flag(&v));
+    let effective = env_override.or(persisted).unwrap_or(false);
+    match sub {
+        Some("on") | Some("off") => {
+            let on = sub == Some("on");
+            match session.db.as_ref() {
+                Some(db) => {
+                    let _ = db.set_setting("startup_digest", if on { "on" } else { "off" });
+                    println!(
+                        "startup digest {} — takes effect next startup{}",
+                        if on { "on" } else { "off" },
+                        if env_override.is_some() {
+                            " (AISH_STARTUP_DIGEST env is set and overrides this)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                None => println!("startup digest: no persistent store — can't save the setting"),
+            }
+        }
+        None | Some("status") => {
+            println!(
+                "startup digest: {} (default off; suppresses the boot-time coordinator wall)",
+                if effective { "on" } else { "off" }
+            );
+            if env_override.is_some() {
+                println!(
+                    "  source: AISH_STARTUP_DIGEST env override{}",
+                    persisted
+                        .map(|p| format!(" (persisted setting: {})", if p { "on" } else { "off" }))
+                        .unwrap_or_default()
+                );
+            } else if persisted.is_some() {
+                println!("  source: persisted :startup-digest setting");
+            }
+        }
+        Some(other) => {
+            println!("unknown :startup-digest subcommand '{other}' — usage: :startup-digest [on|off|status]")
         }
     }
 }
