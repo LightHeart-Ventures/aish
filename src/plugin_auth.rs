@@ -276,17 +276,17 @@ pub fn persist_credentials_at(
 /// non-alphanumeric character folded to `_`. Sorted for deterministic output.
 /// Empty when the profile has no persisted credentials.
 ///
-/// The live consumer is the lifecycle-hook runner (Phase 0.5.4) — until that
-/// wiring lands this resolver is exercised by the round-trip tests, so the
-/// non-test build sees it as unused.
-#[allow(dead_code)]
+/// The live consumer is the lifecycle-hook runner (Phase 0.5.5): before a
+/// plugin's `on_init.sh` is fork/exec'd, `plugins::collect_lifecycle_env_at`
+/// merges this plugin's profile fields into the hook's environment.
+#[allow(dead_code)] // convenience wrapper; the live path calls `profile_env_at`
 pub fn profile_env(login_name: &str) -> Vec<(String, String)> {
     profile_env_at(&credentials_path(), login_name)
 }
 
-/// [`profile_env`] against an explicit credentials path — the seam the tests and
-/// a lifecycle-hook runner drive without touching the real `~/.aish/credentials`.
-#[allow(dead_code)]
+/// [`profile_env`] against an explicit credentials path — the seam both the
+/// live hook runner (`plugins::collect_lifecycle_env_at`) and the tests drive
+/// without hardcoding the real `~/.aish/credentials`.
 pub fn profile_env_at(path: &Path, login_name: &str) -> Vec<(String, String)> {
     let vars = crate::mcp::load_profile(&path.to_string_lossy(), &profile_section(login_name));
     let mut out: Vec<(String, String)> = vars
@@ -299,14 +299,12 @@ pub fn profile_env_at(path: &Path, login_name: &str) -> Vec<(String, String)> {
 
 /// `AISH_PROFILE_<NAME>_<FIELD>` — the env-var name a credential field is
 /// exported under for lifecycle hooks.
-#[allow(dead_code)]
 fn env_key(login_name: &str, field: &str) -> String {
     format!("AISH_PROFILE_{}_{}", sanitize(login_name), sanitize(field))
 }
 
 /// Fold a token into an env-var-safe upper-case identifier: `[A-Z0-9]` kept,
 /// everything else → `_`.
-#[allow(dead_code)]
 fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {

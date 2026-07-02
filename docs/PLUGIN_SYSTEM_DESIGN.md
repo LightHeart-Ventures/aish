@@ -998,8 +998,25 @@ write.
 - **Lifecycle hooks** — `profile_env(<plugin-id>)` flattens the profile into
   `AISH_PROFILE_<PLUGIN>_<FIELD>=value` env pairs (name + field folded to
   `[A-Z0-9]`→`_`, upper-cased), e.g. `AISH_PROFILE_MYCOMPANY_ACCESS_TOKEN`. A hook's
-  `on_init.sh` reads these directly. (Wiring into the live hook runner lands with
-  0.5.4; the resolver + round-trip are covered by tests now.)
+  `on_init.sh` reads these directly. **This is now wired into the live hook runner:**
+  `plugins::collect_lifecycle_env_at` calls `plugin_auth::profile_env_at` for each
+  enabled plugin and injects that plugin's `AISH_PROFILE_*` vars into the hook's
+  process environment **before** it is fork/exec'd.
+
+  Injection is deliberately narrow:
+  - **hook-process-only** — the credential vars are handed to the child process; they
+    are **never** merged into the shared session env, so a login secret cannot leak into
+    the interactive shell's environment.
+  - **own-profile-only** — plugin `<id>` only ever sees `[profile:<id>]`; one plugin
+    cannot read another plugin's credentials.
+  - **no KEY=VALUE leak-back** — if a hook echoes a credential to stdout under a
+    credential-like key (`token`, `secret`, `key`, …), `parse_hook_env` still rejects it
+    with a warning, so tokens can't round-trip into the session env through the
+    env-injection channel (0.5.4).
+
+  Covered by tests `hook_sees_own_profile_credentials`,
+  `hook_cannot_leak_credential_into_session_env`, and
+  `hook_does_not_see_other_plugins_credentials` in `src/plugins.rs`.
 
 **Example.** `examples/plugins/hello-world/login.sh` is a minimal device-code-style
 handler that emits a fake token object, demonstrating the stdout JSON contract.
