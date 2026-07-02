@@ -2429,7 +2429,7 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, run_id: String, task:
     // never blocks a job. `none`/unset keep the host path byte-for-byte.
     let selection = crate::container::resolve_selection(
         crate::container::Runtime::parse_selector(
-            std::env::var("AISH_CONTAINER_RUNTIME").ok().as_deref(),
+            std::env::var("AISH_WORKER_RUNTIME").ok().as_deref(),
         ),
         crate::container::runtime_on_path(crate::container::Runtime::Podman),
         crate::container::runtime_on_path(crate::container::Runtime::Docker),
