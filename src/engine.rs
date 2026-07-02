@@ -723,7 +723,15 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
 /// A coordinator turn is always a standard (Messages API) model call, hence the
 /// `[standard]` label the parent attaches; batch fan-out is announced separately.
 fn emit_narration(session: &mut Session, text: &str) {
-    let rendered = crate::md::render(text.trim(), "");
+    // In a coordinator each rendered line is re-framed by the parent as a pane
+    // row (`┃ [label] …`); render tables/rules narrow enough to survive that
+    // gutter so the parent's terminal doesn't hard-wrap the box. Interactively
+    // there's no gutter — render at full terminal width.
+    let rendered = if session.nested {
+        crate::md::render_pane(text.trim(), "")
+    } else {
+        crate::md::render(text.trim(), "")
+    };
     if session.nested {
         for line in rendered.lines() {
             eprintln!("🗨 {line}");
