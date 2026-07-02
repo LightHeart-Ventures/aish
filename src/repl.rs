@@ -1130,6 +1130,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("new", "clear conversation history"),
     ("output", "stream coordinators' activity"),
     ("quit", "exit aish"),
+    ("reasoning", "show reasoning-quality telemetry (escalate vs guess)"),
     ("rename", "rename this session"),
     (
         "restart",
@@ -4144,6 +4145,15 @@ fn handle_context(backend: &Backend, session: &Session) {
     }
 }
 
+/// `:reasoning` — render the reasoning-quality telemetry summary: the escalate
+/// rate, the guess→wrong-turn rate, and both broken down by complexity and risk.
+/// This is the ground-truth model of *when aish's own reasoning is good enough*
+/// vs. *when to reach for the stronger model* (see `crate::reasoning_telemetry`).
+fn handle_reasoning() {
+    let summary = crate::reasoning_telemetry::summarize();
+    println!("{}", crate::reasoning_telemetry::render_report(&summary));
+}
+
 /// `:compact` — force a context compaction now: offload the oldest slice of the
 /// conversation to the SQLite memories table (recoverable via the recall tool,
 /// tagged `context-offload`) and replace it with a short in-context summary.
@@ -4476,6 +4486,7 @@ async fn handle_colon(
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
                  :context                            show context-window usage (tokens, %, memories)\n\
+                 :reasoning                          reasoning-quality telemetry: escalate-vs-guess rate + outcomes by complexity/risk\n\
                  :compact                            offload older history to long-term memory now\n\
                  :memories [organize]                list stored memories, or dedup them\n\
                  :telemetry [clear]                  tool-call failure/retry-recovery stats (or wipe them)\n\
@@ -5138,6 +5149,7 @@ async fn handle_colon(
             }
         }
         Some("context") => handle_context(backend, session),
+        Some("reasoning") => handle_reasoning(),
         Some("compact") => handle_compact(backend, session),
         Some("memories" | "memory") => handle_memories(parts.next(), session),
         Some("telemetry" | "tool-stats") => handle_telemetry(parts.next(), session),
@@ -6436,9 +6448,11 @@ mod tests {
         assert!(full.contains(":mode"));
         assert!(full.contains("confirmation"));
 
-        // Typing narrows it in place: `:re` -> rename + restart + result + rewrite.
-        let re = palette_hint(":re", 3).expect("`:re` matches rename + restart + result + rewrite");
-        assert_eq!(re.matches('\n').count(), 4);
+        // Typing narrows it in place: `:re` -> reasoning + rename + restart + result + rewrite.
+        let re = palette_hint(":re", 3)
+            .expect("`:re` matches reasoning + rename + restart + result + rewrite");
+        assert_eq!(re.matches('\n').count(), 5);
+        assert!(re.contains(":reasoning"));
         assert!(re.contains(":rename"));
         assert!(re.contains(":restart"));
         assert!(re.contains(":result"));
