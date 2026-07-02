@@ -7,6 +7,7 @@ mod coordinator;
 mod db;
 mod db_paths;
 mod diag;
+mod dispatch_stats;
 mod editor;
 mod engine;
 mod git;
