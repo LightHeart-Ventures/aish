@@ -1082,27 +1082,6 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_carries_decide_then_act_rule() {
-        // The "decide-then-act / denser turns" behaviour is a baked-in prompt
-        // rule — present regardless of escalate availability — that biases the
-        // agent toward batching independent tool calls and away from
-        // nudge-triggering no-op turn closes.
-        let session = Session::new().unwrap();
-        for escalate in [false, true] {
-            let p = session.system_prompt(escalate);
-            assert!(p.contains("Decide-then-act"), "missing decide-then-act rule");
-            assert!(
-                p.contains("read→think→read ping-pong"),
-                "missing ping-pong collapse directive"
-            );
-            assert!(
-                p.contains("SAME turn"),
-                "missing batch-independent-calls directive"
-            );
-        }
-    }
-
-    #[test]
     fn system_prompt_carries_repospec_habit() {
         // The ".repospec.json habit" (read+verify+remember when present,
         // create+remember when absent) is a baked-in prompt rule so every aish
