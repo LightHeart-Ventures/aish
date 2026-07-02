@@ -541,6 +541,13 @@ pub async fn run(
                 },
             },
         };
+        // The in-place Ctrl-O toggle block (engine::render_raw_toggle) can only
+        // erase itself while it's still the last thing on screen — i.e. the
+        // prompt sits directly below it. Any other outcome scrolls fresh output
+        // in, so drop the erase anchor; only a follow-up Ctrl-O keeps it.
+        if !matches!(outcome, ReadOutcome::CtrlO) {
+            session.raw_view_rows = 0;
+        }
         match outcome {
             ReadOutcome::Line(line) => {
                 let line = line.trim().to_string();
@@ -2646,13 +2653,10 @@ pub(crate) fn resolve_program(cmd: &str, cwd: &Path, path_var: &str) -> Option<P
 /// collapsed views.
 fn toggle_raw_output(session: &mut Session) {
     session.raw_tool_output = !session.raw_tool_output;
-    if session.raw_tool_output {
-        println!("\x1b[2mraw tool output on\x1b[0m");
-        engine::reveal_last_turn(session);
-    } else {
-        println!("\x1b[2mraw tool output off\x1b[0m");
-        engine::collapse_last_turn(session);
-    }
+    // Flip the last turn's tool output in place (expand ⇆ collapse), erasing the
+    // previously-rendered block so a second Ctrl-O truly re-collapses instead of
+    // appending a summary below the still-visible expanded text.
+    engine::render_raw_toggle(session, session.raw_tool_output);
 }
 
 /// True when a prompt line mentions "troubleshoot" (case-insensitive). Such a
