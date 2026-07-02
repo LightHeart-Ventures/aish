@@ -31,7 +31,6 @@ mod plugin_dispatcher;
 mod plugin_memory;
 #[cfg(test)]
 mod plugin_phase05_consolidation_tests;
-mod plugin_memory;
 mod plugin_state;
 mod plugins;
 mod present;
