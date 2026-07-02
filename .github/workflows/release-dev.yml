@@ -60,12 +60,26 @@ jobs:
       expected_assets: ${{ steps.set.outputs.expected_assets }}
       platforms: ${{ steps.set.outputs.platforms }}
       assets: ${{ steps.set.outputs.assets }}
+      release_tag: ${{ steps.tag.outputs.tag }}
       reuse: ${{ steps.reuse.outputs.reuse }}
       reuse_tag: ${{ steps.reuse.outputs.reuse_tag }}
     steps:
       - uses: actions/checkout@v6
         with:
           ref: main
+
+      - name: Compute release tag
+        id: tag
+        run: |
+          set -euo pipefail
+          current="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          IFS='.' read -r major minor patch <<< "$current"
+          next_minor=$((minor + 1))
+          next_version="${major}.${next_minor}.0"
+          tag="dev-v${next_version}-dev.${{ github.run_number }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Computed dev release tag: $tag"
+        shell: bash
 
       - name: Compute build matrix from platform selection
         id: set
@@ -217,6 +231,8 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release binary
+        env:
+          AISH_RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
         run: cargo build --release --features local --target ${{ matrix.target }}
         shell: bash
 
@@ -256,16 +272,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Resolve next semantic version
+      # Tag was computed in setup job; reuse it here
+      - name: Set release tag
         id: nextver
         run: |
-          set -euo pipefail
-          current="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
-          IFS='.' read -r major minor patch <<< "$current"
-          next_minor=$((minor + 1))
-          next_version="${major}.${next_minor}.0"
-          tag="dev-v${next_version}-dev.${{ github.run_number }}"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "tag=${{ needs.setup.outputs.release_tag }}" >> "$GITHUB_OUTPUT"
         shell: bash
 
       # --- Fresh-compile path: gather the matrix build artifacts ---

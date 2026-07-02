@@ -106,8 +106,14 @@ pub fn channel() -> Channel {
 /// time via `env!("CARGO_PKG_VERSION")`. **IMPORTANT: Always keep Cargo.toml's
 /// [package] version field in sync with the current release tag to prevent
 /// version detection drift during updates.**
+///
+/// For dev releases, `AISH_RELEASE_TAG` (if set at build time by the
+/// `release-dev.yml` workflow) appends the snapshot label, making the version
+/// visible as: "0.25.1 (dev snapshot dev-v0.26.0-dev.6)".
 pub fn current_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    // AISH_VERSION_STRING is generated at build time by build.rs, which composes
+    // the base version with an optional dev snapshot tag from AISH_RELEASE_TAG.
+    env!("AISH_VERSION_STRING")
 }
 
 /// A newer release that has an installable asset for this platform.

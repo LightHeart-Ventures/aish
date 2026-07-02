@@ -4732,7 +4732,10 @@ async fn handle_colon(
             let mut any = false;
             let mut seen = std::collections::HashSet::new();
             // In-memory coordinators launched by THIS session (live status).
-            for w in session.worker_jobs.lock().unwrap().iter() {
+            // Sort newest-first by start time.
+            let mut in_mem: Vec<_> = session.worker_jobs.lock().unwrap().iter().cloned().collect();
+            in_mem.sort_by(|a, b| b.started_epoch().cmp(&a.started_epoch()));
+            for w in in_mem.iter() {
                 any = true;
                 seen.insert(w.id.clone());
                 let (started_cell, runtime_cell) = crate::style::time_cells(
@@ -4768,11 +4771,18 @@ async fn handle_colon(
             // already listed in-memory to avoid double-counting this session's.
             if let Some(store) = &session.coordinator_store {
                 if let Ok(rows) = store.load_all() {
-                    for r in rows.iter().filter(|r| {
+                    // Sort newest-first by creation time.
+                    let mut durable: Vec<&_> = rows.iter().filter(|r| {
                         !seen.contains(&r.run_id)
                             && (show_all
                                 || r.session_id.as_deref() == Some(session.session_id.as_str()))
-                    }) {
+                    }).collect();
+                    durable.sort_by(|a, b| {
+                        let a_ts = a.created_at.as_deref().and_then(crate::style::parse_sqlite_utc).unwrap_or(0);
+                        let b_ts = b.created_at.as_deref().and_then(crate::style::parse_sqlite_utc).unwrap_or(0);
+                        b_ts.cmp(&a_ts)
+                    });
+                    for r in durable {
                         any = true;
                         let is_me = r.session_id.as_deref() == Some(session.session_id.as_str());
                         let label = r
