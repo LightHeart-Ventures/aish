@@ -315,9 +315,17 @@ fn pane_cols() -> usize {
 }
 
 /// Visible display width of `s` with ANSI SGR sequences discounted (zero-width).
+///
+/// The visible remainder is measured with `UnicodeWidthStr::width` (string-level,
+/// not a per-char sum) so an emoji-presentation sequence — a base codepoint
+/// followed by U+FE0F, e.g. `🛠️` / `⚙️` / `✏️` — is counted at its true 2-column
+/// terminal width. Summing `UnicodeWidthChar::width` per char undercounts those
+/// by one (the base is width-1, the VS16 selector width-0), and that off-by-one
+/// is exactly what pushed a wrapped row one column past the margin and made the
+/// terminal soft-wrap its last character onto a stray line.
 fn vis_cols(s: &str) -> usize {
-    use unicode_width::UnicodeWidthChar;
-    let mut w = 0usize;
+    use unicode_width::UnicodeWidthStr;
+    let mut clean = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
@@ -331,9 +339,25 @@ fn vis_cols(s: &str) -> usize {
             }
             continue;
         }
-        w += UnicodeWidthChar::width(c).unwrap_or(0);
+        clean.push(c);
     }
-    w
+    UnicodeWidthStr::width(clean.as_str())
+}
+
+/// Terminal width of a single `char` while stepping a string, promoted to 2 when
+/// it is an emoji base immediately followed by U+FE0F (the emoji-presentation
+/// selector, passed as `next`). `unicode-width`'s per-char width can't see the
+/// trailing selector and undercounts `🛠️`/`⚙️`/… by one column; this restores the
+/// true width for the char-by-char hard-break loops. The VS16 selector itself is
+/// width-0, so the pair still totals 2. Pure → unit-tested.
+fn step_width(c: char, next: Option<char>) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    let base = UnicodeWidthChar::width(c).unwrap_or(0);
+    if base == 1 && next == Some('\u{FE0F}') {
+        2
+    } else {
+        base
+    }
 }
 
 /// Is `c` part of a leading glyph/status prefix (not message text)? Covers the
@@ -390,9 +414,11 @@ fn split_body_glyph(body: &str) -> (&str, &str) {
 /// breaking at spaces; hard-breaks a single word longer than `width` by display
 /// column. Callers guard against ANSI-bearing messages (which must not wrap).
 fn wrap_visible(msg: &str, width: usize) -> Vec<String> {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_width::UnicodeWidthStr;
     let width = width.max(1);
-    let cw = |s: &str| s.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum::<usize>();
+    // String-level width so emoji-presentation sequences (base + U+FE0F) count
+    // as 2 columns, matching the terminal — a per-char sum undercounts them.
+    let cw = |s: &str| UnicodeWidthStr::width(s);
     let mut lines: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut cur_w = 0usize;
@@ -408,8 +434,9 @@ fn wrap_visible(msg: &str, width: usize) -> Vec<String> {
             }
             let mut chunk = String::new();
             let mut chw = 0usize;
-            for ch in word.chars() {
-                let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let mut it = word.chars().peekable();
+            while let Some(ch) = it.next() {
+                let w = step_width(ch, it.peek().copied());
                 if chw + w > width && !chunk.is_empty() {
                     lines.push(std::mem::take(&mut chunk));
                     chw = 0;
@@ -482,7 +509,6 @@ fn absorb_sgr(state: &mut String, seg: &str) {
 /// reset, so a colour span split across a wrap never bleeds into the pane border,
 /// the hang-indent pad, or the rest of the terminal. Pure → unit-tested.
 fn wrap_visible_ansi(msg: &str, width: usize, seed: &str) -> Vec<String> {
-    use unicode_width::UnicodeWidthChar;
     let width = width.max(1);
     let mut lines: Vec<String> = Vec::new();
     let mut open = seed.to_string(); // SGR active at the START of the current line
@@ -541,13 +567,16 @@ fn wrap_visible_ansi(msg: &str, width: usize, seed: &str) -> Vec<String> {
                     cur.push_str(seq);
                     absorb_sgr(&mut state, seq);
                 } else {
-                    let w = UnicodeWidthChar::width(c).unwrap_or(0);
+                    it.next(); // consume c
+                    // Peek the next codepoint so a base + U+FE0F emoji-presentation
+                    // pair (e.g. 🛠️) is measured at its true 2-column width.
+                    let next = it.peek().map(|&(_, cc)| cc);
+                    let w = step_width(c, next);
                     if cur_w + w > width && cur_w > 0 {
                         finish(&mut lines, &mut open, &state, &mut cur, &mut cur_w);
                     }
                     cur.push(c);
                     cur_w += w;
-                    it.next();
                 }
             }
         } else {
@@ -3436,6 +3465,56 @@ mod tests {
                 && visible.contains("768 lib + 26 memory + 5 routing pass here"),
             "message text intact across wraps: {visible:?}"
         );
+    }
+
+    #[test]
+    fn vis_cols_counts_vs16_emoji_as_two_columns() {
+        // Regression: a base emoji + U+FE0F emoji-presentation selector (🛠️/⚙️/✏️)
+        // renders as 2 terminal columns but `UnicodeWidthChar::width` per-char
+        // undercounts it to 1 (base 1 + selector 0). String-level width is honest.
+        assert_eq!(vis_cols("\u{1F6E0}\u{FE0F}"), 2, "🛠️ is 2 cols");
+        assert_eq!(vis_cols("\u{2699}\u{FE0F}"), 2, "⚙️ is 2 cols");
+        // The exact tool-result prefix from the bug report: "✓ 🛠️ ".
+        assert_eq!(vis_cols("\u{2713} \u{1F6E0}\u{FE0F} "), 5, "✓ 🛠️  prefix is 5 cols");
+        // A bare rocket (already width-2, no selector) is unchanged.
+        assert_eq!(vis_cols("\u{1F680}"), 2, "🚀 is 2 cols");
+    }
+
+    #[test]
+    fn step_width_promotes_vs16_pair() {
+        // Emoji base followed by the VS16 selector → promoted to 2.
+        assert_eq!(step_width('\u{1F6E0}', Some('\u{FE0F}')), 2);
+        // Same base with no trailing selector → its intrinsic (narrow) width.
+        assert_eq!(step_width('\u{1F6E0}', None), 1);
+        // The selector itself contributes nothing (the pair still totals 2).
+        assert_eq!(step_width('\u{FE0F}', None), 0);
+        // A wide emoji is untouched by a (non-)selector follow char.
+        assert_eq!(step_width('\u{1F680}', Some('x')), 2);
+    }
+
+    #[test]
+    fn pane_row_vs16_emoji_prefix_stays_within_width() {
+        // Regression for the reported soft-wrap: a tool-result row whose glyph
+        // prefix is `✓ 🛠️ ` (base emoji + VS16) was measured one column short, so
+        // the first wrapped row came out `cols + 1` wide and the terminal folded
+        // its last character ("g" of "streaming") onto a stray line. Every emitted
+        // row must now sit within the terminal width.
+        let label = "w_bduJrw6R"; // gutter = 5 + 10 = 15
+        let msg = "gh pr create --repo LightHeart-Ventures/aish --base main \
+                   --head aish/w_bduJrw6R --title feat streaming completions \
+                   through the backend trait implements streaming end to end";
+        let text = format!("\u{2713} \u{1F6E0}\u{FE0F} {msg}");
+        let cols = 72;
+        let row = pane_row_cols(label, &text, cols, PANE_BORDER);
+        let lines: Vec<&str> = row.split('\n').collect();
+        assert!(lines.len() >= 2, "long tool-result should wrap: {row:?}");
+        for l in &lines {
+            assert!(
+                vis_cols(l) <= cols,
+                "row must not exceed width {cols}: {l:?} ({} cols)",
+                vis_cols(l)
+            );
+        }
     }
 
     #[test]
