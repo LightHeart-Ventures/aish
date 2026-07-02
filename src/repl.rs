@@ -258,6 +258,10 @@ pub async fn run(
         if let Some(t) = term.as_mut() {
             t.init_scroll_region();
         }
+        // Idle-timeout heartbeat: repaints the footer after 3s parked at the
+        // prompt so a terminal scroll that carried it out of view self-heals
+        // (the "I scrolled and the footer disappeared" complaint).
+        crate::terminal::spawn_footer_heartbeat();
         // SIGWINCH → set the resize flag; the loop drains it before the prompt.
         let resized_sig = resized.clone();
         tokio::spawn(async move {

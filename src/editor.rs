@@ -197,7 +197,12 @@ impl LineEditor for RustylineEditor {
     }
 
     fn read_line(&mut self, prompt: &str) -> ReadOutcome {
+        // Mark the idle-at-prompt window so the footer heartbeat may repaint a
+        // scrolled-away footer while we block here (cleared the moment a line
+        // returns).
+        crate::terminal::set_reading_line(true);
         let res = self.rl.readline(prompt);
+        crate::terminal::set_reading_line(false);
         self.outcome(res)
     }
 
@@ -205,7 +210,9 @@ impl LineEditor for RustylineEditor {
         // rustyline takes the pre-filled buffer as a (left, right) split around
         // the cursor; we want the whole candidate to the LEFT so the cursor
         // lands at end-of-line, ready to edit or Enter.
+        crate::terminal::set_reading_line(true);
         let res = self.rl.readline_with_initial(prompt, (initial, ""));
+        crate::terminal::set_reading_line(false);
         self.outcome(res)
     }
 
