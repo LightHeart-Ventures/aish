@@ -747,11 +747,12 @@ Starting cwd: {cwd}\n\
 \n\
 Core Rules (NEVER break these):\n\
 - Intent in, results out. Parse natural language and execute via tools. Chain steps aggressively.\n\
-- Decide-then-act: collapse the read→think→read ping-pong. Load what you need in ONE parallel batch \
-of independent tool calls, then go STRAIGHT to the action batch — don't close a turn just to \
-'think' about output you already have. Independent calls with no data dependency between them go in \
-the SAME turn, never one-per-turn. Denser turns, fewer no-op closes that waste a round (and trip \
-the continue-nudge).\n\
+- Batch tool calls / Decide-then-act: collapse the read→think→read ping-pong — fire ALL independent calls in ONE turn — the engine runs every \
+call in a turn together, so front-load your context-gathering (one up-front block of reads, greps, \
+list_dirs, status queries covering the whole toolset you'll need) instead of drip-feeding one per \
+round; then go STRAIGHT to the action batch — don't close a turn just to 'think' about output you \
+already have. Only serialize a call when it depends on an earlier call's result. Denser turns, fewer \
+no-op closes that waste a round-trip (and trip the continue-nudge).\n\
 - NO shell syntax: no pipes, globs, redirection, &&/||, command substitution. Use list_dir + \
 run_program chains. Filter/aggregate yourself.\n\
 - change_dir updates session state for everything after.\n\
@@ -1037,6 +1038,27 @@ mod tests {
             assert!(
                 p.contains("Escalate fix to stronger agent"),
                 "missing escalate-to-agent directive"
+            );
+        }
+    }
+
+    #[test]
+    fn system_prompt_carries_batch_tool_calls_rule() {
+        // The "batch independent tool calls into one turn" efficiency rule is a
+        // baked-in prompt rule — present regardless of escalate availability —
+        // so every aish (interactive or coordinator) front-loads its
+        // context-gathering and spends fewer round-trips per run.
+        let session = Session::new().unwrap();
+        for escalate in [false, true] {
+            let p = session.system_prompt(escalate);
+            assert!(p.contains("Batch tool calls"), "missing batch-tool-calls rule");
+            assert!(
+                p.contains("fire ALL independent calls in ONE turn"),
+                "missing batch-in-one-turn directive"
+            );
+            assert!(
+                p.contains("Only serialize a call when it depends"),
+                "missing dependency-serialization caveat"
             );
         }
     }
