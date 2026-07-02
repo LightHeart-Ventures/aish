@@ -895,20 +895,22 @@ fn reexec_aish() {
     }
 }
 
-/// Build the coordinator status line shown in the footer's middle row (row H-1).
+/// Build the coordinator status line shown in the footer's middle row (row H-1)
+/// — the "2nd statusline".
 ///
-/// Blank when not attached to any coordinator. When attached it mirrors the
-/// Shift-Tab attach announcement — `⇄ attached to <id> (i/n · Shift-Tab to
-/// cycle, :detach to stop)` — with a review-mode variant for a coordinator that
-/// has already finished. The string carries its own ANSI styling — a bold
-/// yellow `⇄ attached to <id>` prefix with a dim parenthetical — so it matches
-/// the Shift-Tab attach announcement printed in the scroll area. The footer
-/// renderer paints it verbatim and clips on visible width (ANSI-aware).
+/// - When attached to a coordinator it mirrors the Shift-Tab attach
+///   announcement — `⇄ attached to <id> (i/n · Shift-Tab to cycle, :detach to
+///   stop)` — with a review-mode variant for a coordinator that has finished.
+/// - When NOT attached but coordinators exist to cycle into, it shows the
+///   detached hint `⇄ detached — back to interactive (Shift-Tab to cycle into a
+///   coordinator)` so the 2nd statusline reflects the interactive state instead
+///   of going blank.
+/// - Blank only when there are no coordinators at all.
+///
+/// The returned string is already colorized (ANSI when color is enabled); the
+/// footer renderer clips it to width via `clip_visible`, which is escape-aware.
 fn coordinator_status_message(session: &Session) -> String {
-    let attached = match session.attached.lock().unwrap().clone() {
-        Some(id) => id,
-        None => return String::new(),
-    };
+    let attached = session.attached.lock().unwrap().clone();
     // Same ordering as `cycle_worker`: newest coordinator first (spawn order
     // reversed), each paired with a terminal (done/failed) flag.
     let workers: Vec<(String, bool)> = session
@@ -919,22 +921,56 @@ fn coordinator_status_message(session: &Session) -> String {
         .rev()
         .map(|w| (w.id.clone(), matches!(w.status().as_str(), "done" | "failed")))
         .collect();
+    coordinator_status_line(attached.as_deref(), &workers, crate::style::colors_enabled())
+}
+
+/// Pure form of [`coordinator_status_message`]: caller supplies the attach
+/// cursor, the worker list, and the color decision so the rendering (including
+/// the detached-back-to-interactive hint and colorization) is unit-testable
+/// without a live `Session` or a TTY.
+fn coordinator_status_line(
+    attached: Option<&str>,
+    workers: &[(String, bool)],
+    color_on: bool,
+) -> String {
+    use crate::style::{paint_with, Color};
     let n = workers.len();
-    let short = crate::batch::short_id(&attached);
-    match workers.iter().position(|(id, _)| id == &attached) {
-        Some(i) => {
-            let idx = i + 1;
-            if workers[i].1 {
-                format!(
-                    "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m \x1b[2m({idx}/{n} · review mode: type to resume, Shift-Tab to cycle, :detach to stop)\x1b[0m"
-                )
+    match attached {
+        // Detached: back at the interactive prompt. Show the cycle hint on the
+        // 2nd statusline whenever there is at least one coordinator to cycle
+        // into; otherwise leave it blank.
+        None => {
+            if workers.is_empty() {
+                String::new()
             } else {
-                format!("\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({idx}/{n} · Shift-Tab to cycle, :detach to stop)\x1b[0m")
+                paint_with(
+                    "⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)",
+                    Color::Cyan,
+                    color_on,
+                )
             }
         }
-        // Attached to a run no longer in the local worker list (e.g. reattached
-        // across a restart) — still reflect the attach state.
-        None => format!("\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m(:detach to stop)\x1b[0m"),
+        Some(id) => {
+            let short = crate::batch::short_id(id);
+            let msg = match workers.iter().position(|(w, _)| w == id) {
+                Some(i) => {
+                    let idx = i + 1;
+                    if workers[i].1 {
+                        format!(
+                            "⇄ attached to {short} (finished) ({idx}/{n} · review mode: type to resume, Shift-Tab to cycle, :detach to stop)"
+                        )
+                    } else {
+                        format!(
+                            "⇄ attached to {short} ({idx}/{n} · Shift-Tab to cycle, :detach to stop)"
+                        )
+                    }
+                }
+                // Attached to a run no longer in the local worker list (e.g.
+                // reattached across a restart) — still reflect the attach state.
+                None => format!("⇄ attached to {short} (:detach to stop)"),
+            };
+            paint_with(&msg, Color::Yellow, color_on)
+        }
     }
 }
 
@@ -3600,7 +3636,7 @@ fn cycle_worker(session: &mut Session) {
         *session.attached.lock().unwrap() = None;
         *session.attach_review_announced.lock().unwrap() = None;
         println!(
-            "\x1b[2m⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)\x1b[0m"
+            "\x1b[36m⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)\x1b[0m"
         );
         return;
     }
@@ -3679,7 +3715,7 @@ fn cycle_worker_live(
         *attached.lock().unwrap() = None;
         *review.lock().unwrap() = None;
         println!(
-            "\x1b[2m⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)\x1b[0m"
+            "\x1b[36m⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)\x1b[0m"
         );
         return;
     }
@@ -6454,6 +6490,55 @@ mod tests {
         // `:close`d) is treated as interactive, so the next press lands on the
         // first worker rather than panicking or skipping.
         assert_eq!(next_attach_index(&running, Some("w_gone")), 1);
+    }
+
+    // ---- 2nd-statusline coordinator status message ----------------------
+    fn workers(xs: &[(&str, bool)]) -> Vec<(String, bool)> {
+        xs.iter().map(|(id, done)| (id.to_string(), *done)).collect()
+    }
+
+    #[test]
+    fn status_line_detached_shows_colorized_cycle_hint() {
+        // Detached with coordinators present → the cyan-colorized detached hint
+        // lands on the 2nd statusline instead of a blank row.
+        let ws = workers(&[("w_a", false)]);
+        let s = coordinator_status_line(None, &ws, true);
+        assert_eq!(
+            s,
+            "\x1b[36m⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)\x1b[0m"
+        );
+        // color_on=false → same text, no ANSI (respects NO_COLOR / non-TTY).
+        let plain = coordinator_status_line(None, &ws, false);
+        assert_eq!(
+            plain,
+            "⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)"
+        );
+        assert!(!plain.contains('\x1b'));
+    }
+
+    #[test]
+    fn status_line_detached_no_workers_is_blank() {
+        // No coordinators to cycle into → nothing on the 2nd statusline.
+        assert_eq!(coordinator_status_line(None, &[], true), String::new());
+    }
+
+    #[test]
+    fn status_line_attached_is_yellow_and_indexed() {
+        let ws = workers(&[("w_a", false), ("w_b", false)]);
+        let s = coordinator_status_line(Some("w_a"), &ws, true);
+        assert!(s.starts_with("\x1b[33m"));
+        assert!(s.ends_with("\x1b[0m"));
+        assert!(s.contains("attached to"));
+        assert!(s.contains("(1/2 · Shift-Tab to cycle, :detach to stop)"));
+    }
+
+    #[test]
+    fn status_line_attached_finished_shows_review_mode() {
+        let ws = workers(&[("w_done", true)]);
+        let s = coordinator_status_line(Some("w_done"), &ws, false);
+        assert!(s.contains("(finished)"));
+        assert!(s.contains("review mode"));
+        assert!(!s.contains('\x1b')); // color_on=false → plain
     }
 
     #[test]
