@@ -848,8 +848,51 @@ pub async fn run(
     }
 
     editor.save_history();
+
+    // `:restart` (or the post-`:update` auto-restart) asked us to reload rather
+    // than exit. Do it as the very last act, after all the exit cleanup above
+    // (jobs hung up, SessionEnd fired, footer torn down, history saved), by
+    // replacing this process image with a fresh aish carrying the SAME argv.
+    // `reexec_aish` only returns if the exec fails.
+    if session.restart_requested {
+        drop(session); // close the DB / release locks before handing off the image
+        reexec_aish();
+    }
+
     println!("bye");
     Ok(())
+}
+
+/// Reload aish in place: replace the current process image with a fresh run of
+/// the same binary and the SAME argv it was launched with (`:restart`, and the
+/// post-`:update` auto-restart). Resolving via `current_exe()` means an update
+/// that swapped the on-disk binary is picked up automatically.
+///
+/// On Unix this `exec`s, so it never returns on success — the new aish inherits
+/// the terminal directly. It only returns here if the exec call itself failed,
+/// in which case the caller falls through to a normal exit.
+#[cfg(unix)]
+fn reexec_aish() {
+    use std::io::Write;
+    println!("\x1b[2m↻ restarting aish…\x1b[0m");
+    let _ = std::io::stdout().flush();
+    // `restart_in_place` canonicalizes `current_exe()` and `exec`s — it replaces
+    // the process image and only returns an io::Error if the re-exec FAILED.
+    let err = crate::update::restart_in_place();
+    eprintln!("\x1b[31maish:\x1b[0m restart failed: {err}");
+}
+
+/// Non-Unix fallback: spawn a fresh aish and exit the current one. Best-effort —
+/// the two processes briefly overlap, unlike the Unix `exec` hand-off.
+#[cfg(not(unix))]
+fn reexec_aish() {
+    println!("\u{21bb} restarting aish…");
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("aish"));
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    match std::process::Command::new(&exe).args(&args).spawn() {
+        Ok(_) => std::process::exit(0),
+        Err(e) => eprintln!("aish: restart failed: {e}"),
+    }
 }
 
 /// Build the coordinator status line shown in the footer's middle row (row H-1)
@@ -1051,6 +1094,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("output", "stream coordinators' activity"),
     ("quit", "exit aish"),
     ("rename", "rename this session"),
+    (
+        "restart",
+        "reload aish with the same command it started with",
+    ),
     ("result", "view a finished job's result"),
     (
         "rewrite",
@@ -4967,7 +5014,19 @@ async fn handle_colon(
         Some("allow") => handle_allow(parts.next(), parts.next(), session),
         Some("batch") => handle_batch(parts.next(), parts.next(), session),
         Some("startup-digest") => handle_startup_digest(parts.next(), session),
-        Some("update") => handle_update(pending_update, session, parts.next()).await,
+        Some("update") => {
+            // handle_update returns true when the user opted to auto-restart onto
+            // the freshly-installed binary — propagate it as the REPL break signal.
+            if handle_update(pending_update, session, parts.next()).await {
+                return true;
+            }
+        }
+        Some("restart") => {
+            // Re-exec the current aish with the same argv it was launched with.
+            // Sets the flag the REPL loop consumes after exit cleanup, then breaks.
+            session.restart_requested = true;
+            return true;
+        }
         Some("mcp") => handle_mcp(parts.collect(), session).await,
         Some("skill" | "skills") => {
             let rest: Vec<&str> = parts.collect();
@@ -5055,12 +5114,12 @@ fn channel_blurb(ch: crate::update::Channel) -> &'static str {
 /// mode skips the confirm.
 async fn handle_update(
     pending_update: &mut Option<crate::update::UpdateInfo>,
-    session: &Session,
+    session: &mut Session,
     chan_arg: Option<&str>,
-) {
+) -> bool {
     if !crate::update::gh_available() {
         println!("update needs the GitHub CLI (`gh`) on PATH — see https://cli.github.com");
-        return;
+        return false;
     }
     // Resolve the requested channel: an explicit arg overrides the env default
     // for this invocation only. An unrecognised arg aborts loudly rather than
@@ -5073,7 +5132,7 @@ async fn handle_update(
                 println!(
                     "unknown channel '{s}' — valid channels: \x1b[36mprod\x1b[0m, \x1b[36mdev\x1b[0m, \x1b[36mci\x1b[0m"
                 );
-                return;
+                return false;
             }
         },
     };
@@ -5098,11 +5157,11 @@ async fn handle_update(
                         crate::update::current_version(),
                         active.as_str()
                     );
-                    return;
+                    return false;
                 }
                 Err(e) => {
                     println!("update check failed: {e:#}");
-                    return;
+                    return false;
                 }
             }
         }
@@ -5127,12 +5186,12 @@ async fn handle_update(
     if !go {
         println!("update cancelled — run :update when you're ready.");
         *pending_update = Some(info); // keep it so the next :update needn't re-check
-        return;
+        return false;
     }
     if let Err(e) = crate::update::perform(&info).await {
         println!("\x1b[31mupdate failed:\x1b[0m {e:#}");
         *pending_update = Some(info);
-        return;
+        return false;
     }
     // The swap took effect on disk but in-flight jobs keep running the OLD inode;
     // the new binary applies on next launch. Remind the user when skew is live.
@@ -5142,6 +5201,28 @@ async fn handle_update(
             "\x1b[33mnote:\x1b[0m {running} background job{plural} still on the old binary — the new version applies to work started after the next restart."
         );
     }
+    // Auto-restart onto the freshly-installed binary. Only offered when it's safe:
+    // no background workers on the old inode (a restart re-execs the parent and
+    // would strand them) — colon commands are handled between turns, so we're
+    // never mid-turn here. Ask first (yolo skips the prompt), then signal the
+    // REPL loop to re-exec via `session.restart_requested`.
+    if running == 0 {
+        let restart = session.mode == crate::session::Mode::Yolo
+            || matches!(
+                confirm_tty("restart aish now to load the new version?"),
+                tools::Decision::AllowOnce
+                    | tools::Decision::AlwaysAllow
+                    | tools::Decision::AllowDir
+            );
+        if restart {
+            session.restart_requested = true;
+            return true;
+        }
+        println!(
+            "\x1b[2mupdate installed — run \x1b[0m\x1b[36m:restart\x1b[0m\x1b[2m (or relaunch) to load it.\x1b[0m"
+        );
+    }
+    false
 }
 
 /// `:mcp` manages MCP servers (like Claude Code's `/mcp`): list, reconnect, add,
@@ -6251,10 +6332,11 @@ mod tests {
         assert!(full.contains(":mode"));
         assert!(full.contains("confirmation"));
 
-        // Typing narrows it in place: `:re` -> rename + result only.
-        let re = palette_hint(":re", 3).expect("`:re` matches rename + result + rewrite");
-        assert_eq!(re.matches('\n').count(), 3);
+        // Typing narrows it in place: `:re` -> rename + restart + result + rewrite.
+        let re = palette_hint(":re", 3).expect("`:re` matches rename + restart + result + rewrite");
+        assert_eq!(re.matches('\n').count(), 4);
         assert!(re.contains(":rename"));
+        assert!(re.contains(":restart"));
         assert!(re.contains(":result"));
         assert!(re.contains(":rewrite"));
 

@@ -375,6 +375,12 @@ pub struct Session {
     /// the next turn (one-shot), so a later command's output can still seed a
     /// genuinely fresh prompt. Session-local, never persisted.
     pub suppress_context_seed: bool,
+    /// Set by `:restart` (and the post-`:update` auto-restart) to ask the REPL
+    /// loop to re-exec the aish binary with the SAME argv it was launched with,
+    /// instead of just exiting. Consumed by `repl::run` after the normal exit
+    /// cleanup: when true it replaces the process image (Unix `exec`) rather than
+    /// printing "bye" and returning. Session-local, never persisted.
+    pub restart_requested: bool,
     /// The verbatim assignment a background coordinator was launched with, PINNED
     /// into the system prompt so it survives every history compaction. A
     /// long-running worker compacts its oldest turns to free context (see
@@ -452,6 +458,7 @@ impl Session {
             output_json: false,
             hooks: crate::hooks::HookSet::empty(),
             suppress_context_seed: false,
+            restart_requested: false,
             task_anchor: None,
             loop_state: None,
             resume: Arc::new(Mutex::new(ResumeState::default())),
