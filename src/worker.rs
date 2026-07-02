@@ -425,6 +425,138 @@ fn wrap_visible(msg: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Fold the SGR escape sequences contained in `seg` into `state` — the running
+/// set of styles "active" at the cursor, which a wrapped continuation line must
+/// re-open so a colour span split across the wrap keeps painting. A full reset
+/// (`\x1b[0m` / `\x1b[m`) clears the set; every other SGR sequence is appended
+/// (later codes override earlier ones for the same attribute, so re-emitting the
+/// whole chain reproduces the exact terminal state). Non-SGR escapes and plain
+/// text are ignored. Pure → unit-tested.
+fn absorb_sgr(state: &mut String, seg: &str) {
+    let mut it = seg.char_indices().peekable();
+    while let Some(&(start, c)) = it.peek() {
+        if c != '\x1b' {
+            it.next();
+            continue;
+        }
+        it.next(); // ESC
+        if !matches!(it.peek(), Some(&(_, '['))) {
+            continue; // not a CSI — ignore
+        }
+        it.next(); // '['
+        let mut end = start + 1;
+        let mut final_byte = '\0';
+        while let Some(&(k, cc)) = it.peek() {
+            it.next();
+            end = k + cc.len_utf8();
+            if cc.is_ascii_alphabetic() {
+                final_byte = cc;
+                break;
+            }
+        }
+        if final_byte == 'm' {
+            let seq = &seg[start..end];
+            if seq == "\x1b[0m" || seq == "\x1b[m" {
+                state.clear();
+            } else {
+                state.push_str(seq);
+            }
+        }
+    }
+}
+
+/// Like [`wrap_visible`], but for a message that CARRIES inline ANSI SGR colour
+/// (the markdown-rendered narration the coordinator emits — `code`/**bold**
+/// spans arrive pre-coloured). Wraps on VISIBLE columns (escapes are zero-width)
+/// and returns self-contained chunks: each re-opens the SGR state active at its
+/// start (seeded from `seed`, whatever the glyph prefix left open) and appends a
+/// reset, so a colour span split across a wrap never bleeds into the pane border,
+/// the hang-indent pad, or the rest of the terminal. Pure → unit-tested.
+fn wrap_visible_ansi(msg: &str, width: usize, seed: &str) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut open = seed.to_string(); // SGR active at the START of the current line
+    let mut state = seed.to_string(); // SGR active at the cursor (end of `cur`)
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+
+    // Emit `open + cur (+ reset)` as a finished line, then start a fresh line
+    // whose opening SGR is whatever is active NOW (`state`).
+    fn finish(
+        lines: &mut Vec<String>,
+        open: &mut String,
+        state: &str,
+        cur: &mut String,
+        cur_w: &mut usize,
+    ) {
+        let mut s = String::with_capacity(open.len() + cur.len() + 4);
+        s.push_str(open);
+        s.push_str(cur);
+        if !open.is_empty() || !state.is_empty() {
+            s.push_str("\x1b[0m");
+        }
+        lines.push(s);
+        *open = state.to_string();
+        cur.clear();
+        *cur_w = 0;
+    }
+
+    for word in msg.split(' ') {
+        let ww = vis_cols(word);
+        if cur_w > 0 && cur_w + 1 + ww > width {
+            finish(&mut lines, &mut open, &state, &mut cur, &mut cur_w);
+        }
+        if ww > width {
+            // A single word wider than the line: hard-break it by display column,
+            // stepping whole ANSI escapes (zero width) so none is ever split.
+            if cur_w > 0 {
+                finish(&mut lines, &mut open, &state, &mut cur, &mut cur_w);
+            }
+            let mut it = word.char_indices().peekable();
+            while let Some(&(start, c)) = it.peek() {
+                if c == '\x1b' {
+                    it.next(); // ESC
+                    let mut end = start + 1;
+                    if matches!(it.peek(), Some(&(_, '['))) {
+                        it.next(); // '['
+                        while let Some(&(k, cc)) = it.peek() {
+                            it.next();
+                            end = k + cc.len_utf8();
+                            if cc.is_ascii_alphabetic() {
+                                break;
+                            }
+                        }
+                    }
+                    let seq = &word[start..end];
+                    cur.push_str(seq);
+                    absorb_sgr(&mut state, seq);
+                } else {
+                    let w = UnicodeWidthChar::width(c).unwrap_or(0);
+                    if cur_w + w > width && cur_w > 0 {
+                        finish(&mut lines, &mut open, &state, &mut cur, &mut cur_w);
+                    }
+                    cur.push(c);
+                    cur_w += w;
+                    it.next();
+                }
+            }
+        } else {
+            if cur_w > 0 {
+                cur.push(' ');
+                cur_w += 1;
+            }
+            cur.push_str(word);
+            cur_w += ww;
+            absorb_sgr(&mut state, word);
+        }
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        finish(&mut lines, &mut open, &state, &mut cur, &mut cur_w);
+    }
+    lines
+}
+
 /// Render one forwarded coordinator line as a row of the contained `:output`
 /// pane: `┃ [label] text`. The border + `[label]` gutter are chrome (cyan
 /// border, dim label); `text` is emitted verbatim so it keeps whatever inline
@@ -475,12 +607,22 @@ fn pane_row_cols(label: &str, text: &str, cols: usize) -> String {
     let (prefix, message) = split_body_glyph(text);
     let indent = gutter_w + vis_cols(prefix);
     let avail = cols.saturating_sub(indent);
-    // Whole row already fits, or too narrow to hang-indent, or the message
-    // carries inline ANSI we must not break across lines → single line.
-    if gutter_w + vis_cols(text) <= cols || avail < MIN_WRAP_COLS || message.contains('\x1b') {
+    // Whole row already fits (ANSI is zero-width, so vis_cols is honest), or it's
+    // too narrow to hang-indent → single line.
+    if gutter_w + vis_cols(text) <= cols || avail < MIN_WRAP_COLS {
         return first;
     }
-    let chunks = wrap_visible(message, avail);
+    // Wrap the message. If it carries inline SGR colour (markdown-rendered
+    // narration — `code`/**bold** spans), wrap ANSI-aware so each continuation
+    // line re-opens the style active at the wrap point (seeded from whatever the
+    // glyph prefix left open) and resets at its end. Otherwise plain wrap.
+    let chunks = if prefix.contains('\x1b') || message.contains('\x1b') {
+        let mut seed = String::new();
+        absorb_sgr(&mut seed, prefix);
+        wrap_visible_ansi(message, avail, &seed)
+    } else {
+        wrap_visible(message, avail)
+    };
     if chunks.len() <= 1 {
         return first;
     }
@@ -3191,12 +3333,76 @@ mod tests {
 
     #[test]
     fn pane_row_ansi_message_not_wrapped() {
-        // A message carrying inline ANSI (the thinking row) must never be split
-        // across lines — colour codes would be orphaned. Emitted single-line
-        // even at a narrow width.
+        // At a width too narrow to hang-indent (avail < MIN_WRAP_COLS) the row is
+        // never wrapped — even an ANSI-bearing message is emitted single-line.
+        // ("w_a7k3m2pQ" gutter = 15; cols = 30 ⇒ avail = 15 < MIN_WRAP_COLS.)
         let body = "\x1b[2;36mthinking… a very long status that would otherwise wrap across the terminal width here\x1b[0m";
         let row = pane_row_cols("w_a7k3m2pQ", body, 30);
-        assert!(!row.contains('\n'), "ANSI-bearing message stays on one line");
+        assert!(!row.contains('\n'), "too narrow to hang-indent → single line");
+    }
+
+    #[test]
+    fn pane_row_wraps_ansi_message_preserving_color() {
+        // Regression: markdown-rendered narration carries inline SGR (a `code`
+        // span → dim). It must WRAP (hang-indented) like plain text — the old
+        // code bailed to a single line on any '\x1b', so the terminal soft-wrapped
+        // it back to column 0. Each continuation line must re-open the active
+        // colour and reset, and stay within the width.
+        let label = "w_abc12345"; // gutter = 15
+        let msg = "CI gate clean: cargo \x1b[2mtest --no-default-features --locked\x1b[0m — 768 lib + 26 memory + 5 routing pass here";
+        let row = pane_row_cols(label, &format!("🚀 {msg}"), 50);
+
+        let lines: Vec<&str> = row.split('\n').collect();
+        assert!(lines.len() >= 2, "ANSI message should wrap: {row:?}");
+        for l in &lines {
+            assert!(l.starts_with(PANE_BORDER), "row keeps the border: {l:?}");
+            assert!(vis_cols(l) <= 50, "row within width: {l:?} ({})", vis_cols(l));
+        }
+        // Continuation hangs under the first message letter: "🚀 " = 3 cols after
+        // the 15-col gutter ⇒ indent 18 ⇒ "┃" + 17 spaces.
+        let after = lines[1].strip_prefix(PANE_BORDER).unwrap();
+        assert_eq!(
+            after.chars().take_while(|c| *c == ' ').count(),
+            17,
+            "continuation hangs under the first letter: {:?}",
+            lines[1]
+        );
+        // Colour survives: the dim open code and a reset are both present.
+        assert!(row.contains("\x1b[2m"), "dim code preserved: {row:?}");
+        assert!(row.contains("\x1b[0m"), "reset present: {row:?}");
+        // Content integrity: stripping ANSI + border/pad reassembles the message.
+        let strip_ansi = |s: &str| -> String {
+            let mut out = String::new();
+            let mut it = s.chars().peekable();
+            while let Some(c) = it.next() {
+                if c == '\x1b' {
+                    for cc in it.by_ref() {
+                        if cc.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        let visible: String = lines
+            .iter()
+            .map(|l| {
+                let no_ansi = strip_ansi(l);
+                let body = no_ansi.strip_prefix('┃').unwrap_or(&no_ansi).trim_start();
+                body.strip_prefix("[w_abc12345]")
+                    .map(|s| s.trim_start().to_string())
+                    .unwrap_or_else(|| body.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            visible.contains("CI gate clean: cargo test --no-default-features --locked")
+                && visible.contains("768 lib + 26 memory + 5 routing pass here"),
+            "message text intact across wraps: {visible:?}"
+        );
     }
 
     #[test]
