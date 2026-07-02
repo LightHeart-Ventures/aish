@@ -3124,7 +3124,8 @@ fn attached_result_lines(run_id: &str, jobs: &crate::worker::WorkerJobs) -> Vec<
     let Some(job) = job else {
         return Vec::new();
     };
-    let rendered = crate::md::render_stdout(job.fetch().trim());
+    let rendered =
+        crate::md::render_stdout_within(job.fetch().trim(), crate::worker::pane_content_cols(run_id));
     let mut out = Vec::new();
     let mut lines = rendered.split('\n');
     match lines.next() {
@@ -3161,7 +3162,10 @@ fn print_attached_result(run_id: &str, session: &Session) {
         // (e.g. only `·result Diagnosis complete. …` with the rest of the
         // markdown missing). Splitting per line is the same shape
         // `backfill_attached` uses for the streamed activity rows.
-        let rendered = crate::md::render_stdout(job.fetch().trim());
+        let rendered = crate::md::render_stdout_within(
+            job.fetch().trim(),
+            crate::worker::pane_content_cols(run_id),
+        );
         let mut lines = rendered.split('\n');
         match lines.next() {
             Some(first) => {
