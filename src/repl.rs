@@ -3715,9 +3715,10 @@ fn resume_coordinator(prev_run_id: &str, message: &str, session: &mut Session) {
     // so there's nothing to re-bind — just clear the review marker so the next
     // finish re-announces. Activity for the new thread streams into this same pane.
     *session.attach_review_announced.lock().unwrap() = None;
-    println!(
-        "\x1b[1;33m↻ resuming {prev_short} (thread {thread})\x1b[0m — folding in your message; its activity streams here. \x1b[2m:detach to stop.\x1b[0m"
-    );
+    // Silently continue per the operator's input — no resume banner. The new
+    // thread's activity streams into this same pane; there's no need to notify
+    // the operator that the worker is resuming.
+    let _ = (prev_short, thread);
 }
 
 /// Build the seed task for a resumed coordinator: the prior run's task + final
