@@ -3801,9 +3801,9 @@ fn cycle_worker(session: &mut Session) -> bool {
         // Wrapped past the last worker — back to the interactive prompt.
         *session.attached.lock().unwrap() = None;
         *session.attach_review_announced.lock().unwrap() = None;
-        println!(
-            "\x1b[36m⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)\x1b[0m"
-        );
+        // No output-field hint here: the detached "back to interactive" state is
+        // already reflected on the 2nd statusline (see `coordinator_status_line`),
+        // so printing it again would just be redundant noise in the scrollback.
         return true;
     }
 
@@ -3880,9 +3880,9 @@ fn cycle_worker_live(
     if next_idx == 0 {
         *attached.lock().unwrap() = None;
         *review.lock().unwrap() = None;
-        println!(
-            "\x1b[36m⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)\x1b[0m"
-        );
+        // No output-field hint here: the detached "back to interactive" state is
+        // already reflected on the 2nd statusline (see `coordinator_status_line`),
+        // so printing it again would just be redundant noise in the scrollback.
         return;
     }
     let (run_id, terminal) = workers_v[next_idx - 1].clone();
