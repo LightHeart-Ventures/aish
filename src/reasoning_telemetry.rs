@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Cap on any recorded free-text field (topic / rationale). Keeps the `.jsonl`
 /// small and bounds accidental payloads.
@@ -276,7 +276,7 @@ pub fn update_outcome(id: &str, outcome: Outcome) -> bool {
 /// A per-bucket tally used in the summary: how many decisions fell in this
 /// bucket, how many were guesses, and of the guesses with a known result, how
 /// many took a wrong turn.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bucket {
     pub total: usize,
     pub escalated: usize,
@@ -321,70 +321,410 @@ impl Summary {
     }
 }
 
-/// Read the telemetry log, fold outcome updates onto their events, and compute
-/// the [`Summary`]. Malformed lines are skipped. Returns an empty summary when
-/// the log is missing.
-pub fn summarize() -> Summary {
-    let mut events: BTreeMap<String, ReasoningEvent> = BTreeMap::new();
+// ─────────────────────────── Memoized summary (Phase 3) ───────────────────────────
+//
+// `:reasoning` used to re-scan the entire `.jsonl` (parsing every line, rebuilding
+// the fold map) on every invocation — O(file). At 10k+ decisions that scan is
+// noticeable, and a user running `:reasoning` twice in a minute paid it twice.
+//
+// We now persist a compact **aggregate memo** (`reasoning-telemetry-memo.json`)
+// next to the log. It carries only the folded counters plus the source
+// mtime/byte-length and how many lines it was computed from:
+//
+//   { version, source_mtime, source_len, lines_consumed,
+//     total, overall, by_complexity, by_risk }
+//
+// Fast path — nothing changed since the memo (same mtime AND byte length):
+// deserialize the tiny memo and return it. No `.jsonl` scan at all → O(1)-ish
+// regardless of log size.
+//
+// Incremental path — the log only grew (append-only): fold ONLY the new lines
+// (from `lines_consumed` onward) onto the memo. Cost is O(new lines), not O(file).
+//
+// Full recompute — memo missing/stale/wrong-version, the log shrank/rotated, or
+// `AISH_REASONING_MEMO_FORCE_RESCAN=1`: scan the whole file and rewrite the memo
+// (the original behavior), then serve from it.
+//
+// Correctly folding a *late outcome onto an old event* requires per-event state
+// (which bucket the event fell in, and its current outcome) that the aggregate
+// memo alone cannot reconstruct. So the folded per-event state is kept in a
+// **sidecar** (`…-memo-events.json`) that is loaded only on the incremental/full
+// paths — never on the O(1) fast read. This keeps the aggregate memo small (and
+// the hot read genuinely cheap) while remaining exactly correct.
 
-    let path = log_path();
-    let Ok(file) = std::fs::File::open(&path) else {
-        return Summary::default();
-    };
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else { continue };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue; // skip corrupted line
-        };
-        let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("event");
-        match kind {
-            "outcome" => {
-                // Fold onto an already-seen event; a dangling update (event not
-                // yet parsed) is ignored — events precede their updates in an
-                // append-only log.
-                if let (Some(id), Some(oc)) = (
-                    v.get("id").and_then(|i| i.as_str()),
-                    v.get("outcome").and_then(|o| o.as_str()),
-                ) {
-                    if let (Some(ev), Some(oc)) = (events.get_mut(id), Outcome::parse(oc)) {
-                        ev.outcome = oc;
-                    }
-                }
-            }
-            _ => {
-                if let Ok(ev) = serde_json::from_value::<ReasoningEvent>(v) {
-                    events.insert(ev.id.clone(), ev);
-                }
-            }
-        }
-    }
+/// Memo format version. Bump when the on-disk schema changes so an old memo is
+/// treated as stale (→ full recompute) instead of misread.
+const MEMO_VERSION: u32 = 1;
 
-    let mut summary = Summary::default();
-    for ev in events.values() {
-        summary.total += 1;
-        tally(&mut summary.overall, ev);
-        tally(summary.by_complexity.entry(ev.complexity).or_default(), ev);
-        tally(summary.by_risk.entry(ev.risk).or_default(), ev);
-    }
-    summary
+/// The three per-level buckets, stored as explicit named fields so the memo
+/// serializes to a plain JSON object (`{"low":…,"medium":…,"high":…}`) without
+/// relying on enum-keyed maps.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+struct LevelBuckets {
+    #[serde(default)]
+    low: Bucket,
+    #[serde(default)]
+    medium: Bucket,
+    #[serde(default)]
+    high: Bucket,
 }
 
-fn tally(bucket: &mut Bucket, ev: &ReasoningEvent) {
-    bucket.total += 1;
-    match ev.decision {
-        Decision::Escalated => bucket.escalated += 1,
+impl LevelBuckets {
+    fn get(&self, l: Level) -> Bucket {
+        match l {
+            Level::Low => self.low,
+            Level::Medium => self.medium,
+            Level::High => self.high,
+        }
+    }
+    fn get_mut(&mut self, l: Level) -> &mut Bucket {
+        match l {
+            Level::Low => &mut self.low,
+            Level::Medium => &mut self.medium,
+            Level::High => &mut self.high,
+        }
+    }
+}
+
+/// The persisted aggregate memo (the small, O(1)-readable head). Mirrors the
+/// [`Summary`] counters plus the source-freshness fingerprint.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct MemoHead {
+    #[serde(default)]
+    version: u32,
+    /// Source mtime (nanoseconds since the UNIX epoch) at compute time.
+    #[serde(default)]
+    source_mtime: u64,
+    /// Source byte length at compute time — the primary append/rotation signal.
+    #[serde(default)]
+    source_len: u64,
+    /// How many raw lines of the source were consumed (the incremental cursor).
+    #[serde(default)]
+    lines_consumed: u64,
+    #[serde(default)]
+    total: usize,
+    #[serde(default)]
+    overall: Bucket,
+    #[serde(default)]
+    by_complexity: LevelBuckets,
+    #[serde(default)]
+    by_risk: LevelBuckets,
+}
+
+impl MemoHead {
+    fn to_summary(&self) -> Summary {
+        let mut by_complexity = BTreeMap::new();
+        let mut by_risk = BTreeMap::new();
+        for l in [Level::Low, Level::Medium, Level::High] {
+            by_complexity.insert(l, self.by_complexity.get(l));
+            by_risk.insert(l, self.by_risk.get(l));
+        }
+        Summary {
+            total: self.total,
+            overall: self.overall,
+            by_complexity,
+            by_risk,
+        }
+    }
+}
+
+/// Minimal folded per-event state kept in the sidecar so a later outcome update
+/// can be applied to an old event exactly (right decision, right buckets).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct MemoEvent {
+    decision: Decision,
+    complexity: Level,
+    risk: Level,
+    outcome: Outcome,
+}
+
+/// In-memory working set: the aggregate head plus the per-event fold map.
+#[derive(Debug, Default)]
+struct Memo {
+    head: MemoHead,
+    events: BTreeMap<String, MemoEvent>,
+}
+
+/// Path of the aggregate memo: `AISH_REASONING_MEMO` when set, else the sibling
+/// `…-memo.json` next to the log (default `~/.aish/reasoning-telemetry-memo.json`).
+pub fn memo_path() -> PathBuf {
+    if let Ok(p) = std::env::var("AISH_REASONING_MEMO") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    let log = log_path();
+    let parent = log.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = log
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("reasoning-telemetry");
+    parent.join(format!("{stem}-memo.json"))
+}
+
+/// Path of the per-event fold sidecar (`…-memo-events.json`).
+fn events_path() -> PathBuf {
+    let memo = memo_path();
+    let parent = memo.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = memo
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("reasoning-telemetry-memo");
+    parent.join(format!("{stem}-events.json"))
+}
+
+/// Whether the operator forced a full rescan (`AISH_REASONING_MEMO_FORCE_RESCAN`).
+fn force_rescan() -> bool {
+    matches!(
+        std::env::var("AISH_REASONING_MEMO_FORCE_RESCAN")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// mtime (ns since epoch) + byte length of the source log, if it exists.
+fn source_fingerprint(path: &Path) -> Option<(u64, u64)> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    Some((mtime, md.len()))
+}
+
+/// Signed contribution of one folded event to a single bucket (`+1` add / `-1`
+/// remove). Saturating so a torn memo can never underflow.
+fn apply_sign(b: &mut Bucket, me: &MemoEvent, add: bool) {
+    let adj = |x: &mut usize| {
+        if add {
+            *x += 1;
+        } else {
+            *x = x.saturating_sub(1);
+        }
+    };
+    adj(&mut b.total);
+    match me.decision {
+        Decision::Escalated => adj(&mut b.escalated),
         Decision::Guessed => {
-            bucket.guessed += 1;
-            match ev.outcome {
-                Outcome::Correct => bucket.guess_correct += 1,
-                Outcome::WrongTurn => bucket.guess_wrong += 1,
+            adj(&mut b.guessed);
+            match me.outcome {
+                Outcome::Correct => adj(&mut b.guess_correct),
+                Outcome::WrongTurn => adj(&mut b.guess_wrong),
                 Outcome::Pending | Outcome::Unknown => {}
             }
         }
+    }
+}
+
+/// Add/remove an event's contribution across overall + its complexity/risk buckets.
+fn contribute(head: &mut MemoHead, me: &MemoEvent, add: bool) {
+    if add {
+        head.total += 1;
+    } else {
+        head.total = head.total.saturating_sub(1);
+    }
+    apply_sign(&mut head.overall, me, add);
+    apply_sign(head.by_complexity.get_mut(me.complexity), me, add);
+    apply_sign(head.by_risk.get_mut(me.risk), me, add);
+}
+
+/// Fold a freshly-parsed event line onto the memo. A duplicate id replaces the
+/// prior state (last-write-wins, counted once) — matching the original
+/// `BTreeMap::insert` + single tally semantics.
+fn add_event(memo: &mut Memo, ev: &ReasoningEvent) {
+    let me = MemoEvent {
+        decision: ev.decision,
+        complexity: ev.complexity,
+        risk: ev.risk,
+        outcome: ev.outcome,
+    };
+    if let Some(old) = memo.events.get(&ev.id).copied() {
+        contribute(&mut memo.head, &old, false);
+    }
+    memo.events.insert(ev.id.clone(), me);
+    contribute(&mut memo.head, &me, true);
+}
+
+/// Fold an outcome update onto a (possibly old) event. Dangling updates — no
+/// matching event — are ignored, exactly as before.
+fn apply_outcome_line(memo: &mut Memo, id: &str, oc: Outcome) {
+    let Some(mut me) = memo.events.get(id).copied() else {
+        return;
+    };
+    contribute(&mut memo.head, &me, false);
+    me.outcome = oc;
+    memo.events.insert(id.to_string(), me);
+    contribute(&mut memo.head, &me, true);
+}
+
+/// Fold one raw JSONL line onto the memo (event → tally; outcome → re-fold;
+/// blank/corrupt → skip). Mirrors the original per-line parsing.
+fn fold_line(memo: &mut Memo, line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return; // skip corrupted line
+    };
+    let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("event");
+    if kind == "outcome" {
+        if let (Some(id), Some(oc)) = (
+            v.get("id").and_then(|i| i.as_str()),
+            v.get("outcome").and_then(|o| o.as_str()),
+        ) {
+            if let Some(oc) = Outcome::parse(oc) {
+                apply_outcome_line(memo, id, oc);
+            }
+        }
+    } else if let Ok(ev) = serde_json::from_value::<ReasoningEvent>(v) {
+        add_event(memo, &ev);
+    }
+}
+
+/// Load the aggregate memo head; `None` if missing, unreadable, or a wrong version.
+fn load_head() -> Option<MemoHead> {
+    let data = std::fs::read_to_string(memo_path()).ok()?;
+    let head: MemoHead = serde_json::from_str(&data).ok()?;
+    if head.version != MEMO_VERSION {
+        return None;
+    }
+    Some(head)
+}
+
+/// Load the per-event fold sidecar (empty map when missing/unreadable).
+fn load_events() -> BTreeMap<String, MemoEvent> {
+    std::fs::read_to_string(events_path())
+        .ok()
+        .and_then(|d| serde_json::from_str(&d).ok())
+        .unwrap_or_default()
+}
+
+/// Best-effort atomic write (temp + rename); swallows every error so telemetry
+/// can never break a turn.
+fn write_atomic(path: &Path, data: &[u8]) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, data).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Persist the memo head + event sidecar (best-effort).
+fn write_memo(memo: &Memo) {
+    if let Ok(data) = serde_json::to_string(&memo.head) {
+        write_atomic(&memo_path(), data.as_bytes());
+    }
+    if let Ok(data) = serde_json::to_string(&memo.events) {
+        write_atomic(&events_path(), data.as_bytes());
+    }
+}
+
+/// Scan the whole log from scratch, building both the aggregate head and the
+/// event fold map. Returns `None` only when the log file is absent.
+fn full_recompute() -> Option<Memo> {
+    let path = log_path();
+    let file = std::fs::File::open(&path).ok()?;
+    let mut memo = Memo {
+        head: MemoHead {
+            version: MEMO_VERSION,
+            ..Default::default()
+        },
+        events: BTreeMap::new(),
+    };
+    let mut lines: u64 = 0;
+    for line_res in BufReader::new(file).lines() {
+        // Count every yielded line (Ok or Err) so the incremental cursor lines
+        // up with a future `.lines()` skip, even across an unreadable line.
+        lines += 1;
+        if let Ok(line) = line_res {
+            fold_line(&mut memo, &line);
+        }
+    }
+    memo.head.lines_consumed = lines;
+    if let Some((mtime, len)) = source_fingerprint(&path) {
+        memo.head.source_mtime = mtime;
+        memo.head.source_len = len;
+    }
+    Some(memo)
+}
+
+/// Fold only the lines appended past `head.lines_consumed` onto a loaded memo.
+fn incremental(head: MemoHead) -> Memo {
+    let mut memo = Memo {
+        events: load_events(),
+        head,
+    };
+    let path = log_path();
+    if let Ok(file) = std::fs::File::open(&path) {
+        let skip = memo.head.lines_consumed;
+        let mut idx: u64 = 0;
+        for line_res in BufReader::new(file).lines() {
+            idx += 1;
+            if idx <= skip {
+                continue;
+            }
+            if let Ok(line) = line_res {
+                fold_line(&mut memo, &line);
+            }
+        }
+        memo.head.lines_consumed = idx.max(skip);
+        if let Some((mtime, len)) = source_fingerprint(&path) {
+            memo.head.source_mtime = mtime;
+            memo.head.source_len = len;
+        }
+    }
+    memo
+}
+
+/// Read the telemetry log's ground-truth [`Summary`], memoized.
+///
+/// * **Fast path** (memo fresh — same mtime AND byte length): return the tiny
+///   aggregate memo without scanning the log at all — O(1)-ish in log size.
+/// * **Incremental** (log only grew): fold just the new lines onto the memo.
+/// * **Full recompute** (missing/stale memo, shrink/rotation, or
+///   `AISH_REASONING_MEMO_FORCE_RESCAN=1`): rescan the whole file and rewrite.
+///
+/// Malformed lines are skipped; an absent log yields an empty summary. Every
+/// memo read/write is best-effort — a memo failure silently degrades to a full
+/// scan and never errors a turn.
+pub fn summarize() -> Summary {
+    let path = log_path();
+    let fp = source_fingerprint(&path);
+
+    // No log → nothing to summarize (don't serve a stale memo for a deleted log).
+    let Some((cur_mtime, cur_len)) = fp else {
+        return Summary::default();
+    };
+
+    if !force_rescan() {
+        if let Some(head) = load_head() {
+            // Fresh: neither the content nor the mtime moved → O(1) return.
+            if head.source_len == cur_len && head.source_mtime == cur_mtime {
+                return head.to_summary();
+            }
+            // Grew (append-only): fold only the new tail.
+            if cur_len > head.source_len {
+                let memo = incremental(head);
+                write_memo(&memo);
+                return memo.head.to_summary();
+            }
+            // Shrank / rewritten-in-place / same-len-new-mtime → fall through.
+        }
+    }
+
+    // Full recompute (memo missing, stale, forced, truncated, or rotated).
+    match full_recompute() {
+        Some(memo) => {
+            write_memo(&memo);
+            memo.head.to_summary()
+        }
+        None => Summary::default(),
     }
 }
 
@@ -510,10 +850,15 @@ mod tests {
                 "aish_reasoning_{name}_{}.jsonl",
                 std::process::id()
             ));
-            let _ = std::fs::remove_file(&path);
             unsafe {
                 std::env::set_var("AISH_REASONING_LOG", &path);
+                // Start each test from a clean slate: no leaked force-rescan flag
+                // and no stale memo/sidecar from a prior (possibly panicked) run.
+                std::env::remove_var("AISH_REASONING_MEMO_FORCE_RESCAN");
             }
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(memo_path());
+            let _ = std::fs::remove_file(events_path());
             TestLog {
                 _guard: guard,
                 path,
@@ -523,9 +868,14 @@ mod tests {
 
     impl Drop for TestLog {
         fn drop(&mut self) {
+            // memo_path()/events_path() resolve off AISH_REASONING_LOG — clean them
+            // up while the env var is still set, then unset everything.
+            let _ = std::fs::remove_file(memo_path());
+            let _ = std::fs::remove_file(events_path());
             let _ = std::fs::remove_file(&self.path);
             unsafe {
                 std::env::remove_var("AISH_REASONING_LOG");
+                std::env::remove_var("AISH_REASONING_MEMO_FORCE_RESCAN");
             }
         }
     }
@@ -658,5 +1008,164 @@ mod tests {
         let ev = ReasoningEvent::new(Decision::Guessed, long, "self_report");
         assert!(ev.topic.chars().count() <= MAX_TEXT_LEN + 1); // +1 for the ellipsis
         assert!(ev.topic.ends_with('…'));
+    }
+
+    // ── Memoization (Phase 3) ──────────────────────────────────────────────
+
+    fn read_head() -> MemoHead {
+        serde_json::from_str(&std::fs::read_to_string(memo_path()).unwrap()).unwrap()
+    }
+    fn write_head(h: &MemoHead) {
+        std::fs::write(memo_path(), serde_json::to_string(h).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn summarize_writes_memo_and_matches_full_scan() {
+        let _log = TestLog::new("memo_write");
+        record(
+            &ReasoningEvent::new(Decision::Escalated, "a", "self_report")
+                .with_levels(Level::High, Level::High, Level::High),
+        )
+        .unwrap();
+        record(
+            &ReasoningEvent::new(Decision::Guessed, "b", "self_report")
+                .with_levels(Level::Low, Level::Low, Level::Low)
+                .with_outcome(Outcome::Correct),
+        )
+        .unwrap();
+
+        let s = summarize();
+        assert_eq!(s.total, 2);
+        assert_eq!(s.overall.escalated, 1);
+        assert_eq!(s.overall.guessed, 1);
+
+        // Both memo files are now on disk and the head mirrors the summary.
+        assert!(memo_path().exists(), "aggregate memo written");
+        assert!(events_path().exists(), "event sidecar written");
+        let head = read_head();
+        assert_eq!(head.version, MEMO_VERSION);
+        assert_eq!(head.total, 2);
+        assert_eq!(head.lines_consumed, 2);
+        assert!(head.source_len > 0);
+    }
+
+    #[test]
+    fn fresh_memo_is_served_without_scanning_the_log() {
+        // AC: fresh memo path avoids full-file scan. Prove it by tampering the
+        // memo AFTER it's built and leaving the log untouched — a fast-path read
+        // returns the (bogus) memo value; a full rescan would return the real 1.
+        let _log = TestLog::new("memo_fast");
+        record(&ReasoningEvent::new(Decision::Guessed, "x", "self_report")).unwrap();
+        assert_eq!(summarize().total, 1);
+
+        let mut head = read_head();
+        head.total = 777; // sentinel the log content can never produce
+        write_head(&head);
+
+        // Log unchanged (same mtime + len) → fast path returns the tampered memo.
+        assert_eq!(summarize().total, 777, "fast path read the memo, not the log");
+    }
+
+    #[test]
+    fn incremental_folds_only_new_lines() {
+        // AC: only new lines processed. Sentinel-offset the memo, append one new
+        // event, and confirm the delta is ADDED to the memo (incremental) rather
+        // than recomputed from the whole file (which would give 2, not 102).
+        let _log = TestLog::new("memo_incr");
+        record(&ReasoningEvent::new(Decision::Guessed, "first", "self_report")).unwrap();
+        assert_eq!(summarize().total, 1); // memo: total=1, lines_consumed=1
+
+        let mut head = read_head();
+        head.total = 101; // +100 sentinel over the true count of 1
+        write_head(&head);
+
+        // Append a 2nd event → log grows → incremental path folds just that line.
+        record(&ReasoningEvent::new(Decision::Guessed, "second", "self_report")).unwrap();
+        let s = summarize();
+        assert_eq!(s.total, 102, "incremental added the one new line onto the memo");
+        assert_eq!(read_head().lines_consumed, 2);
+    }
+
+    #[test]
+    fn incremental_outcome_folds_onto_old_memoized_event() {
+        // The tricky correctness case: an outcome update lands AFTER the event was
+        // already memoized (and its per-event state discarded from RAM). The
+        // sidecar restores it so the fold is exact.
+        let _log = TestLog::new("memo_late_outcome");
+        let id = record(
+            &ReasoningEvent::new(Decision::Guessed, "risky", "self_report")
+                .with_levels(Level::High, Level::High, Level::High),
+        )
+        .unwrap();
+        let before = summarize(); // memoizes the pending guess
+        assert_eq!(before.overall.guess_wrong, 0);
+        assert_eq!(before.overall.guess_wrong_pct(), None);
+
+        // Close the loop in a later append → incremental fold onto the old event.
+        assert!(update_outcome(&id, Outcome::WrongTurn));
+        let after = summarize();
+        assert_eq!(after.overall.guessed, 1);
+        assert_eq!(after.overall.guess_wrong, 1);
+        assert_eq!(after.overall.guess_wrong_pct(), Some(100));
+        let high = after.by_complexity.get(&Level::High).copied().unwrap();
+        assert_eq!(high.guess_wrong_pct(), Some(100));
+    }
+
+    #[test]
+    fn shrunk_log_triggers_full_recompute() {
+        // AC: stale memo triggers correct full recompute + rewrite. A rotation /
+        // truncation makes the log SHORTER than the memo's recorded length.
+        let _log = TestLog::new("memo_stale");
+        record(&ReasoningEvent::new(Decision::Guessed, "one", "self_report")).unwrap();
+        record(&ReasoningEvent::new(Decision::Guessed, "two", "self_report")).unwrap();
+        assert_eq!(summarize().total, 2);
+
+        // Sentinel the memo so a stale (fast/incremental) read would be obvious.
+        let mut head = read_head();
+        head.total = 999;
+        write_head(&head);
+
+        // Rotate: truncate the log and write a single fresh event → len shrinks.
+        std::fs::write(log_path(), b"").unwrap();
+        record(&ReasoningEvent::new(Decision::Escalated, "post-rotate", "self_report")).unwrap();
+
+        let s = summarize();
+        assert_eq!(s.total, 1, "full recompute, sentinel discarded");
+        assert_eq!(s.overall.escalated, 1);
+        // Memo was rewritten to the recomputed truth.
+        assert_eq!(read_head().total, 1);
+    }
+
+    #[test]
+    fn force_rescan_env_bypasses_memo() {
+        // AC: AISH_REASONING_MEMO_FORCE_RESCAN=1 forces a full scan.
+        let _log = TestLog::new("memo_force");
+        record(&ReasoningEvent::new(Decision::Guessed, "x", "self_report")).unwrap();
+        assert_eq!(summarize().total, 1);
+
+        let mut head = read_head();
+        head.total = 555; // sentinel a fast path would surface
+        write_head(&head);
+
+        unsafe {
+            std::env::set_var("AISH_REASONING_MEMO_FORCE_RESCAN", "1");
+        }
+        // Forced → ignore the tampered memo, rescan the (unchanged) log → real 1.
+        assert_eq!(summarize().total, 1, "force-rescan ignored the memo");
+        unsafe {
+            std::env::remove_var("AISH_REASONING_MEMO_FORCE_RESCAN");
+        }
+    }
+
+    #[test]
+    fn missing_memo_falls_back_to_full_scan() {
+        let _log = TestLog::new("memo_missing");
+        record(&ReasoningEvent::new(Decision::Guessed, "x", "self_report")).unwrap();
+        assert_eq!(summarize().total, 1);
+        // Delete the memo → next summarize must full-recompute and rebuild it.
+        std::fs::remove_file(memo_path()).unwrap();
+        let s = summarize();
+        assert_eq!(s.total, 1);
+        assert!(memo_path().exists(), "memo rebuilt after loss");
     }
 }
