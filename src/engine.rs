@@ -819,7 +819,7 @@ pub fn statusline_stats(session: &Session) -> String {
         return String::new();
     }
     format!(
-        "tokens in: {}, tokens out: {}, tool calls: {}, turns: {}",
+        "tokens: {} in / {} out, tool calls: {}, turns: {}",
         session.tokens_in, session.tokens_out, session.tool_calls_total, session.turns_total
     )
 }

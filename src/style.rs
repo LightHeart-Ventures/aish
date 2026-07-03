@@ -416,12 +416,13 @@ pub fn statusline_at(
     let left = format!("aish v{version} — AI-native shell · {model}");
     let time = fmt_datetime_utc(epoch);
     // The running session stats (tokens in/out, tool calls, turns) sit on the
-    // RIGHT, immediately to the LEFT of the clock — two spaces between them. An
-    // empty `stats` (a fresh session, nothing run yet) collapses to just the clock.
+    // RIGHT, immediately to the LEFT of the clock — a middle-dot separator (with
+    // flanking spaces) between them. An empty `stats` (a fresh session, nothing
+    // run yet) collapses to just the clock.
     let right = if stats.is_empty() {
         time.clone()
     } else {
-        format!("{stats}  {time}")
+        format!("{stats} · {time}")
     };
     let width = width.max(80);
     // Char counts, not byte lengths — the em-dash and middle-dot are multi-byte
@@ -525,11 +526,11 @@ mod tests {
 
     #[test]
     fn statusline_stats_sit_left_of_clock() {
-        let stats = "tokens in: 120, tokens out: 34, tool calls: 7, turns: 3";
+        let stats = "tokens: 120 in / 34 out, tool calls: 7, turns: 3";
         let s = statusline_at("0.21.1", "m", stats, 1_609_459_200, 120, false);
         assert!(!s.contains('\x1b'));
-        // Stats land immediately to the left of the clock (two spaces between).
-        assert!(s.contains(&format!("{stats}  2021-01-01 00:00")));
+        // Stats land immediately to the left of the clock (middle-dot between).
+        assert!(s.contains(&format!("{stats} · 2021-01-01 00:00")));
         assert!(s.ends_with("2021-01-01 00:00"));
         assert_eq!(s.chars().count(), 120);
     }
