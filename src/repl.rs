@@ -4735,6 +4735,7 @@ instead of firing.\n\nCondition: {description}"
         launch_session_name: session.name.clone(),
         show_output: session.show_worker_output.clone(),
         attached: session.attached.clone(),
+        coordinator_store: session.coordinator_store.clone(),
     };
     let _ = crate::worker::spawn(&session.worker_jobs, task, spec);
     true
