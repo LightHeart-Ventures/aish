@@ -1038,13 +1038,58 @@ pub async fn drain(ctx: &DrainCtx<'_>) -> DrainReport {
 #[cfg(unix)]
 pub fn restart_in_place() -> std::io::Error {
     use std::os::unix::process::CommandExt;
-    let exe = match std::env::current_exe() {
-        Ok(p) => std::fs::canonicalize(&p).unwrap_or(p),
+    let exe = match resolve_restart_exe() {
+        Ok(p) => p,
         Err(e) => return e,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     // `exec` only returns on failure.
     std::process::Command::new(exe).args(args).exec()
+}
+
+/// Resolve the on-disk path to re-exec, robust to an in-place binary swap.
+///
+/// After `:update` renames the new binary over the running one, Linux's
+/// `/proc/self/exe` still points at the ORIGINAL, now-unlinked inode, so
+/// `current_exe()` returns a path with a trailing ` (deleted)` marker (e.g.
+/// `/usr/local/bin/aish (deleted)`). `exec`-ing that literal path fails with
+/// `ENOENT` ("No such file or directory", os error 2) — which is exactly the
+/// post-`:update` "restart failed" symptom. Strip the marker and prefer the
+/// real file that now lives at that location.
+#[cfg(unix)]
+fn resolve_restart_exe() -> std::io::Result<PathBuf> {
+    let raw = std::env::current_exe()?;
+
+    // The swapped-and-unlinked case: `.../aish (deleted)`. The real, freshly
+    // installed binary sits at the de-marked path — re-exec THAT.
+    if let Some(clean) = strip_deleted_suffix(&raw) {
+        if clean.exists() {
+            return Ok(std::fs::canonicalize(&clean).unwrap_or(clean));
+        }
+    }
+
+    // Normal `:restart` (no swap): the path exists as-is.
+    if raw.exists() {
+        return Ok(std::fs::canonicalize(&raw).unwrap_or(raw));
+    }
+
+    // Last resort — the reported path doesn't exist and had no `(deleted)`
+    // marker to strip (unusual). Canonicalize best-effort and let `exec`
+    // surface any real failure to the caller.
+    Ok(std::fs::canonicalize(&raw).unwrap_or(raw))
+}
+
+/// Strip a trailing ` (deleted)` marker the Linux kernel appends to
+/// `/proc/self/exe` when the running binary's inode has been unlinked (e.g. by
+/// an in-place `:update` swap). Returns `None` when no marker is present.
+/// Byte-oriented so it never corrupts a non-UTF-8 path.
+#[cfg(unix)]
+fn strip_deleted_suffix(p: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    const MARKER: &[u8] = b" (deleted)";
+    let bytes = p.as_os_str().as_bytes();
+    let trimmed = bytes.strip_suffix(MARKER)?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(trimmed)))
 }
 
 /// The full staged drain-update: pre-flight → quiesce → (gate) swap → (gate)
@@ -1340,6 +1385,53 @@ mod drain_tests {
         // The (normally-unreachable) success path is modelled too.
         let ok = run_staged(|| Ok(()), || Ok(()), || Ok(()));
         assert_eq!(ok, StagedOutcome::Restarted);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strip_deleted_suffix_removes_kernel_marker() {
+        // After an in-place binary swap, Linux reports `.../aish (deleted)` for
+        // /proc/self/exe. The marker must be stripped so we re-exec the real file.
+        let marked = std::path::Path::new("/usr/local/bin/aish (deleted)");
+        assert_eq!(
+            strip_deleted_suffix(marked),
+            Some(PathBuf::from("/usr/local/bin/aish"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strip_deleted_suffix_noop_on_normal_path() {
+        // A live binary path has no marker — leave it untouched (returns None so
+        // the resolver falls through to the as-is path).
+        let plain = std::path::Path::new("/usr/local/bin/aish");
+        assert_eq!(strip_deleted_suffix(plain), None);
+        // A legitimate filename that merely CONTAINS "deleted" must not match.
+        let tricky = std::path::Path::new("/opt/deleted/aish");
+        assert_eq!(strip_deleted_suffix(tricky), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_restart_exe_prefers_real_file_over_deleted_marker() {
+        // Simulate the post-:update state: a real binary on disk whose
+        // /proc/self/exe-style path carries the `(deleted)` marker. The resolver
+        // must return the real, existing file — not the ENOENT-yielding marked path.
+        let dir = std::env::temp_dir().join(format!("aish-restart-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("aish");
+        std::fs::write(&real, b"#!/bin/true\n").unwrap();
+
+        let marked = PathBuf::from(format!("{} (deleted)", real.display()));
+        let resolved = strip_deleted_suffix(&marked)
+            .filter(|p| p.exists())
+            .expect("de-marked path should exist and resolve");
+        assert_eq!(
+            std::fs::canonicalize(&resolved).unwrap(),
+            std::fs::canonicalize(&real).unwrap()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
