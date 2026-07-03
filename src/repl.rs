@@ -322,6 +322,7 @@ pub async fn run(
         // SecondStatusLine reads. Clones are cheap (Arc handles).
         let alert_store = session.alert_store.clone();
         let alert_banner = session.alert_banner.clone();
+        let worker_banner = session.worker_banner.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(400));
             loop {
@@ -397,13 +398,23 @@ pub async fn run(
                 }
                 // Notify (one line per finished job), don't dump the full result
                 // over the prompt — the user views it on demand with `:result`.
-                let mut notices = crate::batch::notify_pending(&batch_jobs);
-                notices.extend(crate::worker::notify_pending(&worker_jobs));
-                if !notices.is_empty() {
+                // Batch notices still surface above the prompt; the worker-done
+                // notice is MOVED onto the SecondStatusLine footer badge (a
+                // colorized banner the status-line builder reads) instead of
+                // being printed-and-dropped over the prompt.
+                let batch_notices = crate::batch::notify_pending(&batch_jobs);
+                if !batch_notices.is_empty() {
                     finished_bell = true;
                 }
-                for n in notices {
+                for n in batch_notices {
                     crate::tools::print_above_prompt(format!("{n}\n"));
+                }
+                let worker_notices = crate::worker::notify_pending(&worker_jobs);
+                if !worker_notices.is_empty() {
+                    finished_bell = true;
+                    if let Ok(mut b) = worker_banner.lock() {
+                        *b = Some(worker_notices.join("  \u{b7}  "));
+                    }
                 }
                 // Auto-resume wake hook: observe this session's fanned-out
                 // coordinators. Snapshot every worker's terminal-ness and the
@@ -446,6 +457,12 @@ pub async fn run(
                         // editor::nudge_terminal_return): a no-op on kernels that
                         // gate TIOCSTI or when stdin isn't a tty, in which case
                         // we fall back to resuming on the user's next Enter.
+                        // Kernel-independent hands-free wake: raise the resume
+                        // wake flag the idle poll read consults, so a parked
+                        // read_line returns and drains the resume on ANY kernel
+                        // (works where TIOCSTI is gated off). The nudge below is
+                        // kept as belt-and-suspenders for the plain-read path.
+                        crate::editor::arm_resume_wake();
                         crate::editor::nudge_terminal_return();
                         finished_bell = true;
                     }
@@ -549,9 +566,12 @@ pub async fn run(
             // the `?` route escape, exactly like a `:loop` tick, so the parent
             // reads + synthesizes the workers' results without the human typing
             // "continue". A session parked inside a blocking read_line when the
-            // resume arms is woken hands-free by the presenter, which pushes a
-            // newline into the terminal via editor::nudge_terminal_return()
-            // (TIOCSTI) so read_line returns and this drain runs on the next pass.
+            // resume arms is woken hands-free by the presenter: it raises the
+            // editor RESUME_WAKE flag (arm_resume_wake), which the idle poll read
+            // (gated on by the set_background_pending call below) consults and
+            // returns an empty line for — so this drain runs with NO keypress, on
+            // ANY kernel. A TIOCSTI nudge (nudge_terminal_return) fires too as a
+            // belt-and-suspenders fallback for the plain-read path.
             // Residual: on kernels that gate TIOCSTI (Linux ≥6.2
             // dev.tty.legacy_tiocsti=0) or when stdin isn't a tty, the nudge is a
             // no-op and the resume still drains on the user's next keypress.
@@ -614,6 +634,25 @@ pub async fn run(
                             );
                         }
                     }
+                    // Gate the editor's interruptible poll path: if this
+                    // session has outstanding fanned-out workers, the idle read
+                    // must be woken hands-free the instant the last one finishes
+                    // and the presenter arms a resume (arm_resume_wake). Compute
+                    // the live outstanding count HERE — not from the 400ms
+                    // presenter tick — so the gate is correct the moment we
+                    // block, closing the dispatch→first-tick race.
+                    let outstanding_workers = session
+                        .worker_jobs
+                        .lock()
+                        .map(|jobs| {
+                            jobs.iter()
+                                .filter(|w| {
+                                    !matches!(w.status().as_str(), "done" | "failed")
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    crate::editor::set_background_pending(outstanding_workers > 0);
                     editor.read_line(&prompt)
                 }
                 },
@@ -1161,18 +1200,27 @@ fn coordinator_status_message(session: &Session) -> String {
         None => left,
     };
     // A fired `:alert` claims the head of this row until the next prompt — the
-    // compact banner the presenter stashed. Yellow so it stands apart from the
-    // worker badges; the full detail already printed above the prompt.
+    // compact banner the presenter stashed, prefixed with the alarm-clock glyph
+    // (same one the `:workers` table uses for `:alert` monitors) and painted
+    // bold yellow so it stands apart from the worker badges; the full detail
+    // already printed above the prompt.
     if let Some(banner) = session.alert_banner.lock().ok().and_then(|b| b.clone()) {
-        let badge = if color_on {
-            format!("\x1b[1;33m{banner}\x1b[0m")
-        } else {
-            banner
-        };
+        let badge = crate::style::alert_badge(&banner, color_on);
         left = if left.trim().is_empty() {
             badge
         } else {
             format!("{badge}  {left}")
+        };
+    }
+    // A finished background coordinator stashes its colorized completion NOTICE
+    // here (moved off the outputfield). It claims the head of the row after any
+    // alert badge; the notice is already colorized by `worker::notify_pending`
+    // (green ✓ done / red ✗ failed), and `clip_visible` clamps it to width.
+    if let Some(banner) = session.worker_banner.lock().ok().and_then(|b| b.clone()) {
+        left = if left.trim().is_empty() {
+            banner
+        } else {
+            format!("{banner}  {left}")
         };
     }
     // Right-justify the session name (`:rename`) on this row, directly above the
@@ -5794,7 +5842,7 @@ async fn handle_colon(
                     w.started_epoch().unwrap_or(0),
                     format!(
                         "| {} {} | {} * | {} | {} | {} | {} | {} |\n",
-                        crate::style::job_type_emoji("worker"),
+                        crate::style::job_activity_emoji(&w.task),
                         id_cell,
                         me_label,
                         crate::style::styled_status(&w.status()),
@@ -5881,7 +5929,7 @@ async fn handle_colon(
                             started.unwrap_or(0),
                             format!(
                                 "| {} {} | {} | {} | {} | {} | {} | {} |\n",
-                                crate::style::job_type_emoji("coordinator"),
+                                crate::style::job_activity_emoji(&r.task),
                                 crate::batch::short_id(&r.run_id),
                                 session_cell,
                                 crate::style::styled_status(&r.phase),
