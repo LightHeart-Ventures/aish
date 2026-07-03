@@ -351,6 +351,9 @@ pub async fn run(
                 if busy.load(Ordering::SeqCst) {
                     continue; // mid-command/turn — hold results until a pause
                 }
+                // Set by any finish-branch below so we ring the audible bell
+                // ONCE per tick (never a double-beep when two branches fire).
+                let mut finished_bell = false;
                 // A live `:attach` leaves the main loop BLOCKED in `read_line`, so
                 // `announce_attach_review` (which prints the coordinator's FINAL
                 // answer + review notice) can't run until the operator presses
@@ -375,12 +378,16 @@ pub async fn run(
                         crate::tools::print_above_prompt(format!(
                             "\x1b[2m⇄ {short} finished — review mode: type a message to resume it, or :detach to return to your shell.\x1b[0m\n"
                         ));
+                        finished_bell = true;
                     }
                 }
                 // Notify (one line per finished job), don't dump the full result
                 // over the prompt — the user views it on demand with `:result`.
                 let mut notices = crate::batch::notify_pending(&batch_jobs);
                 notices.extend(crate::worker::notify_pending(&worker_jobs));
+                if !notices.is_empty() {
+                    finished_bell = true;
+                }
                 for n in notices {
                     crate::tools::print_above_prompt(format!("{n}\n"));
                 }
@@ -426,7 +433,14 @@ pub async fn run(
                         // gate TIOCSTI or when stdin isn't a tty, in which case
                         // we fall back to resuming on the user's next Enter.
                         crate::editor::nudge_terminal_return();
+                        finished_bell = true;
                     }
+                }
+                // Ring the audible finish-bell once if any worker/batch/coordinator
+                // reached a terminal state this tick. Best-effort + opt-out via
+                // AISH_WORKER_BELL / custom via AISH_WORKER_BELL_CMD.
+                if finished_bell {
+                    crate::tools::play_finish_bell();
                 }
             }
         });
@@ -3856,12 +3870,25 @@ fn resume_coordinator(prev_run_id: &str, message: &str, session: &mut Session) {
         );
         return;
     };
+    // Keep a handle to the (same) job so we can flash an immediate thinking row
+    // the instant the operator resumes — before the fresh child has spawned and
+    // emitted its first `💭 thinking…` line.
+    let job_for_spinner = job.clone();
     let (_id, thread) =
         crate::worker::resume_in_place(&session.worker_jobs, job, resume_task, spec);
     // The attachment already points at THIS worker (we were in its review mode),
     // so there's nothing to re-bind — just clear the review marker so the next
     // finish re-announces. Activity for the new thread streams into this same pane.
     *session.attach_review_announced.lock().unwrap() = None;
+    // Instant feedback: as soon as the operator types a follow-up to a finished
+    // worker, show the animated "thinking…" row in the attach pane rather than a
+    // blank gap until the relaunched coordinator produces its first forwardable
+    // line. We're still attached to this worker (review mode), so the forward
+    // gate is open and the spinner animates immediately; the live stream stops +
+    // replaces it the instant its first line lands (`stop_backfill_thinking`),
+    // exactly like the attach-time backfill spinner.
+    job_for_spinner
+        .start_backfill_thinking(session.show_worker_output.clone(), session.attached.clone());
     // Silently continue per the operator's input — no resume banner. The new
     // thread's activity streams into this same pane; there's no need to notify
     // the operator that the worker is resuming.
