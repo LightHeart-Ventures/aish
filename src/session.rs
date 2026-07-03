@@ -308,6 +308,11 @@ pub struct Session {
     /// The active background `:goal` loop, if any (one per session). Set by
     /// `:goal <condition>`, inspected by bare `:goal`, stopped by `:goal clear`.
     pub goal: Option<crate::goal::Handle>,
+    /// Persistent goal records (TASK-277 domain model), loaded from `aish.db`
+    /// on session start and kept in sync by `persist_goal`. Distinct from the
+    /// transient `goal` batch-oracle handle above: these are the durable
+    /// `Goal` hierarchy (milestones/blockers/linked_tasks/subgoals).
+    pub goals: Vec<crate::goal::Goal>,
     /// Which provider the interactive backend runs on (`"claude"`/`"grok"`/
     /// `"local"`). Set right after the backend is built and updated by `:backend`.
     /// Background coordinators are spawned on this same backend (full parity), so
@@ -501,6 +506,7 @@ impl Session {
             coordinator_store: None,
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
             goal: None,
+            goals: Vec::new(),
             backend_kind: "claude".to_string(),
             show_worker_output: Arc::new(AtomicBool::new(false)),
             escalation: None,
@@ -659,6 +665,35 @@ impl Session {
             crate::plugins::plugin_hook_fragments(&crate::plugins::default_plugins_dir());
         self.hooks =
             crate::hooks::HookSet::load_with_plugins(home.as_deref(), &self.cwd, &fragments);
+    }
+
+    /// Load all persisted goals from `aish.db` into the in-memory cache
+    /// (TASK-277 AC2: "goals load from aish.db on session start"). Called once
+    /// after the DB is opened at startup. A missing/absent store is a no-op —
+    /// goals simply stay empty, exactly like a fresh install.
+    pub fn load_goals(&mut self) {
+        if let Some(db) = &self.db {
+            match db.all_goals() {
+                Ok(gs) => self.goals = gs,
+                Err(e) => eprintln!("\x1b[33maish:\x1b[0m could not load goals: {e:#}"),
+            }
+        }
+    }
+
+    /// Persist a goal on mutation (TASK-277 AC2: "persist on mutation") and
+    /// refresh the in-memory cache. Upserts to `aish.db` when a store is open,
+    /// then inserts-or-replaces the record in `self.goals` by id so the cache
+    /// and the durable table never drift.
+    pub fn persist_goal(&mut self, goal: crate::goal::Goal) {
+        if let Some(db) = &self.db {
+            if let Err(e) = db.upsert_goal(&goal) {
+                eprintln!("\x1b[33maish:\x1b[0m could not persist goal {}: {e:#}", goal.id);
+            }
+        }
+        match self.goals.iter_mut().find(|g| g.id == goal.id) {
+            Some(existing) => *existing = goal,
+            None => self.goals.push(goal),
+        }
     }
 
     /// The autonomy descriptor stamped on every hook payload (design §3.1): a
@@ -1058,6 +1093,50 @@ mod tests {
         let out = truncate_last(s);
         assert!(out.ends_with("…[truncated]"));
         assert!(out.is_char_boundary(out.len() - "\n…[truncated]".len()));
+    }
+
+    #[test]
+    fn goals_persist_on_mutation_and_load_on_session_start() {
+        // TASK-277 AC2: goals load from aish.db on session start and persist on
+        // mutation. Drive it through the Session API against a temp store.
+        use crate::goal::{Goal, GoalStatus, TaskRef};
+        let dir = std::env::temp_dir().join(format!("aish_sess_goals_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dbpath = dir.join("aish.db");
+
+        let mut session = Session::new().unwrap();
+        session.db = Some(crate::db::Db::open(&dbpath).unwrap());
+        assert!(session.goals.is_empty(), "fresh session has no goals");
+
+        // Mutate: create a goal + a subgoal and persist each.
+        let mut root = Goal::new("Ship TASK-277").with_description("persistent goals");
+        root.add_milestone("schema");
+        root.link_task(TaskRef::with_title("TASK-277", "Goal domain model"));
+        let root_id = root.id.clone();
+        let child = Goal::subgoal("wire persistence", root_id.clone());
+        session.persist_goal(root);
+        session.persist_goal(child);
+        assert_eq!(session.goals.len(), 2, "cache tracks both goals");
+
+        // Re-mutate the root (status change) — cache must replace, not append.
+        let mut reopened = session.goals.iter().find(|g| g.id == root_id).unwrap().clone();
+        reopened.set_status(GoalStatus::Completed);
+        session.persist_goal(reopened);
+        assert_eq!(session.goals.len(), 2, "in-place update, no duplicate row");
+
+        // Simulate a restart: a brand-new session loads from the same aish.db.
+        let mut restarted = Session::new().unwrap();
+        restarted.db = Some(crate::db::Db::open(&dbpath).unwrap());
+        restarted.load_goals();
+        assert_eq!(restarted.goals.len(), 2, "both goals rehydrate on start");
+        let loaded_root = restarted.goals.iter().find(|g| g.id == root_id).unwrap();
+        assert_eq!(loaded_root.status, GoalStatus::Completed, "status persisted");
+        assert!(
+            restarted.goals.iter().any(|g| g.parent_id.as_deref() == Some(root_id.as_str())),
+            "subgoal parent link round-trips"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

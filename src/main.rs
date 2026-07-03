@@ -542,6 +542,9 @@ async fn main() -> Result<()> {
         }
     }
 
+    // TASK-277 AC2: load the persistent goal hierarchy from aish.db on start.
+    session.load_goals();
+
     // Durable batch jobs: open the store and reattach any in-flight batches from
     // a previous session (the batch keeps running platform-side while aish is
     // down; this picks the handle back up so results land here when they finish).

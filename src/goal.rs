@@ -1,3 +1,18 @@
+//! Goals — two complementary concepts live here:
+//!
+//! 1. **`Goal`** (domain model, further down) — a durable, structured record of
+//!    something the user wants to achieve: a title/description, a lifecycle
+//!    `status` (active|paused|completed|abandoned), `milestones`, `blockers`,
+//!    `linked_tasks`, and an optional `parent_id` for subgoal nesting. Persisted
+//!    in `aish.db` (the `goals` table) via `crate::db` helpers — loaded on
+//!    session start, saved on mutation. Independent of any execution engine.
+//!
+//! 2. **`GoalLoop`** (below) — the background *pursuit* engine: a
+//!    stopping-oracle modeled on Claude Code's `/goal`. It is ONE way a goal can
+//!    be executed (the generator/verifier batch loop). A domain `Goal` can carry
+//!    such a pursuit, but its structure (milestones, hierarchy, links) outlives
+//!    any single loop.
+//!
 //! Background goal loop — a stopping-oracle modeled on Claude Code's `/goal`,
 //! adapted to run as background batch work (non-blocking) and gated on `:batch`.
 //!
@@ -12,9 +27,10 @@
 //! UNATTENDED in the background, we add a hard `MAX_TURNS` backstop so a
 //! misjudged loop can't spend forever.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Unattended runaway backstop. `/goal` itself has none (the user can Ctrl-C);
 /// a background loop can't be watched, so we cap it.
@@ -41,7 +57,7 @@ enum Step {
     Checking,
 }
 
-pub struct Goal {
+pub struct GoalLoop {
     pub condition: String,
     /// When the goal was first spawned — basis for total elapsed time.
     started: Instant,
@@ -59,9 +75,9 @@ struct Inner {
     phase: Step,
 }
 
-pub type Handle = Arc<Goal>;
+pub type Handle = Arc<GoalLoop>;
 
-impl Goal {
+impl GoalLoop {
     /// True while the loop is still pursuing the goal.
     pub fn is_active(&self) -> bool {
         let i = self.inner.lock().unwrap();
@@ -163,7 +179,7 @@ pub fn spawn(
     model: String,
     cred: crate::backend::claude::Credential,
 ) -> Handle {
-    let goal = Arc::new(Goal {
+    let goal = Arc::new(GoalLoop {
         condition,
         started: Instant::now(),
         inner: Mutex::new(Inner {
@@ -358,6 +374,245 @@ fn deliver(goal: &Handle, turns: usize, reason: &str, output: &str) {
     std::io::stdout().flush().ok();
 }
 
+// ───────────────────────── Domain model ─────────────────────────
+//
+// The durable, structured `Goal` record (AC1/AC2/AC4 of TASK-277). This is
+// intentionally decoupled from the `GoalLoop` pursuit engine above: a goal is a
+// plan (title, milestones, blockers, links, hierarchy) that persists in
+// `aish.db`; the loop is one optional way to *execute* it.
+
+/// Current unix time in whole seconds — the timestamp basis for goal records.
+/// Monotonicity isn't required (these are wall-clock audit stamps), so a clock
+/// skew just yields a slightly-off `created_at`/`updated_at`, never a panic.
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Lifecycle state of a persistent [`Goal`]. Distinct from the pursuit loop's
+/// internal `Status` (which tracks a single background run).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GoalStatus {
+    /// Being actively pursued / worked toward (the default for a new goal).
+    #[default]
+    Active,
+    /// Deliberately set aside — kept, but not being worked right now.
+    Paused,
+    /// Achieved. Terminal.
+    Completed,
+    /// Dropped without completing. Terminal.
+    Abandoned,
+}
+
+impl GoalStatus {
+    /// Canonical lowercase token used for the DB `CHECK` constraint + JSON.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GoalStatus::Active => "active",
+            GoalStatus::Paused => "paused",
+            GoalStatus::Completed => "completed",
+            GoalStatus::Abandoned => "abandoned",
+        }
+    }
+
+    /// Parse a stored token back into a status. Unknown/empty falls back to
+    /// `Active` so a hand-edited or future-versioned row never hard-fails a load.
+    pub fn from_token(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "paused" => GoalStatus::Paused,
+            "completed" => GoalStatus::Completed,
+            "abandoned" => GoalStatus::Abandoned,
+            _ => GoalStatus::Active,
+        }
+    }
+
+    /// A terminal status can't transition further (used by callers / UI to
+    /// gray-out actions).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, GoalStatus::Completed | GoalStatus::Abandoned)
+    }
+}
+
+impl std::fmt::Display for GoalStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A concrete checkpoint on the way to a goal. `done` flips as it's achieved.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Milestone {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub done: bool,
+}
+
+impl Milestone {
+    pub fn new(title: impl Into<String>) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: title.into(),
+            done: false,
+        }
+    }
+}
+
+/// Something impeding progress toward a goal. `resolved` flips when cleared.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Blocker {
+    pub id: String,
+    pub description: String,
+    #[serde(default)]
+    pub resolved: bool,
+}
+
+impl Blocker {
+    pub fn new(description: impl Into<String>) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            description: description.into(),
+            resolved: false,
+        }
+    }
+}
+
+/// A reference to an external work item this goal is tied to — e.g. a board card
+/// key like `"TASK-277"`. `title` is an optional human label cached at link time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRef {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+impl TaskRef {
+    pub fn new(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            title: None,
+        }
+    }
+
+    pub fn with_title(key: impl Into<String>, title: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            title: Some(title.into()),
+        }
+    }
+}
+
+/// A durable, structured goal record. Persisted in `aish.db`'s `goals` table.
+///
+/// Hierarchy: `parent_id` is `Some` for a subgoal, `None` for a top-level goal.
+/// The tree is arbitrary-depth; the store fetches children by `parent_id`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Goal {
+    /// Stable unique id (uuid v4).
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub status: GoalStatus,
+    #[serde(default)]
+    pub milestones: Vec<Milestone>,
+    #[serde(default)]
+    pub blockers: Vec<Blocker>,
+    #[serde(default)]
+    pub linked_tasks: Vec<TaskRef>,
+    /// Parent goal id when this is a subgoal; `None` at the top level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// Unix seconds when created / last mutated. Audit stamps only.
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+impl Goal {
+    /// A fresh top-level goal: new id, `Active`, empty collections, stamped now.
+    pub fn new(title: impl Into<String>) -> Self {
+        let ts = now_secs();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: title.into(),
+            description: String::new(),
+            status: GoalStatus::default(),
+            milestones: Vec::new(),
+            blockers: Vec::new(),
+            linked_tasks: Vec::new(),
+            parent_id: None,
+            created_at: ts,
+            updated_at: ts,
+        }
+    }
+
+    /// A fresh subgoal parented under `parent_id`.
+    pub fn subgoal(title: impl Into<String>, parent_id: impl Into<String>) -> Self {
+        let mut g = Goal::new(title);
+        g.parent_id = Some(parent_id.into());
+        g
+    }
+
+    /// Builder-style description setter (used in construction chains).
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    /// True when this goal hangs under a parent.
+    pub fn is_subgoal(&self) -> bool {
+        self.parent_id.is_some()
+    }
+
+    /// Bump `updated_at`. Called by every mutator so persistence is ordered.
+    pub fn touch(&mut self) {
+        self.updated_at = now_secs();
+    }
+
+    pub fn add_milestone(&mut self, title: impl Into<String>) -> &Milestone {
+        self.milestones.push(Milestone::new(title));
+        self.touch();
+        self.milestones.last().expect("just pushed")
+    }
+
+    pub fn add_blocker(&mut self, description: impl Into<String>) -> &Blocker {
+        self.blockers.push(Blocker::new(description));
+        self.touch();
+        self.blockers.last().expect("just pushed")
+    }
+
+    pub fn link_task(&mut self, task: TaskRef) {
+        // Dedup on key so re-linking the same card is a no-op.
+        if !self.linked_tasks.iter().any(|t| t.key == task.key) {
+            self.linked_tasks.push(task);
+            self.touch();
+        }
+    }
+
+    pub fn set_status(&mut self, status: GoalStatus) {
+        self.status = status;
+        self.touch();
+    }
+
+    /// `(done, total)` milestone counts — a cheap progress signal for the UI.
+    pub fn milestone_progress(&self) -> (usize, usize) {
+        let done = self.milestones.iter().filter(|m| m.done).count();
+        (done, self.milestones.len())
+    }
+
+    /// Unresolved blockers — the ones actually impeding the goal right now.
+    pub fn open_blockers(&self) -> usize {
+        self.blockers.iter().filter(|b| !b.resolved).count()
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,8 +644,8 @@ mod tests {
     }
 
     /// Build a Goal directly (bypassing spawn's background loop) to assert wording.
-    fn goal_with(status: Status, phase: Step, turn_started: bool) -> Goal {
-        Goal {
+    fn goal_with(status: Status, phase: Step, turn_started: bool) -> GoalLoop {
+        GoalLoop {
             condition: "Complete the work".to_string(),
             started: Instant::now(),
             inner: Mutex::new(Inner {
@@ -427,5 +682,130 @@ mod tests {
         assert!(!line.contains("this turn"), "got: {line}");
         assert!(!line.contains("checking"), "got: {line}");
         assert!(!line.contains("working"), "got: {line}");
+    }
+
+    /// AC#3 regression: the batch stopping-oracle loop is unchanged. Pin the
+    /// hard backstop and the generator→verifier state machine so a refactor of
+    /// the new Goal domain model can never silently weaken the unattended loop.
+    #[test]
+    fn batch_oracle_loop_invariants_unchanged() {
+        // Hard MAX_TURNS backstop still guards runaway unattended pursuit.
+        assert_eq!(MAX_TURNS, 25, "MAX_TURNS backstop must not drift");
+
+        // The loop's phase machine still has its three generator/verifier steps.
+        assert!(Step::Idle == Step::Idle);
+        assert!(Step::Working != Step::Checking);
+
+        // An achieved goal is terminal for the loop: is_active() flips false and
+        // the recorded reason is preserved for delivery.
+        let g = goal_with(Status::Active, Step::Working, true);
+        assert!(g.is_active(), "active loop reports active");
+        g.set(Status::Achieved, Some("evidence met".into()));
+        assert!(!g.is_active(), "achieved loop is no longer active");
+        assert!(g.status_line().contains("achieved"), "{}", g.status_line());
+
+        // A failed goal (the MAX_TURNS path) is likewise terminal.
+        let f = goal_with(Status::Active, Step::Checking, true);
+        f.set(Status::Failed, Some("backstop".into()));
+        assert!(!f.is_active(), "failed loop is no longer active");
+    }
+}
+
+#[cfg(test)]
+mod domain_tests {
+    use super::*;
+
+    #[test]
+    fn new_goal_defaults_are_active_and_empty() {
+        let g = Goal::new("Ship TASK-277");
+        assert_eq!(g.title, "Ship TASK-277");
+        assert_eq!(g.status, GoalStatus::Active);
+        assert!(g.milestones.is_empty());
+        assert!(g.blockers.is_empty());
+        assert!(g.linked_tasks.is_empty());
+        assert!(g.parent_id.is_none());
+        assert!(!g.is_subgoal());
+        assert!(!g.id.is_empty());
+        assert!(g.created_at > 0);
+        assert_eq!(g.created_at, g.updated_at);
+    }
+
+    #[test]
+    fn subgoal_carries_parent() {
+        let parent = Goal::new("Parent");
+        let child = Goal::subgoal("Child", parent.id.clone());
+        assert!(child.is_subgoal());
+        assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+    }
+
+    #[test]
+    fn mutators_bump_updated_at_and_collections() {
+        let mut g = Goal::new("G");
+        let created = g.updated_at;
+        g.updated_at -= 5; // simulate an older stamp so touch() is observable
+        g.add_milestone("m1");
+        g.add_blocker("b1");
+        g.link_task(TaskRef::with_title("TASK-277", "Persistent goals"));
+        assert_eq!(g.milestones.len(), 1);
+        assert_eq!(g.blockers.len(), 1);
+        assert_eq!(g.linked_tasks.len(), 1);
+        assert!(g.updated_at >= created);
+    }
+
+    #[test]
+    fn link_task_dedups_on_key() {
+        let mut g = Goal::new("G");
+        g.link_task(TaskRef::new("TASK-277"));
+        g.link_task(TaskRef::with_title("TASK-277", "dup"));
+        assert_eq!(g.linked_tasks.len(), 1);
+    }
+
+    #[test]
+    fn progress_and_open_blocker_counts() {
+        let mut g = Goal::new("G");
+        g.add_milestone("m1");
+        g.add_milestone("m2");
+        g.milestones[0].done = true;
+        g.add_blocker("b1");
+        g.add_blocker("b2");
+        g.blockers[1].resolved = true;
+        assert_eq!(g.milestone_progress(), (1, 2));
+        assert_eq!(g.open_blockers(), 1);
+    }
+
+    #[test]
+    fn status_token_roundtrip() {
+        for s in [
+            GoalStatus::Active,
+            GoalStatus::Paused,
+            GoalStatus::Completed,
+            GoalStatus::Abandoned,
+        ] {
+            assert_eq!(GoalStatus::from_token(s.as_str()), s);
+        }
+        // Unknown / hand-edited tokens degrade to Active, never panic.
+        assert_eq!(GoalStatus::from_token("wat"), GoalStatus::Active);
+        assert_eq!(GoalStatus::from_token(""), GoalStatus::Active);
+        assert_eq!(GoalStatus::from_token(" COMPLETED "), GoalStatus::Completed);
+    }
+
+    #[test]
+    fn terminal_status_flags() {
+        assert!(GoalStatus::Completed.is_terminal());
+        assert!(GoalStatus::Abandoned.is_terminal());
+        assert!(!GoalStatus::Active.is_terminal());
+        assert!(!GoalStatus::Paused.is_terminal());
+    }
+
+    #[test]
+    fn goal_json_roundtrips() {
+        let mut g = Goal::new("Roundtrip").with_description("desc");
+        g.add_milestone("m1");
+        g.add_blocker("b1");
+        g.link_task(TaskRef::new("TASK-277"));
+        g.set_status(GoalStatus::Paused);
+        let json = serde_json::to_string(&g).expect("serialize");
+        let back: Goal = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(g, back);
     }
 }
