@@ -187,6 +187,81 @@ impl RustylineEditor {
             Err(e) => ReadOutcome::Error(e.to_string()),
         }
     }
+
+    /// The idle prompt read. When this session has outstanding background
+    /// workers (`background_pending`) AND stdin is an interactive tty, use an
+    /// interruptible poll loop that returns an EMPTY line the instant the
+    /// presenter raises the hands-free resume wake (`arm_resume_wake`) — so an
+    /// armed auto-resume drains without the human pressing a key, on ANY kernel
+    /// (no TIOCSTI dependency). In every other case fall through to the plain
+    /// blocking rustyline read, so the common interactive path is unchanged.
+    fn blocking_read(&mut self, prompt: &str) -> ReadOutcome {
+        #[cfg(unix)]
+        {
+            let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+            if is_tty && background_pending() {
+                if let Some(outcome) = self.poll_until_wake_or_key(prompt) {
+                    return outcome;
+                }
+                // Raw-mode setup failed — fall through to the plain read.
+            }
+        }
+        let res = self.rl.readline(prompt);
+        self.outcome(res)
+    }
+
+    /// Poll-loop idle read used only while background workers are outstanding.
+    /// Shows the prompt, then alternates short `poll(2)` waits on stdin with
+    /// checks of the resume wake. Returns:
+    ///   * `Some(Line(""))` — the wake fired: the loop drains the armed resume.
+    ///   * `Some(<rustyline outcome>)` — a key arrived: control was handed to
+    ///     rustyline for a full-fidelity edit.
+    ///   * `None` — raw mode couldn't be established; caller does a plain read.
+    #[cfg(unix)]
+    fn poll_until_wake_or_key(&mut self, prompt: &str) -> Option<ReadOutcome> {
+        use std::io::Write;
+        // A resume that armed between the caller's `take_resume_tick` check and
+        // now: return immediately so the loop drains it.
+        if take_resume_wake() {
+            return Some(ReadOutcome::Line(String::new()));
+        }
+        // Show the prompt while idle (cooked mode → normal output processing).
+        {
+            let mut out = std::io::stdout();
+            let _ = write!(out, "{prompt}");
+            let _ = out.flush();
+        }
+        // Raw mode so poll wakes on the first keystroke, not only on Enter.
+        let guard = RawModeGuard::enter()?;
+        loop {
+            match poll_stdin_readable(200) {
+                Ok(true) => {
+                    // A key is waiting. Restore cooked mode (keeping the pending
+                    // byte), erase our idle prompt, and hand the real edit to
+                    // rustyline — it reprints the prompt and reads the buffered
+                    // input with full line editing. `guard` drops here → cooked.
+                    guard.restore();
+                    erase_prompt_line();
+                    let res = self.rl.readline(prompt);
+                    return Some(self.outcome(res));
+                }
+                Ok(false) => {
+                    if take_resume_wake() {
+                        guard.restore();
+                        erase_prompt_line();
+                        return Some(ReadOutcome::Line(String::new()));
+                    }
+                }
+                Err(_) => {
+                    // Hard poll failure — restore, erase, and let the caller do
+                    // a plain blocking read (return None).
+                    guard.restore();
+                    erase_prompt_line();
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 impl LineEditor for RustylineEditor {
@@ -201,9 +276,9 @@ impl LineEditor for RustylineEditor {
         // scrolled-away footer while we block here (cleared the moment a line
         // returns).
         crate::terminal::set_reading_line(true);
-        let res = self.rl.readline(prompt);
+        let outcome = self.blocking_read(prompt);
         crate::terminal::set_reading_line(false);
-        self.outcome(res)
+        outcome
     }
 
     fn read_line_with_initial(&mut self, prompt: &str, initial: &str) -> ReadOutcome {
@@ -312,6 +387,127 @@ impl ConditionalEventHandler for AcceptHint {
 }
 
 // ---------------------------------------------------------------------------
+// Hands-free auto-resume WAKE (kernel-independent; supersedes the TIOCSTI nudge
+// below for the common interactive path).
+//
+// The presenter thread, the moment it ARMS a coalesced resume (the last
+// fanned-out coordinator finished — see session::ResumeState), raises
+// `RESUME_WAKE`. The idle prompt read (`read_line`), while blocked, polls this
+// flag between short `poll(2)` waits on stdin and returns an EMPTY line the
+// instant it is raised — so the main loop's next pass drains the armed resume
+// via `take_resume_tick` with NO keypress required, on ANY kernel. This works
+// where `nudge_terminal_return` (TIOCSTI) silently no-ops: Linux >=6.2 gates
+// `dev.tty.legacy_tiocsti` OFF by default (CVE-2017-5226).
+//
+// `BACKGROUND_PENDING` gates the (very slightly heavier) poll path: the main
+// loop sets it true right before an idle read whenever this session has
+// outstanding fanned-out workers. With no background work outstanding, the idle
+// read is the plain blocking rustyline read, so the common interactive path is
+// byte-for-byte unchanged.
+static RESUME_WAKE: AtomicBool = AtomicBool::new(false);
+static BACKGROUND_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Presenter -> main-loop signal: raise the hands-free resume wake so an idle,
+/// blocked `read_line` returns promptly and the next loop pass drains the armed
+/// auto-resume. Paired with (and more reliable than) `nudge_terminal_return`.
+pub fn arm_resume_wake() {
+    RESUME_WAKE.store(true, Ordering::SeqCst);
+}
+
+/// Read-and-clear the resume wake. The idle poll read consults this; a raised
+/// flag makes it return an empty line so the loop re-checks `take_resume_tick`.
+pub fn take_resume_wake() -> bool {
+    RESUME_WAKE.swap(false, Ordering::SeqCst)
+}
+
+/// Main loop -> editor: record whether this session currently has outstanding
+/// fanned-out background workers. Gates the interruptible poll path in
+/// `read_line`; when false the idle read is the plain blocking rustyline read.
+pub fn set_background_pending(pending: bool) {
+    BACKGROUND_PENDING.store(pending, Ordering::Relaxed);
+}
+
+fn background_pending() -> bool {
+    BACKGROUND_PENDING.load(Ordering::Relaxed)
+}
+
+/// Poll stdin for readability up to `timeout_ms`. `Ok(true)` = a byte is ready,
+/// `Ok(false)` = timed out (or an EINTR from e.g. SIGWINCH — reported as a
+/// timeout so the caller simply loops), `Err` = a hard poll failure (caller
+/// falls back to a plain blocking read).
+#[cfg(unix)]
+fn poll_stdin_readable(timeout_ms: i32) -> std::io::Result<bool> {
+    let mut fd = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut fd, 1, timeout_ms) };
+    if rc < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EINTR) {
+            return Ok(false);
+        }
+        return Err(e);
+    }
+    Ok(rc > 0 && (fd.revents & libc::POLLIN) != 0)
+}
+
+/// RAII raw-mode guard for the idle poll window. Puts stdin into raw mode
+/// (ICANON/ECHO off) so `poll(2)` wakes on the FIRST keystroke rather than only
+/// on Enter, and restores the saved cooked termios on drop. `TCSANOW` applies
+/// the switch WITHOUT flushing the input queue, so a keystroke already typed
+/// survives the transition and is read by rustyline on handoff.
+#[cfg(unix)]
+struct RawModeGuard {
+    orig: libc::termios,
+}
+
+#[cfg(unix)]
+impl RawModeGuard {
+    fn enter() -> Option<Self> {
+        unsafe {
+            let mut orig: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut orig) != 0 {
+                return None;
+            }
+            let mut raw = orig;
+            libc::cfmakeraw(&mut raw);
+            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) != 0 {
+                return None;
+            }
+            Some(RawModeGuard { orig })
+        }
+    }
+
+    /// Restore the saved cooked termios immediately (no input flush). Idempotent.
+    fn restore(&self) {
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.orig);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+/// Erase the idle prompt we printed, returning the cursor to column 0 and
+/// clearing to end-of-line, so rustyline's own prompt reprint (on handoff) or
+/// the auto-resume notice (on wake) starts from a clean line.
+#[cfg(unix)]
+fn erase_prompt_line() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\r\x1b[K");
+    let _ = out.flush();
+}
+
+// ---------------------------------------------------------------------------
+// Hands-free auto-resume nudge (follow-up to the "interrupting an idle read"
 // Hands-free auto-resume nudge (follow-up to the "interrupting an idle read"
 // limitation flagged in repl.rs).
 //
@@ -481,6 +677,48 @@ mod tests {
         assert!(
             !nudge_terminal_return(),
             "nudge must no-op (return false) when stdin isn't an interactive tty"
+        );
+    }
+
+    /// The kernel-independent hands-free wake contract: `arm_resume_wake` raises
+    /// a flag that `take_resume_wake` reads-and-clears EXACTLY once, and
+    /// `set_background_pending` round-trips through `background_pending`. This is
+    /// the seam the idle poll read (`poll_until_wake_or_key`) consults to return
+    /// an empty line the instant the presenter arms a resume — so a parked
+    /// `read_line` drains the auto-resume with no keypress, on any kernel (no
+    /// TIOCSTI dependency). A stale wake must never survive its single drain.
+    #[test]
+    fn resume_wake_arms_and_drains_exactly_once() {
+        // Clean slate — statics are process-global.
+        let _ = take_resume_wake();
+
+        // Not armed → drain is false.
+        assert!(
+            !take_resume_wake(),
+            "a cleared wake must read false"
+        );
+
+        // Arm → first drain sees it, second drain is already clear.
+        arm_resume_wake();
+        assert!(
+            take_resume_wake(),
+            "the armed wake must surface on the first drain"
+        );
+        assert!(
+            !take_resume_wake(),
+            "the wake must not survive its single drain (no stale re-fire)"
+        );
+
+        // Background-pending gate round-trips.
+        set_background_pending(true);
+        assert!(
+            background_pending(),
+            "set_background_pending(true) must gate the poll path on"
+        );
+        set_background_pending(false);
+        assert!(
+            !background_pending(),
+            "set_background_pending(false) must revert to the plain blocking read"
         );
     }
 
