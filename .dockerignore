@@ -1,0 +1,22 @@
+# Keep the Docker build context (Dockerfile.worker) lean and correct.
+# The worker image now self-builds the aish binary in a bookworm builder stage,
+# so we must NOT ship host build artifacts (a host-glibc binary is the exact bug
+# this multi-stage build exists to avoid) or heavy/irrelevant dirs.
+
+# Host build artifacts — never inject a host-libc binary into the image.
+target/
+
+# VCS + coordinator worktrees / state.
+.git/
+.atum/
+worktrees/
+
+# Local dev noise.
+*.log
+aish.db
+aish.db-*
+.DS_Store
+
+# Docs / examples aren't needed to compile the worker.
+docs/spikes/
+examples/
