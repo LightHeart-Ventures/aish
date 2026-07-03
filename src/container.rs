@@ -388,6 +388,30 @@ pub fn image_exists(rt: Runtime, tag: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Preflight compatibility probe: does the `aish` binary baked into `tag`
+/// actually EXEC inside the image? A one-shot `<engine> run --rm <tag> --version`
+/// runs the image's entrypoint (`/usr/local/bin/aish`) with `--version`. It
+/// returns `true` only on a clean exit.
+///
+/// This exists to catch the class of failure a plain [`image_exists`] check
+/// misses: a libc-INCOMPATIBLE image (a binary built against a newer glibc than
+/// the runtime base ships — see Dockerfile.worker) BUILDS fine and INSPECTS
+/// fine, then dies at exec with `GLIBC_x.y not found`. Without this probe the
+/// worker launches a doomed container and the operator just sees a failed job;
+/// with it, `build_container_command` degrades to the host subprocess and prints
+/// an actionable diagnostic. Best-effort — any spawn error reads as "not
+/// runnable" (false) so the caller falls back safely. Captures no output; the
+/// caller owns the user-facing message. Blocking IO — call off the hot path.
+pub fn image_runnable(rt: Runtime, tag: &str) -> bool {
+    std::process::Command::new(rt.bin())
+        .args(["run", "--rm", "--entrypoint", "/usr/local/bin/aish", tag, "--version"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// A discovered worker container — the unit S9.5 discovery scans by label, and
 /// what `list` returns.
 #[derive(Clone, Debug)]
