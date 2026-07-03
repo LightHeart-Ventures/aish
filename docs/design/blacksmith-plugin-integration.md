@@ -162,6 +162,27 @@ separate sprint from SPR-059.
 
 ---
 
+## 7. Concrete implementation: Testbox CLI pre-flight validation (interim)
+
+**Status:** Implemented in PR #471 as `ci-testbox.yml` workflow + Testbox action scaffolding.
+
+While the full plugin integration (stages 0–6 above) unfolds, operators can **today** use Blacksmith Testbox for pre-PR CI validation without waiting for plugin infrastructure. This sidesteps the local coordinator-worktree OOM risk documented in `aish_sre` SKILL.md (§3) by running the exact CI gate on a 4vcpu remote VM.
+
+| Item | Value |
+|---|---|
+| Workflow | `.github/workflows/ci-testbox.yml` (mirror of `ci.yml` with `workflow_dispatch` + Testbox actions) |
+| Gate tested | `cargo test --no-default-features --locked` (same as `ci.yml`) |
+| VM setup | Rust toolchain + warm cargo cache (captured mid-workflow on the persistent testbox VM) |
+| Operator flow | `blacksmith testbox warmup ci-testbox.yml` → `blacksmith testbox run --id <ID> "cargo test --no-default-features --locked"` |
+| Iteration speed | ~30–60s with warm cache (vs. cold PR CI cycle) |
+| OOM safety | Remote 4vcpu box; no local worktree build pressure |
+
+**Prerequisite:** PR #471 must merge to `main` before `workflow_dispatch` becomes callable. Once merged, the warmup/run pattern is ready for feature branches.
+
+**Relationship to roadmap:** This is a **pragmatic interim** for stages 4–5 (plugin-contributed tools). It demonstrates the `testbox run/status` UX using GitHub Actions + Testbox CLI directly, providing a scaffold for future agent-native tooling once gaps #3–4 close.
+
+---
+
 ## Appendix: source references
 
 | Claim | Evidence |
@@ -171,3 +192,4 @@ separate sprint from SPR-059.
 | Blocking/mutating hooks are design-only (Phases 2/3) | `docs/aish-hooks-design.md` §1.2, §2 |
 | Login handler exists | `src/plugin_auth.rs` (~24 KB) |
 | K/V-only state store | `src/plugin_state.rs`; `docs/plugin-state-schema.md` |
+| Testbox CLI + Blacksmith integration | `blacksmith-testbox` SKILL.md; `.github/workflows/ci-testbox.yml` (PR #471) |
