@@ -4660,6 +4660,166 @@ fn looks_like_date(tok: &str) -> bool {
     ok_chars && has_sep && has_digit && tok.len() >= 3
 }
 
+/// A 10-cell unicode progress bar for a 0..=100 percent (rounded to the nearest
+/// cell). Filled cells are `█`, empty cells `░` — no color, so it renders in any
+/// terminal and stays legible when copy-pasted.
+fn goal_progress_bar(pct: u8) -> String {
+    let filled = ((pct as usize * 10) + 50) / 100; // round half-up to nearest cell
+    let filled = filled.min(10);
+    let mut bar = String::with_capacity(10 * 3);
+    for _ in 0..filled {
+        bar.push('█');
+    }
+    for _ in 0..(10 - filled) {
+        bar.push('░');
+    }
+    bar
+}
+
+/// A glanceable emoji for a goal's lifecycle status.
+fn goal_status_emoji(s: crate::goal::GoalStatus) -> &'static str {
+    use crate::goal::GoalStatus;
+    match s {
+        GoalStatus::Active => "🟢",
+        GoalStatus::Paused => "⏸️",
+        GoalStatus::Completed => "✅",
+        GoalStatus::Abandoned => "🗑️",
+    }
+}
+
+/// Render the `:goal status` dashboard — a humanized, emoji-tagged overview of
+/// every tracked goal: its **statement** (title + description), a progress bar,
+/// the **work breakdown** (milestones + linked tasks) with a marker showing
+/// **where the goal currently is** in that breakdown, and any blockers. Also
+/// surfaces the live background-pursuit loop (`:goal <condition>`) at the top
+/// when one is running. Returns the text to print; never panics.
+fn goal_status_dashboard(session: &mut Session) -> String {
+    use crate::goal::{Goal, GoalStatus};
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    // Live background-pursuit loop (the `:goal <condition>` batch oracle), if any.
+    if let Some(loop_) = &session.goal {
+        let _ = writeln!(out, "⟳ \x1b[1mBackground pursuit\x1b[0m");
+        let _ = writeln!(out, "   {}", loop_.status_line());
+    }
+
+    if session.goals.is_empty() {
+        if out.is_empty() {
+            return "no goals yet — `:goal new <title>` to track one, or `:goal <condition>` to pursue one in the background".into();
+        }
+        // A pursuit loop is running but nothing durable is tracked yet.
+        let _ = write!(
+            out,
+            "\n\x1b[2mno tracked goals — `:goal new <title>` to break work into milestones\x1b[0m"
+        );
+        return out;
+    }
+
+    let current = session.current_goal().map(|g| g.id.clone());
+    let mut goals: Vec<&Goal> = session.goals.iter().collect();
+    goals.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let active = goals
+        .iter()
+        .filter(|g| g.status == GoalStatus::Active)
+        .count();
+
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    let _ = writeln!(
+        out,
+        "🎯 \x1b[1mGoals\x1b[0m — {} tracked · {active} active",
+        goals.len()
+    );
+
+    for g in goals {
+        let is_current = Some(&g.id) == current.as_ref();
+        let (m_done, m_total) = g.milestone_progress();
+        let (t_done, t_total) = g.linked_task_progress();
+        let pct = g.progress_percent();
+        let star = if is_current { "  \x1b[33m★ current\x1b[0m" } else { "" };
+
+        // ── Goal statement ────────────────────────────────────────────────
+        let _ = writeln!(
+            out,
+            "\n{} \x1b[1m{}\x1b[0m{star}  \x1b[2m{}\x1b[0m",
+            goal_status_emoji(g.status),
+            g.title,
+            goal_short(&g.id)
+        );
+        if !g.description.is_empty() {
+            let _ = writeln!(out, "   \x1b[2m{}\x1b[0m", g.description);
+        }
+
+        // ── Progress rollup bar ───────────────────────────────────────────
+        let _ = writeln!(
+            out,
+            "   Progress  {}  {pct:>3}%   \x1b[2m· updated {}\x1b[0m",
+            goal_progress_bar(pct),
+            goal_ago(g.updated_at)
+        );
+
+        // ── Work breakdown: milestones (▸ marks where we are right now) ────
+        if m_total > 0 {
+            let _ = writeln!(out, "   \x1b[1mMilestones ({m_done}/{m_total})\x1b[0m");
+            let next_open = g.next_open_milestone().map(|m| m.id.clone());
+            for m in &g.milestones {
+                if m.done {
+                    let _ = writeln!(out, "     ✅ \x1b[2m{}\x1b[0m", m.title);
+                } else if Some(&m.id) == next_open.as_ref() {
+                    let _ = writeln!(out, "     🔸 {}   \x1b[33m◀ you are here\x1b[0m", m.title);
+                } else {
+                    let _ = writeln!(out, "     ⬜ {}", m.title);
+                }
+            }
+        }
+
+        // ── Work breakdown: linked tasks ──────────────────────────────────
+        if t_total > 0 {
+            let _ = writeln!(out, "   \x1b[1mTasks ({t_done}/{t_total})\x1b[0m");
+            for t in &g.linked_tasks {
+                let mark = if t.done { "✅" } else { "⬜" };
+                match &t.title {
+                    Some(title) => {
+                        let _ = writeln!(out, "     {mark} {} \x1b[2m{}\x1b[0m", t.key, title);
+                    }
+                    None => {
+                        let _ = writeln!(out, "     {mark} {}", t.key);
+                    }
+                }
+            }
+        }
+
+        // ── Blockers ──────────────────────────────────────────────────────
+        if !g.blockers.is_empty() {
+            let open = g.open_blockers();
+            let _ = writeln!(out, "   ⛔ \x1b[1mBlockers ({open} open)\x1b[0m");
+            for b in &g.blockers {
+                if b.resolved {
+                    let _ = writeln!(out, "     ✓ \x1b[2m{}\x1b[0m", b.description);
+                } else {
+                    let _ = writeln!(out, "     ✗ {}", b.description);
+                }
+            }
+        }
+
+        // Nothing tracked yet — a friendly nudge instead of a bare bar.
+        if m_total == 0 && t_total == 0 && g.blockers.is_empty() {
+            let _ = writeln!(
+                out,
+                "   \x1b[2mno milestones yet — `:goal milestone <text>` to break it down\x1b[0m"
+            );
+        }
+    }
+
+    // Trim the trailing newline for tidy printing by the dispatcher.
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
 /// Render a goal's full detail block (used by `:goal show`).
 fn goal_detail(g: &crate::goal::Goal) -> String {
     use std::fmt::Write;
@@ -4759,38 +4919,7 @@ fn goal_command(session: &mut Session, sub: &str, args: &str) -> String {
                 None => format!("no goal matching \x1b[2m{args}\x1b[0m (ambiguous or unknown id)"),
             }
         }
-        "status" => {
-            let mut out = String::new();
-            if let Some(loop_) = &session.goal {
-                out.push_str(&loop_.status_line());
-                out.push('\n');
-            }
-            if session.goals.is_empty() {
-                out.push_str(
-                    "no goals yet — `:goal new <title>` to track one, or `:goal <condition>` to pursue one in the background",
-                );
-                return out;
-            }
-            let current = session.current_goal().map(|g| g.id.clone());
-            let mut goals: Vec<&Goal> = session.goals.iter().collect();
-            goals.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-            use std::fmt::Write;
-            let _ = write!(out, "{} goal(s):", goals.len());
-            for g in goals {
-                let (done, total) = g.milestone_progress();
-                let marker = if Some(&g.id) == current.as_ref() { "*" } else { " " };
-                let open = g.open_blockers();
-                let blk = if open > 0 { format!(", {open} blocker(s)") } else { String::new() };
-                let _ = write!(
-                    out,
-                    "\n {marker} [{}] \x1b[2m{}\x1b[0m {} — {done}/{total} milestones{blk}",
-                    g.status,
-                    goal_short(&g.id),
-                    g.title
-                );
-            }
-            out
-        }
+        "status" => goal_status_dashboard(session),
         "link" => {
             if args.is_empty() {
                 return "usage: :goal link <task-id> [title]".into();
@@ -6083,7 +6212,21 @@ async fn handle_colon(
                         let b_ts = b.created_at.as_deref().and_then(crate::style::parse_sqlite_utc).unwrap_or(0);
                         b_ts.cmp(&a_ts)
                     });
+                    // TASK-302: the goal loop mints a fresh `goal-<uuid>` run per
+                    // turn, so every turn lands its own durable row — `:workers`
+                    // otherwise renders one row per turn (each a different phase),
+                    // which reads as "the goal coordinator appears twice". Rows are
+                    // sorted newest-first above, so keeping only the FIRST row per
+                    // recovered goal condition collapses a multi-turn goal to a
+                    // single row showing its latest phase. Non-goal rows return
+                    // `None` and pass through untouched.
+                    let mut seen_goal_conditions = std::collections::HashSet::new();
                     for r in durable {
+                        if let Some(cond) = crate::goal::goal_condition_from_directive(&r.task) {
+                            if !seen_goal_conditions.insert(cond) {
+                                continue;
+                            }
+                        }
                         any = true;
                         let is_me = r.session_id.as_deref() == Some(session.session_id.as_str());
                         let label = r
@@ -9263,8 +9406,54 @@ mod tests {
         assert!(show.contains("Observe everything"), "got: {show}");
         assert!(show.contains("milestones (0/1)"), "got: {show}");
         let status = goal_command(&mut s, "status", "");
-        assert!(status.contains("1 goal(s):"), "got: {status}");
+        // Humanized dashboard header + the goal statement + a progress bar.
+        assert!(status.contains("🎯"), "got: {status}");
+        assert!(status.contains("1 tracked"), "got: {status}");
         assert!(status.contains("Observe everything"), "got: {status}");
+        assert!(status.contains("Progress"), "got: {status}");
+        // Work breakdown: the single open milestone is flagged as current.
+        assert!(status.contains("Milestones (0/1)"), "got: {status}");
+        assert!(status.contains("add tracing"), "got: {status}");
+        assert!(status.contains("you are here"), "got: {status}");
+    }
+
+    #[test]
+    fn goal_progress_bar_rounds_to_nearest_cell() {
+        assert_eq!(goal_progress_bar(0), "░░░░░░░░░░");
+        assert_eq!(goal_progress_bar(100), "██████████");
+        assert_eq!(goal_progress_bar(50), "█████░░░░░");
+        // 33% → 3.3 cells → 3 filled; 67% → 6.7 → 7 filled (half-up).
+        assert_eq!(goal_progress_bar(33), "███░░░░░░░");
+        assert_eq!(goal_progress_bar(67), "███████░░░");
+        // Never overflows past 10 cells even on a stray >100.
+        assert_eq!(goal_progress_bar(200).chars().count(), 10);
+    }
+
+    #[test]
+    fn goal_status_dashboard_shows_breakdown_and_current_position() {
+        let mut s = Session::new().unwrap();
+        goal_command(&mut s, "new", "Ship the dashboard");
+        goal_command(&mut s, "milestone", "design");
+        goal_command(&mut s, "milestone", "build");
+        goal_command(&mut s, "milestone", "release");
+        // Complete the first milestone so the "current" marker lands on #2.
+        {
+            let g = s.goals.last_mut().expect("current goal");
+            g.milestones[0].done = true;
+            g.touch();
+        }
+        let out = goal_command(&mut s, "status", "");
+        assert!(out.contains("🎯"), "header emoji: {out}");
+        assert!(out.contains("Ship the dashboard"), "statement: {out}");
+        assert!(out.contains("Milestones (1/3)"), "breakdown count: {out}");
+        assert!(out.contains("✅"), "done marker: {out}");
+        // The first not-done milestone is flagged as the current position.
+        let build_line = out
+            .lines()
+            .find(|l| l.contains("build"))
+            .unwrap_or_default();
+        assert!(build_line.contains("you are here"), "current: {out}");
+        assert!(out.contains("★ current"), "active-goal star: {out}");
     }
 
     #[test]
