@@ -4724,24 +4724,34 @@ fn pretty_json(v: &serde_json::Value) -> String {
 /// stats (which tools fail most, with what error class, and whether retries
 /// recover), or wipe the telemetry table. Feeds the "is this error worth
 /// retrying vs. escalating?" repair heuristic (see crate::tool_telemetry).
-fn handle_telemetry(sub: Option<&str>, session: &Session) {
-    let Some(db) = &session.db else {
+fn handle_telemetry(sub: Option<&str>, session: &mut Session) {
+    if session.db.is_none() {
         println!("telemetry store unavailable");
         return;
-    };
+    }
     match sub {
-        Some("clear" | "reset" | "wipe") => match db.clear_tool_telemetry() {
-            Ok(n) => println!("telemetry cleared — {n} row(s) removed"),
-            Err(e) => println!("clear failed: {e:#}"),
-        },
+        Some("clear" | "reset" | "wipe") => {
+            // Wipe the whole feedback loop: buffered tail, memoized aggregate,
+            // and the persisted rows — so a `clear` leaves nothing behind.
+            session.tool_telemetry_buf.clear();
+            session.tool_telemetry_cache = None;
+            match session.db.as_ref().unwrap().clear_tool_telemetry() {
+                Ok(n) => println!("telemetry cleared — {n} row(s) removed"),
+                Err(e) => println!("clear failed: {e:#}"),
+            }
+        }
         _ => {
-            let total = db.tool_telemetry_count().unwrap_or(0);
-            let totals = db.tool_telemetry_totals().unwrap_or_default();
-            let class_failures = db.tool_telemetry_class_failures().unwrap_or_default();
-            let retries = db.tool_telemetry_retry_stats().unwrap_or_default();
+            // Cache-aware aggregation (flushes the buffer, serves a fresh
+            // memoized snapshot within the AISH_TELEMETRY_CACHE_SECS window).
+            let agg = crate::tool_telemetry::aggregate_cached(session);
             print!(
                 "{}",
-                crate::tool_telemetry::render_report(total, &totals, &class_failures, &retries)
+                crate::tool_telemetry::render_report(
+                    agg.total,
+                    &agg.totals,
+                    &agg.class_failures,
+                    &agg.retries,
+                )
             );
         }
     }

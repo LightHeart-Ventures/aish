@@ -70,6 +70,72 @@ pub fn parse_unbuffered(v: Option<&str>) -> bool {
     )
 }
 
+// -- :telemetry aggregation cache (TASK-253 / Phase 5) --------------------
+//
+// `:telemetry` runs four GROUP-BY aggregations over the whole `tool_telemetry`
+// table on every invocation. On a long-lived session with a large table that's
+// wasted work when the report is viewed repeatedly. The Session now memoizes the
+// aggregated snapshot for a short TTL: a hit skips the DB round-trips entirely.
+// Invalidation is exact (a recorded tool event clears the cache) plus a loose
+// TTL ceiling so a stale snapshot can never outlive the window.
+
+/// Default aggregation-cache TTL in seconds. `0` disables the cache (every
+/// `:telemetry` re-queries the DB).
+pub const DEFAULT_CACHE_SECS: u64 = 60;
+
+/// Parse `AISH_TELEMETRY_CACHE_SECS`. A non-negative integer sets the cache TTL
+/// in seconds; `0` is honoured verbatim (caching disabled). Unset/unparseable
+/// falls back to the default.
+pub fn parse_cache_secs(v: Option<&str>) -> u64 {
+    v.and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CACHE_SECS)
+}
+
+/// A memoized snapshot of the four aggregated `:telemetry` tables. Cloned out of
+/// the cache on a hit and rendered by [`render_report`].
+#[derive(Debug, Clone, Default)]
+pub struct TelemetryAgg {
+    pub total: i64,
+    pub totals: Vec<ToolTotals>,
+    pub class_failures: Vec<ClassFailure>,
+    pub retries: Vec<RetryStat>,
+}
+
+/// Return the aggregated telemetry snapshot, serving the session cache when it's
+/// fresh (age < the configured TTL) and repopulating it from the DB otherwise.
+/// Flushes the buffered tail first so the aggregate reflects the latest tool
+/// calls. Returns an empty snapshot when no store is attached. A TTL of `0`
+/// disables caching — every call re-queries. Pure w.r.t. process env: the TTL is
+/// read from the pre-resolved `Session::tool_telemetry_cache_ttl`.
+pub fn aggregate_cached(session: &mut Session) -> TelemetryAgg {
+    // Buffered events aren't in the DB yet — drain them so the report is current.
+    flush(session);
+
+    let ttl = session.tool_telemetry_cache_ttl;
+    if !ttl.is_zero() {
+        if let Some((at, agg)) = &session.tool_telemetry_cache {
+            if at.elapsed() < ttl {
+                return agg.clone();
+            }
+        }
+    }
+
+    let agg = match session.db.as_ref() {
+        Some(db) => TelemetryAgg {
+            total: db.tool_telemetry_count().unwrap_or(0),
+            totals: db.tool_telemetry_totals().unwrap_or_default(),
+            class_failures: db.tool_telemetry_class_failures().unwrap_or_default(),
+            retries: db.tool_telemetry_retry_stats().unwrap_or_default(),
+        },
+        None => TelemetryAgg::default(),
+    };
+
+    if !ttl.is_zero() {
+        session.tool_telemetry_cache = Some((std::time::Instant::now(), agg.clone()));
+    }
+    agg
+}
+
 /// A coarse bucket for a failed tool call. Deliberately small: the point is to
 /// spot *patterns* ("atum_list_* timeouts recover 80% of the time"), not to
 /// preserve every error string. Ordered most-specific-first in [`classify`].
@@ -265,6 +331,10 @@ pub fn record(session: &mut Session, tool: &str, result: &ToolResult) {
     if session.db.is_none() {
         return;
     }
+
+    // Exact cache invalidation: a new event changes what `:telemetry` would
+    // aggregate, so drop any memoized snapshot (TASK-253 / Phase 5).
+    session.tool_telemetry_cache = None;
 
     let ev = ToolEvent {
         tool: tool.to_string(),
@@ -576,5 +646,93 @@ mod tests {
         record(&mut s, "read_file", &ok);
         assert!(s.tool_telemetry_buf.is_empty());
         assert_eq!(s.db.as_ref().unwrap().tool_telemetry_count().unwrap(), 1);
+    }
+
+    // -- aggregation cache (TASK-253 / Phase 5) ---------------------------
+
+    #[test]
+    fn parse_cache_secs_honors_env_strings() {
+        assert_eq!(parse_cache_secs(None), DEFAULT_CACHE_SECS);
+        assert_eq!(parse_cache_secs(Some("0")), 0); // disable, honoured verbatim
+        assert_eq!(parse_cache_secs(Some("120")), 120);
+        assert_eq!(parse_cache_secs(Some(" 30 ")), 30);
+        assert_eq!(parse_cache_secs(Some("nope")), DEFAULT_CACHE_SECS);
+        assert_eq!(parse_cache_secs(Some("")), DEFAULT_CACHE_SECS);
+    }
+
+    /// Directly insert one persisted event, bypassing `record` so the
+    /// aggregation cache is NOT invalidated — lets tests prove a cache hit.
+    fn insert_raw(s: &Session, tool: &str) {
+        let ev = ToolEvent {
+            tool: tool.to_string(),
+            is_error: false,
+            error_class: None,
+            is_retry: false,
+            recovered: false,
+            prev_class: None,
+            session_id: s.session_id.clone(),
+        };
+        s.db.as_ref().unwrap().record_tool_event(&ev).unwrap();
+    }
+
+    #[test]
+    fn aggregate_cache_serves_stale_within_ttl() {
+        let dir = tele_tmp("cache_hit");
+        let mut s = tele_session(&dir);
+        s.tool_telemetry_cache_ttl = std::time::Duration::from_secs(3600);
+        s.tool_telemetry_cache = None;
+
+        // Prime the cache from the (empty) table.
+        assert_eq!(aggregate_cached(&mut s).total, 0);
+        assert!(s.tool_telemetry_cache.is_some());
+
+        // Add a row behind the cache's back.
+        insert_raw(&s, "read_file");
+        assert_eq!(s.db.as_ref().unwrap().tool_telemetry_count().unwrap(), 1);
+
+        // Still inside the TTL ⇒ the memoized (total=0) snapshot is served.
+        assert_eq!(
+            aggregate_cached(&mut s).total,
+            0,
+            "a fresh cache hit must not re-query the DB"
+        );
+    }
+
+    #[test]
+    fn aggregate_cache_disabled_when_ttl_zero() {
+        let dir = tele_tmp("cache_off");
+        let mut s = tele_session(&dir);
+        s.tool_telemetry_cache_ttl = std::time::Duration::ZERO;
+        s.tool_telemetry_cache = None;
+
+        insert_raw(&s, "read_file");
+        assert_eq!(aggregate_cached(&mut s).total, 1);
+        assert!(
+            s.tool_telemetry_cache.is_none(),
+            "ttl=0 disables caching — nothing should be memoized"
+        );
+    }
+
+    #[test]
+    fn record_invalidates_aggregation_cache() {
+        let dir = tele_tmp("cache_inval");
+        let mut s = tele_session(&dir);
+        s.tool_telemetry_cache_ttl = std::time::Duration::from_secs(3600);
+        s.tool_telemetry_batch_size = 1; // each record flushes immediately
+        s.tool_telemetry_cache = None;
+
+        assert_eq!(aggregate_cached(&mut s).total, 0);
+        assert!(s.tool_telemetry_cache.is_some());
+
+        // A recorded event clears the memoized snapshot...
+        let ok = ToolResult::text("t", "done", false);
+        record(&mut s, "read_file", &ok);
+        assert!(
+            s.tool_telemetry_cache.is_none(),
+            "record must invalidate the aggregation cache"
+        );
+
+        // ...so the next aggregate reflects the freshly-persisted row.
+        assert_eq!(aggregate_cached(&mut s).total, 1);
     }
 }
