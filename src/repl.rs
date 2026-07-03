@@ -3580,6 +3580,7 @@ fn render_interactive_history_tail(
 ) -> Vec<String> {
     use crate::backend::Role;
     let mut rows: Vec<String> = Vec::new();
+    eprintln!("[DEBUG render_tail] processing {} messages", history.len());
     for m in history {
         match m.role {
             Role::User => {
@@ -3609,6 +3610,7 @@ fn render_interactive_history_tail(
                     // tests, piped runs) `render_stdout` returns the text
                     // unchanged, so the row content is stable to assert on.
                     let rendered = crate::md::render_stdout(text);
+                    eprintln!("[DEBUG render_tail] assistant text.len()={}, rendered.len()={}, lines={}", text.len(), rendered.len(), rendered.lines().count());
                     for line in rendered.lines() {
                         rows.push(line.to_string());
                     }
@@ -3641,6 +3643,7 @@ fn backfill_interactive(session: &Session) -> bool {
     }
     const TAIL_LINES: usize = 40;
     let rows = render_interactive_history_tail(&session.history, TAIL_LINES);
+    eprintln!("[DEBUG backfill] history.len()={}, rows.len()={}", session.history.len(), rows.len());
     if rows.is_empty() {
         return false;
     }
