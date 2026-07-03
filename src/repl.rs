@@ -3532,7 +3532,7 @@ fn interactive_replay_header() -> String {
 ///
 /// Pure (no IO) so it's unit-testable without a TTY. Renders, oldest-first:
 ///   • operator prompts   → bold `💬 <text>` (the questions you typed)
-///   • assistant prose     → plain text lines (the answers)
+///   • assistant prose     → humanized markdown (md::render_stdout — the answers)
 ///   • assistant tool use  → a dim `🔧 <name>` line per tool call
 /// Tool-result feed-back messages (User role, empty text, `tool_results` only)
 /// are skipped — they were ephemeral dim chrome on screen and are the bulkiest.
@@ -3565,7 +3565,16 @@ fn render_interactive_history_tail(
             Role::Assistant => {
                 let text = m.text.trim();
                 if !text.is_empty() {
-                    for line in text.lines() {
+                    // Humanize the markdown the same way the live interactive
+                    // loop does (`md::render_stdout` — see the reply-render at the
+                    // top of `run`) so the replayed history matches what was
+                    // originally on screen: bold, tables, colors, emoji. Printing
+                    // `m.text` verbatim showed raw markdown source instead (the
+                    // reported "not humanized anymore" bug). Off a TTY (unit
+                    // tests, piped runs) `render_stdout` returns the text
+                    // unchanged, so the row content is stable to assert on.
+                    let rendered = crate::md::render_stdout(text);
+                    for line in rendered.lines() {
                         rows.push(line.to_string());
                     }
                 }
