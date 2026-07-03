@@ -602,12 +602,12 @@ fn anchor_bottom_after_wipe() {
 }
 
 /// Erase the current terminal line in place: carriage-return to column 1, then
-/// `ESC[2K` (clear entire line). Used right before [`open_attach_view`] on the
-/// interactive→worker Shift-Tab hop to wipe the ephemeral interactive prompt row
-/// that rustyline's `Cmd::Interrupt` leaves on screen (cursor parked at
-/// end-of-input, i.e. just past an empty prompt on the SAME row) so the attach
-/// header opens on a clean row instead of trailing a stray blank prompt. No-op
-/// off a tty.
+/// `ESC[2K` (clear entire line). Called at the top of [`open_attach_view`] to
+/// wipe the ephemeral interactive prompt/command row the cursor is parked on
+/// (rustyline's `Cmd::Interrupt` on a Shift-Tab hop leaves the cursor just past
+/// an empty prompt on the SAME row; a `:attach` command leaves the echoed
+/// command line above a blank row) so the attach header + backfill open on a
+/// clean row instead of starting ON the prompt. No-op off a tty.
 pub fn erase_current_line() {
     // SAFETY: plain isatty query.
     if unsafe { libc::isatty(1) } != 1 {
@@ -639,7 +639,21 @@ pub fn open_attach_view() {
     if unsafe { libc::isatty(1) } != 1 {
         return;
     }
+    // Only the FIRST hop off the interactive prompt should erase a line: that's
+    // the transition where the cursor is parked on the ephemeral prompt/command
+    // row. Subsequent Shift-Tab cycle hops (attach already active) must NOT
+    // erase, or they'd eat the last row of the previous worker's output.
+    let was_active = attach_view_active();
     ATTACH_ACTIVE.store(true, Ordering::Relaxed);
+    // Replace the ephemeral prompt/command row the cursor is parked on BEFORE
+    // the attach header + backfill print, so the worker view opens on a clean
+    // row instead of starting ON the prompt — the ":attach / Shift-Tab output
+    // starts at the prompt" UX bug. Centralized here so every attach entry point
+    // (`:attach`, `:attach goal`, and the Shift-Tab cycle) gets it uniformly on
+    // the first hop; callers no longer erase the line themselves.
+    if !was_active {
+        erase_current_line();
+    }
     // Re-assert the footer region + home into the bottom body row so the worker
     // view grows up from the bottom, mirroring a fresh clear without the wipe.
     anchor_bottom_after_wipe();
