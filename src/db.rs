@@ -2051,6 +2051,116 @@ mod tests {
         assert!(db.all_goals().unwrap().is_empty());
     }
 
+    /// Integration: persist a goal tree with milestones/blockers/status, reload
+    /// it via `all_goals()`, and drive the domain rollup (`subtree_progress` /
+    /// `subtree_percent`) + routing (`route_next`) over the LOADED records. This
+    /// ties the DB round-trip to the progress-% rollup and goal-aware routing in
+    /// one flow (TASK-283 AC#2).
+    #[test]
+    fn goal_rollup_and_routing_over_persisted_tree() {
+        use crate::goal::{route_next, subtree_percent, subtree_progress, Goal, GoalStatus};
+        let db = temp_db("goals_rollup_routing");
+
+        // root(0/1) ─┬─ ready(0/2)         ← actionable
+        //            └─ blocked(0/1,open)  ← skipped by routing
+        let mut root = Goal::new("root");
+        root.add_milestone("r1");
+        db.upsert_goal(&root).unwrap();
+
+        let mut ready = Goal::subgoal("ready", root.id.clone());
+        ready.add_milestone("a1");
+        ready.add_milestone("a2");
+        ready.milestones[0].done = true; // 1/2
+        db.upsert_goal(&ready).unwrap();
+
+        let mut blocked = Goal::subgoal("blocked", root.id.clone());
+        blocked.add_milestone("b1");
+        blocked.add_blocker("waiting on review");
+        db.upsert_goal(&blocked).unwrap();
+
+        // Reload from disk — everything below operates on the persisted copies.
+        let all = db.all_goals().unwrap();
+        assert_eq!(all.len(), 3);
+
+        // Rollup folds descendants: done = 0+1+0 = 1 ; total = 1+2+1 = 4 ⇒ 25%.
+        assert_eq!(subtree_progress(&root.id, &all), (1, 4));
+        assert_eq!(subtree_percent(&root.id, &all), 25);
+
+        // Routing over the loaded set picks the actionable subgoal, never the
+        // blocked one. (root itself is actionable too, but `ready` proves the
+        // blocker gate — assert the blocked goal is not chosen.)
+        let picked = route_next(&all).expect("something actionable");
+        assert_ne!(picked.title, "blocked", "blocked goal must be skipped");
+
+        // Clearing the blocker + a milestone-done bump survives a re-persist and
+        // is reflected on reload.
+        let mut blocked2 = all.iter().find(|g| g.title == "blocked").unwrap().clone();
+        blocked2.blockers[0].resolved = true;
+        blocked2.set_status(GoalStatus::Active);
+        db.upsert_goal(&blocked2).unwrap();
+        let reloaded = db.all_goals().unwrap();
+        let b = reloaded.iter().find(|g| g.title == "blocked").unwrap();
+        assert_eq!(b.open_blockers(), 0);
+        assert!(b.is_actionable(), "unblocked goal is actionable after reload");
+    }
+
+    /// Forward schema migration: a legacy aish.db that predates the `goals`
+    /// table opens cleanly, gains the goals schema, and preserves pre-existing
+    /// rows. Guards the `CREATE TABLE IF NOT EXISTS` init path against a real
+    /// older on-disk file (TASK-283 AC#2, schema round-trip).
+    #[test]
+    fn legacy_db_without_goals_table_migrates_forward() {
+        use crate::goal::Goal;
+        let path = std::env::temp_dir()
+            .join(format!("aish_test_legacy_migrate_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // Seed a "legacy" DB: only the history table, no goals schema at all.
+        {
+            let legacy = Connection::open(&path).unwrap();
+            legacy
+                .execute_batch(
+                    "CREATE TABLE history (
+                         id      INTEGER PRIMARY KEY,
+                         ts      TEXT NOT NULL DEFAULT current_timestamp,
+                         cwd     TEXT,
+                         kind    TEXT NOT NULL CHECK (kind IN ('input','output')),
+                         content TEXT NOT NULL
+                     );",
+                )
+                .unwrap();
+            legacy
+                .execute(
+                    "INSERT INTO history (cwd, kind, content) VALUES ('/tmp','input','cd repo')",
+                    [],
+                )
+                .unwrap();
+        }
+        // No goals table yet.
+        {
+            let check = Connection::open(&path).unwrap();
+            let has_goals: i64 = check
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='goals'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(has_goals, 0, "precondition: legacy db lacks goals table");
+        }
+
+        // Opening through Db migrates the schema forward without touching data.
+        let db = Db::open(&path).unwrap();
+        // Legacy row survived.
+        assert_eq!(db.recent_inputs(10).unwrap(), vec!["cd repo".to_string()]);
+        // Goals table now exists and is usable.
+        let g = Goal::new("post-migration goal");
+        db.upsert_goal(&g).unwrap();
+        assert_eq!(db.get_goal(&g.id).unwrap().unwrap().title, "post-migration goal");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn history_and_memories_roundtrip() {
         let db = temp_db("roundtrip");
