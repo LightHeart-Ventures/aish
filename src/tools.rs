@@ -1488,6 +1488,67 @@ pub fn announce_raw(line: &str) {
     eprint!("\r\x1b[2K{line}\n");
 }
 
+/// Pure predicate for the finish-bell toggle: enabled unless `AISH_WORKER_BELL`
+/// is explicitly set to a falsey value (`0`/`off`/`false`/`no`, case-insensitive).
+/// An unset var or any other value → on (default). Kept pure so it's testable
+/// without touching process env.
+fn finish_bell_enabled_from(val: Option<&str>) -> bool {
+    match val {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// True when the audible finish-bell is enabled. On by default; opt out by
+/// setting `AISH_WORKER_BELL` to a falsey value (`0`/`off`/`false`/`no`).
+fn finish_bell_enabled() -> bool {
+    finish_bell_enabled_from(std::env::var("AISH_WORKER_BELL").ok().as_deref())
+}
+
+/// Emit an audible notification that a background worker/batch/coordinator just
+/// finished. Portable + dependency-free: writes the ASCII BEL (`\x07`) to the
+/// controlling terminal, which terminals render as an audible (or the user's
+/// configured visual) bell. Opt out with `AISH_WORKER_BELL=0`; override with a
+/// custom player via `AISH_WORKER_BELL_CMD` (split on whitespace, run shell-free,
+/// fire-and-forget) — e.g. `AISH_WORKER_BELL_CMD="paplay /usr/share/sounds/freedesktop/stereo/complete.oga"`.
+/// Best-effort: a missing player or non-tty never breaks the presenter.
+pub fn play_finish_bell() {
+    if !finish_bell_enabled() {
+        return;
+    }
+    // A custom sound command takes precedence when set + non-empty.
+    if let Ok(cmd) = std::env::var("AISH_WORKER_BELL_CMD") {
+        let cmd = cmd.trim();
+        if !cmd.is_empty() {
+            let mut parts = cmd.split_whitespace();
+            if let Some(prog) = parts.next() {
+                let args: Vec<&str> = parts.collect();
+                let _ = std::process::Command::new(prog)
+                    .args(&args)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                return;
+            }
+        }
+    }
+    // Default: ASCII BEL to the terminal. Prefer /dev/tty so the beep reaches the
+    // terminal even when stderr is redirected; fall back to stderr otherwise.
+    use std::io::Write;
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        let _ = tty.write_all(b"\x07");
+        let _ = tty.flush();
+    } else {
+        let mut err = std::io::stderr();
+        let _ = err.write_all(b"\x07");
+        let _ = err.flush();
+    }
+}
+
 /// Hang up every still-live managed job when the shell exits, so none is
 /// orphaned (TASK-123 / S3.6). For each non-terminal job with a known process
 /// group: if it is stopped, continue it first (SIGCONT) — a stopped process
@@ -3956,6 +4017,20 @@ fn char_ceil(s: &str, mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finish_bell_toggle_defaults_on_and_opts_out() {
+        // Default (unset) → enabled.
+        assert!(finish_bell_enabled_from(None));
+        // Falsey values (case/space-insensitive) → disabled.
+        for v in ["0", "off", "false", "no", "OFF", " No ", "FALSE"] {
+            assert!(!finish_bell_enabled_from(Some(v)), "{v:?} should disable the bell");
+        }
+        // Anything else → enabled.
+        for v in ["1", "on", "true", "yes", "", "beep"] {
+            assert!(finish_bell_enabled_from(Some(v)), "{v:?} should keep the bell on");
+        }
+    }
 
     fn spec<'a>(
         pattern: &'a str,
