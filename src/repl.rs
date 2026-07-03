@@ -552,6 +552,40 @@ pub async fn run(
         // badge count; `:update` reuses the SAME helper to warn about version
         // skew before swapping the binary (ISS-2045).
         let running = background_running_count(&session);
+        // TASK-292: auto-show a SOLE running coordinator's live stream. We're at
+        // the idle prompt here — no interactive command is pending (AC1) — so
+        // this is the safe point to reconcile. In Auto mode the target is "one
+        // live worker and nothing else competing"; when that flips we open/close
+        // the contained pane and flip show_worker_output. A user `:worker-output
+        // on|off` pin forces the mode away from Auto, so auto_output_target
+        // returns None and this never overrides the pin (AC3).
+        {
+            let live_workers = crate::worker::running_count(&session.worker_jobs);
+            if let Some(desired) = crate::worker::auto_output_target(
+                session.worker_output_mode(),
+                live_workers,
+                running,
+            ) {
+                let current = session.show_worker_output.load(Ordering::SeqCst);
+                if desired != current {
+                    session.show_worker_output.store(desired, Ordering::SeqCst);
+                    if desired {
+                        // AC1: sole coordinator started → surface its stream.
+                        crate::tools::print_above_prompt(format!(
+                            "worker output AUTO-ON — a sole coordinator is running; streaming its live activity (:worker-output off to silence):\n{}\n",
+                            crate::worker::pane_open()
+                        ));
+                    } else {
+                        // AC2: last coordinator finished (or a 2nd started) →
+                        // close the pane and fall back to the quiet default.
+                        crate::tools::print_above_prompt(format!(
+                            "{}\nworker output AUTO-OFF — no sole coordinator; back to quiet (⟳N pulse only)\n",
+                            crate::worker::pane_close()
+                        ));
+                    }
+                }
+            }
+        }
         // Colour the ⟳N badge by the most recent background-worker event
         // (green ✓ tool success, red ✗ tool failure, magenta ⟳ turn
         // completion), fading back to dim ⟳N after worker::PULSE_FADE.
@@ -1476,7 +1510,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("model", "switch model (opus|sonnet|haiku)"),
     ("model-detect", "pick the best local model for this machine"),
     ("new", "clear conversation history"),
-    ("output", "stream coordinators' activity"),
+    ("output", "stream coordinators' activity (on|off|auto)"),
     ("plugin", "plugin provenance (list|info <id>)"),
     ("quit", "exit aish"),
     ("reasoning", "show reasoning-quality telemetry (escalate vs guess)"),
@@ -5945,34 +5979,56 @@ async fn handle_colon(
             None => println!("usage: :kill <job-id>"),
         },
         Some("output" | "wo") => {
-            let target = match parts.next() {
-                Some("on") => Some(true),
-                Some("off") => Some(false),
-                None => Some(!session.show_worker_output.load(Ordering::SeqCst)),
+            use crate::worker::WorkerOutputMode;
+            // Tri-state: `on`/`off` PIN the stream (a pin always wins over
+            // auto-detection, AC3); `auto` hands control back to the sole-
+            // coordinator auto-show (TASK-292); bare toggles the effective value
+            // and pins it. `None` here means an unknown arg.
+            let target: Option<Option<bool>> = match parts.next() {
+                Some("on") => Some(Some(true)),
+                Some("off") => Some(Some(false)),
+                Some("auto") => Some(None),
+                None => Some(Some(!session.show_worker_output.load(Ordering::SeqCst))),
                 Some(_) => None,
             };
             match target {
-                Some(true) => {
-                    session.show_worker_output.store(true, Ordering::SeqCst);
+                // Pin ON.
+                Some(Some(true)) => {
+                    let was_on = session.show_worker_output.load(Ordering::SeqCst);
+                    session.set_worker_output_mode(WorkerOutputMode::ForcedOn);
                     println!(
-                        "worker output ON — background coordinators now stream their 💭 thinking, tool activity (🛠️ local · 🔧 MCP) and 🚀 standard/🐌 batch turn output, framed in a contained pane:"
+                        "worker output ON (pinned) — background coordinators now stream their 💭 thinking, tool activity (🛠️ local · 🔧 MCP) and 🚀 standard/🐌 batch turn output, framed in a contained pane:"
                     );
-                    // Open the contained pane: every streamed coordinator line
-                    // is now rendered as a bordered row under this top frame
-                    // (see worker::pane_row), so the activity reads as a
-                    // bordered side-column distinct from the user's own shell
-                    // scroll, not loose interleaved lines (w_sn1fHhd5).
-                    println!("{}", crate::worker::pane_open());
+                    // Open the contained pane only if it wasn't already open
+                    // (auto-show may already have opened it) so we never stack a
+                    // second top border. Every streamed coordinator line renders
+                    // as a bordered row under this frame (see worker::pane_row).
+                    if !was_on {
+                        println!("{}", crate::worker::pane_open());
+                    }
                 }
-                Some(false) => {
-                    session.show_worker_output.store(false, Ordering::SeqCst);
-                    // Close the contained pane, then report the quiet default.
-                    println!("{}", crate::worker::pane_close());
+                // Pin OFF.
+                Some(Some(false)) => {
+                    let was_on = session.show_worker_output.load(Ordering::SeqCst);
+                    session.set_worker_output_mode(WorkerOutputMode::ForcedOff);
+                    // Close the contained pane (only if it was open), then report.
+                    if was_on {
+                        println!("{}", crate::worker::pane_close());
+                    }
                     println!(
-                        "worker output OFF — background coordinators run quietly (only the ⟳N pulse + completion notice show)"
+                        "worker output OFF (pinned) — background coordinators run quietly (only the ⟳N pulse + completion notice show)"
                     );
                 }
-                None => println!("usage: :output [on|off]"),
+                // Hand back to auto-detection. The next prompt-render reconcile
+                // opens/closes the pane to match whether a sole coordinator is
+                // running, so we don't touch show_worker_output here.
+                Some(None) => {
+                    session.set_worker_output_mode(WorkerOutputMode::Auto);
+                    println!(
+                        "worker output AUTO — a sole running coordinator is auto-shown, then quiet again once it finishes (:worker-output on|off to pin)"
+                    );
+                }
+                None => println!("usage: :output [on|off|auto]"),
             }
         }
         Some("runtime") => {

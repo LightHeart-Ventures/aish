@@ -70,6 +70,74 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, cap: usize) -> S
 /// read as a transient "pulse", long enough to be seen at the next prompt draw.
 pub const PULSE_FADE: Duration = Duration::from_millis(900);
 
+// ---------------------------------------------------------------------------
+// Worker-output mode — auto-show a SOLE coordinator's live stream (TASK-292)
+// ---------------------------------------------------------------------------
+
+/// Tri-state controlling whether a background coordinator's live activity is
+/// forwarded to the terminal (the `:worker-output` toggle).
+///
+/// * `Auto` (the DEFAULT): aish decides. When exactly ONE background coordinator
+///   is running and nothing else competes for attention, the stream is shown;
+///   the moment it finishes (or a second job starts) it reverts to quiet. Makes
+///   single-job mode feel interactive without drowning the shell when several
+///   coordinators run at once.
+/// * `ForcedOn` / `ForcedOff`: the user pinned it with `:worker-output on|off`.
+///   A pin ALWAYS wins — auto-detection never touches a forced state (AC3). Run
+///   `:worker-output auto` to hand control back to auto-detection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum WorkerOutputMode {
+    /// aish auto-shows a sole coordinator and reverts when it finishes.
+    #[default]
+    Auto,
+    /// User pinned the stream ON — auto-detection is disabled.
+    ForcedOn,
+    /// User pinned the stream OFF — auto-detection is disabled.
+    ForcedOff,
+}
+
+impl WorkerOutputMode {
+    /// Serialize to the `u8` stored in the session's shared `AtomicU8`.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            WorkerOutputMode::Auto => 0,
+            WorkerOutputMode::ForcedOn => 1,
+            WorkerOutputMode::ForcedOff => 2,
+        }
+    }
+
+    /// Reconstruct from the stored `u8` (any unknown value decodes to `Auto`).
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => WorkerOutputMode::ForcedOn,
+            2 => WorkerOutputMode::ForcedOff,
+            _ => WorkerOutputMode::Auto,
+        }
+    }
+}
+
+/// Decide the effective auto target for the worker-output stream (TASK-292).
+///
+/// Returns `Some(true)` to auto-ENABLE the stream, `Some(false)` to auto-DISABLE
+/// it, or `None` when the mode is forced (a user `:worker-output on|off` pin
+/// wins — auto must NOT touch it, AC3).
+///
+/// The auto target is "a SOLE coordinator is running": exactly one live worker
+/// spawned by this session AND nothing else in the combined background tally
+/// competing for attention (`live_background == 1`). When that holds the stream
+/// is shown (AC1); when the last coordinator finishes — or a second job starts —
+/// it reverts to the quiet default (AC2). Pure, so it is unit-tested.
+pub fn auto_output_target(
+    mode: WorkerOutputMode,
+    live_workers: usize,
+    live_background: usize,
+) -> Option<bool> {
+    match mode {
+        WorkerOutputMode::Auto => Some(live_workers == 1 && live_background == 1),
+        WorkerOutputMode::ForcedOn | WorkerOutputMode::ForcedOff => None,
+    }
+}
+
 /// A single prompt-badge pulse event, derived from a coordinator's stderr.
 /// Most-recent-wins across all live workers (see [`fresh_pulse`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -4215,6 +4283,48 @@ mod tests {
             ));
         }
         assert_eq!(fresh_pulse(&jobs), None);
+    }
+
+    #[test]
+    fn worker_output_mode_u8_roundtrips() {
+        for m in [
+            WorkerOutputMode::Auto,
+            WorkerOutputMode::ForcedOn,
+            WorkerOutputMode::ForcedOff,
+        ] {
+            assert_eq!(WorkerOutputMode::from_u8(m.as_u8()), m);
+        }
+        // Default is Auto, and any unknown byte decodes to Auto (forward-compat).
+        assert_eq!(WorkerOutputMode::default(), WorkerOutputMode::Auto);
+        assert_eq!(WorkerOutputMode::from_u8(200), WorkerOutputMode::Auto);
+    }
+
+    #[test]
+    fn auto_output_target_shows_only_a_sole_coordinator() {
+        use WorkerOutputMode::*;
+        // AC1: exactly one live worker and nothing else competing → auto-ON.
+        assert_eq!(auto_output_target(Auto, 1, 1), Some(true));
+        // AC2: no coordinator running → auto-OFF (revert to quiet default).
+        assert_eq!(auto_output_target(Auto, 0, 0), Some(false));
+        // A second background job competing → not "sole" → auto-OFF.
+        assert_eq!(auto_output_target(Auto, 1, 2), Some(false));
+        // Two workers running → not sole → auto-OFF (streams would interleave).
+        assert_eq!(auto_output_target(Auto, 2, 2), Some(false));
+        // One worker but another (batch) job also live → not sole → auto-OFF.
+        assert_eq!(auto_output_target(Auto, 1, 3), Some(false));
+    }
+
+    #[test]
+    fn auto_output_target_never_overrides_a_user_pin() {
+        use WorkerOutputMode::*;
+        // AC3: a forced mode always returns None — auto-detection must not touch
+        // it, regardless of how many coordinators are (or aren't) running.
+        for workers in 0..=2 {
+            for background in 0..=3 {
+                assert_eq!(auto_output_target(ForcedOn, workers, background), None);
+                assert_eq!(auto_output_target(ForcedOff, workers, background), None);
+            }
+        }
     }
 
     #[test]
