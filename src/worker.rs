@@ -2091,6 +2091,19 @@ pub struct WorkerSpec {
     /// `:attach <id>` watches exactly one coordinator without flipping the
     /// session-wide toggle. Read per line, like `show_output`.
     pub attached: Arc<Mutex<Option<String>>>,
+    /// The LAUNCHING session's durable coordinator store (host `aish.db`), cloned
+    /// so `run_worker` can RECONCILE the child's `coordinator_runs` row after the
+    /// child exits. The child (`coordinator::drive`) inserts its own row as
+    /// `coordinating` and is normally responsible for finalizing it to
+    /// `done`/`failed` — but if the child is killed/crashes/hangs AFTER doing the
+    /// real work yet BEFORE writing that terminal phase, the row is orphaned in
+    /// `coordinating` forever (the "stale worker entry" bug: `:workers` /
+    /// `background_status` show it as still coordinating long after its PR merged).
+    /// The parent OUTLIVES the child (`child.wait()` returns) and holds the SAME
+    /// run id, so once the child is dead it patches any still-non-terminal row from
+    /// ground truth (exit status + `result.txt`). `None` for launch paths without a
+    /// store (tests, goal `run_once`); reconciliation is then a no-op.
+    pub coordinator_store: Option<crate::db::CoordinatorStore>,
 }
 
 impl WorkerSpec {
@@ -2109,6 +2122,18 @@ impl WorkerSpec {
             })
             .collect()
     }
+}
+
+/// Whether a durable `coordinator_runs` phase left behind by a child that has
+/// already exited still needs PARENT reconciliation. Terminal phases
+/// (`done`/`failed`) are the child's own authoritative verdict and are left
+/// untouched; anything else (`coordinating`, `awaiting_batch`, …) is an orphan
+/// once the child process is dead and no live writer can advance it — the "stale
+/// worker entry" the operator sees in `:workers`/`background_status`. Kept as a
+/// tiny pure predicate so the reconciliation policy is unit-testable without
+/// spawning a real child.
+fn phase_needs_reconcile(phase: &str) -> bool {
+    !matches!(phase, "done" | "failed")
 }
 
 impl WorkerJob {
@@ -2791,6 +2816,62 @@ from the parent repo; not auto-merged.)",
             WORKER_TIMEOUT.as_secs()
         )),
     }
+    // ── Durable-row reconciliation (stale "coordinating" safety net).
+    //
+    // The child `coordinator::drive` owns finalizing its own `coordinator_runs`
+    // row, but if it dies AFTER completing the work yet BEFORE writing the
+    // terminal phase (SIGKILL, panic, container teardown, DB write dropped), the
+    // row is orphaned as `coordinating` forever — the reported bug where
+    // `:workers`/`background_status` show a run "coordinating" long after its PR
+    // merged. The parent has just reaped the child (`child.wait()` returned) and
+    // holds the SAME `run_id`, so it is now SAFE (no live writer to race) to patch
+    // any row the child left non-terminal. We ONLY touch a still-non-terminal row:
+    // when the child DID finalize, its record is authoritative and left untouched.
+    if let Some(store) = spec.coordinator_store.as_ref() {
+        let non_terminal = match store.result_for_run(&run_id) {
+            Ok(Some(r)) => phase_needs_reconcile(&r.phase),
+            // No row (goal `run_once`, container DB not host-shared) — nothing to
+            // reconcile here; the periodic salvage sweep covers those.
+            Ok(None) | Err(_) => false,
+        };
+        if non_terminal {
+            let outcome = match status {
+                Some(s) if s.success() => {
+                    // Prefer the child's cross-boundary result channel, else the
+                    // captured stdout, so the reconciled row still carries an answer.
+                    let result = crate::worker_store::read_result(&run_id)
+                        .filter(|r| !r.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            let t = out.trim();
+                            if t.is_empty() { "(no output)".to_string() } else { t.to_string() }
+                        });
+                    store.set_done(&run_id, &result)
+                }
+                Some(s) => store.set_failed(
+                    &run_id,
+                    &format!(
+                        "{} (durable row reconciled by parent — child exited without finalizing)",
+                        describe_failure(s, "worker", &err)
+                    ),
+                ),
+                None => store.set_failed(
+                    &run_id,
+                    &format!(
+                        "worker timed out after {}s (durable row reconciled by parent — child killed before finalizing)",
+                        WORKER_TIMEOUT.as_secs()
+                    ),
+                ),
+            };
+            match outcome {
+                Ok(()) => eprintln!(
+                    "\x1b[2maish: reconciled orphaned coordinator row {run_id} (child exited without finalizing its status)\x1b[0m"
+                ),
+                Err(e) => eprintln!(
+                    "\x1b[2maish: failed to reconcile orphaned coordinator row {run_id}: {e}\x1b[0m"
+                ),
+            }
+        }
+    }
     on_complete(&jobs, &job);
 }
 
@@ -3012,6 +3093,38 @@ fn flush_results(jobs: &WorkerJobs) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconcile_only_patches_non_terminal_phases() {
+        // Child's own authoritative verdict — parent must NOT overwrite.
+        assert!(!phase_needs_reconcile("done"));
+        assert!(!phase_needs_reconcile("failed"));
+        // Orphaned mid-flight phases the dead child never finalized — the stale
+        // "coordinating" row the operator saw for w_zrdvGyJC. Parent reconciles.
+        assert!(phase_needs_reconcile("coordinating"));
+        assert!(phase_needs_reconcile("awaiting_batch"));
+        assert!(phase_needs_reconcile("queued"));
+    }
+
+    #[test]
+    fn reconcile_finalizes_a_stale_coordinating_row() {
+        // End-to-end store-side proof: a child inserts its row as `coordinating`,
+        // dies without finalizing, and the parent's reconcile path (guarded by
+        // `phase_needs_reconcile`) advances it to `done` from ground truth.
+        let dir = std::env::temp_dir().join(format!("aish-reconcile-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = crate::db::CoordinatorStore::open(&dir.join("aish.db")).unwrap();
+        store.insert("w_stale", "resolve conflict for #444", "sess", None).unwrap();
+        let before = store.result_for_run("w_stale").unwrap().unwrap();
+        assert_eq!(before.phase, "coordinating");
+        assert!(phase_needs_reconcile(&before.phase));
+        // Parent reconciles on child exit (success):
+        store.set_done("w_stale", "PR #444 merged").unwrap();
+        let after = store.result_for_run("w_stale").unwrap().unwrap();
+        assert_eq!(after.phase, "done");
+        assert!(!phase_needs_reconcile(&after.phase));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn should_forward_gates_on_toggle_or_attach() {
