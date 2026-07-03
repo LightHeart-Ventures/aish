@@ -322,6 +322,7 @@ pub async fn run(
         // SecondStatusLine reads. Clones are cheap (Arc handles).
         let alert_store = session.alert_store.clone();
         let alert_banner = session.alert_banner.clone();
+        let worker_banner = session.worker_banner.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(400));
             loop {
@@ -397,13 +398,23 @@ pub async fn run(
                 }
                 // Notify (one line per finished job), don't dump the full result
                 // over the prompt — the user views it on demand with `:result`.
-                let mut notices = crate::batch::notify_pending(&batch_jobs);
-                notices.extend(crate::worker::notify_pending(&worker_jobs));
-                if !notices.is_empty() {
+                // Batch notices still surface above the prompt; the worker-done
+                // notice is MOVED onto the SecondStatusLine footer badge (a
+                // colorized banner the status-line builder reads) instead of
+                // being printed-and-dropped over the prompt.
+                let batch_notices = crate::batch::notify_pending(&batch_jobs);
+                if !batch_notices.is_empty() {
                     finished_bell = true;
                 }
-                for n in notices {
+                for n in batch_notices {
                     crate::tools::print_above_prompt(format!("{n}\n"));
+                }
+                let worker_notices = crate::worker::notify_pending(&worker_jobs);
+                if !worker_notices.is_empty() {
+                    finished_bell = true;
+                    if let Ok(mut b) = worker_banner.lock() {
+                        *b = Some(worker_notices.join("  \u{b7}  "));
+                    }
                 }
                 // Auto-resume wake hook: observe this session's fanned-out
                 // coordinators. Snapshot every worker's terminal-ness and the
@@ -1171,6 +1182,17 @@ fn coordinator_status_message(session: &Session) -> String {
             badge
         } else {
             format!("{badge}  {left}")
+        };
+    }
+    // A finished background coordinator stashes its colorized completion NOTICE
+    // here (moved off the outputfield). It claims the head of the row after any
+    // alert badge; the notice is already colorized by `worker::notify_pending`
+    // (green ✓ done / red ✗ failed), and `clip_visible` clamps it to width.
+    if let Some(banner) = session.worker_banner.lock().ok().and_then(|b| b.clone()) {
+        left = if left.trim().is_empty() {
+            banner
+        } else {
+            format!("{banner}  {left}")
         };
     }
     // Right-justify the session name (`:rename`) on this row, directly above the
