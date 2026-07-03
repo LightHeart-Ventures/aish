@@ -4335,6 +4335,40 @@ mod tests {
         r.content
     }
 
+    #[test]
+    fn parse_argv_preserves_normal_subcommands() {
+        // Regression guard for the false-alarm "git broke" report: PR #489
+        // removed the shell-refusal policy but MUST NOT touch how a normal
+        // binary + subcommand is parsed. The exact reported command
+        // `git status` has to survive parse_argv byte-for-byte, or direct
+        // dispatch of `git <sub>` would collapse to a bare `git` (which then
+        // errors with "git needs a subcommand").
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let (p, a) = parse_argv(&call("git", &["status"], None)).unwrap();
+        assert_eq!((p.as_str(), a), ("git", v(&["status"])));
+
+        let (p, a) = parse_argv(&call("git", &["log", "--oneline", "-n", "1"], None)).unwrap();
+        assert_eq!((p.as_str(), a), ("git", v(&["log", "--oneline", "-n", "1"])));
+
+        // Absolute-path program + subcommand is likewise passed through intact.
+        let (p, a) = parse_argv(&call("/usr/bin/git", &["status"], None)).unwrap();
+        assert_eq!((p.as_str(), a), ("/usr/bin/git", v(&["status"])));
+    }
+
+    #[tokio::test]
+    async fn shell_invocations_are_allowed() {
+        // PR #489 removed aish's shell-refusal guard so an agent CAN drive a
+        // shell when it genuinely needs one. Lock that behavior in: `sh -c` and
+        // `bash -c` must actually execute end-to-end (the negative tests that
+        // #489 deleted asserted the opposite — this positive test replaces the
+        // lost coverage and fails loudly if the guard is ever reintroduced).
+        let out = run(&call("sh", &["-c", "echo hi"], None)).await;
+        assert_eq!(out.trim(), "hi");
+        let out = run(&call("bash", &["-c", "echo hi"], None)).await;
+        assert_eq!(out.trim(), "hi");
+    }
+
     #[tokio::test]
     async fn normal_command_unaffected() {
         let out = run(&call("echo", &["hi"], None)).await;
