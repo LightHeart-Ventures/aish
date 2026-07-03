@@ -572,7 +572,7 @@ pub async fn run(
                     if desired {
                         // AC1: sole coordinator started → surface its stream.
                         crate::tools::print_above_prompt(format!(
-                            "worker output AUTO-ON — a sole coordinator is running; streaming its live activity (:worker-output off to silence):\n{}\n",
+                            "worker output AUTO-ON — a sole coordinator is running; streaming its live activity (:output off to silence):\n{}\n",
                             crate::worker::pane_open()
                         ));
                     } else {
@@ -6176,7 +6176,7 @@ async fn handle_colon(
                 Some(None) => {
                     session.set_worker_output_mode(WorkerOutputMode::Auto);
                     println!(
-                        "worker output AUTO — a sole running coordinator is auto-shown, then quiet again once it finishes (:worker-output on|off to pin)"
+                        "worker output AUTO — a sole running coordinator is auto-shown, then quiet again once it finishes (:output on|off to pin)"
                     );
                 }
                 None => println!("usage: :output [on|off|auto]"),
