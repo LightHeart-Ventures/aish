@@ -1161,14 +1161,12 @@ fn coordinator_status_message(session: &Session) -> String {
         None => left,
     };
     // A fired `:alert` claims the head of this row until the next prompt — the
-    // compact banner the presenter stashed. Yellow so it stands apart from the
-    // worker badges; the full detail already printed above the prompt.
+    // compact banner the presenter stashed, prefixed with the alarm-clock glyph
+    // (same one the `:workers` table uses for `:alert` monitors) and painted
+    // bold yellow so it stands apart from the worker badges; the full detail
+    // already printed above the prompt.
     if let Some(banner) = session.alert_banner.lock().ok().and_then(|b| b.clone()) {
-        let badge = if color_on {
-            format!("\x1b[1;33m{banner}\x1b[0m")
-        } else {
-            banner
-        };
+        let badge = crate::style::alert_badge(&banner, color_on);
         left = if left.trim().is_empty() {
             badge
         } else {
@@ -5693,7 +5691,7 @@ async fn handle_colon(
                     w.started_epoch().unwrap_or(0),
                     format!(
                         "| {} {} | {} * | {} | {} | {} | {} | {} |\n",
-                        crate::style::job_type_emoji("worker"),
+                        crate::style::job_activity_emoji(&w.task),
                         id_cell,
                         me_label,
                         crate::style::styled_status(&w.status()),
@@ -5780,7 +5778,7 @@ async fn handle_colon(
                             started.unwrap_or(0),
                             format!(
                                 "| {} {} | {} | {} | {} | {} | {} | {} |\n",
-                                crate::style::job_type_emoji("coordinator"),
+                                crate::style::job_activity_emoji(&r.task),
                                 crate::batch::short_id(&r.run_id),
                                 session_cell,
                                 crate::style::styled_status(&r.phase),
