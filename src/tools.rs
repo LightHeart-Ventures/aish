@@ -688,6 +688,8 @@ pub async fn execute(
                 content,
                 is_error: false,
                 structured,
+                output_schema: None,
+                schema_violation: None,
             },
             Err(e) => ToolResult::text(call.id.clone(), format!("error: {e:#}"), true),
         };
