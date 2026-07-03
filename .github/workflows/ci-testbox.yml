@@ -2,28 +2,45 @@ name: CI Testbox
 
 # Warmup workflow for Blacksmith Testbox (https://blacksmith.sh).
 #
-# This is NOT a normal CI job — it exists so `blacksmith testbox warmup
-# ci-testbox.yml` can provision a warm VM that mirrors the real CI gate
-# (see ci.yml). The setup steps below run once during warmup to install the
-# Rust toolchain and pre-compile the dependency graph + test harness, so
-# subsequent `blacksmith testbox run` calls only recompile the files you
-# changed — turning the pre-PR test loop into seconds instead of a cold build.
+# This is NOT a normal CI job — it exists so `blacksmith testbox warmup` can
+# provision a warm VM that mirrors the real CI gate (see ci.yml), then keep it
+# alive so `blacksmith testbox run` can exec commands against it over SSH. The
+# setup steps run once during warmup to install the Rust toolchain and
+# pre-compile the dependency graph + test harness, so subsequent
+# `testbox run` calls only recompile the files you changed — turning the
+# pre-PR test loop into seconds instead of a cold build.
 #
 # Why this exists: cargo builds of aish OOM-kill in local coordinator
-# worktrees (the heavy `local` mistralrs feature). Testbox runs the exact
-# gate remotely on a 4vcpu Blacksmith VM with a warm cargo cache, off the
-# local box entirely.
+# worktrees (the heavy `local` mistralrs feature). Testbox runs the exact gate
+# remotely on a 4vcpu Blacksmith VM with a warm cargo cache, off the local box
+# entirely.
+#
+# The begin-testbox / run-testbox action pair is load-bearing — WITHOUT it the
+# VM is reclaimed the moment the job's last step finishes and `testbox run`
+# has nothing to connect to. begin-testbox (right after checkout) phones home,
+# installs the SSH key, and starts a heartbeat; run-testbox (the final step)
+# signals "ready" and holds the runner open until the idle timeout. All the
+# real setup goes BETWEEN them so the warm state is captured on the live VM.
 #
 # Usage:
-#   blacksmith testbox warmup ci-testbox.yml            # → tbx_...  (save the ID)
+#   blacksmith testbox warmup .github/workflows/ci-testbox.yml --job testbox
+#     # → prints tbx_...  (save the ID)
 #   blacksmith testbox run --id <ID> "cargo test --no-default-features --locked"
+#   blacksmith testbox stop --id <ID>
 #
-# workflow_dispatch (not push/PR) so it never burns CI minutes on its own —
-# it only runs when Testbox dispatches it. GitHub requires the file to live on
-# the default branch before it becomes dispatchable.
+# workflow_dispatch (not push/PR) so it never burns CI minutes on its own — it
+# only runs when Testbox dispatches it. GitHub requires this file to live on
+# the default branch (main) before it becomes dispatchable; warmup then runs
+# the file's content from whatever --ref you point it at (default: current
+# branch).
 
 on:
   workflow_dispatch:
+    inputs:
+      testbox_id:
+        description: 'Testbox session ID (injected by `blacksmith testbox warmup`; leave empty for a validation-only run)'
+        required: false
+        default: ''
 
 jobs:
   testbox:
@@ -31,6 +48,14 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
+
+      # First half of the Testbox pair: phone home, install the SSH key the
+      # CLI will connect with, ensure rsync, and start the heartbeat. Must run
+      # right after checkout and before any setup steps.
+      - name: Begin Testbox
+        uses: useblacksmith/begin-testbox@v2
+        with:
+          testbox_id: ${{ inputs.testbox_id }}
 
       - name: Install Rust toolchain
         run: |
@@ -55,3 +80,9 @@ jobs:
         run: |
           cargo fetch --locked
           cargo test --no-default-features --locked --no-run
+
+      # Second half of the Testbox pair: signal "ready", print connection info,
+      # and hold the runner open until idle timeout so `testbox run` can exec
+      # against the warm VM. Must be the final step.
+      - name: Run Testbox
+        uses: useblacksmith/run-testbox@v2
