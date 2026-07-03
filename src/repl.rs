@@ -2314,6 +2314,22 @@ const NUMERIC_ARG_COMMANDS: &[&str] = &[
     "kill", "head", "tail", "top", "w", "nice", "renice", "fold", "split",
 ];
 
+/// Standalone English function words that betray narration rather than an argv.
+/// A real invocation of an ambiguous command names flags/paths/values; it never
+/// carries a bare "for"/"the"/"did" as an operand. So when a line led by an
+/// ambiguous command holds one of these AND no command syntax (flag/path/dot/
+/// URL/glob), it's prose — even when it embeds an entity id (`w_0uqStqam`,
+/// `orch_…`) or a number that would otherwise defeat the all-alpha fast path.
+/// Deliberately excludes tokens that plausibly double as real args/targets
+/// ("now", "all", "clean") and the ambiguous lead words themselves ("who",
+/// "what"). Surface-form stopgap; superseded by model route preview (S5/S6).
+const ENGLISH_FUNCTION_WORDS: &[&str] = &[
+    "a", "an", "the", "for", "to", "of", "that", "this", "these", "those", "is",
+    "are", "was", "were", "did", "does", "so", "please", "about", "into",
+    "from", "with", "and", "then", "than", "why", "how", "when", "where",
+    "which", "your", "our", "its",
+];
+
 fn looks_like_prose(line: &str, words: &[String]) -> bool {
     // The membership check is case-insensitive: on a case-insensitive
     // filesystem (macOS) `PR`/`What`/`FIND` resolve to the lowercase binary, so
@@ -2347,6 +2363,25 @@ fn looks_like_prose(line: &str, words: &[String]) -> bool {
     // Fast path / strict rule: a line of nothing but plain words is prose.
     // (Keeps "what is the capital of texas" routing to the model.)
     if trimmed.iter().all(|w| is_alpha(w)) {
+        return true;
+    }
+
+    // The `open PR for the work w_0uqStqam did` class: an English sentence the
+    // all-alpha path misses because it embeds a non-alphabetic token — usually
+    // an aish/atum entity id the user is *referring to* (`w_0uqStqam`,
+    // `orch_…`, `card_…`), or a bare number. A genuine invocation of these
+    // ambiguous commands is unambiguous *syntax*: a flag (`-a`), a path (`a/b`),
+    // a filename/host/version (a `.`), a URL (`:`), or a glob. So when the line
+    // carries NO such command syntax yet DOES hold a standalone English
+    // function word ("for"/"the"/"did"/"is"/…), read it as narration → model.
+    // This routes the reported line to the AI while keeping real multi-arg
+    // calls like `make clean_all install` (no function word) dispatching direct.
+    let is_cmd_syntax = |w: &str| w.starts_with('-') || w.contains(['/', '.', ':', '~', '*', '?', '[']);
+    let has_cmd_syntax = trimmed.iter().any(|w| is_cmd_syntax(w));
+    let has_function_word = trimmed
+        .iter()
+        .any(|w| ENGLISH_FUNCTION_WORDS.contains(&w.to_ascii_lowercase().as_str()));
+    if !has_cmd_syntax && has_function_word {
         return true;
     }
 
@@ -7435,6 +7470,26 @@ mod tests {
         assert!(!prose("tail 100")); // line count
         assert!(!prose("w 1")); // w's numeric arg
         assert!(!prose("top 1")); // top's numeric arg
+
+        // The `open PR for the work w_0uqStqam did` class: an English sentence
+        // that embeds an aish/atum entity id defeats the all-alpha fast path,
+        // but a standalone function word ("for"/"the"/"did") with no command
+        // syntax reveals it as narration → model.
+        assert!(prose("open PR for the work w_0uqStqam did"));
+        assert!(prose("open a PR for w_0uqStqam")); // id is the trailing token
+        assert!(prose("open PR 22 for the release")); // id-less number + words
+        assert!(prose("watch the run orch_c1b45797b841 for me"));
+        assert!(prose("cut a release for tag_v2")); // release intent w/ id token
+        // …without swallowing real multi-arg invocations. A `make`/`cat` line of
+        // bare (even underscored) targets carries NO function word, so it stays
+        // a command.
+        assert!(!prose("make clean_all install")); // two real make targets
+        assert!(!prose("cat log_a log_b")); // two real filenames
+        assert!(!prose("make build_all test_all")); // two real make targets
+        // A function word is not enough on its own — command syntax (flag/path/
+        // dot/URL) still pins the line to a direct dispatch.
+        assert!(!prose("open the_file.txt for review")); // dot → command
+        assert!(!prose("cat a/b/c for real")); // path → command
     }
 
     #[test]
