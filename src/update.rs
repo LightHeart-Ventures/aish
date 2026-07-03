@@ -438,9 +438,15 @@ fn now_secs() -> u64 {
 /// seconds); `0` is honoured verbatim (always fetch fresh). Falls back to
 /// [`DEFAULT_UPDATE_CHECK_TTL_SECS`] only when the var is unset or unparseable.
 pub fn check_ttl() -> u64 {
-    std::env::var("AISH_UPDATE_CHECK_TTL")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
+    parse_check_ttl(std::env::var("AISH_UPDATE_CHECK_TTL").ok().as_deref())
+}
+
+/// Pure parse of `AISH_UPDATE_CHECK_TTL` (whole seconds). `0` is honoured
+/// verbatim (always fetch fresh); unset/unparseable falls back to
+/// [`DEFAULT_UPDATE_CHECK_TTL_SECS`]. Never panics. Split out for unit tests
+/// that don't mutate process env (TASK-253 / FR-305).
+pub fn parse_check_ttl(v: Option<&str>) -> u64 {
+    v.and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_UPDATE_CHECK_TTL_SECS)
 }
 
@@ -448,13 +454,15 @@ pub fn check_ttl() -> u64 {
 /// else `~/.aish/config/update-check.json` (alongside the local-model
 /// selection, via [`crate::hwdetect::config_dir`] which creates the dir).
 pub fn cache_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("AISH_UPDATE_CHECK_CACHE_PATH") {
-        let p = PathBuf::from(p);
-        if !p.as_os_str().is_empty() {
-            return p;
-        }
-    }
-    crate::hwdetect::config_dir().join("update-check.json")
+    parse_cache_path(std::env::var_os("AISH_UPDATE_CHECK_CACHE_PATH").as_deref())
+        .unwrap_or_else(|| crate::hwdetect::config_dir().join("update-check.json"))
+}
+
+/// Pure parse of `AISH_UPDATE_CHECK_CACHE_PATH`: `Some(path)` when set and
+/// non-empty, else `None` (caller supplies the default location). Never panics.
+/// Split out for unit tests that don't mutate process env (TASK-253 / FR-305).
+pub fn parse_cache_path(v: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    v.map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
 }
 
 /// Pure TTL predicate: is a cache written at `last_check_ts` still fresh at
@@ -1083,6 +1091,34 @@ pub struct DrainOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- pure env-var parse helpers (TASK-253 / FR-305) -------------------
+
+    #[test]
+    fn parse_check_ttl_defaults_and_overrides() {
+        // Unset / unparseable / empty → default 24h.
+        assert_eq!(parse_check_ttl(None), DEFAULT_UPDATE_CHECK_TTL_SECS);
+        assert_eq!(parse_check_ttl(Some("nope")), DEFAULT_UPDATE_CHECK_TTL_SECS);
+        assert_eq!(parse_check_ttl(Some("")), DEFAULT_UPDATE_CHECK_TTL_SECS);
+        // Whole seconds honoured; 0 means "always fetch fresh".
+        assert_eq!(parse_check_ttl(Some("0")), 0);
+        assert_eq!(parse_check_ttl(Some("3600")), 3600);
+        assert_eq!(parse_check_ttl(Some("  120  ")), 120);
+    }
+
+    #[test]
+    fn parse_cache_path_some_when_set_else_none() {
+        use std::ffi::OsStr;
+        // Unset → None (caller supplies the default location).
+        assert_eq!(parse_cache_path(None), None);
+        // Empty string → None (treated as unset; never an empty path).
+        assert_eq!(parse_cache_path(Some(OsStr::new(""))), None);
+        // Non-empty → Some(path) verbatim.
+        assert_eq!(
+            parse_cache_path(Some(OsStr::new("/tmp/uc.json"))),
+            Some(PathBuf::from("/tmp/uc.json"))
+        );
+    }
 
     #[test]
     fn parses_versions_with_and_without_prefix_and_suffix() {
