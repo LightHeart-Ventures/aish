@@ -1403,14 +1403,14 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
         "rewrite",
         "AI-rewrite intent into a command (edit/accept before run)",
     ),
+    (
+        "schedule",
+        "run a task later/recurring (cron or `in 5 min …`); no args = list",
+    ),
     ("skill", "manage skills (add|search|list|remove)"),
     (
         "stop",
         "stand down an in-flight coordinator — harsher than :tell (--any: cross-session)",
-    ),
-    (
-        "schedule",
-        "run a task later/recurring (cron or `in 5 min …`); no args = list",
     ),
     (
         "suggest",
