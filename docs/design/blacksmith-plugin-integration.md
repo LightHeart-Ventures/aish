@@ -183,6 +183,81 @@ While the full plugin integration (stages 0–6 above) unfolds, operators can **
 
 ---
 
+## 8. Cost & time analysis: persistent vs. on-demand Testbox (from the last 10 PRs)
+
+**Question:** For a real burst-work session, what does it cost — and save — to (A) spin up a
+Blacksmith Testbox at the *start* of work and hold it, vs. (B) spin one up on-demand
+("I need to build → start a tester") each time?
+
+### 8.1 The measured baseline (PRs #462–#471, 2026-07-03)
+
+| Metric | Value |
+|---|---|
+| Session span | 18:30:33 → 19:28:32 = **~58 min** |
+| PRs opened | 10 (#462–#471) |
+| Code PRs (need build/test) | **7** (#463–#469) |
+| Version bumps (trivial) | 2 (#462, #470) |
+| CI/doc only | 1 (#471) |
+| Cadence | a new PR every **~5–6 min** |
+| CI gate | `cargo test --no-default-features --locked` on Blacksmith **4vcpu** ($0.008/min) |
+| CI wall-time | **~37s warm**, **~150–196s cold** (a `Cargo.lock` version bump busts the `hashFiles('**/Cargo.lock')` cache key → full recompile) |
+
+Every PR **already** runs this gate on Blacksmith automatically. The open question is only about the
+**pre-PR loop** — where coordinator worktrees OOM on `cargo test` (heavy `local` feature, `aish_sre` §3),
+so today the choice is *push-blind-and-round-trip-through-CI* or *OOM locally*.
+
+### 8.2 Cost model inputs
+
+- Blacksmith 4vcpu = **$0.008/min**; free tier **3,000 min/mo**.
+- Cold warmup (first compile, cache-restored target) ≈ **3–4 min** VM.
+- Warm incremental `testbox run` (few changed files) ≈ **~20–30s** VM.
+- Assume **~2 test iterations per code PR** → ~14 runs across the session.
+
+### 8.3 Strategy A — warm up at start, hold the whole session
+
+- 1 cold warmup (~4 min) **overlaps** with writing the first fix → ~0 felt wait.
+- VM stays alive ~58 min (bounded by session wall-clock); 14 runs are seconds each on the warm target.
+- **VM cost ≈ 58 min × $0.008 = ~$0.46/session** (worst case ~$0.70 if left to idle-timeout unstopped).
+- **Felt dev wait ≈ ~0** — tests are instant all session; OOM risk **eliminated**.
+
+### 8.4 Strategy B — on-demand ("start a tester when I need to build")
+
+- Each build burst: fresh-ish VM warmup (~3 min: cache restore + incremental link) + run + stop → ~4–5 min alive.
+- 7 bursts × ~4.5 min = **~32 VM-min ≈ ~$0.26/session** — cheaper on raw VM-minutes (no idle gaps billed).
+- **BUT** the ~3 min warmup is **not overlapped** — you've already written the code and are *blocked* waiting.
+  7 × ~3 min = **~15–21 min of felt, blocking wait/session**.
+- Because warmup (~3 min) ≈ cold CI (~3 min), for this cadence **B barely beats just-push-to-CI on time.**
+
+### 8.5 Head-to-head
+
+| | **A — warm at start** | **B — on-demand** |
+|---|---|---|
+| VM cost / session | ~**$0.46** (idle-inclusive) | ~**$0.26** |
+| Free-tier burn | ~58 min | ~32 min |
+| **Felt dev wait** | **~0** (warmup hidden behind coding) | **~15–21 min** (warmup blocks each build) |
+| OOM risk eliminated | ✅ | ✅ |
+| Best for | **batched multi-PR sessions (like this one)** | sparse, occasional one-off builds |
+
+### 8.6 Time saved vs. the no-Testbox baseline
+
+- Baseline pain per PR: OOM-retry locally, or push-blind + CI round-trip (~40s–3min, sometimes multiple pushes).
+- **Strategy A saves the most:** ~1.5–3 min/PR × 7 ≈ **~10–20 min/session**, and removes OOM entirely.
+- **Strategy B saves little on *time*:** re-paying ~3 min warmup per build ≈ CI cold time, so net ~0–1 min/PR over just-push-to-CI. It wins on *cash* only when a persistent VM would otherwise sit idle for hours.
+
+### 8.7 Recommendation
+
+- **The decision is about developer time, not dollars.** Both strategies sit far under the 3,000-min/mo
+  free tier: a heavy ~58-min session (~58 testbox-min + ~30–40 CI-min ≈ ~90–100 Blacksmith-min) → **~30 such
+  sessions/mo are free**. Real cash cost of either strategy for this volume ≈ **$0**.
+- **For burst sessions (one PR every ~5–6 min, like these 10): use Strategy A.** The idle VM cost (~$0.46,
+  likely $0 under free tier) buys instant, OOM-free tests across all 7 code PRs and saves ~10–20 min.
+- **Use Strategy B only for sparse/occasional builds** where holding a VM would waste idle hours — then the
+  ~3-min warmup-per-build latency is an acceptable trade for not paying idle minutes.
+- **Rule of thumb:** *warm up at start whenever you expect ≥3 build/test iterations within ~30 min; otherwise
+  spin on-demand.* This 10-PR session clears that bar 5× over → **A.**
+
+---
+
 ## Appendix: source references
 
 | Claim | Evidence |
