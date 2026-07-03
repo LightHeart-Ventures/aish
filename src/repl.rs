@@ -312,6 +312,11 @@ pub async fn run(
         // completions off the main thread and arms a coalesced resume; the main
         // loop drains it on its next idle pass. See session::ResumeState.
         let resume = session.resume.clone();
+        // `:alert` monitor plumbing shared with this presenter: the store to
+        // poll native alerts / claim fired ones, and the banner slot the
+        // SecondStatusLine reads. Clones are cheap (Arc handles).
+        let alert_store = session.alert_store.clone();
+        let alert_banner = session.alert_banner.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(400));
             loop {
@@ -319,6 +324,42 @@ pub async fn run(
                 if busy.load(Ordering::SeqCst) {
                     continue; // mid-command/turn — hold results until a pause
                 }
+                // ── `:alert` monitors ──────────────────────────────────────
+                // Evaluate due native alerts (file/command probes) token-free,
+                // then surface every fired alert (native OR semantic ones a
+                // delegated coordinator flipped) exactly once. `take_fired`
+                // advances each row armed→fired→done so it never repeats.
+                if let Some(store) = &alert_store {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    if let Ok(armed) = store.armed_alerts() {
+                        for a in armed {
+                            if a.due(now) {
+                                let _ = store.touch_alert_check(a.id, now);
+                                if let Some(fired) = crate::alert::poll(&a) {
+                                    let _ =
+                                        store.mark_alert_fired(a.id, &fired.detail, &fired.short);
+                                }
+                            }
+                        }
+                    }
+                    if let Ok(fired) = store.take_fired() {
+                        let mut ring = false;
+                        for (_id, detail, short, audible) in fired {
+                            crate::tools::print_above_prompt(format!("{detail}\n"));
+                            if let Ok(mut b) = alert_banner.lock() {
+                                *b = Some(short);
+                            }
+                            ring = ring || audible;
+                        }
+                        if ring {
+                            crate::alert::play_alert_bell();
+                        }
+                    }
+                }
+
                 // Set by any finish-branch below so we ring the audible bell
                 // ONCE per tick (never a double-beep when two branches fire).
                 let mut finished_bell = false;
@@ -1091,11 +1132,11 @@ fn coordinator_status_message(session: &Session) -> String {
         })
         .collect();
     let color_on = crate::style::colors_enabled();
-    let left = coordinator_status_line(attached.as_deref(), &workers, color_on);
+    let mut left = coordinator_status_line(attached.as_deref(), &workers, color_on);
     // Fold any active `:schedule` status (a task just fired / finished) onto the
     // SecondStatusLine ahead of the coordinator hint, so the operator sees
     // scheduled-task lifecycle transitions live in the footer.
-    let left = match session.schedule.status_line() {
+    left = match session.schedule.status_line() {
         Some(s) if left.is_empty() => {
             if color_on {
                 format!("\x1b[36m{s}\x1b[0m")
@@ -1112,6 +1153,21 @@ fn coordinator_status_message(session: &Session) -> String {
         }
         None => left,
     };
+    // A fired `:alert` claims the head of this row until the next prompt — the
+    // compact banner the presenter stashed. Yellow so it stands apart from the
+    // worker badges; the full detail already printed above the prompt.
+    if let Some(banner) = session.alert_banner.lock().ok().and_then(|b| b.clone()) {
+        let badge = if color_on {
+            format!("\x1b[1;33m{banner}\x1b[0m")
+        } else {
+            banner
+        };
+        left = if left.trim().is_empty() {
+            badge
+        } else {
+            format!("{badge}  {left}")
+        };
+    }
     // Right-justify the session name (`:rename`) on this row, directly above the
     // clock on the statusline below — in bold magenta. Blank when unnamed.
     crate::style::second_statusline_at(
@@ -3126,6 +3182,7 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
                 launch_session_name: session.name.clone(),
                 show_output: session.show_worker_output.clone(),
                 attached: session.attached.clone(),
+                coordinator_store: session.coordinator_store.clone(),
             };
             let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
             let message = format!(
@@ -3845,6 +3902,7 @@ fn resume_coordinator(prev_run_id: &str, message: &str, session: &mut Session) {
         launch_session_name: session.name.clone(),
         show_output: session.show_worker_output.clone(),
         attached: session.attached.clone(),
+        coordinator_store: session.coordinator_store.clone(),
     };
     // Resume IN PLACE: reuse the SAME `WorkerJob` — same visible id, same slot in
     // `:workers`, same attachment — instead of spawning a fresh worker. The job
@@ -4252,6 +4310,297 @@ fn take_any_flag<'a>(toks: &[&'a str]) -> (bool, Vec<&'a str>) {
 }
 
 /// Queue an operator message for an in-flight background coordinator — the
+// ───────────────────────── `:goal` subcommands (TASK-278) ─────────────────────────
+//
+// CRUD over the durable `crate::goal::Goal` records that TASK-277 persists in
+// `aish.db`. `goal_command` returns the text to print (so the dispatcher stays a
+// one-liner and the whole surface is unit-testable), mutating + persisting
+// `session.goals` as a side effect. Every path returns a helpful one-line
+// message on bad input — none panic (TASK-278 AC4). Unrecognized heads never
+// reach here: the dispatcher routes them to the back-compat batch pursuit loop.
+
+/// Short, stable handle for a goal in listings — the first 8 chars of its uuid.
+fn goal_short(id: &str) -> &str {
+    &id[..id.len().min(8)]
+}
+
+/// Coarse "N<unit> ago" for a unix-seconds stamp. Never panics on skew.
+fn goal_ago(secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(secs);
+    let d = (now - secs).max(0);
+    if d < 60 {
+        format!("{d}s ago")
+    } else if d < 3600 {
+        format!("{}m ago", d / 60)
+    } else if d < 86_400 {
+        format!("{}h ago", d / 3600)
+    } else {
+        format!("{}d ago", d / 86_400)
+    }
+}
+
+/// Heuristic date sniff for the optional trailing `[date]` of `:goal milestone`.
+/// Accepts ISO-ish `2025-01-31` or `1/31` / `01/31/2025` — a token made only of
+/// digits and `-`/`/` separators with at least one separator and one digit. Kept
+/// deliberately loose (no chrono dependency); a non-date trailing word simply
+/// stays part of the milestone name.
+fn looks_like_date(tok: &str) -> bool {
+    let ok_chars = tok.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '/');
+    let has_sep = tok.contains('-') || tok.contains('/');
+    let has_digit = tok.chars().any(|c| c.is_ascii_digit());
+    ok_chars && has_sep && has_digit && tok.len() >= 3
+}
+
+/// Render a goal's full detail block (used by `:goal show`).
+fn goal_detail(g: &crate::goal::Goal) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let (done, total) = g.milestone_progress();
+    let _ = writeln!(
+        s,
+        "\x1b[1mgoal [{}]\x1b[0m {} \x1b[2m{}\x1b[0m",
+        g.status,
+        g.title,
+        goal_short(&g.id)
+    );
+    if !g.description.is_empty() {
+        let _ = writeln!(s, "  {}", g.description);
+    }
+    let _ = writeln!(
+        s,
+        "  \x1b[2mupdated {} · created {}\x1b[0m",
+        goal_ago(g.updated_at),
+        goal_ago(g.created_at)
+    );
+    let _ = write!(s, "  milestones ({done}/{total})");
+    if g.milestones.is_empty() {
+        let _ = write!(s, " —");
+    } else {
+        s.push('\n');
+        for m in &g.milestones {
+            let mark = if m.done { "[x]" } else { "[ ]" };
+            let _ = writeln!(s, "    {mark} {}", m.title);
+        }
+        // trim the trailing newline from the last writeln for tidy joining below
+        while s.ends_with('\n') {
+            s.pop();
+        }
+    }
+    let open = g.open_blockers();
+    let _ = write!(s, "\n  blockers ({open} open)");
+    if g.blockers.is_empty() {
+        let _ = write!(s, " —");
+    } else {
+        s.push('\n');
+        for b in &g.blockers {
+            let mark = if b.resolved { "✓" } else { "✗" };
+            let _ = writeln!(s, "    {mark} {}", b.description);
+        }
+        while s.ends_with('\n') {
+            s.pop();
+        }
+    }
+    let _ = write!(s, "\n  linked");
+    if g.linked_tasks.is_empty() {
+        let _ = write!(s, " —");
+    } else {
+        let refs: Vec<String> = g
+            .linked_tasks
+            .iter()
+            .map(|t| match &t.title {
+                Some(title) => format!("{} ({title})", t.key),
+                None => t.key.clone(),
+            })
+            .collect();
+        let _ = write!(s, " {}", refs.join(", "));
+    }
+    s
+}
+
+/// Handle a persisted-goal subcommand, returning the line(s) to print. Mutating
+/// subcommands persist via `session.persist_goal` and update `current_goal_id`.
+fn goal_command(session: &mut Session, sub: &str, args: &str) -> String {
+    use crate::goal::{Goal, GoalStatus, TaskRef};
+    let args = args.trim();
+    match sub {
+        "new" => {
+            if args.is_empty() {
+                return "usage: :goal new <title>".into();
+            }
+            let g = Goal::new(args);
+            let (id, short, title) = (g.id.clone(), goal_short(&g.id).to_string(), g.title.clone());
+            session.persist_goal(g);
+            session.current_goal_id = Some(id);
+            format!("goal created \x1b[2m{short}\x1b[0m {title} — now current")
+        }
+        "show" => {
+            let g = if args.is_empty() {
+                session.current_goal().cloned()
+            } else {
+                session.find_goal_by_prefix(args).cloned()
+            };
+            match g {
+                Some(g) => {
+                    session.current_goal_id = Some(g.id.clone());
+                    goal_detail(&g)
+                }
+                None if args.is_empty() => {
+                    "no goals yet — `:goal new <title>` to create one".into()
+                }
+                None => format!("no goal matching \x1b[2m{args}\x1b[0m (ambiguous or unknown id)"),
+            }
+        }
+        "status" => {
+            let mut out = String::new();
+            if let Some(loop_) = &session.goal {
+                out.push_str(&loop_.status_line());
+                out.push('\n');
+            }
+            if session.goals.is_empty() {
+                out.push_str(
+                    "no goals yet — `:goal new <title>` to track one, or `:goal <condition>` to pursue one in the background",
+                );
+                return out;
+            }
+            let current = session.current_goal().map(|g| g.id.clone());
+            let mut goals: Vec<&Goal> = session.goals.iter().collect();
+            goals.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            use std::fmt::Write;
+            let _ = write!(out, "{} goal(s):", goals.len());
+            for g in goals {
+                let (done, total) = g.milestone_progress();
+                let marker = if Some(&g.id) == current.as_ref() { "*" } else { " " };
+                let open = g.open_blockers();
+                let blk = if open > 0 { format!(", {open} blocker(s)") } else { String::new() };
+                let _ = write!(
+                    out,
+                    "\n {marker} [{}] \x1b[2m{}\x1b[0m {} — {done}/{total} milestones{blk}",
+                    g.status,
+                    goal_short(&g.id),
+                    g.title
+                );
+            }
+            out
+        }
+        "link" => {
+            if args.is_empty() {
+                return "usage: :goal link <task-id> [title]".into();
+            }
+            // First token is the key; any remainder is a cached human title.
+            let mut it = args.splitn(2, char::is_whitespace);
+            let key = it.next().unwrap_or("").to_string();
+            let title = it.next().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+            let Some(mut g) = session.current_goal().cloned() else {
+                return "no current goal — `:goal new <title>` or `:goal show <id>` first".into();
+            };
+            let tref = match title {
+                Some(t) => TaskRef::with_title(key.clone(), t),
+                None => TaskRef::new(key.clone()),
+            };
+            g.link_task(tref);
+            let (short, gt) = (goal_short(&g.id).to_string(), g.title.clone());
+            session.persist_goal(g);
+            format!("linked {key} → \x1b[2m{short}\x1b[0m {gt}")
+        }
+        "block" => {
+            if args.is_empty() {
+                return "usage: :goal block <reason> [@waiting-on]".into();
+            }
+            // Optional trailing `@who` marks what the goal is waiting on.
+            let (reason, waiting) = match args.rsplit_once(char::is_whitespace) {
+                Some((head, last)) if last.starts_with('@') && last.len() > 1 => {
+                    (head.trim().to_string(), Some(last[1..].to_string()))
+                }
+                _ => (args.to_string(), None),
+            };
+            if reason.is_empty() {
+                return "usage: :goal block <reason> [@waiting-on]".into();
+            }
+            let desc = match waiting {
+                Some(who) => format!("{reason} (waiting on {who})"),
+                None => reason,
+            };
+            let Some(mut g) = session.current_goal().cloned() else {
+                return "no current goal — `:goal new <title>` or `:goal show <id>` first".into();
+            };
+            g.add_blocker(desc.clone());
+            let short = goal_short(&g.id).to_string();
+            session.persist_goal(g);
+            format!("blocked \x1b[2m{short}\x1b[0m: {desc}")
+        }
+        "unblock" => {
+            if args.is_empty() {
+                return "usage: :goal unblock <reason>   (matches an open blocker)".into();
+            }
+            let Some(mut g) = session.current_goal().cloned() else {
+                return "no current goal — nothing to unblock".into();
+            };
+            let needle = args.to_ascii_lowercase();
+            let hit = g
+                .blockers
+                .iter_mut()
+                .find(|b| !b.resolved && b.description.to_ascii_lowercase().contains(&needle));
+            match hit {
+                Some(b) => {
+                    b.resolved = true;
+                    let desc = b.description.clone();
+                    g.touch();
+                    session.persist_goal(g);
+                    format!("unblocked: {desc}")
+                }
+                None => format!("no open blocker matching \x1b[2m{args}\x1b[0m"),
+            }
+        }
+        "milestone" => {
+            if args.is_empty() {
+                return "usage: :goal milestone <name> [date]".into();
+            }
+            // Fold an optional trailing date token into the milestone title.
+            let title = match args.rsplit_once(char::is_whitespace) {
+                Some((head, last)) if looks_like_date(last) && !head.trim().is_empty() => {
+                    format!("{} (due {last})", head.trim())
+                }
+                _ => args.to_string(),
+            };
+            let Some(mut g) = session.current_goal().cloned() else {
+                return "no current goal — `:goal new <title>` or `:goal show <id>` first".into();
+            };
+            g.add_milestone(title.clone());
+            let short = goal_short(&g.id).to_string();
+            session.persist_goal(g);
+            format!("milestone added \x1b[2m{short}\x1b[0m: {title}")
+        }
+        "complete" => {
+            // `:goal complete [<id>]` — the named goal, else the current one.
+            let g = if args.is_empty() {
+                session.current_goal().cloned()
+            } else {
+                session.find_goal_by_prefix(args).cloned()
+            };
+            let Some(mut g) = g else {
+                return if args.is_empty() {
+                    "no current goal to complete — `:goal new <title>` first".into()
+                } else {
+                    format!("no goal matching \x1b[2m{args}\x1b[0m")
+                };
+            };
+            if g.status == GoalStatus::Completed {
+                return format!("already complete: \x1b[2m{}\x1b[0m {}", goal_short(&g.id), g.title);
+            }
+            g.set_status(GoalStatus::Completed);
+            let (short, title) = (goal_short(&g.id).to_string(), g.title.clone());
+            session.persist_goal(g);
+            format!("goal completed \x1b[2m{short}\x1b[0m {title} ✓")
+        }
+        // The dispatcher only routes known subcommands here.
+        other => format!("unknown :goal subcommand `{other}`"),
+    }
+}
+
+
 /// `:tell` / SendMessage channel. The message lands in the durable
 /// `coordinator_messages` mailbox keyed by the run's id and is folded into the
 /// coordinator's NEXT round (see `coordinator::drive`), so it's how you steer a
@@ -4368,6 +4717,55 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
 /// this session owns, additionally SIGINTs its process group so the in-flight
 /// turn aborts and the boundary is reached promptly. Candidate resolution and the
 /// AC7 `--any` ownership gate mirror `tell_coordinator`.
+/// Dispatch a background coordinator to resolve a SEMANTIC `:alert` — a
+/// condition no local probe can decide. The coordinator runs with the full
+/// toolset and, the moment it judges the condition met, calls the `set_alert`
+/// tool with this alert's id, which the presenter surfaces to the operator
+/// console exactly like a native probe. Returns false when no coordinator could
+/// be launched (missing credential / can't locate the aish binary), leaving the
+/// alert armed for a human/agent to fire manually.
+fn spawn_alert_coordinator(session: &mut Session, id: i64, description: &str) -> bool {
+    // A coordinator needs a credential for the active backend and our own exe.
+    let no_credential = match session.backend_kind.as_str() {
+        "grok" => !crate::backend::grok::credential_available(&session.env),
+        _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
+    };
+    if no_credential {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let task = format!(
+        "You are resolving an operator ALERT (the aish `:alert` feature). Watch for this \
+condition and, the INSTANT it is satisfied, call the `set_alert` tool with alert_id={id} and a \
+concise `message` describing what happened — that is the whole job. Use your tools to check \
+periodically (poll external state like PRs, files, services, logs as appropriate); do not spin in \
+a tight loop — space out your checks. If the condition is already true right now, fire immediately. \
+If after reasonable effort it is clearly unsatisfiable or you cannot determine it, stop and say so \
+instead of firing.\n\nCondition: {description}"
+    );
+    // Alert monitors observe live state; run in the shared cwd (no worktree
+    // isolation — they don't write code) so `gh`/file checks see the real world.
+    let spec = crate::worker::WorkerSpec {
+        exe,
+        cwd: session.cwd.clone(),
+        backend: session.backend_kind.clone(),
+        model: crate::worker::coordinator_model(&session.backend_kind, &session.batch_model),
+        env: session.env.clone(),
+        isolate: false,
+        base: "main".to_string(),
+        launch_session_id: session.session_id.clone(),
+        launch_session_name: session.name.clone(),
+        show_output: session.show_worker_output.clone(),
+        attached: session.attached.clone(),
+        coordinator_store: session.coordinator_store.clone(),
+    };
+    let _ = crate::worker::spawn(&session.worker_jobs, task, spec);
+    true
+}
+
+
 fn stop_coordinator(id: Option<&str>, any: bool, session: &mut Session) {
     let Some(id) = id else {
         println!(
@@ -5066,8 +5464,13 @@ async fn handle_colon(
                  :rename <name>                      name the session (prefixes the prompt); auto-set to the repo name at startup, bare :rename clears\n\
                  :rewrite <intent>                   AI-rewrite intent into ONE command, prefilled to edit/accept before it runs (alias :rw)\n\
                  :suggest [hint]                     AI-suggest the next command from session context, prefilled to edit/accept before it runs (alias :sg)\n\
+                 :alert <condition>                  monitor for a condition and surface it in the console when met (native file/PR/command probe,\n\
+                                                     or a delegated agent for free-form conditions); distinct audible cue. :alert list, :alert clear <id|all>\n\
                  :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
                                                      a verifier judges each turn. :goal status, :goal clear\n\
+                 :goal new <title>                   track a durable goal (persisted); then link/block/milestone/show/complete\n\
+                 :goal link <task> [title]|block <reason>|milestone <name> [date]\n\
+                                                     annotate the current goal; :goal show [id], :goal complete [id]\n\
                  :loop <count> <prompt>              re-run <prompt> as an inline agentic turn <count> times;\n\
                                                      context accumulates across iterations. :loop status, :loop stop\n\
                  :allow                              list always-allowed tools/commands + dir grants\n\
@@ -5566,6 +5969,7 @@ async fn handle_colon(
                             show_output: session.show_worker_output.clone(),
                             attached: session.attached.clone(),
                             worker_jobs: session.worker_jobs.clone(),
+                            coordinator_store: session.coordinator_store.clone(),
                         };
                         println!("{}", session.schedule.add(rest, ctx));
                     }
@@ -5631,25 +6035,126 @@ async fn handle_colon(
                 println!("session named \x1b[1;35m[{rest}]\x1b[0m");
             }
         }
+        Some("alert") => {
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            let rest = rest.trim().to_string();
+            let lower = rest.to_lowercase();
+            match session.alert_store.clone() {
+                None => println!(
+                    "alert store unavailable — `:alert` needs the shared aish.db (check startup warnings)"
+                ),
+                // Bare `:alert` / `:alert list [all]` — show armed (and, with
+                // `all`, done/cancelled) monitors.
+                Some(store) if rest.is_empty() || lower == "list" || lower == "list all" || lower == "ls" => {
+                    let include_all = lower == "list all";
+                    match store.list_alerts(include_all) {
+                        Ok(rows) if rows.is_empty() => println!(
+                            "no alerts — `:alert <condition>` to arm one (e.g. `:alert let me know when PR 333 is merged`)"
+                        ),
+                        Ok(rows) => {
+                            println!("\x1b[1m ID  STATE      KIND      CONDITION\x1b[0m");
+                            for (id, state, kind, condition, _short) in rows {
+                                println!("{id:>3}  {state:<9} {kind:<8}  {condition}");
+                            }
+                            println!("\x1b[2m:alert clear <id|all> to cancel\x1b[0m");
+                        }
+                        Err(e) => println!("alert list failed: {e:#}"),
+                    }
+                }
+                // `:alert clear|cancel [<id>|all]`.
+                Some(store)
+                    if lower.starts_with("clear") || lower.starts_with("cancel") =>
+                {
+                    let arg = lower
+                        .strip_prefix("clear")
+                        .or_else(|| lower.strip_prefix("cancel"))
+                        .unwrap_or("")
+                        .trim();
+                    if arg.is_empty() || arg == "all" {
+                        match store.cancel_all_alerts() {
+                            Ok(0) => println!("no armed alerts to cancel"),
+                            Ok(n) => println!("cancelled {n} alert(s)"),
+                            Err(e) => println!("cancel failed: {e:#}"),
+                        }
+                    } else if let Ok(id) = arg.parse::<i64>() {
+                        match store.cancel_alert(id) {
+                            Ok(true) => println!("alert {id} cancelled"),
+                            Ok(false) => println!("no armed alert #{id}"),
+                            Err(e) => println!("cancel failed: {e:#}"),
+                        }
+                    } else {
+                        println!("usage: :alert clear [<id>|all]");
+                    }
+                }
+                // `:alert <condition>` — arm a monitor. A trailing `--silent`
+                // (or `--no-bell`) opts out of the audible cue.
+                Some(store) => {
+                    let (audible, cond) = if let Some(c) = rest.strip_suffix("--silent") {
+                        (false, c.trim())
+                    } else if let Some(c) = rest.strip_suffix("--no-bell") {
+                        (false, c.trim())
+                    } else {
+                        (true, rest.as_str())
+                    };
+                    if cond.is_empty() {
+                        println!("usage: :alert <condition>   e.g. :alert notify me when /tmp/build.done appears");
+                    } else {
+                        let kind = crate::alert::parse_condition(cond);
+                        match store.insert_alert(cond, &kind, audible, Some(&session.session_id)) {
+                            Ok(id) => match &kind {
+                                crate::alert::AlertKind::Semantic { description } => {
+                                    let dispatched =
+                                        spawn_alert_coordinator(session, id, description);
+                                    if dispatched {
+                                        println!(
+                                            "\x1b[1;33m⚠ alert #{id} armed\x1b[0m (semantic) — a background agent is watching; I'll surface it here the moment it's met."
+                                        );
+                                    } else {
+                                        println!(
+                                            "\x1b[1;33m⚠ alert #{id} armed\x1b[0m (semantic) — but no coordinator could be dispatched (credential/exe?); ask an agent to `set_alert {id}` when met, or `:alert clear {id}`."
+                                        );
+                                    }
+                                }
+                                _ => println!(
+                                    "\x1b[1;33m⚠ alert #{id} armed\x1b[0m ({}) — monitoring token-free; I'll surface it here when it fires. `:alert list` / `:alert clear {id}`.",
+                                    kind.tag()
+                                ),
+                            },
+                            Err(e) => println!("couldn't arm alert: {e:#}"),
+                        }
+                    }
+                }
+            }
+        }
+
         Some("goal") => {
             let rest = parts.collect::<Vec<_>>().join(" ");
             let rest = rest.trim();
-            match rest {
+            let mut goal_it = rest.splitn(2, char::is_whitespace);
+            let goal_head = goal_it.next().unwrap_or("");
+            let goal_tail = goal_it.next().unwrap_or("").trim();
+            match goal_head {
+                // Persisted-goal subcommands (TASK-278) — CRUD on the durable
+                // `Goal` records. Unrecognized heads fall through to the
+                // back-compat batch pursuit loop below.
+                "new" | "show" | "status" | "link" | "block" | "unblock" | "milestone"
+                | "complete" => println!("{}", goal_command(session, goal_head, goal_tail)),
+                // Bare `:goal`: the live loop's status if one is running, else a
+                // persisted-goal overview (which prints its own empty-state hint).
                 "" => match &session.goal {
                     Some(g) => println!("{}", g.status_line()),
-                    None => println!(
-                        "no goal set — `:goal <condition>` to set one (requires :batch on)"
-                    ),
+                    None => println!("{}", goal_command(session, "status", "")),
                 },
                 "clear" | "stop" | "off" | "reset" | "none" | "cancel" => match session.goal.take()
                 {
                     Some(g) => {
                         g.clear();
-                        println!("goal cleared");
+                        println!("goal loop cleared");
                     }
-                    None => println!("no goal set"),
+                    None => println!("no goal loop running"),
                 },
-                cond => {
+                _ => {
+                    let cond = rest;
                     if !session.batch_mode {
                         println!(
                             "`:goal` runs as background batch work — enable it first with `:batch on`"
@@ -5681,6 +6186,7 @@ async fn handle_colon(
                                     launch_session_name: session.name.clone(),
                                     show_output: session.show_worker_output.clone(),
                                     attached: session.attached.clone(),
+                                    coordinator_store: session.coordinator_store.clone(),
                                 };
                                 // KNOWN LIMITATION: the verifier still judges on
                                 // Claude (batch_model + the Claude credential
@@ -8123,5 +8629,105 @@ mod tests {
             aish, bash,
             "direct oracle failed to detect an intentional divergence — the harness is blind"
         );
+    }
+
+    // ───────── `:goal` persisted-subcommand surface (TASK-278) ─────────
+
+    #[test]
+    fn goal_new_creates_and_pins_current() {
+        let mut s = Session::new().unwrap();
+        let out = goal_command(&mut s, "new", "Ship the release");
+        assert!(out.contains("goal created"), "got: {out}");
+        assert!(out.contains("now current"), "got: {out}");
+        assert_eq!(s.goals.len(), 1);
+        assert_eq!(s.goals[0].title, "Ship the release");
+        // current_goal_id points at the just-created goal.
+        assert_eq!(s.current_goal_id.as_deref(), Some(s.goals[0].id.as_str()));
+    }
+
+    #[test]
+    fn goal_new_requires_a_title() {
+        let mut s = Session::new().unwrap();
+        let out = goal_command(&mut s, "new", "   ");
+        assert!(out.starts_with("usage:"), "got: {out}");
+        assert!(s.goals.is_empty());
+    }
+
+    #[test]
+    fn goal_link_block_milestone_apply_to_current() {
+        let mut s = Session::new().unwrap();
+        goal_command(&mut s, "new", "Land TASK-278");
+        let link = goal_command(&mut s, "link", "TASK-278 goal CRUD");
+        assert!(link.contains("linked TASK-278"), "got: {link}");
+        let ms = goal_command(&mut s, "milestone", "wire dispatcher 2025-01-31");
+        assert!(ms.contains("milestone added"), "got: {ms}");
+        assert!(ms.contains("(due 2025-01-31)"), "date folded in: {ms}");
+        let blk = goal_command(&mut s, "block", "waiting on review @grhohertz");
+        assert!(blk.contains("waiting on grhohertz"), "got: {blk}");
+
+        let g = s.current_goal().expect("current goal");
+        assert_eq!(g.linked_tasks.len(), 1);
+        assert_eq!(g.linked_tasks[0].key, "TASK-278");
+        assert_eq!(g.linked_tasks[0].title.as_deref(), Some("goal CRUD"));
+        assert_eq!(g.milestones.len(), 1);
+        assert_eq!(g.open_blockers(), 1);
+    }
+
+    #[test]
+    fn goal_unblock_matches_open_blocker() {
+        let mut s = Session::new().unwrap();
+        goal_command(&mut s, "new", "G");
+        goal_command(&mut s, "block", "waiting on CI");
+        let miss = goal_command(&mut s, "unblock", "nonsense");
+        assert!(miss.contains("no open blocker"), "got: {miss}");
+        assert_eq!(s.current_goal().unwrap().open_blockers(), 1);
+        let hit = goal_command(&mut s, "unblock", "ci");
+        assert!(hit.contains("unblocked"), "got: {hit}");
+        assert_eq!(s.current_goal().unwrap().open_blockers(), 0);
+    }
+
+    #[test]
+    fn goal_complete_is_terminal_and_idempotent() {
+        let mut s = Session::new().unwrap();
+        goal_command(&mut s, "new", "Finish");
+        let done = goal_command(&mut s, "complete", "");
+        assert!(done.contains("goal completed"), "got: {done}");
+        assert_eq!(s.current_goal().unwrap().status, crate::goal::GoalStatus::Completed);
+        let again = goal_command(&mut s, "complete", "");
+        assert!(again.contains("already complete"), "got: {again}");
+    }
+
+    #[test]
+    fn goal_show_and_status_render_without_panicking() {
+        let mut s = Session::new().unwrap();
+        // Empty-state messages first.
+        assert!(goal_command(&mut s, "status", "").contains("no goals yet"));
+        assert!(goal_command(&mut s, "show", "").contains("no goals yet"));
+        goal_command(&mut s, "new", "Observe everything");
+        goal_command(&mut s, "milestone", "add tracing");
+        let show = goal_command(&mut s, "show", "");
+        assert!(show.contains("Observe everything"), "got: {show}");
+        assert!(show.contains("milestones (0/1)"), "got: {show}");
+        let status = goal_command(&mut s, "status", "");
+        assert!(status.contains("1 goal(s):"), "got: {status}");
+        assert!(status.contains("Observe everything"), "got: {status}");
+    }
+
+    #[test]
+    fn goal_subcommands_need_a_current_goal() {
+        let mut s = Session::new().unwrap();
+        // With no goals, mutators explain themselves instead of panicking.
+        for sub in ["link", "block", "milestone"] {
+            let out = goal_command(&mut s, sub, "whatever");
+            assert!(out.contains("no current goal"), "{sub}: {out}");
+        }
+    }
+
+    #[test]
+    fn goal_show_unknown_prefix_reports_miss() {
+        let mut s = Session::new().unwrap();
+        goal_command(&mut s, "new", "A goal");
+        let out = goal_command(&mut s, "show", "deadbeefcafe");
+        assert!(out.contains("no goal matching"), "got: {out}");
     }
 }

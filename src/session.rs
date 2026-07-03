@@ -308,6 +308,18 @@ pub struct Session {
     /// subgoals, milestones, blockers, and task links alongside memories in
     /// aish.db. None if it failed to open — goals then aren't persisted.
     pub goal_store: Option<crate::db::GoalStore>,
+    /// Durable `:alert` monitor store (shares aish.db). Cloneable — the
+    /// background presenter, the `:alert` command handler, and the `set_alert`
+    /// tool all hold a handle. None if it failed to open.
+    pub alert_store: Option<crate::db::AlertStore>,
+    /// The current fired-alert banner for the SecondStatusLine, shared with the
+    /// background presenter which sets it when an alert surfaces. `None` = no
+    /// pending alert banner.
+    pub alert_banner: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Id of the goal `:goal` subcommands target by default (set by `:goal
+    /// new` / `:goal show <id>`). Session-local (not persisted); falls back to
+    /// the active goal when unset or stale. (TASK-278)
+    pub current_goal_id: Option<String>,
     /// True when THIS aish is itself a background coordinator (env
     /// `AISH_COORDINATOR=1`). The nested guard: a coordinator must never spawn
     /// its own workers (no infinite re-exec recursion), so `run_in_background`
@@ -514,6 +526,9 @@ impl Session {
             schedule: crate::schedule::Scheduler::new(),
             coordinator_store: None,
             goal_store: None,
+            alert_store: None,
+            alert_banner: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            current_goal_id: None,
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
             goal: None,
             goals: Vec::new(),
@@ -824,6 +839,39 @@ impl Session {
             let title = crate::goal::truncate_condition(&g.title);
             format!("🎯 {title} {}%", g.progress_percent())
         })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
     }
 
     /// The autonomy descriptor stamped on every hook payload (design §3.1): a

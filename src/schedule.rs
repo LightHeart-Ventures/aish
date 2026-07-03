@@ -43,6 +43,10 @@ pub struct SpawnCtx {
     pub show_output: Arc<AtomicBool>,
     pub attached: Arc<Mutex<Option<String>>>,
     pub worker_jobs: crate::worker::WorkerJobs,
+    /// Launching session's durable coordinator store, cloned so each scheduled
+    /// coordinator spawn can reconcile its own orphaned `coordinator_runs` row
+    /// after the child exits (mirrors `:dispatch`). `None` when no store is wired.
+    pub coordinator_store: Option<crate::db::CoordinatorStore>,
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +356,7 @@ fn build_spec(ctx: &SpawnCtx) -> crate::worker::WorkerSpec {
         launch_session_name: ctx.launch_session_name.clone(),
         show_output: ctx.show_output.clone(),
         attached: ctx.attached.clone(),
+        coordinator_store: ctx.coordinator_store.clone(),
     }
 }
 

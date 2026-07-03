@@ -116,7 +116,28 @@ impl Db {
                  created_at   INTEGER NOT NULL DEFAULT 0,
                  updated_at   INTEGER NOT NULL DEFAULT 0
              );
-             CREATE INDEX IF NOT EXISTS idx_goals_parent ON goals (parent_id);",
+             CREATE INDEX IF NOT EXISTS idx_goals_parent ON goals (parent_id);
+             -- Operator-armed condition monitors (crate::alert, :alert). One row
+             -- per armed alert. `kind_json` is the serialized AlertKind; `state`
+             -- moves armed → fired (or cancelled). Native alerts are polled by
+             -- the interactive presenter; semantic ones are resolved by a
+             -- delegated coordinator that flips state via set_alert.
+             CREATE TABLE IF NOT EXISTS alerts (
+                 id           INTEGER PRIMARY KEY,
+                 condition    TEXT NOT NULL,
+                 kind         TEXT NOT NULL DEFAULT 'semantic',
+                 kind_json    TEXT NOT NULL DEFAULT 'null',
+                 audible      INTEGER NOT NULL DEFAULT 1,
+                 state        TEXT NOT NULL DEFAULT 'armed'
+                              CHECK (state IN ('armed','fired','done','cancelled')),
+                 fired_detail TEXT,
+                 fired_short  TEXT,
+                 last_checked INTEGER NOT NULL DEFAULT 0,
+                 session_id   TEXT,
+                 created_at   INTEGER NOT NULL DEFAULT 0,
+                 fired_at     INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts (state);",
         )
         .context("schema init failed")?;
         let db = Self { conn };
@@ -1605,6 +1626,244 @@ pub struct GoalTaskLink {
     pub ref_id: String,
     pub created_at: String,
 }
+
+/// Durable store for `:alert` monitors. Own SQLite connection against the
+/// shared `aish.db` (same table the main [`Db`] schema declares), cloneable so
+/// the interactive presenter, the REPL command handler, and a delegated
+/// coordinator's `set_alert` tool all share it. Armed alerts are polled by the
+/// presenter (native kinds) or resolved by a background coordinator (semantic);
+/// either path flips the row to `fired`, and [`AlertStore::take_fired`] hands
+/// each fired row to the presenter exactly once (advancing it to `done`) so an
+/// alert never re-surfaces — even across process restarts.
+#[derive(Clone)]
+pub struct AlertStore {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl AlertStore {
+    /// Open (and idempotently ensure) the alerts table on the shared aish.db.
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)
+            .with_context(|| format!("can't open alert store at {}", path.display()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             CREATE TABLE IF NOT EXISTS alerts (
+                 id           INTEGER PRIMARY KEY,
+                 condition    TEXT NOT NULL,
+                 kind         TEXT NOT NULL DEFAULT 'semantic',
+                 kind_json    TEXT NOT NULL DEFAULT 'null',
+                 audible      INTEGER NOT NULL DEFAULT 1,
+                 state        TEXT NOT NULL DEFAULT 'armed'
+                              CHECK (state IN ('armed','fired','done','cancelled')),
+                 fired_detail TEXT,
+                 fired_short  TEXT,
+                 last_checked INTEGER NOT NULL DEFAULT 0,
+                 session_id   TEXT,
+                 created_at   INTEGER NOT NULL DEFAULT 0,
+                 fired_at     INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts (state);",
+        )
+        .context("alert schema init failed")?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Arm a new alert. Returns the new row id.
+    pub fn insert_alert(
+        &self,
+        condition: &str,
+        kind: &crate::alert::AlertKind,
+        audible: bool,
+        session_id: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO alerts
+               (condition, kind, kind_json, audible, state, last_checked,
+                session_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'armed', 0, ?5, ?6)",
+            rusqlite::params![
+                condition,
+                kind.tag(),
+                kind.to_json(),
+                audible as i64,
+                session_id,
+                Self::now(),
+            ],
+        )
+        .context("insert alert failed")?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Every still-armed alert (what the presenter polls / a coordinator resolves).
+    pub fn armed_alerts(&self) -> Result<Vec<crate::alert::Alert>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, condition, kind_json, audible, last_checked
+             FROM alerts WHERE state = 'armed' ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], Self::alert_from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            if let Some(a) = r? {
+                out.push(a);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Row → `Alert`; a row whose `kind_json` won't parse is skipped (`None`).
+    fn alert_from_row(
+        r: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<Option<crate::alert::Alert>> {
+        let id: i64 = r.get(0)?;
+        let condition: String = r.get(1)?;
+        let kind_json: String = r.get(2)?;
+        let audible: i64 = r.get(3)?;
+        let last_checked: i64 = r.get(4)?;
+        Ok(crate::alert::AlertKind::from_json(&kind_json).map(|kind| crate::alert::Alert {
+            id,
+            condition,
+            kind,
+            audible: audible != 0,
+            last_checked,
+        }))
+    }
+
+    /// Record that a native alert was just evaluated (throttles re-polling).
+    pub fn touch_alert_check(&self, id: i64, ts: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE alerts SET last_checked = ?2 WHERE id = ?1",
+            rusqlite::params![id, ts],
+        )
+        .context("touch alert failed")?;
+        Ok(())
+    }
+
+    /// Flip an armed alert to `fired`, stashing the rendered detail/short strings.
+    /// Returns true when a row actually transitioned (still-armed → fired).
+    pub fn mark_alert_fired(&self, id: i64, detail: &str, short: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "UPDATE alerts
+                   SET state='fired', fired_detail=?2, fired_short=?3, fired_at=?4
+                 WHERE id = ?1 AND state='armed'",
+                rusqlite::params![id, detail, short, Self::now()],
+            )
+            .context("mark alert fired failed")?;
+        Ok(n > 0)
+    }
+
+    /// Atomically claim every `fired` alert, advancing each to `done`, and return
+    /// the surfacing payloads `(id, detail, short, audible)`. The presenter calls
+    /// this each tick; the armed→fired→done march guarantees exactly-once
+    /// surfacing regardless of which process (presenter or coordinator) fired it.
+    pub fn take_fired(&self) -> Result<Vec<(i64, String, String, bool)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, fired_detail, fired_short, audible, condition
+             FROM alerts WHERE state='fired' ORDER BY fired_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let id: i64 = r.get(0)?;
+                let detail: Option<String> = r.get(1)?;
+                let short: Option<String> = r.get(2)?;
+                let audible: i64 = r.get(3)?;
+                let condition: String = r.get(4)?;
+                Ok((id, detail, short, audible != 0, condition))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, detail, short, audible, condition) in rows {
+            conn.execute("UPDATE alerts SET state='done' WHERE id = ?1", [id])
+                .context("advance fired alert to done failed")?;
+            let detail = detail.unwrap_or_else(|| format!("⚠ ALERT  {condition}"));
+            let short = short.unwrap_or_else(|| format!("⚠ {condition}"));
+            out.push((id, detail, short, audible));
+        }
+        Ok(out)
+    }
+
+    /// Cancel one armed alert. Returns true when a row was actually cancelled.
+    pub fn cancel_alert(&self, id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "UPDATE alerts SET state='cancelled' WHERE id = ?1 AND state='armed'",
+                [id],
+            )
+            .context("cancel alert failed")?;
+        Ok(n > 0)
+    }
+
+    /// Cancel every armed alert. Returns how many were cancelled.
+    pub fn cancel_all_alerts(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute("UPDATE alerts SET state='cancelled' WHERE state='armed'", [])
+            .context("cancel all alerts failed")?;
+        Ok(n)
+    }
+
+    /// Display rows for `:alert list` — `(id, state, kind_tag, condition,
+    /// fired_short)`, newest first, excluding cancelled/done unless `include_all`.
+    pub fn list_alerts(
+        &self,
+        include_all: bool,
+    ) -> Result<Vec<(i64, String, String, String, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = if include_all {
+            "SELECT id, state, kind, condition, fired_short FROM alerts ORDER BY created_at DESC"
+        } else {
+            "SELECT id, state, kind, condition, fired_short FROM alerts
+             WHERE state IN ('armed','fired') ORDER BY created_at DESC"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// The raw condition text of an armed alert (for a coordinator's task / echo).
+    pub fn condition_of(&self, id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let out = conn
+            .query_row(
+                "SELECT condition FROM alerts WHERE id = ?1",
+                [id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .context("condition_of failed")?;
+        Ok(out)
+    }
+}
+
 
 /// Durable store for goal trees. Own SQLite connection against `aish.db`,
 /// cloneable so multiple holders share it. `PRAGMA foreign_keys = ON` is set per

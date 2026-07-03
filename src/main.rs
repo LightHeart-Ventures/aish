@@ -1,3 +1,4 @@
+mod alert;
 mod autosuggest;
 mod backend;
 mod batch;
@@ -581,6 +582,15 @@ async fn main() -> Result<()> {
         Err(e) => eprintln!("\x1b[33maish:\x1b[0m goal store unavailable: {e:#}"),
     }
     timer.mark("goal store open");
+
+    // Durable `:alert` monitors: open the store (shared aish.db). The presenter
+    // polls native alerts and surfaces fired ones; a delegated coordinator fires
+    // semantic ones via the `set_alert` tool. Non-fatal on failure.
+    match db::AlertStore::open(&db_paths::main_db_path()) {
+        Ok(store) => session.alert_store = Some(store),
+        Err(e) => eprintln!("\x1b[33maish:\x1b[0m alert store unavailable: {e:#}"),
+    }
+    timer.mark("alert store open");
 
     // Load the lifecycle-hook registry for the non-interactive entry paths
     // (one-shot `-c`, background coordinator, script). The interactive REPL loads

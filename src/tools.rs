@@ -407,6 +407,28 @@ self-contained sentence."
             }),
         },
         ToolDef {
+            name: "set_alert".into(),
+            description: "Operator-alert monitor (the `:alert` feature). TWO uses: \
+(1) ARM a new monitor — pass `condition` in natural language (e.g. \"let me know when PR 333 is \
+merged\" or \"watch for a change on /tmp/build.done\"); aish parses it into a native probe \
+(file-change or a `gh`/command check it polls token-free) or, if free-form, a semantic monitor. \
+(2) FIRE an already-armed monitor — pass its `alert_id` (and an optional `message` describing \
+what happened). When YOU were dispatched as a background coordinator to resolve a semantic alert, \
+your job is exactly this: watch for the condition, then call set_alert with that alert_id the \
+moment it is met. Firing surfaces a detailed line in the operator's console/OutputField, a short \
+banner on the SecondStatusLine, and a distinct audible cue (different from the worker-done bell)."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "alert_id": {"type": "integer", "description": "Fire this already-armed alert. Omit when arming a new one via `condition`."},
+                    "condition": {"type": "string", "description": "Natural-language condition to ARM a new monitor. Omit when firing an existing one via `alert_id`."},
+                    "message": {"type": "string", "description": "When firing: a concise note describing what happened (shown in the alert). Ignored when arming."},
+                    "silent": {"type": "boolean", "description": "When arming: suppress the audible cue on fire (default false)."}
+                }
+            }),
+        },
+        ToolDef {
             name: "recall".into(),
             description: "Search persistent memories by keyword (empty query → most recent), \
 ranked by relevance. Check here when past context might matter: preferences, project facts, prior \
@@ -706,6 +728,7 @@ pub async fn execute(
         "append_file" => append_file(call, session, confirm),
         "change_dir" => change_dir(call, session),
         "remember" => remember(call, session),
+        "set_alert" => set_alert(call, session),
         "recall" => recall(call, session),
         "job_output" => job_output(call, session),
         "run_in_background" => run_in_background(call, session),
@@ -2005,6 +2028,7 @@ short, natural sentence that you're working on it and the answer will appear her
         launch_session_name: session.name.clone(),
         show_output: session.show_worker_output.clone(),
         attached: session.attached.clone(),
+        coordinator_store: session.coordinator_store.clone(),
     };
     let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
     let short = crate::batch::short_id(&id);
@@ -3926,6 +3950,51 @@ fn remember(call: &ToolCall, session: &Session) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("missing content"))?;
     let id = db.remember(content, call.args["tags"].as_str())?;
     Ok(format!("remembered (#{id})"))
+}
+
+/// Arm or fire an operator `:alert` monitor. Shared store with the presenter and
+/// the `:alert` command — a coordinator that fires here surfaces to the operator
+/// console the same as a native probe.
+fn set_alert(call: &ToolCall, session: &Session) -> Result<String> {
+    let store = session
+        .alert_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("alert store unavailable"))?;
+    // FIRE path: an alert_id was supplied → flip that armed monitor to fired.
+    if let Some(id) = call.args["alert_id"].as_i64() {
+        let condition = store
+            .condition_of(id)?
+            .ok_or_else(|| anyhow::anyhow!("no armed alert #{id} (already fired or cancelled?)"))?;
+        let message = call.args["message"].as_str().unwrap_or("");
+        let fired = crate::alert::render_semantic_fired(&condition, message);
+        let flipped = store.mark_alert_fired(id, &fired.detail, &fired.short)?;
+        return Ok(if flipped {
+            format!("alert #{id} fired — surfaced to the operator console")
+        } else {
+            format!("alert #{id} was not armed (already fired or cancelled) — no-op")
+        });
+    }
+    // ARM path: a natural-language condition → parse + insert a new monitor.
+    let condition = call.args["condition"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("provide `alert_id` to fire, or `condition` to arm"))?;
+    let silent = call.args["silent"].as_bool().unwrap_or(false);
+    let kind = crate::alert::parse_condition(condition);
+    let native = kind.is_native();
+    let id = store.insert_alert(condition, &kind, !silent, Some(&session.session_id))?;
+    Ok(if native {
+        format!(
+            "armed alert #{id} ({}) — aish polls it token-free and surfaces it when met",
+            kind.tag()
+        )
+    } else {
+        format!(
+            "armed alert #{id} (semantic) — resolve it yourself by monitoring the condition and \
+calling set_alert with alert_id={id} when it is met (semantic alerts have no local probe)"
+        )
+    })
 }
 
 fn recall(call: &ToolCall, session: &Session) -> Result<String> {
