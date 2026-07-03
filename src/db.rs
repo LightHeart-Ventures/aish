@@ -41,6 +41,7 @@ impl Db {
             Connection::open(path).with_context(|| format!("can't open {}", path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;
              CREATE TABLE IF NOT EXISTS history (
                  id      INTEGER PRIMARY KEY,
                  ts      TEXT NOT NULL DEFAULT current_timestamp,
@@ -950,6 +951,7 @@ impl BatchStore {
             .with_context(|| format!("can't open batch store at {}", path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;
              CREATE TABLE IF NOT EXISTS batch_jobs (
                  local_id     TEXT PRIMARY KEY,
                  anthropic_id TEXT,
@@ -1129,6 +1131,7 @@ impl CoordinatorStore {
             .with_context(|| format!("can't open coordinator store at {}", path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;
              PRAGMA synchronous = NORMAL;
              CREATE TABLE IF NOT EXISTS coordinator_runs (
                  run_id       TEXT PRIMARY KEY,
@@ -1622,6 +1625,7 @@ impl GoalStore {
             .context("enable foreign_keys")?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;
              PRAGMA synchronous = NORMAL;
              CREATE TABLE IF NOT EXISTS goals (
                  id          INTEGER PRIMARY KEY,
