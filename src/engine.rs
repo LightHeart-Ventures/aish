@@ -1,4 +1,4 @@
-use crate::backend::{Backend, Msg, Role, ToolResult};
+use crate::backend::{Backend, Msg, OutputSchemaRef, Role, ToolResult};
 use crate::session::Session;
 use crate::tools::{self, Confirm};
 use anyhow::Result;
@@ -528,7 +528,7 @@ async fn run_turn_inner(
                 .as_mut()
                 .map(|a| a.begin(&call.name, &call.args));
 
-            let result =
+            let mut result =
                 if let Some(crate::turn_audit::Step::Replay { output, is_error }) = &audit_step {
                     // Resumed turn: surface a dim replay marker (no spinner, no
                     // re-execution) and reuse the journaled result.
@@ -564,6 +564,12 @@ async fn run_turn_inner(
                     }
                     result
                 };
+            // Phase 3.4 runtime enforcement: if this result declared an
+            // `output_schema`, validate its structured payload against the
+            // plugin's named schema. Fail-open — a violation is logged and
+            // annotated for the model, never blocking the payload. Zero-cost
+            // (no plugin discovery) when no schema was declared: the common case.
+            validate_output_schema(&mut result);
             // Tally this completed tool call and paint the interactive activity
             // stream: up to the last 5 lines of the call's output, then a running
             // status line (tokens in/out, tool calls, turns). Mirrors how an
@@ -1442,9 +1448,141 @@ pub fn render_raw_toggle(session: &mut Session, now_on: bool) {
     session.raw_view_rows = rows;
 }
 
+/// Phase 3.4 runtime enforcement hook. When `result` declares an
+/// `output_schema` AND carries a structured payload, validate that payload
+/// against the plugin's named schema (discovered under the default plugins
+/// dir). Fail-open: a violation — or an unknown plugin/schema — is logged to
+/// stderr and recorded on the result as a model-facing note, but the payload is
+/// never altered or dropped. Returns immediately (no plugin discovery, no
+/// allocation) when no schema is declared, which is the overwhelming common
+/// case, so the hook adds zero overhead to ordinary tool calls.
+fn validate_output_schema(result: &mut ToolResult) {
+    // Common case: nothing declared → do not even touch the plugin loader.
+    if result.output_schema.is_none() {
+        return;
+    }
+    validate_output_schema_in(&crate::plugins::default_plugins_dir(), result);
+}
+
+/// Core of [`validate_output_schema`], parameterised on the plugins dir so it is
+/// unit-testable against a temp plugin fixture without a live `Session`.
+fn validate_output_schema_in(plugins_dir: &std::path::Path, result: &mut ToolResult) {
+    let Some(OutputSchemaRef {
+        plugin_id,
+        schema_name,
+    }) = result.output_schema.clone()
+    else {
+        return;
+    };
+    // A schema was declared but the tool emitted no structured payload — nothing
+    // to validate. (Text-only results skip validation entirely.)
+    let Some(value) = result.structured.clone() else {
+        return;
+    };
+    if let Err(e) = crate::plugins::validate_against_plugin_schema(
+        plugins_dir,
+        &plugin_id,
+        &schema_name,
+        &value,
+    ) {
+        // Fail-open: log the violation and annotate for the model, but let the
+        // payload flow through unchanged.
+        let note = format!("payload violates schema `{plugin_id}/{schema_name}`: {e}");
+        eprintln!("\x1b[2m  \u{26a0} schema-validation: {note}\x1b[0m");
+        result.note_schema_violation(note);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Phase 3.4: output-schema runtime-enforcement hook ----------------
+
+    /// Materialize a throwaway plugin dir shipping a single `schemas/<name>.json`
+    /// so `validate_output_schema_in` can discover it. Returns the plugins root.
+    fn schema_fixture(plugin_id: &str, schema_name: &str, schema: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "aish_schema_enf_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let pdir = root.join(plugin_id);
+        std::fs::create_dir_all(pdir.join("schemas")).unwrap();
+        std::fs::write(pdir.join("plugin.json"), format!("{{\"id\":\"{plugin_id}\"}}")).unwrap();
+        std::fs::write(pdir.join("schemas").join(format!("{schema_name}.json")), schema).unwrap();
+        root
+    }
+
+    const OBJ_SCHEMA: &str =
+        r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}"#;
+
+    #[test]
+    fn schema_validation_passes_transparently() {
+        let root = schema_fixture("plug", "item", OBJ_SCHEMA);
+        let mut r = ToolResult::structured("t", "name=ok", serde_json::json!({"name": "ok"}), false)
+            .with_output_schema("plug", "item");
+        validate_output_schema_in(&root, &mut r);
+        // Conforms → no violation recorded, model sees exactly the payload JSON.
+        assert!(r.schema_violation.is_none());
+        assert_eq!(r.model_content().as_ref(), r#"{"name":"ok"}"#);
+    }
+
+    #[test]
+    fn schema_validation_failure_is_logged_noted_and_not_blocked() {
+        let root = schema_fixture("plug", "item", OBJ_SCHEMA);
+        // `name` is a number → type violation.
+        let mut r = ToolResult::structured("t", "name=1", serde_json::json!({"name": 1}), false)
+            .with_output_schema("plug", "item");
+        validate_output_schema_in(&root, &mut r);
+        // Failure is recorded (for the model) but the payload still flows.
+        let note = r.schema_violation.clone().expect("violation recorded");
+        assert!(note.contains("plug/item"), "note names the schema: {note}");
+        let model = r.model_content();
+        assert!(
+            model.starts_with("[schema-validation warning]"),
+            "model told of the violation: {model}"
+        );
+        // Fail-open: the original payload is still present after the banner.
+        assert!(model.contains(r#"{"name":1}"#), "payload not blocked: {model}");
+        assert!(r.structured.is_some());
+    }
+
+    #[test]
+    fn no_output_schema_declaration_is_zero_cost_noop() {
+        // The common case: a structured result with NO declared schema. The
+        // top-level hook must return before touching the plugin loader.
+        let mut r =
+            ToolResult::structured("t", "x", serde_json::json!({"anything": true}), false);
+        validate_output_schema(&mut r);
+        assert!(r.schema_violation.is_none());
+        assert!(r.output_schema.is_none());
+    }
+
+    #[test]
+    fn unknown_plugin_fails_open_with_note() {
+        // Schema declared against a plugin that isn't present → UnknownSchema,
+        // logged fail-open, never blocking.
+        let empty = std::env::temp_dir().join(format!("aish_schema_enf_empty_{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let mut r = ToolResult::structured("t", "x", serde_json::json!({"name": "ok"}), false)
+            .with_output_schema("ghost", "item");
+        validate_output_schema_in(&empty, &mut r);
+        assert!(r.schema_violation.is_some(), "unknown schema is noted, not silent");
+        assert!(r.structured.is_some(), "payload still flows");
+    }
+
+    #[test]
+    fn schema_declared_but_text_only_result_is_skipped() {
+        let root = schema_fixture("plug", "item", OBJ_SCHEMA);
+        // A schema ref with no structured payload → nothing to validate.
+        let mut r = ToolResult::text("t", "just text", false).with_output_schema("plug", "item");
+        validate_output_schema_in(&root, &mut r);
+        assert!(r.schema_violation.is_none());
+        assert_eq!(r.model_content().as_ref(), "just text");
+    }
 
     #[test]
     fn raw_body_placeholder() {
