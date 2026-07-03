@@ -161,6 +161,12 @@ pub fn styled_result_with(cell: &str, color_on: bool) -> String {
     t.to_string()
 }
 
+/// The glyph marking operator `:alert` activity — an alarm clock. Single-sourced
+/// here so the `:workers` activity icon ([`job_activity_emoji`]) and the
+/// fired-alert SecondStatusLine badge ([`alert_badge`]) always render the same
+/// symbol; change it once and both surfaces move together.
+pub const ALERT_GLYPH: &str = "⏰";
+
 /// Emoji marking a background job's KIND, for legends and mixed listings.
 pub fn job_type_emoji(kind: &str) -> &'static str {
     match kind.trim().to_ascii_lowercase().as_str() {
@@ -168,6 +174,49 @@ pub fn job_type_emoji(kind: &str) -> &'static str {
         "batch" => "📦",
         "goal" => "🎯",
         _ => "•",
+    }
+}
+
+/// Emoji marking what a background worker is DOING, inferred from its task text.
+///
+/// The `:workers` table used to stamp every row with the same generic robot
+/// (`job_type_emoji("worker"|"coordinator")`), so an operator couldn't tell an
+/// `:alert` monitor apart from a code task at a glance. This classifier inspects
+/// the worker's task string for the distinctive markers each special worker
+/// class carries and returns a purpose-fitting glyph, falling back to the
+/// generic worker robot when the task is just ordinary background work.
+///
+/// It keys on stable, multi-word anchors (not single common words) to avoid
+/// false positives, and is pure so it's cheap and unit-testable. Extend by
+/// adding a new anchor → glyph arm before the fallback.
+pub fn job_activity_emoji(task: &str) -> &'static str {
+    let t = task.to_ascii_lowercase();
+    // Operator `:alert` monitors are spawned by `spawn_alert_coordinator` with a
+    // fixed task prefix — "resolving an operator ALERT (the aish `:alert`
+    // feature)" — whose whole job is to call the `set_alert` tool when a
+    // condition is met. Alarm clock.
+    if t.contains("operator alert") || t.contains("`:alert` feature") || t.contains("set_alert") {
+        return ALERT_GLYPH;
+    }
+    // Ordinary background work — reuse the generic worker glyph so the robot
+    // emoji stays single-sourced with `job_type_emoji`.
+    job_type_emoji("worker")
+}
+
+/// Render the compact fired-`:alert` badge that claims the head of the
+/// SecondStatusLine until the next prompt.
+///
+/// When an operator `:alert` fires, the presenter stashes a short banner
+/// (`session.alert_banner`) and this helper turns it into the badge shown on the
+/// SecondStatusLine — prefixed with the same alarm-clock [`ALERT_GLYPH`] the
+/// `:workers` table uses for `:alert` monitors, so the fire is instantly legible
+/// as an alert. Bold yellow when color is on (it stands apart from the worker
+/// badges); plain glyph + text otherwise. Pure, so it's unit-testable.
+pub fn alert_badge(banner: &str, color_on: bool) -> String {
+    if color_on {
+        format!("\x1b[1;33m{ALERT_GLYPH} {banner}\x1b[0m")
+    } else {
+        format!("{ALERT_GLYPH} {banner}")
     }
 }
 
@@ -653,5 +702,35 @@ mod tests {
         assert_eq!(job_type_emoji("batch"), "📦");
         assert_eq!(job_type_emoji("goal"), "🎯");
         assert_eq!(job_type_emoji("mystery"), "•");
+    }
+
+    #[test]
+    fn job_activity_emoji_alert_vs_generic() {
+        // The exact task prefix spawn_alert_coordinator uses → alarm clock.
+        let alert_task = "You are resolving an operator ALERT (the aish `:alert` feature). \
+Watch for this condition and call the `set_alert` tool with alert_id=7 …";
+        assert_eq!(job_activity_emoji(alert_task), "⏰");
+        // Any of the anchors alone is enough.
+        assert_eq!(job_activity_emoji("call set_alert when the PR merges"), "⏰");
+        assert_eq!(job_activity_emoji("watch for an operator alert condition"), "⏰");
+        // Ordinary background work falls back to the generic worker robot.
+        assert_eq!(job_activity_emoji("fix the failing CI on branch feat/x"), "🤖");
+        assert_eq!(job_activity_emoji("refactor the coordinator store"), "🤖");
+        assert_eq!(job_activity_emoji(""), "🤖");
+    }
+
+    #[test]
+    fn alert_badge_carries_alarm_glyph() {
+        // Plain mode: alarm glyph + space + banner, no ANSI.
+        assert_eq!(alert_badge("PR #42 merged", false), "⏰ PR #42 merged");
+        // Colored mode: bold-yellow wrap around glyph + banner.
+        assert_eq!(
+            alert_badge("PR #42 merged", true),
+            "\x1b[1;33m⏰ PR #42 merged\x1b[0m"
+        );
+        // The badge glyph is the same one `:workers` stamps on `:alert` monitors,
+        // so the fired-alert SecondStatusLine and the worker row stay in lockstep.
+        assert!(alert_badge("x", false).starts_with(ALERT_GLYPH));
+        assert_eq!(job_activity_emoji("set_alert now"), ALERT_GLYPH);
     }
 }
