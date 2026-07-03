@@ -312,15 +312,15 @@ pub struct Session {
     /// background presenter, the `:alert` command handler, and the `set_alert`
     /// tool all hold a handle. None if it failed to open.
     pub alert_store: Option<crate::db::AlertStore>,
-    /// The current fired-alert banner for the SecondStatusLine, shared with the
-    /// background presenter which sets it when an alert surfaces. `None` = no
-    /// pending alert banner.
-    pub alert_banner: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    /// The most recent worker-done banner for the SecondStatusLine, shared with
-    /// the background presenter which sets it when a background coordinator
-    /// finishes. The completion NOTICE lives HERE (a colorized footer badge)
-    /// instead of being dumped over the prompt. `None` = no pending banner.
-    pub worker_banner: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// The single most-recent "flash" message for the SecondStatusLine's
+    /// recent-message slot, shared with the background presenter. This row shows
+    /// exactly ONE message at a time (most-recent wins): the presenter overwrites
+    /// it when an `:alert` fires or a background coordinator finishes, and it is
+    /// cleared on an attach/detach transition so the live coordinator/attach hint
+    /// resurfaces. Already colorized (ready for the head of the row). `None` = no
+    /// pending flash → the row falls back to the live coordinator/attach hint
+    /// instead of stacking messages on top of each other.
+    pub flash: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Id of the goal `:goal` subcommands target by default (set by `:goal
     /// new` / `:goal show <id>`). Session-local (not persisted); falls back to
     /// the active goal when unset or stale. (TASK-278)
@@ -532,8 +532,7 @@ impl Session {
             coordinator_store: None,
             goal_store: None,
             alert_store: None,
-            alert_banner: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            worker_banner: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            flash: std::sync::Arc::new(std::sync::Mutex::new(None)),
             current_goal_id: None,
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
             goal: None,
