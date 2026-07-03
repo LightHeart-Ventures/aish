@@ -87,6 +87,9 @@ pub struct Alert {
     pub condition: String,
     pub kind: AlertKind,
     /// Audible cue on fire (default true; `:alert ... --silent` clears it).
+    /// Persisted per-row; the presenter reads it back from the fired-row tuple
+    /// (`take_fired`) rather than this in-memory copy, so it's `#[allow]`ed here.
+    #[allow(dead_code)]
     pub audible: bool,
     /// Epoch-seconds of the last native evaluation (0 = never).
     pub last_checked: i64,
@@ -108,6 +111,7 @@ pub struct Fired {
     pub short: String,
 }
 
+#[allow(dead_code)] // test helper + documents the epoch-seconds contract for `poll`'s `now`
 fn now_epoch() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
