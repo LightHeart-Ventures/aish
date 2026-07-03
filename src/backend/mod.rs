@@ -53,12 +53,38 @@ pub struct ToolCall {
     pub args: Value,
 }
 
+/// A reference to a plugin-declared JSON Schema that a tool result's structured
+/// payload is expected to conform to (Phase 3.4 runtime enforcement). `plugin_id`
+/// selects the discovered plugin; `schema_name` is the file stem under
+/// `<plugin>/schemas/<name>.json`. A structured-emitting tool that opts into
+/// validation attaches one via [`ToolResult::with_output_schema`]; the engine's
+/// post-execution hook ([`crate::engine`]) then validates the payload against it.
+/// `None` — the common case — means "no schema declared", and the hook is a
+/// zero-cost no-op (it never touches the plugin loader).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputSchemaRef {
+    pub plugin_id: String,
+    pub schema_name: String,
+}
+
 /// The result we feed back for one tool call.
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     pub id: String,
     pub content: String,
     pub is_error: bool,
+    /// Optional plugin-schema declaration for this result's structured payload
+    /// (Phase 3.4). `Some` opts the result into runtime validation by the
+    /// engine's post-execution hook; `None` (the common case) means the hook
+    /// returns immediately with zero overhead. See [`OutputSchemaRef`].
+    pub output_schema: Option<OutputSchemaRef>,
+    /// Populated by the engine's validation hook when the declared
+    /// `output_schema` REJECTED the structured payload (Phase 3.4). Fail-open:
+    /// the payload still flows to the model, but [`ToolResult::model_content`]
+    /// prepends a `[schema-validation warning]` note so the model is told the
+    /// data is off-spec. `None` when no schema was declared or validation
+    /// passed.
+    pub schema_violation: Option<String>,
     /// Optional typed payload for tools whose output is already structured
     /// (records / tables). `content` stays the rendered, human-readable source
     /// of truth; this is additive JSON the model can consume without
@@ -81,6 +107,8 @@ impl ToolResult {
             content: content.into(),
             is_error,
             structured: None,
+            output_schema: None,
+            schema_violation: None,
         }
     }
 
@@ -98,7 +126,34 @@ impl ToolResult {
             content: content.into(),
             is_error,
             structured: Some(value),
+            output_schema: None,
+            schema_violation: None,
         }
+    }
+
+    /// Declare that this result's structured payload should conform to the named
+    /// schema shipped by `plugin_id` (Phase 3.4). Builder form — attach it to a
+    /// structured result to opt into runtime validation by the engine's
+    /// post-execution hook. A no-op in effect until that hook runs; text-only
+    /// results (no `structured` payload) are still skipped by the hook.
+    #[allow(dead_code)] // producer-side seam — attached by schema-aware tools; exercised by tests.
+    pub fn with_output_schema(
+        mut self,
+        plugin_id: impl Into<String>,
+        schema_name: impl Into<String>,
+    ) -> Self {
+        self.output_schema = Some(OutputSchemaRef {
+            plugin_id: plugin_id.into(),
+            schema_name: schema_name.into(),
+        });
+        self
+    }
+
+    /// Record that the declared `output_schema` rejected this result's payload
+    /// (Phase 3.4). Called by the engine's validation hook; fail-open — the
+    /// payload is untouched, only the model-facing note is set.
+    pub fn note_schema_violation(&mut self, note: impl Into<String>) {
+        self.schema_violation = Some(note.into());
     }
 
     /// The representation fed back to the MODEL for this result (S7.3).
@@ -120,6 +175,22 @@ impl ToolResult {
     /// re-capped here for any caller that isn't), so an oversized structured
     /// result degrades to representative text instead of crashing the turn.
     pub fn model_content(&self) -> std::borrow::Cow<'_, str> {
+        let body = self.model_body();
+        // Phase 3.4: a schema violation prepends a one-line warning so the model
+        // knows the payload is off-spec, while the payload itself still flows
+        // through unchanged (fail-open). Zero overhead when no violation is set.
+        match &self.schema_violation {
+            Some(note) => std::borrow::Cow::Owned(format!(
+                "[schema-validation warning] {note}\n\n{body}"
+            )),
+            None => body,
+        }
+    }
+
+    /// The payload half of [`model_content`] — the structured JSON (capped) or
+    /// the verbatim text — WITHOUT the schema-violation banner. Split out so the
+    /// banner can be prepended without duplicating the cap logic.
+    fn model_body(&self) -> std::borrow::Cow<'_, str> {
         // ~25k tokens. Comfortably below the model's context window while still
         // large enough for a legitimate structured result.
         const MAX_MODEL_RESULT: usize = 100_000;

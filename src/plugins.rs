@@ -151,16 +151,17 @@ pub struct Plugin {
 
 impl Plugin {
     /// This plugin's schema with the given name (file stem), or `None`.
-    #[allow(dead_code)] // Phase 3.4 runtime seam — see schema section note.
+    // Phase 3.4: WIRED — reached via `validate` → the engine tool-return hook.
     pub fn schema(&self, name: &str) -> Option<&PluginSchema> {
         self.schemas.iter().find(|s| s.name == name)
     }
 
     /// Validate a structured value against one of this plugin's named schemas
-    /// (Phase 3.4 runtime seam). `Err(SchemaValidationError::UnknownSchema)`
-    /// when the plugin ships no schema by that name; `Err(Failed)` with the
-    /// collected violations when the value doesn't conform.
-    #[allow(dead_code)] // Phase 3.4 runtime seam — see schema section note.
+    /// (Phase 3.4). `Err(SchemaValidationError::UnknownSchema)` when the plugin
+    /// ships no schema by that name; `Err(Failed)` with the collected violations
+    /// when the value doesn't conform.
+    // Phase 3.4: WIRED — called by `validate_against_plugin_schema`, which the
+    // engine tool-return hook invokes on every schema-declaring result.
     pub fn validate(&self, schema_name: &str, value: &Value) -> Result<(), SchemaValidationError> {
         match self.schema(schema_name) {
             None => Err(SchemaValidationError::UnknownSchema(schema_name.to_string())),
@@ -597,10 +598,12 @@ pub fn collect_plugin_mcp_servers(
 //
 // NOTE: `validate_json_schema` and the `Plugin::validate` /
 // `validate_against_plugin_schema` seam are the Phase-3.4 "validate tool output
-// at runtime" entry points. They are exercised by the unit tests below and are
-// intentionally landed ahead of the tool-return dispatch wiring, so they read
-// as dead code in a non-test build (the `#[allow(dead_code)]` on each keeps the
-// warning set clean without silencing the rest of the module).
+// at runtime" entry points. RESOLVED (Phase 3.4 runtime-enforcement half): the
+// tool-return dispatch wiring now exists — `engine::validate_output_schema`
+// calls `validate_against_plugin_schema` after every tool call whose
+// `ToolResult` carries an `output_schema` declaration, logging violations
+// fail-open and annotating the result for the model. These are therefore LIVE
+// runtime paths, not dead code.
 //
 // The validator ([`validate_json_schema`]) is a pragmatic subset of JSON Schema
 // draft-07 covering the keywords structured tool output actually uses:
@@ -909,10 +912,10 @@ fn compact(v: &Value) -> String {
 }
 
 /// Validate `value` against `<plugins_dir>/<plugin_id>/schemas/<schema_name>.json`
-/// (Phase 3.4 runtime entry point). Discovers the plugin fresh so callers need
-/// only the plugins dir + ids. `UnknownSchema` when the plugin (or schema) is
-/// absent; `Failed` with all violations otherwise.
-#[allow(dead_code)] // Phase 3.4 runtime seam — see section note; used by tests.
+/// (Phase 3.4 runtime entry point — WIRED into `engine::validate_output_schema`).
+/// Discovers the plugin fresh so callers need only the plugins dir + ids.
+/// `UnknownSchema` when the plugin (or schema) is absent; `Failed` with all
+/// violations otherwise.
 pub fn validate_against_plugin_schema(
     plugins_dir: &Path,
     plugin_id: &str,
