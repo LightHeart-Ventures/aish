@@ -457,6 +457,12 @@ pub async fn run(
                         // editor::nudge_terminal_return): a no-op on kernels that
                         // gate TIOCSTI or when stdin isn't a tty, in which case
                         // we fall back to resuming on the user's next Enter.
+                        // Kernel-independent hands-free wake: raise the resume
+                        // wake flag the idle poll read consults, so a parked
+                        // read_line returns and drains the resume on ANY kernel
+                        // (works where TIOCSTI is gated off). The nudge below is
+                        // kept as belt-and-suspenders for the plain-read path.
+                        crate::editor::arm_resume_wake();
                         crate::editor::nudge_terminal_return();
                         finished_bell = true;
                     }
@@ -560,9 +566,12 @@ pub async fn run(
             // the `?` route escape, exactly like a `:loop` tick, so the parent
             // reads + synthesizes the workers' results without the human typing
             // "continue". A session parked inside a blocking read_line when the
-            // resume arms is woken hands-free by the presenter, which pushes a
-            // newline into the terminal via editor::nudge_terminal_return()
-            // (TIOCSTI) so read_line returns and this drain runs on the next pass.
+            // resume arms is woken hands-free by the presenter: it raises the
+            // editor RESUME_WAKE flag (arm_resume_wake), which the idle poll read
+            // (gated on by the set_background_pending call below) consults and
+            // returns an empty line for — so this drain runs with NO keypress, on
+            // ANY kernel. A TIOCSTI nudge (nudge_terminal_return) fires too as a
+            // belt-and-suspenders fallback for the plain-read path.
             // Residual: on kernels that gate TIOCSTI (Linux ≥6.2
             // dev.tty.legacy_tiocsti=0) or when stdin isn't a tty, the nudge is a
             // no-op and the resume still drains on the user's next keypress.
@@ -625,6 +634,25 @@ pub async fn run(
                             );
                         }
                     }
+                    // Gate the editor's interruptible poll path: if this
+                    // session has outstanding fanned-out workers, the idle read
+                    // must be woken hands-free the instant the last one finishes
+                    // and the presenter arms a resume (arm_resume_wake). Compute
+                    // the live outstanding count HERE — not from the 400ms
+                    // presenter tick — so the gate is correct the moment we
+                    // block, closing the dispatch→first-tick race.
+                    let outstanding_workers = session
+                        .worker_jobs
+                        .lock()
+                        .map(|jobs| {
+                            jobs.iter()
+                                .filter(|w| {
+                                    !matches!(w.status().as_str(), "done" | "failed")
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    crate::editor::set_background_pending(outstanding_workers > 0);
                     editor.read_line(&prompt)
                 }
                 },
