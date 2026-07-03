@@ -263,6 +263,7 @@ impl GitRepoCache {
             .with_context(|| format!("can't open git repo cache at {}", path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;
              CREATE TABLE IF NOT EXISTS repo_state (
                  repo_key       TEXT PRIMARY KEY,
                  root           TEXT NOT NULL,
