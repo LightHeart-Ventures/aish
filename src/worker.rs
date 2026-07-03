@@ -2489,6 +2489,25 @@ fn build_container_command(
         }
     }
 
+    // Preflight compat probe: the image can exist yet be UNRUNNABLE — e.g. a
+    // binary built against a newer glibc than the runtime base ships dies at
+    // exec with `GLIBC_x.y not found`. Such an image builds + inspects fine, so
+    // the checks above pass; only this `run --version` probe catches it. Degrade
+    // to the host subprocess with an actionable message rather than launching a
+    // doomed container and surfacing an opaque failed job. (Dockerfile.worker's
+    // multi-stage self-build makes this rare, but a stale/hand-injected image
+    // still fails safe here.)
+    if !c::image_runnable(rt, &tag) {
+        eprintln!(
+            "aish: worker image {tag} exists but its aish binary won't exec in the \
+             container (likely a libc mismatch — the image's binary was built against \
+             a newer glibc than the runtime base). Rebuild it with `make worker-image` \
+             (the multi-stage Dockerfile.worker self-builds against the runtime's libc). \
+             Falling back to host subprocess."
+        );
+        return None;
+    }
+
     // Per-worker state dir (AC4), 0700.
     let state_dir = worker_state_root().join(&spec.id_for_state(run_id));
     ensure_dir_0700(&state_dir);

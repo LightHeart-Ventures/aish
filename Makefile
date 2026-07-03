@@ -104,6 +104,12 @@ clean:
 # build-on-first-use path in worker.rs shells out to exactly this target. Prefers
 # docker, falls back to podman. `worker-image-multiarch` is the release-time
 # multi-arch publish (linux/amd64 + linux/arm64) per AC5.
+#
+# NOTE: Dockerfile.worker is a MULTI-STAGE self-build — it compiles aish INSIDE
+# a bookworm builder stage so the runtime glibc always matches the binary. There
+# is therefore NO host-build prerequisite (a host binary would reintroduce the
+# glibc-mismatch bug this design removes), and the build context must include the
+# source tree (`.dockerignore` trims target/, .git, worktrees).
 
 WORKER_IMAGE ?= aish-worker
 # Default the tag to the Cargo package version; an env override (passed by the
@@ -112,13 +118,14 @@ VERSION      ?= $(shell grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 WORKER_TAG    = $(WORKER_IMAGE):$(VERSION)
 PLATFORMS    ?= linux/amd64,linux/arm64
 
-worker-image: build
-	@echo "building $(WORKER_TAG) (local, single-arch) …"
+worker-image:
+	@echo "building $(WORKER_TAG) (local, single-arch, self-building) …"
 	@if command -v docker >/dev/null 2>&1; then 		docker build -t $(WORKER_TAG) -f Dockerfile.worker . ; 	elif command -v podman >/dev/null 2>&1; then 		podman build -t $(WORKER_TAG) -f Dockerfile.worker . ; 	else 		echo "worker-image: neither docker nor podman is on PATH" >&2 ; exit 1 ; 	fi
 	@echo "built $(WORKER_TAG)"
 
-# Multi-arch publish (AC5). Requires a glibc-matching aish build per platform;
-# wire this into CI where cross-compiled binaries are available. `PUSH=1` pushes.
+# Multi-arch publish (AC5). The multi-stage self-build compiles aish per-platform
+# INSIDE the image (buildx emulates the non-native arch), so no pre-cross-compiled
+# host binary is required. `PUSH=1` pushes.
 worker-image-multiarch:
 	@echo "building $(WORKER_TAG) for $(PLATFORMS) …"
 	@if command -v docker >/dev/null 2>&1; then 		docker buildx build --platform $(PLATFORMS) -t $(WORKER_TAG) 			-f Dockerfile.worker $(if $(PUSH),--push,--load) . ; 	elif command -v podman >/dev/null 2>&1; then 		podman build --platform $(PLATFORMS) -t $(WORKER_TAG) -f Dockerfile.worker . ; 	else 		echo "worker-image-multiarch: neither docker nor podman is on PATH" >&2 ; exit 1 ; 	fi
