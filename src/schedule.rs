@@ -321,6 +321,12 @@ fn tick(inner: &Arc<Mutex<SchedState>>, status: &Arc<Mutex<Option<String>>>) {
             st.ctx.as_ref().map(|c| c.worker_jobs.clone())
         };
         let Some(jobs) = ctx_jobs else { continue };
+        // Nesting-depth guard (TASK-287): don't fire a scheduled coordinator once
+        // the spawn budget is exhausted.
+        if let Err(msg) = crate::worker::spawn_budget_gate() {
+            *status.lock().unwrap() = Some(format!("⏰ #{} skipped — {msg}", f.num));
+            continue;
+        }
         let wid = crate::worker::spawn(&jobs, f.task.clone(), f.spec);
         *status.lock().unwrap() = Some(format!("⏰ #{} running — {}", f.num, f.hint));
         crate::tools::print_above_prompt(format!(

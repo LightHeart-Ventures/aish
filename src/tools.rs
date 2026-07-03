@@ -2012,6 +2012,12 @@ short, natural sentence that you're working on it and the answer will appear her
         );
     }
 
+    // Nesting-depth guard (TASK-287): refuse to fork a coordinator once this
+    // process's spawn budget is exhausted. Only the worker-spawn path is gated —
+    // the tool-less batch tier above returns before here, and a batch offload is
+    // an API call, not a host fork, so it carries no fork-bomb risk.
+    crate::worker::spawn_budget_gate().map_err(|e| anyhow::anyhow!(e))?;
+
     let exe = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("can't locate the aish binary to re-exec: {e}"))?;
     // Worktree isolation (the headline fix for parallel coordinators clobbering
