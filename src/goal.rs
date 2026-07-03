@@ -741,6 +741,29 @@ impl Goal {
         self.milestones.iter().find(|m| !m.done)
     }
 
+    /// Goal-aware next-work selection (TASK-280): the next aligned unit of work
+    /// to advance this goal, or `None` when the goal isn't actionable
+    /// (paused / blocked / terminal / already complete) or has nothing left to
+    /// pick up. This is the seam the task-less `:dispatch` path consumes to route
+    /// work toward the live goal instead of printing bare usage.
+    ///
+    /// Precedence: the data model keeps `milestones` and `linked_tasks` as
+    /// sibling lists (no explicit task→milestone tag), so a still-open linked
+    /// task is the concrete unit of work — framed by the next incomplete
+    /// milestone it advances toward (AC2: prefer the next incomplete milestone's
+    /// tasks). When every linked task is done, the next incomplete milestone
+    /// itself becomes the suggested work.
+    pub fn next_aligned_work(&self) -> Option<NextWork<'_>> {
+        if !self.is_actionable() {
+            return None;
+        }
+        let milestone = self.next_open_milestone();
+        if let Some(task) = self.linked_tasks.iter().find(|t| !t.done) {
+            return Some(NextWork::Task { task, milestone });
+        }
+        milestone.map(NextWork::Milestone)
+    }
+
     /// Whether this goal is ready to be worked *right now*: it's `Active`, has no
     /// open blockers, and isn't already fully complete. Routing skips goals that
     /// are paused, blocked, terminal, or done.
@@ -846,6 +869,60 @@ pub fn subtree_percent(root_id: &str, all: &[Goal]) -> u8 {
         return 0;
     }
     (((done * 100) + total / 2) / total) as u8
+}
+
+/// A concrete next unit of work selected for an actionable goal (TASK-280) — what
+/// goal-aware routing surfaces when `:dispatch` is invoked with no task and there
+/// is a live goal to advance. Either a specific linked task to pick up (framed by
+/// the milestone in flight) or, when no linked tasks remain open, the next
+/// incomplete milestone itself. Borrows the goal so rendering stays allocation-light.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NextWork<'a> {
+    /// The next incomplete linked task to pick up, with the current open
+    /// milestone (if any) it advances toward.
+    Task {
+        task: &'a TaskRef,
+        milestone: Option<&'a Milestone>,
+    },
+    /// No linked tasks remain open — tackle the next incomplete milestone.
+    Milestone(&'a Milestone),
+}
+
+impl NextWork<'_> {
+    /// The task text a coordinator would be assigned for this unit of work — the
+    /// linked task's key (plus cached title) or the milestone title. This is the
+    /// concrete string the operator confirms via `:dispatch <text>`.
+    pub fn dispatch_text(&self) -> String {
+        match self {
+            NextWork::Task { task, .. } => match &task.title {
+                Some(t) => format!("{}: {t}", task.key),
+                None => task.key.clone(),
+            },
+            NextWork::Milestone(m) => m.title.clone(),
+        }
+    }
+
+    /// A one-line human summary of the suggested work, for the operator prompt.
+    pub fn summary(&self) -> String {
+        match self {
+            NextWork::Task { task, milestone } => {
+                let label = match &task.title {
+                    Some(t) => format!("{} ({t})", task.key),
+                    None => task.key.clone(),
+                };
+                match milestone {
+                    Some(m) => format!(
+                        "task {label} toward milestone \u{201c}{}\u{201d}",
+                        truncate_ellipsis(&m.title, 60)
+                    ),
+                    None => format!("task {label}"),
+                }
+            }
+            NextWork::Milestone(m) => {
+                format!("milestone \u{201c}{}\u{201d}", truncate_ellipsis(&m.title, 60))
+            }
+        }
+    }
 }
 
 /// Goal-aware routing selection: pick the next goal to work from a set. Returns
@@ -1155,6 +1232,95 @@ mod domain_tests {
         assert_eq!(g.next_open_milestone().unwrap().title, "second");
         g.milestones[1].done = true;
         assert!(g.next_open_milestone().is_none(), "none when all done");
+    }
+
+    // ── TASK-280: goal-aware next-work selection ────────────────────────────
+
+    #[test]
+    fn next_aligned_work_none_when_not_actionable() {
+        // Paused goal → no routing (task-less dispatch falls back to usage).
+        let mut g = Goal::new("G");
+        g.add_milestone("m1");
+        g.link_task(TaskRef::new("TASK-1"));
+        g.set_status(GoalStatus::Paused);
+        assert!(g.next_aligned_work().is_none(), "paused goal routes nothing");
+
+        // Blocked goal → no routing even while Active.
+        let mut g = Goal::new("G");
+        g.add_milestone("m1");
+        g.add_blocker("waiting on review");
+        assert!(g.next_aligned_work().is_none(), "blocked goal routes nothing");
+
+        // Fully complete goal → no routing.
+        let mut g = Goal::new("G");
+        g.add_milestone("m1");
+        g.milestones[0].done = true;
+        assert!(g.next_aligned_work().is_none(), "complete goal routes nothing");
+
+        // Empty active goal (nothing tracked) → nothing to pick up.
+        let g = Goal::new("G");
+        assert!(g.next_aligned_work().is_none(), "empty goal routes nothing");
+    }
+
+    #[test]
+    fn next_aligned_work_prefers_incomplete_task_framed_by_milestone() {
+        let mut g = Goal::new("Ship it");
+        g.add_milestone("Design");
+        g.add_milestone("Build");
+        g.milestones[0].done = true; // next open milestone == "Build"
+        g.link_task(TaskRef::with_title("TASK-9", "wire routing"));
+        g.link_task(TaskRef::new("TASK-10"));
+        g.linked_tasks[0].done = true; // first OPEN task == TASK-10
+
+        match g.next_aligned_work().expect("actionable goal routes work") {
+            NextWork::Task { task, milestone } => {
+                assert_eq!(task.key, "TASK-10", "picks first not-done linked task");
+                assert_eq!(
+                    milestone.map(|m| m.title.as_str()),
+                    Some("Build"),
+                    "AC2: frames by the next incomplete milestone"
+                );
+            }
+            other => panic!("expected a task suggestion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn next_aligned_work_falls_back_to_milestone_when_tasks_done() {
+        let mut g = Goal::new("Ship it");
+        g.add_milestone("Build");
+        g.link_task(TaskRef::new("TASK-1"));
+        g.linked_tasks[0].done = true; // all linked tasks done, milestone still open
+        match g.next_aligned_work().expect("milestone remains") {
+            NextWork::Milestone(m) => assert_eq!(m.title, "Build"),
+            other => panic!("expected a milestone suggestion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn next_work_dispatch_text_and_summary_render() {
+        let m = Milestone::new("Build");
+        let titled = TaskRef::with_title("TASK-9", "wire routing");
+        let bare = TaskRef::new("TASK-10");
+
+        let w = NextWork::Task {
+            task: &titled,
+            milestone: Some(&m),
+        };
+        assert_eq!(w.dispatch_text(), "TASK-9: wire routing");
+        assert!(w.summary().contains("TASK-9 (wire routing)"));
+        assert!(w.summary().contains("Build"));
+
+        let w = NextWork::Task {
+            task: &bare,
+            milestone: None,
+        };
+        assert_eq!(w.dispatch_text(), "TASK-10");
+        assert_eq!(w.summary(), "task TASK-10");
+
+        let w = NextWork::Milestone(&m);
+        assert_eq!(w.dispatch_text(), "Build");
+        assert!(w.summary().contains("Build"));
     }
 
     // ── rollup: progress % (subtree aggregate) ──────────────────────────────
