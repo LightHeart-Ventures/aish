@@ -4907,6 +4907,74 @@ fn goal_command(session: &mut Session, sub: &str, args: &str) -> String {
 }
 
 
+/// A durable coordinator row's phase is "live" (it can still fold in a queued
+/// `:tell`) only while non-terminal. Unknown / legacy / MISSING phase strings
+/// parse to `Phase::Failed` (see `coordinator::Phase::parse`) and are therefore
+/// treated as terminal — a row we cannot interpret must never silently swallow a
+/// message. (TASK-286 AC1/AC2: check phase; reject done/failed/missing.) Pure →
+/// unit-tested.
+fn phase_is_live(phase: &str) -> bool {
+    !crate::coordinator::Phase::parse(phase).is_terminal()
+}
+
+/// The decision `tell_coordinator` reaches after matching `<id>` against the live
+/// worker table + durable coordinator store and applying the ownership gate.
+/// Pure over its inputs (`resolve_tell_target`) so the routing is unit-tested;
+/// `tell_coordinator` does the IO (collect candidates, print, enqueue).
+#[derive(Debug, PartialEq, Eq)]
+enum TellTarget {
+    /// No coordinator — live or durable — matched the id.
+    NotFound,
+    /// Match(es) existed but every one is owned by another session and `--any`
+    /// was not supplied.
+    ForeignOnly,
+    /// The single owned match has already reached a terminal phase
+    /// (done / failed / unknown-or-missing) — nothing would read the message.
+    Terminal(String),
+    /// Exactly one live, owned coordinator — ready to receive the message.
+    Ready(String),
+    /// The id was a prefix that matched several owned coordinators.
+    Ambiguous(Vec<String>),
+}
+
+/// Resolve a `:tell <id>` against the collected `candidates`
+/// (`(run_id, terminal, owner_session)` — the caller derives `terminal` from the
+/// live worker status or, for a durable row, from [`phase_is_live`]) and the
+/// `--any` ownership gate. Pure → unit-tested (TASK-286 AC3 non-existent id, plus
+/// the terminal / foreign / ambiguous branches).
+fn resolve_tell_target(
+    candidates: &[(String, bool, Option<String>)],
+    my_session: &str,
+    any: bool,
+) -> TellTarget {
+    let owned: Vec<&(String, bool, Option<String>)> = candidates
+        .iter()
+        .filter(|(_, _, owner)| {
+            matches!(
+                owner_gate(owner.as_deref(), my_session, any),
+                OwnerGate::Allow
+            )
+        })
+        .collect();
+    if owned.is_empty() {
+        return if candidates.is_empty() {
+            TellTarget::NotFound
+        } else {
+            TellTarget::ForeignOnly
+        };
+    }
+    match owned.as_slice() {
+        [(run_id, terminal, _)] => {
+            if *terminal {
+                TellTarget::Terminal(run_id.clone())
+            } else {
+                TellTarget::Ready(run_id.clone())
+            }
+        }
+        many => TellTarget::Ambiguous(many.iter().map(|(rid, _, _)| rid.clone()).collect()),
+    }
+}
+
 /// `:tell` / SendMessage channel. The message lands in the durable
 /// `coordinator_messages` mailbox keyed by the run's id and is folded into the
 /// coordinator's NEXT round (see `coordinator::drive`), so it's how you steer a
@@ -4953,50 +5021,40 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
             if hit(&r.run_id) && !candidates.iter().any(|(rid, _, _)| rid == &r.run_id) {
                 candidates.push((
                     r.run_id.clone(),
-                    matches!(r.phase.as_str(), "done" | "failed"),
+                    // TASK-286: a durable row whose phase is done/failed OR
+                    // unknown/missing is dead — never queue into it.
+                    !phase_is_live(&r.phase),
                     r.session_id.clone(),
                 ));
             }
         }
     }
 
-    // AC7 ownership gate: by default you may only steer coordinators your OWN
-    // session launched; `--any` opts into another session's coordinator. A
-    // foreign-only match without `--any` is refused with guidance rather than
-    // silently treated as "not found", so the run isn't invisibly reachable.
-    let owned: Vec<(String, bool, Option<String>)> = candidates
-        .iter()
-        .filter(|(_, _, owner)| {
-            matches!(
-                owner_gate(owner.as_deref(), &session.session_id, any),
-                OwnerGate::Allow
-            )
-        })
-        .cloned()
-        .collect();
-    if owned.is_empty() {
-        if candidates.is_empty() {
+    // AC7 ownership gate + liveness routing, resolved by the pure
+    // `resolve_tell_target` (unit-tested). By default you may only steer
+    // coordinators your OWN session launched; `--any` opts into another
+    // session's. A terminal or unknown-phase run is refused — nothing would read
+    // the message — so a `:tell` never becomes a silent no-op (TASK-286).
+    match resolve_tell_target(&candidates, &session.session_id, any) {
+        TellTarget::NotFound => {
             println!("no background coordinator matching '{id}' (see :workers)");
-        } else {
+        }
+        TellTarget::ForeignOnly => {
             println!(
                 "'{id}' matches a coordinator launched by another session — re-run as `:tell --any {id} <message>` to steer it"
             );
         }
-        return;
-    }
-
-    match owned.as_slice() {
-        [(run_id, terminal, _)] => {
-            let short = crate::batch::short_id(run_id);
-            if *terminal {
-                println!(
-                    "coordinator {short} has already finished — message not queued (`:result {short}` to view its result)"
-                );
-                return;
-            }
-            match store.enqueue_message(run_id, message, Some(&session.session_id)) {
+        TellTarget::Terminal(run_id) => {
+            let short = crate::batch::short_id(&run_id);
+            println!(
+                "coordinator {short} is finished; unable to send message (`:result {short}` to view its result)"
+            );
+        }
+        TellTarget::Ready(run_id) => {
+            let short = crate::batch::short_id(&run_id);
+            match store.enqueue_message(&run_id, message, Some(&session.session_id)) {
                 Ok(_) => {
-                    let pending = store.pending_message_count(run_id).unwrap_or(0);
+                    let pending = store.pending_message_count(&run_id).unwrap_or(0);
                     println!(
                         "\x1b[2m✉ queued for {short} ({pending} pending) — folded in at the start of its next round\x1b[0m"
                     );
@@ -5004,12 +5062,12 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
                 Err(e) => println!("couldn't queue message: {e}"),
             }
         }
-        many => {
+        TellTarget::Ambiguous(ids) => {
             println!(
                 "'{id}' matches {} coordinators — be more specific:",
-                many.len()
+                ids.len()
             );
-            for (rid, _, _) in many {
+            for rid in ids {
                 println!("  {rid}");
             }
         }
@@ -8449,6 +8507,73 @@ mod tests {
         assert_eq!(owner_gate(None, "sess-a", false), OwnerGate::Allow);
         // --any is a harmless no-op when the run is already yours.
         assert_eq!(owner_gate(Some("sess-a"), "sess-a", true), OwnerGate::Allow);
+    }
+
+    #[test]
+    fn phase_is_live_treats_missing_and_unknown_as_dead() {
+        // TASK-286 AC1/AC2: :tell checks coordinator.phase before enqueuing and
+        // rejects done/failed/missing. Live (resumable) phases can still read a
+        // queued message; terminal + unknown/missing cannot.
+        assert!(phase_is_live("coordinating"));
+        assert!(phase_is_live("awaiting_batch"));
+        assert!(!phase_is_live("done"));
+        assert!(!phase_is_live("failed"));
+        // Missing (empty) and unknown/legacy phase strings parse to Failed and
+        // are therefore dead — a row we cannot interpret must not swallow a msg.
+        assert!(!phase_is_live(""));
+        assert!(!phase_is_live("zombie"));
+    }
+
+    #[test]
+    fn resolve_tell_target_routes_by_liveness_and_ownership() {
+        let me = "sess-a";
+        let live = |rid: &str, owner: Option<&str>| {
+            (rid.to_string(), false, owner.map(str::to_string))
+        };
+        let dead = |rid: &str, owner: Option<&str>| {
+            (rid.to_string(), true, owner.map(str::to_string))
+        };
+
+        // AC3: :tell to a non-existent run-id fails gracefully (NotFound), never
+        // a silent no-op or a raw DB error.
+        assert_eq!(
+            resolve_tell_target(&[], me, false),
+            TellTarget::NotFound
+        );
+
+        // A live, owned coordinator is ready to receive the message.
+        assert_eq!(
+            resolve_tell_target(&[live("w_live", Some(me))], me, false),
+            TellTarget::Ready("w_live".to_string())
+        );
+
+        // A finished (dead) coordinator is refused rather than enqueued-into.
+        assert_eq!(
+            resolve_tell_target(&[dead("w_done", Some(me))], me, false),
+            TellTarget::Terminal("w_done".to_string())
+        );
+
+        // A match owned only by another session, without --any, is refused with
+        // guidance (ForeignOnly) — not silently invisible.
+        assert_eq!(
+            resolve_tell_target(&[live("w_other", Some("sess-b"))], me, false),
+            TellTarget::ForeignOnly
+        );
+        // …and --any opts in, making it Ready.
+        assert_eq!(
+            resolve_tell_target(&[live("w_other", Some("sess-b"))], me, true),
+            TellTarget::Ready("w_other".to_string())
+        );
+
+        // An ambiguous prefix that matches several owned coordinators lists them.
+        assert_eq!(
+            resolve_tell_target(
+                &[live("w_a", Some(me)), live("w_b", Some(me))],
+                me,
+                false
+            ),
+            TellTarget::Ambiguous(vec!["w_a".to_string(), "w_b".to_string()])
+        );
     }
 
     #[test]
