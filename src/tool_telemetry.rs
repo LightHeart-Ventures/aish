@@ -624,6 +624,34 @@ mod tests {
     }
 
     #[test]
+    fn batching_collapses_transactions_at_scale() {
+        // AC#2: reduced transaction count at scale. With batch=20, a run of 1000
+        // tool calls persists in batch-sized steps — proving each 20-event window
+        // is ONE store transaction (≈50 total), not 1000 per-event writes.
+        let dir = tele_tmp("scale_tx");
+        let mut s = tele_session(&dir);
+        s.tool_telemetry_batch_size = 20;
+        let ok = ToolResult::text("t", "done", false);
+        for _ in 0..19 {
+            record(&mut s, "run_program", &ok);
+        }
+        assert_eq!(
+            s.db.as_ref().unwrap().tool_telemetry_count().unwrap(),
+            0,
+            "19 events collapsed into 0 transactions (still buffered)"
+        );
+        record(&mut s, "run_program", &ok);
+        assert_eq!(s.db.as_ref().unwrap().tool_telemetry_count().unwrap(), 20);
+        for n in 21..=1000 {
+            record(&mut s, "run_program", &ok);
+            let persisted = s.db.as_ref().unwrap().tool_telemetry_count().unwrap();
+            assert_eq!(persisted, (n / 20) * 20, "persist tracks batch boundaries");
+        }
+        assert!(s.tool_telemetry_buf.is_empty());
+        assert_eq!(s.db.as_ref().unwrap().tool_telemetry_count().unwrap(), 1000);
+    }
+
+    #[test]
     fn drop_flushes_buffered_tail() {
         let dir = tele_tmp("drop");
         let dbpath = dir.join("t.db");

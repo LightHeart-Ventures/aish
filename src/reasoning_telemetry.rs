@@ -1274,6 +1274,26 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_is_constant_work_at_scale() {
+        // AC#2: O(1) :reasoning at scale. Build a memo over a large backlog, then
+        // prove a subsequent summarize folds ONLY the newly-appended line —
+        // constant work regardless of the 10k-line history behind it.
+        let _log = TestLog::new("memo_scale");
+        for _ in 0..10_000 {
+            record(&ReasoningEvent::new(Decision::Guessed, "bulk", "self_report")).unwrap();
+        }
+        assert_eq!(summarize().total, 10_000);
+        assert_eq!(read_head().lines_consumed, 10_000);
+        let mut head = read_head();
+        head.total = 100_000; // sentinel above any full-rescan result
+        write_head(&head);
+        record(&ReasoningEvent::new(Decision::Guessed, "tail", "self_report")).unwrap();
+        let s = summarize();
+        assert_eq!(s.total, 100_001, "only the single new line was folded (O(1))");
+        assert_eq!(read_head().lines_consumed, 10_001);
+    }
+
+    #[test]
     fn incremental_outcome_folds_onto_old_memoized_event() {
         // The tricky correctness case: an outcome update lands AFTER the event was
         // already memoized (and its per-event state discarded from RAM). The
