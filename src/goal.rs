@@ -650,7 +650,8 @@ impl Goal {
 
     /// A 0..=100 rollup of goal progress across BOTH milestones and linked
     /// tasks (TASK-282). Terminal `Completed` always reads 100. With no
-    /// trackable items the percentage is 0 (nothing to roll up yet).
+    /// trackable items the percentage is 0 (nothing to roll up yet). The ratio
+    /// is rounded half-up without floats.
     pub fn progress_percent(&self) -> u8 {
         if self.status == GoalStatus::Completed {
             return 100;
@@ -662,7 +663,24 @@ impl Goal {
             return 0;
         }
         let done = m_done + t_done;
-        ((done * 100) / total) as u8
+        // Round half-up without floats: (done*100 + total/2) / total.
+        (((done * 100) + total / 2) / total) as u8
+    }
+
+    /// The next checkpoint to tackle — the first not-yet-`done` milestone in
+    /// order. `None` when every milestone is done (or there are none). This is
+    /// the primitive goal-aware routing consumes to pick the next unit of work.
+    pub fn next_open_milestone(&self) -> Option<&Milestone> {
+        self.milestones.iter().find(|m| !m.done)
+    }
+
+    /// Whether this goal is ready to be worked *right now*: it's `Active`, has no
+    /// open blockers, and isn't already fully complete. Routing skips goals that
+    /// are paused, blocked, terminal, or done.
+    pub fn is_actionable(&self) -> bool {
+        self.status == GoalStatus::Active
+            && self.open_blockers() == 0
+            && self.progress_percent() < 100
     }
 
     /// Auto-advance the status when everything tracked is finished: a non-terminal
@@ -724,6 +742,51 @@ impl Goal {
         }
         out
     }
+}
+
+/// Aggregate `(done, total)` milestone counts across a goal **and its entire
+/// descendant subtree**, identified by `root_id` within `all`. This is the
+/// cross-tree progress rollup: a parent's real progress folds in its subgoals.
+/// Unknown `root_id` yields `(0, 0)`. Pure over the slice — no DB, no ordering
+/// assumptions beyond parent_id links.
+pub fn subtree_progress(root_id: &str, all: &[Goal]) -> (usize, usize) {
+    let mut done = 0;
+    let mut total = 0;
+    // Iterative DFS over parent_id edges; cycle-safe via a visited set.
+    let mut stack = vec![root_id.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if let Some(g) = all.iter().find(|g| g.id == id) {
+            let (d, t) = g.milestone_progress();
+            done += d;
+            total += t;
+            for child in all.iter().filter(|c| c.parent_id.as_deref() == Some(id.as_str())) {
+                stack.push(child.id.clone());
+            }
+        }
+    }
+    (done, total)
+}
+
+/// Subtree progress as a rounded 0–100 percentage (see [`subtree_progress`]).
+/// Empty/unknown subtrees report 0.
+pub fn subtree_percent(root_id: &str, all: &[Goal]) -> u8 {
+    let (done, total) = subtree_progress(root_id, all);
+    if total == 0 {
+        return 0;
+    }
+    (((done * 100) + total / 2) / total) as u8
+}
+
+/// Goal-aware routing selection: pick the next goal to work from a set. Returns
+/// the first [`Goal::is_actionable`] goal in input order (deterministic), or
+/// `None` when everything is paused/blocked/terminal/done. This is the seam the
+/// invoke path builds on to route work toward the user's live goals.
+pub fn route_next(goals: &[Goal]) -> Option<&Goal> {
+    goals.iter().find(|g| g.is_actionable())
 }
 
 
@@ -971,6 +1034,105 @@ mod domain_tests {
         let json = serde_json::to_string(&g).expect("serialize");
         let back: Goal = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(g, back);
+    }
+
+    // ── rollup: progress % (single goal) ────────────────────────────────────
+    #[test]
+    fn progress_percent_rounds_and_handles_empty() {
+        let mut g = Goal::new("P");
+        assert_eq!(g.progress_percent(), 0, "no milestones ⇒ 0%");
+        g.add_milestone("a");
+        g.add_milestone("b");
+        g.add_milestone("c");
+        assert_eq!(g.progress_percent(), 0);
+        g.milestones[0].done = true; // 1/3 = 33.33 → 33
+        assert_eq!(g.progress_percent(), 33);
+        g.milestones[1].done = true; // 2/3 = 66.67 → 67 (half-up)
+        assert_eq!(g.progress_percent(), 67);
+        g.milestones[2].done = true; // 3/3 → 100
+        assert_eq!(g.progress_percent(), 100);
+    }
+
+    #[test]
+    fn next_open_milestone_picks_first_undone() {
+        let mut g = Goal::new("N");
+        assert!(g.next_open_milestone().is_none(), "none when empty");
+        g.add_milestone("first");
+        g.add_milestone("second");
+        g.milestones[0].done = true;
+        assert_eq!(g.next_open_milestone().unwrap().title, "second");
+        g.milestones[1].done = true;
+        assert!(g.next_open_milestone().is_none(), "none when all done");
+    }
+
+    // ── rollup: progress % (subtree aggregate) ──────────────────────────────
+    #[test]
+    fn subtree_progress_folds_in_descendants() {
+        // root ─┬─ a ── grand
+        //       └─ b
+        let mut root = Goal::new("root");
+        root.add_milestone("r1"); // 0/1
+        let mut a = Goal::subgoal("a", root.id.clone());
+        a.add_milestone("a1");
+        a.milestones[0].done = true; // 1/1
+        let mut grand = Goal::subgoal("grand", a.id.clone());
+        grand.add_milestone("g1");
+        grand.add_milestone("g2");
+        grand.milestones[0].done = true; // 1/2
+        let b = Goal::subgoal("b", root.id.clone()); // 0/0
+
+        let all = vec![root.clone(), a, grand, b];
+        // done = 0(root)+1(a)+1(grand)+0(b) = 2 ; total = 1+1+2+0 = 4 ⇒ 50%
+        assert_eq!(subtree_progress(&root.id, &all), (2, 4));
+        assert_eq!(subtree_percent(&root.id, &all), 50);
+        // Unknown root is empty, never panics.
+        assert_eq!(subtree_progress("ghost", &all), (0, 0));
+        assert_eq!(subtree_percent("ghost", &all), 0);
+    }
+
+    // ── goal-aware routing selection ────────────────────────────────────────
+    #[test]
+    fn is_actionable_gates_on_status_blockers_and_completion() {
+        let mut g = Goal::new("work");
+        g.add_milestone("m");
+        assert!(g.is_actionable(), "active + unblocked + incomplete ⇒ actionable");
+
+        g.add_blocker("waiting");
+        assert!(!g.is_actionable(), "open blocker ⇒ not actionable");
+        g.blockers[0].resolved = true;
+        assert!(g.is_actionable(), "cleared blocker ⇒ actionable again");
+
+        g.milestones[0].done = true; // 100%
+        assert!(!g.is_actionable(), "fully complete ⇒ not actionable");
+
+        let mut paused = Goal::new("later");
+        paused.add_milestone("m");
+        paused.set_status(GoalStatus::Paused);
+        assert!(!paused.is_actionable(), "paused ⇒ not actionable");
+    }
+
+    #[test]
+    fn route_next_picks_first_actionable_in_order() {
+        // done ── skipped; blocked ── skipped; ready ── chosen.
+        let mut done = Goal::new("done");
+        done.add_milestone("x");
+        done.milestones[0].done = true;
+
+        let mut blocked = Goal::new("blocked");
+        blocked.add_milestone("y");
+        blocked.add_blocker("dep");
+
+        let mut ready = Goal::new("ready");
+        ready.add_milestone("z");
+
+        let goals = vec![done, blocked, ready];
+        assert_eq!(route_next(&goals).unwrap().title, "ready");
+
+        // Nothing actionable ⇒ None.
+        let mut only_paused = Goal::new("p");
+        only_paused.set_status(GoalStatus::Paused);
+        assert!(route_next(&[only_paused]).is_none());
+        assert!(route_next(&[]).is_none());
     }
 
     #[test]
