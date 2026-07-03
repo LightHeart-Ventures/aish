@@ -440,6 +440,16 @@ pub struct Session {
     pub tool_telemetry_unbuffered: bool,
     /// Instant of the last telemetry flush; drives the interval check.
     pub tool_telemetry_last_flush: std::time::Instant,
+    /// Pre-aggregated `:telemetry` snapshot (TASK-252 / FR-305). The GROUP BY
+    /// scans behind the report are re-run at most once per
+    /// `tool_telemetry_cache_secs`; a freshly recorded tool call invalidates it
+    /// exactly (see `crate::tool_telemetry::record`). `None` until the first
+    /// `:telemetry` populates it, or after an invalidation. Session-local.
+    pub tool_telemetry_cache: Option<crate::tool_telemetry::TelemetryCache>,
+    /// Max age a cached `:telemetry` aggregate is served before a re-query.
+    /// Resolved from `AISH_TELEMETRY_CACHE_SECS` at construction (default 60s);
+    /// `0` disables the cache (every `:telemetry` re-queries).
+    pub tool_telemetry_cache_secs: std::time::Duration,
 }
 
 impl Drop for Session {
@@ -520,6 +530,12 @@ impl Session {
                 std::env::var("AISH_TELEMETRY_UNBUFFERED").ok().as_deref(),
             ),
             tool_telemetry_last_flush: std::time::Instant::now(),
+            tool_telemetry_cache: None,
+            tool_telemetry_cache_secs: std::time::Duration::from_secs(
+                crate::tool_telemetry::parse_cache_secs(
+                    std::env::var("AISH_TELEMETRY_CACHE_SECS").ok().as_deref(),
+                ),
+            ),
         })
     }
 
