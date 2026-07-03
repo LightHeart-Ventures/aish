@@ -94,7 +94,28 @@ impl Db {
                  recovered   INTEGER NOT NULL DEFAULT 0,
                  prev_class  TEXT,
                  session_id  TEXT
-             );",
+             );
+             -- Durable goal records (crate::goal::Goal, TASK-277). The rich
+             -- sub-collections are stored as JSON TEXT so the schema stays flat
+             -- while round-tripping milestones/blockers/linked_tasks losslessly.
+             -- `parent_id` gives arbitrary-depth subgoal nesting (indexed so
+             -- child lookups are cheap); ON DELETE would orphan children, so the
+             -- store deletes subtrees explicitly.
+             CREATE TABLE IF NOT EXISTS goals (
+                 id           TEXT PRIMARY KEY,
+                 title        TEXT NOT NULL,
+                 description  TEXT NOT NULL DEFAULT '',
+                 status       TEXT NOT NULL DEFAULT 'active'
+                              CHECK (status IN
+                              ('active','paused','completed','abandoned')),
+                 parent_id    TEXT,
+                 milestones   TEXT NOT NULL DEFAULT '[]',
+                 blockers     TEXT NOT NULL DEFAULT '[]',
+                 linked_tasks TEXT NOT NULL DEFAULT '[]',
+                 created_at   INTEGER NOT NULL DEFAULT 0,
+                 updated_at   INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idx_goals_parent ON goals (parent_id);",
         )
         .context("schema init failed")?;
         let db = Self { conn };
@@ -679,6 +700,145 @@ impl Db {
     }
 }
 
+// ───────────────────────── Goals (TASK-277) ─────────────────────────
+//
+// Persistence for durable `crate::goal::Goal` records. Kept in its own `impl`
+// block for readability; the rich sub-collections (milestones/blockers/
+// linked_tasks) are stored as JSON TEXT so the table schema stays flat while
+// round-tripping losslessly.
+impl Db {
+    /// Insert a new goal or overwrite the existing row with the same id
+    /// (upsert). Callers should `goal.touch()` before saving mutated records so
+    /// `updated_at` reflects the change.
+    pub fn upsert_goal(&self, goal: &crate::goal::Goal) -> Result<()> {
+        let milestones = serde_json::to_string(&goal.milestones)
+            .context("serialize goal.milestones")?;
+        let blockers =
+            serde_json::to_string(&goal.blockers).context("serialize goal.blockers")?;
+        let linked = serde_json::to_string(&goal.linked_tasks)
+            .context("serialize goal.linked_tasks")?;
+        self.conn
+            .execute(
+                "INSERT INTO goals
+                   (id, title, description, status, parent_id,
+                    milestones, blockers, linked_tasks, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                   title        = excluded.title,
+                   description  = excluded.description,
+                   status       = excluded.status,
+                   parent_id    = excluded.parent_id,
+                   milestones   = excluded.milestones,
+                   blockers     = excluded.blockers,
+                   linked_tasks = excluded.linked_tasks,
+                   updated_at   = excluded.updated_at",
+                rusqlite::params![
+                    goal.id,
+                    goal.title,
+                    goal.description,
+                    goal.status.as_str(),
+                    goal.parent_id,
+                    milestones,
+                    blockers,
+                    linked,
+                    goal.created_at,
+                    goal.updated_at,
+                ],
+            )
+            .context("upsert goal failed")?;
+        Ok(())
+    }
+
+    /// Fetch one goal by id, or `None` when it doesn't exist.
+    pub fn get_goal(&self, id: &str) -> Result<Option<crate::goal::Goal>> {
+        self.conn
+            .query_row(
+                "SELECT id, title, description, status, parent_id,
+                        milestones, blockers, linked_tasks, created_at, updated_at
+                 FROM goals WHERE id = ?1",
+                [id],
+                Self::goal_from_row,
+            )
+            .optional()
+            .context("get goal failed")
+    }
+
+    /// All goals, newest-updated first. UI/list callers filter client-side.
+    pub fn all_goals(&self) -> Result<Vec<crate::goal::Goal>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, description, status, parent_id,
+                    milestones, blockers, linked_tasks, created_at, updated_at
+             FROM goals ORDER BY updated_at DESC, created_at DESC",
+        )?;
+        let rows = stmt.query_map([], Self::goal_from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Direct children of `parent_id` (one level of the subgoal tree).
+    pub fn child_goals(&self, parent_id: &str) -> Result<Vec<crate::goal::Goal>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, description, status, parent_id,
+                    milestones, blockers, linked_tasks, created_at, updated_at
+             FROM goals WHERE parent_id = ?1
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([parent_id], Self::goal_from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Delete a goal and its entire subgoal subtree (depth-first). Returns the
+    /// number of rows removed. SQLite has no recursive DELETE, so we walk the
+    /// tree in Rust to avoid orphaning descendants.
+    pub fn delete_goal(&self, id: &str) -> Result<usize> {
+        let mut removed = 0;
+        let child_ids: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM goals WHERE parent_id = ?1")?;
+            let rows = stmt.query_map([id], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for child in child_ids {
+            removed += self.delete_goal(&child)?;
+        }
+        removed += self
+            .conn
+            .execute("DELETE FROM goals WHERE id = ?1", [id])
+            .context("delete goal failed")?;
+        Ok(removed)
+    }
+
+    /// Row → `Goal`, tolerating malformed JSON in the sub-collection columns
+    /// (a corrupt cell degrades to an empty vec rather than failing the load).
+    fn goal_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::goal::Goal> {
+        let status_tok: String = r.get(3)?;
+        let milestones_json: String = r.get(5)?;
+        let blockers_json: String = r.get(6)?;
+        let linked_json: String = r.get(7)?;
+        Ok(crate::goal::Goal {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            description: r.get(2)?,
+            status: crate::goal::GoalStatus::from_token(&status_tok),
+            parent_id: r.get(4)?,
+            milestones: serde_json::from_str(&milestones_json).unwrap_or_default(),
+            blockers: serde_json::from_str(&blockers_json).unwrap_or_default(),
+            linked_tasks: serde_json::from_str(&linked_json).unwrap_or_default(),
+            created_at: r.get(8)?,
+            updated_at: r.get(9)?,
+        })
+    }
+}
+
+/// One recall candidate: the display fields plus the row's embedding (when
 /// One recall candidate: the display fields plus the row's embedding (when
 /// present) for relevance re-ranking. Rendered to the `[ts] (tags) content`
 /// string the model sees, truncated to the recall hit cap.
@@ -1838,6 +1998,53 @@ mod tests {
         let db = temp_db("vec");
         let v = db.vec_version().unwrap();
         assert!(v.starts_with('v'), "unexpected vec_version: {v}");
+    }
+
+    #[test]
+    fn goal_upsert_get_and_list() {
+        use crate::goal::{Goal, GoalStatus, TaskRef};
+        let db = temp_db("goals_crud");
+
+        let mut g = Goal::new("Ship TASK-277").with_description("persistent goals");
+        g.add_milestone("schema");
+        g.add_blocker("review pending");
+        g.link_task(TaskRef::with_title("TASK-277", "Persistent goals"));
+        db.upsert_goal(&g).unwrap();
+
+        let got = db.get_goal(&g.id).unwrap().expect("goal exists");
+        assert_eq!(got, g);
+        assert_eq!(got.milestones.len(), 1);
+        assert_eq!(got.blockers.len(), 1);
+        assert_eq!(got.linked_tasks[0].key, "TASK-277");
+
+        let mut g2 = got.clone();
+        g2.set_status(GoalStatus::Completed);
+        db.upsert_goal(&g2).unwrap();
+        let reloaded = db.get_goal(&g.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, GoalStatus::Completed);
+
+        assert_eq!(db.all_goals().unwrap().len(), 1);
+        assert!(db.get_goal("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn goal_subtree_delete_cascades() {
+        use crate::goal::Goal;
+        let db = temp_db("goals_tree");
+
+        let root = Goal::new("root");
+        db.upsert_goal(&root).unwrap();
+        let child = Goal::subgoal("child", root.id.clone());
+        db.upsert_goal(&child).unwrap();
+        let grandchild = Goal::subgoal("grandchild", child.id.clone());
+        db.upsert_goal(&grandchild).unwrap();
+
+        assert_eq!(db.child_goals(&root.id).unwrap().len(), 1);
+        assert_eq!(db.child_goals(&child.id).unwrap().len(), 1);
+
+        let removed = db.delete_goal(&root.id).unwrap();
+        assert_eq!(removed, 3);
+        assert!(db.all_goals().unwrap().is_empty());
     }
 
     #[test]
