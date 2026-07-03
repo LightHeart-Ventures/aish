@@ -610,6 +610,11 @@ impl Session {
         self.tokens_out = 0;
         self.tool_calls_total = 0;
         self.turns_total = 0;
+        // TASK-282 AC1/AC3: the durable goal tree is independent of the
+        // conversation. Re-hydrate it from aish.db and re-assert the single
+        // active-goal invariant so the goal (and its rollup) survives `:new`.
+        self.load_goals();
+        self.reconcile_active_goal();
     }
 
     /// One-line status of the active loop (bare `:loop` / `:loop status`).
@@ -699,6 +704,121 @@ impl Session {
             Some(existing) => *existing = goal,
             None => self.goals.push(goal),
         }
+    }
+
+    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
     }
 
     /// The autonomy descriptor stamped on every hook payload (design §3.1): a
@@ -1168,6 +1288,111 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_keeps_single_active_goal_and_survives_restart() {
+        // TASK-282 AC1 + AC3: only one active goal is reconciled on startup, and
+        // the active goal reloads across a process restart.
+        use crate::goal::Goal;
+        let dir = std::env::temp_dir().join(format!("aish_sess_282a_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dbpath = dir.join("aish.db");
+
+        let mut session = Session::new().unwrap();
+        session.db = Some(crate::db::Db::open(&dbpath).unwrap());
+
+        // Two top-level Active goals; persist older first so the second is newest.
+        let mut older = Goal::new("Older goal");
+        older.updated_at -= 100;
+        older.created_at -= 100;
+        let older_id = older.id.clone();
+        let newer = Goal::new("Newer goal");
+        let newer_id = newer.id.clone();
+        session.persist_goal(older);
+        session.persist_goal(newer);
+
+        // load_goals orders newest-updated-first; reconcile keeps that one.
+        session.load_goals();
+        let kept = session.reconcile_active_goal();
+        assert_eq!(kept.as_deref(), Some(newer_id.as_str()), "newest stays active");
+        assert_eq!(
+            session.active_goal().map(|g| g.id.clone()),
+            Some(newer_id.clone()),
+            "exactly one active goal after reconcile"
+        );
+        // The older one was demoted to Paused and persisted.
+        let older_now = session.goals.iter().find(|g| g.id == older_id).unwrap();
+        assert_eq!(older_now.status, crate::goal::GoalStatus::Paused);
+
+        // Restart: the active goal rehydrates and reconcile is idempotent.
+        let mut restarted = Session::new().unwrap();
+        restarted.db = Some(crate::db::Db::open(&dbpath).unwrap());
+        restarted.load_goals();
+        restarted.reconcile_active_goal();
+        assert_eq!(
+            restarted.active_goal().map(|g| g.id.clone()),
+            Some(newer_id),
+            "active goal reloads after restart"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn coordinator_finish_rolls_up_linked_goal_progress() {
+        // TASK-282 AC2: a finishing linked coordinator updates the goal rollup.
+        use crate::goal::{Goal, GoalStatus, TaskRef};
+        let mut session = Session::new().unwrap();
+
+        let mut goal = Goal::new("Ship the feature");
+        goal.link_task(TaskRef::new("TASK-500"));
+        goal.link_task(TaskRef::new("TASK-501"));
+        let gid = goal.id.clone();
+        session.persist_goal(goal);
+
+        // A coordinator whose task text mentions TASK-500 finishes.
+        let advanced = session.record_coordinator_task_progress(
+            "review, design, build, open PR for TASK-500 as specified",
+        );
+        assert_eq!(advanced.len(), 1, "one goal advanced");
+        assert_eq!(advanced[0].0, "Ship the feature");
+        assert_eq!(advanced[0].1, 50, "1 of 2 linked tasks done → 50%");
+        // Still Active (not everything done).
+        assert_eq!(
+            session.goals.iter().find(|g| g.id == gid).unwrap().status,
+            GoalStatus::Active
+        );
+
+        // Re-running the same finish is a no-op (already done).
+        assert!(session
+            .record_coordinator_task_progress("TASK-500 again")
+            .is_empty());
+
+        // The second linked coordinator finishes → 100% and auto-complete.
+        let advanced2 = session.record_coordinator_task_progress("done with TASK-501");
+        assert_eq!(advanced2[0].1, 100);
+        assert_eq!(
+            session.goals.iter().find(|g| g.id == gid).unwrap().status,
+            GoalStatus::Completed,
+            "goal auto-completes when all linked tasks finish"
+        );
+        // Badge reflects the active goal only — none active now.
+        assert!(session.goal_badge().is_none(), "no active goal after completion");
+    }
+
+    #[test]
+    fn goal_badge_shows_active_goal_percentage() {
+        use crate::goal::{Goal, TaskRef};
+        let mut session = Session::new().unwrap();
+        assert!(session.goal_badge().is_none(), "no goal → no badge");
+
+        let mut goal = Goal::new("Persist goals");
+        goal.link_task(TaskRef::new("TASK-282"));
+        session.persist_goal(goal);
+        let badge = session.goal_badge().expect("active goal → badge");
+        assert!(badge.contains("Persist goals"), "badge names the goal: {badge}");
+        assert!(badge.contains("0%"), "badge shows rollup percent: {badge}");
     }
 
     #[test]

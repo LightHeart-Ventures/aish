@@ -481,6 +481,12 @@ pub async fn run(
         // announce it once and flip into review mode (stay attached so a typed
         // line resumes it). See `announce_attach_review`.
         announce_attach_review(&mut session);
+        // TASK-282 AC2: fold any finished linked coordinator into its goal's
+        // progress rollup (idempotent — fires the notice once, on the pass that
+        // first sees the finish).
+        for notice in session.sync_goal_rollup() {
+            crate::tools::print_above_prompt(format!("{notice}\n"));
+        }
         // Tab completion resolves against the session's cwd, which `cd` mutates.
         editor.set_cwd(&session.cwd);
         // We're about to idle at the prompt — let the presenter flush results.
@@ -505,8 +511,14 @@ pub async fn run(
             Some(run_id) => format!("\x1b[1;33m⇄{} \x1b[0m", crate::batch::short_id(run_id)),
             None => String::new(),
         };
+        // TASK-282: surface the active goal + rollup % just before the cwd so it
+        // rides along every prompt (empty when there's no active goal).
+        let goal_badge = session
+            .goal_badge()
+            .map(|b| format!("\x1b[35m{b}\x1b[0m "))
+            .unwrap_or_default();
         let prompt = format!(
-            "{attach}{badge}\x1b[36m{}\x1b[0m ❯ ",
+            "{attach}{badge}{goal_badge}\x1b[36m{}\x1b[0m ❯ ",
             short_cwd(&session)
         );
         

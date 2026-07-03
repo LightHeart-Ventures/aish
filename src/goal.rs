@@ -160,6 +160,7 @@ fn fmt_duration(d: Duration) -> String {
 }
 
 /// Keep the condition snippet on one line — long goals get an ellipsis.
+<<<<<<< HEAD
 fn truncate_condition(condition: &str) -> String {
     truncate_ellipsis(condition, 60)
 }
@@ -171,6 +172,12 @@ fn truncate_condition(condition: &str) -> String {
 pub fn truncate_ellipsis(s: &str, max: usize) -> String {
     if s.chars().count() > max {
         let head: String = s.chars().take(max).collect();
+=======
+pub(crate) fn truncate_condition(condition: &str) -> String {
+    const MAX: usize = 60;
+    if condition.chars().count() > MAX {
+        let head: String = condition.chars().take(MAX).collect();
+>>>>>>> 9907d69 (feat(goals): single active goal + coordinator progress rollup (TASK-282))
         format!("{}…", head.trim_end())
     } else {
         s.to_string()
@@ -494,6 +501,10 @@ pub struct TaskRef {
     pub key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Flips true when the work item this ref points at is finished — set by a
+    /// finishing linked coordinator (TASK-282). Feeds the goal progress rollup.
+    #[serde(default)]
+    pub done: bool,
 }
 
 impl TaskRef {
@@ -501,6 +512,7 @@ impl TaskRef {
         Self {
             key: key.into(),
             title: None,
+            done: false,
         }
     }
 
@@ -508,6 +520,7 @@ impl TaskRef {
         Self {
             key: key.into(),
             title: Some(title.into()),
+            done: false,
         }
     }
 }
@@ -616,6 +629,68 @@ impl Goal {
     /// Unresolved blockers — the ones actually impeding the goal right now.
     pub fn open_blockers(&self) -> usize {
         self.blockers.iter().filter(|b| !b.resolved).count()
+    }
+
+    /// `(done, total)` linked-task counts — the coordinator-driven progress
+    /// signal (TASK-282). A finishing linked coordinator flips one `done`.
+    pub fn linked_task_progress(&self) -> (usize, usize) {
+        let done = self.linked_tasks.iter().filter(|t| t.done).count();
+        (done, self.linked_tasks.len())
+    }
+
+    /// Mark the linked task with `key` finished. Returns true when this actually
+    /// flipped a not-yet-done ref (so callers can skip a no-op persist). Bumps
+    /// `updated_at` only on a real change.
+    pub fn complete_linked_task(&mut self, key: &str) -> bool {
+        if let Some(t) = self
+            .linked_tasks
+            .iter_mut()
+            .find(|t| t.key == key && !t.done)
+        {
+            t.done = true;
+            self.touch();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A 0..=100 rollup of goal progress across BOTH milestones and linked
+    /// tasks (TASK-282). Terminal `Completed` always reads 100. With no
+    /// trackable items the percentage is 0 (nothing to roll up yet).
+    pub fn progress_percent(&self) -> u8 {
+        if self.status == GoalStatus::Completed {
+            return 100;
+        }
+        let (m_done, m_total) = self.milestone_progress();
+        let (t_done, t_total) = self.linked_task_progress();
+        let total = m_total + t_total;
+        if total == 0 {
+            return 0;
+        }
+        let done = m_done + t_done;
+        ((done * 100) / total) as u8
+    }
+
+    /// Auto-advance the status when everything tracked is finished: a non-terminal
+    /// goal with ≥1 tracked item all at 100% flips to `Completed`. Returns true
+    /// when the status changed so the caller can persist. No-op when there is
+    /// nothing to roll up (avoids "completing" an empty goal).
+    pub fn rollup_status(&mut self) -> bool {
+        if self.status.is_terminal() {
+            return false;
+        }
+        let (_, m_total) = self.milestone_progress();
+        let (_, t_total) = self.linked_task_progress();
+        if m_total + t_total == 0 {
+            return false;
+        }
+        if self.progress_percent() == 100 {
+            self.set_status(GoalStatus::Completed);
+            true
+        } else {
+            false
+        }
     }
 
     /// TASK-279: a compact, token-cheap summary of this goal for injection into
@@ -903,5 +978,60 @@ mod domain_tests {
         let json = serde_json::to_string(&g).expect("serialize");
         let back: Goal = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(g, back);
+    }
+
+    #[test]
+    fn complete_linked_task_flips_once() {
+        let mut g = Goal::new("G");
+        g.link_task(TaskRef::new("TASK-282"));
+        g.updated_at -= 5;
+        let before = g.updated_at;
+        assert!(g.complete_linked_task("TASK-282"), "first flip changes it");
+        assert_eq!(g.linked_task_progress(), (1, 1));
+        assert!(g.updated_at >= before, "touch bumps updated_at");
+        // Re-completing is a no-op (already done) and re-keying a missing task too.
+        assert!(!g.complete_linked_task("TASK-282"));
+        assert!(!g.complete_linked_task("TASK-999"));
+    }
+
+    #[test]
+    fn progress_percent_blends_milestones_and_tasks() {
+        let mut g = Goal::new("G");
+        // No trackable items → 0%.
+        assert_eq!(g.progress_percent(), 0);
+        g.add_milestone("m1");
+        g.add_milestone("m2");
+        g.link_task(TaskRef::new("TASK-282"));
+        g.link_task(TaskRef::new("TASK-283"));
+        // 4 items, none done → 0%.
+        assert_eq!(g.progress_percent(), 0);
+        g.milestones[0].done = true;
+        g.complete_linked_task("TASK-282");
+        // 2 of 4 done → 50%.
+        assert_eq!(g.progress_percent(), 50);
+    }
+
+    #[test]
+    fn rollup_status_completes_when_all_done() {
+        let mut g = Goal::new("G");
+        g.link_task(TaskRef::new("TASK-282"));
+        // Not all done → no rollup.
+        assert!(!g.rollup_status());
+        assert_eq!(g.status, GoalStatus::Active);
+        g.complete_linked_task("TASK-282");
+        assert!(g.rollup_status(), "all tasks done → Completed");
+        assert_eq!(g.status, GoalStatus::Completed);
+        assert_eq!(g.progress_percent(), 100);
+        // Idempotent: a second rollup on a terminal goal does nothing.
+        assert!(!g.rollup_status());
+    }
+
+    #[test]
+    fn rollup_status_ignores_empty_goal() {
+        // A goal with nothing tracked must never auto-complete.
+        let mut g = Goal::new("G");
+        assert!(!g.rollup_status());
+        assert_eq!(g.status, GoalStatus::Active);
+        assert_eq!(g.progress_percent(), 0);
     }
 }
