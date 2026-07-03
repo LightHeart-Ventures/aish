@@ -317,6 +317,11 @@ pub struct Session {
     /// transient `goal` batch-oracle handle above: these are the durable
     /// `Goal` hierarchy (milestones/blockers/linked_tasks/subgoals).
     pub goals: Vec<crate::goal::Goal>,
+    /// Id of the goal the `:goal` subcommands (show/link/block/unblock/
+    /// milestone/complete) act on when none is named explicitly. Set by
+    /// `:goal new` and `:goal show <id>`; `None` falls back to the
+    /// most-recently-updated non-terminal goal (see `current_goal`).
+    pub current_goal_id: Option<String>,
     /// Which provider the interactive backend runs on (`"claude"`/`"grok"`/
     /// `"local"`). Set right after the backend is built and updated by `:backend`.
     /// Background coordinators are spawned on this same backend (full parity), so
@@ -512,6 +517,7 @@ impl Session {
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
             goal: None,
             goals: Vec::new(),
+            current_goal_id: None,
             backend_kind: "claude".to_string(),
             show_worker_output: Arc::new(AtomicBool::new(false)),
             escalation: None,
@@ -706,7 +712,8 @@ impl Session {
         }
     }
 
-    /// The single active top-level goal, if any (TASK-282). "Active" =
+<<<<<<< HEAD
+    /// The single active top-level goal, if any (TASK-282)    /// The single active top-level goal, if any (TASK-282). "Active" =
     /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
     /// the cache holds more than one (see `reconcile_active_goal`, which keeps
     /// that from happening in practice). Borrows the cached record so callers
@@ -821,7 +828,18144 @@ impl Session {
         })
     }
 
-    /// The autonomy descriptor stamped on every hook payload (design §3.1): a
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    } "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice)    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    } Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }
+        self    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }goals
+                /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }iter()
+                /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }find(|g| !g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }is_subgoal() && g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3)    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }
+    /// Returns the id of the goal left active, if any    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    } Idempotent: a store with
+    /// zero or one active goal is left untouched    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first)    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }
+        let active_ids: Vec<String> = self
+                /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }goals
+                /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }iter()
+                /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }filter(|g| !g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }is_subgoal() && g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }status == GoalStatus::Active)
+                /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }map(|g| g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }id    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }clone())
+                /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }collect();
+        let keep = active_ids    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }first()    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }cloned();
+        // Demote the rest (all but the first / newest)    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }
+        for id in active_ids    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }into_iter()    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }skip(1) {
+            if let Some(g) = self    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }goals    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }iter()    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }find(|g| g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }id == id) {
+                let mut demoted = g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }clone();
+                demoted    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }set_status(GoalStatus::Paused);
+                self    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2)    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    } Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    } Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }goals {
+            if g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }status    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }is_terminal() {
+                continue;
+            }
+            for t in &g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }linked_tasks {
+                if !t    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }done && !t    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }key    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }is_empty() && task_text    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }contains(&t    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }key) {
+                    hits    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }push((g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }id    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }clone(), t    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }key    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }goals    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }iter()    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }find(|g| g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }id == goal_id) {
+                let mut updated = g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }clone();
+                if updated    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }complete_linked_task(&key) {
+                    updated    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }rollup_status();
+                    let entry = (updated    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }title    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }clone(), updated    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }progress_percent());
+                    self    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }persist_goal(updated);
+                    advanced    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2)    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    } Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    } Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating)    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }
+        let tasks: Vec<String> = {
+            match self    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }worker_jobs    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }lock() {
+                Ok(jobs) => jobs
+                        /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }iter()
+                        /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }filter(|j| matches!(j    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }status()    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }as_str(), "done" | "failed"))
+                        /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }map(|j| j    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }task    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }clone())
+                        /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    } `🎯 Cross-session persistence 60%`    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    } `None` when there is
+    /// no active goal    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    } Consumed by the prompt/activity badge    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }
+    pub fn goal_badge(&self) -> Option<String> {
+        self    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }active_goal()    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }map(|g| {
+            let title = crate::goal::truncate_condition(&g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }title);
+            format!("🎯 {title} {}%", g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }progress_percent())
+        })
+=======
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    } `None` only when no goals exist    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }current_goal_id {
+            if let Some(g) = self    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }goals    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }iter()    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }find(|g| &g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }id == id) {
+                return Some(g);
+            }
+        }
+        self    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }goals
+                /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }iter()
+                /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }filter(|g| !g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }status    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }is_terminal())
+                /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }max_by_key(|g| g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }updated_at)
+                /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }or_else(|| self    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }goals    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }iter()    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }max_by_key(|g| g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    } Returns `None`
+    /// when nothing matches or the prefix is ambiguous    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }goals    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }iter()    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }find(|g| g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }goals    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }iter()    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }filter(|g| g    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }id    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }starts_with(needle));
+        let first = hits    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }next()?;
+        match hits    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+>>>>>>> 122bb09 (feat(goal): :goal REPL subcommands new/show/status/link/block/unblock/milestone/complete (TASK-278))
+    }
+
+    /// The autonomy descriptor stamped on every hook payload (design §3    /// The single active top-level goal, if any (TASK-282). "Active" =
+    /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
+    /// the cache holds more than one (see `reconcile_active_goal`, which keeps
+    /// that from happening in practice). Borrows the cached record so callers
+    /// can read progress/badge without a DB round-trip.
+    pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
+        // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
+        // updated_at DESC), so the first match is the freshest active goal.
+        self.goals
+            .iter()
+            .find(|g| !g.is_subgoal() && g.status == crate::goal::GoalStatus::Active)
+    }
+
+    /// Enforce the single-active-goal invariant on startup (TASK-282 AC3).
+    /// Keeps the newest-updated top-level Active goal active and demotes every
+    /// other top-level Active goal to `Paused`, persisting each demotion.
+    /// Returns the id of the goal left active, if any. Idempotent: a store with
+    /// zero or one active goal is left untouched.
+    pub fn reconcile_active_goal(&mut self) -> Option<String> {
+        use crate::goal::GoalStatus;
+        // Collect ids of top-level active goals in cache order (newest first).
+        let active_ids: Vec<String> = self
+            .goals
+            .iter()
+            .filter(|g| !g.is_subgoal() && g.status == GoalStatus::Active)
+            .map(|g| g.id.clone())
+            .collect();
+        let keep = active_ids.first().cloned();
+        // Demote the rest (all but the first / newest).
+        for id in active_ids.into_iter().skip(1) {
+            if let Some(g) = self.goals.iter().find(|g| g.id == id) {
+                let mut demoted = g.clone();
+                demoted.set_status(GoalStatus::Paused);
+                self.persist_goal(demoted);
+            }
+        }
+        keep
+    }
+
+    /// A finished linked coordinator reports progress against its goal
+    /// (TASK-282 AC2). Scans every non-terminal goal for an incomplete linked
+    /// task whose key appears in `task_text`; flips it done, rolls the status
+    /// up (auto-completing when everything is finished), and persists. Returns
+    /// `(goal_title, percent)` for each goal that advanced so the caller can
+    /// surface a one-line notice.
+    pub fn record_coordinator_task_progress(&mut self, task_text: &str) -> Vec<(String, u8)> {
+        let mut advanced = Vec::new();
+        // Snapshot the (goal_id, task_key) pairs to touch — avoids holding an
+        // immutable borrow across the mutating persist below.
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for g in &self.goals {
+            if g.status.is_terminal() {
+                continue;
+            }
+            for t in &g.linked_tasks {
+                if !t.done && !t.key.is_empty() && task_text.contains(&t.key) {
+                    hits.push((g.id.clone(), t.key.clone()));
+                }
+            }
+        }
+        for (goal_id, key) in hits {
+            if let Some(g) = self.goals.iter().find(|g| g.id == goal_id) {
+                let mut updated = g.clone();
+                if updated.complete_linked_task(&key) {
+                    updated.rollup_status();
+                    let entry = (updated.title.clone(), updated.progress_percent());
+                    self.persist_goal(updated);
+                    advanced.push(entry);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Roll finished background coordinators up into their linked goals
+    /// (TASK-282 AC2). Scans terminal (`done`/`failed`) worker jobs, feeds each
+    /// one's task text through `record_coordinator_task_progress`, and returns a
+    /// one-line notice per goal that advanced. Idempotent: a linked task already
+    /// marked `done` is a no-op, so this is safe to call every REPL pass — the
+    /// notice fires exactly once, on the pass that first observes the finish.
+    pub fn sync_goal_rollup(&mut self) -> Vec<String> {
+        // Snapshot terminal worker task texts (drop the lock before mutating).
+        let tasks: Vec<String> = {
+            match self.worker_jobs.lock() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .filter(|j| matches!(j.status().as_str(), "done" | "failed"))
+                    .map(|j| j.task.clone())
+                    .collect(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        let mut notices = Vec::new();
+        for task in tasks {
+            for (title, pct) in self.record_coordinator_task_progress(&task) {
+                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                notices.push(format!(
+                    "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
+                    crate::goal::truncate_condition(&title)
+                ));
+            }
+        }
+        notices
+    }
+
+    /// Compact one-line badge for the active goal (TASK-282): title + rollup
+    /// percentage, e.g. `🎯 Cross-session persistence 60%`. `None` when there is
+    /// no active goal. Consumed by the prompt/activity badge.
+    pub fn goal_badge(&self) -> Option<String> {
+        self.active_goal().map(|g| {
+            let title = crate::goal::truncate_condition(&g.title);
+            format!("🎯 {title} {}%", g.progress_percent())
+        })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
+    }1): a
     /// background coordinator (`nested`) is `coordinator`, everything else is
     /// `interactive`. Lets a hook scope itself to human vs. autonomous turns.
     pub fn agent_kind(&self) -> crate::hooks::Agent {
