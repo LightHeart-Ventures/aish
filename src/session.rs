@@ -2,7 +2,7 @@ use crate::backend::{Msg, ToolResult};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// How much the safety gate asks before acting.
@@ -361,6 +361,13 @@ pub struct Session {
     /// stderr-streaming task (via `WorkerSpec`) and read per line, so toggling
     /// mid-run takes effect on later lines.
     pub show_worker_output: Arc<AtomicBool>,
+    /// Tri-state governing `show_worker_output` (TASK-292): `Auto` (DEFAULT) lets
+    /// aish auto-show a SOLE running coordinator and revert when it finishes;
+    /// `ForcedOn`/`ForcedOff` mean the user pinned the stream with
+    /// `:worker-output on|off` — a pin ALWAYS wins, auto never overrides it.
+    /// Stored as a `u8` (see [`crate::worker::WorkerOutputMode`]) so it shares
+    /// cheaply like `show_worker_output`; session-local, never persisted.
+    pub worker_output_mode: Arc<AtomicU8>,
     /// `(provider, model)` of the stronger model a weak frontend should escalate
     /// hard, in-turn reasoning to — recomputed each turn by the engine from
     /// `Backend::escalation_target`. `None` when the frontend is already frontier
@@ -503,6 +510,27 @@ impl Drop for Session {
 }
 
 impl Session {
+    /// Read the current `:worker-output` mode (TASK-292).
+    pub fn worker_output_mode(&self) -> crate::worker::WorkerOutputMode {
+        crate::worker::WorkerOutputMode::from_u8(self.worker_output_mode.load(Ordering::SeqCst))
+    }
+
+    /// Set the `:worker-output` mode (TASK-292). Setting a forced mode also pins
+    /// `show_worker_output` to match; switching back to `Auto` leaves the current
+    /// effective value in place for the next prompt-render auto-reconcile to fix.
+    pub fn set_worker_output_mode(&self, mode: crate::worker::WorkerOutputMode) {
+        self.worker_output_mode.store(mode.as_u8(), Ordering::SeqCst);
+        match mode {
+            crate::worker::WorkerOutputMode::ForcedOn => {
+                self.show_worker_output.store(true, Ordering::SeqCst)
+            }
+            crate::worker::WorkerOutputMode::ForcedOff => {
+                self.show_worker_output.store(false, Ordering::SeqCst)
+            }
+            crate::worker::WorkerOutputMode::Auto => {}
+        }
+    }
+
     pub fn new() -> Result<Self> {
         let cwd = std::env::current_dir()?;
         Ok(Self {
@@ -548,6 +576,9 @@ impl Session {
             goals: Vec::new(),
             backend_kind: "claude".to_string(),
             show_worker_output: Arc::new(AtomicBool::new(false)),
+            worker_output_mode: Arc::new(AtomicU8::new(
+                crate::worker::WorkerOutputMode::default().as_u8(),
+            )),
             escalation: None,
             turn_audit: None,
             worker_transcript: None,
