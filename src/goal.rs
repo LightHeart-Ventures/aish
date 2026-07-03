@@ -136,6 +136,18 @@ impl GoalLoop {
         }
     }
 
+    /// Backfill lines for `:attach goal` (TASK-301) — the goal analogue of a
+    /// worker's replayed history tail. A `GoalLoop` keeps NO full transcript
+    /// (each turn runs an ephemeral `run_once` worker under a throwaway id), so
+    /// we surface the durable state it DOES hold: the full condition plus the
+    /// current status line (phase, turn count, elapsed, last verifier check).
+    /// Returned newest-context-last so the caller can dim + print them above the
+    /// resuming live stream.
+    pub fn attach_backfill(&self) -> Vec<String> {
+        vec![format!("🎯 goal: {}", self.condition), self.status_line()]
+    }
+
+
     fn set(&self, status: Status, reason: Option<String>) {
         let mut i = self.inner.lock().unwrap();
         i.status = status;
@@ -518,6 +530,34 @@ impl TaskRef {
     }
 }
 
+/// Render the `:workers` goal-hierarchy block (TASK-300): the goal and its
+/// linked work items as a tree, correlating each linked task key to a live
+/// coordinator whose task text references that key. The current architecture
+/// does not stamp a `goal_id` on spawned coordinators, so the parent↔child link
+/// is derived from the durable `Goal.linked_tasks` records (real data) matched
+/// against each worker's task string. Returns `None` when the goal has no linked
+/// tasks (nothing to nest). Pure/formatting-only → unit-testable without a live
+/// board or spawned workers. `workers` is `(worker_id, worker_task)` pairs.
+pub fn render_goal_hierarchy(goal: &Goal, workers: &[(String, String)]) -> Option<String> {
+    if goal.linked_tasks.is_empty() {
+        return None;
+    }
+    let title = truncate_ellipsis(&goal.title, 60);
+    let n = goal.linked_tasks.len();
+    let kids = if n == 1 { "child" } else { "children" };
+    let mut out = format!("├─ goal: {title} [{n} {kids}]");
+    for (i, t) in goal.linked_tasks.iter().enumerate() {
+        let branch = if i + 1 == n { "└─" } else { "├─" };
+        // Correlate a live worker to this linked task by task-key substring.
+        let line = match workers.iter().find(|(_, task)| task.contains(&t.key)) {
+            Some((id, _)) => format!("\n│  {branch} {id} ({})", t.key),
+            None => format!("\n│  {branch} {} (no active worker)", t.key),
+        };
+        out.push_str(&line);
+    }
+    Some(out)
+}
+
 /// A durable, structured goal record. Persisted in `aish.db`'s `goals` table.
 ///
 /// Hierarchy: `parent_id` is `Some` for a subgoal, `None` for a top-level goal.
@@ -834,6 +874,31 @@ mod tests {
                 phase,
             }),
         }
+    }
+
+    // TASK-301: `:attach goal` history backfill surfaces the goal's durable
+    // state (condition + status line) since a GoalLoop keeps no transcript.
+    #[test]
+    fn test_attach_goal_shows_history() {
+        let g = goal_with(Status::Active, Step::Checking, true);
+        let lines = g.attach_backfill();
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Complete the work"),
+            "backfill shows the goal condition: {joined}"
+        );
+        assert!(
+            joined.contains("goal [active"),
+            "backfill shows the status line: {joined}"
+        );
+        assert!(
+            joined.contains("turn 3"),
+            "backfill shows turn progress: {joined}"
+        );
+        assert!(
+            joined.contains("last check: not yet"),
+            "backfill shows the last verifier check: {joined}"
+        );
     }
 
     #[test]
@@ -1188,5 +1253,35 @@ mod domain_tests {
         assert!(!g.rollup_status());
         assert_eq!(g.status, GoalStatus::Active);
         assert_eq!(g.progress_percent(), 0);
+    }
+
+    // TASK-300: `:workers` shows the goal's linked work items as a tree,
+    // correlating each linked task key to a live coordinator by task text.
+    #[test]
+    fn test_workers_list_shows_goal_hierarchy() {
+        let mut goal = Goal::new("ship hierarchies");
+        goal.link_task(TaskRef::new("TASK-280"));
+        goal.link_task(TaskRef::new("TASK-281"));
+        let workers = vec![
+            ("w_abc123".to_string(), "implement TASK-280 board sync".to_string()),
+            ("w_def456".to_string(), "TASK-281 render tree".to_string()),
+        ];
+        let tree = render_goal_hierarchy(&goal, &workers).expect("hierarchy for a linked goal");
+        assert!(
+            tree.contains("goal: ship hierarchies [2 children]"),
+            "got: {tree}"
+        );
+        assert!(tree.contains("├─ w_abc123 (TASK-280)"), "got: {tree}");
+        assert!(tree.contains("└─ w_def456 (TASK-281)"), "got: {tree}");
+
+        // A linked task with no live worker still renders, flagged.
+        let mut solo = Goal::new("solo");
+        solo.link_task(TaskRef::new("TASK-999"));
+        let tree2 = render_goal_hierarchy(&solo, &[]).expect("hierarchy with no workers");
+        assert!(tree2.contains("[1 child]"), "got: {tree2}");
+        assert!(tree2.contains("TASK-999 (no active worker)"), "got: {tree2}");
+
+        // No linked tasks → nothing to nest.
+        assert!(render_goal_hierarchy(&Goal::new("empty"), &[]).is_none());
     }
 }

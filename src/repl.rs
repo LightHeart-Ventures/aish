@@ -965,9 +965,20 @@ pub async fn run(
                     let cb_workers = cyc_workers.clone();
                     let cb_attached = cyc_attached.clone();
                     let cb_review = cyc_review.clone();
+                    // TASK-299: clone the goal handle so a mid-turn Shift-Tab can
+                    // include the active `:goal` in the rotation (checked live at
+                    // press time — goal state can change during the turn).
+                    let cb_goal = session.goal.clone();
                     let on_shift_tab: crate::keywatch::ShiftTabFn =
                         std::sync::Arc::new(move || {
-                            cycle_worker_live(&cb_workers, &cb_attached, &cb_review);
+                            let goal_active =
+                                cb_goal.as_ref().is_some_and(|g| g.is_active());
+                            cycle_worker_live(
+                                &cb_workers,
+                                &cb_attached,
+                                &cb_review,
+                                goal_active,
+                            );
                         });
                     let mut keywatch =
                         crate::keywatch::TurnKeyWatch::install(Some(on_shift_tab));
@@ -3423,6 +3434,13 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
                 println!(
                     "\x1b[1;33m⇄ attached to the goal\x1b[0m — streaming its turns live. \x1b[2mgoals are watch-only; :goal clear to stop it, :detach to stop watching.\x1b[0m"
                 );
+                // TASK-301: backfill the goal's durable state (condition, status,
+                // turn progress, last verifier check) so attaching shows context
+                // above the resuming live stream — mirrors a worker's replayed
+                // history tail.
+                for line in g.attach_backfill() {
+                    println!("\x1b[2m{line}\x1b[0m");
+                }
             }
             Some(_) => println!("the goal has already finished — `:goal` for its final status"),
             None => println!("no goal set — `:goal <condition>` to start one (requires :batch on)"),
@@ -4211,6 +4229,20 @@ fn next_attach_index(running: &[String], current: Option<&str>) -> usize {
     (cur_idx + 1) % (running.len() + 1)
 }
 
+/// Build the ordered Shift-Tab attach-rotation id list: the live/terminal
+/// coordinator ids (as `cycle_worker` collects them, newest-first) with the
+/// active `:goal` sentinel ([`GOAL_ATTACH_ID`]) appended as a final watch-only
+/// slot when `goal_active` (TASK-299). Pure, so rotation MEMBERSHIP is
+/// unit-testable without a live Session; `next_attach_index` then does the
+/// index math over whatever this returns.
+fn attach_rotation_ids(worker_ids: &[String], goal_active: bool) -> Vec<String> {
+    let mut ids = worker_ids.to_vec();
+    if goal_active {
+        ids.push(GOAL_ATTACH_ID.to_string());
+    }
+    ids
+}
+
 /// `Shift-Tab` — cycle the interactive session's attach cursor across the
 /// coordinators it launched, NEWEST first. The cycle is `interactive → newest
 /// → … → oldest → interactive` (reverse spawn order): the first press from the
@@ -4237,7 +4269,10 @@ fn cycle_worker(session: &mut Session) -> bool {
     // print a hint. A Shift-Tab with no workers is a silent no-op that leaves
     // the operator's prompt exactly as it was. This check MUST come before the
     // screen clear below (otherwise an empty cycle still wipes the screen).
-    if session.worker_jobs.lock().unwrap().is_empty() {
+    // TASK-299: the active background `:goal` joins the Shift-Tab rotation as a
+    // final watch-only slot, so a goal-only session (no workers) still cycles.
+    let goal_active = session.goal.as_ref().is_some_and(|g| g.is_active());
+    if session.worker_jobs.lock().unwrap().is_empty() && !goal_active {
         return false;
     }
     // Synchronously tear down any live worker "thinking…" spinner BEFORE we
@@ -4276,7 +4311,9 @@ fn cycle_worker(session: &mut Session) -> bool {
     // detached interactive prompt. The index math is factored into the pure,
     // unit-tested `next_attach_index` so it stays verifiable without spawning
     // real coordinators.
-    let ids: Vec<String> = workers.iter().map(|(id, _, _)| id.clone()).collect();
+    // TASK-299: the active `:goal` joins the rotation as a final watch-only slot.
+    let worker_ids: Vec<String> = workers.iter().map(|(id, _, _)| id.clone()).collect();
+    let ids = attach_rotation_ids(&worker_ids, goal_active);
     let current = session.attached.lock().unwrap().clone();
     let next_idx = next_attach_index(&ids, current.as_deref());
 
@@ -4312,6 +4349,30 @@ fn cycle_worker(session: &mut Session) -> bool {
         crate::terminal::erase_current_line();
     }
     crate::terminal::open_attach_view();
+    // TASK-299/301: the goal is the last rotation slot — watch-only. Stream its
+    // turns live and backfill its durable state (mirrors `:attach goal`), then
+    // stop before the worker-index dereference (the goal is not in `workers`).
+    if ids[next_idx - 1] == GOAL_ATTACH_ID {
+        *session.attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
+        *session.attach_review_announced.lock().unwrap() = None;
+        let task = session
+            .goal
+            .as_ref()
+            .map(|g| g.condition.clone())
+            .unwrap_or_default();
+        println!(
+            "\x1b[1;33m⇄ attached to the goal\x1b[0m \x1b[2m({}/{} · watch-only; :goal clear to stop it, Shift-Tab to cycle, :detach to stop){}\x1b[0m",
+            next_idx,
+            ids.len(),
+            attach_task_suffix(&task)
+        );
+        if let Some(g) = &session.goal {
+            for line in g.attach_backfill() {
+                println!("\x1b[2m{line}\x1b[0m");
+            }
+        }
+        return true;
+    }
     let (run_id, terminal, task) = workers[next_idx - 1].clone();
     *session.attached.lock().unwrap() = Some(run_id.clone());
     let short = crate::batch::short_id(&run_id);
@@ -4364,6 +4425,7 @@ fn cycle_worker_live(
     workers: &crate::worker::WorkerJobs,
     attached: &Arc<Mutex<Option<String>>>,
     review: &Arc<Mutex<Option<String>>>,
+    goal_active: bool,
 ) {
     let workers_v: Vec<(String, bool, String)> = workers
         .lock()
@@ -4378,12 +4440,14 @@ fn cycle_worker_live(
             )
         })
         .collect();
-    if workers_v.is_empty() {
-        // No coordinators to attach to — take no action (no hint, no redraw),
-        // matching the idle-prompt `cycle_worker` no-op.
+    if workers_v.is_empty() && !goal_active {
+        // No coordinators AND no active goal to attach to — take no action (no
+        // hint, no redraw), matching the idle-prompt `cycle_worker` no-op.
         return;
     }
-    let ids: Vec<String> = workers_v.iter().map(|(id, _, _)| id.clone()).collect();
+    // TASK-299: mid-turn rotation includes the active `:goal` as the final slot.
+    let worker_ids: Vec<String> = workers_v.iter().map(|(id, _, _)| id.clone()).collect();
+    let ids = attach_rotation_ids(&worker_ids, goal_active);
     let current = attached.lock().unwrap().clone();
     let next_idx = next_attach_index(&ids, current.as_deref());
     if next_idx == 0 {
@@ -4392,6 +4456,18 @@ fn cycle_worker_live(
         // No output-field hint here: the detached "back to interactive" state is
         // already reflected on the 2nd statusline (see `coordinator_status_line`),
         // so printing it again would just be redundant noise in the scrollback.
+        return;
+    }
+    // TASK-299: goal sentinel is the last slot — watch-only, no db backfill
+    // mid-turn (a post-turn Shift-Tab runs full `cycle_worker` with backfill).
+    if ids[next_idx - 1] == GOAL_ATTACH_ID {
+        *attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
+        *review.lock().unwrap() = None;
+        println!(
+            "\x1b[1;33m⇄ attached to the goal\x1b[0m \x1b[2m({}/{} · watch-only; Shift-Tab to cycle, :detach to stop)\x1b[0m",
+            next_idx,
+            ids.len()
+        );
         return;
     }
     let (run_id, terminal, task) = workers_v[next_idx - 1].clone();
@@ -6040,6 +6116,22 @@ async fn handle_colon(
                 println!(
                     "no background workers in this session — :workers all to see every session"
                 );
+            }
+            // TASK-300: beneath the flat table, render the active goal's linked
+            // work items as a hierarchy so spawned goal workers are visible as
+            // children of their parent goal (correlated to live coordinators by
+            // task-key substring).
+            if let Some(goal) = session.active_goal() {
+                let ws: Vec<(String, String)> = session
+                    .worker_jobs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|w| (w.id.clone(), w.task.clone()))
+                    .collect();
+                if let Some(tree) = crate::goal::render_goal_hierarchy(goal, &ws) {
+                    println!("{tree}");
+                }
             }
         }
         Some("dispatch-stats" | "dstats") => {
@@ -8250,6 +8342,33 @@ mod tests {
 
         // Goal-only (no workers): interactive toggles to/from the goal.
         let goal_only = ids(&[GOAL_ATTACH_ID]);
+        assert_eq!(next_attach_index(&goal_only, None), 1); // -> goal
+        assert_eq!(next_attach_index(&goal_only, Some(GOAL_ATTACH_ID)), 0); // -> interactive
+    }
+
+    #[test]
+    fn routing_shift_tab_includes_goal() {
+        // TASK-299: `attach_rotation_ids` appends the goal sentinel as the final
+        // watch-only slot when a `:goal` is active; `next_attach_index` then
+        // rotates interactive → workers… → goal → interactive.
+        let worker_ids = ids(&["w_1", "w_2"]);
+
+        // Goal inactive → rotation is workers-only (no goal slot appended).
+        assert_eq!(attach_rotation_ids(&worker_ids, false), worker_ids);
+
+        // Goal active → goal sentinel is the last entry.
+        let with_goal = attach_rotation_ids(&worker_ids, true);
+        assert_eq!(with_goal, ids(&["w_1", "w_2", GOAL_ATTACH_ID]));
+
+        // Full cycle: interactive → w_1 → w_2 → goal → interactive.
+        assert_eq!(next_attach_index(&with_goal, None), 1); // -> w_1
+        assert_eq!(next_attach_index(&with_goal, Some("w_1")), 2); // -> w_2
+        assert_eq!(next_attach_index(&with_goal, Some("w_2")), 3); // -> goal
+        assert_eq!(next_attach_index(&with_goal, Some(GOAL_ATTACH_ID)), 0); // -> interactive
+
+        // Goal-only session (no workers) still cycles interactive ⇄ goal.
+        let goal_only = attach_rotation_ids(&[], true);
+        assert_eq!(goal_only, ids(&[GOAL_ATTACH_ID]));
         assert_eq!(next_attach_index(&goal_only, None), 1); // -> goal
         assert_eq!(next_attach_index(&goal_only, Some(GOAL_ATTACH_ID)), 0); // -> interactive
     }
