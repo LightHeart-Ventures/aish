@@ -304,6 +304,18 @@ pub struct Session {
     /// subgoals, milestones, blockers, and task links alongside memories in
     /// aish.db. None if it failed to open — goals then aren't persisted.
     pub goal_store: Option<crate::db::GoalStore>,
+    /// Durable `:alert` monitor store (shares aish.db). Cloneable — the
+    /// background presenter, the `:alert` command handler, and the `set_alert`
+    /// tool all hold a handle. None if it failed to open.
+    pub alert_store: Option<crate::db::AlertStore>,
+    /// The current fired-alert banner for the SecondStatusLine, shared with the
+    /// background presenter which sets it when an alert surfaces. `None` = no
+    /// pending alert banner.
+    pub alert_banner: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Id of the goal `:goal` subcommands target by default (set by `:goal
+    /// new` / `:goal show <id>`). Session-local (not persisted); falls back to
+    /// the active goal when unset or stale. (TASK-278)
+    pub current_goal_id: Option<String>,
     /// True when THIS aish is itself a background coordinator (env
     /// `AISH_COORDINATOR=1`). The nested guard: a coordinator must never spawn
     /// its own workers (no infinite re-exec recursion), so `run_in_background`
@@ -317,11 +329,6 @@ pub struct Session {
     /// transient `goal` batch-oracle handle above: these are the durable
     /// `Goal` hierarchy (milestones/blockers/linked_tasks/subgoals).
     pub goals: Vec<crate::goal::Goal>,
-    /// Id of the goal the `:goal` subcommands (show/link/block/unblock/
-    /// milestone/complete) act on when none is named explicitly. Set by
-    /// `:goal new` and `:goal show <id>`; `None` falls back to the
-    /// most-recently-updated non-terminal goal (see `current_goal`).
-    pub current_goal_id: Option<String>,
     /// Which provider the interactive backend runs on (`"claude"`/`"grok"`/
     /// `"local"`). Set right after the backend is built and updated by `:backend`.
     /// Background coordinators are spawned on this same backend (full parity), so
@@ -514,10 +521,12 @@ impl Session {
             worker_jobs: Default::default(),
             coordinator_store: None,
             goal_store: None,
+            alert_store: None,
+            alert_banner: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            current_goal_id: None,
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
             goal: None,
             goals: Vec::new(),
-            current_goal_id: None,
             backend_kind: "claude".to_string(),
             show_worker_output: Arc::new(AtomicBool::new(false)),
             escalation: None,
