@@ -3340,9 +3340,34 @@ fn duplicate_dispatch<'a>(
     })
 }
 
+/// TASK-280: goal-aware next-task routing for a task-less `:dispatch`. When the
+/// operator runs `:dispatch` with no task and there is a live, actionable goal,
+/// suggest the next aligned unit of work (its linked task framed by the next open
+/// milestone, or the milestone itself) and show the exact `:dispatch <task>` line
+/// to confirm it — rather than printing bare usage. Returns `None` when there is
+/// no active goal or nothing left to pick up, so the caller keeps current
+/// behavior unchanged (AC3).
+fn goal_next_work_suggestion(session: &Session) -> Option<String> {
+    let goal = session.active_goal()?;
+    let work = goal.next_aligned_work()?;
+    let title = crate::goal::truncate_ellipsis(&goal.title, 60);
+    Some(format!(
+        "\x1b[1;36m🎯 no task given\x1b[0m\x1b[2m — next aligned work for goal \x1b[0m\x1b[1m{title}\x1b[0m\x1b[2m:\x1b[0m\n\
+         \x1b[2m  →\x1b[0m {}\n\
+         \x1b[2m  confirm:\x1b[0m \x1b[1;36m:dispatch {}\x1b[0m\x1b[2m   ·   or :dispatch <task> for something else\x1b[0m",
+        work.summary(),
+        work.dispatch_text(),
+    ))
+}
+
 fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
     let task = task.trim();
     if task.is_empty() {
+        // TASK-280: with a live actionable goal, route toward its next aligned
+        // task instead of printing bare usage. No active goal → usage unchanged.
+        if let Some(suggestion) = goal_next_work_suggestion(session) {
+            return Dispatched::message_only(suggestion);
+        }
         return Dispatched::message_only(
             "usage: :dispatch <task>   — launch a background coordinator for <task>",
         );
@@ -9703,5 +9728,49 @@ mod tests {
         goal_command(&mut s, "new", "A goal");
         let out = goal_command(&mut s, "show", "deadbeefcafe");
         assert!(out.contains("no goal matching"), "got: {out}");
+    }
+
+    // ───────── TASK-280: goal-aware task-less `:dispatch` routing ─────────
+
+    #[test]
+    fn goal_next_work_suggestion_none_without_active_goal() {
+        // No goals at all → no suggestion (usage stays unchanged, AC3).
+        let s = Session::new().unwrap();
+        assert!(goal_next_work_suggestion(&s).is_none());
+    }
+
+    #[test]
+    fn goal_next_work_suggestion_routes_to_linked_task_framed_by_milestone() {
+        let mut s = Session::new().unwrap();
+        goal_command(&mut s, "new", "Ship routing");
+        goal_command(&mut s, "milestone", "Build");
+        goal_command(&mut s, "link", "TASK-280 wire routing");
+        let out = goal_next_work_suggestion(&s).expect("actionable goal suggests work");
+        // Names the goal, the linked task, the framing milestone, and the exact
+        // confirmable dispatch line.
+        assert!(out.contains("Ship routing"), "goal title: {out}");
+        assert!(out.contains("TASK-280"), "task key: {out}");
+        assert!(out.contains("Build"), "milestone frame: {out}");
+        assert!(out.contains(":dispatch TASK-280"), "confirm line: {out}");
+    }
+
+    #[test]
+    fn taskless_dispatch_prefers_goal_suggestion_over_usage() {
+        let mut s = Session::new().unwrap();
+        goal_command(&mut s, "new", "Ship routing");
+        goal_command(&mut s, "link", "TASK-280 wire routing");
+        // Empty task + live actionable goal → routes toward the goal, not usage.
+        let d = dispatch_coordinator("   ", &mut s);
+        assert!(d.message.contains("TASK-280"), "routed: {}", d.message);
+        assert!(!d.message.starts_with("usage:"), "not usage: {}", d.message);
+        assert!(d.id.is_none(), "suggestion dispatches nothing yet");
+    }
+
+    #[test]
+    fn taskless_dispatch_without_goal_still_shows_usage() {
+        let mut s = Session::new().unwrap();
+        // No active goal → bare usage preserved (AC3 back-compat).
+        let d = dispatch_coordinator("", &mut s);
+        assert!(d.message.starts_with("usage:"), "usage: {}", d.message);
     }
 }
