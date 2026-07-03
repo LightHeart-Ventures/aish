@@ -642,6 +642,7 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
             if let Some(s) = store {
                 let _ = s.set_failed(run_id, &error);
             }
+            record_run_metrics(store, run_id, session);
             finalize_worker_store(run_id, "failed", None);
             return Outcome {
                 phase: Phase::Failed,
@@ -706,6 +707,7 @@ final status plus your best partial result. After this turn you are terminated."
                         if let Some(s) = store {
                             let _ = s.set_failed(run_id, &error);
                         }
+                        record_run_metrics(store, run_id, session);
                         finalize_worker_store(run_id, "failed", None);
                         return Outcome {
                             phase: Phase::Failed,
@@ -725,6 +727,7 @@ final status plus your best partial result. After this turn you are terminated."
             if let Some(s) = store {
                 let _ = s.set_done(run_id, &answer);
             }
+            record_run_metrics(store, run_id, session);
             finalize_worker_store(run_id, "done", Some(&answer));
             return Outcome {
                 phase: Phase::Done,
@@ -749,6 +752,7 @@ final status plus your best partial result. After this turn you are terminated."
                 if let Some(s) = store {
                     let _ = s.set_failed(run_id, &error);
                 }
+                record_run_metrics(store, run_id, session);
                 finalize_worker_store(run_id, "failed", None);
                 return Outcome {
                     phase: Phase::Failed,
@@ -829,6 +833,7 @@ partial result."
             if let Some(s) = store {
                 let _ = s.set_failed(run_id, &error);
             }
+            record_run_metrics(store, run_id, session);
             finalize_worker_store(run_id, "failed", Some(&answer));
             return Outcome {
                 phase: Phase::Failed,
@@ -881,6 +886,7 @@ delivered above). Fold them into your work: continue the task, or give the final
         if let Some(s) = store {
             let _ = s.set_done(run_id, &answer);
         }
+        record_run_metrics(store, run_id, session);
         finalize_worker_store(run_id, "done", Some(&answer));
         return Outcome {
             phase: Phase::Done,
@@ -1275,6 +1281,23 @@ fn finalize_worker_store(run_id: &str, status: &str, result: Option<&str>) {
     let _ = crate::worker_store::set_status(run_id, status);
 }
 
+/// Persist the run's cumulative cost/effort metrics — tokens in/out, agentic
+/// turns, and tool-call count — from the live coordinator session totals onto
+/// the durable `coordinator_runs` row. Called at every terminal exit just
+/// before `set_done`/`set_failed`. Best-effort: a store error is swallowed so a
+/// metrics write can never sink a completing run.
+fn record_run_metrics(store: Option<&CoordinatorStore>, run_id: &str, session: &Session) {
+    if let Some(s) = store {
+        let _ = s.record_metrics(
+            run_id,
+            session.tokens_in as u64,
+            session.tokens_out as u64,
+            session.turns_total as u64,
+            session.tool_calls_total as u64,
+        );
+    }
+}
+
 /// Best-effort current git branch of `dir`, recorded in the worker `meta.json`
 /// so retention never reclaims a dir whose worktree still holds kept work on an
 /// `aish/<id>` branch (AC7). `None` outside a repo, on a detached HEAD, or when
@@ -1608,6 +1631,10 @@ mod tests {
             session_name: None,
             created_at: None,
             heartbeat_at,
+            tokens_in: 0,
+            tokens_out: 0,
+            turns: 0,
+            tool_calls: 0,
         }
     }
 

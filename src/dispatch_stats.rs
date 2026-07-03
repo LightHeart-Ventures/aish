@@ -300,6 +300,10 @@ mod tests {
             session_name: None,
             created_at: created.map(String::from),
             heartbeat_at: beat.map(String::from),
+            tokens_in: 0,
+            tokens_out: 0,
+            turns: 0,
+            tool_calls: 0,
         }
     }
 
