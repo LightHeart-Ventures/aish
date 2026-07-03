@@ -917,7 +917,7 @@ urgent questions.\n\
 longevity hacks, micro-SaaS velocity.\n\
 \n\
 Final reply style: one line when possible. Table when useful. End turn cleanly. No \"I'm thinking\" \
-fluff.{skills}{batch}{escalate}{console}{task}",
+fluff.{skills}{batch}{escalate}{console}{goal}{task}",
             host = self.host_info,
             cwd = self.cwd.display(),
             skills = self.skills_prompt,
@@ -928,6 +928,7 @@ fluff.{skills}{batch}{escalate}{console}{task}",
                 ""
             },
             console = if self.nested { CONSOLE_NUDGE } else { "" },
+            goal = self.active_goal_block(),
             task = self
                 .task_anchor
                 .as_deref()
@@ -935,7 +936,32 @@ fluff.{skills}{batch}{escalate}{console}{task}",
                 .unwrap_or_default(),
         )
     }
+
+    /// TASK-279: the compact active-goal + open-blocker context appended to
+    /// every turn's system prompt. Returns an empty string when no goal is
+    /// `Active`, so goal-less sessions inject nothing — zero token cost and a
+    /// byte-stable cached prefix (AC2). When multiple goals are active the
+    /// most-recently-updated one is treated as "the" active goal. The block is
+    /// recomputed each user turn (not cached with the static prefix) so
+    /// milestone/blocker changes are reflected as the goal evolves.
+    fn active_goal_block(&self) -> String {
+        let active = self
+            .goals
+            .iter()
+            .filter(|g| g.status == crate::goal::GoalStatus::Active)
+            .max_by_key(|g| g.updated_at);
+        match active {
+            Some(g) => format!("\n\n{GOAL_CONTEXT_HEADER}\n{}", g.prompt_summary()),
+            None => String::new(),
+        }
+    }
 }
+
+/// Header for the TASK-279 active-goal context block appended to the per-turn
+/// system prompt. Deliberately terse — the whole block must stay token-cheap.
+const GOAL_CONTEXT_HEADER: &str =
+    "Active goal context (keep your decisions aligned to this; the blockers below are impeding \
+progress — resolve or work around them):";
 
 /// The default on-disk skills directory: `~/.aish/skills`. Mirrors main.rs's
 /// `aish_dir().join("skills")` so the interactive `:skill` reload and the
@@ -1291,6 +1317,84 @@ mod tests {
                 "missing batch-independent-calls directive"
             );
         }
+    }
+
+    #[test]
+    fn system_prompt_injects_active_goal_context() {
+        // TASK-279 AC1: an active goal folds a compact title + current-milestone
+        // + progress + open-blocker block into the per-turn system prompt.
+        use crate::goal::Goal;
+        let mut session = Session::new().unwrap();
+
+        // AC2: with no goal, nothing is injected — byte-identical to before.
+        let base = session.system_prompt(false);
+        assert!(
+            !base.contains("Active goal context"),
+            "goal-less session must inject nothing"
+        );
+
+        let mut g = Goal::new("Ship the active-goal injection");
+        g.add_milestone("design");
+        g.add_milestone("build");
+        g.add_milestone("open PR");
+        g.milestones[0].done = true;
+        g.add_blocker("waiting on review");
+        session.goals.push(g);
+
+        let p = session.system_prompt(false);
+        assert!(p.contains("Active goal context"), "missing goal header: {p}");
+        assert!(
+            p.contains("Goal: Ship the active-goal injection"),
+            "missing goal title"
+        );
+        assert!(p.contains("current milestone: build"), "missing current milestone");
+        assert!(p.contains("1/3 done"), "missing progress count");
+        assert!(p.contains("33%"), "missing percent");
+        assert!(
+            p.contains("Open blockers: waiting on review"),
+            "missing open blockers"
+        );
+    }
+
+    #[test]
+    fn system_prompt_only_injects_for_active_goals() {
+        // AC2: paused/terminal goals never inject; picking the active goal is
+        // guarded on GoalStatus::Active.
+        use crate::goal::{Goal, GoalStatus};
+        let mut session = Session::new().unwrap();
+
+        let mut paused = Goal::new("Paused work");
+        paused.set_status(GoalStatus::Paused);
+        let mut done = Goal::new("Finished work");
+        done.set_status(GoalStatus::Completed);
+        session.goals.push(paused);
+        session.goals.push(done);
+        assert!(
+            !session.system_prompt(false).contains("Active goal context"),
+            "no ACTIVE goal → no injection even with paused/completed goals present"
+        );
+
+        // Flip one to active → it now injects.
+        session.goals.push(Goal::new("Now active"));
+        let p = session.system_prompt(false);
+        assert!(p.contains("Active goal context"), "active goal should inject");
+        assert!(p.contains("Goal: Now active"), "wrong goal chosen: {p}");
+    }
+
+    #[test]
+    fn system_prompt_picks_most_recently_updated_active_goal() {
+        // When several goals are active, the most-recently-updated one wins.
+        use crate::goal::Goal;
+        let mut session = Session::new().unwrap();
+        let mut older = Goal::new("Older goal");
+        older.updated_at = 1_000;
+        let mut newer = Goal::new("Newer goal");
+        newer.updated_at = 2_000;
+        session.goals.push(older);
+        session.goals.push(newer);
+        let p = session.system_prompt(false);
+        assert!(p.contains("Goal: Newer goal"), "expected newest active goal: {p}");
+        assert!(!p.contains("Goal: Older goal"), "older goal must not be chosen");
     }
 
     #[test]
