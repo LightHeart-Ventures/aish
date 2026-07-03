@@ -160,13 +160,20 @@ fn fmt_duration(d: Duration) -> String {
 }
 
 /// Keep the condition snippet on one line — long goals get an ellipsis.
-fn truncate_condition(condition: &str) -> String {
-    const MAX: usize = 60;
-    if condition.chars().count() > MAX {
-        let head: String = condition.chars().take(MAX).collect();
+pub(crate) fn truncate_condition(condition: &str) -> String {
+    truncate_ellipsis(condition, 60)
+}
+
+/// Ellipsize `s` to at most `max` chars (a trailing `…` is added when it's
+/// clipped) so a value stays on one compact line. Shared by `truncate_condition`
+/// (the `:goal` status line) and [`Goal::prompt_summary`] (the TASK-279 per-turn
+/// system-prompt block), so both truncate identically.
+pub fn truncate_ellipsis(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let head: String = s.chars().take(max).collect();
         format!("{}…", head.trim_end())
     } else {
-        condition.to_string()
+        s.to_string()
     }
 }
 
@@ -487,6 +494,10 @@ pub struct TaskRef {
     pub key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Flips true when the work item this ref points at is finished — set by a
+    /// finishing linked coordinator (TASK-282). Feeds the goal progress rollup.
+    #[serde(default)]
+    pub done: bool,
 }
 
 impl TaskRef {
@@ -494,6 +505,7 @@ impl TaskRef {
         Self {
             key: key.into(),
             title: None,
+            done: false,
         }
     }
 
@@ -501,6 +513,7 @@ impl TaskRef {
         Self {
             key: key.into(),
             title: Some(title.into()),
+            done: false,
         }
     }
 }
@@ -611,14 +624,45 @@ impl Goal {
         self.blockers.iter().filter(|b| !b.resolved).count()
     }
 
-    /// Milestone completion as a 0–100 percentage — the single-goal rollup the
-    /// UI renders next to the title. A goal with no milestones yet reports 0
-    /// (nothing proven done), and the ratio is rounded to the nearest percent.
+    /// `(done, total)` linked-task counts — the coordinator-driven progress
+    /// signal (TASK-282). A finishing linked coordinator flips one `done`.
+    pub fn linked_task_progress(&self) -> (usize, usize) {
+        let done = self.linked_tasks.iter().filter(|t| t.done).count();
+        (done, self.linked_tasks.len())
+    }
+
+    /// Mark the linked task with `key` finished. Returns true when this actually
+    /// flipped a not-yet-done ref (so callers can skip a no-op persist). Bumps
+    /// `updated_at` only on a real change.
+    pub fn complete_linked_task(&mut self, key: &str) -> bool {
+        if let Some(t) = self
+            .linked_tasks
+            .iter_mut()
+            .find(|t| t.key == key && !t.done)
+        {
+            t.done = true;
+            self.touch();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A 0..=100 rollup of goal progress across BOTH milestones and linked
+    /// tasks (TASK-282). Terminal `Completed` always reads 100. With no
+    /// trackable items the percentage is 0 (nothing to roll up yet). The ratio
+    /// is rounded half-up without floats.
     pub fn progress_percent(&self) -> u8 {
-        let (done, total) = self.milestone_progress();
+        if self.status == GoalStatus::Completed {
+            return 100;
+        }
+        let (m_done, m_total) = self.milestone_progress();
+        let (t_done, t_total) = self.linked_task_progress();
+        let total = m_total + t_total;
         if total == 0 {
             return 0;
         }
+        let done = m_done + t_done;
         // Round half-up without floats: (done*100 + total/2) / total.
         (((done * 100) + total / 2) / total) as u8
     }
@@ -637,6 +681,66 @@ impl Goal {
         self.status == GoalStatus::Active
             && self.open_blockers() == 0
             && self.progress_percent() < 100
+    }
+
+    /// Auto-advance the status when everything tracked is finished: a non-terminal
+    /// goal with ≥1 tracked item all at 100% flips to `Completed`. Returns true
+    /// when the status changed so the caller can persist. No-op when there is
+    /// nothing to roll up (avoids "completing" an empty goal).
+    pub fn rollup_status(&mut self) -> bool {
+        if self.status.is_terminal() {
+            return false;
+        }
+        let (_, m_total) = self.milestone_progress();
+        let (_, t_total) = self.linked_task_progress();
+        if m_total + t_total == 0 {
+            return false;
+        }
+        if self.progress_percent() == 100 {
+            self.set_status(GoalStatus::Completed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// TASK-279: a compact, token-cheap summary of this goal for injection into
+    /// the per-turn system prompt. One or two short lines — the (truncated)
+    /// title, the current milestone with a `done/total` + percent progress
+    /// signal, and any open blockers (capped and truncated so a goal with many
+    /// long blockers can't bloat the prompt). Callers guard on an *active* goal,
+    /// so this is never rendered for paused or terminal goals.
+    pub fn prompt_summary(&self) -> String {
+        let mut out = format!("Goal: {}", truncate_ellipsis(&self.title, 72));
+        let (done, total) = self.milestone_progress();
+        if total > 0 {
+            let pct = done * 100 / total;
+            match self.milestones.iter().find(|m| !m.done) {
+                Some(current) => out.push_str(&format!(
+                    " — current milestone: {} ({done}/{total} done, {pct}%)",
+                    truncate_ellipsis(&current.title, 60)
+                )),
+                None => out.push_str(&format!(" — milestones {done}/{total} done ({pct}%)")),
+            }
+        }
+        let open: Vec<&Blocker> = self.blockers.iter().filter(|b| !b.resolved).collect();
+        if !open.is_empty() {
+            const MAX_SHOWN: usize = 3;
+            let shown = open
+                .iter()
+                .take(MAX_SHOWN)
+                .map(|b| truncate_ellipsis(&b.description, 60))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let extra = open.len().saturating_sub(MAX_SHOWN);
+            let more = if extra > 0 {
+                format!(" (+{extra} more)")
+            } else {
+                String::new()
+            };
+            out.push_str(&format!("\nOpen blockers: {shown}{more}"));
+        }
+        out
     }
 }
 
@@ -871,6 +975,56 @@ mod domain_tests {
     }
 
     #[test]
+    fn prompt_summary_shows_current_milestone_progress_and_blockers() {
+        // TASK-279: title + current (first not-done) milestone + done/total +
+        // percent + open blockers, all in the compact block.
+        let mut g = Goal::new("Ship goal-context injection");
+        g.add_milestone("design");
+        g.add_milestone("build");
+        g.add_milestone("open PR");
+        g.milestones[0].done = true; // 1 of 3 done → current = "build", 33%
+        g.add_blocker("waiting on review");
+        let s = g.prompt_summary();
+        assert!(s.contains("Goal: Ship goal-context injection"), "{s}");
+        assert!(s.contains("current milestone: build"), "{s}");
+        assert!(s.contains("1/3 done"), "{s}");
+        assert!(s.contains("33%"), "{s}");
+        assert!(s.contains("Open blockers: waiting on review"), "{s}");
+    }
+
+    #[test]
+    fn prompt_summary_omits_empty_sections_and_caps_blockers() {
+        // No milestones, no blockers → just the title line, nothing dangling.
+        let g = Goal::new("Bare goal");
+        assert_eq!(g.prompt_summary(), "Goal: Bare goal");
+
+        // All milestones done → summary reports full completion, no "current".
+        let mut done = Goal::new("Done goal");
+        done.add_milestone("a");
+        done.milestones[0].done = true;
+        let ds = done.prompt_summary();
+        assert!(ds.contains("milestones 1/1 done (100%)"), "{ds}");
+        assert!(!ds.contains("current milestone"), "{ds}");
+
+        // >3 open blockers → first three shown, rest summarized as "(+N more)".
+        let mut many = Goal::new("Blocked goal");
+        for i in 0..5 {
+            many.add_blocker(format!("blocker {i}"));
+        }
+        let ms = many.prompt_summary();
+        assert!(ms.contains("(+2 more)"), "{ms}");
+    }
+
+    #[test]
+    fn prompt_summary_truncates_long_title() {
+        // AC3: long goal text is ellipsized so the block stays one compact line.
+        let g = Goal::new("x".repeat(120));
+        let s = g.prompt_summary();
+        assert!(s.contains('…'), "long title must be ellipsized: {s}");
+        assert!(!s.contains(&"x".repeat(120)), "full long title must not appear");
+    }
+
+    #[test]
     fn goal_json_roundtrips() {
         let mut g = Goal::new("Roundtrip").with_description("desc");
         g.add_milestone("m1");
@@ -979,5 +1133,60 @@ mod domain_tests {
         only_paused.set_status(GoalStatus::Paused);
         assert!(route_next(&[only_paused]).is_none());
         assert!(route_next(&[]).is_none());
+    }
+
+    #[test]
+    fn complete_linked_task_flips_once() {
+        let mut g = Goal::new("G");
+        g.link_task(TaskRef::new("TASK-282"));
+        g.updated_at -= 5;
+        let before = g.updated_at;
+        assert!(g.complete_linked_task("TASK-282"), "first flip changes it");
+        assert_eq!(g.linked_task_progress(), (1, 1));
+        assert!(g.updated_at >= before, "touch bumps updated_at");
+        // Re-completing is a no-op (already done) and re-keying a missing task too.
+        assert!(!g.complete_linked_task("TASK-282"));
+        assert!(!g.complete_linked_task("TASK-999"));
+    }
+
+    #[test]
+    fn progress_percent_blends_milestones_and_tasks() {
+        let mut g = Goal::new("G");
+        // No trackable items → 0%.
+        assert_eq!(g.progress_percent(), 0);
+        g.add_milestone("m1");
+        g.add_milestone("m2");
+        g.link_task(TaskRef::new("TASK-282"));
+        g.link_task(TaskRef::new("TASK-283"));
+        // 4 items, none done → 0%.
+        assert_eq!(g.progress_percent(), 0);
+        g.milestones[0].done = true;
+        g.complete_linked_task("TASK-282");
+        // 2 of 4 done → 50%.
+        assert_eq!(g.progress_percent(), 50);
+    }
+
+    #[test]
+    fn rollup_status_completes_when_all_done() {
+        let mut g = Goal::new("G");
+        g.link_task(TaskRef::new("TASK-282"));
+        // Not all done → no rollup.
+        assert!(!g.rollup_status());
+        assert_eq!(g.status, GoalStatus::Active);
+        g.complete_linked_task("TASK-282");
+        assert!(g.rollup_status(), "all tasks done → Completed");
+        assert_eq!(g.status, GoalStatus::Completed);
+        assert_eq!(g.progress_percent(), 100);
+        // Idempotent: a second rollup on a terminal goal does nothing.
+        assert!(!g.rollup_status());
+    }
+
+    #[test]
+    fn rollup_status_ignores_empty_goal() {
+        // A goal with nothing tracked must never auto-complete.
+        let mut g = Goal::new("G");
+        assert!(!g.rollup_status());
+        assert_eq!(g.status, GoalStatus::Active);
+        assert_eq!(g.progress_percent(), 0);
     }
 }

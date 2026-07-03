@@ -544,6 +544,10 @@ async fn main() -> Result<()> {
 
     // TASK-277 AC2: load the persistent goal hierarchy from aish.db on start.
     session.load_goals();
+    // TASK-282 AC3: reconcile down to a single active goal on startup (demote
+    // any stale extra actives to Paused) so the prompt badge + rollup are
+    // unambiguous.
+    session.reconcile_active_goal();
 
     // Durable batch jobs: open the store and reattach any in-flight batches from
     // a previous session (the batch keeps running platform-side while aish is
