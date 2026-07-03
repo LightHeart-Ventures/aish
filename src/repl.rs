@@ -5677,6 +5677,12 @@ async fn handle_colon(
             // started elsewhere (or in a prior process) show up too. Skip ids
             // already listed in-memory to avoid double-counting this session's.
             if let Some(store) = &session.coordinator_store {
+                // Live orphan reap before listing: flip stale, unowned,
+                // non-terminal rows to `failed` so zombie "coordinating" workers
+                // (owner process gone before its detached sub-coordinator tasks
+                // reconciled) self-heal in a long-lived session, not just at
+                // startup. Shares the startup reaper's predicate.
+                crate::coordinator::reap_orphaned_runs(store, session.session_id.as_str());
                 if let Ok(rows) = store.load_all() {
                     // Sort newest-first by creation time.
                     let mut durable: Vec<&_> = rows.iter().filter(|r| {

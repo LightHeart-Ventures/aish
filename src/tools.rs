@@ -2322,6 +2322,12 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
     // Durable coordinator runs from the shared store — every session's, so this
     // surfaces runs that outlive (or were started by) another aish process.
     if let Some(store) = &session.coordinator_store {
+        // Live orphan reap before we read: flip any stale, unowned, non-terminal
+        // row to `failed` so a zombie coordinator (owner process exited before
+        // reconciling its detached sub-coordinator tasks) shows as failed here
+        // instead of lingering forever at `coordinating`. Startup does this too,
+        // but a long-lived interactive session never restarts.
+        crate::coordinator::reap_orphaned_runs(store, session.session_id.as_str());
         if let Ok(rows) = store.load_all() {
             for r in rows {
                 let jref = JobRef {
