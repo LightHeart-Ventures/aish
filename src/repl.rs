@@ -3102,6 +3102,7 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
                 launch_session_name: session.name.clone(),
                 show_output: session.show_worker_output.clone(),
                 attached: session.attached.clone(),
+                coordinator_store: session.coordinator_store.clone(),
             };
             let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
             let message = format!(
@@ -3821,6 +3822,7 @@ fn resume_coordinator(prev_run_id: &str, message: &str, session: &mut Session) {
         launch_session_name: session.name.clone(),
         show_output: session.show_worker_output.clone(),
         attached: session.attached.clone(),
+        coordinator_store: session.coordinator_store.clone(),
     };
     // Resume IN PLACE: reuse the SAME `WorkerJob` — same visible id, same slot in
     // `:workers`, same attachment — instead of spawning a fresh worker. The job
@@ -5606,6 +5608,7 @@ async fn handle_colon(
                                     launch_session_name: session.name.clone(),
                                     show_output: session.show_worker_output.clone(),
                                     attached: session.attached.clone(),
+                                    coordinator_store: session.coordinator_store.clone(),
                                 };
                                 // KNOWN LIMITATION: the verifier still judges on
                                 // Claude (batch_model + the Claude credential

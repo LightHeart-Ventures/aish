@@ -2005,6 +2005,7 @@ short, natural sentence that you're working on it and the answer will appear her
         launch_session_name: session.name.clone(),
         show_output: session.show_worker_output.clone(),
         attached: session.attached.clone(),
+        coordinator_store: session.coordinator_store.clone(),
     };
     let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
     let short = crate::batch::short_id(&id);
