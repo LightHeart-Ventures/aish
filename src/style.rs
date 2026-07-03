@@ -333,12 +333,19 @@ pub fn fmt_datetime_utc(epoch: i64) -> String {
 /// separated by enough spaces to fill the terminal width. Runtime form — reads
 /// the wall clock, terminal width, and [`colors_enabled`]. Off a tty (piped /
 /// `NO_COLOR`) it still returns plain text; the caller decides whether to print.
-pub fn statusline(version: &str, model: &str) -> String {
+pub fn statusline(version: &str, model: &str, stats: &str) -> String {
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    statusline_at(version, model, epoch, statusline_width(), colors_enabled())
+    statusline_at(
+        version,
+        model,
+        stats,
+        epoch,
+        statusline_width(),
+        colors_enabled(),
+    )
 }
 
 /// Current terminal width used for footer rows (floored at 80). Public so the
@@ -398,9 +405,25 @@ pub fn second_statusline_at(left: &str, name: Option<&str>, width: usize, color_
 
 /// Pure form of [`statusline`]: the caller supplies the instant, width, and
 /// color decision, so alignment + padding are unit-testable without a TTY.
-pub fn statusline_at(version: &str, model: &str, epoch: i64, width: usize, color_on: bool) -> String {
+pub fn statusline_at(
+    version: &str,
+    model: &str,
+    stats: &str,
+    epoch: i64,
+    width: usize,
+    color_on: bool,
+) -> String {
     let left = format!("aish v{version} — AI-native shell · {model}");
-    let right = fmt_datetime_utc(epoch);
+    let time = fmt_datetime_utc(epoch);
+    // The running session stats (tokens in/out, tool calls, turns) sit on the
+    // RIGHT, immediately to the LEFT of the clock — a middle-dot separator (with
+    // flanking spaces) between them. An empty `stats` (a fresh session, nothing
+    // run yet) collapses to just the clock.
+    let right = if stats.is_empty() {
+        time.clone()
+    } else {
+        format!("{stats} · {time}")
+    };
     let width = width.max(80);
     // Char counts, not byte lengths — the em-dash and middle-dot are multi-byte
     // but single-column, so counting chars keeps the right edge aligned.
@@ -410,13 +433,13 @@ pub fn statusline_at(version: &str, model: &str, epoch: i64, width: usize, color
     let spaces = " ".repeat(gap);
     if color_on {
         // Subtle accents rather than one flat dim wash: a cyan version badge,
-        // a dim tagline/model frame, and a dim right-justified clock. The gap
-        // above is computed from the PLAIN char widths, so coloring the halves
-        // never disturbs the alignment.
+        // a dim tagline/model frame, and a dim right-justified stats+clock. The
+        // gap above is computed from the PLAIN char widths, so coloring the
+        // halves never disturbs the alignment.
         let badge = format!("\x1b[36maish v{version}{RESET}");
         let frame = format!("\x1b[2m — AI-native shell · {model}{RESET}");
-        let clock = format!("\x1b[2m{right}{RESET}");
-        format!("{badge}{frame}{spaces}{clock}")
+        let right_dim = format!("\x1b[2m{right}{RESET}");
+        format!("{badge}{frame}{spaces}{right_dim}")
     } else {
         format!("{left}{spaces}{right}")
     }
@@ -493,7 +516,7 @@ mod tests {
 
     #[test]
     fn statusline_aligns_and_pads_to_width() {
-        let s = statusline_at("0.21.1", "claude (sonnet)", 1_609_459_200, 80, false);
+        let s = statusline_at("0.21.1", "claude (sonnet)", "", 1_609_459_200, 80, false);
         assert!(!s.contains('\x1b')); // plain mode: no ANSI
         assert!(s.starts_with("aish v0.21.1 — AI-native shell · claude (sonnet)"));
         assert!(s.ends_with("2021-01-01 00:00"));
@@ -502,8 +525,19 @@ mod tests {
     }
 
     #[test]
+    fn statusline_stats_sit_left_of_clock() {
+        let stats = "tokens: 120 in / 34 out, tool calls: 7, turns: 3";
+        let s = statusline_at("0.21.1", "m", stats, 1_609_459_200, 120, false);
+        assert!(!s.contains('\x1b'));
+        // Stats land immediately to the left of the clock (middle-dot between).
+        assert!(s.contains(&format!("{stats} · 2021-01-01 00:00")));
+        assert!(s.ends_with("2021-01-01 00:00"));
+        assert_eq!(s.chars().count(), 120);
+    }
+
+    #[test]
     fn statusline_colored_has_subtle_accents() {
-        let s = statusline_at("0.21.1", "m", 0, 80, true);
+        let s = statusline_at("0.21.1", "m", "", 0, 80, true);
         // Cyan version badge up front, a dim frame after it, RESET at the end.
         assert!(s.starts_with("\x1b[36maish v0.21.1"));
         assert!(s.contains("\x1b[2m")); // dim tagline/clock present
@@ -514,7 +548,7 @@ mod tests {
 
     #[test]
     fn statusline_narrow_width_floors_at_80() {
-        let s = statusline_at("0.21.1", "x", 0, 10, false);
+        let s = statusline_at("0.21.1", "x", "", 0, 10, false);
         assert!(s.chars().count() >= 80);
         assert!(s.contains("  ")); // separating gap present
     }
