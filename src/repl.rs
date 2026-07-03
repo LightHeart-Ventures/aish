@@ -3283,6 +3283,11 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
             "no credential for the active backend — Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY",
         );
     }
+    // Nesting-depth guard (TASK-287): refuse `:dispatch` once the spawn budget
+    // is exhausted, with a clear operator-facing error.
+    if let Err(msg) = crate::worker::spawn_budget_gate() {
+        return Dispatched::message_only(msg);
+    }
     match std::env::current_exe() {
         Ok(exe) => {
             // Isolate a writing/building coordinator in its own git worktree +
@@ -5171,6 +5176,11 @@ fn spawn_alert_coordinator(session: &mut Session, id: i64, description: &str) ->
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
+    // Nesting-depth guard (TASK-287): an alert monitor is a background
+    // coordinator too — don't arm one once the spawn budget is exhausted.
+    if crate::worker::spawn_budget_gate().is_err() {
+        return false;
+    }
     let task = format!(
         "You are resolving an operator ALERT (the aish `:alert` feature). Watch for this \
 condition and, the INSTANT it is satisfied, call the `set_alert` tool with alert_id={id} and a \
