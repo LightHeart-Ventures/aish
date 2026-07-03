@@ -312,6 +312,11 @@ pub async fn run(
         // completions off the main thread and arms a coalesced resume; the main
         // loop drains it on its next idle pass. See session::ResumeState.
         let resume = session.resume.clone();
+        // `:alert` monitor plumbing shared with this presenter: the store to
+        // poll native alerts / claim fired ones, and the banner slot the
+        // SecondStatusLine reads. Clones are cheap (Arc handles).
+        let alert_store = session.alert_store.clone();
+        let alert_banner = session.alert_banner.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(400));
             loop {
@@ -319,6 +324,42 @@ pub async fn run(
                 if busy.load(Ordering::SeqCst) {
                     continue; // mid-command/turn — hold results until a pause
                 }
+                // ── `:alert` monitors ──────────────────────────────────────
+                // Evaluate due native alerts (file/command probes) token-free,
+                // then surface every fired alert (native OR semantic ones a
+                // delegated coordinator flipped) exactly once. `take_fired`
+                // advances each row armed→fired→done so it never repeats.
+                if let Some(store) = &alert_store {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    if let Ok(armed) = store.armed_alerts() {
+                        for a in armed {
+                            if a.due(now) {
+                                let _ = store.touch_alert_check(a.id, now);
+                                if let Some(fired) = crate::alert::poll(&a) {
+                                    let _ =
+                                        store.mark_alert_fired(a.id, &fired.detail, &fired.short);
+                                }
+                            }
+                        }
+                    }
+                    if let Ok(fired) = store.take_fired() {
+                        let mut ring = false;
+                        for (_id, detail, short, audible) in fired {
+                            crate::tools::print_above_prompt(format!("{detail}\n"));
+                            if let Ok(mut b) = alert_banner.lock() {
+                                *b = Some(short);
+                            }
+                            ring = ring || audible;
+                        }
+                        if ring {
+                            crate::alert::play_alert_bell();
+                        }
+                    }
+                }
+
                 // Set by any finish-branch below so we ring the audible bell
                 // ONCE per tick (never a double-beep when two branches fire).
                 let mut finished_bell = false;
@@ -1091,7 +1132,22 @@ fn coordinator_status_message(session: &Session) -> String {
         })
         .collect();
     let color_on = crate::style::colors_enabled();
-    let left = coordinator_status_line(attached.as_deref(), &workers, color_on);
+    let mut left = coordinator_status_line(attached.as_deref(), &workers, color_on);
+    // A fired `:alert` claims the head of this row until the next prompt — the
+    // compact banner the presenter stashed. Yellow so it stands apart from the
+    // worker badges; the full detail already printed above the prompt.
+    if let Some(banner) = session.alert_banner.lock().ok().and_then(|b| b.clone()) {
+        let badge = if color_on {
+            format!("\x1b[1;33m{banner}\x1b[0m")
+        } else {
+            banner
+        };
+        left = if left.trim().is_empty() {
+            badge
+        } else {
+            format!("{badge}  {left}")
+        };
+    }
     // Right-justify the session name (`:rename`) on this row, directly above the
     // clock on the statusline below — in bold magenta. Blank when unnamed.
     crate::style::second_statusline_at(
@@ -4635,6 +4691,54 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
 /// this session owns, additionally SIGINTs its process group so the in-flight
 /// turn aborts and the boundary is reached promptly. Candidate resolution and the
 /// AC7 `--any` ownership gate mirror `tell_coordinator`.
+/// Dispatch a background coordinator to resolve a SEMANTIC `:alert` — a
+/// condition no local probe can decide. The coordinator runs with the full
+/// toolset and, the moment it judges the condition met, calls the `set_alert`
+/// tool with this alert's id, which the presenter surfaces to the operator
+/// console exactly like a native probe. Returns false when no coordinator could
+/// be launched (missing credential / can't locate the aish binary), leaving the
+/// alert armed for a human/agent to fire manually.
+fn spawn_alert_coordinator(session: &mut Session, id: i64, description: &str) -> bool {
+    // A coordinator needs a credential for the active backend and our own exe.
+    let no_credential = match session.backend_kind.as_str() {
+        "grok" => !crate::backend::grok::credential_available(&session.env),
+        _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
+    };
+    if no_credential {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let task = format!(
+        "You are resolving an operator ALERT (the aish `:alert` feature). Watch for this \
+condition and, the INSTANT it is satisfied, call the `set_alert` tool with alert_id={id} and a \
+concise `message` describing what happened — that is the whole job. Use your tools to check \
+periodically (poll external state like PRs, files, services, logs as appropriate); do not spin in \
+a tight loop — space out your checks. If the condition is already true right now, fire immediately. \
+If after reasonable effort it is clearly unsatisfiable or you cannot determine it, stop and say so \
+instead of firing.\n\nCondition: {description}"
+    );
+    // Alert monitors observe live state; run in the shared cwd (no worktree
+    // isolation — they don't write code) so `gh`/file checks see the real world.
+    let spec = crate::worker::WorkerSpec {
+        exe,
+        cwd: session.cwd.clone(),
+        backend: session.backend_kind.clone(),
+        model: crate::worker::coordinator_model(&session.backend_kind, &session.batch_model),
+        env: session.env.clone(),
+        isolate: false,
+        base: "main".to_string(),
+        launch_session_id: session.session_id.clone(),
+        launch_session_name: session.name.clone(),
+        show_output: session.show_worker_output.clone(),
+        attached: session.attached.clone(),
+    };
+    let _ = crate::worker::spawn(&session.worker_jobs, task, spec);
+    true
+}
+
+
 fn stop_coordinator(id: Option<&str>, any: bool, session: &mut Session) {
     let Some(id) = id else {
         println!(
@@ -5333,6 +5437,8 @@ async fn handle_colon(
                  :rename <name>                      name the session (prefixes the prompt); auto-set to the repo name at startup, bare :rename clears\n\
                  :rewrite <intent>                   AI-rewrite intent into ONE command, prefilled to edit/accept before it runs (alias :rw)\n\
                  :suggest [hint]                     AI-suggest the next command from session context, prefilled to edit/accept before it runs (alias :sg)\n\
+                 :alert <condition>                  monitor for a condition and surface it in the console when met (native file/PR/command probe,\n\
+                                                     or a delegated agent for free-form conditions); distinct audible cue. :alert list, :alert clear <id|all>\n\
                  :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
                                                      a verifier judges each turn. :goal status, :goal clear\n\
                  :goal new <title>                   track a durable goal (persisted); then link/block/milestone/show/complete\n\
@@ -5850,6 +5956,98 @@ async fn handle_colon(
                 println!("session named \x1b[1;35m[{rest}]\x1b[0m");
             }
         }
+        Some("alert") => {
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            let rest = rest.trim().to_string();
+            let lower = rest.to_lowercase();
+            match session.alert_store.clone() {
+                None => println!(
+                    "alert store unavailable — `:alert` needs the shared aish.db (check startup warnings)"
+                ),
+                // Bare `:alert` / `:alert list [all]` — show armed (and, with
+                // `all`, done/cancelled) monitors.
+                Some(store) if rest.is_empty() || lower == "list" || lower == "list all" || lower == "ls" => {
+                    let include_all = lower == "list all";
+                    match store.list_alerts(include_all) {
+                        Ok(rows) if rows.is_empty() => println!(
+                            "no alerts — `:alert <condition>` to arm one (e.g. `:alert let me know when PR 333 is merged`)"
+                        ),
+                        Ok(rows) => {
+                            println!("\x1b[1m ID  STATE      KIND      CONDITION\x1b[0m");
+                            for (id, state, kind, condition, _short) in rows {
+                                println!("{id:>3}  {state:<9} {kind:<8}  {condition}");
+                            }
+                            println!("\x1b[2m:alert clear <id|all> to cancel\x1b[0m");
+                        }
+                        Err(e) => println!("alert list failed: {e:#}"),
+                    }
+                }
+                // `:alert clear|cancel [<id>|all]`.
+                Some(store)
+                    if lower.starts_with("clear") || lower.starts_with("cancel") =>
+                {
+                    let arg = lower
+                        .strip_prefix("clear")
+                        .or_else(|| lower.strip_prefix("cancel"))
+                        .unwrap_or("")
+                        .trim();
+                    if arg.is_empty() || arg == "all" {
+                        match store.cancel_all_alerts() {
+                            Ok(0) => println!("no armed alerts to cancel"),
+                            Ok(n) => println!("cancelled {n} alert(s)"),
+                            Err(e) => println!("cancel failed: {e:#}"),
+                        }
+                    } else if let Ok(id) = arg.parse::<i64>() {
+                        match store.cancel_alert(id) {
+                            Ok(true) => println!("alert {id} cancelled"),
+                            Ok(false) => println!("no armed alert #{id}"),
+                            Err(e) => println!("cancel failed: {e:#}"),
+                        }
+                    } else {
+                        println!("usage: :alert clear [<id>|all]");
+                    }
+                }
+                // `:alert <condition>` — arm a monitor. A trailing `--silent`
+                // (or `--no-bell`) opts out of the audible cue.
+                Some(store) => {
+                    let (audible, cond) = if let Some(c) = rest.strip_suffix("--silent") {
+                        (false, c.trim())
+                    } else if let Some(c) = rest.strip_suffix("--no-bell") {
+                        (false, c.trim())
+                    } else {
+                        (true, rest.as_str())
+                    };
+                    if cond.is_empty() {
+                        println!("usage: :alert <condition>   e.g. :alert notify me when /tmp/build.done appears");
+                    } else {
+                        let kind = crate::alert::parse_condition(cond);
+                        match store.insert_alert(cond, &kind, audible, Some(&session.session_id)) {
+                            Ok(id) => match &kind {
+                                crate::alert::AlertKind::Semantic { description } => {
+                                    let dispatched =
+                                        spawn_alert_coordinator(session, id, description);
+                                    if dispatched {
+                                        println!(
+                                            "\x1b[1;33m⚠ alert #{id} armed\x1b[0m (semantic) — a background agent is watching; I'll surface it here the moment it's met."
+                                        );
+                                    } else {
+                                        println!(
+                                            "\x1b[1;33m⚠ alert #{id} armed\x1b[0m (semantic) — but no coordinator could be dispatched (credential/exe?); ask an agent to `set_alert {id}` when met, or `:alert clear {id}`."
+                                        );
+                                    }
+                                }
+                                _ => println!(
+                                    "\x1b[1;33m⚠ alert #{id} armed\x1b[0m ({}) — monitoring token-free; I'll surface it here when it fires. `:alert list` / `:alert clear {id}`.",
+                                    kind.tag()
+                                ),
+                            },
+                            Err(e) => println!("couldn't arm alert: {e:#}"),
+                        }
+                    }
+                }
+            }
+        }
+
         Some("goal") => {
             let rest = parts.collect::<Vec<_>>().join(" ");
             let rest = rest.trim();
