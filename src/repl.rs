@@ -4228,6 +4228,297 @@ fn take_any_flag<'a>(toks: &[&'a str]) -> (bool, Vec<&'a str>) {
 }
 
 /// Queue an operator message for an in-flight background coordinator — the
+// ───────────────────────── `:goal` subcommands (TASK-278) ─────────────────────────
+//
+// CRUD over the durable `crate::goal::Goal` records that TASK-277 persists in
+// `aish.db`. `goal_command` returns the text to print (so the dispatcher stays a
+// one-liner and the whole surface is unit-testable), mutating + persisting
+// `session.goals` as a side effect. Every path returns a helpful one-line
+// message on bad input — none panic (TASK-278 AC4). Unrecognized heads never
+// reach here: the dispatcher routes them to the back-compat batch pursuit loop.
+
+/// Short, stable handle for a goal in listings — the first 8 chars of its uuid.
+fn goal_short(id: &str) -> &str {
+    &id[..id.len().min(8)]
+}
+
+/// Coarse "N<unit> ago" for a unix-seconds stamp. Never panics on skew.
+fn goal_ago(secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(secs);
+    let d = (now - secs).max(0);
+    if d < 60 {
+        format!("{d}s ago")
+    } else if d < 3600 {
+        format!("{}m ago", d / 60)
+    } else if d < 86_400 {
+        format!("{}h ago", d / 3600)
+    } else {
+        format!("{}d ago", d / 86_400)
+    }
+}
+
+/// Heuristic date sniff for the optional trailing `[date]` of `:goal milestone`.
+/// Accepts ISO-ish `2025-01-31` or `1/31` / `01/31/2025` — a token made only of
+/// digits and `-`/`/` separators with at least one separator and one digit. Kept
+/// deliberately loose (no chrono dependency); a non-date trailing word simply
+/// stays part of the milestone name.
+fn looks_like_date(tok: &str) -> bool {
+    let ok_chars = tok.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '/');
+    let has_sep = tok.contains('-') || tok.contains('/');
+    let has_digit = tok.chars().any(|c| c.is_ascii_digit());
+    ok_chars && has_sep && has_digit && tok.len() >= 3
+}
+
+/// Render a goal's full detail block (used by `:goal show`).
+fn goal_detail(g: &crate::goal::Goal) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let (done, total) = g.milestone_progress();
+    let _ = writeln!(
+        s,
+        "\x1b[1mgoal [{}]\x1b[0m {} \x1b[2m{}\x1b[0m",
+        g.status,
+        g.title,
+        goal_short(&g.id)
+    );
+    if !g.description.is_empty() {
+        let _ = writeln!(s, "  {}", g.description);
+    }
+    let _ = writeln!(
+        s,
+        "  \x1b[2mupdated {} · created {}\x1b[0m",
+        goal_ago(g.updated_at),
+        goal_ago(g.created_at)
+    );
+    let _ = write!(s, "  milestones ({done}/{total})");
+    if g.milestones.is_empty() {
+        let _ = write!(s, " —");
+    } else {
+        s.push('\n');
+        for m in &g.milestones {
+            let mark = if m.done { "[x]" } else { "[ ]" };
+            let _ = writeln!(s, "    {mark} {}", m.title);
+        }
+        // trim the trailing newline from the last writeln for tidy joining below
+        while s.ends_with('\n') {
+            s.pop();
+        }
+    }
+    let open = g.open_blockers();
+    let _ = write!(s, "\n  blockers ({open} open)");
+    if g.blockers.is_empty() {
+        let _ = write!(s, " —");
+    } else {
+        s.push('\n');
+        for b in &g.blockers {
+            let mark = if b.resolved { "✓" } else { "✗" };
+            let _ = writeln!(s, "    {mark} {}", b.description);
+        }
+        while s.ends_with('\n') {
+            s.pop();
+        }
+    }
+    let _ = write!(s, "\n  linked");
+    if g.linked_tasks.is_empty() {
+        let _ = write!(s, " —");
+    } else {
+        let refs: Vec<String> = g
+            .linked_tasks
+            .iter()
+            .map(|t| match &t.title {
+                Some(title) => format!("{} ({title})", t.key),
+                None => t.key.clone(),
+            })
+            .collect();
+        let _ = write!(s, " {}", refs.join(", "));
+    }
+    s
+}
+
+/// Handle a persisted-goal subcommand, returning the line(s) to print. Mutating
+/// subcommands persist via `session.persist_goal` and update `current_goal_id`.
+fn goal_command(session: &mut Session, sub: &str, args: &str) -> String {
+    use crate::goal::{Goal, GoalStatus, TaskRef};
+    let args = args.trim();
+    match sub {
+        "new" => {
+            if args.is_empty() {
+                return "usage: :goal new <title>".into();
+            }
+            let g = Goal::new(args);
+            let (id, short, title) = (g.id.clone(), goal_short(&g.id).to_string(), g.title.clone());
+            session.persist_goal(g);
+            session.current_goal_id = Some(id);
+            format!("goal created \x1b[2m{short}\x1b[0m {title} — now current")
+        }
+        "show" => {
+            let g = if args.is_empty() {
+                session.current_goal().cloned()
+            } else {
+                session.find_goal_by_prefix(args).cloned()
+            };
+            match g {
+                Some(g) => {
+                    session.current_goal_id = Some(g.id.clone());
+                    goal_detail(&g)
+                }
+                None if args.is_empty() => {
+                    "no goals yet — `:goal new <title>` to create one".into()
+                }
+                None => format!("no goal matching \x1b[2m{args}\x1b[0m (ambiguous or unknown id)"),
+            }
+        }
+        "status" => {
+            let mut out = String::new();
+            if let Some(loop_) = &session.goal {
+                out.push_str(&loop_.status_line());
+                out.push('\n');
+            }
+            if session.goals.is_empty() {
+                out.push_str(
+                    "no goals yet — `:goal new <title>` to track one, or `:goal <condition>` to pursue one in the background",
+                );
+                return out;
+            }
+            let current = session.current_goal().map(|g| g.id.clone());
+            let mut goals: Vec<&Goal> = session.goals.iter().collect();
+            goals.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            use std::fmt::Write;
+            let _ = write!(out, "{} goal(s):", goals.len());
+            for g in goals {
+                let (done, total) = g.milestone_progress();
+                let marker = if Some(&g.id) == current.as_ref() { "*" } else { " " };
+                let open = g.open_blockers();
+                let blk = if open > 0 { format!(", {open} blocker(s)") } else { String::new() };
+                let _ = write!(
+                    out,
+                    "\n {marker} [{}] \x1b[2m{}\x1b[0m {} — {done}/{total} milestones{blk}",
+                    g.status,
+                    goal_short(&g.id),
+                    g.title
+                );
+            }
+            out
+        }
+        "link" => {
+            if args.is_empty() {
+                return "usage: :goal link <task-id> [title]".into();
+            }
+            // First token is the key; any remainder is a cached human title.
+            let mut it = args.splitn(2, char::is_whitespace);
+            let key = it.next().unwrap_or("").to_string();
+            let title = it.next().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+            let Some(mut g) = session.current_goal().cloned() else {
+                return "no current goal — `:goal new <title>` or `:goal show <id>` first".into();
+            };
+            let tref = match title {
+                Some(t) => TaskRef::with_title(key.clone(), t),
+                None => TaskRef::new(key.clone()),
+            };
+            g.link_task(tref);
+            let (short, gt) = (goal_short(&g.id).to_string(), g.title.clone());
+            session.persist_goal(g);
+            format!("linked {key} → \x1b[2m{short}\x1b[0m {gt}")
+        }
+        "block" => {
+            if args.is_empty() {
+                return "usage: :goal block <reason> [@waiting-on]".into();
+            }
+            // Optional trailing `@who` marks what the goal is waiting on.
+            let (reason, waiting) = match args.rsplit_once(char::is_whitespace) {
+                Some((head, last)) if last.starts_with('@') && last.len() > 1 => {
+                    (head.trim().to_string(), Some(last[1..].to_string()))
+                }
+                _ => (args.to_string(), None),
+            };
+            if reason.is_empty() {
+                return "usage: :goal block <reason> [@waiting-on]".into();
+            }
+            let desc = match waiting {
+                Some(who) => format!("{reason} (waiting on {who})"),
+                None => reason,
+            };
+            let Some(mut g) = session.current_goal().cloned() else {
+                return "no current goal — `:goal new <title>` or `:goal show <id>` first".into();
+            };
+            g.add_blocker(desc.clone());
+            let short = goal_short(&g.id).to_string();
+            session.persist_goal(g);
+            format!("blocked \x1b[2m{short}\x1b[0m: {desc}")
+        }
+        "unblock" => {
+            if args.is_empty() {
+                return "usage: :goal unblock <reason>   (matches an open blocker)".into();
+            }
+            let Some(mut g) = session.current_goal().cloned() else {
+                return "no current goal — nothing to unblock".into();
+            };
+            let needle = args.to_ascii_lowercase();
+            let hit = g
+                .blockers
+                .iter_mut()
+                .find(|b| !b.resolved && b.description.to_ascii_lowercase().contains(&needle));
+            match hit {
+                Some(b) => {
+                    b.resolved = true;
+                    let desc = b.description.clone();
+                    g.touch();
+                    session.persist_goal(g);
+                    format!("unblocked: {desc}")
+                }
+                None => format!("no open blocker matching \x1b[2m{args}\x1b[0m"),
+            }
+        }
+        "milestone" => {
+            if args.is_empty() {
+                return "usage: :goal milestone <name> [date]".into();
+            }
+            // Fold an optional trailing date token into the milestone title.
+            let title = match args.rsplit_once(char::is_whitespace) {
+                Some((head, last)) if looks_like_date(last) && !head.trim().is_empty() => {
+                    format!("{} (due {last})", head.trim())
+                }
+                _ => args.to_string(),
+            };
+            let Some(mut g) = session.current_goal().cloned() else {
+                return "no current goal — `:goal new <title>` or `:goal show <id>` first".into();
+            };
+            g.add_milestone(title.clone());
+            let short = goal_short(&g.id).to_string();
+            session.persist_goal(g);
+            format!("milestone added \x1b[2m{short}\x1b[0m: {title}")
+        }
+        "complete" => {
+            // `:goal complete [<id>]` — the named goal, else the current one.
+            let g = if args.is_empty() {
+                session.current_goal().cloned()
+            } else {
+                session.find_goal_by_prefix(args).cloned()
+            };
+            let Some(mut g) = g else {
+                return if args.is_empty() {
+                    "no current goal to complete — `:goal new <title>` first".into()
+                } else {
+                    format!("no goal matching \x1b[2m{args}\x1b[0m")
+                };
+            };
+            if g.status == GoalStatus::Completed {
+                return format!("already complete: \x1b[2m{}\x1b[0m {}", goal_short(&g.id), g.title);
+            }
+            g.set_status(GoalStatus::Completed);
+            let (short, title) = (goal_short(&g.id).to_string(), g.title.clone());
+            session.persist_goal(g);
+            format!("goal completed \x1b[2m{short}\x1b[0m {title} ✓")
+        }
+        // The dispatcher only routes known subcommands here.
+        other => format!("unknown :goal subcommand `{other}`"),
+    }
+}
+
+
 /// `:tell` / SendMessage channel. The message lands in the durable
 /// `coordinator_messages` mailbox keyed by the run's id and is folded into the
 /// coordinator's NEXT round (see `coordinator::drive`), so it's how you steer a
@@ -5044,6 +5335,9 @@ async fn handle_colon(
                  :suggest [hint]                     AI-suggest the next command from session context, prefilled to edit/accept before it runs (alias :sg)\n\
                  :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
                                                      a verifier judges each turn. :goal status, :goal clear\n\
+                 :goal new <title>                   track a durable goal (persisted); then link/block/milestone/show/complete\n\
+                 :goal link <task> [title]|block <reason>|milestone <name> [date]\n\
+                                                     annotate the current goal; :goal show [id], :goal complete [id]\n\
                  :loop <count> <prompt>              re-run <prompt> as an inline agentic turn <count> times;\n\
                                                      context accumulates across iterations. :loop status, :loop stop\n\
                  :allow                              list always-allowed tools/commands + dir grants\n\
@@ -5559,22 +5853,31 @@ async fn handle_colon(
         Some("goal") => {
             let rest = parts.collect::<Vec<_>>().join(" ");
             let rest = rest.trim();
-            match rest {
+            let mut goal_it = rest.splitn(2, char::is_whitespace);
+            let goal_head = goal_it.next().unwrap_or("");
+            let goal_tail = goal_it.next().unwrap_or("").trim();
+            match goal_head {
+                // Persisted-goal subcommands (TASK-278) — CRUD on the durable
+                // `Goal` records. Unrecognized heads fall through to the
+                // back-compat batch pursuit loop below.
+                "new" | "show" | "status" | "link" | "block" | "unblock" | "milestone"
+                | "complete" => println!("{}", goal_command(session, goal_head, goal_tail)),
+                // Bare `:goal`: the live loop's status if one is running, else a
+                // persisted-goal overview (which prints its own empty-state hint).
                 "" => match &session.goal {
                     Some(g) => println!("{}", g.status_line()),
-                    None => println!(
-                        "no goal set — `:goal <condition>` to set one (requires :batch on)"
-                    ),
+                    None => println!("{}", goal_command(session, "status", "")),
                 },
                 "clear" | "stop" | "off" | "reset" | "none" | "cancel" => match session.goal.take()
                 {
                     Some(g) => {
                         g.clear();
-                        println!("goal cleared");
+                        println!("goal loop cleared");
                     }
-                    None => println!("no goal set"),
+                    None => println!("no goal loop running"),
                 },
-                cond => {
+                _ => {
+                    let cond = rest;
                     if !session.batch_mode {
                         println!(
                             "`:goal` runs as background batch work — enable it first with `:batch on`"
@@ -8048,5 +8351,105 @@ mod tests {
             aish, bash,
             "direct oracle failed to detect an intentional divergence — the harness is blind"
         );
+    }
+
+    // ───────── `:goal` persisted-subcommand surface (TASK-278) ─────────
+
+    #[test]
+    fn goal_new_creates_and_pins_current() {
+        let mut s = Session::new().unwrap();
+        let out = goal_command(&mut s, "new", "Ship the release");
+        assert!(out.contains("goal created"), "got: {out}");
+        assert!(out.contains("now current"), "got: {out}");
+        assert_eq!(s.goals.len(), 1);
+        assert_eq!(s.goals[0].title, "Ship the release");
+        // current_goal_id points at the just-created goal.
+        assert_eq!(s.current_goal_id.as_deref(), Some(s.goals[0].id.as_str()));
+    }
+
+    #[test]
+    fn goal_new_requires_a_title() {
+        let mut s = Session::new().unwrap();
+        let out = goal_command(&mut s, "new", "   ");
+        assert!(out.starts_with("usage:"), "got: {out}");
+        assert!(s.goals.is_empty());
+    }
+
+    #[test]
+    fn goal_link_block_milestone_apply_to_current() {
+        let mut s = Session::new().unwrap();
+        goal_command(&mut s, "new", "Land TASK-278");
+        let link = goal_command(&mut s, "link", "TASK-278 goal CRUD");
+        assert!(link.contains("linked TASK-278"), "got: {link}");
+        let ms = goal_command(&mut s, "milestone", "wire dispatcher 2025-01-31");
+        assert!(ms.contains("milestone added"), "got: {ms}");
+        assert!(ms.contains("(due 2025-01-31)"), "date folded in: {ms}");
+        let blk = goal_command(&mut s, "block", "waiting on review @grhohertz");
+        assert!(blk.contains("waiting on grhohertz"), "got: {blk}");
+
+        let g = s.current_goal().expect("current goal");
+        assert_eq!(g.linked_tasks.len(), 1);
+        assert_eq!(g.linked_tasks[0].key, "TASK-278");
+        assert_eq!(g.linked_tasks[0].title.as_deref(), Some("goal CRUD"));
+        assert_eq!(g.milestones.len(), 1);
+        assert_eq!(g.open_blockers(), 1);
+    }
+
+    #[test]
+    fn goal_unblock_matches_open_blocker() {
+        let mut s = Session::new().unwrap();
+        goal_command(&mut s, "new", "G");
+        goal_command(&mut s, "block", "waiting on CI");
+        let miss = goal_command(&mut s, "unblock", "nonsense");
+        assert!(miss.contains("no open blocker"), "got: {miss}");
+        assert_eq!(s.current_goal().unwrap().open_blockers(), 1);
+        let hit = goal_command(&mut s, "unblock", "ci");
+        assert!(hit.contains("unblocked"), "got: {hit}");
+        assert_eq!(s.current_goal().unwrap().open_blockers(), 0);
+    }
+
+    #[test]
+    fn goal_complete_is_terminal_and_idempotent() {
+        let mut s = Session::new().unwrap();
+        goal_command(&mut s, "new", "Finish");
+        let done = goal_command(&mut s, "complete", "");
+        assert!(done.contains("goal completed"), "got: {done}");
+        assert_eq!(s.current_goal().unwrap().status, crate::goal::GoalStatus::Completed);
+        let again = goal_command(&mut s, "complete", "");
+        assert!(again.contains("already complete"), "got: {again}");
+    }
+
+    #[test]
+    fn goal_show_and_status_render_without_panicking() {
+        let mut s = Session::new().unwrap();
+        // Empty-state messages first.
+        assert!(goal_command(&mut s, "status", "").contains("no goals yet"));
+        assert!(goal_command(&mut s, "show", "").contains("no goals yet"));
+        goal_command(&mut s, "new", "Observe everything");
+        goal_command(&mut s, "milestone", "add tracing");
+        let show = goal_command(&mut s, "show", "");
+        assert!(show.contains("Observe everything"), "got: {show}");
+        assert!(show.contains("milestones (0/1)"), "got: {show}");
+        let status = goal_command(&mut s, "status", "");
+        assert!(status.contains("1 goal(s):"), "got: {status}");
+        assert!(status.contains("Observe everything"), "got: {status}");
+    }
+
+    #[test]
+    fn goal_subcommands_need_a_current_goal() {
+        let mut s = Session::new().unwrap();
+        // With no goals, mutators explain themselves instead of panicking.
+        for sub in ["link", "block", "milestone"] {
+            let out = goal_command(&mut s, sub, "whatever");
+            assert!(out.contains("no current goal"), "{sub}: {out}");
+        }
+    }
+
+    #[test]
+    fn goal_show_unknown_prefix_reports_miss() {
+        let mut s = Session::new().unwrap();
+        goal_command(&mut s, "new", "A goal");
+        let out = goal_command(&mut s, "show", "deadbeefcafe");
+        assert!(out.contains("no goal matching"), "got: {out}");
     }
 }

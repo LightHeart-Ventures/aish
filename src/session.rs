@@ -317,6 +317,11 @@ pub struct Session {
     /// transient `goal` batch-oracle handle above: these are the durable
     /// `Goal` hierarchy (milestones/blockers/linked_tasks/subgoals).
     pub goals: Vec<crate::goal::Goal>,
+    /// Id of the goal the `:goal` subcommands (show/link/block/unblock/
+    /// milestone/complete) act on when none is named explicitly. Set by
+    /// `:goal new` and `:goal show <id>`; `None` falls back to the
+    /// most-recently-updated non-terminal goal (see `current_goal`).
+    pub current_goal_id: Option<String>,
     /// Which provider the interactive backend runs on (`"claude"`/`"grok"`/
     /// `"local"`). Set right after the backend is built and updated by `:backend`.
     /// Background coordinators are spawned on this same backend (full parity), so
@@ -512,6 +517,7 @@ impl Session {
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
             goal: None,
             goals: Vec::new(),
+            current_goal_id: None,
             backend_kind: "claude".to_string(),
             show_worker_output: Arc::new(AtomicBool::new(false)),
             escalation: None,
@@ -819,6 +825,39 @@ impl Session {
             let title = crate::goal::truncate_condition(&g.title);
             format!("🎯 {title} {}%", g.progress_percent())
         })
+    }
+
+    /// Resolve the "current" persisted goal the `:goal` subcommands act on when
+    /// the operator doesn't name one explicitly: the goal pinned by
+    /// `current_goal_id` (set by `:goal new`/`:goal show <id>`) if it still
+    /// exists, else the most-recently-updated non-terminal goal, else the most
+    /// recently updated goal of any status. `None` only when no goals exist.
+    pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
+        if let Some(id) = &self.current_goal_id {
+            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
+                return Some(g);
+            }
+        }
+        self.goals
+            .iter()
+            .filter(|g| !g.status.is_terminal())
+            .max_by_key(|g| g.updated_at)
+            .or_else(|| self.goals.iter().max_by_key(|g| g.updated_at))
+    }
+
+    /// Find a goal by an id prefix (what the operator types after `:goal show`),
+    /// preferring an exact id match, then a unique prefix match. Returns `None`
+    /// when nothing matches or the prefix is ambiguous.
+    pub fn find_goal_by_prefix(&self, needle: &str) -> Option<&crate::goal::Goal> {
+        if let Some(exact) = self.goals.iter().find(|g| g.id == needle) {
+            return Some(exact);
+        }
+        let mut hits = self.goals.iter().filter(|g| g.id.starts_with(needle));
+        let first = hits.next()?;
+        match hits.next() {
+            Some(_) => None, // ambiguous prefix
+            None => Some(first),
+        }
     }
 
     /// The autonomy descriptor stamped on every hook payload (design §3.1): a
