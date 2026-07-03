@@ -3262,6 +3262,50 @@ impl Dispatched {
     }
 }
 
+/// TASK-290: default duplicate-dispatch suppression window, in seconds.
+const DISPATCH_DEDUP_SECS: u64 = 5;
+
+/// The dedup window for [`dispatch_coordinator`]. Defaults to
+/// [`DISPATCH_DEDUP_SECS`]; override with `AISH_DISPATCH_DEDUP_SECS=<secs>`
+/// (a `0` disables suppression entirely, e.g. for tests or power users who
+/// genuinely want back-to-back identical dispatches).
+fn dispatch_dedup_window() -> Duration {
+    std::env::var("AISH_DISPATCH_DEDUP_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DISPATCH_DEDUP_SECS))
+}
+
+/// Stable content hash of a task string used to key recent dispatches. Trims
+/// first so trailing/leading whitespace doesn't defeat dedup.
+fn task_hash(task: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    task.trim().hash(&mut h);
+    h.finish()
+}
+
+/// TASK-290: pure duplicate-dispatch check. Returns `Some(run_id)` when `task`
+/// was already dispatched within `window` of `now` (a still-fresh entry in
+/// `recent`), so the caller can reject the second launch pointing at the first.
+/// Returns `None` when there's no matching entry or the prior dispatch has aged
+/// out of the window. Kept side-effect-free (no pruning, no clock reads) so it's
+/// unit-testable with synthetic `Instant`s.
+fn duplicate_dispatch<'a>(
+    recent: &'a std::collections::HashMap<u64, (String, Instant)>,
+    task: &str,
+    now: Instant,
+    window: Duration,
+) -> Option<&'a str> {
+    if window.is_zero() {
+        return None;
+    }
+    recent.get(&task_hash(task)).and_then(|(id, when)| {
+        (now.duration_since(*when) < window).then_some(id.as_str())
+    })
+}
+
 fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
     let task = task.trim();
     if task.is_empty() {
@@ -3287,6 +3331,21 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
     // is exhausted, with a clear operator-facing error.
     if let Err(msg) = crate::worker::spawn_budget_gate() {
         return Dispatched::message_only(msg);
+    }
+    // TASK-290: suppress an accidental duplicate — the same task dispatched
+    // again within the dedup window (default 5s). Prevents double-spends of
+    // background work that may have external side effects (API calls, cost,
+    // writes). Point the operator at the still-running first launch instead of
+    // spawning a second identical coordinator.
+    let now = Instant::now();
+    let window = dispatch_dedup_window();
+    // Prune aged-out entries so the map stays tiny and a re-dispatch after the
+    // window naturally succeeds.
+    session
+        .recent_dispatches
+        .retain(|_, (_, when)| now.duration_since(*when) < window);
+    if let Some(run_id) = duplicate_dispatch(&session.recent_dispatches, task, now, window) {
+        return Dispatched::message_only(format!("task already running (run_id: {run_id})"));
     }
     match std::env::current_exe() {
         Ok(exe) => {
@@ -3318,6 +3377,11 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
                 coordinator_store: session.coordinator_store.clone(),
             };
             let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
+            // TASK-290: record this launch so an identical dispatch inside the
+            // dedup window is rejected pointing back at `id`.
+            session
+                .recent_dispatches
+                .insert(task_hash(task), (id.clone(), now));
             let message = format!(
                 "\x1b[2mdispatched background coordinator \x1b[0m\x1b[1;36m{id}\x1b[0m\x1b[2m \
 — runs here with the full toolset; result auto-delivers. \x1b[0m\x1b[36m:workers\x1b[0m\x1b[2m to check.\x1b[0m"
@@ -7449,6 +7513,107 @@ fn dirs_history_path() -> std::path::PathBuf {
 mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
+    use std::collections::HashMap;
+
+    // TASK-290: a second dispatch of the SAME task within the dedup window is
+    // detected as a duplicate and points at the first run's id.
+    #[test]
+    fn duplicate_dispatch_within_window_is_rejected() {
+        let now = Instant::now();
+        let window = Duration::from_secs(5);
+        let mut recent: HashMap<u64, (String, Instant)> = HashMap::new();
+        recent.insert(task_hash("build the thing"), ("w_abc123".into(), now));
+
+        // Same task, 2s later — still inside the 5s window → duplicate.
+        let two_s_later = now + Duration::from_secs(2);
+        assert_eq!(
+            duplicate_dispatch(&recent, "build the thing", two_s_later, window),
+            Some("w_abc123"),
+            "identical task inside the window must be flagged as a duplicate"
+        );
+        // Whitespace differences don't defeat dedup (task_hash trims).
+        assert_eq!(
+            duplicate_dispatch(&recent, "  build the thing  ", two_s_later, window),
+            Some("w_abc123"),
+            "leading/trailing whitespace must not bypass dedup"
+        );
+    }
+
+    // A dispatch AFTER the window elapses is allowed through (no stale match).
+    #[test]
+    fn duplicate_dispatch_after_window_is_allowed() {
+        let now = Instant::now();
+        let window = Duration::from_secs(5);
+        let mut recent: HashMap<u64, (String, Instant)> = HashMap::new();
+        recent.insert(task_hash("build the thing"), ("w_abc123".into(), now));
+
+        let six_s_later = now + Duration::from_secs(6);
+        assert_eq!(
+            duplicate_dispatch(&recent, "build the thing", six_s_later, window),
+            None,
+            "a dispatch past the window must NOT be treated as a duplicate"
+        );
+    }
+
+    // A DIFFERENT task within the window is not a duplicate.
+    #[test]
+    fn different_task_within_window_is_not_a_duplicate() {
+        let now = Instant::now();
+        let window = Duration::from_secs(5);
+        let mut recent: HashMap<u64, (String, Instant)> = HashMap::new();
+        recent.insert(task_hash("build the thing"), ("w_abc123".into(), now));
+
+        assert_eq!(
+            duplicate_dispatch(&recent, "ship the other thing", now, window),
+            None,
+            "a distinct task must dispatch even inside the window"
+        );
+    }
+
+    // A zero window disables suppression entirely (escape hatch).
+    #[test]
+    fn zero_window_disables_dedup() {
+        let now = Instant::now();
+        let mut recent: HashMap<u64, (String, Instant)> = HashMap::new();
+        recent.insert(task_hash("build the thing"), ("w_abc123".into(), now));
+
+        assert_eq!(
+            duplicate_dispatch(&recent, "build the thing", now, Duration::ZERO),
+            None,
+            "window of 0 must never flag a duplicate"
+        );
+    }
+
+    // The configurable window honors AISH_DISPATCH_DEDUP_SECS, falling back to
+    // the 5s default when unset/invalid.
+    #[test]
+    fn dedup_window_is_configurable() {
+        // NOTE: env is process-global; this test owns the var and restores it.
+        // SAFETY: no other thread reads this var concurrently during the test —
+        // only `dispatch_dedup_window` reads it and only this test writes it.
+        let prev = std::env::var("AISH_DISPATCH_DEDUP_SECS").ok();
+
+        unsafe { std::env::remove_var("AISH_DISPATCH_DEDUP_SECS") };
+        assert_eq!(dispatch_dedup_window(), Duration::from_secs(DISPATCH_DEDUP_SECS));
+
+        unsafe { std::env::set_var("AISH_DISPATCH_DEDUP_SECS", "12") };
+        assert_eq!(dispatch_dedup_window(), Duration::from_secs(12));
+
+        unsafe { std::env::set_var("AISH_DISPATCH_DEDUP_SECS", "0") };
+        assert_eq!(dispatch_dedup_window(), Duration::from_secs(0));
+
+        unsafe { std::env::set_var("AISH_DISPATCH_DEDUP_SECS", "not-a-number") };
+        assert_eq!(
+            dispatch_dedup_window(),
+            Duration::from_secs(DISPATCH_DEDUP_SECS),
+            "invalid value falls back to the default window"
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AISH_DISPATCH_DEDUP_SECS", v) },
+            None => unsafe { std::env::remove_var("AISH_DISPATCH_DEDUP_SECS") },
+        }
+    }
 
     // The attach-review claim is once-only per (marker, run_id): the first caller
     // to observe a finished attached worker prints its final result; the racing
