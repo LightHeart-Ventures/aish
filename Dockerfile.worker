@@ -47,11 +47,36 @@ RUN cargo build --release --no-default-features --locked \
 # ─── runtime stage ───────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
-# git is needed by the coordinator's worktree/VCS tooling; ca-certificates for
-# HTTPS (MCP servers, gh, crates). Slim base keeps the image small (AC perf).
+# Runtime toolchain a coordinator worker actually shells out to. A worker is a
+# full aish coordinator: it opens PRs and reads CI (`gh`), fetches over HTTP
+# (`curl`), runs helper scripts (`python3`), and drives git in its worktree
+# (`git` + `openssh-client` for ssh remotes). `jq` pairs with `gh --json`;
+# `ca-certificates` anchors TLS (MCP over HTTPS, crates, gh); `less` is the
+# default git/gh pager; `gnupg` is only needed to verify the GitHub CLI apt key.
+#
+# `gh` is NOT in Debian bookworm's repos, so we add GitHub's apt source (their
+# documented install path) rather than pinning a downloaded .deb.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates \
+    && apt-get install -y --no-install-recommends \
+        git ca-certificates curl python3 jq openssh-client less gnupg \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+         -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+         > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
+
+# The worker's project tree is a git WORKTREE bind-mounted from the host, owned
+# by the host uid but read by root in the container — git 2.35.2+ refuses such a
+# repo with "detected dubious ownership" and aborts every VCS op. The container
+# is a single-tenant hermetic sandbox, so globally trust any worktree path.
+# (NOTE: this does NOT fix the gitlink itself — a worktree's `.git` file points
+#  at the parent repo's `.git/worktrees/<id>` OUTSIDE the /aish/work mount, so
+#  git in-container still needs that commondir mounted; tracked separately.)
+RUN git config --system --add safe.directory '*'
 
 # The binary built above shares this stage's glibc, so it always runs here.
 COPY --from=builder /aish-bin /usr/local/bin/aish
