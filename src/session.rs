@@ -300,6 +300,10 @@ pub struct Session {
     /// `background_status` / startup rehydrate can see runs across restarts.
     /// None if it failed to open — coordinator runs then aren't persisted.
     pub coordinator_store: Option<crate::db::CoordinatorStore>,
+    /// Durable goal-tree store (own SQLite connection, TASK-276). Persists goals,
+    /// subgoals, milestones, blockers, and task links alongside memories in
+    /// aish.db. None if it failed to open — goals then aren't persisted.
+    pub goal_store: Option<crate::db::GoalStore>,
     /// True when THIS aish is itself a background coordinator (env
     /// `AISH_COORDINATOR=1`). The nested guard: a coordinator must never spawn
     /// its own workers (no infinite re-exec recursion), so `run_in_background`
@@ -499,6 +503,7 @@ impl Session {
             batch_store: None,
             worker_jobs: Default::default(),
             coordinator_store: None,
+            goal_store: None,
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
             goal: None,
             backend_kind: "claude".to_string(),

@@ -1383,6 +1383,446 @@ impl CoordinatorStore {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Goal persistence (TASK-276) — durable goal trees stored alongside memories in
+// aish.db. A goal has an optional parent (self-referential FK) so subgoals form
+// a tree; milestones, blockers, and task links hang off a goal. Kept in its own
+// cloneable connection like `CoordinatorStore`/`BatchStore` (WAL makes the
+// concurrent connections against the same file safe), so a future background
+// goal-tracker and the REPL can both hold a handle. This layer is intentionally
+// string-typed for status/severity — the typed domain model (enums, invariants)
+// lands in the follow-up domain-model task; here we only own schema + CRUD.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One row of the `goals` table. `parent_id` is `None` for a root goal and
+/// `Some(id)` for a subgoal, which is what makes the tree queryable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalRow {
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One row of the `milestones` table — a dated checkpoint under a goal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MilestoneRow {
+    pub id: i64,
+    pub goal_id: i64,
+    pub title: String,
+    pub target_date: Option<String>,
+    pub done: bool,
+    pub created_at: String,
+}
+
+/// One row of the `blockers` table — something impeding a goal. `cleared_at`
+/// is `None` while the blocker is open and set to a timestamp when resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockerRow {
+    pub id: i64,
+    pub goal_id: i64,
+    pub reason: String,
+    pub waiting_on: Option<String>,
+    pub severity: String,
+    pub created_at: String,
+    pub cleared_at: Option<String>,
+}
+
+/// One row of `goal_task_links` — a loose reference from a goal to some external
+/// entity (a task card, an issue, a coordinator run, …). `ref_kind` names the
+/// namespace (e.g. "task", "issue", "run") and `ref_id` the id within it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalTaskLink {
+    pub id: i64,
+    pub goal_id: i64,
+    pub ref_kind: String,
+    pub ref_id: String,
+    pub created_at: String,
+}
+
+/// Durable store for goal trees. Own SQLite connection against `aish.db`,
+/// cloneable so multiple holders share it. `PRAGMA foreign_keys = ON` is set per
+/// connection (SQLite defaults it OFF) so the `ON DELETE CASCADE` chains — a
+/// goal delete reaps its subgoals, milestones, blockers, and links.
+#[derive(Clone)]
+pub struct GoalStore {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl GoalStore {
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)
+            .with_context(|| format!("can't open goal store at {}", path.display()))?;
+        // FK enforcement is per-connection in SQLite and defaults OFF; turn it on
+        // BEFORE any statement so CASCADE deletes fire.
+        conn.pragma_update(None, "foreign_keys", true)
+            .context("enable foreign_keys")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             CREATE TABLE IF NOT EXISTS goals (
+                 id          INTEGER PRIMARY KEY,
+                 parent_id   INTEGER REFERENCES goals(id) ON DELETE CASCADE,
+                 title       TEXT NOT NULL,
+                 description TEXT,
+                 status      TEXT NOT NULL DEFAULT 'active'
+                             CHECK (status IN
+                             ('active','paused','done','abandoned','blocked')),
+                 created_at  TEXT NOT NULL DEFAULT current_timestamp,
+                 updated_at  TEXT NOT NULL DEFAULT current_timestamp
+             );
+             CREATE INDEX IF NOT EXISTS idx_goals_parent ON goals (parent_id);
+
+             CREATE TABLE IF NOT EXISTS milestones (
+                 id          INTEGER PRIMARY KEY,
+                 goal_id     INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+                 title       TEXT NOT NULL,
+                 target_date TEXT,
+                 done        INTEGER NOT NULL DEFAULT 0,
+                 created_at  TEXT NOT NULL DEFAULT current_timestamp
+             );
+             CREATE INDEX IF NOT EXISTS idx_milestones_goal ON milestones (goal_id);
+
+             CREATE TABLE IF NOT EXISTS blockers (
+                 id         INTEGER PRIMARY KEY,
+                 goal_id    INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+                 reason     TEXT NOT NULL,
+                 waiting_on TEXT,
+                 severity   TEXT NOT NULL DEFAULT 'medium'
+                            CHECK (severity IN ('low','medium','high','critical')),
+                 created_at TEXT NOT NULL DEFAULT current_timestamp,
+                 cleared_at TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_blockers_goal ON blockers (goal_id);
+
+             -- Loose reference from a goal to an external entity (task/issue/run).
+             -- UNIQUE keeps a given (goal, kind, id) link idempotent.
+             CREATE TABLE IF NOT EXISTS goal_task_links (
+                 id         INTEGER PRIMARY KEY,
+                 goal_id    INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+                 ref_kind   TEXT NOT NULL,
+                 ref_id     TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT current_timestamp,
+                 UNIQUE (goal_id, ref_kind, ref_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_goal_links_goal ON goal_task_links (goal_id);",
+        )
+        .context("goal schema init failed")?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    // ── goals ────────────────────────────────────────────────────────────────
+
+    /// Create a goal. `parent_id` = `None` makes a root goal; `Some(id)` makes a
+    /// subgoal of that goal. `status` defaults to `active` when `None`. Returns
+    /// the new row id.
+    pub fn create_goal(
+        &self,
+        parent_id: Option<i64>,
+        title: &str,
+        description: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO goals (parent_id, title, description, status)
+             VALUES (?1, ?2, ?3, COALESCE(?4, 'active'))",
+            rusqlite::params![parent_id, title, description, status],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Read one goal by id. `None` when it doesn't exist.
+    pub fn get_goal(&self, id: i64) -> Result<Option<GoalRow>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id, parent_id, title, description, status, created_at, updated_at
+                 FROM goals WHERE id = ?1",
+                [id],
+                Self::map_goal,
+            )
+            .optional()?)
+    }
+
+    /// Every goal, oldest first.
+    pub fn list_goals(&self) -> Result<Vec<GoalRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, parent_id, title, description, status, created_at, updated_at
+             FROM goals ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], Self::map_goal)?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Root goals only (no parent) — the top of each tree.
+    pub fn list_root_goals(&self) -> Result<Vec<GoalRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, parent_id, title, description, status, created_at, updated_at
+             FROM goals WHERE parent_id IS NULL ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], Self::map_goal)?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Direct children of `parent_id` — one level of the tree.
+    pub fn list_subgoals(&self, parent_id: i64) -> Result<Vec<GoalRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, parent_id, title, description, status, created_at, updated_at
+             FROM goals WHERE parent_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([parent_id], Self::map_goal)?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Full update of a goal's mutable fields; bumps `updated_at`. Returns the
+    /// number of rows changed (0 when the id is unknown).
+    pub fn update_goal(
+        &self,
+        id: i64,
+        title: &str,
+        description: Option<&str>,
+        status: &str,
+    ) -> Result<usize> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE goals
+             SET title = ?2, description = ?3, status = ?4, updated_at = current_timestamp
+             WHERE id = ?1",
+            rusqlite::params![id, title, description, status],
+        )?)
+    }
+
+    /// Narrow update of just the status (bumps `updated_at`). Returns rows changed.
+    pub fn set_goal_status(&self, id: i64, status: &str) -> Result<usize> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE goals SET status = ?2, updated_at = current_timestamp WHERE id = ?1",
+            rusqlite::params![id, status],
+        )?)
+    }
+
+    /// Reparent a goal (or promote it to root with `None`) — the mutable side of
+    /// the hierarchy. Bumps `updated_at`. Returns rows changed.
+    pub fn set_goal_parent(&self, id: i64, parent_id: Option<i64>) -> Result<usize> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE goals SET parent_id = ?2, updated_at = current_timestamp WHERE id = ?1",
+            rusqlite::params![id, parent_id],
+        )?)
+    }
+
+    /// Delete a goal. `ON DELETE CASCADE` reaps its subgoals, milestones,
+    /// blockers, and links. Returns rows changed (0 when the id is unknown).
+    pub fn delete_goal(&self, id: i64) -> Result<usize> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM goals WHERE id = ?1", [id])?)
+    }
+
+    // ── milestones ─────────────────────────────────────────────────────────────
+
+    /// Add a milestone under a goal. Returns the new row id.
+    pub fn create_milestone(
+        &self,
+        goal_id: i64,
+        title: &str,
+        target_date: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO milestones (goal_id, title, target_date) VALUES (?1, ?2, ?3)",
+            rusqlite::params![goal_id, title, target_date],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// All milestones for a goal, oldest first.
+    pub fn list_milestones(&self, goal_id: i64) -> Result<Vec<MilestoneRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, goal_id, title, target_date, done, created_at
+             FROM milestones WHERE goal_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([goal_id], Self::map_milestone)?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Toggle a milestone's done flag. Returns rows changed.
+    pub fn set_milestone_done(&self, id: i64, done: bool) -> Result<usize> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE milestones SET done = ?2 WHERE id = ?1",
+            rusqlite::params![id, done as i64],
+        )?)
+    }
+
+    /// Delete a milestone. Returns rows changed.
+    pub fn delete_milestone(&self, id: i64) -> Result<usize> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM milestones WHERE id = ?1", [id])?)
+    }
+
+    // ── blockers ───────────────────────────────────────────────────────────────
+
+    /// Record a blocker on a goal. `severity` defaults to `medium` when `None`.
+    /// Returns the new row id.
+    pub fn create_blocker(
+        &self,
+        goal_id: i64,
+        reason: &str,
+        waiting_on: Option<&str>,
+        severity: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO blockers (goal_id, reason, waiting_on, severity)
+             VALUES (?1, ?2, ?3, COALESCE(?4, 'medium'))",
+            rusqlite::params![goal_id, reason, waiting_on, severity],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Blockers for a goal, oldest first. `open_only` returns just the
+    /// uncleared ones (`cleared_at IS NULL`).
+    pub fn list_blockers(&self, goal_id: i64, open_only: bool) -> Result<Vec<BlockerRow>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = if open_only {
+            "SELECT id, goal_id, reason, waiting_on, severity, created_at, cleared_at
+             FROM blockers WHERE goal_id = ?1 AND cleared_at IS NULL ORDER BY id"
+        } else {
+            "SELECT id, goal_id, reason, waiting_on, severity, created_at, cleared_at
+             FROM blockers WHERE goal_id = ?1 ORDER BY id"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([goal_id], Self::map_blocker)?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Mark a blocker cleared (stamps `cleared_at = now`). Returns rows changed.
+    pub fn clear_blocker(&self, id: i64) -> Result<usize> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE blockers SET cleared_at = current_timestamp WHERE id = ?1",
+            [id],
+        )?)
+    }
+
+    /// Delete a blocker outright. Returns rows changed.
+    pub fn delete_blocker(&self, id: i64) -> Result<usize> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM blockers WHERE id = ?1", [id])?)
+    }
+
+    // ── links ──────────────────────────────────────────────────────────────────
+
+    /// Link a goal to an external entity. Idempotent on `(goal_id, ref_kind,
+    /// ref_id)` — a repeat link is a no-op. Returns the row id (existing when the
+    /// link was already present).
+    pub fn link_goal(&self, goal_id: i64, ref_kind: &str, ref_id: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO goal_task_links (goal_id, ref_kind, ref_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT(goal_id, ref_kind, ref_id) DO NOTHING",
+            rusqlite::params![goal_id, ref_kind, ref_id],
+        )?;
+        Ok(conn.query_row(
+            "SELECT id FROM goal_task_links WHERE goal_id = ?1 AND ref_kind = ?2 AND ref_id = ?3",
+            rusqlite::params![goal_id, ref_kind, ref_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Remove a link. Returns rows changed.
+    pub fn unlink_goal(&self, goal_id: i64, ref_kind: &str, ref_id: &str) -> Result<usize> {
+        Ok(self.conn.lock().unwrap().execute(
+            "DELETE FROM goal_task_links WHERE goal_id = ?1 AND ref_kind = ?2 AND ref_id = ?3",
+            rusqlite::params![goal_id, ref_kind, ref_id],
+        )?)
+    }
+
+    /// All links for a goal, oldest first.
+    pub fn list_links(&self, goal_id: i64) -> Result<Vec<GoalTaskLink>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, goal_id, ref_kind, ref_id, created_at
+             FROM goal_task_links WHERE goal_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([goal_id], Self::map_link)?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Reverse lookup: every goal linked to a given external entity.
+    pub fn goals_for_ref(&self, ref_kind: &str, ref_id: &str) -> Result<Vec<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT goal_id FROM goal_task_links WHERE ref_kind = ?1 AND ref_id = ?2 ORDER BY goal_id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![ref_kind, ref_id], |r| r.get::<_, i64>(0))?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    // ── row mappers ────────────────────────────────────────────────────────────
+
+    fn map_goal(r: &rusqlite::Row) -> rusqlite::Result<GoalRow> {
+        Ok(GoalRow {
+            id: r.get(0)?,
+            parent_id: r.get(1)?,
+            title: r.get(2)?,
+            description: r.get(3)?,
+            status: r.get(4)?,
+            created_at: r.get(5)?,
+            updated_at: r.get(6)?,
+        })
+    }
+
+    fn map_milestone(r: &rusqlite::Row) -> rusqlite::Result<MilestoneRow> {
+        Ok(MilestoneRow {
+            id: r.get(0)?,
+            goal_id: r.get(1)?,
+            title: r.get(2)?,
+            target_date: r.get(3)?,
+            done: r.get::<_, i64>(4)? != 0,
+            created_at: r.get(5)?,
+        })
+    }
+
+    fn map_blocker(r: &rusqlite::Row) -> rusqlite::Result<BlockerRow> {
+        Ok(BlockerRow {
+            id: r.get(0)?,
+            goal_id: r.get(1)?,
+            reason: r.get(2)?,
+            waiting_on: r.get(3)?,
+            severity: r.get(4)?,
+            created_at: r.get(5)?,
+            cleared_at: r.get(6)?,
+        })
+    }
+
+    fn map_link(r: &rusqlite::Row) -> rusqlite::Result<GoalTaskLink> {
+        Ok(GoalTaskLink {
+            id: r.get(0)?,
+            goal_id: r.get(1)?,
+            ref_kind: r.get(2)?,
+            ref_id: r.get(3)?,
+            created_at: r.get(4)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1985,5 +2425,138 @@ mod tests {
         assert!(!db.revoke("git").unwrap()); // already gone
         assert!(!db.is_allowed("git").unwrap());
         assert_eq!(names(&db), vec!["npm"]);
+    }
+
+    // ── goal store (TASK-276) ──────────────────────────────────────────────────
+
+    fn temp_goal_store(name: &str) -> (GoalStore, std::path::PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("aish_goal_{name}_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        (GoalStore::open(&path).unwrap(), path)
+    }
+
+    #[test]
+    fn goal_crud_roundtrip_and_reopen() {
+        let (store, path) = temp_goal_store("crud");
+
+        let id = store
+            .create_goal(None, "Ship goals feature", Some("the big one"), None)
+            .unwrap();
+        let g = store.get_goal(id).unwrap().unwrap();
+        assert_eq!(g.title, "Ship goals feature");
+        assert_eq!(g.description.as_deref(), Some("the big one"));
+        assert_eq!(g.status, "active"); // COALESCE default
+        assert_eq!(g.parent_id, None);
+
+        // Update mutates fields + bumps status.
+        assert_eq!(
+            store
+                .update_goal(id, "Ship goals", Some("trimmed"), "paused")
+                .unwrap(),
+            1
+        );
+        let g = store.get_goal(id).unwrap().unwrap();
+        assert_eq!(g.title, "Ship goals");
+        assert_eq!(g.status, "paused");
+
+        // Narrow status setter.
+        assert_eq!(store.set_goal_status(id, "done").unwrap(), 1);
+        assert_eq!(store.get_goal(id).unwrap().unwrap().status, "done");
+
+        // Survives a reopen (real durability, not just in-memory).
+        let reopened = GoalStore::open(&path).unwrap();
+        assert_eq!(reopened.get_goal(id).unwrap().unwrap().status, "done");
+        assert_eq!(reopened.list_goals().unwrap().len(), 1);
+
+        // Delete.
+        assert_eq!(reopened.delete_goal(id).unwrap(), 1);
+        assert!(reopened.get_goal(id).unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn goal_hierarchy_is_queryable_and_cascades() {
+        let (store, path) = temp_goal_store("tree");
+
+        let root = store.create_goal(None, "root", None, None).unwrap();
+        let a = store.create_goal(Some(root), "child-a", None, None).unwrap();
+        let b = store.create_goal(Some(root), "child-b", None, None).unwrap();
+        let grand = store.create_goal(Some(a), "grandchild", None, None).unwrap();
+
+        // Roots vs children queryable.
+        assert_eq!(
+            store
+                .list_root_goals()
+                .unwrap()
+                .iter()
+                .map(|g| g.id)
+                .collect::<Vec<_>>(),
+            vec![root]
+        );
+        let kids: Vec<i64> = store.list_subgoals(root).unwrap().iter().map(|g| g.id).collect();
+        assert_eq!(kids, vec![a, b]);
+        assert_eq!(
+            store.get_goal(grand).unwrap().unwrap().parent_id,
+            Some(a)
+        );
+
+        // Reparent grandchild under root (promote a level).
+        assert_eq!(store.set_goal_parent(grand, Some(root)).unwrap(), 1);
+        let kids: Vec<i64> = store.list_subgoals(root).unwrap().iter().map(|g| g.id).collect();
+        assert_eq!(kids, vec![a, b, grand]);
+
+        // Deleting the root cascades to the whole tree (FK ON DELETE CASCADE).
+        assert_eq!(store.delete_goal(root).unwrap(), 1);
+        assert!(store.list_goals().unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn milestones_blockers_links_roundtrip() {
+        let (store, path) = temp_goal_store("children");
+        let goal = store.create_goal(None, "with children", None, None).unwrap();
+
+        // Milestones.
+        let m1 = store.create_milestone(goal, "alpha", Some("2026-01-01")).unwrap();
+        store.create_milestone(goal, "beta", None).unwrap();
+        let ms = store.list_milestones(goal).unwrap();
+        assert_eq!(ms.len(), 2);
+        assert!(!ms[0].done);
+        assert_eq!(store.set_milestone_done(m1, true).unwrap(), 1);
+        assert!(store.list_milestones(goal).unwrap()[0].done);
+        assert_eq!(store.delete_milestone(m1).unwrap(), 1);
+        assert_eq!(store.list_milestones(goal).unwrap().len(), 1);
+
+        // Blockers: severity default, open-only filter, clear.
+        let bl = store
+            .create_blocker(goal, "waiting on review", Some("alice"), None)
+            .unwrap();
+        assert_eq!(store.list_blockers(goal, true).unwrap()[0].severity, "medium");
+        store
+            .create_blocker(goal, "ci red", None, Some("critical"))
+            .unwrap();
+        assert_eq!(store.list_blockers(goal, true).unwrap().len(), 2);
+        assert_eq!(store.clear_blocker(bl).unwrap(), 1);
+        assert_eq!(store.list_blockers(goal, true).unwrap().len(), 1); // open only
+        assert_eq!(store.list_blockers(goal, false).unwrap().len(), 2); // all
+        assert!(store.list_blockers(goal, false).unwrap()[0].cleared_at.is_some());
+
+        // Links: idempotent, reverse lookup, unlink.
+        let l1 = store.link_goal(goal, "task", "TASK-276").unwrap();
+        let l1_again = store.link_goal(goal, "task", "TASK-276").unwrap();
+        assert_eq!(l1, l1_again); // idempotent, same row
+        store.link_goal(goal, "issue", "ISS-9").unwrap();
+        assert_eq!(store.list_links(goal).unwrap().len(), 2);
+        assert_eq!(store.goals_for_ref("task", "TASK-276").unwrap(), vec![goal]);
+        assert_eq!(store.unlink_goal(goal, "task", "TASK-276").unwrap(), 1);
+        assert_eq!(store.list_links(goal).unwrap().len(), 1);
+
+        // Deleting the goal cascades to milestones, blockers, and links.
+        store.delete_goal(goal).unwrap();
+        assert!(store.list_milestones(goal).unwrap().is_empty());
+        assert!(store.list_blockers(goal, false).unwrap().is_empty());
+        assert!(store.list_links(goal).unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
     }
 }

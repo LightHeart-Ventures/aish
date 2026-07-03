@@ -565,6 +565,15 @@ async fn main() -> Result<()> {
     }
     timer.mark("coordinator rehydrate");
 
+    // Durable goal trees (TASK-276): open the store so the goal/milestone/blocker
+    // tables are created (idempotent migration) on the shared aish.db. Foundation
+    // for the goal domain model + tracker; failure here is non-fatal.
+    match db::GoalStore::open(&db_paths::main_db_path()) {
+        Ok(store) => session.goal_store = Some(store),
+        Err(e) => eprintln!("\x1b[33maish:\x1b[0m goal store unavailable: {e:#}"),
+    }
+    timer.mark("goal store open");
+
     // Load the lifecycle-hook registry for the non-interactive entry paths
     // (one-shot `-c`, background coordinator, script). The interactive REPL loads
     // it itself in `repl::run` (right before firing SessionStart). This is what
