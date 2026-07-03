@@ -378,8 +378,24 @@ pub fn fmt_datetime_utc(epoch: i64) -> String {
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
 }
 
+/// Local timezone offset in seconds east of UTC for the given epoch instant.
+/// Resolved via libc `localtime_r`, so it honors `$TZ` and the system zoneinfo
+/// database — including the correct DST rule for that specific instant. Falls
+/// back to `0` (UTC) if the C call fails. Not pure (reads the system TZ), so it
+/// lives outside the unit-tested date helpers.
+fn local_offset_secs(epoch: i64) -> i64 {
+    unsafe {
+        let t = epoch as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return 0;
+        }
+        tm.tm_gmtoff as i64
+    }
+}
+
 /// Render the REPL statusline: version + shell tagline + model on the LEFT,
-/// the current UTC date/time (`YYYY-MM-DD HH:MM`) right-justified on the RIGHT,
+/// the current LOCAL date/time (`YYYY-MM-DD HH:MM`) right-justified on the RIGHT,
 /// separated by enough spaces to fill the terminal width. Runtime form — reads
 /// the wall clock, terminal width, and [`colors_enabled`]. Off a tty (piped /
 /// `NO_COLOR`) it still returns plain text; the caller decides whether to print.
@@ -388,11 +404,16 @@ pub fn statusline(version: &str, model: &str, stats: &str) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    // Shift the instant by the local UTC offset so the clock shows system/wall
+    // time (e.g. Central) rather than UTC. `statusline_at`/`fmt_datetime_utc`
+    // stay pure UTC formatters — feeding them the offset-adjusted epoch renders
+    // local wall-clock time without a chrono dependency.
+    let local = epoch + local_offset_secs(epoch);
     statusline_at(
         version,
         model,
         stats,
-        epoch,
+        local,
         statusline_width(),
         colors_enabled(),
     )
