@@ -578,6 +578,29 @@ impl Session {
         self.loop_state.take().is_some()
     }
 
+    /// Start a fresh conversation (`:new`): drop the transcript and reset the
+    /// session-cumulative accounting so nothing from the prior conversation
+    /// bleeds into the new one.
+    ///
+    /// `:new` used to only `history.clear()` + arm the last-output seed
+    /// suppression, which left the running totals that feed the interactive
+    /// activity-stream status line (`tokens in/out`, `tool calls`, `turns`) and
+    /// the `:context` window estimate carrying their old values into what is
+    /// meant to be a clean slate — a cosmetic drift the user reported. Resetting
+    /// them here keeps the status line honest for the new conversation.
+    pub fn reset_conversation(&mut self) {
+        self.history.clear();
+        // Stop the prior conversation's final reply from bleeding back in via the
+        // TASK-13 last-output seed: an empty history is exactly the condition
+        // seed_context uses to re-inject $LAST. Consumed one-shot on next turn.
+        self.suppress_context_seed = true;
+        self.context_used = 0;
+        self.tokens_in = 0;
+        self.tokens_out = 0;
+        self.tool_calls_total = 0;
+        self.turns_total = 0;
+    }
+
     /// One-line status of the active loop (bare `:loop` / `:loop status`).
     pub fn loop_status(&self) -> String {
         match &self.loop_state {
@@ -1035,6 +1058,32 @@ mod tests {
         let out = truncate_last(s);
         assert!(out.ends_with("…[truncated]"));
         assert!(out.is_char_boundary(out.len() - "\n…[truncated]".len()));
+    }
+
+    #[test]
+    fn reset_conversation_clears_history_and_accounting() {
+        let mut session = Session::new().unwrap();
+        // Simulate a conversation that ran for a while.
+        session.history.push(Msg::user("hello"));
+        session.history.push(Msg::user("world"));
+        session.context_used = 17_000_000;
+        session.tokens_in = 17_000_000;
+        session.tokens_out = 72_000;
+        session.tool_calls_total = 12;
+        session.turns_total = 5;
+        session.suppress_context_seed = false;
+
+        session.reset_conversation();
+
+        // Transcript gone and every session-cumulative counter back to zero.
+        assert!(session.history.is_empty(), "history not cleared");
+        assert_eq!(session.context_used, 0, "context_used not reset");
+        assert_eq!(session.tokens_in, 0, "tokens_in not reset");
+        assert_eq!(session.tokens_out, 0, "tokens_out not reset");
+        assert_eq!(session.tool_calls_total, 0, "tool_calls_total not reset");
+        assert_eq!(session.turns_total, 0, "turns_total not reset");
+        // And the last-output re-seed is suppressed for the next turn.
+        assert!(session.suppress_context_seed, "context seed not suppressed");
     }
 
     #[test]

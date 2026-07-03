@@ -5789,12 +5789,7 @@ async fn handle_colon(
             println!("mode → {}", describe_mode(session.mode));
         }
         Some("new") => {
-            session.history.clear();
-            // Stop the prior conversation's final reply from bleeding back in via
-            // the TASK-13 last-output seed: an empty history is exactly the
-            // condition seed_context uses to re-inject $LAST. Consumed one-shot
-            // on the next turn.
-            session.suppress_context_seed = true;
+            session.reset_conversation();
             println!("history cleared");
         }
         Some("allow") => handle_allow(parts.next(), parts.next(), session),
