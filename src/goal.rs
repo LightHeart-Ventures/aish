@@ -160,8 +160,7 @@ fn fmt_duration(d: Duration) -> String {
 }
 
 /// Keep the condition snippet on one line — long goals get an ellipsis.
-<<<<<<< HEAD
-fn truncate_condition(condition: &str) -> String {
+pub(crate) fn truncate_condition(condition: &str) -> String {
     truncate_ellipsis(condition, 60)
 }
 
@@ -172,12 +171,6 @@ fn truncate_condition(condition: &str) -> String {
 pub fn truncate_ellipsis(s: &str, max: usize) -> String {
     if s.chars().count() > max {
         let head: String = s.chars().take(max).collect();
-=======
-pub(crate) fn truncate_condition(condition: &str) -> String {
-    const MAX: usize = 60;
-    if condition.chars().count() > MAX {
-        let head: String = condition.chars().take(MAX).collect();
->>>>>>> 9907d69 (feat(goals): single active goal + coordinator progress rollup (TASK-282))
         format!("{}…", head.trim_end())
     } else {
         s.to_string()
