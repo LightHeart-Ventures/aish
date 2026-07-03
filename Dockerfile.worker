@@ -40,7 +40,7 @@ COPY . .
 
 # Claude-only, stripped release build (profile.release: opt-level=2, thin LTO,
 # strip). Matches the coordinator/CI build policy exactly.
-RUN cargo build --release --no-default-features \
+RUN cargo build --release --no-default-features --locked \
     && cp target/release/aish /aish-bin \
     && /aish-bin --version
 
