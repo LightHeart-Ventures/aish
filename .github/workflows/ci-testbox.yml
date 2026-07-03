@@ -1,0 +1,57 @@
+name: CI Testbox
+
+# Warmup workflow for Blacksmith Testbox (https://blacksmith.sh).
+#
+# This is NOT a normal CI job — it exists so `blacksmith testbox warmup
+# ci-testbox.yml` can provision a warm VM that mirrors the real CI gate
+# (see ci.yml). The setup steps below run once during warmup to install the
+# Rust toolchain and pre-compile the dependency graph + test harness, so
+# subsequent `blacksmith testbox run` calls only recompile the files you
+# changed — turning the pre-PR test loop into seconds instead of a cold build.
+#
+# Why this exists: cargo builds of aish OOM-kill in local coordinator
+# worktrees (the heavy `local` mistralrs feature). Testbox runs the exact
+# gate remotely on a 4vcpu Blacksmith VM with a warm cargo cache, off the
+# local box entirely.
+#
+# Usage:
+#   blacksmith testbox warmup ci-testbox.yml            # → tbx_...  (save the ID)
+#   blacksmith testbox run --id <ID> "cargo test --no-default-features --locked"
+#
+# workflow_dispatch (not push/PR) so it never burns CI minutes on its own —
+# it only runs when Testbox dispatches it. GitHub requires the file to live on
+# the default branch before it becomes dispatchable.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  testbox:
+    name: testbox warmup (Rust, Claude-only)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Warm the VM so the first `testbox run` is fast: fetch the locked
+      # dependency graph and compile the test binaries WITHOUT running them.
+      # --no-default-features drops the in-process local model (mistralrs /
+      # mistralrs-core) — same flag the real CI gate (ci.yml) uses. Keep this
+      # in lockstep with ci.yml's Test step so the testbox matches CI exactly.
+      - name: Warm build (fetch + compile deps and test harness)
+        run: |
+          cargo fetch --locked
+          cargo test --no-default-features --locked --no-run
