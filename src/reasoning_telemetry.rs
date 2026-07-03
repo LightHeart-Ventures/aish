@@ -251,9 +251,17 @@ const DEFAULT_ROTATE_MB: f64 = 5.0;
 /// effect without a restart. A value `<= 0` (or unparseable-to-positive)
 /// disables rotation and returns `0`.
 fn rotate_threshold_bytes() -> u64 {
-    let mb = std::env::var("AISH_REASONING_ROTATE_MB")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
+    parse_rotate_mb(std::env::var("AISH_REASONING_ROTATE_MB").ok().as_deref())
+}
+
+/// Pure parse of `AISH_REASONING_ROTATE_MB` → threshold in BYTES. A finite
+/// value `> 0` (fractional allowed) scales to bytes; `<= 0` (or
+/// unparseable-to-finite) disables rotation → `0`. Unset falls back to
+/// [`DEFAULT_ROTATE_MB`]. Never panics. Split out for env-free unit tests
+/// (TASK-253 / FR-305).
+fn parse_rotate_mb(v: Option<&str>) -> u64 {
+    let mb = v
+        .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|m| m.is_finite())
         .unwrap_or(DEFAULT_ROTATE_MB);
     if mb <= 0.0 {
@@ -589,12 +597,14 @@ fn events_path() -> PathBuf {
 
 /// Whether the operator forced a full rescan (`AISH_REASONING_MEMO_FORCE_RESCAN`).
 fn force_rescan() -> bool {
-    matches!(
-        std::env::var("AISH_REASONING_MEMO_FORCE_RESCAN")
-            .ok()
-            .as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
+    parse_force_rescan(std::env::var("AISH_REASONING_MEMO_FORCE_RESCAN").ok().as_deref())
+}
+
+/// Pure parse of `AISH_REASONING_MEMO_FORCE_RESCAN`: truthy (`1`/`true`/`yes`/
+/// `on`) forces a full rescan; anything else (incl. unset/malformed) is
+/// `false`. Never panics. Split out for env-free unit tests (TASK-253 / FR-305).
+fn parse_force_rescan(v: Option<&str>) -> bool {
+    matches!(v, Some("1") | Some("true") | Some("yes") | Some("on"))
 }
 
 /// mtime (ns since epoch) + byte length of the source log, if it exists.
@@ -960,6 +970,41 @@ fn now_iso8601() -> String {
 mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
+
+    // -- pure env-var parse helpers (TASK-253 / FR-305) -------------------
+    // These take an Option<&str> so they need no process-env mutation and can
+    // run concurrently with the env-locked tests below.
+
+    #[test]
+    fn parse_rotate_mb_defaults_and_overrides() {
+        let default_bytes = (DEFAULT_ROTATE_MB * 1_048_576.0) as u64;
+        // Unset → default (5 MB) in bytes.
+        assert_eq!(parse_rotate_mb(None), default_bytes);
+        // Whole + fractional MB scale to bytes.
+        assert_eq!(parse_rotate_mb(Some("1")), 1_048_576);
+        assert_eq!(parse_rotate_mb(Some("2.5")), 2_621_440);
+        assert_eq!(parse_rotate_mb(Some(" 10 ")), 10_485_760);
+        // <= 0 disables rotation → 0.
+        assert_eq!(parse_rotate_mb(Some("0")), 0);
+        assert_eq!(parse_rotate_mb(Some("-1")), 0);
+        // Unparseable / non-finite → default (never panics, never rotates wild).
+        assert_eq!(parse_rotate_mb(Some("nope")), default_bytes);
+        assert_eq!(parse_rotate_mb(Some("inf")), default_bytes);
+        assert_eq!(parse_rotate_mb(Some("nan")), default_bytes);
+    }
+
+    #[test]
+    fn parse_force_rescan_truthy_only() {
+        for t in ["1", "true", "yes", "on"] {
+            assert!(parse_force_rescan(Some(t)), "{t:?} should force a rescan");
+        }
+        // Case-sensitive exact match: mixed/upper case and falsey tokens are off.
+        for f in ["0", "false", "no", "off", "", "TRUE", "Yes", "On "] {
+            assert!(!parse_force_rescan(Some(f)), "{f:?} should not force a rescan");
+        }
+        assert!(!parse_force_rescan(None));
+    }
+
 
     // The log path is process-global (an env var), so tests that touch it must
     // not run concurrently. Serialize them behind this mutex.
