@@ -2,24 +2,31 @@ name: Worker Image
 
 # Builds and publishes the background-worker container image (Dockerfile.worker)
 # to the GitHub Container Registry. A "worker" is `aish` re-exec'd in
-# --coordinator mode inside this image (see src/container.rs); the image simply
-# bakes a prebuilt linux/glibc `aish` binary over a debian:bookworm-slim base.
+# --coordinator mode inside this image (see src/container.rs).
 #
-# This is the CI counterpart of the Makefile's `worker-image-multiarch` target
-# (AC5). It leverages Blacksmith's Docker builder actions, which are drop-in
-# replacements for docker/setup-buildx-action + docker/build-push-action but run
-# on Blacksmith's fast, cache-backed builders (the repo already runs on
-# blacksmith-* runners):
+# ─── Dockerfile.worker is a MULTI-STAGE SELF-BUILD — do NOT reintroduce a host
+#     pre-compile here ──────────────────────────────────────────────────────
+# Dockerfile.worker compiles `aish` INSIDE a `rust:1-bookworm` builder stage and
+# copies the resulting binary into the matching `debian:bookworm-slim` runtime,
+# so the container's glibc ALWAYS matches the binary regardless of the runner's
+# host distro. Do NOT add back a runner-side `cargo build` + `COPY` of
+# `target/release/aish` (an `AISH_BIN` build-arg) — that was the EXACT cause of
+# the glibc-mismatch failure class: a binary built on a modern host (Ubuntu 24.04
+# → glibc 2.39) produced an image that BUILT and INSPECTED fine, then died at
+# container exec with `/lib/x86_64-linux-gnu/libc.so.6: version 'GLIBC_2.39' not
+# found`, surfacing to operators only as opaque failed background jobs.
+#
+# Because the compile happens inside Docker, this workflow needs NO Rust
+# toolchain, NO cargo cache, and NO build-args on the runner — it just hands the
+# source tree (build context) to buildx. `.dockerignore` trims target/, .git, and
+# worktrees so no host-libc binary can leak into the context.
+#
+# This is the CI counterpart of the Makefile's `worker-image-multiarch` target.
+# It runs on Blacksmith's cache-backed Docker builder actions:
 #   - useblacksmith/setup-docker-builder@v1  (buildx builder w/ sticky cache)
-#   - useblacksmith/build-push-action@v2     (build + push, native layer cache)
-#
-# Dockerfile.worker INJECTS the binary from the build context
-# (ARG AISH_BIN=target/release/aish), so we compile aish on the runner first,
-# then hand the context to the builder. The binary must match the image's
-# platform + libc; the Blacksmith runner is linux/amd64 glibc, matching the
-# debian:bookworm-slim base, so we publish linux/amd64. `default = []` in
-# Cargo.toml means a plain `cargo build --release` is already lean (the heavy
-# `local` llama.cpp feature is opt-in and unneeded for a worker).
+#   - useblacksmith/build-push-action@v2     (build + push, native layer cache —
+#     the in-image cargo build is cached across runs, so no host cargo cache is
+#     needed).
 on:
   push:
     tags:
@@ -50,29 +57,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        run: |
-          rustup update --no-self-update stable
-          rustup default stable
-        shell: bash
-
-      - name: Cache cargo + target
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-worker-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      # Compile the glibc/amd64 aish binary Dockerfile.worker copies from the
-      # build context. default = [] keeps this lean (no local llama.cpp build).
-      - name: Build aish release binary
-        run: cargo build --release --locked
-        shell: bash
-
       # Blacksmith's drop-in for docker/setup-buildx-action: provisions a buildx
-      # builder backed by Blacksmith's sticky layer cache.
+      # builder backed by Blacksmith's sticky layer cache (which also caches the
+      # in-image cargo build layers between runs).
       - name: Set up Docker builder (Blacksmith)
         uses: useblacksmith/setup-docker-builder@v1
 
@@ -97,8 +84,11 @@ jobs:
             type=sha
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
-      # Blacksmith's drop-in for docker/build-push-action: identical inputs, with
-      # native layer caching (no cache-from/cache-to plumbing required).
+      # The multi-stage Dockerfile.worker self-builds the binary against the
+      # runtime base's glibc, so we pass only the source context — no build-args,
+      # no prebuilt binary. linux/amd64 matches the debian:bookworm-slim base and
+      # the amd64 hosts workers run on; the self-build makes adding linux/arm64
+      # here trivial (buildx emulates the arch) if that's ever needed.
       - name: Build & push worker image
         uses: useblacksmith/build-push-action@v2
         with:
@@ -108,5 +98,3 @@ jobs:
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            AISH_BIN=target/release/aish
