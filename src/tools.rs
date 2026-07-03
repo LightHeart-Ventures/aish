@@ -1478,11 +1478,34 @@ pub fn install_external_printer(printer: Box<dyn crate::editor::LinePrinter>) {
 pub fn print_above_prompt(text: String) -> bool {
     if let Ok(mut slot) = printer_slot().lock() {
         if let Some(printer) = slot.as_mut() {
-            printer.print(text);
+            printer.print(to_crlf(&text));
             return true;
         }
     }
     false
+}
+
+/// Rewrite bare LF into CRLF for the rustyline `ExternalPrinter`, which writes
+/// the message VERBATIM while the terminal is in RAW mode (the prompt is live).
+/// In raw mode a lone `\n` is a line-feed ONLY — the cursor drops a row but keeps
+/// its column — so a message's own newlines (the hang-indented pane-row
+/// continuation lines, and the trailing newline between back-to-back rows) leave
+/// the cursor drifting rightward, stair-stepping every following line off the
+/// left border (the reported `┃ [label]` gutter-indent bug). Emitting `\r\n`
+/// returns the cursor to column 0 on each line so rustyline's post-write repaint
+/// model matches the physical cursor. Idempotent: an existing `\r\n` is left
+/// untouched (never doubled to `\r\r\n`). Pure — unit-tested.
+fn to_crlf(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut prev = '\0';
+    for ch in text.chars() {
+        if ch == '\n' && prev != '\r' {
+            out.push('\r');
+        }
+        out.push(ch);
+        prev = ch;
+    }
+    out
 }
 
 /// Print one line from a background source (job output, MCP notification)
@@ -4108,6 +4131,26 @@ fn char_ceil(s: &str, mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn to_crlf_rewrites_bare_lf_and_is_idempotent() {
+        // Bare LF → CRLF.
+        assert_eq!(to_crlf("a\nb"), "a\r\nb");
+        // Trailing newline (the pane-row terminator) is rewritten.
+        assert_eq!(to_crlf("row\n"), "row\r\n");
+        // Multiple bare newlines (multi-line markdown result body).
+        assert_eq!(to_crlf("l1\nl2\nl3\n"), "l1\r\nl2\r\nl3\r\n");
+        // Already-CRLF is left untouched (never doubled to \r\r\n).
+        assert_eq!(to_crlf("a\r\nb\r\n"), "a\r\nb\r\n");
+        // Mixed: only the bare LF gains a CR.
+        assert_eq!(to_crlf("a\r\nb\nc"), "a\r\nb\r\nc");
+        // No newline → unchanged.
+        assert_eq!(to_crlf("plain"), "plain");
+        // Empty → empty.
+        assert_eq!(to_crlf(""), "");
+        // A lone CR (no following LF) is preserved as-is.
+        assert_eq!(to_crlf("a\rb"), "a\rb");
+    }
 
     #[test]
     fn finish_bell_toggle_defaults_on_and_opts_out() {
