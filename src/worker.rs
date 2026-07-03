@@ -1312,6 +1312,68 @@ fn parse_u64_or(raw: Option<&str>, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+// ── Nesting-depth guard: coordinator spawn budget (TASK-287) ────────────────
+//
+// A cheap, hard backstop against a runaway nested-coordinator fork-bomb. Each
+// process carries a `AISH_SPAWN_BUDGET` env var = the number of further spawn
+// levels it is still allowed to fork. A root interactive session has no var set
+// and so defaults to `DEFAULT_SPAWN_BUDGET`. Every time we fork a child
+// coordinator (`worker_command` / container `env_inline`) we stamp the child's
+// env with our own budget MINUS ONE (`child_spawn_budget`). Before any fork the
+// dispatch sites call `spawn_budget_gate`, which refuses once the budget is
+// exhausted (`< 1`). This does NOT implement full nested support — it is only
+// the guard so nesting, whenever it is enabled, can't recurse without bound.
+
+/// Env var carrying the remaining spawn budget from a parent coordinator to its
+/// child. Unset ⇒ root session ⇒ `DEFAULT_SPAWN_BUDGET`.
+pub const SPAWN_BUDGET_ENV: &str = "AISH_SPAWN_BUDGET";
+
+/// Default budget for a root session (env var unset). `3` ⇒ a root may spawn
+/// three levels deep (L1, L2, L3) and the fourth spawn is refused — matching the
+/// TASK-287 acceptance criteria ("3 levels spawn OK, 4th is rejected").
+pub const DEFAULT_SPAWN_BUDGET: u32 = 3;
+
+/// Parse a raw `AISH_SPAWN_BUDGET` value. `None`/empty/unparseable ⇒ the root
+/// default; otherwise the parsed value (including a legitimate `0`, which the
+/// gate reads as "exhausted — refuse further spawns"). Pure → unit-tested
+/// without mutating process-wide env.
+fn parse_spawn_budget(raw: Option<&str>) -> u32 {
+    raw.and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_SPAWN_BUDGET)
+}
+
+/// This process's remaining spawn budget (from the inherited env, else default).
+pub fn spawn_budget() -> u32 {
+    parse_spawn_budget(std::env::var(SPAWN_BUDGET_ENV).ok().as_deref())
+}
+
+/// The budget to stamp on a child we are about to fork: our own minus one,
+/// saturating at zero. Pure → unit-tested.
+pub fn child_spawn_budget(current: u32) -> u32 {
+    current.saturating_sub(1)
+}
+
+/// Whether a process holding `current` budget may still fork a child. Pure.
+pub fn spawn_budget_ok(current: u32) -> bool {
+    current >= 1
+}
+
+/// Dispatch gate: `Ok(())` when this process may still fork a coordinator, else
+/// an `Err` carrying an operator-facing message. Called by every spawn site
+/// (`run_in_background`, `:dispatch`, scheduled/alert workers) BEFORE forking.
+pub fn spawn_budget_gate() -> Result<(), String> {
+    let budget = spawn_budget();
+    if spawn_budget_ok(budget) {
+        Ok(())
+    } else {
+        Err(format!(
+            "coordinator spawn budget exhausted ({SPAWN_BUDGET_ENV}={budget}) — refusing to spawn a \
+nested coordinator to prevent a runaway fork-bomb. This is the depth guard (TASK-287); raise the \
+budget only if you understand the recursion risk."
+        ))
+    }
+}
+
 /// Build the `tokio::process::Command` that re-execs aish in `--coordinator`
 /// mode for a single task. Centralises the args, env, pipes, AND the resource
 /// limits applied to the child, so `run_worker` and `run_once` stay in sync.
@@ -1354,6 +1416,12 @@ fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str, cwd: &std::path::
         // Nested-coordinator guard: an in-container/in-worker aish must never
         // spawn its own workers (no infinite recursion). The child reads this.
         .env("AISH_COORDINATOR", "1")
+        // Nesting-depth guard (TASK-287): hand the child our own spawn budget
+        // MINUS ONE, so a nested chain can fork at most `AISH_SPAWN_BUDGET`
+        // levels deep before `spawn_budget_gate` refuses. Single source of truth
+        // for the host vehicle; the container vehicle stamps the identical value
+        // via `env_inline` (see run_worker's container branch).
+        .env(SPAWN_BUDGET_ENV, child_spawn_budget(spawn_budget()).to_string())
         // Tie the work to the LAUNCHING session: the child adopts this id so its
         // durable records attribute to the session that asked for the work.
         .env("AISH_LAUNCH_SESSION_ID", &spec.launch_session_id)
@@ -2756,6 +2824,12 @@ fn build_container_command(
     // Non-secret control env passed inline.
     let mut env_inline = vec![
         ("AISH_COORDINATOR".to_string(), "1".to_string()),
+        // Nesting-depth guard (TASK-287): identical decrement to the host path
+        // in `worker_command` — stamp the container child's budget = ours − 1.
+        (
+            SPAWN_BUDGET_ENV.to_string(),
+            child_spawn_budget(spawn_budget()).to_string(),
+        ),
         (
             "AISH_LAUNCH_SESSION_ID".to_string(),
             spec.launch_session_id.clone(),
@@ -3382,6 +3456,59 @@ mod tests {
         }
         // All done → fully restored, no leak.
         assert_eq!(THINKING_ACTIVE.load(Ordering::Relaxed), base);
+    }
+
+    #[test]
+    fn spawn_budget_defaults_when_unset() {
+        // Root session (env var absent/empty/garbage) ⇒ the root default.
+        assert_eq!(parse_spawn_budget(None), DEFAULT_SPAWN_BUDGET);
+        assert_eq!(parse_spawn_budget(Some("")), DEFAULT_SPAWN_BUDGET);
+        assert_eq!(parse_spawn_budget(Some("  ")), DEFAULT_SPAWN_BUDGET);
+        assert_eq!(parse_spawn_budget(Some("nope")), DEFAULT_SPAWN_BUDGET);
+        // A legitimate value parses, including a literal 0 (exhausted).
+        assert_eq!(parse_spawn_budget(Some("5")), 5);
+        assert_eq!(parse_spawn_budget(Some(" 2 ")), 2);
+        assert_eq!(parse_spawn_budget(Some("0")), 0);
+    }
+
+    #[test]
+    fn spawn_budget_three_levels_ok_fourth_rejected() {
+        // AC (TASK-287): starting from a root default budget, three successive
+        // coordinator spawns are permitted and the fourth is refused. We model
+        // the real chain: at each level the gate checks THIS level's budget, then
+        // stamps the child with `child_spawn_budget` (= budget − 1).
+        let root = parse_spawn_budget(None); // 3
+        assert_eq!(root, 3);
+
+        // Level 1 spawn: root(3) may fork; child gets 2.
+        assert!(spawn_budget_ok(root), "L1 spawn must be allowed");
+        let l1 = child_spawn_budget(root);
+        assert_eq!(l1, 2);
+
+        // Level 2 spawn: l1(2) may fork; child gets 1.
+        assert!(spawn_budget_ok(l1), "L2 spawn must be allowed");
+        let l2 = child_spawn_budget(l1);
+        assert_eq!(l2, 1);
+
+        // Level 3 spawn: l2(1) may fork; child gets 0.
+        assert!(spawn_budget_ok(l2), "L3 spawn must be allowed");
+        let l3 = child_spawn_budget(l2);
+        assert_eq!(l3, 0);
+
+        // Level 4 spawn: l3(0) is exhausted — refused.
+        assert!(!spawn_budget_ok(l3), "L4 spawn must be rejected");
+
+        // saturating: a would-be level-5 budget never underflows below 0.
+        assert_eq!(child_spawn_budget(l3), 0);
+    }
+
+    #[test]
+    fn spawn_budget_gate_predicate_and_var_name() {
+        assert!(spawn_budget_ok(1));
+        assert!(!spawn_budget_ok(0));
+        // The rejection message (in `spawn_budget_gate`) names this var so an
+        // operator can act on it — pin the documented name.
+        assert_eq!(SPAWN_BUDGET_ENV, "AISH_SPAWN_BUDGET");
     }
 
     #[test]

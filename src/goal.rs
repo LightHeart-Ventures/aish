@@ -214,6 +214,43 @@ pub fn spawn(
     goal
 }
 
+/// Shared opening line of every goal-turn generator directive. Kept as a const
+/// so the builder ([`goal_directive`]) and its inverse
+/// ([`goal_condition_from_directive`]) can never drift apart — the inverse backs
+/// the `:workers` goal-turn coalescing (TASK-302).
+const GOAL_DIRECTIVE_PREFIX: &str =
+    "Work toward this goal, then report what you did and the evidence:\n";
+/// Marker separating the goal condition from the verifier's last-check guidance
+/// in a re-tried turn's directive.
+const GOAL_DIRECTIVE_GUIDANCE_MARKER: &str = "\n\nThe goal is NOT yet met — last check said: ";
+
+/// Build the per-turn generator directive. `guidance` is the verifier's feedback
+/// from the previous turn (`None` on the first turn). Single source of truth for
+/// the directive shape so [`goal_condition_from_directive`] can reverse it.
+pub(crate) fn goal_directive(condition: &str, guidance: Option<&str>) -> String {
+    match guidance {
+        Some(g) => {
+            format!("{GOAL_DIRECTIVE_PREFIX}{condition}{GOAL_DIRECTIVE_GUIDANCE_MARKER}{g}")
+        }
+        None => format!("{GOAL_DIRECTIVE_PREFIX}{condition}"),
+    }
+}
+
+/// Inverse of [`goal_directive`]: recover the goal condition from a persisted
+/// goal-turn `task` string. Returns `None` when `task` isn't a goal directive,
+/// so non-goal coordinator rows pass through un-grouped. Used by `:workers` to
+/// collapse a goal loop's per-turn `goal-<uuid>` coordinator rows under ONE goal
+/// — a multi-turn goal then renders a single row instead of one-per-turn
+/// (TASK-302).
+pub(crate) fn goal_condition_from_directive(task: &str) -> Option<String> {
+    let rest = task.strip_prefix(GOAL_DIRECTIVE_PREFIX)?;
+    let condition = match rest.split_once(GOAL_DIRECTIVE_GUIDANCE_MARKER) {
+        Some((cond, _guidance)) => cond,
+        None => rest,
+    };
+    Some(condition.to_string())
+}
+
 async fn run_goal(
     goal: Handle,
     spec: crate::worker::WorkerSpec,
@@ -243,17 +280,7 @@ async fn run_goal(
         };
 
         // Generator: a full-tool worker pursues the goal with the latest guidance.
-        let directive = match &guidance {
-            Some(g) => format!(
-                "Work toward this goal, then report what you did and the evidence:\n{}\n\n\
-                 The goal is NOT yet met — last check said: {}",
-                goal.condition, g
-            ),
-            None => format!(
-                "Work toward this goal, then report what you did and the evidence:\n{}",
-                goal.condition
-            ),
-        };
+        let directive = goal_directive(&goal.condition, guidance.as_deref());
         announce(&format!("turn {turn}: working…"));
         {
             let mut i = goal.inner.lock().unwrap();
@@ -1283,5 +1310,37 @@ mod domain_tests {
 
         // No linked tasks → nothing to nest.
         assert!(render_goal_hierarchy(&Goal::new("empty"), &[]).is_none());
+    }
+
+    // TASK-302: the goal loop mints a fresh `goal-<uuid>` coordinator each turn,
+    // so the ONLY stable key tying a goal's turns together is the condition
+    // embedded in the directive. `goal_condition_from_directive` must recover it
+    // for both directive shapes (first turn + re-tried turn) so `:workers` can
+    // collapse the turns into one row.
+    #[test]
+    fn goal_directive_round_trips_condition() {
+        let cond = "make the tests green\nacross the board";
+        // First turn (no guidance).
+        let first = goal_directive(cond, None);
+        assert_eq!(
+            goal_condition_from_directive(&first).as_deref(),
+            Some(cond),
+            "first-turn directive should round-trip the condition"
+        );
+        // Re-tried turn (verifier guidance appended) recovers the SAME condition,
+        // so both turns hash to one goal group regardless of changing guidance.
+        let retry = goal_directive(cond, Some("still 3 tests failing"));
+        assert_eq!(
+            goal_condition_from_directive(&retry).as_deref(),
+            Some(cond),
+            "re-tried directive should recover the identical condition"
+        );
+        assert_eq!(
+            goal_condition_from_directive(&first),
+            goal_condition_from_directive(&retry),
+            "every turn of one goal shares a grouping key"
+        );
+        // A plain (non-goal) coordinator task is not a directive → no key.
+        assert!(goal_condition_from_directive("fix the flaky CI run").is_none());
     }
 }
