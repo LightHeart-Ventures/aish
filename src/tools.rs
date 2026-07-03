@@ -1139,7 +1139,7 @@ fn unwrap_noexec_builtin(program: &str, args: &[String]) -> Option<(String, Vec<
 }
 
 
-/// Extract (program, args) from a tool call, enforcing the "no shell" invariant.
+/// Extract (program, args) from a tool call.
 fn parse_argv(call: &ToolCall) -> Result<(String, Vec<String>)> {
     let program = call.args["program"]
         .as_str()
@@ -1159,129 +1159,13 @@ fn parse_argv(call: &ToolCall) -> Result<(String, Vec<String>)> {
 
     // Unwrap a no-exec POSIX builtin (`command`/`builtin`/`type`) the model
     // reached for — there's no such binary to fork/exec, so rewrite to the real
-    // target (or `which` for the `-v`/`type` existence probe). Done BEFORE the
-    // no-shell check so `command bash -c …` still unwraps to `bash` and is then
-    // refused as a shell.
+    // target (or `which` for the `-v`/`type` existence probe).
     let (program, args) = match unwrap_noexec_builtin(&program, &args) {
         Some(rewritten) => rewritten,
         None => (program, args),
     };
 
-    // The "no shell" invariant: refuse to be a backdoor into one.
-    let bin = Path::new(&program)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(&program);
-    if matches!(bin, "sh" | "bash" | "zsh" | "dash" | "fish" | "ksh") {
-        anyhow::bail!("{}", shell_refusal(bin, &args));
-    }
-    // …and refuse a shell smuggled through an exec wrapper (`env bash -c …`,
-    // `sudo bash -c …`, `timeout 5 bash -c …`): the wrapper is a real binary, so
-    // the direct check above waves it through while it still forks a shell.
-    if let Some((shell, shell_args)) = wrapped_shell(&program, &args) {
-        anyhow::bail!("{}", shell_refusal_via_wrapper(bin, &shell, &shell_args));
-    }
     Ok((program, args))
-}
-
-/// Build the "no shell" refusal message. aish refuses to fork a shell, but it
-/// CAN run an aish-compatible script file itself (`aish <file>` is a real
-/// line-by-line interpreter — see `script.rs`). So when the call is the
-/// `bash <file>` form — exactly one non-flag argument, no inline `-c` — point
-/// the model straight at the working path: re-run the script *through aish*.
-/// For the inline `-c "…"` form (or anything else) there's no file to hand off,
-/// so the model is told to call the underlying program directly, with the
-/// aish-script escape hatch mentioned as a parenthetical. The caveat about
-/// bash-specific grammar is spelled out so the model doesn't blindly reroute a
-/// genuine bash script (which aish would mis-execute).
-fn shell_refusal(shell: &str, args: &[String]) -> String {
-    let inline = args.iter().any(|a| a == "-c");
-    let non_flags: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
-    if !inline {
-        if let [file] = non_flags.as_slice() {
-            return format!(
-                "aish does not invoke shells like `{shell}`. To run the script `{file}`, run it \
-through aish itself: run_program program=\"aish\" args=[\"{file}\"] — aish has its own \
-line-by-line script interpreter. Caveat: aish runs each line as a single command/pipeline, NOT a \
-bash grammar — if `{file}` uses bash-specific syntax (&&, ||, $(…), for/while/if, redirections, \
-heredocs) it will be mis-executed, so port those lines or run the underlying programs directly \
-instead."
-            );
-        }
-    }
-    format!(
-        "aish does not invoke shells like `{shell}` — call the underlying program directly. (To \
-run an aish-compatible script file, use run_program program=\"aish\" args=[\"<file>\"]; aish's \
-script mode is line-by-line, not a bash grammar.)"
-    )
-}
-
-/// Exec wrappers a model can use to smuggle a shell past the no-shell invariant:
-/// `env bash -c …`, `sudo bash -c …`, `timeout 5 bash -c …`, `nohup bash -c …`,
-/// etc. Each forks/execs a command named in its arguments, so a shell there
-/// escapes the direct-`program` check in `parse_argv`. Closing this hole keeps
-/// the "aish is not a shell backdoor" invariant honest against the common
-/// wrapping forms an agent reaches for.
-const EXEC_WRAPPERS: &[&str] = &[
-    "env", "sudo", "doas", "nohup", "setsid", "nice", "ionice", "stdbuf", "timeout", "xargs",
-    "time",
-];
-
-/// Detect a shell smuggled through a known exec-wrapper prefix. Returns the
-/// wrapped shell's basename plus the args that follow it (so the caller can
-/// build the same `bash -c` guidance) when `program` is an exec wrapper whose
-/// effective command is a shell. Conservative: it walks past the wrapper's own
-/// option flags, `NAME=VALUE` env assignments, and numeric/duration tokens
-/// (`timeout 5`, `nice 10`), then inspects the first "plain word" — the command
-/// the wrapper would exec — and matches its basename against the shell set. It
-/// deliberately does NOT chase option-arguments (`sudo -u root bash`), trading a
-/// rare miss for zero false positives on ordinary wrapped commands. Pure +
-/// unit-tested.
-fn wrapped_shell(program: &str, args: &[String]) -> Option<(String, Vec<String>)> {
-    if !EXEC_WRAPPERS.contains(&bin_name(program)) {
-        return None;
-    }
-    for (i, a) in args.iter().enumerate() {
-        // wrapper option flag (-n, -u, -i, -I{}, --foreground, …) — skip.
-        if a.starts_with('-') {
-            continue;
-        }
-        // `env FOO=bar` style assignment (no path separator) — skip.
-        if a.contains('=') && !a.contains('/') {
-            continue;
-        }
-        // `timeout 5` / `timeout 1.5m` / `nice 10` duration or niceness — skip.
-        if is_duration_token(a) {
-            continue;
-        }
-        // First real command token: is the wrapper about to exec a shell?
-        let cmd = bin_name(a);
-        if matches!(cmd, "sh" | "bash" | "zsh" | "dash" | "fish" | "ksh") {
-            return Some((cmd.to_string(), args[i + 1..].to_vec()));
-        }
-        return None; // wrapped command is not a shell — let it run.
-    }
-    None
-}
-
-/// A `timeout`/`nice`-style numeric argument: digits with an optional decimal
-/// and an optional trailing unit suffix (`s`, `m`, `h`, `d`). Used only to skip
-/// past the duration token so the following command word is examined.
-fn is_duration_token(a: &str) -> bool {
-    let core = a.strip_suffix(['s', 'm', 'h', 'd']).unwrap_or(a);
-    !core.is_empty() && core.chars().all(|c| c.is_ascii_digit() || c == '.')
-}
-
-/// Refusal for a shell reached through an exec wrapper (`env bash -c …`). Names
-/// the wrapper so the model understands why the call was blocked, then reuses
-/// the standard shell guidance (call the underlying program directly, or run an
-/// aish script through aish).
-fn shell_refusal_via_wrapper(wrapper: &str, shell: &str, shell_args: &[String]) -> String {
-    format!(
-        "aish does not invoke shells — `{wrapper}` here would exec `{shell}`, bypassing the \
-no-shell invariant. {}",
-        shell_refusal(shell, shell_args)
-    )
 }
 
 async fn run_program(
@@ -4783,81 +4667,6 @@ mod tests {
         assert_eq!(session.last_status, 1);
         let _ = execute(&call("true", &[], None), &mut session, &mut confirm).await;
         assert_eq!(session.last_status, 0);
-    }
-
-    #[test]
-    fn shell_refusal_points_at_aish_for_single_file() {
-        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        // `bash /tmp/x.sh` → reroute hint naming the file and the aish escape hatch.
-        let m = shell_refusal("bash", &v(&["/tmp/cost_writers.sh"]));
-        assert!(m.contains("program=\"aish\""), "{m}");
-        assert!(m.contains("/tmp/cost_writers.sh"), "{m}");
-        assert!(m.contains("line-by-line"), "{m}");
-        // `bash script.sh arg` (two non-flags) is NOT the single-file form → generic msg.
-        let multi = shell_refusal("bash", &v(&["script.sh", "arg"]));
-        assert!(!multi.contains("To run the script"), "{multi}");
-        assert!(multi.contains("call the underlying program directly"), "{multi}");
-        // `bash -c "…"` (inline) → generic msg, never the file-reroute branch.
-        let inline = shell_refusal("bash", &v(&["-c", "echo hi"]));
-        assert!(!inline.contains("To run the script"), "{inline}");
-        assert!(inline.contains("call the underlying program directly"), "{inline}");
-    }
-
-    #[test]
-    fn wrapped_shell_detects_smuggled_shells() {
-        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let w = |p: &str, a: &[&str]| wrapped_shell(p, &v(a));
-
-        // The reported form: a shell forked through `env`.
-        assert_eq!(
-            w("env", &["bash", "-c", "cat ~/.secret"]),
-            Some(("bash".into(), v(&["-c", "cat ~/.secret"])))
-        );
-        // `env FOO=bar bash -c …` — assignments are skipped before the command.
-        assert_eq!(
-            w("env", &["FOO=bar", "bash", "-c", "id"]),
-            Some(("bash".into(), v(&["-c", "id"])))
-        );
-        // `sudo bash -c …` and `nohup sh -c …`.
-        assert_eq!(w("sudo", &["bash", "-c", "id"]), Some(("bash".into(), v(&["-c", "id"]))));
-        assert_eq!(w("nohup", &["sh", "-c", "id"]), Some(("sh".into(), v(&["-c", "id"]))));
-        // `timeout 5 bash -c …` — the duration token is skipped.
-        assert_eq!(
-            w("timeout", &["5", "zsh", "-c", "id"]),
-            Some(("zsh".into(), v(&["-c", "id"])))
-        );
-        assert_eq!(w("timeout", &["1.5m", "bash"]), Some(("bash".into(), v(&[]))));
-        // `nice -n 10 bash` — flag then niceness then the shell.
-        assert_eq!(w("nice", &["-n", "10", "bash"]), Some(("bash".into(), v(&[]))));
-        // Full-path wrappers and shells resolve by basename.
-        assert_eq!(
-            w("/usr/bin/env", &["/bin/bash", "-c", "id"]),
-            Some(("bash".into(), v(&["-c", "id"])))
-        );
-
-        // Not a wrapper → untouched (a real `bash`-named arg to a normal binary).
-        assert_eq!(w("grep", &["bash", "file"]), None);
-        // Wrapper running a NON-shell → allowed to run.
-        assert_eq!(w("env", &["python3", "app.py"]), None);
-        assert_eq!(w("timeout", &["5", "curl", "https://x"]), None);
-        // Conservative miss (documented): option-arg before the shell isn't chased.
-        assert_eq!(w("sudo", &["-u", "root", "bash"]), None);
-    }
-
-    #[test]
-    fn parse_argv_refuses_wrapped_shell() {
-        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        // End-to-end: `env bash -c …` is refused with wrapper-aware guidance.
-        let err = parse_argv(&call("env", &["bash", "-c", "cat ~/.secret"], None))
-            .expect_err("env bash -c should be refused");
-        let msg = err.to_string();
-        assert!(msg.contains("bypassing the no-shell invariant"), "{msg}");
-        assert!(msg.contains("`env`"), "{msg}");
-        // A wrapper around a real program still parses fine.
-        let (prog, args) = parse_argv(&call("timeout", &["5", "curl", "https://x"], None))
-            .expect("timeout curl should parse");
-        assert_eq!(prog, "timeout");
-        assert_eq!(args, v(&["5", "curl", "https://x"]));
     }
 
     #[test]
