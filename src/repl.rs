@@ -3262,6 +3262,50 @@ impl Dispatched {
     }
 }
 
+/// TASK-290: default duplicate-dispatch suppression window, in seconds.
+const DISPATCH_DEDUP_SECS: u64 = 5;
+
+/// The dedup window for [`dispatch_coordinator`]. Defaults to
+/// [`DISPATCH_DEDUP_SECS`]; override with `AISH_DISPATCH_DEDUP_SECS=<secs>`
+/// (a `0` disables suppression entirely, e.g. for tests or power users who
+/// genuinely want back-to-back identical dispatches).
+fn dispatch_dedup_window() -> Duration {
+    std::env::var("AISH_DISPATCH_DEDUP_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DISPATCH_DEDUP_SECS))
+}
+
+/// Stable content hash of a task string used to key recent dispatches. Trims
+/// first so trailing/leading whitespace doesn't defeat dedup.
+fn task_hash(task: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    task.trim().hash(&mut h);
+    h.finish()
+}
+
+/// TASK-290: pure duplicate-dispatch check. Returns `Some(run_id)` when `task`
+/// was already dispatched within `window` of `now` (a still-fresh entry in
+/// `recent`), so the caller can reject the second launch pointing at the first.
+/// Returns `None` when there's no matching entry or the prior dispatch has aged
+/// out of the window. Kept side-effect-free (no pruning, no clock reads) so it's
+/// unit-testable with synthetic `Instant`s.
+fn duplicate_dispatch<'a>(
+    recent: &'a std::collections::HashMap<u64, (String, Instant)>,
+    task: &str,
+    now: Instant,
+    window: Duration,
+) -> Option<&'a str> {
+    if window.is_zero() {
+        return None;
+    }
+    recent.get(&task_hash(task)).and_then(|(id, when)| {
+        (now.duration_since(*when) < window).then_some(id.as_str())
+    })
+}
+
 fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
     let task = task.trim();
     if task.is_empty() {
@@ -3282,6 +3326,26 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
         return Dispatched::message_only(
             "no credential for the active backend — Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY",
         );
+    }
+    // Nesting-depth guard (TASK-287): refuse `:dispatch` once the spawn budget
+    // is exhausted, with a clear operator-facing error.
+    if let Err(msg) = crate::worker::spawn_budget_gate() {
+        return Dispatched::message_only(msg);
+    }
+    // TASK-290: suppress an accidental duplicate — the same task dispatched
+    // again within the dedup window (default 5s). Prevents double-spends of
+    // background work that may have external side effects (API calls, cost,
+    // writes). Point the operator at the still-running first launch instead of
+    // spawning a second identical coordinator.
+    let now = Instant::now();
+    let window = dispatch_dedup_window();
+    // Prune aged-out entries so the map stays tiny and a re-dispatch after the
+    // window naturally succeeds.
+    session
+        .recent_dispatches
+        .retain(|_, (_, when)| now.duration_since(*when) < window);
+    if let Some(run_id) = duplicate_dispatch(&session.recent_dispatches, task, now, window) {
+        return Dispatched::message_only(format!("task already running (run_id: {run_id})"));
     }
     match std::env::current_exe() {
         Ok(exe) => {
@@ -3313,6 +3377,11 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
                 coordinator_store: session.coordinator_store.clone(),
             };
             let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
+            // TASK-290: record this launch so an identical dispatch inside the
+            // dedup window is rejected pointing back at `id`.
+            session
+                .recent_dispatches
+                .insert(task_hash(task), (id.clone(), now));
             let message = format!(
                 "\x1b[2mdispatched background coordinator \x1b[0m\x1b[1;36m{id}\x1b[0m\x1b[2m \
 — runs here with the full toolset; result auto-delivers. \x1b[0m\x1b[36m:workers\x1b[0m\x1b[2m to check.\x1b[0m"
@@ -5036,6 +5105,74 @@ fn goal_command(session: &mut Session, sub: &str, args: &str) -> String {
 }
 
 
+/// A durable coordinator row's phase is "live" (it can still fold in a queued
+/// `:tell`) only while non-terminal. Unknown / legacy / MISSING phase strings
+/// parse to `Phase::Failed` (see `coordinator::Phase::parse`) and are therefore
+/// treated as terminal — a row we cannot interpret must never silently swallow a
+/// message. (TASK-286 AC1/AC2: check phase; reject done/failed/missing.) Pure →
+/// unit-tested.
+fn phase_is_live(phase: &str) -> bool {
+    !crate::coordinator::Phase::parse(phase).is_terminal()
+}
+
+/// The decision `tell_coordinator` reaches after matching `<id>` against the live
+/// worker table + durable coordinator store and applying the ownership gate.
+/// Pure over its inputs (`resolve_tell_target`) so the routing is unit-tested;
+/// `tell_coordinator` does the IO (collect candidates, print, enqueue).
+#[derive(Debug, PartialEq, Eq)]
+enum TellTarget {
+    /// No coordinator — live or durable — matched the id.
+    NotFound,
+    /// Match(es) existed but every one is owned by another session and `--any`
+    /// was not supplied.
+    ForeignOnly,
+    /// The single owned match has already reached a terminal phase
+    /// (done / failed / unknown-or-missing) — nothing would read the message.
+    Terminal(String),
+    /// Exactly one live, owned coordinator — ready to receive the message.
+    Ready(String),
+    /// The id was a prefix that matched several owned coordinators.
+    Ambiguous(Vec<String>),
+}
+
+/// Resolve a `:tell <id>` against the collected `candidates`
+/// (`(run_id, terminal, owner_session)` — the caller derives `terminal` from the
+/// live worker status or, for a durable row, from [`phase_is_live`]) and the
+/// `--any` ownership gate. Pure → unit-tested (TASK-286 AC3 non-existent id, plus
+/// the terminal / foreign / ambiguous branches).
+fn resolve_tell_target(
+    candidates: &[(String, bool, Option<String>)],
+    my_session: &str,
+    any: bool,
+) -> TellTarget {
+    let owned: Vec<&(String, bool, Option<String>)> = candidates
+        .iter()
+        .filter(|(_, _, owner)| {
+            matches!(
+                owner_gate(owner.as_deref(), my_session, any),
+                OwnerGate::Allow
+            )
+        })
+        .collect();
+    if owned.is_empty() {
+        return if candidates.is_empty() {
+            TellTarget::NotFound
+        } else {
+            TellTarget::ForeignOnly
+        };
+    }
+    match owned.as_slice() {
+        [(run_id, terminal, _)] => {
+            if *terminal {
+                TellTarget::Terminal(run_id.clone())
+            } else {
+                TellTarget::Ready(run_id.clone())
+            }
+        }
+        many => TellTarget::Ambiguous(many.iter().map(|(rid, _, _)| rid.clone()).collect()),
+    }
+}
+
 /// `:tell` / SendMessage channel. The message lands in the durable
 /// `coordinator_messages` mailbox keyed by the run's id and is folded into the
 /// coordinator's NEXT round (see `coordinator::drive`), so it's how you steer a
@@ -5082,50 +5219,40 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
             if hit(&r.run_id) && !candidates.iter().any(|(rid, _, _)| rid == &r.run_id) {
                 candidates.push((
                     r.run_id.clone(),
-                    matches!(r.phase.as_str(), "done" | "failed"),
+                    // TASK-286: a durable row whose phase is done/failed OR
+                    // unknown/missing is dead — never queue into it.
+                    !phase_is_live(&r.phase),
                     r.session_id.clone(),
                 ));
             }
         }
     }
 
-    // AC7 ownership gate: by default you may only steer coordinators your OWN
-    // session launched; `--any` opts into another session's coordinator. A
-    // foreign-only match without `--any` is refused with guidance rather than
-    // silently treated as "not found", so the run isn't invisibly reachable.
-    let owned: Vec<(String, bool, Option<String>)> = candidates
-        .iter()
-        .filter(|(_, _, owner)| {
-            matches!(
-                owner_gate(owner.as_deref(), &session.session_id, any),
-                OwnerGate::Allow
-            )
-        })
-        .cloned()
-        .collect();
-    if owned.is_empty() {
-        if candidates.is_empty() {
+    // AC7 ownership gate + liveness routing, resolved by the pure
+    // `resolve_tell_target` (unit-tested). By default you may only steer
+    // coordinators your OWN session launched; `--any` opts into another
+    // session's. A terminal or unknown-phase run is refused — nothing would read
+    // the message — so a `:tell` never becomes a silent no-op (TASK-286).
+    match resolve_tell_target(&candidates, &session.session_id, any) {
+        TellTarget::NotFound => {
             println!("no background coordinator matching '{id}' (see :workers)");
-        } else {
+        }
+        TellTarget::ForeignOnly => {
             println!(
                 "'{id}' matches a coordinator launched by another session — re-run as `:tell --any {id} <message>` to steer it"
             );
         }
-        return;
-    }
-
-    match owned.as_slice() {
-        [(run_id, terminal, _)] => {
-            let short = crate::batch::short_id(run_id);
-            if *terminal {
-                println!(
-                    "coordinator {short} has already finished — message not queued (`:result {short}` to view its result)"
-                );
-                return;
-            }
-            match store.enqueue_message(run_id, message, Some(&session.session_id)) {
+        TellTarget::Terminal(run_id) => {
+            let short = crate::batch::short_id(&run_id);
+            println!(
+                "coordinator {short} is finished; unable to send message (`:result {short}` to view its result)"
+            );
+        }
+        TellTarget::Ready(run_id) => {
+            let short = crate::batch::short_id(&run_id);
+            match store.enqueue_message(&run_id, message, Some(&session.session_id)) {
                 Ok(_) => {
-                    let pending = store.pending_message_count(run_id).unwrap_or(0);
+                    let pending = store.pending_message_count(&run_id).unwrap_or(0);
                     println!(
                         "\x1b[2m✉ queued for {short} ({pending} pending) — folded in at the start of its next round\x1b[0m"
                     );
@@ -5133,12 +5260,12 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
                 Err(e) => println!("couldn't queue message: {e}"),
             }
         }
-        many => {
+        TellTarget::Ambiguous(ids) => {
             println!(
                 "'{id}' matches {} coordinators — be more specific:",
-                many.len()
+                ids.len()
             );
-            for (rid, _, _) in many {
+            for rid in ids {
                 println!("  {rid}");
             }
         }
@@ -5171,6 +5298,11 @@ fn spawn_alert_coordinator(session: &mut Session, id: i64, description: &str) ->
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
+    // Nesting-depth guard (TASK-287): an alert monitor is a background
+    // coordinator too — don't arm one once the spawn budget is exhausted.
+    if crate::worker::spawn_budget_gate().is_err() {
+        return false;
+    }
     let task = format!(
         "You are resolving an operator ALERT (the aish `:alert` feature). Watch for this \
 condition and, the INSTANT it is satisfied, call the `set_alert` tool with alert_id={id} and a \
@@ -6154,7 +6286,21 @@ async fn handle_colon(
                         let b_ts = b.created_at.as_deref().and_then(crate::style::parse_sqlite_utc).unwrap_or(0);
                         b_ts.cmp(&a_ts)
                     });
+                    // TASK-302: the goal loop mints a fresh `goal-<uuid>` run per
+                    // turn, so every turn lands its own durable row — `:workers`
+                    // otherwise renders one row per turn (each a different phase),
+                    // which reads as "the goal coordinator appears twice". Rows are
+                    // sorted newest-first above, so keeping only the FIRST row per
+                    // recovered goal condition collapses a multi-turn goal to a
+                    // single row showing its latest phase. Non-goal rows return
+                    // `None` and pass through untouched.
+                    let mut seen_goal_conditions = std::collections::HashSet::new();
                     for r in durable {
+                        if let Some(cond) = crate::goal::goal_condition_from_directive(&r.task) {
+                            if !seen_goal_conditions.insert(cond) {
+                                continue;
+                            }
+                        }
                         any = true;
                         let is_me = r.session_id.as_deref() == Some(session.session_id.as_str());
                         let label = r
@@ -7367,6 +7513,107 @@ fn dirs_history_path() -> std::path::PathBuf {
 mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
+    use std::collections::HashMap;
+
+    // TASK-290: a second dispatch of the SAME task within the dedup window is
+    // detected as a duplicate and points at the first run's id.
+    #[test]
+    fn duplicate_dispatch_within_window_is_rejected() {
+        let now = Instant::now();
+        let window = Duration::from_secs(5);
+        let mut recent: HashMap<u64, (String, Instant)> = HashMap::new();
+        recent.insert(task_hash("build the thing"), ("w_abc123".into(), now));
+
+        // Same task, 2s later — still inside the 5s window → duplicate.
+        let two_s_later = now + Duration::from_secs(2);
+        assert_eq!(
+            duplicate_dispatch(&recent, "build the thing", two_s_later, window),
+            Some("w_abc123"),
+            "identical task inside the window must be flagged as a duplicate"
+        );
+        // Whitespace differences don't defeat dedup (task_hash trims).
+        assert_eq!(
+            duplicate_dispatch(&recent, "  build the thing  ", two_s_later, window),
+            Some("w_abc123"),
+            "leading/trailing whitespace must not bypass dedup"
+        );
+    }
+
+    // A dispatch AFTER the window elapses is allowed through (no stale match).
+    #[test]
+    fn duplicate_dispatch_after_window_is_allowed() {
+        let now = Instant::now();
+        let window = Duration::from_secs(5);
+        let mut recent: HashMap<u64, (String, Instant)> = HashMap::new();
+        recent.insert(task_hash("build the thing"), ("w_abc123".into(), now));
+
+        let six_s_later = now + Duration::from_secs(6);
+        assert_eq!(
+            duplicate_dispatch(&recent, "build the thing", six_s_later, window),
+            None,
+            "a dispatch past the window must NOT be treated as a duplicate"
+        );
+    }
+
+    // A DIFFERENT task within the window is not a duplicate.
+    #[test]
+    fn different_task_within_window_is_not_a_duplicate() {
+        let now = Instant::now();
+        let window = Duration::from_secs(5);
+        let mut recent: HashMap<u64, (String, Instant)> = HashMap::new();
+        recent.insert(task_hash("build the thing"), ("w_abc123".into(), now));
+
+        assert_eq!(
+            duplicate_dispatch(&recent, "ship the other thing", now, window),
+            None,
+            "a distinct task must dispatch even inside the window"
+        );
+    }
+
+    // A zero window disables suppression entirely (escape hatch).
+    #[test]
+    fn zero_window_disables_dedup() {
+        let now = Instant::now();
+        let mut recent: HashMap<u64, (String, Instant)> = HashMap::new();
+        recent.insert(task_hash("build the thing"), ("w_abc123".into(), now));
+
+        assert_eq!(
+            duplicate_dispatch(&recent, "build the thing", now, Duration::ZERO),
+            None,
+            "window of 0 must never flag a duplicate"
+        );
+    }
+
+    // The configurable window honors AISH_DISPATCH_DEDUP_SECS, falling back to
+    // the 5s default when unset/invalid.
+    #[test]
+    fn dedup_window_is_configurable() {
+        // NOTE: env is process-global; this test owns the var and restores it.
+        // SAFETY: no other thread reads this var concurrently during the test —
+        // only `dispatch_dedup_window` reads it and only this test writes it.
+        let prev = std::env::var("AISH_DISPATCH_DEDUP_SECS").ok();
+
+        unsafe { std::env::remove_var("AISH_DISPATCH_DEDUP_SECS") };
+        assert_eq!(dispatch_dedup_window(), Duration::from_secs(DISPATCH_DEDUP_SECS));
+
+        unsafe { std::env::set_var("AISH_DISPATCH_DEDUP_SECS", "12") };
+        assert_eq!(dispatch_dedup_window(), Duration::from_secs(12));
+
+        unsafe { std::env::set_var("AISH_DISPATCH_DEDUP_SECS", "0") };
+        assert_eq!(dispatch_dedup_window(), Duration::from_secs(0));
+
+        unsafe { std::env::set_var("AISH_DISPATCH_DEDUP_SECS", "not-a-number") };
+        assert_eq!(
+            dispatch_dedup_window(),
+            Duration::from_secs(DISPATCH_DEDUP_SECS),
+            "invalid value falls back to the default window"
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AISH_DISPATCH_DEDUP_SECS", v) },
+            None => unsafe { std::env::remove_var("AISH_DISPATCH_DEDUP_SECS") },
+        }
+    }
 
     // The attach-review claim is once-only per (marker, run_id): the first caller
     // to observe a finished attached worker prints its final result; the racing
@@ -8578,6 +8825,73 @@ mod tests {
         assert_eq!(owner_gate(None, "sess-a", false), OwnerGate::Allow);
         // --any is a harmless no-op when the run is already yours.
         assert_eq!(owner_gate(Some("sess-a"), "sess-a", true), OwnerGate::Allow);
+    }
+
+    #[test]
+    fn phase_is_live_treats_missing_and_unknown_as_dead() {
+        // TASK-286 AC1/AC2: :tell checks coordinator.phase before enqueuing and
+        // rejects done/failed/missing. Live (resumable) phases can still read a
+        // queued message; terminal + unknown/missing cannot.
+        assert!(phase_is_live("coordinating"));
+        assert!(phase_is_live("awaiting_batch"));
+        assert!(!phase_is_live("done"));
+        assert!(!phase_is_live("failed"));
+        // Missing (empty) and unknown/legacy phase strings parse to Failed and
+        // are therefore dead — a row we cannot interpret must not swallow a msg.
+        assert!(!phase_is_live(""));
+        assert!(!phase_is_live("zombie"));
+    }
+
+    #[test]
+    fn resolve_tell_target_routes_by_liveness_and_ownership() {
+        let me = "sess-a";
+        let live = |rid: &str, owner: Option<&str>| {
+            (rid.to_string(), false, owner.map(str::to_string))
+        };
+        let dead = |rid: &str, owner: Option<&str>| {
+            (rid.to_string(), true, owner.map(str::to_string))
+        };
+
+        // AC3: :tell to a non-existent run-id fails gracefully (NotFound), never
+        // a silent no-op or a raw DB error.
+        assert_eq!(
+            resolve_tell_target(&[], me, false),
+            TellTarget::NotFound
+        );
+
+        // A live, owned coordinator is ready to receive the message.
+        assert_eq!(
+            resolve_tell_target(&[live("w_live", Some(me))], me, false),
+            TellTarget::Ready("w_live".to_string())
+        );
+
+        // A finished (dead) coordinator is refused rather than enqueued-into.
+        assert_eq!(
+            resolve_tell_target(&[dead("w_done", Some(me))], me, false),
+            TellTarget::Terminal("w_done".to_string())
+        );
+
+        // A match owned only by another session, without --any, is refused with
+        // guidance (ForeignOnly) — not silently invisible.
+        assert_eq!(
+            resolve_tell_target(&[live("w_other", Some("sess-b"))], me, false),
+            TellTarget::ForeignOnly
+        );
+        // …and --any opts in, making it Ready.
+        assert_eq!(
+            resolve_tell_target(&[live("w_other", Some("sess-b"))], me, true),
+            TellTarget::Ready("w_other".to_string())
+        );
+
+        // An ambiguous prefix that matches several owned coordinators lists them.
+        assert_eq!(
+            resolve_tell_target(
+                &[live("w_a", Some(me)), live("w_b", Some(me))],
+                me,
+                false
+            ),
+            TellTarget::Ambiguous(vec!["w_a".to_string(), "w_b".to_string()])
+        );
     }
 
     #[test]

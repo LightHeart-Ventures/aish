@@ -114,6 +114,16 @@ pub fn parse_ref(input: &str) -> Result<SkillRef> {
         .or_else(|| s.strip_prefix("skill.fish/"))
         .unwrap_or(s)
         .trim_matches('/');
+    // A URL that isn't a skill.fish link (and wasn't recognized as a GitHub ref
+    // by `parse_github_ref` — which returns `None` for e.g. a non-github host or
+    // a path with unsafe segments) must NOT be split as `owner/name`: doing so
+    // yields the baffling `invalid owner: "https:"`. Fail with actionable text.
+    if path.contains("://") {
+        bail!(
+            "unsupported skill reference {s:?} — expected `owner/name`, a \
+             `github:owner/repo[/path]` spec, or an `https://github.com/…` URL"
+        );
+    }
     let mut parts = path.splitn(2, '/');
     let owner = parts
         .next()
@@ -1172,15 +1182,27 @@ fn valid_github_ref(s: &str) -> bool {
 
 /// Validate a repo sub-path: every `/`-separated component must be a safe
 /// segment. Returns the normalized path (no leading/trailing slash) or `None`.
+///
+/// Empty and `.` (current-dir, no-op) segments are dropped rather than
+/// rejected — GitHub tree/blob URLs harvested from registries routinely carry
+/// them (e.g. `…/tree/main/./plugins/foo/./skills/bar`), and a `.` component is
+/// semantically a no-op. `..` and odd characters are still rejected (traversal
+/// guard), and a path that normalizes to nothing → `None`.
 fn normalize_github_path(path: &str) -> Option<String> {
-    let trimmed = path.trim_matches('/');
-    if trimmed.is_empty() {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if !valid_github_segment(seg) {
+            return None;
+        }
+        out.push(seg);
+    }
+    if out.is_empty() {
         return None;
     }
-    if !trimmed.split('/').all(valid_github_segment) {
-        return None;
-    }
-    Some(trimmed.to_string())
+    Some(out.join("/"))
 }
 
 /// Parse a GitHub skill spec. Returns `None` when `input` is not a GitHub spec
@@ -2325,6 +2347,54 @@ mod tests {
         assert!(parse_github_ref("github:../evil/skills").is_none());
         // `/tree` with no ref is malformed.
         assert!(parse_github_ref("https://github.com/acme/skills/tree").is_none());
+    }
+
+    #[test]
+    fn github_tree_url_with_dot_segments_normalizes() {
+        // GitHub tree/blob URLs harvested from registries (e.g. mcpmarket)
+        // routinely carry no-op `.` current-dir segments. They must be dropped,
+        // not rejected — otherwise the whole spec falls through to `parse_ref`
+        // and produces the baffling `invalid owner: "https:"`.
+        let gh = parse_github_ref(
+            "https://github.com/wshobson/agents/tree/main/./skills/./code-review-excellence",
+        )
+        .expect("dot segments should normalize, not reject");
+        assert_eq!(gh.owner, "wshobson");
+        assert_eq!(gh.repo, "agents");
+        assert_eq!(gh.git_ref, "main");
+        assert_eq!(gh.path.as_deref(), Some("skills/code-review-excellence"));
+    }
+
+    #[test]
+    fn normalize_github_path_drops_dot_keeps_traversal_guard() {
+        assert_eq!(
+            normalize_github_path("./plugins/./skills/foo/.").as_deref(),
+            Some("plugins/skills/foo")
+        );
+        assert_eq!(normalize_github_path("a//b/./c").as_deref(), Some("a/b/c"));
+        // Traversal and empty-after-normalize are still rejected.
+        assert!(normalize_github_path("a/../etc").is_none());
+        assert!(normalize_github_path("././.").is_none());
+        assert!(normalize_github_path("").is_none());
+    }
+
+    #[test]
+    fn parse_ref_rejects_bare_url_with_actionable_error() {
+        // A URL that is not a skill.fish link (and that `parse_github_ref`
+        // declined) must NOT be split into `owner: "https:"`. It should fail
+        // with a clear, actionable message instead.
+        let err = parse_ref("https://example.com/foo/bar").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unsupported skill reference"),
+            "expected actionable url error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("invalid owner"),
+            "must not leak the owner-split error for a URL, got: {msg}"
+        );
+        // The bare `owner/name` shorthand still parses fine.
+        assert_eq!(parse_ref("acme/git-helper").unwrap().owner, "acme");
     }
 
     #[test]

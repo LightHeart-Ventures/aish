@@ -295,6 +295,14 @@ pub struct Session {
     /// Live full-tool background workers — aish subprocesses run in
     /// `--coordinator` mode. In memory for the session, like `batch_jobs`.
     pub worker_jobs: crate::worker::WorkerJobs,
+    /// TASK-290: short-window duplicate-dispatch suppression. Maps a task's
+    /// content hash → `(run_id, dispatched_at)` for the most recent background
+    /// coordinator launched for that exact task. A second `:dispatch` of the
+    /// same task within the dedup window (default 5s, `AISH_DISPATCH_DEDUP_SECS`)
+    /// is rejected pointing at the first run instead of spawning a duplicate.
+    /// Session-local, never persisted; entries older than the window are pruned
+    /// on each dispatch so it stays tiny.
+    pub recent_dispatches: std::collections::HashMap<u64, (String, std::time::Instant)>,
     /// Deferred + recurring `:schedule` tasks (cron / natural language). Each
     /// fire spawns a background coordinator; the tick task updates the 2nd
     /// status line and prints console summaries. Session-local, never persisted.
@@ -528,6 +536,7 @@ impl Session {
             batch_jobs: Default::default(),
             batch_store: None,
             worker_jobs: Default::default(),
+            recent_dispatches: std::collections::HashMap::new(),
             schedule: crate::schedule::Scheduler::new(),
             coordinator_store: None,
             goal_store: None,
