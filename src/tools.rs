@@ -2352,11 +2352,25 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
                         .unwrap_or_else(|| "—".into())
                 };
                 let result = format_result(r.result.as_ref(), r.error.as_ref());
+                // Append run telemetry (turns / tool calls / tokens in·out) to
+                // the status cell when we've captured any — see record_run_metrics.
+                let phase_cell = if r.turns == 0
+                    && r.tool_calls == 0
+                    && r.tokens_in == 0
+                    && r.tokens_out == 0
+                {
+                    r.phase.clone()
+                } else {
+                    format!(
+                        "{} · {}t {}tc {}in/{}out",
+                        r.phase, r.turns, r.tool_calls, r.tokens_in, r.tokens_out
+                    )
+                };
                 out.push_str(&format!(
                     "| `{}` | coordinator | {} | {} | {} | {} | {} |\n",
                     crate::batch::short_id(&r.run_id),
                     owner,
-                    r.phase,
+                    phase_cell,
                     r.created_at.as_deref().unwrap_or("—"),
                     trunc(&r.task),
                     result

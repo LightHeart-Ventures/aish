@@ -1106,6 +1106,16 @@ pub struct CoordinatorRow {
     /// Last liveness beat (SQLite `current_timestamp` string). A run whose owner
     /// is gone and whose heartbeat is stale is treated as orphaned on reattach.
     pub heartbeat_at: Option<String>,
+    /// Cumulative prompt (input) tokens billed across the run, captured from the
+    /// coordinator session at terminal exit. 0 for rows created before the
+    /// metrics migration or for runs that never took a turn.
+    pub tokens_in: u64,
+    /// Cumulative completion (output) tokens produced across the run.
+    pub tokens_out: u64,
+    /// Count of agentic turns taken across the run.
+    pub turns: u64,
+    /// Count of tool calls executed across the run.
+    pub tool_calls: u64,
 }
 
 /// One run's terminal payload, read STRICTLY by `run_id` (TASK-205). A single
@@ -1223,6 +1233,17 @@ impl CoordinatorStore {
                 [],
             );
         }
+        // Worker-run cost/effort metrics captured from the coordinator session
+        // totals at terminal exit: cumulative prompt/completion tokens, agentic
+        // turns, and tool-call count. Additive `ADD COLUMN` with a constant
+        // default — the duplicate-column error is swallowed once present, so the
+        // migration is idempotent, and existing rows read back 0.
+        for col in ["tokens_in", "tokens_out", "turns", "tool_calls"] {
+            let _ = conn.execute(
+                &format!("ALTER TABLE coordinator_runs ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"),
+                [],
+            );
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -1302,12 +1323,36 @@ impl CoordinatorStore {
         Ok(())
     }
 
+    /// Stamp the run's cumulative cost/effort counters — prompt (`tokens_in`)
+    /// and completion (`tokens_out`) tokens, agentic `turns`, and `tool_calls` —
+    /// captured from the coordinator [`crate::session::Session`] totals at
+    /// terminal exit. Keyed by `run_id`; leaves phase/result/heartbeat untouched
+    /// so it can be called just before `set_done`/`set_failed`. Best-effort at
+    /// the call site: a metrics-write error never gates run completion.
+    pub fn record_metrics(
+        &self,
+        run_id: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+        turns: u64,
+        tool_calls: u64,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE coordinator_runs \
+             SET tokens_in = ?2, tokens_out = ?3, turns = ?4, tool_calls = ?5 \
+             WHERE run_id = ?1",
+            (run_id, tokens_in, tokens_out, turns, tool_calls),
+        )?;
+        Ok(())
+    }
+
     /// Every persisted run, oldest first — used at startup to surface completed
     /// runs and reap orphaned ones.
     pub fn load_all(&self) -> Result<Vec<CoordinatorRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT run_id, task, phase, result, error, session_id, session_name, created_at, heartbeat_at
+            "SELECT run_id, task, phase, result, error, session_id, session_name, created_at, heartbeat_at, \
+                    tokens_in, tokens_out, turns, tool_calls
              FROM coordinator_runs ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1321,6 +1366,10 @@ impl CoordinatorStore {
                 session_name: r.get(6)?,
                 created_at: r.get(7)?,
                 heartbeat_at: r.get(8)?,
+                tokens_in: r.get(9)?,
+                tokens_out: r.get(10)?,
+                turns: r.get(11)?,
+                tool_calls: r.get(12)?,
             })
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect())
@@ -2537,6 +2586,42 @@ mod tests {
         store.set_failed("batch_1", "timeout").unwrap();
         assert_eq!(reopened.clear_finished().unwrap(), 2); // both terminal now
         assert!(reopened.load_all().unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn coordinator_store_records_run_metrics() {
+        let path =
+            std::env::temp_dir().join(format!("aish_coord_metrics_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+
+        store
+            .insert("run_m", "capture worker telemetry", "sess-m", None)
+            .unwrap();
+        // Fresh rows read back zeroed (migration default), so downstream renders
+        // treat "no metrics captured" distinctly from a real zero-effort run.
+        let before = store.load_all().unwrap();
+        let r0 = before.iter().find(|r| r.run_id == "run_m").unwrap();
+        assert_eq!(
+            (r0.tokens_in, r0.tokens_out, r0.turns, r0.tool_calls),
+            (0, 0, 0, 0)
+        );
+
+        // Stamp metrics, then close out — record_metrics must not touch phase.
+        store.record_metrics("run_m", 12_345, 6_789, 7, 42).unwrap();
+        store.set_done("run_m", "done").unwrap();
+
+        // Survives a restart (persisted columns, not in-memory state).
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        let rows = reopened.load_all().unwrap();
+        let r = rows.iter().find(|r| r.run_id == "run_m").unwrap();
+        assert_eq!(r.tokens_in, 12_345);
+        assert_eq!(r.tokens_out, 6_789);
+        assert_eq!(r.turns, 7);
+        assert_eq!(r.tool_calls, 42);
+        assert_eq!(r.phase, "done"); // metrics write left phase/result intact
+        assert_eq!(r.result.as_deref(), Some("done"));
         let _ = std::fs::remove_file(&path);
     }
 
