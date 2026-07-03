@@ -17,7 +17,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -829,6 +829,13 @@ fn is_thinking_notice(raw: &str) -> bool {
 /// exactly like the interactive thinking indicator, which animates and then
 /// vanishes when output begins. TTY-gated: `start` returns `None` off a terminal,
 /// and the caller then falls back to a one-shot static row.
+///
+/// Concurrency: in-place redraws own the terminal's single cursor line, so two
+/// or more spinners animating at once would clobber each other on ONE row (the
+/// "messy overlapping thinking" bug). Only the SOLE active thinker (tracked by
+/// [`THINKING_ACTIVE`]) animates in place; when a second worker starts thinking,
+/// each additional spinner instead commits its notice as its OWN
+/// newline-terminated line, so every "thinking…" stays on a separate line.
 struct ThinkingSpinner {
     /// Registry id — lets [`quiesce_thinking_spinners`] abort exactly this
     /// spinner's task and lets `stop`/natural-exit unregister itself.
@@ -838,6 +845,34 @@ struct ThinkingSpinner {
 
 /// Monotonic id source for live thinking spinners.
 static SPINNER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Count of thinking spinners currently active (started, not yet torn down).
+/// Read on each animation frame to decide between an IN-PLACE animated row (the
+/// sole thinker) and a committed one-line notice (2+ workers thinking at once).
+/// With independent `\r`-in-place redraws, concurrent spinners collide on ONE
+/// terminal line — the "messy overlapping thinking" bug; the count is how a
+/// spinner knows it must instead land on its own line.
+static THINKING_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII counter for [`THINKING_ACTIVE`]: increments on construction — done
+/// SYNCHRONOUSLY in `ThinkingSpinner::start` before the spinner task is spawned,
+/// so a newcomer is counted the instant it starts and every already-running
+/// spinner sees the concurrency on its very next frame — and decrements on drop.
+/// Drop fires on the task's natural exit AND when the task is aborted (tokio
+/// drops the future's captured locals), so the count can neither leak nor
+/// double-decrement regardless of how the spinner ends.
+struct ThinkGuard;
+impl ThinkGuard {
+    fn new() -> Self {
+        THINKING_ACTIVE.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+impl Drop for ThinkGuard {
+    fn drop(&mut self) {
+        THINKING_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Abort handles for every currently-animating thinking spinner, keyed by id.
 /// The REPL drains this synchronously via [`quiesce_thinking_spinners`] on a
@@ -901,38 +936,86 @@ impl ThinkingSpinner {
         eprint!("\x1b[?25l"); // hide the cursor while the spinner turns
         let label = label.to_string();
         let id = SPINNER_SEQ.fetch_add(1, Ordering::Relaxed);
+        // Count this thinker BEFORE spawning its task, so every already-running
+        // spinner sees the new concurrency on its next frame (and switches from
+        // in-place animation to its own committed line). Moved into the task so
+        // the decrement fires on natural exit AND on abort.
+        let guard = ThinkGuard::new();
         let task = tokio::spawn(async move {
+            let _guard = guard;
             let mut tick = tokio::time::interval(Duration::from_millis(80));
+            // Once this spinner has committed a static one-line notice (because
+            // 2+ workers were thinking concurrently) it stays on that line for
+            // the rest of its life — it never flips back to in-place animation,
+            // so the notice can't jump lines mid-think.
+            let mut committed_static = false;
             for i in 0.. {
                 tick.tick().await;
                 // Shift-Tab / `:detach` / `:output off` close this worker's
                 // forward gate. The stream loop can't react until its next line
                 // (it's parked in `next_line().await`), so the spinner watches
-                // the gate itself: the moment it closes, erase the row, restore
-                // the cursor, and stop — the thinking animation vanishes at once.
+                // the gate itself: the moment it closes, tear down and stop — the
+                // thinking animation vanishes at once.
                 let attached_id = attached.lock().ok().and_then(|g| g.clone());
                 if !should_forward(
                     show_output.load(Ordering::Relaxed),
                     attached_id.as_deref(),
                     &label,
                 ) {
-                    eprint!("\r\x1b[2K\x1b[?25h");
+                    if committed_static {
+                        // The notice already stands on its own committed line;
+                        // don't erase the current line (it's fresh / the prompt) —
+                        // just restore the cursor.
+                        eprint!("\x1b[?25h");
+                    } else {
+                        // Erase the transient in-place animated row + restore cursor.
+                        eprint!("\r\x1b[2K\x1b[?25h");
+                    }
                     break;
                 }
-                // Cyan braille frame + dim "thinking…", mirroring the interactive
-                // spinner's look, framed as a pane row so it carries the same
-                // border + `[label]` gutter as every other streamed line.
-                // NARRATION_ALIGN_PAD lands the braille frame in the same
-                // column as the 🚀 rocket / tool glyph so the animated thinking
-                // row aligns with every other streamed glyph (rocket alignment).
-                let body = format!(
-                    "{NARRATION_ALIGN_PAD}\x1b[36m{}\x1b[0m \x1b[2;36mthinking…\x1b[0m",
-                    THINKING_FRAMES[i % THINKING_FRAMES.len()]
-                );
+                if committed_static {
+                    // Already on its own line — nothing left to animate. Keep
+                    // polling only so a later detach restores the cursor cleanly.
+                    continue;
+                }
                 // Green wall for the LIVE post-attach thinking row (this worker
                 // is the one `:attach`ed to), cyan for the global `:output` pane —
                 // matching the border the forwarded activity rows use.
                 let live = attached_id.as_deref() == Some(&label);
+                // CONCURRENCY: only the SOLE active thinker animates IN PLACE.
+                // When two or more workers think at once, independent `\r`
+                // in-place redraws collide on ONE terminal line (the "messy
+                // overlapping thinking" bug). Each additional thinker instead
+                // commits its notice as its OWN newline-terminated line via
+                // `announce_raw` (prompt-preserving), so every "thinking…" stays
+                // on a separate line.
+                if THINKING_ACTIVE.load(Ordering::Relaxed) > 1 {
+                    let body = format!(
+                        "{NARRATION_ALIGN_PAD}\x1b[36m{}\x1b[0m \x1b[2;36mthinking…\x1b[0m",
+                        THINKING_FRAMES[0]
+                    );
+                    let row = if live {
+                        pane_row_live(&label, &body)
+                    } else {
+                        pane_row(&label, &body)
+                    };
+                    // Un-hide the cursor `start` hid — there is no in-place
+                    // animation to conceal — then commit the row on its own line.
+                    eprint!("\x1b[?25h");
+                    crate::tools::announce_raw(&row);
+                    committed_static = true;
+                    continue;
+                }
+                // Sole thinker: animate in place (the original behaviour).
+                // Cyan braille frame + dim "thinking…", mirroring the interactive
+                // spinner's look, framed as a pane row so it carries the same
+                // border + `[label]` gutter as every other streamed line.
+                // NARRATION_ALIGN_PAD lands the braille frame in the same column
+                // as the 🚀 rocket / tool glyph (rocket alignment).
+                let body = format!(
+                    "{NARRATION_ALIGN_PAD}\x1b[36m{}\x1b[0m \x1b[2;36mthinking…\x1b[0m",
+                    THINKING_FRAMES[i % THINKING_FRAMES.len()]
+                );
                 let row = if live {
                     pane_row_live(&label, &body)
                 } else {
@@ -3206,6 +3289,31 @@ mod tests {
         // But with the session-wide `:output on`, the user wants every
         // coordinator's reasoning visible, so cycling away does NOT kill it.
         assert!(should_forward(true, None, label));
+    }
+
+    #[test]
+    fn think_guard_tracks_concurrent_thinkers() {
+        // THINKING_ACTIVE is the concurrency signal a spinner reads each frame to
+        // decide in-place animation (sole thinker) vs its own committed line (2+
+        // concurrent thinkers). The RAII guard must increment on construction and
+        // decrement on drop so the count is exact — a leaked/doubled count would
+        // wrongly route a sole thinker to a static line, or two concurrent ones
+        // back onto the same clobbered row.
+        let base = THINKING_ACTIVE.load(Ordering::Relaxed);
+        {
+            let _a = ThinkGuard::new();
+            assert_eq!(THINKING_ACTIVE.load(Ordering::Relaxed), base + 1);
+            {
+                let _b = ThinkGuard::new();
+                // Two thinkers at once → the "commit each on its own line" path.
+                assert_eq!(THINKING_ACTIVE.load(Ordering::Relaxed), base + 2);
+                assert!(THINKING_ACTIVE.load(Ordering::Relaxed) > 1);
+            }
+            // Second thinker done → back to the sole-thinker (animate) count.
+            assert_eq!(THINKING_ACTIVE.load(Ordering::Relaxed), base + 1);
+        }
+        // All done → fully restored, no leak.
+        assert_eq!(THINKING_ACTIVE.load(Ordering::Relaxed), base);
     }
 
     #[test]

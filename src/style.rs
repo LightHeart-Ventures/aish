@@ -206,9 +206,10 @@ pub fn job_activity_emoji(task: &str) -> &'static str {
 /// Render the compact fired-`:alert` badge that claims the head of the
 /// SecondStatusLine until the next prompt.
 ///
-/// When an operator `:alert` fires, the presenter stashes a short banner
-/// (`session.alert_banner`) and this helper turns it into the badge shown on the
-/// SecondStatusLine — prefixed with the same alarm-clock [`ALERT_GLYPH`] the
+/// When an operator `:alert` fires, the presenter turns the short banner into
+/// this badge and stores it as the SecondStatusLine's single flash message
+/// (`session.flash`, most-recent wins) — prefixed with the same alarm-clock
+/// [`ALERT_GLYPH`] the
 /// `:workers` table uses for `:alert` monitors, so the fire is instantly legible
 /// as an alert. Bold yellow when color is on (it stands apart from the worker
 /// badges); plain glyph + text otherwise. Pure, so it's unit-testable.

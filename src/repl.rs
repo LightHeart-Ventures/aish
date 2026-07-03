@@ -321,14 +321,31 @@ pub async fn run(
         // poll native alerts / claim fired ones, and the banner slot the
         // SecondStatusLine reads. Clones are cheap (Arc handles).
         let alert_store = session.alert_store.clone();
-        let alert_banner = session.alert_banner.clone();
-        let worker_banner = session.worker_banner.clone();
+        let flash = session.flash.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(400));
+            // Last observed attach cursor — an attach/detach/cycle transition
+            // clears the SecondStatusLine flash so the fresh coordinator hint
+            // (which IS that event's recent message) resurfaces (most-recent wins).
+            let mut last_attached: Option<String> = None;
             loop {
                 tick.tick().await;
                 if busy.load(Ordering::SeqCst) {
                     continue; // mid-command/turn — hold results until a pause
+                }
+                // ── SecondStatusLine recent-message slot ───────────────────
+                // The 2nd statusline shows ONE recent message at a time. When the
+                // operator attaches/detaches/cycles, the live coordinator hint is
+                // itself that event's message — so drop any stale flash (a prior
+                // alert/worker-done notice) on an attach-state change.
+                {
+                    let cur = attached.lock().unwrap().clone();
+                    if cur != last_attached {
+                        last_attached = cur;
+                        if let Ok(mut f) = flash.lock() {
+                            *f = None;
+                        }
+                    }
                 }
                 // ── `:alert` monitors ──────────────────────────────────────
                 // Evaluate due native alerts (file/command probes) token-free,
@@ -355,8 +372,13 @@ pub async fn run(
                         let mut ring = false;
                         for (_id, detail, short, audible) in fired {
                             crate::tools::print_above_prompt(format!("{detail}\n"));
-                            if let Ok(mut b) = alert_banner.lock() {
-                                *b = Some(short);
+                            // Most-recent wins: overwrite the single flash slot
+                            // with the colorized alert badge (no stacking).
+                            if let Ok(mut f) = flash.lock() {
+                                *f = Some(crate::style::alert_badge(
+                                    &short,
+                                    crate::style::colors_enabled(),
+                                ));
                             }
                             ring = ring || audible;
                         }
@@ -412,8 +434,10 @@ pub async fn run(
                 let worker_notices = crate::worker::notify_pending(&worker_jobs);
                 if !worker_notices.is_empty() {
                     finished_bell = true;
-                    if let Ok(mut b) = worker_banner.lock() {
-                        *b = Some(worker_notices.join("  \u{b7}  "));
+                    // Most-recent wins: the finished-coordinator notice (already
+                    // colorized) overwrites the single flash slot (no stacking).
+                    if let Ok(mut f) = flash.lock() {
+                        *f = Some(worker_notices.join("  \u{b7}  "));
                     }
                 }
                 // Auto-resume wake hook: observe this session's fanned-out
@@ -1145,6 +1169,19 @@ fn reexec_aish() {
     }
 }
 
+/// Resolve the SecondStatusLine's recent-message slot to the ONE message it may
+/// show. The row is a most-recent-wins ticker, not a stack: when a `flash` is
+/// pending (a fired `:alert` badge or a finished-coordinator notice, set by the
+/// background presenter) it REPLACES the live coordinator/attach `baseline`
+/// entirely — the two must never render on top of each other. With no flash the
+/// baseline shows through. Pure, so the replace-don't-stack rule is unit-tested.
+fn recent_message_row(baseline: String, flash: Option<String>) -> String {
+    match flash {
+        Some(f) if !f.trim().is_empty() => f,
+        _ => baseline,
+    }
+}
+
 /// Build the coordinator status line shown in the footer's middle row (row H-1)
 /// — the "2nd statusline".
 ///
@@ -1199,30 +1236,14 @@ fn coordinator_status_message(session: &Session) -> String {
         }
         None => left,
     };
-    // A fired `:alert` claims the head of this row until the next prompt — the
-    // compact banner the presenter stashed, prefixed with the alarm-clock glyph
-    // (same one the `:workers` table uses for `:alert` monitors) and painted
-    // bold yellow so it stands apart from the worker badges; the full detail
-    // already printed above the prompt.
-    if let Some(banner) = session.alert_banner.lock().ok().and_then(|b| b.clone()) {
-        let badge = crate::style::alert_badge(&banner, color_on);
-        left = if left.trim().is_empty() {
-            badge
-        } else {
-            format!("{badge}  {left}")
-        };
-    }
-    // A finished background coordinator stashes its colorized completion NOTICE
-    // here (moved off the outputfield). It claims the head of the row after any
-    // alert badge; the notice is already colorized by `worker::notify_pending`
-    // (green ✓ done / red ✗ failed), and `clip_visible` clamps it to width.
-    if let Some(banner) = session.worker_banner.lock().ok().and_then(|b| b.clone()) {
-        left = if left.trim().is_empty() {
-            banner
-        } else {
-            format!("{banner}  {left}")
-        };
-    }
+    // The recent-message slot shows exactly ONE message at a time. When the
+    // presenter has a pending flash — a fired `:alert` badge or a finished-
+    // coordinator notice, already colorized, most-recent wins — it REPLACES the
+    // live coordinator/schedule hint for this row instead of stacking on top of
+    // it. With no flash pending, the live attach/detach + schedule hint shows
+    // through. The flash is dropped on the next attach/detach transition so the
+    // fresh hint resurfaces.
+    left = recent_message_row(left, session.flash.lock().ok().and_then(|b| b.clone()));
     // Right-justify the session name (`:rename`) on this row, directly above the
     // clock on the statusline below — in bold magenta. Blank when unnamed.
     crate::style::second_statusline_at(
@@ -8058,6 +8079,25 @@ mod tests {
             "⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)"
         );
         assert!(!plain.contains('\x1b'));
+    }
+
+    #[test]
+    fn recent_message_row_flash_replaces_baseline_no_stacking() {
+        // A pending flash (e.g. a fired `:alert` badge) REPLACES the live hint —
+        // the two must not concatenate on top of each other.
+        let baseline =
+            "⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)".to_string();
+        let flash = Some("⚠ New PR opened in LightHeart-Ventures/ai…".to_string());
+        let row = recent_message_row(baseline.clone(), flash);
+        assert_eq!(row, "⚠ New PR opened in LightHeart-Ventures/ai…");
+        assert!(!row.contains("detached"), "flash must not stack the hint: {row}");
+        // No flash → the live baseline hint shows through unchanged.
+        assert_eq!(recent_message_row(baseline.clone(), None), baseline);
+        // Empty/whitespace flash is treated as absent (falls back to baseline).
+        assert_eq!(
+            recent_message_row(baseline.clone(), Some("   ".to_string())),
+            baseline
+        );
     }
 
     #[test]
