@@ -3010,10 +3010,13 @@ pub fn notify_pending(jobs: &WorkerJobs) -> Vec<String> {
     pending
         .iter()
         .map(|job| {
-            let (icon, what) = if job.status() == "failed" {
-                ("✗", "failed")
+            // Colorized (not dim) — this notice now lives on the SecondStatusLine
+            // footer badge, so it earns real colour: green when the coordinator
+            // finished cleanly, red when it failed.
+            let (icon, what, color) = if job.status() == "failed" {
+                ("✗", "failed", "\x1b[1;31m")
             } else {
-                ("✓", "done")
+                ("✓", "done", "\x1b[1;32m")
             };
             job.mark_displayed();
             // Surface the branch an isolated worker left changes on, so the parent
@@ -3023,7 +3026,7 @@ pub fn notify_pending(jobs: &WorkerJobs) -> Vec<String> {
                 .map(|b| format!(" · branch `{b}`"))
                 .unwrap_or_default();
             format!(
-                "\x1b[2m{icon} {} {what} — `:result {}` to view · {}{branch}\x1b[0m",
+                "{color}{icon} {} {what} — `:result {}` to view · {}{branch}\x1b[0m",
                 job.id,
                 job.id,
                 crate::batch::one_line(&job.task)

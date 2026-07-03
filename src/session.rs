@@ -316,6 +316,11 @@ pub struct Session {
     /// background presenter which sets it when an alert surfaces. `None` = no
     /// pending alert banner.
     pub alert_banner: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// The most recent worker-done banner for the SecondStatusLine, shared with
+    /// the background presenter which sets it when a background coordinator
+    /// finishes. The completion NOTICE lives HERE (a colorized footer badge)
+    /// instead of being dumped over the prompt. `None` = no pending banner.
+    pub worker_banner: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Id of the goal `:goal` subcommands target by default (set by `:goal
     /// new` / `:goal show <id>`). Session-local (not persisted); falls back to
     /// the active goal when unset or stale. (TASK-278)
@@ -528,6 +533,7 @@ impl Session {
             goal_store: None,
             alert_store: None,
             alert_banner: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            worker_banner: std::sync::Arc::new(std::sync::Mutex::new(None)),
             current_goal_id: None,
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
             goal: None,
