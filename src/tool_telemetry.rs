@@ -60,6 +60,20 @@ pub fn parse_flush_secs(v: Option<&str>) -> u64 {
         .unwrap_or(DEFAULT_FLUSH_SECS)
 }
 
+/// Default `:telemetry` aggregation cache TTL (seconds). Repeated `:telemetry`
+/// within this window is served from the Session snapshot instead of re-running
+/// the GROUP BY scans (TASK-252 / FR-305).
+pub const DEFAULT_CACHE_SECS: u64 = 60;
+
+/// Parse `AISH_TELEMETRY_CACHE_SECS`. `0` is honoured verbatim (disables the
+/// cache — every `:telemetry` re-queries); unset/unparseable falls back to the
+/// default.
+pub fn parse_cache_secs(v: Option<&str>) -> u64 {
+    v.and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CACHE_SECS)
+}
+
+
 /// Parse `AISH_TELEMETRY_UNBUFFERED`. Truthy (`1`/`true`/`yes`/`on`, case-
 /// insensitive) restores the legacy per-call insert path — every `record`
 /// flushes immediately. Anything else keeps buffering on.
@@ -235,6 +249,60 @@ pub struct RetryStat {
     pub recovered: i64,
 }
 
+/// A pre-aggregated `:telemetry` snapshot cached on the [`Session`] (TASK-252 /
+/// FR-305). Holds the four values the report is rendered from plus the instant
+/// it was computed, so a repeated `:telemetry` inside the cache window skips the
+/// GROUP BY scans entirely. Cloned out on a hit; cheap (a handful of small rows).
+#[derive(Debug, Clone)]
+pub struct TelemetryCache {
+    /// When this snapshot was computed — drives the TTL freshness check.
+    pub cached_at: std::time::Instant,
+    /// Total tool-call rows logged (`db.tool_telemetry_count`).
+    pub total: i64,
+    /// Per-tool call/failure totals.
+    pub totals: Vec<ToolTotals>,
+    /// Per-(tool, error-class) failure counts.
+    pub class_failures: Vec<ClassFailure>,
+    /// Per-(tool, prev-class) retry-recovery stats.
+    pub retries: Vec<RetryStat>,
+}
+
+/// Return the aggregated `:telemetry` snapshot, served from the Session cache
+/// when it is fresh — age `< session.tool_telemetry_cache_secs` and present —
+/// otherwise re-run the GROUP BY queries, cache the result, and return it.
+/// Returns `None` when no persistent store is attached (nothing to aggregate).
+///
+/// A `cache_secs` of `0` makes every call a miss (the cache is effectively
+/// disabled), and a freshly recorded tool call clears the cache in [`record`]
+/// for exact invalidation, so a stale window can only ever elapse when NO new
+/// tool calls happened — exactly when the numbers wouldn't have changed anyway.
+pub fn aggregate_cached(session: &mut Session) -> Option<TelemetryCache> {
+    // No store ⇒ nothing to aggregate.
+    if session.db.is_none() {
+        return None;
+    }
+
+    // Fresh cache hit: serve the snapshot, no DB scan.
+    if let Some(c) = &session.tool_telemetry_cache {
+        if c.cached_at.elapsed() < session.tool_telemetry_cache_secs {
+            return Some(c.clone());
+        }
+    }
+
+    // Miss (empty, stale, or TTL=0): re-aggregate and repopulate the cache.
+    let db = session.db.as_ref().unwrap();
+    let snap = TelemetryCache {
+        cached_at: std::time::Instant::now(),
+        total: db.tool_telemetry_count().unwrap_or(0),
+        totals: db.tool_telemetry_totals().unwrap_or_default(),
+        class_failures: db.tool_telemetry_class_failures().unwrap_or_default(),
+        retries: db.tool_telemetry_retry_stats().unwrap_or_default(),
+    };
+    session.tool_telemetry_cache = Some(snap.clone());
+    Some(snap)
+}
+
+/// Record one completed tool call. Best-effort: updates the session's
 /// Record one completed tool call. Best-effort: updates the session's
 /// last-unresolved-failure map (for retry detection) and appends the event to
 /// the session ring buffer, flushing to SQLite as one transaction when the
@@ -260,6 +328,11 @@ pub fn record(session: &mut Session, tool: &str, result: &ToolResult) {
     } else {
         session.tool_failures.remove(tool);
     }
+
+    // TASK-252: a freshly recorded tool call makes any cached `:telemetry`
+    // aggregate stale — invalidate it exactly here (the loose TTL in
+    // `aggregate_cached` is only the backstop). Cheap and store-independent.
+    session.tool_telemetry_cache = None;
 
     // No store ⇒ nothing to persist or buffer.
     if session.db.is_none() {
@@ -576,5 +649,96 @@ mod tests {
         record(&mut s, "read_file", &ok);
         assert!(s.tool_telemetry_buf.is_empty());
         assert_eq!(s.db.as_ref().unwrap().tool_telemetry_count().unwrap(), 1);
+    }
+
+    // -- pre-aggregated :telemetry cache (TASK-252 / FR-305) ---------------
+
+    #[test]
+    fn parse_cache_secs_defaults_and_overrides() {
+        assert_eq!(parse_cache_secs(None), DEFAULT_CACHE_SECS);
+        assert_eq!(parse_cache_secs(Some("0")), 0); // honoured — disables cache
+        assert_eq!(parse_cache_secs(Some(" 120 ")), 120);
+        assert_eq!(parse_cache_secs(Some("nope")), DEFAULT_CACHE_SECS);
+    }
+
+    /// A tool event minted directly (bypassing `record`, so it does NOT
+    /// invalidate the cache) — used to prove a fresh cache masks new rows.
+    fn direct_event(session_id: &str) -> ToolEvent {
+        ToolEvent {
+            tool: "read_file".into(),
+            is_error: false,
+            error_class: None,
+            is_retry: false,
+            recovered: false,
+            prev_class: None,
+            session_id: session_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn aggregate_cached_serves_fresh_snapshot_within_window() {
+        let dir = tele_tmp("cache_hit");
+        let mut s = tele_session(&dir);
+        s.tool_telemetry_cache_secs = std::time::Duration::from_secs(3600);
+        let ok = ToolResult::text("t", "done", false);
+        record(&mut s, "read_file", &ok);
+        flush(&mut s); // 1 row lands in the DB
+        // First read is a miss → queries + caches total=1.
+        let a = aggregate_cached(&mut s).unwrap();
+        assert_eq!(a.total, 1);
+        assert!(s.tool_telemetry_cache.is_some());
+        // Insert out-of-band (no `record`, no invalidation). The fresh cache
+        // must still serve the old total — that's the whole point of caching.
+        let ev = direct_event(&s.session_id);
+        s.db.as_ref().unwrap().record_tool_event(&ev).unwrap();
+        let b = aggregate_cached(&mut s).unwrap();
+        assert_eq!(b.total, 1, "fresh cache should mask the out-of-band insert");
+    }
+
+    #[test]
+    fn record_invalidates_telemetry_cache_exactly() {
+        let dir = tele_tmp("cache_inval");
+        let mut s = tele_session(&dir);
+        s.tool_telemetry_cache_secs = std::time::Duration::from_secs(3600);
+        let ok = ToolResult::text("t", "done", false);
+        record(&mut s, "read_file", &ok);
+        flush(&mut s);
+        assert_eq!(aggregate_cached(&mut s).unwrap().total, 1);
+        assert!(s.tool_telemetry_cache.is_some());
+        // A newly recorded tool call clears the cache immediately.
+        record(&mut s, "read_file", &ok);
+        assert!(s.tool_telemetry_cache.is_none(), "record must invalidate the cache");
+        flush(&mut s);
+        assert_eq!(
+            aggregate_cached(&mut s).unwrap().total,
+            2,
+            "re-aggregation after invalidation reflects the new row"
+        );
+    }
+
+    #[test]
+    fn cache_secs_zero_disables_the_cache() {
+        let dir = tele_tmp("cache_zero");
+        let mut s = tele_session(&dir);
+        s.tool_telemetry_cache_secs = std::time::Duration::ZERO;
+        let ok = ToolResult::text("t", "done", false);
+        record(&mut s, "read_file", &ok);
+        flush(&mut s);
+        assert_eq!(aggregate_cached(&mut s).unwrap().total, 1);
+        // TTL=0 ⇒ every call re-queries, so an out-of-band insert is picked up.
+        let ev = direct_event(&s.session_id);
+        s.db.as_ref().unwrap().record_tool_event(&ev).unwrap();
+        assert_eq!(
+            aggregate_cached(&mut s).unwrap().total,
+            2,
+            "TTL=0 must re-query on every :telemetry"
+        );
+    }
+
+    #[test]
+    fn aggregate_cached_none_without_store() {
+        let mut s = Session::new().unwrap();
+        s.db = None;
+        assert!(aggregate_cached(&mut s).is_none());
     }
 }

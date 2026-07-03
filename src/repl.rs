@@ -4724,25 +4724,35 @@ fn pretty_json(v: &serde_json::Value) -> String {
 /// stats (which tools fail most, with what error class, and whether retries
 /// recover), or wipe the telemetry table. Feeds the "is this error worth
 /// retrying vs. escalating?" repair heuristic (see crate::tool_telemetry).
-fn handle_telemetry(sub: Option<&str>, session: &Session) {
-    let Some(db) = &session.db else {
+fn handle_telemetry(sub: Option<&str>, session: &mut Session) {
+    if session.db.is_none() {
         println!("telemetry store unavailable");
         return;
-    };
+    }
     match sub {
-        Some("clear" | "reset" | "wipe") => match db.clear_tool_telemetry() {
-            Ok(n) => println!("telemetry cleared — {n} row(s) removed"),
-            Err(e) => println!("clear failed: {e:#}"),
-        },
+        Some("clear" | "reset" | "wipe") => {
+            let db = session.db.as_ref().unwrap();
+            match db.clear_tool_telemetry() {
+                Ok(n) => println!("telemetry cleared — {n} row(s) removed"),
+                Err(e) => println!("clear failed: {e:#}"),
+            }
+            // Wiping the table invalidates any pre-aggregated snapshot (TASK-252).
+            session.tool_telemetry_cache = None;
+        }
         _ => {
-            let total = db.tool_telemetry_count().unwrap_or(0);
-            let totals = db.tool_telemetry_totals().unwrap_or_default();
-            let class_failures = db.tool_telemetry_class_failures().unwrap_or_default();
-            let retries = db.tool_telemetry_retry_stats().unwrap_or_default();
-            print!(
-                "{}",
-                crate::tool_telemetry::render_report(total, &totals, &class_failures, &retries)
-            );
+            // Pre-aggregated read: served from the 60s Session cache on a hit,
+            // re-queried and cached on a miss (TASK-252 / FR-305).
+            if let Some(snap) = crate::tool_telemetry::aggregate_cached(session) {
+                print!(
+                    "{}",
+                    crate::tool_telemetry::render_report(
+                        snap.total,
+                        &snap.totals,
+                        &snap.class_failures,
+                        &snap.retries,
+                    )
+                );
+            }
         }
     }
 }
