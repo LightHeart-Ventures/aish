@@ -457,6 +457,12 @@ pub async fn run(
                         // editor::nudge_terminal_return): a no-op on kernels that
                         // gate TIOCSTI or when stdin isn't a tty, in which case
                         // we fall back to resuming on the user's next Enter.
+                        // Kernel-independent hands-free wake: raise the resume
+                        // wake flag the idle poll read consults, so a parked
+                        // read_line returns and drains the resume on ANY kernel
+                        // (works where TIOCSTI is gated off). The nudge below is
+                        // kept as belt-and-suspenders for the plain-read path.
+                        crate::editor::arm_resume_wake();
                         crate::editor::nudge_terminal_return();
                         finished_bell = true;
                     }
@@ -560,9 +566,12 @@ pub async fn run(
             // the `?` route escape, exactly like a `:loop` tick, so the parent
             // reads + synthesizes the workers' results without the human typing
             // "continue". A session parked inside a blocking read_line when the
-            // resume arms is woken hands-free by the presenter, which pushes a
-            // newline into the terminal via editor::nudge_terminal_return()
-            // (TIOCSTI) so read_line returns and this drain runs on the next pass.
+            // resume arms is woken hands-free by the presenter: it raises the
+            // editor RESUME_WAKE flag (arm_resume_wake), which the idle poll read
+            // (gated on by the set_background_pending call below) consults and
+            // returns an empty line for — so this drain runs with NO keypress, on
+            // ANY kernel. A TIOCSTI nudge (nudge_terminal_return) fires too as a
+            // belt-and-suspenders fallback for the plain-read path.
             // Residual: on kernels that gate TIOCSTI (Linux ≥6.2
             // dev.tty.legacy_tiocsti=0) or when stdin isn't a tty, the nudge is a
             // no-op and the resume still drains on the user's next keypress.
@@ -625,6 +634,25 @@ pub async fn run(
                             );
                         }
                     }
+                    // Gate the editor's interruptible poll path: if this
+                    // session has outstanding fanned-out workers, the idle read
+                    // must be woken hands-free the instant the last one finishes
+                    // and the presenter arms a resume (arm_resume_wake). Compute
+                    // the live outstanding count HERE — not from the 400ms
+                    // presenter tick — so the gate is correct the moment we
+                    // block, closing the dispatch→first-tick race.
+                    let outstanding_workers = session
+                        .worker_jobs
+                        .lock()
+                        .map(|jobs| {
+                            jobs.iter()
+                                .filter(|w| {
+                                    !matches!(w.status().as_str(), "done" | "failed")
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    crate::editor::set_background_pending(outstanding_workers > 0);
                     editor.read_line(&prompt)
                 }
                 },
@@ -3465,6 +3493,100 @@ fn backfill_attached(run_id: &str, session: &Session) {
     }
 }
 
+/// Header printed once above the return-to-interactive backfill — the symmetric
+/// counterpart to `crate::worker::pane_replay_header`. Brackets the "conversation
+/// so far" replay block that reprints the operator's own chat when they `:detach`
+/// / Shift-Tab back to the interactive prompt. Pure — unit-tested.
+fn interactive_replay_header() -> String {
+    "\x1b[36m\u{2523}\u{2501} interactive \u{2014} conversation so far \x1b[0m\x1b[2m(replay)\x1b[0m\x1b[36m \u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\x1b[0m".to_string()
+}
+
+/// Render the operator's OWN recent conversation into display rows for the
+/// return-to-interactive backfill — the symmetric counterpart to
+/// [`backfill_attached`] (which replays a WORKER's transcript on worker-entry).
+/// When you `:detach` or Shift-Tab back to the interactive prompt, the worker's
+/// printed output has scrolled your conversation up into scrollback; without a
+/// replay you'd land on a bare prompt (the reported bug). This reprints a tail of
+/// the chat so your history trails right above the prompt again.
+///
+/// Pure (no IO) so it's unit-testable without a TTY. Renders, oldest-first:
+///   • operator prompts   → bold `💬 <text>` (the questions you typed)
+///   • assistant prose     → plain text lines (the answers)
+///   • assistant tool use  → a dim `🔧 <name>` line per tool call
+/// Tool-result feed-back messages (User role, empty text, `tool_results` only)
+/// are skipped — they were ephemeral dim chrome on screen and are the bulkiest.
+/// The synthetic "[Context compacted: …]" summary is skipped too (an engine
+/// artifact, not something the operator said). Rendered rows are tailed to the
+/// last `max_lines` so only ~1 screen replays.
+fn render_interactive_history_tail(
+    history: &[crate::backend::Msg],
+    max_lines: usize,
+) -> Vec<String> {
+    use crate::backend::Role;
+    let mut rows: Vec<String> = Vec::new();
+    for m in history {
+        match m.role {
+            Role::User => {
+                let text = m.text.trim();
+                // Skip tool-result feed-back (empty text) and the compaction
+                // banner — neither is an operator utterance.
+                if text.is_empty() || text.starts_with("[Context compacted:") {
+                    continue;
+                }
+                for (i, line) in text.lines().enumerate() {
+                    if i == 0 {
+                        rows.push(format!("\x1b[1m💬 {line}\x1b[0m"));
+                    } else {
+                        rows.push(format!("\x1b[1m   {line}\x1b[0m"));
+                    }
+                }
+            }
+            Role::Assistant => {
+                let text = m.text.trim();
+                if !text.is_empty() {
+                    for line in text.lines() {
+                        rows.push(line.to_string());
+                    }
+                }
+                for tc in &m.tool_calls {
+                    rows.push(format!("\x1b[2m🔧 {}\x1b[0m", tc.name));
+                }
+            }
+        }
+    }
+    let total = rows.len();
+    if total > max_lines {
+        rows = rows.into_iter().skip(total - max_lines).collect();
+    }
+    rows
+}
+
+/// Reprint a tail of the operator's own conversation when returning to the
+/// interactive prompt (`:detach` / Shift-Tab wrap back to slot 0). Symmetric with
+/// [`backfill_attached`]: worker-entry replays the worker transcript, so
+/// interactive-entry must replay the interactive transcript — otherwise the
+/// worker's printed output leaves the chat stranded in scrollback and you land on
+/// a bare prompt. Returns `true` when it printed anything (so the caller can arm
+/// the prompt gap), `false` when there was nothing to replay or we're off a TTY
+/// (piped/non-interactive runs stay silent).
+fn backfill_interactive(session: &Session) -> bool {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        return false;
+    }
+    const TAIL_LINES: usize = 40;
+    let rows = render_interactive_history_tail(&session.history, TAIL_LINES);
+    if rows.is_empty() {
+        return false;
+    }
+    println!("{}", interactive_replay_header());
+    for row in rows {
+        println!("{row}");
+    }
+    true
+}
+
+
 /// Print a finished coordinator's final result inside the attach pane, so an
 /// operator who `:attach`es a done/failed worker sees the work they're about to
 /// continue from. A no-op when the worker isn't in this session.
@@ -3572,6 +3694,11 @@ fn detach_worker(session: &mut Session) {
             // the interactive output is already in scrollback — just re-anchor and
             // print the detach line trailing the worker output.
             crate::terminal::close_attach_view();
+            // Symmetric replay: the worker's output scrolled the interactive
+            // conversation up into scrollback, so reprint a tail of it above the
+            // prompt (mirrors worker-entry `backfill_attached`). Without this you'd
+            // land on a bare prompt — the reported bug.
+            backfill_interactive(session);
             let short = crate::batch::short_id(&run_id);
             println!(
                 "\x1b[2m⇄ detached from {short} — it keeps running; :workers to check, :result {short} when done\x1b[0m"
@@ -4097,12 +4224,14 @@ fn cycle_worker(session: &mut Session) -> bool {
         // already reflected on the 2nd statusline (see `coordinator_status_line`),
         // so printing it again would just be redundant noise in the scrollback.
         //
-        // Return false so the caller does NOT arm `needs_gap`: this branch prints
-        // no output, and `close_attach_view` already re-anchored the cursor to
-        // the bottom body row, so the prompt should redraw right there. Arming the
-        // gap would inject blank lines that scroll the output up two rows on every
-        // return trip.
-        return false;
+        // Symmetric replay: reprint a tail of the operator's own conversation so
+        // it trails right above the prompt again (the worker's inline output
+        // scrolled it up into scrollback). Mirrors worker-entry `backfill_attached`.
+        // Return whatever it printed: `true` when it replayed (arm `needs_gap` so
+        // the prompt gets a clean gap below the replay), `false` when there was
+        // nothing to replay / off a TTY (old behavior — no gap, cursor already
+        // re-anchored by `close_attach_view`).
+        return backfill_interactive(session);
     }
 
     // Open the worker view inline on the primary buffer WITHOUT destroying
@@ -8039,6 +8168,41 @@ mod tests {
         let fresult = t.find("Prior result body").unwrap();
         let ffollow = t.find("now also handle X").unwrap();
         assert!(ftask < fresult && fresult < ffollow, "ordering wrong: {t}");
+    }
+
+    #[test]
+    fn interactive_history_tail_renders_and_tails() {
+        use crate::backend::{Msg, Role, ToolCall};
+        let mut assistant_with_tool = Msg::user("");
+        assistant_with_tool.role = Role::Assistant;
+        assistant_with_tool.text = "Here is the plan".to_string();
+        assistant_with_tool.tool_calls = vec![ToolCall {
+            id: "1".to_string(),
+            name: "read_file".to_string(),
+            args: serde_json::json!({}),
+        }];
+
+        let history = vec![
+            Msg::user("[Context compacted: 3 earlier message(s) …]"),
+            Msg::user("first question"),
+            assistant_with_tool,
+            Msg::tool_results(vec![]),
+            Msg::user("second question"),
+        ];
+
+        let rows = render_interactive_history_tail(&history, 40);
+        let joined = rows.join("\n");
+        assert!(joined.contains("💬 first question"), "{joined}");
+        assert!(joined.contains("💬 second question"), "{joined}");
+        assert!(joined.contains("Here is the plan"), "{joined}");
+        assert!(joined.contains("🔧 read_file"), "{joined}");
+        assert!(!joined.contains("Context compacted"), "{joined}");
+
+        let capped = render_interactive_history_tail(&history, 1);
+        assert_eq!(capped.len(), 1, "tail cap not applied: {capped:?}");
+        assert!(capped[0].contains("second question"), "{capped:?}");
+
+        assert!(render_interactive_history_tail(&[], 40).is_empty());
     }
 
     #[test]
