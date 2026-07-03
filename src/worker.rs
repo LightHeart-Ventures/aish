@@ -636,12 +636,56 @@ pub fn pane_content_cols(label: &str) -> usize {
     }
 }
 
+/// Fold control characters in pane row text into single spaces so a row stays a
+/// single logical line inside the `┃` bordered column. A raw newline (or CR/tab)
+/// — e.g. from a coordinator's multi-line task prompt replayed on `:attach` —
+/// would otherwise print a physical line break that escapes the pane box. ESC
+/// (`\x1b`) is preserved along with its CSI sequence so inline ANSI SGR colour
+/// survives untouched; every other C0/DEL control becomes a space, and runs of
+/// folded controls collapse to one space to avoid ragged gaps. Pure —
+/// unit-tested.
+fn fold_pane_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Copy an ESC-initiated CSI escape verbatim (ESC '[' … final alpha).
+            out.push(c);
+            if chars.peek() == Some(&'[') {
+                out.push(chars.next().unwrap());
+                while let Some(&cc) = chars.peek() {
+                    out.push(chars.next().unwrap());
+                    if cc.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if c.is_control() {
+            if !out.ends_with(' ') {
+                out.push(' ');
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Width-parameterized core of [`pane_row`] — pure, so wrapping is unit-tested
 /// without touching the terminal or global `$COLUMNS`. `cols == usize::MAX`
 /// means "unknown width" → never wrap (single line, byte-identical to the
 /// pre-wrap behaviour).
 fn pane_row_cols(label: &str, text: &str, cols: usize, border: &str) -> String {
     use unicode_width::UnicodeWidthStr;
+    // Fold embedded control chars (newlines/CR/tab from a multi-line task prompt
+    // or a chatty tool line) into single spaces FIRST — a raw `\n` in the row
+    // text would print a physical line break that escapes the `┃` bordered
+    // column, shattering the pane box (the reported `:attach` replay bug). ANSI
+    // SGR runs are preserved verbatim so inline colour survives.
+    let folded = fold_pane_controls(text);
+    let text = folded.as_str();
     let first = format!("{border} \x1b[2m[{label}]\x1b[0m {text}");
     if cols == usize::MAX {
         return first; // unknown width (piped/tests): never wrap
@@ -3825,6 +3869,51 @@ mod tests {
         );
         // The bold is closed so it doesn't bleed into following rows.
         assert!(row.ends_with("\x1b[0m"), "bold is reset at the end: {row}");
+    }
+
+    #[test]
+    fn pane_row_folds_newlines_so_the_box_border_is_never_broken() {
+        // A multi-line task prompt (the `:attach` replay bug) must render as a
+        // SINGLE physical line — no raw newline may escape the `┃` column.
+        let task = "Phase A0 Extraction\n\nMove builders.ts\nand validators.ts";
+        // Fixed width so the wrap path runs; every emitted line must carry a border.
+        let row = pane_row_cols("w_llQBTM29", task, 200, PANE_BORDER);
+        assert!(
+            !row.contains('\n'),
+            "no raw newline survives when the folded row fits one line: {row:?}"
+        );
+        assert!(
+            row.contains("Phase A0 Extraction") && row.contains("validators.ts"),
+            "task text is preserved (newlines folded to spaces): {row:?}"
+        );
+        assert!(
+            !row.contains("Extraction\n") && !row.contains("Extraction  "),
+            "consecutive control chars collapse to a single space: {row:?}"
+        );
+        // When wrapping DOES split a long folded prompt, every continuation line
+        // still begins with the pane border — the box is never breached.
+        let long = "alpha\nbeta\ngamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega extra words to force a wrap here please";
+        let wrapped = pane_row_cols("w_x", long, 40, PANE_BORDER);
+        for line in wrapped.split('\n') {
+            assert!(
+                line.starts_with(PANE_BORDER),
+                "every wrapped line keeps the border: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fold_pane_controls_preserves_ansi_sgr() {
+        // Inline colour (bold task glyph) must survive the fold untouched.
+        let text = "\x1b[1m💬 task: line one\nline two\x1b[0m";
+        let folded = fold_pane_controls(text);
+        assert!(folded.contains("\x1b[1m"), "SGR open preserved: {folded:?}");
+        assert!(folded.contains("\x1b[0m"), "SGR reset preserved: {folded:?}");
+        assert!(!folded.contains('\n'), "newline folded away: {folded:?}");
+        assert!(
+            folded.contains("line one line two"),
+            "newline became a single space: {folded:?}"
+        );
     }
 
     #[test]
