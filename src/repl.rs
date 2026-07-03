@@ -6025,7 +6025,21 @@ async fn handle_colon(
                         let b_ts = b.created_at.as_deref().and_then(crate::style::parse_sqlite_utc).unwrap_or(0);
                         b_ts.cmp(&a_ts)
                     });
+                    // TASK-302: the goal loop mints a fresh `goal-<uuid>` run per
+                    // turn, so every turn lands its own durable row — `:workers`
+                    // otherwise renders one row per turn (each a different phase),
+                    // which reads as "the goal coordinator appears twice". Rows are
+                    // sorted newest-first above, so keeping only the FIRST row per
+                    // recovered goal condition collapses a multi-turn goal to a
+                    // single row showing its latest phase. Non-goal rows return
+                    // `None` and pass through untouched.
+                    let mut seen_goal_conditions = std::collections::HashSet::new();
                     for r in durable {
+                        if let Some(cond) = crate::goal::goal_condition_from_directive(&r.task) {
+                            if !seen_goal_conditions.insert(cond) {
+                                continue;
+                            }
+                        }
                         any = true;
                         let is_me = r.session_id.as_deref() == Some(session.session_id.as_str());
                         let label = r
