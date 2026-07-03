@@ -92,6 +92,20 @@ static LAST_FOOTER_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
 /// Ensures the heartbeat thread is spawned at most once per process.
 static HEARTBEAT_SPAWNED: AtomicBool = AtomicBool::new(false);
 
+/// True while the in-progress input line is non-empty. The heartbeat NEVER
+/// repaints while this is set, so a partially-typed command can never be
+/// clobbered by a footer repaint racing rustyline's own line render (the
+/// "prompt eaten by the cursor" bug). Set from the highlighter on every redraw
+/// (via [`set_input_dirty`]) and cleared when a fresh read begins.
+static INPUT_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// Record whether the input buffer currently holds text. The rustyline
+/// highlighter calls this on every line render, so the heartbeat can back off
+/// the moment the user starts typing and re-arm once the buffer is empty again.
+pub fn set_input_dirty(dirty: bool) {
+    INPUT_DIRTY.store(dirty, Ordering::Relaxed);
+}
+
 /// Monotonic milliseconds since a fixed process epoch — cheap, thread-shared,
 /// and immune to wall-clock jumps (unlike `SystemTime`).
 fn heartbeat_now_ms() -> u64 {
@@ -112,6 +126,9 @@ pub fn note_footer_activity() {
 pub fn set_reading_line(reading: bool) {
     READING_LINE.store(reading, Ordering::Relaxed);
     if reading {
+        // A fresh read starts with an empty buffer; clear any stale dirty flag
+        // and re-arm the idle timer so the heartbeat waits a full interval.
+        set_input_dirty(false);
         note_footer_activity();
     }
 }
@@ -139,6 +156,10 @@ pub fn spawn_footer_heartbeat() {
                 if !ACTIVE.load(Ordering::Relaxed)
                     || !READING_LINE.load(Ordering::Relaxed)
                     || ATTACH_ACTIVE.load(Ordering::Relaxed)
+                    // Never repaint over a line the user is mid-editing — a
+                    // non-empty buffer means rustyline owns the visible cursor
+                    // and a racing footer repaint would eat the prompt.
+                    || INPUT_DIRTY.load(Ordering::Relaxed)
                 {
                     continue;
                 }
@@ -870,6 +891,19 @@ mod tests {
         // the moment a line is submitted / an engine turn begins.
         set_reading_line(false);
         assert!(!READING_LINE.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn input_dirty_flag_round_trips_and_read_clears_it() {
+        // A non-empty in-progress line sets the dirty flag; the heartbeat reads
+        // it and backs off (verified indirectly — the gate is a plain load).
+        set_input_dirty(true);
+        assert!(INPUT_DIRTY.load(Ordering::Relaxed));
+        // Starting a fresh read always clears the flag — the buffer is empty at
+        // the new prompt, so the heartbeat is free to repaint the footer again.
+        set_reading_line(true);
+        assert!(!INPUT_DIRTY.load(Ordering::Relaxed));
+        set_reading_line(false);
     }
 
     #[test]
