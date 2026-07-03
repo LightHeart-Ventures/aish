@@ -28,18 +28,32 @@
 //! the boundary becomes legible ("at HIGH complexity I guess wrong 60% of the
 //! time — always escalate there").
 //!
+//! ## Log rotation
+//! The `.jsonl` is append-only and would otherwise grow without bound. When the
+//! active file crosses a size threshold (default 5 MB, override with
+//! `AISH_REASONING_ROTATE_MB`; `0` disables) it is rotated: the active file is
+//! gzip-compressed into `…jsonl.1.gz`, older archives shift up
+//! (`.1.gz`→`.2.gz`→`.3.gz`), and anything past the newest [`MAX_ARCHIVES`] is
+//! deleted. Rotation never loses data from the summary: [`summarize`] folds the
+//! retained gzip archives (oldest→newest) *and* the active file in append order,
+//! so a decision recorded before a rotation still counts, and an outcome update
+//! written after a rotation still folds onto its (now-archived) event. Archives
+//! stay auditable on disk; the retained set bounds both disk use and the
+//! summarize scan.
+//!
 //! ## Safety & robustness
 //! Everything here is best-effort: a write that fails (full disk, read-only
 //! mount) is swallowed so telemetry can never break a live turn. Reads skip
 //! malformed lines, so a torn final write degrades to "summarize what parses".
-//! Topic/rationale strings are truncated before they touch disk. This module
-//! is purely OBSERVATIONAL — it records what happened and never changes agent
-//! behavior.
+//! Rotation is likewise best-effort — a failed rename/gzip leaves the active
+//! file in place and the turn unaffected. Topic/rationale strings are truncated
+//! before they touch disk. This module is purely OBSERVATIONAL — it records what
+//! happened and never changes agent behavior.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 /// Cap on any recorded free-text field (topic / rationale). Keeps the `.jsonl`
@@ -223,9 +237,101 @@ pub fn log_path() -> PathBuf {
         .join("reasoning-telemetry.jsonl")
 }
 
+/// Number of gzip archives retained after rotation (`.1.gz` newest … `.N.gz`
+/// oldest). Anything older is deleted so disk use — and the [`summarize`] scan —
+/// stays bounded.
+pub const MAX_ARCHIVES: usize = 3;
+
+/// Default rotation threshold in megabytes when `AISH_REASONING_ROTATE_MB` is
+/// unset.
+const DEFAULT_ROTATE_MB: f64 = 5.0;
+
+/// Rotation size threshold in bytes. Read from `AISH_REASONING_ROTATE_MB`
+/// (megabytes, fractional allowed for tests) each call so an override takes
+/// effect without a restart. A value `<= 0` (or unparseable-to-positive)
+/// disables rotation and returns `0`.
+fn rotate_threshold_bytes() -> u64 {
+    let mb = std::env::var("AISH_REASONING_ROTATE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|m| m.is_finite())
+        .unwrap_or(DEFAULT_ROTATE_MB);
+    if mb <= 0.0 {
+        return 0;
+    }
+    (mb * 1_048_576.0) as u64
+}
+
+/// The path of the `n`-th archive for a given active log path: `<path>.<n>.gz`
+/// (`n = 1` is the most recent).
+fn archive_path(path: &Path, n: usize) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(format!(".{n}.gz"));
+    PathBuf::from(s)
+}
+
+/// gzip `src` into `dst` (overwriting). Best-effort: returns `false` on any I/O
+/// error, leaving the caller to keep the active file in place.
+fn gzip_file(src: &Path, dst: &Path) -> bool {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    let Ok(input) = std::fs::read(src) else {
+        return false;
+    };
+    let Ok(out) = std::fs::File::create(dst) else {
+        return false;
+    };
+    let mut enc = GzEncoder::new(out, Compression::default());
+    if enc.write_all(&input).is_err() {
+        return false;
+    }
+    match enc.finish() {
+        Ok(mut f) => f.flush().is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Rotate the active log: evict the oldest archive, shift the rest up, gzip the
+/// active file into `.1.gz`, and clear the active file. Best-effort throughout —
+/// a partial failure never propagates. Only invoked once the active file has
+/// crossed the size threshold.
+fn rotate(path: &Path) {
+    // Only compress a file that actually has content (guards against clearing a
+    // file that was truncated out from under us between the size check and here).
+    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) == 0 {
+        return;
+    }
+    // Evict the oldest retained archive; it is about to be pushed off the end.
+    let _ = std::fs::remove_file(archive_path(path, MAX_ARCHIVES));
+    // Shift the remaining archives up one slot: .2.gz → .3.gz, .1.gz → .2.gz.
+    for n in (1..MAX_ARCHIVES).rev() {
+        let src = archive_path(path, n);
+        if src.exists() {
+            let _ = std::fs::rename(&src, archive_path(path, n + 1));
+        }
+    }
+    // Sweep any stragglers beyond the retained window (e.g. left over from a run
+    // with a larger MAX_ARCHIVES or a shrunk threshold) so the set stays bounded.
+    for n in (MAX_ARCHIVES + 1)..=(MAX_ARCHIVES + 8) {
+        let stray = archive_path(path, n);
+        if stray.exists() {
+            let _ = std::fs::remove_file(stray);
+        }
+    }
+    // Compress the active file into the freshest archive slot, then clear it.
+    // Only clear on a successful gzip so a compression failure never drops data.
+    if gzip_file(path, &archive_path(path, 1)) {
+        // Truncate in place (recreate empty) — the next append reopens it.
+        let _ = OpenOptions::new().write(true).truncate(true).open(path);
+    }
+}
+
 /// Append one JSON record as a single line. Best-effort — a failure (missing
 /// parent dir it couldn't create, read-only mount) is swallowed and returns
 /// `false` so a caller can note "not logged" without ever erroring a turn.
+///
+/// After a successful write the active file is size-checked and rotated when it
+/// crosses the threshold (see the module-level "Log rotation" note).
 fn append_line(line: &str) -> bool {
     let path = log_path();
     if let Some(parent) = path.parent() {
@@ -237,10 +343,12 @@ fn append_line(line: &str) -> bool {
     let mut buf = line.to_string();
     buf.push('\n');
     let ok = file.write_all(buf.as_bytes()).is_ok() && file.flush().is_ok();
-    // Close the handle before any rotation rename/remove.
-    drop(file);
     if ok {
-        maybe_rotate(&path);
+        let threshold = rotate_threshold_bytes();
+        if threshold > 0 && file.metadata().map(|m| m.len()).unwrap_or(0) >= threshold {
+            drop(file); // close before we rename/compress/truncate it
+            rotate(&path);
+        }
     }
     ok
 }
@@ -327,229 +435,249 @@ impl Summary {
     }
 }
 
-/// Read the telemetry log, fold outcome updates onto their events, and compute
-/// the [`Summary`]. Malformed lines are skipped. Returns an empty summary when
-/// the log is missing.
-///
-/// TASK-250: this is memoized. The first call folds the whole log and persists
-/// a `<log>-memo.json` sidecar (the folded [`Summary`] plus the per-guess index
-/// needed to re-fold late outcomes) tagged with the source file's length +
-/// mtime and the byte offset consumed. Subsequent calls that see a pure APPEND
-/// (the common case — telemetry is append-only) load the memo and fold ONLY the
-/// new tail bytes, so cost is O(new lines) rather than O(whole log). A shrink,
-/// in-place rewrite, or rotation invalidates the memo and triggers a full
-/// rescan. Set `AISH_REASONING_MEMO_FORCE_RESCAN=1` to always full-scan.
-pub fn summarize() -> Summary {
-    compute().0
+// ─────────────────────────── Memoized summary (Phase 3) ───────────────────────────
+//
+// `:reasoning` used to re-scan the entire `.jsonl` (parsing every line, rebuilding
+// the fold map) on every invocation — O(file). At 10k+ decisions that scan is
+// noticeable, and a user running `:reasoning` twice in a minute paid it twice.
+//
+// We now persist a compact **aggregate memo** (`reasoning-telemetry-memo.json`)
+// next to the log. It carries only the folded counters plus the source
+// mtime/byte-length and how many lines it was computed from:
+//
+//   { version, source_mtime, source_len, lines_consumed,
+//     total, overall, by_complexity, by_risk }
+//
+// Fast path — nothing changed since the memo (same mtime AND byte length):
+// deserialize the tiny memo and return it. No `.jsonl` scan at all → O(1)-ish
+// regardless of log size.
+//
+// Incremental path — the log only grew (append-only): fold ONLY the new lines
+// (from `lines_consumed` onward) onto the memo. Cost is O(new lines), not O(file).
+//
+// Full recompute — memo missing/stale/wrong-version, the log shrank/rotated, or
+// `AISH_REASONING_MEMO_FORCE_RESCAN=1`: scan the whole file and rewrite the memo
+// (the original behavior), then serve from it.
+//
+// Correctly folding a *late outcome onto an old event* requires per-event state
+// (which bucket the event fell in, and its current outcome) that the aggregate
+// memo alone cannot reconstruct. So the folded per-event state is kept in a
+// **sidecar** (`…-memo-events.json`) that is loaded only on the incremental/full
+// paths — never on the O(1) fast read. This keeps the aggregate memo small (and
+// the hot read genuinely cheap) while remaining exactly correct.
+
+/// Memo format version. Bump when the on-disk schema changes so an old memo is
+/// treated as stale (→ full recompute) instead of misread.
+const MEMO_VERSION: u32 = 1;
+
+/// The three per-level buckets, stored as explicit named fields so the memo
+/// serializes to a plain JSON object (`{"low":…,"medium":…,"high":…}`) without
+/// relying on enum-keyed maps.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+struct LevelBuckets {
+    #[serde(default)]
+    low: Bucket,
+    #[serde(default)]
+    medium: Bucket,
+    #[serde(default)]
+    high: Bucket,
 }
 
-// ---------------------------------------------------------------------------
-// TASK-250: memoized / incremental summary engine.
-// ---------------------------------------------------------------------------
-
-/// Memo schema version — bump to invalidate all on-disk memos after a change to
-/// the folded representation.
-const MEMO_V: u32 = 1;
-
-/// Diagnostic stats about how [`compute`] produced a [`Summary`]. Exposed for
-/// tests that assert the incremental hot path only scans NEW lines; the fields
-/// are unread in production (`summarize` discards them).
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-struct ScanStats {
-    /// True when the summary was served from the memo (whole or incrementally).
-    incremental: bool,
-    /// Number of source lines parsed during this call.
-    lines_scanned: usize,
+impl LevelBuckets {
+    fn get(&self, l: Level) -> Bucket {
+        match l {
+            Level::Low => self.low,
+            Level::Medium => self.medium,
+            Level::High => self.high,
+        }
+    }
+    fn get_mut(&mut self, l: Level) -> &mut Bucket {
+        match l {
+            Level::Low => &mut self.low,
+            Level::Medium => &mut self.medium,
+            Level::High => &mut self.high,
+        }
+    }
 }
 
-/// A remembered guess: enough to SUBTRACT its prior outcome contribution and
-/// ADD a new one when a late/updated outcome line arrives incrementally.
+/// The persisted aggregate memo (the small, O(1)-readable head). Mirrors the
+/// [`Summary`] counters plus the source-freshness fingerprint.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct MemoHead {
+    #[serde(default)]
+    version: u32,
+    /// Source mtime (nanoseconds since the UNIX epoch) at compute time.
+    #[serde(default)]
+    source_mtime: u64,
+    /// Source byte length at compute time — the primary append/rotation signal.
+    #[serde(default)]
+    source_len: u64,
+    /// How many raw lines of the source were consumed (the incremental cursor).
+    #[serde(default)]
+    lines_consumed: u64,
+    #[serde(default)]
+    total: usize,
+    #[serde(default)]
+    overall: Bucket,
+    #[serde(default)]
+    by_complexity: LevelBuckets,
+    #[serde(default)]
+    by_risk: LevelBuckets,
+}
+
+impl MemoHead {
+    fn to_summary(&self) -> Summary {
+        let mut by_complexity = BTreeMap::new();
+        let mut by_risk = BTreeMap::new();
+        for l in [Level::Low, Level::Medium, Level::High] {
+            by_complexity.insert(l, self.by_complexity.get(l));
+            by_risk.insert(l, self.by_risk.get(l));
+        }
+        Summary {
+            total: self.total,
+            overall: self.overall,
+            by_complexity,
+            by_risk,
+        }
+    }
+}
+
+/// Minimal folded per-event state kept in the sidecar so a later outcome update
+/// can be applied to an old event exactly (right decision, right buckets).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-struct GuessRec {
+struct MemoEvent {
+    decision: Decision,
     complexity: Level,
     risk: Level,
     outcome: Outcome,
 }
 
-/// On-disk memo sidecar: the folded summary plus the guess index and the source
-/// signature (len + mtime + consumed byte/line offset) that lets us decide
-/// between "unchanged", "pure append", and "stale → rescan".
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// In-memory working set: the aggregate head plus the per-event fold map.
+#[derive(Debug, Default)]
 struct Memo {
-    #[serde(default)]
-    v: u32,
-    source_len: u64,
-    #[serde(default)]
-    source_mtime_ns: u128,
-    computed_from_byte: u64,
-    #[serde(default)]
-    computed_from_line: u64,
-    total: usize,
-    overall: Bucket,
-    #[serde(default)]
-    by_complexity: BTreeMap<String, Bucket>,
-    #[serde(default)]
-    by_risk: BTreeMap<String, Bucket>,
-    #[serde(default)]
-    guesses: BTreeMap<String, GuessRec>,
+    head: MemoHead,
+    events: BTreeMap<String, MemoEvent>,
 }
 
-/// In-memory working accumulator folded over the log (or its new tail).
-#[derive(Default)]
-struct Acc {
-    total: usize,
-    overall: Bucket,
-    by_complexity: BTreeMap<Level, Bucket>,
-    by_risk: BTreeMap<Level, Bucket>,
-    guesses: BTreeMap<String, GuessRec>,
-    consumed_bytes: u64,
-    consumed_lines: u64,
-}
-
-/// Memo sidecar path: `<log-dir>/<stem>-memo.json`.
-fn memo_path() -> PathBuf {
-    let log = log_path();
-    let parent = log.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    let name = log
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("reasoning-telemetry.jsonl");
-    let base = name.strip_suffix(".jsonl").unwrap_or(name);
-    parent.join(format!("{base}-memo.json"))
-}
-
-fn mtime_ns(meta: &std::fs::Metadata) -> u128 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-}
-
-fn load_memo() -> Option<Memo> {
-    let data = std::fs::read(memo_path()).ok()?;
-    let memo: Memo = serde_json::from_slice(&data).ok()?;
-    if memo.v != MEMO_V {
-        return None;
-    }
-    Some(memo)
-}
-
-fn save_memo(acc: &Acc, source_len: u64, source_mtime_ns: u128) {
-    let memo = Memo {
-        v: MEMO_V,
-        source_len,
-        source_mtime_ns,
-        computed_from_byte: acc.consumed_bytes,
-        computed_from_line: acc.consumed_lines,
-        total: acc.total,
-        overall: acc.overall,
-        by_complexity: acc
-            .by_complexity
-            .iter()
-            .map(|(k, v)| (k.as_str().to_string(), *v))
-            .collect(),
-        by_risk: acc
-            .by_risk
-            .iter()
-            .map(|(k, v)| (k.as_str().to_string(), *v))
-            .collect(),
-        guesses: acc.guesses.clone(),
-    };
-    let Ok(json) = serde_json::to_string(&memo) else {
-        return;
-    };
-    let path = memo_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    // Write to a temp sidecar then rename for atomicity; best-effort.
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, json.as_bytes()).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
-}
-
-fn memo_to_acc(m: Memo) -> Acc {
-    let mut acc = Acc {
-        total: m.total,
-        overall: m.overall,
-        guesses: m.guesses,
-        consumed_bytes: m.computed_from_byte,
-        consumed_lines: m.computed_from_line,
-        ..Default::default()
-    };
-    for (k, v) in m.by_complexity {
-        acc.by_complexity.insert(Level::parse(&k), v);
-    }
-    for (k, v) in m.by_risk {
-        acc.by_risk.insert(Level::parse(&k), v);
-    }
-    acc
-}
-
-fn acc_to_summary(acc: &Acc) -> Summary {
-    Summary {
-        total: acc.total,
-        overall: acc.overall,
-        by_complexity: acc.by_complexity.clone(),
-        by_risk: acc.by_risk.clone(),
-    }
-}
-
-fn memo_to_summary(m: &Memo) -> Summary {
-    let mut s = Summary {
-        total: m.total,
-        overall: m.overall,
-        ..Default::default()
-    };
-    for (k, v) in &m.by_complexity {
-        s.by_complexity.insert(Level::parse(k), *v);
-    }
-    for (k, v) in &m.by_risk {
-        s.by_risk.insert(Level::parse(k), *v);
-    }
-    s
-}
-
-/// Read `path` from `offset` to EOF into a byte buffer (the appended tail).
-fn read_from(path: &Path, offset: u64) -> Option<Vec<u8>> {
-    let mut f = std::fs::File::open(path).ok()?;
-    f.seek(SeekFrom::Start(offset)).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    Some(buf)
-}
-
-/// Fold every complete (newline-terminated) line in `data` into `acc`,
-/// advancing `consumed_bytes`/`consumed_lines`. `start_offset` is the absolute
-/// byte position of `data[0]` in the source file. A trailing line WITHOUT a
-/// newline is left unconsumed (a torn/partial final write) and folded later
-/// once its terminating newline arrives. Returns the number of lines folded.
-fn consume_bytes(acc: &mut Acc, data: &[u8], start_offset: u64) -> usize {
-    let mut lines = 0usize;
-    let mut line_start = 0usize;
-    for (i, &b) in data.iter().enumerate() {
-        if b == b'\n' {
-            process_raw_line(acc, &data[line_start..i]);
-            lines += 1;
-            acc.consumed_lines += 1;
-            acc.consumed_bytes = start_offset + (i as u64) + 1;
-            line_start = i + 1;
+/// Path of the aggregate memo: `AISH_REASONING_MEMO` when set, else the sibling
+/// `…-memo.json` next to the log (default `~/.aish/reasoning-telemetry-memo.json`).
+pub fn memo_path() -> PathBuf {
+    if let Ok(p) = std::env::var("AISH_REASONING_MEMO") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
         }
     }
-    lines
+    let log = log_path();
+    let parent = log.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = log
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("reasoning-telemetry");
+    parent.join(format!("{stem}-memo.json"))
 }
 
-/// Parse one raw log line and fold it into `acc`: an `event` bumps the buckets
-/// (and, for a guess, records + tallies its embedded outcome); an `outcome`
-/// line re-folds a prior guess (subtract old contribution, add new).
-fn process_raw_line(acc: &mut Acc, raw: &[u8]) {
-    let Ok(text) = std::str::from_utf8(raw) else {
+/// Path of the per-event fold sidecar (`…-memo-events.json`).
+fn events_path() -> PathBuf {
+    let memo = memo_path();
+    let parent = memo.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = memo
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("reasoning-telemetry-memo");
+    parent.join(format!("{stem}-events.json"))
+}
+
+/// Whether the operator forced a full rescan (`AISH_REASONING_MEMO_FORCE_RESCAN`).
+fn force_rescan() -> bool {
+    matches!(
+        std::env::var("AISH_REASONING_MEMO_FORCE_RESCAN")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// mtime (ns since epoch) + byte length of the source log, if it exists.
+fn source_fingerprint(path: &Path) -> Option<(u64, u64)> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    Some((mtime, md.len()))
+}
+
+/// Signed contribution of one folded event to a single bucket (`+1` add / `-1`
+/// remove). Saturating so a torn memo can never underflow.
+fn apply_sign(b: &mut Bucket, me: &MemoEvent, add: bool) {
+    let adj = |x: &mut usize| {
+        if add {
+            *x += 1;
+        } else {
+            *x = x.saturating_sub(1);
+        }
+    };
+    adj(&mut b.total);
+    match me.decision {
+        Decision::Escalated => adj(&mut b.escalated),
+        Decision::Guessed => {
+            adj(&mut b.guessed);
+            match me.outcome {
+                Outcome::Correct => adj(&mut b.guess_correct),
+                Outcome::WrongTurn => adj(&mut b.guess_wrong),
+                Outcome::Pending | Outcome::Unknown => {}
+            }
+        }
+    }
+}
+
+/// Add/remove an event's contribution across overall + its complexity/risk buckets.
+fn contribute(head: &mut MemoHead, me: &MemoEvent, add: bool) {
+    if add {
+        head.total += 1;
+    } else {
+        head.total = head.total.saturating_sub(1);
+    }
+    apply_sign(&mut head.overall, me, add);
+    apply_sign(head.by_complexity.get_mut(me.complexity), me, add);
+    apply_sign(head.by_risk.get_mut(me.risk), me, add);
+}
+
+/// Fold a freshly-parsed event line onto the memo. A duplicate id replaces the
+/// prior state (last-write-wins, counted once) — matching the original
+/// `BTreeMap::insert` + single tally semantics.
+fn add_event(memo: &mut Memo, ev: &ReasoningEvent) {
+    let me = MemoEvent {
+        decision: ev.decision,
+        complexity: ev.complexity,
+        risk: ev.risk,
+        outcome: ev.outcome,
+    };
+    if let Some(old) = memo.events.get(&ev.id).copied() {
+        contribute(&mut memo.head, &old, false);
+    }
+    memo.events.insert(ev.id.clone(), me);
+    contribute(&mut memo.head, &me, true);
+}
+
+/// Fold an outcome update onto a (possibly old) event. Dangling updates — no
+/// matching event — are ignored, exactly as before.
+fn apply_outcome_line(memo: &mut Memo, id: &str, oc: Outcome) {
+    let Some(mut me) = memo.events.get(id).copied() else {
         return;
     };
-    let line = text.trim();
+    contribute(&mut memo.head, &me, false);
+    me.outcome = oc;
+    memo.events.insert(id.to_string(), me);
+    contribute(&mut memo.head, &me, true);
+}
+
+/// Fold one raw JSONL line onto the memo (event → tally; outcome → re-fold;
+/// blank/corrupt → skip). Mirrors the original per-line parsing.
+fn fold_line(memo: &mut Memo, line: &str) {
+    let line = line.trim();
     if line.is_empty() {
         return;
     }
@@ -562,258 +690,169 @@ fn process_raw_line(acc: &mut Acc, raw: &[u8]) {
             v.get("id").and_then(|i| i.as_str()),
             v.get("outcome").and_then(|o| o.as_str()),
         ) {
-            if let Some(newoc) = Outcome::parse(oc) {
-                if let Some(g) = acc.guesses.get(id).copied() {
-                    // Re-fold: retract the old outcome, apply the new one.
-                    adjust_guess(acc, g.complexity, g.risk, g.outcome, -1);
-                    adjust_guess(acc, g.complexity, g.risk, newoc, 1);
-                    if let Some(slot) = acc.guesses.get_mut(id) {
-                        slot.outcome = newoc;
-                    }
-                }
+            if let Some(oc) = Outcome::parse(oc) {
+                apply_outcome_line(memo, id, oc);
             }
         }
-        return;
-    }
-    if let Ok(ev) = serde_json::from_value::<ReasoningEvent>(v) {
-        acc.total += 1;
-        bump_counts(acc, &ev);
+    } else if let Ok(ev) = serde_json::from_value::<ReasoningEvent>(v) {
+        add_event(memo, &ev);
     }
 }
 
-/// Fold a fresh event into the overall/complexity/risk buckets.
-fn bump_counts(acc: &mut Acc, ev: &ReasoningEvent) {
-    let cx = ev.complexity;
-    let rk = ev.risk;
-    fn bump(bucket: &mut Bucket, decision: Decision) {
-        bucket.total += 1;
-        match decision {
-            Decision::Escalated => bucket.escalated += 1,
-            Decision::Guessed => bucket.guessed += 1,
-        }
+/// Load the aggregate memo head; `None` if missing, unreadable, or a wrong version.
+fn load_head() -> Option<MemoHead> {
+    let data = std::fs::read_to_string(memo_path()).ok()?;
+    let head: MemoHead = serde_json::from_str(&data).ok()?;
+    if head.version != MEMO_VERSION {
+        return None;
     }
-    bump(&mut acc.overall, ev.decision);
-    bump(acc.by_complexity.entry(cx).or_default(), ev.decision);
-    bump(acc.by_risk.entry(rk).or_default(), ev.decision);
-    if let Decision::Guessed = ev.decision {
-        // Apply the event's embedded outcome (usually Pending) and remember the
-        // guess so a later outcome line can re-fold it incrementally.
-        adjust_guess(acc, cx, rk, ev.outcome, 1);
-        acc.guesses.insert(
-            ev.id.clone(),
-            GuessRec {
-                complexity: cx,
-                risk: rk,
-                outcome: ev.outcome,
-            },
-        );
-    }
+    Some(head)
 }
 
-/// Add (`delta = 1`) or retract (`delta = -1`) a guess outcome's contribution
-/// to the correct/wrong counters across the overall + complexity + risk
-/// buckets. Pending/Unknown contribute nothing. Counters saturate at zero.
-fn adjust_guess(acc: &mut Acc, cx: Level, rk: Level, outcome: Outcome, delta: i64) {
-    fn apply(bucket: &mut Bucket, outcome: Outcome, delta: i64) {
-        match outcome {
-            Outcome::Correct => {
-                bucket.guess_correct = (bucket.guess_correct as i64 + delta).max(0) as usize
-            }
-            Outcome::WrongTurn => {
-                bucket.guess_wrong = (bucket.guess_wrong as i64 + delta).max(0) as usize
-            }
-            Outcome::Pending | Outcome::Unknown => {}
-        }
-    }
-    apply(&mut acc.overall, outcome, delta);
-    apply(acc.by_complexity.entry(cx).or_default(), outcome, delta);
-    apply(acc.by_risk.entry(rk).or_default(), outcome, delta);
-}
-
-/// The memoized core behind [`summarize`]. Returns the folded summary plus
-/// [`ScanStats`] describing whether the memo hot path was taken.
-fn compute() -> (Summary, ScanStats) {
-    let path = log_path();
-    let force = std::env::var("AISH_REASONING_MEMO_FORCE_RESCAN")
-        .map(|v| {
-            let v = v.trim();
-            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
-        })
-        .unwrap_or(false);
-
-    // The active file may be missing right after a rotation (it is recreated on
-    // the next append) — archives can still hold data, so don't early-return to
-    // empty here; fall through to the rotation-aware full recompute below.
-    let meta = std::fs::metadata(&path).ok();
-
-    if let (false, Some(meta)) = (force, meta.as_ref()) {
-        let cur_len = meta.len();
-        let cur_mtime_ns = mtime_ns(meta);
-        if let Some(memo) = load_memo() {
-            // Unchanged file → serve the memo verbatim (zero new lines).
-            if memo.source_len == cur_len && memo.source_mtime_ns == cur_mtime_ns {
-                return (
-                    memo_to_summary(&memo),
-                    ScanStats {
-                        incremental: true,
-                        lines_scanned: 0,
-                    },
-                );
-            }
-            // Pure append (grew, prefix intact) → fold only the new tail.
-            if cur_len > memo.source_len && memo.computed_from_byte <= cur_len {
-                let mut acc = memo_to_acc(memo);
-                let start = acc.consumed_bytes;
-                if let Some(tail) = read_from(&path, start) {
-                    let scanned = consume_bytes(&mut acc, &tail, start);
-                    let summary = acc_to_summary(&acc);
-                    save_memo(&acc, cur_len, cur_mtime_ns);
-                    return (
-                        summary,
-                        ScanStats {
-                            incremental: true,
-                            lines_scanned: scanned,
-                        },
-                    );
-                }
-            }
-            // Otherwise (shrunk / rewritten / rotated) → fall through to rescan.
-        }
-    }
-
-    // Full recompute (rotation-aware): fold the retained gzip archives
-    // oldest→newest FIRST, then the active file. This reconstructs global append
-    // order across a rotation boundary, so a pre-rotation event still counts and
-    // an outcome update written after a rotation folds onto its now-archived
-    // event. Archive contributions are baked into the memo, so a later pure
-    // append only re-scans the active tail (archives can't change without a
-    // rotation, and a rotation invalidates the memo anyway).
-    let mut acc = Acc::default();
-    fold_archives(&mut acc);
-    let data = std::fs::read(&path).unwrap_or_default();
-    let scanned = consume_bytes(&mut acc, &data, 0);
-    let summary = acc_to_summary(&acc);
-    // Persist a memo only when the active file exists — its len+mtime signature
-    // is what the incremental hot path keys on.
-    if let Some(meta) = meta.as_ref() {
-        save_memo(&acc, meta.len(), mtime_ns(meta));
-    }
-    (
-        summary,
-        ScanStats {
-            incremental: false,
-            lines_scanned: scanned,
-        },
-    )
-}
-
-/// Fold every retained gzip archive into `acc`, oldest generation first
-/// (`.{ROTATE_KEEP}.gz` … `.1.gz`), reconstructing append order so a later
-/// outcome update folds onto an event that has since been archived. Best-effort:
-/// an unreadable or truncated archive is skipped rather than losing the rest of
-/// the summary.
-fn fold_archives(acc: &mut Acc) {
-    for n in (1..=ROTATE_KEEP).rev() {
-        let Ok(f) = std::fs::File::open(archive_path(n)) else {
-            continue;
-        };
-        let mut buf = Vec::new();
-        if flate2::read::GzDecoder::new(f).read_to_end(&mut buf).is_ok() {
-            for line in buf.split(|&b| b == b'\n') {
-                process_raw_line(acc, line);
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TASK-251: size-threshold rotation of reasoning-telemetry.jsonl.
-// ---------------------------------------------------------------------------
-
-/// Default rotation threshold in MB; override with `AISH_REASONING_ROTATE_MB`
-/// (`0` or negative disables rotation entirely).
-const DEFAULT_ROTATE_MB: f64 = 5.0;
-
-/// Number of compressed archive generations to retain (`.1.gz` … `.N.gz`).
-const ROTATE_KEEP: usize = 3;
-
-/// Rotation threshold in bytes; `0` means rotation is disabled.
-fn rotate_limit_bytes() -> u64 {
-    let mb = std::env::var("AISH_REASONING_ROTATE_MB")
+/// Load the per-event fold sidecar (empty map when missing/unreadable).
+fn load_events() -> BTreeMap<String, MemoEvent> {
+    std::fs::read_to_string(events_path())
         .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(DEFAULT_ROTATE_MB);
-    if mb <= 0.0 {
-        return 0;
-    }
-    (mb * 1_048_576.0) as u64
+        .and_then(|d| serde_json::from_str(&d).ok())
+        .unwrap_or_default()
 }
 
-/// Archive path for rotation generation `n`: `<log>.<n>.gz` next to the log.
-fn archive_path(n: usize) -> PathBuf {
-    let log = log_path();
-    let parent = log.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    let name = log
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("reasoning-telemetry.jsonl");
-    parent.join(format!("{name}.{n}.gz"))
+/// Best-effort atomic write (temp + rename); swallows every error so telemetry
+/// can never break a turn.
+fn write_atomic(path: &Path, data: &[u8]) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, data).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
-/// Rotate the live log once it reaches the threshold. Best-effort — any failure
-/// leaves the live log in place so telemetry is never lost on a rotation error.
-fn maybe_rotate(path: &Path) {
-    let limit = rotate_limit_bytes();
-    if limit == 0 {
-        return;
+/// Persist the memo head + event sidecar (best-effort).
+fn write_memo(memo: &Memo) {
+    if let Ok(data) = serde_json::to_string(&memo.head) {
+        write_atomic(&memo_path(), data.as_bytes());
     }
-    let Ok(meta) = std::fs::metadata(path) else {
-        return;
+    if let Ok(data) = serde_json::to_string(&memo.events) {
+        write_atomic(&events_path(), data.as_bytes());
+    }
+}
+
+/// Scan the whole log from scratch, building both the aggregate head and the
+/// event fold map. Returns `None` only when the log file is absent.
+fn full_recompute() -> Option<Memo> {
+    let path = log_path();
+    let mut memo = Memo {
+        head: MemoHead {
+            version: MEMO_VERSION,
+            ..Default::default()
+        },
+        events: BTreeMap::new(),
     };
-    if meta.len() < limit {
-        return;
-    }
-    rotate(path);
-}
-
-/// Compress the live log into `.1.gz`, shifting older generations up and
-/// dropping anything past [`ROTATE_KEEP`]. The live log is then truncated (a
-/// fresh, empty file) and the memo invalidated so the next [`summarize`]
-/// recomputes cleanly.
-fn rotate(path: &Path) {
-    // Shift older generations up: .2.gz -> .3.gz, .1.gz -> .2.gz.
-    for n in (1..ROTATE_KEEP).rev() {
-        let src = archive_path(n);
-        if src.exists() {
-            let _ = std::fs::rename(&src, &archive_path(n + 1));
+    // Rotation-aware: fold the retained gzip archives oldest→newest (.N.gz …
+    // .1.gz) FIRST so an outcome update always folds onto an event seen at or
+    // before it, then the still-active file. Archives never grow in place, so
+    // only the active file's line count feeds the incremental cursor.
+    for n in (1..=MAX_ARCHIVES).rev() {
+        if let Ok(f) = std::fs::File::open(archive_path(&path, n)) {
+            for line_res in BufReader::new(flate2::read::GzDecoder::new(f)).lines() {
+                if let Ok(line) = line_res {
+                    fold_line(&mut memo, &line);
+                }
+            }
         }
     }
-    // Compress the live log into generation .1.gz.
-    let Ok(bytes) = std::fs::read(path) else {
-        return;
-    };
-    if gzip_to(&bytes, &archive_path(1)).is_ok() {
-        // Start a fresh live log and invalidate the memo (its source signature
-        // no longer matches the truncated file).
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(memo_path());
+    let file = std::fs::File::open(&path).ok()?;
+    let mut lines: u64 = 0;
+    for line_res in BufReader::new(file).lines() {
+        // Count every yielded line (Ok or Err) so the incremental cursor lines
+        // up with a future `.lines()` skip, even across an unreadable line.
+        lines += 1;
+        if let Ok(line) = line_res {
+            fold_line(&mut memo, &line);
+        }
     }
-    // Drop any generations beyond the retention window (e.g. leftover from a
-    // previously larger ROTATE_KEEP).
-    for n in (ROTATE_KEEP + 1)..=(ROTATE_KEEP + 8) {
-        let _ = std::fs::remove_file(archive_path(n));
+    memo.head.lines_consumed = lines;
+    if let Some((mtime, len)) = source_fingerprint(&path) {
+        memo.head.source_mtime = mtime;
+        memo.head.source_len = len;
     }
+    Some(memo)
 }
 
-/// gzip `bytes` into `dst` (pure-Rust miniz_oxide backend).
-fn gzip_to(bytes: &[u8], dst: &Path) -> std::io::Result<()> {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    let file = std::fs::File::create(dst)?;
-    let mut enc = GzEncoder::new(file, Compression::default());
-    enc.write_all(bytes)?;
-    enc.finish()?;
-    Ok(())
+/// Fold only the lines appended past `head.lines_consumed` onto a loaded memo.
+fn incremental(head: MemoHead) -> Memo {
+    let mut memo = Memo {
+        events: load_events(),
+        head,
+    };
+    let path = log_path();
+    if let Ok(file) = std::fs::File::open(&path) {
+        let skip = memo.head.lines_consumed;
+        let mut idx: u64 = 0;
+        for line_res in BufReader::new(file).lines() {
+            idx += 1;
+            if idx <= skip {
+                continue;
+            }
+            if let Ok(line) = line_res {
+                fold_line(&mut memo, &line);
+            }
+        }
+        memo.head.lines_consumed = idx.max(skip);
+        if let Some((mtime, len)) = source_fingerprint(&path) {
+            memo.head.source_mtime = mtime;
+            memo.head.source_len = len;
+        }
+    }
+    memo
+}
+
+/// Read the telemetry log's ground-truth [`Summary`], memoized.
+///
+/// * **Fast path** (memo fresh — same mtime AND byte length): return the tiny
+///   aggregate memo without scanning the log at all — O(1)-ish in log size.
+/// * **Incremental** (log only grew): fold just the new lines onto the memo.
+/// * **Full recompute** (missing/stale memo, shrink/rotation, or
+///   `AISH_REASONING_MEMO_FORCE_RESCAN=1`): rescan the whole file and rewrite.
+///
+/// Malformed lines are skipped; an absent log yields an empty summary. Every
+/// memo read/write is best-effort — a memo failure silently degrades to a full
+/// scan and never errors a turn.
+pub fn summarize() -> Summary {
+    let path = log_path();
+    let fp = source_fingerprint(&path);
+
+    // No log → nothing to summarize (don't serve a stale memo for a deleted log).
+    let Some((cur_mtime, cur_len)) = fp else {
+        return Summary::default();
+    };
+
+    if !force_rescan() {
+        if let Some(head) = load_head() {
+            // Fresh: neither the content nor the mtime moved → O(1) return.
+            if head.source_len == cur_len && head.source_mtime == cur_mtime {
+                return head.to_summary();
+            }
+            // Grew (append-only): fold only the new tail.
+            if cur_len > head.source_len {
+                let memo = incremental(head);
+                write_memo(&memo);
+                return memo.head.to_summary();
+            }
+            // Shrank / rewritten-in-place / same-len-new-mtime → fall through.
+        }
+    }
+
+    // Full recompute (memo missing, stale, forced, truncated, or rotated).
+    match full_recompute() {
+        Some(memo) => {
+            write_memo(&memo);
+            memo.head.to_summary()
+        }
+        None => Summary::default(),
+    }
 }
 
 /// Render the summary as a compact, human-readable report for the `:reasoning`
@@ -938,16 +977,15 @@ mod tests {
                 "aish_reasoning_{name}_{}.jsonl",
                 std::process::id()
             ));
-            let _ = std::fs::remove_file(&path);
             unsafe {
                 std::env::set_var("AISH_REASONING_LOG", &path);
+                // Start each test from a clean slate: no leaked force-rescan flag
+                // and no stale memo/sidecar from a prior (possibly panicked) run.
+                std::env::remove_var("AISH_REASONING_MEMO_FORCE_RESCAN");
             }
-            // Clear any stale sidecar/memo + rotation archives from a prior run
-            // that reused this name (same pid), so each test starts clean.
+            let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(memo_path());
-            for n in 1..=(ROTATE_KEEP + 8) {
-                let _ = std::fs::remove_file(archive_path(n));
-            }
+            let _ = std::fs::remove_file(events_path());
             TestLog {
                 _guard: guard,
                 path,
@@ -955,17 +993,31 @@ mod tests {
         }
     }
 
+    impl TestLog {
+        /// Set the rotation threshold (megabytes, fractional allowed) for the
+        /// duration of this test. Cleared on drop.
+        fn set_rotate_mb(&self, mb: &str) {
+            unsafe {
+                std::env::set_var("AISH_REASONING_ROTATE_MB", mb);
+            }
+        }
+    }
+
     impl Drop for TestLog {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
+            // memo_path()/events_path() resolve off AISH_REASONING_LOG — clean them
+            // up while the env var is still set, then unset everything.
             let _ = std::fs::remove_file(memo_path());
-            for n in 1..=(ROTATE_KEEP + 8) {
-                let _ = std::fs::remove_file(archive_path(n));
+            let _ = std::fs::remove_file(events_path());
+            let _ = std::fs::remove_file(&self.path);
+            // Sweep any archives this test produced.
+            for n in 1..=(MAX_ARCHIVES + 8) {
+                let _ = std::fs::remove_file(archive_path(&self.path, n));
             }
             unsafe {
                 std::env::remove_var("AISH_REASONING_LOG");
-                std::env::remove_var("AISH_REASONING_ROTATE_MB");
                 std::env::remove_var("AISH_REASONING_MEMO_FORCE_RESCAN");
+                std::env::remove_var("AISH_REASONING_ROTATE_MB");
             }
         }
     }
@@ -1100,244 +1152,261 @@ mod tests {
         assert!(ev.topic.ends_with('…'));
     }
 
-    // -------------------------------------------------------------------
-    // TASK-250: memoized / incremental summary.
-    // -------------------------------------------------------------------
+    // ── Memoization (Phase 3) ──────────────────────────────────────────────
 
-    #[test]
-    fn memo_is_written_and_reused_incrementally() {
-        let _log = TestLog::new("memo_incr");
-        record(&ReasoningEvent::new(Decision::Escalated, "a", "self_report")).unwrap();
-        // First summarize computes from scratch and writes the memo sidecar.
-        let (s1, st1) = compute();
-        assert_eq!(s1.total, 1);
-        assert!(!st1.incremental, "first pass is a full scan");
-        assert!(memo_path().exists(), "memo sidecar persisted");
-
-        // A pure re-read with no new lines must serve straight from the memo.
-        let (s2, st2) = compute();
-        assert_eq!(s2.total, 1);
-        assert!(st2.incremental);
-        assert_eq!(st2.lines_scanned, 0, "unchanged file scans nothing");
-
-        // Append one more event → only the NEW tail line is folded.
-        record(&ReasoningEvent::new(Decision::Guessed, "b", "self_report")).unwrap();
-        let (s3, st3) = compute();
-        assert_eq!(s3.total, 2);
-        assert!(st3.incremental, "append is the incremental hot path");
-        assert_eq!(st3.lines_scanned, 1, "only the appended line is scanned");
-        assert_eq!(s3.overall.escalated, 1);
-        assert_eq!(s3.overall.guessed, 1);
+    fn read_head() -> MemoHead {
+        serde_json::from_str(&std::fs::read_to_string(memo_path()).unwrap()).unwrap()
+    }
+    fn write_head(h: &MemoHead) {
+        std::fs::write(memo_path(), serde_json::to_string(h).unwrap()).unwrap();
     }
 
     #[test]
-    fn incremental_matches_full_rescan_with_late_outcome() {
-        let _log = TestLog::new("memo_outcome");
+    fn summarize_writes_memo_and_matches_full_scan() {
+        let _log = TestLog::new("memo_write");
+        record(
+            &ReasoningEvent::new(Decision::Escalated, "a", "self_report")
+                .with_levels(Level::High, Level::High, Level::High),
+        )
+        .unwrap();
+        record(
+            &ReasoningEvent::new(Decision::Guessed, "b", "self_report")
+                .with_levels(Level::Low, Level::Low, Level::Low)
+                .with_outcome(Outcome::Correct),
+        )
+        .unwrap();
+
+        let s = summarize();
+        assert_eq!(s.total, 2);
+        assert_eq!(s.overall.escalated, 1);
+        assert_eq!(s.overall.guessed, 1);
+
+        // Both memo files are now on disk and the head mirrors the summary.
+        assert!(memo_path().exists(), "aggregate memo written");
+        assert!(events_path().exists(), "event sidecar written");
+        let head = read_head();
+        assert_eq!(head.version, MEMO_VERSION);
+        assert_eq!(head.total, 2);
+        assert_eq!(head.lines_consumed, 2);
+        assert!(head.source_len > 0);
+    }
+
+    #[test]
+    fn fresh_memo_is_served_without_scanning_the_log() {
+        // AC: fresh memo path avoids full-file scan. Prove it by tampering the
+        // memo AFTER it's built and leaving the log untouched — a fast-path read
+        // returns the (bogus) memo value; a full rescan would return the real 1.
+        let _log = TestLog::new("memo_fast");
+        record(&ReasoningEvent::new(Decision::Guessed, "x", "self_report")).unwrap();
+        assert_eq!(summarize().total, 1);
+
+        let mut head = read_head();
+        head.total = 777; // sentinel the log content can never produce
+        write_head(&head);
+
+        // Log unchanged (same mtime + len) → fast path returns the tampered memo.
+        assert_eq!(summarize().total, 777, "fast path read the memo, not the log");
+    }
+
+    #[test]
+    fn incremental_folds_only_new_lines() {
+        // AC: only new lines processed. Sentinel-offset the memo, append one new
+        // event, and confirm the delta is ADDED to the memo (incremental) rather
+        // than recomputed from the whole file (which would give 2, not 102).
+        let _log = TestLog::new("memo_incr");
+        record(&ReasoningEvent::new(Decision::Guessed, "first", "self_report")).unwrap();
+        assert_eq!(summarize().total, 1); // memo: total=1, lines_consumed=1
+
+        let mut head = read_head();
+        head.total = 101; // +100 sentinel over the true count of 1
+        write_head(&head);
+
+        // Append a 2nd event → log grows → incremental path folds just that line.
+        record(&ReasoningEvent::new(Decision::Guessed, "second", "self_report")).unwrap();
+        let s = summarize();
+        assert_eq!(s.total, 102, "incremental added the one new line onto the memo");
+        assert_eq!(read_head().lines_consumed, 2);
+    }
+
+    #[test]
+    fn incremental_outcome_folds_onto_old_memoized_event() {
+        // The tricky correctness case: an outcome update lands AFTER the event was
+        // already memoized (and its per-event state discarded from RAM). The
+        // sidecar restores it so the fold is exact.
+        let _log = TestLog::new("memo_late_outcome");
         let id = record(
             &ReasoningEvent::new(Decision::Guessed, "risky", "self_report")
                 .with_levels(Level::High, Level::High, Level::High),
         )
         .unwrap();
-        // Prime the memo.
-        let primed = summarize();
-        assert_eq!(primed.overall.guess_wrong, 0);
+        let before = summarize(); // memoizes the pending guess
+        assert_eq!(before.overall.guess_wrong, 0);
+        assert_eq!(before.overall.guess_wrong_pct(), None);
 
-        // Late outcome arrives → incremental re-fold must reflect the wrong turn.
+        // Close the loop in a later append → incremental fold onto the old event.
         assert!(update_outcome(&id, Outcome::WrongTurn));
-        let incr = summarize();
-        assert_eq!(incr.overall.guess_wrong, 1);
-        assert_eq!(incr.overall.guess_wrong_pct(), Some(100));
-
-        // A forced full rescan must agree byte-for-byte with the incremental result.
-        unsafe {
-            std::env::set_var("AISH_REASONING_MEMO_FORCE_RESCAN", "1");
-        }
-        let (full, st) = compute();
-        unsafe {
-            std::env::remove_var("AISH_REASONING_MEMO_FORCE_RESCAN");
-        }
-        assert!(!st.incremental);
-        assert_eq!(full.total, incr.total);
-        assert_eq!(full.overall, incr.overall);
-        let hi_full = full.by_complexity.get(&Level::High).copied().unwrap();
-        let hi_incr = incr.by_complexity.get(&Level::High).copied().unwrap();
-        assert_eq!(hi_full, hi_incr);
+        let after = summarize();
+        assert_eq!(after.overall.guessed, 1);
+        assert_eq!(after.overall.guess_wrong, 1);
+        assert_eq!(after.overall.guess_wrong_pct(), Some(100));
+        let high = after.by_complexity.get(&Level::High).copied().unwrap();
+        assert_eq!(high.guess_wrong_pct(), Some(100));
     }
 
     #[test]
-    fn memo_invalidated_on_shrink_triggers_rescan() {
-        let _log = TestLog::new("memo_shrink");
+    fn shrunk_log_triggers_full_recompute() {
+        // AC: stale memo triggers correct full recompute + rewrite. A rotation /
+        // truncation makes the log SHORTER than the memo's recorded length.
+        let _log = TestLog::new("memo_stale");
         record(&ReasoningEvent::new(Decision::Guessed, "one", "self_report")).unwrap();
         record(&ReasoningEvent::new(Decision::Guessed, "two", "self_report")).unwrap();
         assert_eq!(summarize().total, 2);
 
-        // Rewrite the log smaller (as a rotation/truncate would) — the memo's
-        // source signature no longer matches, so the next compute full-rescans.
-        std::fs::write(
-            log_path(),
-            format!(
-                "{}\n",
-                serde_json::to_string(&ReasoningEvent::new(
-                    Decision::Escalated,
-                    "fresh",
-                    "self_report"
-                ))
-                .unwrap()
-            ),
-        )
-        .unwrap();
-        let (s, st) = compute();
-        assert_eq!(s.total, 1, "recomputed against the shrunken file");
+        // Sentinel the memo so a stale (fast/incremental) read would be obvious.
+        let mut head = read_head();
+        head.total = 999;
+        write_head(&head);
+
+        // Rotate: truncate the log and write a single fresh event → len shrinks.
+        std::fs::write(log_path(), b"").unwrap();
+        record(&ReasoningEvent::new(Decision::Escalated, "post-rotate", "self_report")).unwrap();
+
+        let s = summarize();
+        assert_eq!(s.total, 1, "full recompute, sentinel discarded");
         assert_eq!(s.overall.escalated, 1);
-        assert!(!st.incremental, "shrink forces a full rescan");
-    }
-
-    // -------------------------------------------------------------------
-    // TASK-251: size-threshold rotation.
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn rotation_archives_and_truncates_at_threshold() {
-        let _log = TestLog::new("rotate");
-        // Tiny threshold so a couple of records trip it.
-        unsafe {
-            std::env::set_var("AISH_REASONING_ROTATE_MB", "0.0001"); // ~104 bytes
-        }
-        // Write enough events to exceed the limit; rotation fires inside append.
-        for i in 0..20 {
-            record(&ReasoningEvent::new(
-                Decision::Guessed,
-                format!("event number {i} with some padding text"),
-                "self_report",
-            ));
-        }
-        // At least the first archive generation exists and is gzip-magic'd.
-        let gz = archive_path(1);
-        assert!(gz.exists(), "rotation produced a .1.gz archive");
-        let head = std::fs::read(&gz).unwrap();
-        assert!(head.len() >= 2 && head[0] == 0x1f && head[1] == 0x8b, "gzip magic");
-
-        // The live log was truncated at least once → it's smaller than the total
-        // volume written, and still readable/summarizable.
-        let live_len = std::fs::metadata(log_path()).map(|m| m.len()).unwrap_or(0);
-        assert!(live_len < 20 * 100, "live log truncated on rotation");
-        let _ = summarize(); // must not panic on a freshly-rotated log
+        // Memo was rewritten to the recomputed truth.
+        assert_eq!(read_head().total, 1);
     }
 
     #[test]
-    fn rotation_disabled_when_threshold_zero() {
-        let _log = TestLog::new("rotate_off");
+    fn force_rescan_env_bypasses_memo() {
+        // AC: AISH_REASONING_MEMO_FORCE_RESCAN=1 forces a full scan.
+        let _log = TestLog::new("memo_force");
+        record(&ReasoningEvent::new(Decision::Guessed, "x", "self_report")).unwrap();
+        assert_eq!(summarize().total, 1);
+
+        let mut head = read_head();
+        head.total = 555; // sentinel a fast path would surface
+        write_head(&head);
+
         unsafe {
-            std::env::set_var("AISH_REASONING_ROTATE_MB", "0");
+            std::env::set_var("AISH_REASONING_MEMO_FORCE_RESCAN", "1");
         }
-        for i in 0..50 {
-            record(&ReasoningEvent::new(
-                Decision::Guessed,
-                format!("padding padding padding event {i}"),
-                "self_report",
-            ));
+        // Forced → ignore the tampered memo, rescan the (unchanged) log → real 1.
+        assert_eq!(summarize().total, 1, "force-rescan ignored the memo");
+        unsafe {
+            std::env::remove_var("AISH_REASONING_MEMO_FORCE_RESCAN");
         }
-        assert!(
-            !archive_path(1).exists(),
-            "no archive when rotation disabled"
-        );
-        assert_eq!(summarize().total, 50);
     }
 
     #[test]
-    fn rotation_retains_only_keep_generations() {
-        let _log = TestLog::new("rotate_keep");
-        unsafe {
-            std::env::set_var("AISH_REASONING_ROTATE_MB", "0.0001");
-        }
-        // Many events → several rotations.
-        for i in 0..200 {
-            record(&ReasoningEvent::new(
-                Decision::Guessed,
-                format!("event {i} with a decent amount of padding to grow the log fast"),
-                "self_report",
-            ));
-        }
-        // Never keep more than ROTATE_KEEP generations.
-        assert!(archive_path(1).exists());
-        assert!(
-            !archive_path(ROTATE_KEEP + 1).exists(),
-            "generations beyond ROTATE_KEEP are pruned"
-        );
+    fn missing_memo_falls_back_to_full_scan() {
+        let _log = TestLog::new("memo_missing");
+        record(&ReasoningEvent::new(Decision::Guessed, "x", "self_report")).unwrap();
+        assert_eq!(summarize().total, 1);
+        // Delete the memo → next summarize must full-recompute and rebuild it.
+        std::fs::remove_file(memo_path()).unwrap();
+        let s = summarize();
+        assert_eq!(s.total, 1);
+        assert!(memo_path().exists(), "memo rebuilt after loss");
     }
-
-    // -------------------------------------------------------------------
-    // Rotation + summarize: no data lost across the rotation boundary.
-    // (Guards the archive-folding path in `compute`.)
-    // -------------------------------------------------------------------
+    // ----- rotation (TASK-251) -----
 
     #[test]
-    fn rotation_loses_no_data_across_boundary() {
-        let _log = TestLog::new("rotate_nodata");
-        unsafe {
-            std::env::set_var("AISH_REASONING_ROTATE_MB", "0.0008");
-        }
-        // A handful of guesses; rotation archives the earliest into .1.gz.
+    fn rotate_threshold_env_is_honored() {
+        let log = TestLog::new("threshold");
+        log.set_rotate_mb("5");
+        assert_eq!(rotate_threshold_bytes(), 5 * 1_048_576);
+        // 0 disables rotation.
+        log.set_rotate_mb("0");
+        assert_eq!(rotate_threshold_bytes(), 0);
+        // Fractional MB (used by these tests) resolves to bytes.
+        log.set_rotate_mb("0.5");
+        assert_eq!(rotate_threshold_bytes(), 524_288);
+        // Unparseable → falls back to the 5 MB default (never disables by accident).
+        log.set_rotate_mb("garbage");
+        assert_eq!(rotate_threshold_bytes(), (DEFAULT_ROTATE_MB * 1_048_576.0) as u64);
+    }
+
+    #[test]
+    fn rotation_creates_gz_archive_and_loses_no_data() {
+        let log = TestLog::new("rotate_gz");
+        // ~0.8 KB threshold → one rotation across ~6 small event lines.
+        log.set_rotate_mb("0.0008");
         for i in 0..6 {
             record(&ReasoningEvent::new(
                 Decision::Guessed,
-                format!("event {i}"),
+                format!("e{i}"),
                 "t",
             ))
             .unwrap();
         }
-        // Force a full, rotation-aware rescan (archives folded before active).
-        unsafe {
-            std::env::set_var("AISH_REASONING_MEMO_FORCE_RESCAN", "1");
-        }
+        // A gzip archive was produced by the rotation.
+        assert!(
+            archive_path(&log.path, 1).exists(),
+            ".1.gz archive should exist after rotation"
+        );
+        // No data lost: the summary still folds every event (archive + active).
         let s = summarize();
-        unsafe {
-            std::env::remove_var("AISH_REASONING_MEMO_FORCE_RESCAN");
-        }
-        assert_eq!(s.total, 6, "every event counted across the rotation boundary");
+        assert_eq!(s.total, 6, "all events counted across the rotation boundary");
         assert_eq!(s.overall.guessed, 6);
     }
 
     #[test]
-    fn outcome_update_folds_onto_archived_event_after_rotation() {
-        let _log = TestLog::new("rotate_fold");
-        unsafe {
-            std::env::set_var("AISH_REASONING_ROTATE_MB", "0.0008");
+    fn only_last_max_archives_are_retained() {
+        let log = TestLog::new("retain");
+        // Tiny threshold → rotate every ~2 events; write enough to rotate well
+        // past MAX_ARCHIVES so the oldest archives are evicted.
+        log.set_rotate_mb("0.00025");
+        for i in 0..14 {
+            record(&ReasoningEvent::new(
+                Decision::Escalated,
+                format!("e{i}"),
+                "t",
+            ))
+            .unwrap();
         }
+        for n in 1..=MAX_ARCHIVES {
+            assert!(
+                archive_path(&log.path, n).exists(),
+                "archive .{n}.gz should be retained"
+            );
+        }
+        assert!(
+            !archive_path(&log.path, MAX_ARCHIVES + 1).exists(),
+            "archive beyond MAX_ARCHIVES must be evicted"
+        );
+    }
+
+    #[test]
+    fn outcome_update_folds_onto_archived_event_after_rotation() {
+        let log = TestLog::new("rotate_fold");
+        log.set_rotate_mb("0.0008");
         // The tracked guess, recorded first so it lands in the first archive.
         let id = record(
             &ReasoningEvent::new(Decision::Guessed, "risky call", "t")
                 .with_levels(Level::High, Level::High, Level::High),
         )
         .unwrap();
-        // Push fillers until the first rotation archives the early records — we
-        // stop at the first archive so the tracked event stays within the
-        // retained window (no eviction) regardless of exact line sizes.
-        let mut i = 0;
-        while !archive_path(1).exists() && i < 100 {
+        // Filler escalations push the active file past the threshold, archiving
+        // the tracked event out of the hot file.
+        for i in 0..6 {
             record(&ReasoningEvent::new(
                 Decision::Escalated,
-                format!("filler event {i} with padding to grow the active log"),
+                format!("f{i}"),
                 "t",
-            ));
-            i += 1;
+            ))
+            .unwrap();
         }
         assert!(
-            archive_path(1).exists(),
+            archive_path(&log.path, 1).exists(),
             "rotation should have archived the early records"
         );
-        // Close the loop AFTER rotation — the update lands in the fresh active
-        // file yet must still fold onto the now-archived event.
+        // Close the loop *after* rotation — the update is written to the fresh
+        // active file, yet must still fold onto the now-archived event.
         assert!(update_outcome(&id, Outcome::WrongTurn));
 
-        // Force a rescan so we exercise the archive-folding path deterministically.
-        unsafe {
-            std::env::set_var("AISH_REASONING_MEMO_FORCE_RESCAN", "1");
-        }
         let s = summarize();
-        unsafe {
-            std::env::remove_var("AISH_REASONING_MEMO_FORCE_RESCAN");
-        }
         assert_eq!(s.overall.guessed, 1, "only the tracked decision is a guess");
         assert_eq!(
             s.overall.guess_wrong, 1,
