@@ -54,6 +54,7 @@ mod tools;
 mod tool_telemetry;
 mod turn_audit;
 mod update;
+mod schedule;
 mod worker;
 mod worker_store;
 

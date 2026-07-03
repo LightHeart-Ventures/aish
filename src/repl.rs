@@ -1133,6 +1133,26 @@ fn coordinator_status_message(session: &Session) -> String {
         .collect();
     let color_on = crate::style::colors_enabled();
     let mut left = coordinator_status_line(attached.as_deref(), &workers, color_on);
+    // Fold any active `:schedule` status (a task just fired / finished) onto the
+    // SecondStatusLine ahead of the coordinator hint, so the operator sees
+    // scheduled-task lifecycle transitions live in the footer.
+    left = match session.schedule.status_line() {
+        Some(s) if left.is_empty() => {
+            if color_on {
+                format!("\x1b[36m{s}\x1b[0m")
+            } else {
+                s
+            }
+        }
+        Some(s) => {
+            if color_on {
+                format!("\x1b[36m{s}\x1b[0m  \u{b7}  {left}")
+            } else {
+                format!("{s}  \u{b7}  {left}")
+            }
+        }
+        None => left,
+    };
     // A fired `:alert` claims the head of this row until the next prompt — the
     // compact banner the presenter stashed. Yellow so it stands apart from the
     // worker badges; the full detail already printed above the prompt.
@@ -1382,6 +1402,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     (
         "rewrite",
         "AI-rewrite intent into a command (edit/accept before run)",
+    ),
+    (
+        "schedule",
+        "run a task later/recurring (cron or `in 5 min …`); no args = list",
     ),
     ("skill", "manage skills (add|search|list|remove)"),
     (
@@ -5901,6 +5925,58 @@ async fn handle_colon(
                 println!("\x1b[2m:result <job> to view a result\x1b[0m");
             } else {
                 println!("no background jobs");
+            }
+        }
+        Some("schedule") => {
+            // Deferred / recurring background tasks. `:schedule` alone lists;
+            // `:schedule clear [N]` cancels; otherwise the rest is
+            // `<cron|in N unit|every N unit> <task>` and always fires as a
+            // background coordinator (never inline).
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            let rest = rest.trim();
+            if rest.is_empty() {
+                println!("{}", session.schedule.list());
+            } else if let Some(arg) = rest.strip_prefix("clear") {
+                let arg = arg.trim();
+                let num = if arg.is_empty() {
+                    None
+                } else {
+                    arg.parse::<u64>().ok()
+                };
+                if !arg.is_empty() && num.is_none() {
+                    println!("usage: :schedule clear [N]");
+                } else {
+                    println!("{}", session.schedule.clear(num));
+                }
+            } else if session.nested {
+                println!(
+                    "can't :schedule from inside a coordinator (no nested coordinators)"
+                );
+            } else {
+                match std::env::current_exe() {
+                    Ok(exe) => {
+                        let ctx = crate::schedule::SpawnCtx {
+                            exe,
+                            cwd: session.cwd.clone(),
+                            backend: session.backend_kind.clone(),
+                            model: crate::worker::coordinator_model(
+                                &session.backend_kind,
+                                &session.batch_model,
+                            ),
+                            env: session.env.clone(),
+                            launch_session_id: session.session_id.clone(),
+                            launch_session_name: session.name.clone(),
+                            show_output: session.show_worker_output.clone(),
+                            attached: session.attached.clone(),
+                            worker_jobs: session.worker_jobs.clone(),
+                            coordinator_store: session.coordinator_store.clone(),
+                        };
+                        println!("{}", session.schedule.add(rest, ctx));
+                    }
+                    Err(e) => println!(
+                        "can't locate the aish binary to launch scheduled coordinators: {e}"
+                    ),
+                }
             }
         }
         Some("dispatch") => {
