@@ -231,12 +231,40 @@ table of defaults and how to force a fresh update check / reasoning rescan.
 · `:backend <claude|local>` — switch inference backend
 · `:yolo` — shorthand for `:mode yolo`
 · `:new` — start a fresh session
+· `:goal <new|show|status|link|block|unblock|milestone|complete>` — manage long-horizon goals (see [Goals](#goals--long-horizon-work-with-goal))
 · `:help` — show all commands
 · `:quit` (or Ctrl-D / `exit`) — exit
 
 Ctrl-C aborts the current turn; during TTY hand-off (interactive programs like
 `vim`, `ssh`) it interrupts the foreground child, exactly like a shell.
 `→`/`Ctrl-F` accept history ghost-text suggestions.
+
+## Goals — long-horizon work with `:goal`
+
+A **goal** is a durable, multi-session objective that outlives any single turn.
+Where a background coordinator drives one task to completion, a goal is the
+umbrella above it: a persistent tree of **goal → milestones → tasks** plus the
+**blockers** standing in the way. Goals are stored in `~/.aish/aish.db`, so they
+survive `:new`, restarts, and `:update` — pick up exactly where you left off.
+
+While a goal is active, its current state (the objective, open milestones, and
+any unresolved blockers) is injected into every turn's context, so the agent
+keeps steering toward it and routes its next task with the goal in mind.
+
+| Command | What it does |
+|---|---|
+| `:goal new <text>` | Create a new goal and make it the active one |
+| `:goal show` | Show the active goal's full tree — milestones, tasks, blockers |
+| `:goal status` | One-glance dashboard: progress rollup, phase, and elapsed time |
+| `:goal link <task>` | Attach a task/coordinator run to the active goal |
+| `:goal milestone <text>` | Add a milestone under the active goal |
+| `:goal block <text>` | Record a blocker that's holding the goal up |
+| `:goal unblock <id>` | Clear a resolved blocker |
+| `:goal complete` | Mark the active goal done |
+
+Only one goal is active at a time; `:goal new` supersedes the previous active
+goal (past goals remain on record). Progress rolls up from completed
+milestones/tasks, and Shift-Tab cycles straight into the active goal's loop.
 
 ## Scripting
 
