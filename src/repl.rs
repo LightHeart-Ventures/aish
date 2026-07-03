@@ -257,13 +257,18 @@ pub async fn run(
                 let statusline = crate::style::statusline(
                     crate::update::current_version(),
                     &backend.describe(),
+                    &crate::engine::statusline_stats(&session),
                 );
                 t.draw_footer(&coordinator_status_message(&session), &statusline);
             }
         } else {
             println!(
                 "{}",
-                crate::style::statusline(crate::update::current_version(), &backend.describe())
+                crate::style::statusline(
+                    crate::update::current_version(),
+                    &backend.describe(),
+                    &crate::engine::statusline_stats(&session),
+                )
             );
         }
         println!(
@@ -589,6 +594,7 @@ pub async fn run(
                                 let statusline = crate::style::statusline(
                                     crate::update::current_version(),
                                     &backend.describe(),
+                                    &crate::engine::statusline_stats(&session),
                                 );
                                 t.draw_footer(
                                     &coordinator_status_message(&session),
@@ -602,7 +608,8 @@ pub async fn run(
                                 "{}",
                                 crate::style::statusline(
                                     crate::update::current_version(),
-                                    &backend.describe()
+                                    &backend.describe(),
+                                    &crate::engine::statusline_stats(&session),
                                 )
                             );
                         }

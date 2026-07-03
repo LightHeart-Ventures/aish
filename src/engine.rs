@@ -801,40 +801,45 @@ fn emit_activity_stream(session: &Session, result: &ToolResult) {
     // expanded view agree (raw_body substitutes a placeholder / pretty JSON for
     // an empty `content`).
     let line_count = raw_body(result).lines().count();
-    let lines = activity_stream_lines(
-        line_count,
-        session.tokens_in,
-        session.tokens_out,
-        session.tool_calls_total,
-        session.turns_total,
-    );
-    for line in lines {
+    for line in activity_stream_lines(line_count) {
         eprintln!("\x1b[2m{}\x1b[0m", truncate_to_cols(&line, cols));
     }
 }
 
-/// Pure builder for the interactive activity-stream lines beneath a tool
-/// header: a collapsed `N lines of output — Ctrl-O to expand` summary (omitted
-/// when the call produced nothing), then the running status line. Kept free of
+/// Compact running session stats for the main statusline — `tokens in/out`,
+/// cumulative tool calls, and turns — placed to the LEFT of the clock. Returns
+/// an empty string for a fresh session that has done nothing yet, so the
+/// statusline stays clean until the first turn/tool call.
+pub fn statusline_stats(session: &Session) -> String {
+    if session.tokens_in == 0
+        && session.tokens_out == 0
+        && session.tool_calls_total == 0
+        && session.turns_total == 0
+    {
+        return String::new();
+    }
+    format!(
+        "tokens in: {}, tokens out: {}, tool calls: {}, turns: {}",
+        session.tokens_in, session.tokens_out, session.tool_calls_total, session.turns_total
+    )
+}
+
+/// Pure builder for the interactive activity-stream line beneath a tool header:
+/// a collapsed `N lines of output — Ctrl-O to expand` summary (omitted when the
+/// call produced nothing). Indented to column 5 so it nests under the ✓/✗ tool
+/// header and lines up with the expanded body ([`reveal_last_turn`]) — Ctrl-O
+/// toggling no longer shifts it a column. The running token/tool/turn stats now
+/// live on the main statusline ([`statusline_stats`]), not here. Kept free of
 /// ANSI/terminal I/O so the format contract is unit-testable; the caller dims +
 /// width-clamps each line.
-fn activity_stream_lines(
-    line_count: usize,
-    tokens_in: usize,
-    tokens_out: usize,
-    tool_calls: usize,
-    turns: usize,
-) -> Vec<String> {
+fn activity_stream_lines(line_count: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     if line_count > 0 {
         let noun = if line_count == 1 { "line" } else { "lines" };
         lines.push(format!(
-            "    … {line_count} {noun} of output — Ctrl-O to expand"
+            "     … {line_count} {noun} of output — Ctrl-O to expand"
         ));
     }
-    lines.push(format!(
-        "    tokens in: {tokens_in}, tokens out: {tokens_out}, tool calls: {tool_calls}, turns: {turns}"
-    ));
     lines
 }
 
@@ -1850,35 +1855,24 @@ mod tests {
     }
 
     #[test]
-    fn activity_stream_summarizes_output_and_appends_status() {
-        // Instead of echoing the tail, the stream now shows a single collapsed
-        // summary line (line count + Ctrl-O hint) then the running status line.
-        let lines = activity_stream_lines(8, 120, 34, 7, 3);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "    … 8 lines of output — Ctrl-O to expand");
-        assert_eq!(
-            lines[1],
-            "    tokens in: 120, tokens out: 34, tool calls: 7, turns: 3"
-        );
+    fn activity_stream_summarizes_output() {
+        // The stream shows a single collapsed summary line (line count + Ctrl-O
+        // hint), indented to column 5 to nest under the tool header. The running
+        // token/tool/turn stats moved to the main statusline.
+        let lines = activity_stream_lines(8);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "     … 8 lines of output — Ctrl-O to expand");
     }
 
     #[test]
     fn activity_stream_handles_single_and_empty_output() {
         // One line → singular noun.
-        let lines = activity_stream_lines(1, 1, 2, 3, 4);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "    … 1 line of output — Ctrl-O to expand");
-        assert_eq!(
-            lines[1],
-            "    tokens in: 1, tokens out: 2, tool calls: 3, turns: 4"
-        );
-        // No output → only the status line, no summary row.
-        let lines = activity_stream_lines(0, 0, 0, 0, 0);
+        let lines = activity_stream_lines(1);
         assert_eq!(lines.len(), 1);
-        assert_eq!(
-            lines[0],
-            "    tokens in: 0, tokens out: 0, tool calls: 0, turns: 0"
-        );
+        assert_eq!(lines[0], "     … 1 line of output — Ctrl-O to expand");
+        // No output → nothing at all (no summary row, stats live elsewhere).
+        let lines = activity_stream_lines(0);
+        assert!(lines.is_empty());
     }
 
     #[test]
