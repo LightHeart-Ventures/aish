@@ -3856,12 +3856,25 @@ fn resume_coordinator(prev_run_id: &str, message: &str, session: &mut Session) {
         );
         return;
     };
+    // Keep a handle to the (same) job so we can flash an immediate thinking row
+    // the instant the operator resumes — before the fresh child has spawned and
+    // emitted its first `💭 thinking…` line.
+    let job_for_spinner = job.clone();
     let (_id, thread) =
         crate::worker::resume_in_place(&session.worker_jobs, job, resume_task, spec);
     // The attachment already points at THIS worker (we were in its review mode),
     // so there's nothing to re-bind — just clear the review marker so the next
     // finish re-announces. Activity for the new thread streams into this same pane.
     *session.attach_review_announced.lock().unwrap() = None;
+    // Instant feedback: as soon as the operator types a follow-up to a finished
+    // worker, show the animated "thinking…" row in the attach pane rather than a
+    // blank gap until the relaunched coordinator produces its first forwardable
+    // line. We're still attached to this worker (review mode), so the forward
+    // gate is open and the spinner animates immediately; the live stream stops +
+    // replaces it the instant its first line lands (`stop_backfill_thinking`),
+    // exactly like the attach-time backfill spinner.
+    job_for_spinner
+        .start_backfill_thinking(session.show_worker_output.clone(), session.attached.clone());
     // Silently continue per the operator's input — no resume banner. The new
     // thread's activity streams into this same pane; there's no need to notify
     // the operator that the worker is resuming.
