@@ -161,12 +161,19 @@ fn fmt_duration(d: Duration) -> String {
 
 /// Keep the condition snippet on one line — long goals get an ellipsis.
 fn truncate_condition(condition: &str) -> String {
-    const MAX: usize = 60;
-    if condition.chars().count() > MAX {
-        let head: String = condition.chars().take(MAX).collect();
+    truncate_ellipsis(condition, 60)
+}
+
+/// Ellipsize `s` to at most `max` chars (a trailing `…` is added when it's
+/// clipped) so a value stays on one compact line. Shared by `truncate_condition`
+/// (the `:goal` status line) and [`Goal::prompt_summary`] (the TASK-279 per-turn
+/// system-prompt block), so both truncate identically.
+pub fn truncate_ellipsis(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let head: String = s.chars().take(max).collect();
         format!("{}…", head.trim_end())
     } else {
-        condition.to_string()
+        s.to_string()
     }
 }
 
@@ -610,6 +617,45 @@ impl Goal {
     pub fn open_blockers(&self) -> usize {
         self.blockers.iter().filter(|b| !b.resolved).count()
     }
+
+    /// TASK-279: a compact, token-cheap summary of this goal for injection into
+    /// the per-turn system prompt. One or two short lines — the (truncated)
+    /// title, the current milestone with a `done/total` + percent progress
+    /// signal, and any open blockers (capped and truncated so a goal with many
+    /// long blockers can't bloat the prompt). Callers guard on an *active* goal,
+    /// so this is never rendered for paused or terminal goals.
+    pub fn prompt_summary(&self) -> String {
+        let mut out = format!("Goal: {}", truncate_ellipsis(&self.title, 72));
+        let (done, total) = self.milestone_progress();
+        if total > 0 {
+            let pct = done * 100 / total;
+            match self.milestones.iter().find(|m| !m.done) {
+                Some(current) => out.push_str(&format!(
+                    " — current milestone: {} ({done}/{total} done, {pct}%)",
+                    truncate_ellipsis(&current.title, 60)
+                )),
+                None => out.push_str(&format!(" — milestones {done}/{total} done ({pct}%)")),
+            }
+        }
+        let open: Vec<&Blocker> = self.blockers.iter().filter(|b| !b.resolved).collect();
+        if !open.is_empty() {
+            const MAX_SHOWN: usize = 3;
+            let shown = open
+                .iter()
+                .take(MAX_SHOWN)
+                .map(|b| truncate_ellipsis(&b.description, 60))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let extra = open.len().saturating_sub(MAX_SHOWN);
+            let more = if extra > 0 {
+                format!(" (+{extra} more)")
+            } else {
+                String::new()
+            };
+            out.push_str(&format!("\nOpen blockers: {shown}{more}"));
+        }
+        out
+    }
 }
 
 
@@ -795,6 +841,56 @@ mod domain_tests {
         assert!(GoalStatus::Abandoned.is_terminal());
         assert!(!GoalStatus::Active.is_terminal());
         assert!(!GoalStatus::Paused.is_terminal());
+    }
+
+    #[test]
+    fn prompt_summary_shows_current_milestone_progress_and_blockers() {
+        // TASK-279: title + current (first not-done) milestone + done/total +
+        // percent + open blockers, all in the compact block.
+        let mut g = Goal::new("Ship goal-context injection");
+        g.add_milestone("design");
+        g.add_milestone("build");
+        g.add_milestone("open PR");
+        g.milestones[0].done = true; // 1 of 3 done → current = "build", 33%
+        g.add_blocker("waiting on review");
+        let s = g.prompt_summary();
+        assert!(s.contains("Goal: Ship goal-context injection"), "{s}");
+        assert!(s.contains("current milestone: build"), "{s}");
+        assert!(s.contains("1/3 done"), "{s}");
+        assert!(s.contains("33%"), "{s}");
+        assert!(s.contains("Open blockers: waiting on review"), "{s}");
+    }
+
+    #[test]
+    fn prompt_summary_omits_empty_sections_and_caps_blockers() {
+        // No milestones, no blockers → just the title line, nothing dangling.
+        let g = Goal::new("Bare goal");
+        assert_eq!(g.prompt_summary(), "Goal: Bare goal");
+
+        // All milestones done → summary reports full completion, no "current".
+        let mut done = Goal::new("Done goal");
+        done.add_milestone("a");
+        done.milestones[0].done = true;
+        let ds = done.prompt_summary();
+        assert!(ds.contains("milestones 1/1 done (100%)"), "{ds}");
+        assert!(!ds.contains("current milestone"), "{ds}");
+
+        // >3 open blockers → first three shown, rest summarized as "(+N more)".
+        let mut many = Goal::new("Blocked goal");
+        for i in 0..5 {
+            many.add_blocker(format!("blocker {i}"));
+        }
+        let ms = many.prompt_summary();
+        assert!(ms.contains("(+2 more)"), "{ms}");
+    }
+
+    #[test]
+    fn prompt_summary_truncates_long_title() {
+        // AC3: long goal text is ellipsized so the block stays one compact line.
+        let g = Goal::new("x".repeat(120));
+        let s = g.prompt_summary();
+        assert!(s.contains('…'), "long title must be ellipsized: {s}");
+        assert!(!s.contains(&"x".repeat(120)), "full long title must not appear");
     }
 
     #[test]
