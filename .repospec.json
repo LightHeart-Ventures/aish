@@ -1,7 +1,7 @@
 {
   "schema": "repospec/v1",
   "name": "aish",
-  "version": "0.26.0",
+  "version": "0.28.1",
   "description": "An AI-native Linux shell that routes commands and intent to Claude or local LLMs",
   "repository": "https://github.com/LightHeart-Ventures/aish",
   "license": "Apache-2.0",
@@ -134,6 +134,14 @@
       "depends_on": ["tools"],
       "key_files": ["src/skill_provider.rs", "src/skills.rs"],
       "tags": ["extensibility", "prompting"]
+    },
+    {
+      "id": "schedule",
+      "path": "src/schedule.rs",
+      "purpose": "`:schedule` command backend; parses cron 5-field exprs and natural-language delays ('in 5 minutes …', 'every 30s …'), holds the ScheduleStore of pending jobs on the Session, and a background ticker fires each due job by spawning a coordinator worker, updating the SecondStatusLine on fire/finish, and posting a console summary when done.",
+      "depends_on": ["session", "worker", "repl"],
+      "key_files": ["src/schedule.rs"],
+      "tags": ["scheduling", "background", "worker"]
     }
   ],
   "patterns": [
