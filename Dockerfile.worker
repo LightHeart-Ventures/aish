@@ -33,6 +33,15 @@ FROM rust:1-bookworm AS builder
 
 WORKDIR /src
 
+# `wreq` (browser-impersonating HTTP client) pulls in `btls-sys`, which compiles
+# BoringSSL from source via cmake on EVERY build config — `--no-default-features`
+# does not skip it. gcc/g++ ship in rust:1-bookworm but cmake does not, so the
+# build fails with `is cmake not installed?` (exit 101) without this. (`perl` is
+# also a BoringSSL codegen dep but is already present in the base image.)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
+
 # The `.cargo/config.toml` in the context carries the per-build `jobs` cap, so
 # the in-image compile inherits the same OOM mitigation as host/worktree builds.
 # `.dockerignore` keeps the context lean (no target/, .git, worktrees).
