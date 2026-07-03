@@ -43,11 +43,11 @@ pub const MIN_FOOTER_ROWS: u16 = 5;
 /// decide whether it must reset margins on unwind) and by [`restore_after_clear`].
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Whether the alternate screen buffer is currently active — a worker attach
-/// view has taken over the screen via [`enter_alt_screen`]. Tracked so the
-/// enter/leave transitions are idempotent and the panic hook can restore the
-/// primary buffer on unwind.
-static ALT_SCREEN: AtomicBool = AtomicBool::new(false);
+/// Whether a worker attach view is currently active. The attach view renders on
+/// the PRIMARY screen buffer (not the alternate buffer) so the terminal's native
+/// scrollback keeps working — see [`open_attach_view`]. Tracked so the footer
+/// heartbeat backs off while a worker view owns the foreground.
+static ATTACH_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// True once we have XTSAVE'd + disabled xterm "alternate scroll" mode (DECSET
 /// 1007) for the footer scroll region. Guards the save so region re-asserts
@@ -138,7 +138,7 @@ pub fn spawn_footer_heartbeat() {
                 // and no worker alt-screen view owns the terminal.
                 if !ACTIVE.load(Ordering::Relaxed)
                     || !READING_LINE.load(Ordering::Relaxed)
-                    || ALT_SCREEN.load(Ordering::Relaxed)
+                    || ATTACH_ACTIVE.load(Ordering::Relaxed)
                 {
                     continue;
                 }
@@ -559,18 +559,10 @@ pub fn resume_footer_region() {
 }
 
 
-/// Whether a bottom-anchored footer scroll region is currently installed. Lets
-/// the REPL decide, after a screen clear, whether the cursor was already homed
-/// into the body by [`restore_after_clear`] (footer mode) or still needs to be
-/// moved to the bottom row for a bottom-anchored view (inline / no-footer mode).
-pub fn footer_active() -> bool {
-    ACTIVE.load(Ordering::Relaxed)
-}
-
-/// Whether the alternate screen buffer is currently active (a worker attach view
-/// owns the screen). See [`enter_alt_screen`].
-pub fn on_alt_screen() -> bool {
-    ALT_SCREEN.load(Ordering::Relaxed)
+/// Whether a worker attach view currently owns the foreground. See
+/// [`open_attach_view`].
+pub fn attach_view_active() -> bool {
+    ATTACH_ACTIVE.load(Ordering::Relaxed)
 }
 
 /// Re-anchor the cursor into the bottom of the body after a screen wipe / buffer
@@ -589,13 +581,12 @@ fn anchor_bottom_after_wipe() {
 }
 
 /// Erase the current terminal line in place: carriage-return to column 1, then
-/// `ESC[2K` (clear entire line). Used right before [`enter_alt_screen`] on the
+/// `ESC[2K` (clear entire line). Used right before [`open_attach_view`] on the
 /// interactive→worker Shift-Tab hop to wipe the ephemeral interactive prompt row
 /// that rustyline's `Cmd::Interrupt` leaves on screen (cursor parked at
-/// end-of-input, i.e. just past an empty prompt on the SAME row). Without this,
-/// `ESC[?1049h` snapshots that stale prompt into the primary buffer, restores it
-/// verbatim on detach, and the REPL's freshly-drawn prompt stacks below it —
-/// piling up one empty prompt per Shift-Tab round-trip. No-op off a tty.
+/// end-of-input, i.e. just past an empty prompt on the SAME row) so the attach
+/// header opens on a clean row instead of trailing a stray blank prompt. No-op
+/// off a tty.
 pub fn erase_current_line() {
     // SAFETY: plain isatty query.
     if unsafe { libc::isatty(1) } != 1 {
@@ -606,45 +597,47 @@ pub fn erase_current_line() {
     let _ = out.flush();
 }
 
-/// Enter the alternate screen buffer so a worker attach view can take over the
-/// screen WITHOUT destroying the interactive scrollback. `ESC[?1049h` saves the
-/// primary buffer (all prior interactive output + cursor); [`leave_alt_screen`]
-/// restores it verbatim, so detaching returns the operator to exactly the output
-/// that was on screen when they attached. Idempotent — a no-op when already on
-/// the alt screen or off a tty.
-pub fn enter_alt_screen() {
+/// Open a worker attach view on the PRIMARY screen buffer.
+///
+/// The attach view deliberately does NOT switch to the alternate screen buffer
+/// (`ESC[?1049h`). The alternate buffer has no scrollback, so any worker output
+/// that scrolled past the top row was unreachable by the mouse wheel / PageUp —
+/// the "can't scroll `:attach` worker output, only interactive" bug. Rendering
+/// the attach stream inline on the primary buffer keeps the terminal's native
+/// scrollback live (the wheel stays bound to scrollback via the alternate-scroll
+/// suppression installed with the footer region), so a worker's output scrolls
+/// exactly like interactive output.
+///
+/// This is also non-destructive: it never wipes the screen, so the underlying
+/// interactive output is preserved (scrolled up into scrollback, not erased) —
+/// the same goal the earlier alt-screen overlay served, minus the scrollback
+/// loss. It only re-anchors the cursor to the bottom of the body so the attach
+/// header + backfilled tail trail the last output. Idempotent; no-op off a tty.
+pub fn open_attach_view() {
     // SAFETY: plain isatty query.
     if unsafe { libc::isatty(1) } != 1 {
         return;
     }
-    if ALT_SCREEN.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    let mut out = std::io::stdout();
-    let _ = write!(out, "\x1b[?1049h");
-    let _ = out.flush();
-    // Fresh alt buffer: re-assert the footer region + anchor to the bottom so
-    // the worker view trails the last row like a clear does.
+    ATTACH_ACTIVE.store(true, Ordering::Relaxed);
+    // Re-assert the footer region + home into the bottom body row so the worker
+    // view grows up from the bottom, mirroring a fresh clear without the wipe.
     anchor_bottom_after_wipe();
 }
 
-/// Leave the alternate screen buffer, restoring the primary buffer (the
-/// interactive scrollback + cursor as they were before [`enter_alt_screen`]).
-/// Idempotent — a no-op when not on the alt screen or off a tty.
-pub fn leave_alt_screen() {
+/// Close the worker attach view, returning to the interactive prompt on the same
+/// primary buffer. Because [`open_attach_view`] never left the primary buffer,
+/// there is nothing to restore — the interactive output is already in scrollback.
+/// Just clears the attach flag and re-anchors the cursor to the bottom body row
+/// so the detached line + next prompt trail the output. Idempotent; no-op off a
+/// tty.
+pub fn close_attach_view() {
     // SAFETY: plain isatty query.
     if unsafe { libc::isatty(1) } != 1 {
         return;
     }
-    if !ALT_SCREEN.swap(false, Ordering::Relaxed) {
+    if !ATTACH_ACTIVE.swap(false, Ordering::Relaxed) {
         return;
     }
-    let mut out = std::io::stdout();
-    let _ = write!(out, "\x1b[?1049l");
-    let _ = out.flush();
-    // Restored primary buffer: some terminals drop the DECSTBM margins across a
-    // 1049 switch, so re-assert the region + repaint the footer and home into
-    // the body — the detached line + next prompt then trail the restored output.
     anchor_bottom_after_wipe();
 }
 
@@ -669,14 +662,10 @@ pub fn bottom_home_seq(rows: u16) -> String {
 pub fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Restore the primary screen buffer first (if a worker attach view had
-        // taken over the alt buffer), so the crash + backtrace land on the
-        // operator's real scrollback rather than a stranded alt screen.
-        if ALT_SCREEN.swap(false, Ordering::Relaxed) {
-            let mut out = std::io::stdout();
-            let _ = write!(out, "\x1b[?1049l");
-            let _ = out.flush();
-        }
+        // A worker attach view renders on the primary buffer (no alternate
+        // buffer to pop), so a crash mid-attach already lands on real
+        // scrollback — just clear the flag.
+        ATTACH_ACTIVE.store(false, Ordering::Relaxed);
         if ACTIVE.load(Ordering::Relaxed) {
             let mut out = std::io::stdout();
             let _ = write!(out, "{}{RESET_REGION}\r\n", restore_alt_scroll_seq());

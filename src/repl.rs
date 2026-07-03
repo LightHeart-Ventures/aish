@@ -100,38 +100,6 @@ fn clear_screen() {
     }
 }
 
-/// Like [`clear_screen`], but leaves the cursor anchored at the BOTTOM of the
-/// body so the view drawn next (the Shift-Tab attach header + backfilled tail +
-/// redrawn prompt) grows UP from the bottom instead of stranding at the top of
-/// an otherwise-blank screen.
-///
-/// In footer mode [`crate::terminal::restore_after_clear`] already homes the
-/// cursor to the bottom body row (just above the pinned footer), so the attach
-/// view naturally trails the last output. In inline mode (no footer region —
-/// short terminals, or footer disabled) nothing homed the cursor after
-/// `ESC[2J ESC[H`, so it sat at row 1 and the backfill anchored at the TOP with
-/// a blank screen beneath it — the "prompt anchors at the top instead of 2
-/// lines below the last output" bug. Homing to the last row makes inline mode
-/// match footer mode: printing at the bottom row scrolls the screen up, so the
-/// output + prompt stay pinned to the bottom.
-fn clear_screen_anchor_bottom() {
-    // SAFETY: plain isatty query.
-    if unsafe { libc::isatty(1) } != 1 {
-        return;
-    }
-    print!("\x1b[2J\x1b[H");
-    let _ = std::io::stdout().flush();
-    if crate::terminal::footer_active() {
-        // Footer mode: re-assert the region + repaint the footer; this homes the
-        // cursor to the bottom body row.
-        crate::terminal::restore_after_clear();
-    } else if let Some(rows) = crate::terminal::screen_rows() {
-        // Inline mode: home to the last row so the view grows up from the bottom.
-        print!("{}", crate::terminal::bottom_home_seq(rows));
-        let _ = std::io::stdout().flush();
-    }
-}
-
 pub async fn run(
     mut backend: Backend,
     mut session: Session,
@@ -996,10 +964,10 @@ pub async fn run(
             .await;
     }
 
-    // If the operator exits while attached to a worker view, restore the primary
-    // screen buffer first so the parting line + shell prompt land on their real
-    // scrollback rather than a stranded alt screen.
-    crate::terminal::leave_alt_screen();
+    // If the operator exits while attached to a worker view, close it so the
+    // parting line + shell prompt trail the output cleanly. The attach view
+    // renders on the primary buffer, so there is no alternate buffer to pop.
+    crate::terminal::close_attach_view();
 
     // Tear down the bottom-anchored footer before we print the parting line, so
     // "bye" lands in a normal full-height screen instead of above a stale pinned
@@ -3252,11 +3220,7 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
     if id == GOAL_ATTACH_ID {
         match &session.goal {
             Some(g) if g.is_active() => {
-                if crate::terminal::on_alt_screen() {
-                    clear_screen_anchor_bottom();
-                } else {
-                    crate::terminal::enter_alt_screen();
-                }
+                crate::terminal::open_attach_view();
                 *session.attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
                 println!(
                     "\x1b[1;33m⇄ attached to the goal\x1b[0m — streaming its turns live. \x1b[2mgoals are watch-only; :goal clear to stop it, :detach to stop watching.\x1b[0m"
@@ -3283,15 +3247,11 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
     match matches.as_slice() {
         [] => println!("no coordinator in this session matching '{id}' (see :workers)"),
         [(run_id, terminal)] => {
-            // Take over the screen on the alt buffer WITHOUT destroying the
-            // interactive scrollback (mirrors Shift-Tab): the first attach saves
-            // the primary buffer so `:detach` restores it verbatim; re-attaching
-            // while already on the alt buffer just wipes it for a fresh view.
-            if crate::terminal::on_alt_screen() {
-                clear_screen_anchor_bottom();
-            } else {
-                crate::terminal::enter_alt_screen();
-            }
+            // Open the worker view inline on the primary buffer (mirrors
+            // Shift-Tab). Non-destructive: the interactive output scrolls up into
+            // scrollback rather than being wiped, and the worker's output stays
+            // scrollable via the terminal's native scrollback.
+            crate::terminal::open_attach_view();
             *session.attached.lock().unwrap() = Some(run_id.clone());
             let short = crate::batch::short_id(run_id);
             if *terminal {
@@ -3494,10 +3454,10 @@ fn detach_worker(session: &mut Session) {
     crate::worker::quiesce_thinking_spinners();
     match session.attached.lock().unwrap().take() {
         Some(run_id) => {
-            // Leave the alt screen buffer, restoring the primary buffer: the
-            // operator returns to exactly the interactive output that was on
-            // screen when they attached, with the detach line trailing it.
-            crate::terminal::leave_alt_screen();
+            // Close the worker view. It rendered inline on the primary buffer, so
+            // the interactive output is already in scrollback — just re-anchor and
+            // print the detach line trailing the worker output.
+            crate::terminal::close_attach_view();
             let short = crate::batch::short_id(&run_id);
             println!(
                 "\x1b[2m⇄ detached from {short} — it keeps running; :workers to check, :result {short} when done\x1b[0m"
@@ -4011,11 +3971,11 @@ fn cycle_worker(session: &mut Session) -> bool {
     let next_idx = next_attach_index(&ids, current.as_deref());
 
     if next_idx == 0 {
-        // Wrapped past the last worker — back to the interactive prompt. Leave
-        // the alt screen buffer, restoring the primary buffer: the operator
-        // returns to exactly the interactive output that was on screen when
-        // they first attached, and the detached line trails it.
-        crate::terminal::leave_alt_screen();
+        // Wrapped past the last worker — back to the interactive prompt. Close
+        // the worker view; it rendered inline on the primary buffer, so the
+        // interactive output is already in scrollback and the detached line
+        // trails it.
+        crate::terminal::close_attach_view();
         *session.attached.lock().unwrap() = None;
         *session.attach_review_announced.lock().unwrap() = None;
         // No output-field hint here: the detached "back to interactive" state is
@@ -4023,29 +3983,23 @@ fn cycle_worker(session: &mut Session) -> bool {
         // so printing it again would just be redundant noise in the scrollback.
         //
         // Return false so the caller does NOT arm `needs_gap`: this branch prints
-        // no output, and `leave_alt_screen` already restored the primary buffer +
-        // anchored the cursor to the bottom body row, so the prompt should redraw
-        // right there. Arming the gap would inject blank lines that scroll the
-        // restored interactive output up two rows on every return trip.
+        // no output, and `close_attach_view` already re-anchored the cursor to
+        // the bottom body row, so the prompt should redraw right there. Arming the
+        // gap would inject blank lines that scroll the output up two rows on every
+        // return trip.
         return false;
     }
 
-    // Switch the screen to the worker view WITHOUT destroying interactive
-    // scrollback. Interactive→worker (first hop off the prompt) enters the alt
-    // screen buffer, saving the primary buffer so the eventual detach restores
-    // it verbatim. Worker→worker hops are already on the alt buffer, so just
-    // wipe it for a fresh view (anchored to the bottom).
-    if crate::terminal::on_alt_screen() {
-        clear_screen_anchor_bottom();
-    } else {
-        // Erase the ephemeral interactive prompt row BEFORE `enter_alt_screen`'s
-        // `ESC[?1049h` snapshots the primary buffer — otherwise that stale prompt
-        // is saved, restored verbatim on the way back to interactive, and the
-        // REPL's freshly-drawn prompt stacks below it, piling up one empty prompt
-        // per Shift-Tab round-trip (the "loads up with prompts" bug).
+    // Open the worker view inline on the primary buffer WITHOUT destroying
+    // interactive scrollback: the interactive output scrolls up into scrollback
+    // (not wiped), and the worker's output stays scrollable via the terminal's
+    // native scrollback. On the first hop off the prompt, erase the ephemeral
+    // interactive prompt row rustyline left behind so the attach header opens on
+    // a clean row instead of trailing a stray blank prompt.
+    if !crate::terminal::attach_view_active() {
         crate::terminal::erase_current_line();
-        crate::terminal::enter_alt_screen();
     }
+    crate::terminal::open_attach_view();
     let (run_id, terminal, task) = workers[next_idx - 1].clone();
     *session.attached.lock().unwrap() = Some(run_id.clone());
     let short = crate::batch::short_id(&run_id);
