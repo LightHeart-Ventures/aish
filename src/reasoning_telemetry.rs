@@ -28,19 +28,33 @@
 //! the boundary becomes legible ("at HIGH complexity I guess wrong 60% of the
 //! time — always escalate there").
 //!
+//! ## Log rotation
+//! The `.jsonl` is append-only and would otherwise grow without bound. When the
+//! active file crosses a size threshold (default 5 MB, override with
+//! `AISH_REASONING_ROTATE_MB`; `0` disables) it is rotated: the active file is
+//! gzip-compressed into `…jsonl.1.gz`, older archives shift up
+//! (`.1.gz`→`.2.gz`→`.3.gz`), and anything past the newest [`MAX_ARCHIVES`] is
+//! deleted. Rotation never loses data from the summary: [`summarize`] folds the
+//! retained gzip archives (oldest→newest) *and* the active file in append order,
+//! so a decision recorded before a rotation still counts, and an outcome update
+//! written after a rotation still folds onto its (now-archived) event. Archives
+//! stay auditable on disk; the retained set bounds both disk use and the
+//! summarize scan.
+//!
 //! ## Safety & robustness
 //! Everything here is best-effort: a write that fails (full disk, read-only
 //! mount) is swallowed so telemetry can never break a live turn. Reads skip
 //! malformed lines, so a torn final write degrades to "summarize what parses".
-//! Topic/rationale strings are truncated before they touch disk. This module
-//! is purely OBSERVATIONAL — it records what happened and never changes agent
-//! behavior.
+//! Rotation is likewise best-effort — a failed rename/gzip leaves the active
+//! file in place and the turn unaffected. Topic/rationale strings are truncated
+//! before they touch disk. This module is purely OBSERVATIONAL — it records what
+//! happened and never changes agent behavior.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Cap on any recorded free-text field (topic / rationale). Keeps the `.jsonl`
 /// small and bounds accidental payloads.
@@ -223,9 +237,101 @@ pub fn log_path() -> PathBuf {
         .join("reasoning-telemetry.jsonl")
 }
 
+/// Number of gzip archives retained after rotation (`.1.gz` newest … `.N.gz`
+/// oldest). Anything older is deleted so disk use — and the [`summarize`] scan —
+/// stays bounded.
+pub const MAX_ARCHIVES: usize = 3;
+
+/// Default rotation threshold in megabytes when `AISH_REASONING_ROTATE_MB` is
+/// unset.
+const DEFAULT_ROTATE_MB: f64 = 5.0;
+
+/// Rotation size threshold in bytes. Read from `AISH_REASONING_ROTATE_MB`
+/// (megabytes, fractional allowed for tests) each call so an override takes
+/// effect without a restart. A value `<= 0` (or unparseable-to-positive)
+/// disables rotation and returns `0`.
+fn rotate_threshold_bytes() -> u64 {
+    let mb = std::env::var("AISH_REASONING_ROTATE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|m| m.is_finite())
+        .unwrap_or(DEFAULT_ROTATE_MB);
+    if mb <= 0.0 {
+        return 0;
+    }
+    (mb * 1_048_576.0) as u64
+}
+
+/// The path of the `n`-th archive for a given active log path: `<path>.<n>.gz`
+/// (`n = 1` is the most recent).
+fn archive_path(path: &Path, n: usize) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(format!(".{n}.gz"));
+    PathBuf::from(s)
+}
+
+/// gzip `src` into `dst` (overwriting). Best-effort: returns `false` on any I/O
+/// error, leaving the caller to keep the active file in place.
+fn gzip_file(src: &Path, dst: &Path) -> bool {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    let Ok(input) = std::fs::read(src) else {
+        return false;
+    };
+    let Ok(out) = std::fs::File::create(dst) else {
+        return false;
+    };
+    let mut enc = GzEncoder::new(out, Compression::default());
+    if enc.write_all(&input).is_err() {
+        return false;
+    }
+    match enc.finish() {
+        Ok(mut f) => f.flush().is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Rotate the active log: evict the oldest archive, shift the rest up, gzip the
+/// active file into `.1.gz`, and clear the active file. Best-effort throughout —
+/// a partial failure never propagates. Only invoked once the active file has
+/// crossed the size threshold.
+fn rotate(path: &Path) {
+    // Only compress a file that actually has content (guards against clearing a
+    // file that was truncated out from under us between the size check and here).
+    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) == 0 {
+        return;
+    }
+    // Evict the oldest retained archive; it is about to be pushed off the end.
+    let _ = std::fs::remove_file(archive_path(path, MAX_ARCHIVES));
+    // Shift the remaining archives up one slot: .2.gz → .3.gz, .1.gz → .2.gz.
+    for n in (1..MAX_ARCHIVES).rev() {
+        let src = archive_path(path, n);
+        if src.exists() {
+            let _ = std::fs::rename(&src, archive_path(path, n + 1));
+        }
+    }
+    // Sweep any stragglers beyond the retained window (e.g. left over from a run
+    // with a larger MAX_ARCHIVES or a shrunk threshold) so the set stays bounded.
+    for n in (MAX_ARCHIVES + 1)..=(MAX_ARCHIVES + 8) {
+        let stray = archive_path(path, n);
+        if stray.exists() {
+            let _ = std::fs::remove_file(stray);
+        }
+    }
+    // Compress the active file into the freshest archive slot, then clear it.
+    // Only clear on a successful gzip so a compression failure never drops data.
+    if gzip_file(path, &archive_path(path, 1)) {
+        // Truncate in place (recreate empty) — the next append reopens it.
+        let _ = OpenOptions::new().write(true).truncate(true).open(path);
+    }
+}
+
 /// Append one JSON record as a single line. Best-effort — a failure (missing
 /// parent dir it couldn't create, read-only mount) is swallowed and returns
 /// `false` so a caller can note "not logged" without ever erroring a turn.
+///
+/// After a successful write the active file is size-checked and rotated when it
+/// crosses the threshold (see the module-level "Log rotation" note).
 fn append_line(line: &str) -> bool {
     let path = log_path();
     if let Some(parent) = path.parent() {
@@ -236,7 +342,15 @@ fn append_line(line: &str) -> bool {
     };
     let mut buf = line.to_string();
     buf.push('\n');
-    file.write_all(buf.as_bytes()).is_ok() && file.flush().is_ok()
+    let ok = file.write_all(buf.as_bytes()).is_ok() && file.flush().is_ok();
+    if ok {
+        let threshold = rotate_threshold_bytes();
+        if threshold > 0 && file.metadata().map(|m| m.len()).unwrap_or(0) >= threshold {
+            drop(file); // close before we rename/compress/truncate it
+            rotate(&path);
+        }
+    }
+    ok
 }
 
 /// Record a fresh reasoning event. Returns the event id on success (for a later
@@ -324,14 +438,44 @@ impl Summary {
 /// Read the telemetry log, fold outcome updates onto their events, and compute
 /// the [`Summary`]. Malformed lines are skipped. Returns an empty summary when
 /// the log is missing.
+///
+/// Rotation-aware: the retained gzip archives are folded oldest→newest *before*
+/// the active file, reconstructing global append order across a rotation
+/// boundary. This is what guarantees "no reasoning data lost" — a pre-rotation
+/// event still counts, and an outcome update written after the rotation still
+/// folds onto its now-archived event.
 pub fn summarize() -> Summary {
     let mut events: BTreeMap<String, ReasoningEvent> = BTreeMap::new();
 
     let path = log_path();
-    let Ok(file) = std::fs::File::open(&path) else {
-        return Summary::default();
-    };
-    for line in BufReader::new(file).lines() {
+    // Oldest archive first (.N.gz) … newest (.1.gz), then the still-active file,
+    // so an outcome update always folds onto an event seen at or before it.
+    for n in (1..=MAX_ARCHIVES).rev() {
+        let ap = archive_path(&path, n);
+        if let Ok(f) = std::fs::File::open(&ap) {
+            fold_lines(BufReader::new(flate2::read::GzDecoder::new(f)), &mut events);
+        }
+    }
+    if let Ok(file) = std::fs::File::open(&path) {
+        fold_lines(BufReader::new(file), &mut events);
+    }
+
+    let mut summary = Summary::default();
+    for ev in events.values() {
+        summary.total += 1;
+        tally(&mut summary.overall, ev);
+        tally(summary.by_complexity.entry(ev.complexity).or_default(), ev);
+        tally(summary.by_risk.entry(ev.risk).or_default(), ev);
+    }
+    summary
+}
+
+/// Fold one source's lines into the `events` map: parse each JSONL record,
+/// insert `event` records, and fold `outcome` updates onto an already-seen
+/// event. Malformed lines are skipped. Sources must be supplied in append order
+/// (oldest first) so an outcome never precedes its event.
+fn fold_lines<R: BufRead>(reader: R, events: &mut BTreeMap<String, ReasoningEvent>) {
+    for line in reader.lines() {
         let Ok(line) = line else { continue };
         let line = line.trim();
         if line.is_empty() {
@@ -362,15 +506,6 @@ pub fn summarize() -> Summary {
             }
         }
     }
-
-    let mut summary = Summary::default();
-    for ev in events.values() {
-        summary.total += 1;
-        tally(&mut summary.overall, ev);
-        tally(summary.by_complexity.entry(ev.complexity).or_default(), ev);
-        tally(summary.by_risk.entry(ev.risk).or_default(), ev);
-    }
-    summary
 }
 
 fn tally(bucket: &mut Bucket, ev: &ReasoningEvent) {
@@ -521,11 +656,26 @@ mod tests {
         }
     }
 
+    impl TestLog {
+        /// Set the rotation threshold (megabytes, fractional allowed) for the
+        /// duration of this test. Cleared on drop.
+        fn set_rotate_mb(&self, mb: &str) {
+            unsafe {
+                std::env::set_var("AISH_REASONING_ROTATE_MB", mb);
+            }
+        }
+    }
+
     impl Drop for TestLog {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
+            // Sweep any archives this test produced.
+            for n in 1..=(MAX_ARCHIVES + 8) {
+                let _ = std::fs::remove_file(archive_path(&self.path, n));
+            }
             unsafe {
                 std::env::remove_var("AISH_REASONING_LOG");
+                std::env::remove_var("AISH_REASONING_ROTATE_MB");
             }
         }
     }
@@ -658,5 +808,112 @@ mod tests {
         let ev = ReasoningEvent::new(Decision::Guessed, long, "self_report");
         assert!(ev.topic.chars().count() <= MAX_TEXT_LEN + 1); // +1 for the ellipsis
         assert!(ev.topic.ends_with('…'));
+    }
+
+    // ----- rotation (TASK-251) -----
+
+    #[test]
+    fn rotate_threshold_env_is_honored() {
+        let log = TestLog::new("threshold");
+        log.set_rotate_mb("5");
+        assert_eq!(rotate_threshold_bytes(), 5 * 1_048_576);
+        // 0 disables rotation.
+        log.set_rotate_mb("0");
+        assert_eq!(rotate_threshold_bytes(), 0);
+        // Fractional MB (used by these tests) resolves to bytes.
+        log.set_rotate_mb("0.5");
+        assert_eq!(rotate_threshold_bytes(), 524_288);
+        // Unparseable → falls back to the 5 MB default (never disables by accident).
+        log.set_rotate_mb("garbage");
+        assert_eq!(rotate_threshold_bytes(), (DEFAULT_ROTATE_MB * 1_048_576.0) as u64);
+    }
+
+    #[test]
+    fn rotation_creates_gz_archive_and_loses_no_data() {
+        let log = TestLog::new("rotate_gz");
+        // ~0.8 KB threshold → one rotation across ~6 small event lines.
+        log.set_rotate_mb("0.0008");
+        for i in 0..6 {
+            record(&ReasoningEvent::new(
+                Decision::Guessed,
+                format!("e{i}"),
+                "t",
+            ))
+            .unwrap();
+        }
+        // A gzip archive was produced by the rotation.
+        assert!(
+            archive_path(&log.path, 1).exists(),
+            ".1.gz archive should exist after rotation"
+        );
+        // No data lost: the summary still folds every event (archive + active).
+        let s = summarize();
+        assert_eq!(s.total, 6, "all events counted across the rotation boundary");
+        assert_eq!(s.overall.guessed, 6);
+    }
+
+    #[test]
+    fn only_last_max_archives_are_retained() {
+        let log = TestLog::new("retain");
+        // Tiny threshold → rotate every ~2 events; write enough to rotate well
+        // past MAX_ARCHIVES so the oldest archives are evicted.
+        log.set_rotate_mb("0.00025");
+        for i in 0..14 {
+            record(&ReasoningEvent::new(
+                Decision::Escalated,
+                format!("e{i}"),
+                "t",
+            ))
+            .unwrap();
+        }
+        for n in 1..=MAX_ARCHIVES {
+            assert!(
+                archive_path(&log.path, n).exists(),
+                "archive .{n}.gz should be retained"
+            );
+        }
+        assert!(
+            !archive_path(&log.path, MAX_ARCHIVES + 1).exists(),
+            "archive beyond MAX_ARCHIVES must be evicted"
+        );
+    }
+
+    #[test]
+    fn outcome_update_folds_onto_archived_event_after_rotation() {
+        let log = TestLog::new("rotate_fold");
+        log.set_rotate_mb("0.0008");
+        // The tracked guess, recorded first so it lands in the first archive.
+        let id = record(
+            &ReasoningEvent::new(Decision::Guessed, "risky call", "t")
+                .with_levels(Level::High, Level::High, Level::High),
+        )
+        .unwrap();
+        // Filler escalations push the active file past the threshold, archiving
+        // the tracked event out of the hot file.
+        for i in 0..6 {
+            record(&ReasoningEvent::new(
+                Decision::Escalated,
+                format!("f{i}"),
+                "t",
+            ))
+            .unwrap();
+        }
+        assert!(
+            archive_path(&log.path, 1).exists(),
+            "rotation should have archived the early records"
+        );
+        // Close the loop *after* rotation — the update is written to the fresh
+        // active file, yet must still fold onto the now-archived event.
+        assert!(update_outcome(&id, Outcome::WrongTurn));
+
+        let s = summarize();
+        assert_eq!(s.overall.guessed, 1, "only the tracked decision is a guess");
+        assert_eq!(
+            s.overall.guess_wrong, 1,
+            "the post-rotation outcome folded onto the archived event"
+        );
+        assert_eq!(s.overall.guess_wrong_pct(), Some(100));
+        let high = s.by_complexity.get(&Level::High).copied().unwrap();
+        assert_eq!(high.guess_wrong_pct(), Some(100));
     }
 }
