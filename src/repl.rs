@@ -1888,6 +1888,12 @@ impl Highlighter for AishHelper {
     /// buffer is an O(1) memo hit — the flicker-free guarantee at typing speed
     /// (S5.4 / TASK-133); only a genuine edit pays the recompute, exactly once.
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
+        // Every keystroke/redraw runs the highlighter. Keep the footer idle
+        // timer fresh while the line is being actively rendered and flag a
+        // non-empty buffer, so the idle-heartbeat repaint can never fire on top
+        // of an in-progress command and eat the prompt (footer heartbeat bug).
+        crate::terminal::note_footer_activity();
+        crate::terminal::set_input_dirty(!line.is_empty());
         match self.cached_preview(line).ansi() {
             Some(color) => std::borrow::Cow::Owned(format!("{color}{line}\x1b[0m")),
             None => std::borrow::Cow::Borrowed(line),
