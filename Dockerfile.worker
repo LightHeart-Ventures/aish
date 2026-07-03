@@ -33,6 +33,18 @@ FROM rust:1-bookworm AS builder
 
 WORKDIR /src
 
+# Native build deps for crates with C/C++ build scripts. `wreq` (browser-
+# impersonating HTTP client) pulls BoringSSL via `btls-sys`, whose build script
+# shells out to `cmake` (compile BoringSSL) and `bindgen` (needs `libclang`).
+# These are in the DEFAULT dependency graph, so `--no-default-features` does NOT
+# drop them — without cmake+clang the build panics with
+#   cmake-0.1.x panicked: failed to execute command ... is `cmake` not installed?
+# Kept as its own layer (before `COPY . .`) so it stays cache-warm across source
+# changes. gcc/g++/make/perl are already provided by the buildpack-deps base.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake clang libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # The `.cargo/config.toml` in the context carries the per-build `jobs` cap, so
 # the in-image compile inherits the same OOM mitigation as host/worktree builds.
 # `.dockerignore` keeps the context lean (no target/, .git, worktrees).
