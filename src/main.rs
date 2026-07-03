@@ -5,6 +5,7 @@ mod batch;
 mod container;
 mod context;
 mod coordinator;
+mod coordinator_store;
 mod db;
 mod db_paths;
 mod diag;
