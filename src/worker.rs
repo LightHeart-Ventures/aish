@@ -941,12 +941,14 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
             if let Some(spin) = thinking.take() {
                 spin.stop();
             }
-            // Prefix a blank line so the always-surfaced console note is set
+            // Wrap the always-surfaced console note in blank lines so it is set
             // visually apart from whatever printed immediately before it (a
-            // coordinator `·result`, a tool row, or the prompt) rather than
-            // abutting it. `announce_raw` clears only the CURRENT line, so
-            // without this the 📣 note butts straight up against the prior text.
-            crate::tools::announce_raw(&format!("\n{}", console_row(label, &note)));
+            // coordinator `·result`, a tool row, or the prompt) AND from whatever
+            // follows it — rather than abutting either. `announce_raw` appends a
+            // single trailing newline (ending the note's own line), so the extra
+            // leading `\n` gives the blank line ABOVE and the extra trailing `\n`
+            // gives the blank line BELOW.
+            crate::tools::announce_raw(&format!("\n{}\n", console_row(label, &note)));
             if tail.len() == STDERR_TAIL_LINES {
                 tail.pop_front();
             }
