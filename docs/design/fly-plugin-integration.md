@@ -335,6 +335,95 @@ place to expose it to the agent.
 
 ---
 
+## 9. Missing plugin registry (the distribution gap)
+
+Every gap in §4 is a *capability* gap — what a plugin can **do** once it is on
+disk. §9 is a different axis entirely: **distribution** — how a plugin **gets**
+on disk in the first place. Even a perfect `fly` plugin (login + poll today,
+`mcp__fly__*` after gap #4 closes) is worthless if there is no supported way to
+install, version, or update it. Today there is not.
+
+### 9.1 How plugins are actually loaded
+
+Plugin loading is a **local directory walk, nothing more**. `plugins::discover`
+(`src/plugins.rs`) does exactly one thing: `read_dir(~/.aish/plugins/)`, and for
+each subdirectory parse `plugin.json`, load its `skills/`, `schemas/`, and
+`.mcp.json`. There is no network step, no manifest catalog, no signature check,
+no version resolution, no `aish plugin add`. A plugin exists on your machine iff
+**you** placed its files under `~/.aish/plugins/<id>/` by hand (or a script did).
+
+That means the stage-0 `fly` plugin from §7 ships to a user's machine by
+precisely one mechanism today: *manually* create `~/.aish/plugins/fly/`, write
+`plugin.json` and `login.sh`, `chmod +x` the handler, and drop in the optional
+`skills/fly-ops/SKILL.md`. There is no `aish plugin add fly`, no
+`aish plugin update fly`, no pinned version, and no discovery of "what fly
+plugins exist."
+
+### 9.2 The asymmetry that makes this glaring
+
+The gap is stark because the **sibling skill subsystem already has the whole
+registry stack** the plugin subsystem lacks:
+
+| Concern | **Skills** (has a registry) | **Plugins** (has none) |
+|---|---|---|
+| Discovery | `aish --skill-search <query>` → registry catalog | directory listing of `~/.aish/plugins/` only |
+| Catalog | `~/.aish/registry/index.json` (binary-embedded, offline) | — |
+| Remote source | `AISH_SKILL_REGISTRY` → skill.fish / mcpmarket / mirror | — |
+| Install | `:skill add <owner/name>` (fetch → import) | copy files by hand |
+| Update / version | ref-pinned fetch, re-import | — (edit files in place) |
+| Recommend-on-miss | `skill_match.rs` nudges an installable registry skill | — |
+| Code | `src/skill_provider.rs`, `initialize_registry` | `src/plugins.rs::discover` (local `read_dir`) |
+
+The irony is direct: **a plugin's job is to *contribute skills into* that skill
+registry** (`plugin_skills` flattens each plugin's `skills/` into the catalog),
+yet the plugin *carrying* those skills has no registry of its own. The transport
+has richer distribution than the thing being transported.
+
+### 9.3 Impact on the Fly plugin
+
+| Stage (from §5) | Blocked by the registry gap? | Consequence |
+|---|---|---|
+| 0 — login + poll | Not *blocked*, but un-distributable | Every user hand-installs `~/.aish/plugins/fly/`; no shared, versioned artifact |
+| 2 — `mcp__fly__*` MCP server | Amplified | Closing gap #4 produces a bundled MCP plugin with **no channel to ship it** — capability without distribution |
+| 3 — typed tools | Amplified | Same: the higher-value the plugin, the more its lack of an install/update path hurts |
+
+The registry gap is **orthogonal** to §4's capability gaps but **multiplies**
+their payoff risk: the more valuable a plugin becomes (Fly's centre of gravity is
+gap #4, the MCP server), the more its absence of a supported install/version/
+update path bottlenecks adoption. You can build `mcp__fly__deploy`; you cannot
+`aish plugin add fly` it onto a fleet.
+
+### 9.4 What closing it looks like
+
+The cheapest path is to **reuse the skill-registry machinery** rather than invent
+a parallel one — the shapes already rhyme:
+
+1. **Plugin catalog** — a `plugins`-flavoured index (mirror
+   `~/.aish/registry/index.json`) listing `id / version / source / description`,
+   with an `AISH_PLUGIN_REGISTRY` override paralleling `AISH_SKILL_REGISTRY`.
+2. **`aish plugin add <ref>`** — fetch → verify → materialise under
+   `~/.aish/plugins/<id>/`, the plugin analogue of `:skill add`. `discover`
+   needs no change; it already loads whatever lands on disk.
+3. **Versioning / update** — `plugin.json` already carries `version`; a registry
+   makes it meaningful (pin, diff, `aish plugin update`).
+4. **Recommend-on-miss (optional)** — when the agent wants a capability a plugin
+   would provide, nudge an installable registry plugin, exactly as
+   `skill_match.rs` nudges skills.
+
+None of this touches the capability tracks (webhooks, hooks, tools, MCP). It is a
+pure **distribution** layer — and until it exists, "ship the `fly` plugin" means
+"paste files into `~/.aish/plugins/fly/`," which is fine for one developer and a
+non-starter for a fleet.
+
+> **Gap #8 (registry/distribution).** Add to §4's list: *No plugin registry —
+> plugins are local-disk-only, discovered by a `read_dir` of `~/.aish/plugins/`;
+> there is no catalog, install command, or version/update path (skills have all
+> three).* Track: **distribution** (new, unscoped). Status: **Absent.** Impact:
+> caps adoption of every plugin stage, most acutely the high-value MCP plugin
+> (stage 2). Where it lives: `src/plugins.rs::discover`.
+
+---
+
 ## Appendix: source references
 
 | Claim | Evidence |
@@ -347,3 +436,5 @@ place to expose it to the agent.
 | Plugin skills + JSON-schema contribution | `src/plugins.rs` `discover` / `PluginSchema` |
 | Local Docker worker backend + OOM risk | `src/container.rs`; `Dockerfile.worker`; `aish_sre` SKILL.md §3; `docs/spikes/S1.4-reaper-vs-waitpid.md` |
 | Fly Machines API / `flyctl` / GraphQL / token auth | fly.io platform docs (`api.machines.dev/v1`, `api.fly.io/graphql`, `fly auth token`) |
+| Plugins are local-disk-only (no registry): loaded by a `read_dir` of `~/.aish/plugins/` | `src/plugins.rs` `discover` / `default_plugins_dir` |
+| Skills, by contrast, have a full registry (catalog, `AISH_SKILL_REGISTRY`, install, recommend-on-miss) | `src/skill_provider.rs`; `registry/index.json`; `src/skill_match.rs` |
