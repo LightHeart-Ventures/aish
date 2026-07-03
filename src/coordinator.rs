@@ -994,9 +994,14 @@ pub fn rehydrate(session: &mut Session) {
             Phase::Coordinating | Phase::AwaitingBatch => {
                 // Non-terminal. If it's ours (same session id — only possible
                 // after an in-process resume, since ids are per-run) or its
-                // heartbeat is fresh, leave it; otherwise it's orphaned.
-                let mine = row.session_id.as_deref() == Some(own.as_str());
-                if !mine && heartbeat_is_stale(row.heartbeat_at.as_deref()) {
+                // heartbeat is fresh, leave it; otherwise it's orphaned. Same
+                // predicate the live reaper (`reap_orphaned_runs`) uses.
+                if is_orphaned_row(
+                    row.session_id.as_deref(),
+                    own.as_str(),
+                    &phase,
+                    row.heartbeat_at.as_deref(),
+                ) {
                     let _ = store.set_failed(
                         &row.run_id,
                         "orphaned: owner gone and heartbeat stale (reaped on startup)",
@@ -1155,6 +1160,71 @@ fn heartbeat_is_stale(heartbeat_at: Option<&str>) -> bool {
         }
         None => true, // unparseable → stale (don't keep a row we can't reason about)
     }
+}
+
+/// Decide whether a coordinator store row is an ORPHAN that should be reaped: a
+/// non-terminal run (`coordinating`/`awaiting_batch`) NOT owned by the reading
+/// session whose heartbeat is stale (its owner process is gone). Pure so both
+/// the startup reaper and the live status-read reaper share ONE predicate —
+/// keeping their liveness criteria from drifting apart. Terminal rows and this
+/// session's own rows are never orphans.
+fn is_orphaned_row(
+    session_id: Option<&str>,
+    own: &str,
+    phase: &Phase,
+    heartbeat_at: Option<&str>,
+) -> bool {
+    matches!(phase, Phase::Coordinating | Phase::AwaitingBatch)
+        && session_id != Some(own)
+        && heartbeat_is_stale(heartbeat_at)
+}
+
+/// Live orphan reap for the status-read paths (`:workers`, `background_status`).
+/// The durable store is the source of truth, but a coordinator that fans out
+/// interactive sub-coordinators runs their reconcile as detached in-process
+/// tasks: if that parent process exits before they finish, the children's rows
+/// are left stuck at `coordinating` forever — the operator sees zombie
+/// "coordinating" workers doing no apparent work (the reported symptom). Startup
+/// already reaps these (`reattach_saved_runs`), but a long-lived interactive
+/// session never restarts, so nothing flips them. Calling this on every status
+/// read reconciles any stale, unowned, non-terminal row to `failed` so zombies
+/// self-heal LIVE instead of lingering until the next process start. Returns the
+/// number reaped. Uses the SAME `is_orphaned_row` predicate as the startup path.
+pub fn reap_orphaned_runs(store: &CoordinatorStore, own_session_id: &str) -> usize {
+    let rows = match store.load_all() {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    let mut reaped = 0usize;
+    for run_id in orphaned_run_ids(&rows, own_session_id) {
+        if store
+            .set_failed(
+                &run_id,
+                "orphaned: owner gone and heartbeat stale (reaped live)",
+            )
+            .is_ok()
+        {
+            reaped += 1;
+        }
+    }
+    reaped
+}
+
+/// Pure core of the reap: the run-ids among `rows` that are orphans for the
+/// reading session `own`. Split out from the store I/O so the full ownership ×
+/// phase × staleness matrix is unit-testable without a live DB.
+fn orphaned_run_ids(rows: &[crate::db::CoordinatorRow], own: &str) -> Vec<String> {
+    rows.iter()
+        .filter(|row| {
+            is_orphaned_row(
+                row.session_id.as_deref(),
+                own,
+                &Phase::parse(&row.phase),
+                row.heartbeat_at.as_deref(),
+            )
+        })
+        .map(|row| row.run_id.clone())
+        .collect()
 }
 
 /// Current UTC time as unix seconds.
@@ -1519,6 +1589,115 @@ mod tests {
         // Missing/garbage heartbeats are stale.
         assert!(heartbeat_is_stale(None));
         assert!(heartbeat_is_stale(Some("garbage")));
+    }
+
+    /// Build a minimal CoordinatorRow fixture for the orphan-reap tests.
+    fn row(
+        run_id: &str,
+        phase: &str,
+        session_id: Option<&str>,
+        heartbeat_at: Option<String>,
+    ) -> crate::db::CoordinatorRow {
+        crate::db::CoordinatorRow {
+            run_id: run_id.into(),
+            task: "t".into(),
+            phase: phase.into(),
+            result: None,
+            error: None,
+            session_id: session_id.map(str::to_string),
+            session_name: None,
+            created_at: None,
+            heartbeat_at,
+        }
+    }
+
+    #[test]
+    fn is_orphaned_row_matrix() {
+        let now = now_unix_secs();
+        let stale = Some(unix_to_sqlite(now - 60 * 60)); // 1h ago > 15m
+        let fresh = Some(unix_to_sqlite(now));
+
+        // Orphan: coordinating, foreign owner, stale heartbeat.
+        assert!(is_orphaned_row(
+            Some("other"),
+            "me",
+            &Phase::Coordinating,
+            stale.as_deref()
+        ));
+        // Orphan: awaiting_batch counts too.
+        assert!(is_orphaned_row(
+            Some("other"),
+            "me",
+            &Phase::AwaitingBatch,
+            stale.as_deref()
+        ));
+        // Orphan: missing heartbeat is stale.
+        assert!(is_orphaned_row(Some("other"), "me", &Phase::Coordinating, None));
+
+        // NOT orphan: it's mine (same session), even if stale.
+        assert!(!is_orphaned_row(
+            Some("me"),
+            "me",
+            &Phase::Coordinating,
+            stale.as_deref()
+        ));
+        // NOT orphan: foreign but heartbeat fresh (owner still alive).
+        assert!(!is_orphaned_row(
+            Some("other"),
+            "me",
+            &Phase::Coordinating,
+            fresh.as_deref()
+        ));
+        // NOT orphan: terminal phases are never reaped.
+        assert!(!is_orphaned_row(Some("other"), "me", &Phase::Done, None));
+        assert!(!is_orphaned_row(Some("other"), "me", &Phase::Failed, None));
+    }
+
+    #[test]
+    fn orphaned_run_ids_selects_only_stale_unowned_nonterminal() {
+        let now = now_unix_secs();
+        let stale = || Some(unix_to_sqlite(now - 60 * 60));
+        let fresh = || Some(unix_to_sqlite(now));
+        let rows = vec![
+            row("zombie", "coordinating", Some("gone"), stale()), // reap
+            row("zombie_batch", "awaiting_batch", Some("gone"), stale()), // reap
+            row("no_beat", "coordinating", Some("gone"), None),   // reap
+            row("mine", "coordinating", Some("me"), stale()),     // keep (mine)
+            row("live", "coordinating", Some("other"), fresh()),  // keep (fresh)
+            row("done", "done", Some("other"), stale()),          // keep (terminal)
+            row("failed", "failed", Some("other"), stale()),      // keep (terminal)
+        ];
+        let mut ids = orphaned_run_ids(&rows, "me");
+        ids.sort();
+        assert_eq!(ids, vec!["no_beat", "zombie", "zombie_batch"]);
+    }
+
+    #[test]
+    fn reap_orphaned_runs_flips_zombie_but_spares_fresh_and_own() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("reap_orphan_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+        // Foreign, non-terminal — but its heartbeat is FRESH (insert stamps
+        // current_timestamp), so it must NOT be reaped.
+        store.insert("foreign_fresh", "task", "other", None).unwrap();
+        // This session's own non-terminal run — never reaped regardless.
+        store.insert("mine", "task", "me", None).unwrap();
+
+        // Nothing is stale yet → zero reaped, both rows stay coordinating.
+        assert_eq!(reap_orphaned_runs(&store, "me"), 0);
+        let phase_of = |id: &str| {
+            store
+                .load_all()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.run_id == id)
+                .map(|r| r.phase)
+        };
+        assert_eq!(phase_of("foreign_fresh").as_deref(), Some("coordinating"));
+        assert_eq!(phase_of("mine").as_deref(), Some("coordinating"));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Test helper: unix seconds → SQLite `current_timestamp` string (UTC).
