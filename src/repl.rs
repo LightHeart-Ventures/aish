@@ -3701,7 +3701,6 @@ fn render_interactive_history_tail(
 ) -> Vec<String> {
     use crate::backend::Role;
     let mut rows: Vec<String> = Vec::new();
-    eprintln!("[DEBUG render_tail] processing {} messages", history.len());
     for m in history {
         match m.role {
             Role::User => {
@@ -3731,7 +3730,6 @@ fn render_interactive_history_tail(
                     // tests, piped runs) `render_stdout` returns the text
                     // unchanged, so the row content is stable to assert on.
                     let rendered = crate::md::render_stdout(text);
-                    eprintln!("[DEBUG render_tail] assistant text.len()={}, rendered.len()={}, lines={}", text.len(), rendered.len(), rendered.lines().count());
                     for line in rendered.lines() {
                         rows.push(line.to_string());
                     }
@@ -3764,7 +3762,6 @@ fn backfill_interactive(session: &Session) -> bool {
     }
     const TAIL_LINES: usize = 40;
     let rows = render_interactive_history_tail(&session.history, TAIL_LINES);
-    eprintln!("[DEBUG backfill] history.len()={}, rows.len()={}", session.history.len(), rows.len());
     if rows.is_empty() {
         return false;
     }
@@ -4445,12 +4442,9 @@ fn cycle_worker(session: &mut Session) -> bool {
     // Open the worker view inline on the primary buffer WITHOUT destroying
     // interactive scrollback: the interactive output scrolls up into scrollback
     // (not wiped), and the worker's output stays scrollable via the terminal's
-    // native scrollback. On the first hop off the prompt, erase the ephemeral
-    // interactive prompt row rustyline left behind so the attach header opens on
-    // a clean row instead of trailing a stray blank prompt.
-    if !crate::terminal::attach_view_active() {
-        crate::terminal::erase_current_line();
-    }
+    // native scrollback. `open_attach_view` erases the ephemeral interactive
+    // prompt row rustyline left behind so the attach header opens on a clean row
+    // instead of starting ON the prompt.
     crate::terminal::open_attach_view();
     // TASK-299/301: the goal is the last rotation slot — watch-only. Stream its
     // turns live and backfill its durable state (mirrors `:attach goal`), then
