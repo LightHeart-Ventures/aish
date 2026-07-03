@@ -171,6 +171,32 @@ pub fn job_type_emoji(kind: &str) -> &'static str {
     }
 }
 
+/// Emoji marking what a background worker is DOING, inferred from its task text.
+///
+/// The `:workers` table used to stamp every row with the same generic robot
+/// (`job_type_emoji("worker"|"coordinator")`), so an operator couldn't tell an
+/// `:alert` monitor apart from a code task at a glance. This classifier inspects
+/// the worker's task string for the distinctive markers each special worker
+/// class carries and returns a purpose-fitting glyph, falling back to the
+/// generic worker robot when the task is just ordinary background work.
+///
+/// It keys on stable, multi-word anchors (not single common words) to avoid
+/// false positives, and is pure so it's cheap and unit-testable. Extend by
+/// adding a new anchor → glyph arm before the fallback.
+pub fn job_activity_emoji(task: &str) -> &'static str {
+    let t = task.to_ascii_lowercase();
+    // Operator `:alert` monitors are spawned by `spawn_alert_coordinator` with a
+    // fixed task prefix — "resolving an operator ALERT (the aish `:alert`
+    // feature)" — whose whole job is to call the `set_alert` tool when a
+    // condition is met. Alarm clock.
+    if t.contains("operator alert") || t.contains("`:alert` feature") || t.contains("set_alert") {
+        return "⏰";
+    }
+    // Ordinary background work — reuse the generic worker glyph so the robot
+    // emoji stays single-sourced with `job_type_emoji`.
+    job_type_emoji("worker")
+}
+
 // ---------------------------------------------------------------------------
 // Time formatting — start/stop timestamps + durations for the `:workers` table
 // ---------------------------------------------------------------------------
@@ -653,5 +679,20 @@ mod tests {
         assert_eq!(job_type_emoji("batch"), "📦");
         assert_eq!(job_type_emoji("goal"), "🎯");
         assert_eq!(job_type_emoji("mystery"), "•");
+    }
+
+    #[test]
+    fn job_activity_emoji_alert_vs_generic() {
+        // The exact task prefix spawn_alert_coordinator uses → alarm clock.
+        let alert_task = "You are resolving an operator ALERT (the aish `:alert` feature). \
+Watch for this condition and call the `set_alert` tool with alert_id=7 …";
+        assert_eq!(job_activity_emoji(alert_task), "⏰");
+        // Any of the anchors alone is enough.
+        assert_eq!(job_activity_emoji("call set_alert when the PR merges"), "⏰");
+        assert_eq!(job_activity_emoji("watch for an operator alert condition"), "⏰");
+        // Ordinary background work falls back to the generic worker robot.
+        assert_eq!(job_activity_emoji("fix the failing CI on branch feat/x"), "🤖");
+        assert_eq!(job_activity_emoji("refactor the coordinator store"), "🤖");
+        assert_eq!(job_activity_emoji(""), "🤖");
     }
 }

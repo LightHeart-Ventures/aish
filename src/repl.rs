@@ -5693,7 +5693,7 @@ async fn handle_colon(
                     w.started_epoch().unwrap_or(0),
                     format!(
                         "| {} {} | {} * | {} | {} | {} | {} | {} |\n",
-                        crate::style::job_type_emoji("worker"),
+                        crate::style::job_activity_emoji(&w.task),
                         id_cell,
                         me_label,
                         crate::style::styled_status(&w.status()),
@@ -5780,7 +5780,7 @@ async fn handle_colon(
                             started.unwrap_or(0),
                             format!(
                                 "| {} {} | {} | {} | {} | {} | {} | {} |\n",
-                                crate::style::job_type_emoji("coordinator"),
+                                crate::style::job_activity_emoji(&r.task),
                                 crate::batch::short_id(&r.run_id),
                                 session_cell,
                                 crate::style::styled_status(&r.phase),
