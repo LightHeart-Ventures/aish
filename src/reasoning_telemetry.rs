@@ -641,20 +641,14 @@ fn compute() -> (Summary, ScanStats) {
         })
         .unwrap_or(false);
 
-    let Ok(meta) = std::fs::metadata(&path) else {
-        // No log yet → empty summary; leave any stale memo untouched.
-        return (
-            Summary::default(),
-            ScanStats {
-                incremental: false,
-                lines_scanned: 0,
-            },
-        );
-    };
-    let cur_len = meta.len();
-    let cur_mtime_ns = mtime_ns(&meta);
+    // The active file may be missing right after a rotation (it is recreated on
+    // the next append) — archives can still hold data, so don't early-return to
+    // empty here; fall through to the rotation-aware full recompute below.
+    let meta = std::fs::metadata(&path).ok();
 
-    if !force {
+    if let (false, Some(meta)) = (force, meta.as_ref()) {
+        let cur_len = meta.len();
+        let cur_mtime_ns = mtime_ns(meta);
         if let Some(memo) = load_memo() {
             // Unchanged file → serve the memo verbatim (zero new lines).
             if memo.source_len == cur_len && memo.source_mtime_ns == cur_mtime_ns {
@@ -687,12 +681,23 @@ fn compute() -> (Summary, ScanStats) {
         }
     }
 
-    // Full recompute.
-    let data = std::fs::read(&path).unwrap_or_default();
+    // Full recompute (rotation-aware): fold the retained gzip archives
+    // oldest→newest FIRST, then the active file. This reconstructs global append
+    // order across a rotation boundary, so a pre-rotation event still counts and
+    // an outcome update written after a rotation folds onto its now-archived
+    // event. Archive contributions are baked into the memo, so a later pure
+    // append only re-scans the active tail (archives can't change without a
+    // rotation, and a rotation invalidates the memo anyway).
     let mut acc = Acc::default();
+    fold_archives(&mut acc);
+    let data = std::fs::read(&path).unwrap_or_default();
     let scanned = consume_bytes(&mut acc, &data, 0);
     let summary = acc_to_summary(&acc);
-    save_memo(&acc, cur_len, cur_mtime_ns);
+    // Persist a memo only when the active file exists — its len+mtime signature
+    // is what the incremental hot path keys on.
+    if let Some(meta) = meta.as_ref() {
+        save_memo(&acc, meta.len(), mtime_ns(meta));
+    }
     (
         summary,
         ScanStats {
@@ -700,6 +705,25 @@ fn compute() -> (Summary, ScanStats) {
             lines_scanned: scanned,
         },
     )
+}
+
+/// Fold every retained gzip archive into `acc`, oldest generation first
+/// (`.{ROTATE_KEEP}.gz` … `.1.gz`), reconstructing append order so a later
+/// outcome update folds onto an event that has since been archived. Best-effort:
+/// an unreadable or truncated archive is skipped rather than losing the rest of
+/// the summary.
+fn fold_archives(acc: &mut Acc) {
+    for n in (1..=ROTATE_KEEP).rev() {
+        let Ok(f) = std::fs::File::open(archive_path(n)) else {
+            continue;
+        };
+        let mut buf = Vec::new();
+        if flate2::read::GzDecoder::new(f).read_to_end(&mut buf).is_ok() {
+            for line in buf.split(|&b| b == b'\n') {
+                process_raw_line(acc, line);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1240,5 +1264,87 @@ mod tests {
             !archive_path(ROTATE_KEEP + 1).exists(),
             "generations beyond ROTATE_KEEP are pruned"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Rotation + summarize: no data lost across the rotation boundary.
+    // (Guards the archive-folding path in `compute`.)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn rotation_loses_no_data_across_boundary() {
+        let _log = TestLog::new("rotate_nodata");
+        unsafe {
+            std::env::set_var("AISH_REASONING_ROTATE_MB", "0.0008");
+        }
+        // A handful of guesses; rotation archives the earliest into .1.gz.
+        for i in 0..6 {
+            record(&ReasoningEvent::new(
+                Decision::Guessed,
+                format!("event {i}"),
+                "t",
+            ))
+            .unwrap();
+        }
+        // Force a full, rotation-aware rescan (archives folded before active).
+        unsafe {
+            std::env::set_var("AISH_REASONING_MEMO_FORCE_RESCAN", "1");
+        }
+        let s = summarize();
+        unsafe {
+            std::env::remove_var("AISH_REASONING_MEMO_FORCE_RESCAN");
+        }
+        assert_eq!(s.total, 6, "every event counted across the rotation boundary");
+        assert_eq!(s.overall.guessed, 6);
+    }
+
+    #[test]
+    fn outcome_update_folds_onto_archived_event_after_rotation() {
+        let _log = TestLog::new("rotate_fold");
+        unsafe {
+            std::env::set_var("AISH_REASONING_ROTATE_MB", "0.0008");
+        }
+        // The tracked guess, recorded first so it lands in the first archive.
+        let id = record(
+            &ReasoningEvent::new(Decision::Guessed, "risky call", "t")
+                .with_levels(Level::High, Level::High, Level::High),
+        )
+        .unwrap();
+        // Push fillers until the first rotation archives the early records — we
+        // stop at the first archive so the tracked event stays within the
+        // retained window (no eviction) regardless of exact line sizes.
+        let mut i = 0;
+        while !archive_path(1).exists() && i < 100 {
+            record(&ReasoningEvent::new(
+                Decision::Escalated,
+                format!("filler event {i} with padding to grow the active log"),
+                "t",
+            ));
+            i += 1;
+        }
+        assert!(
+            archive_path(1).exists(),
+            "rotation should have archived the early records"
+        );
+        // Close the loop AFTER rotation — the update lands in the fresh active
+        // file yet must still fold onto the now-archived event.
+        assert!(update_outcome(&id, Outcome::WrongTurn));
+
+        // Force a rescan so we exercise the archive-folding path deterministically.
+        unsafe {
+            std::env::set_var("AISH_REASONING_MEMO_FORCE_RESCAN", "1");
+        }
+        let s = summarize();
+        unsafe {
+            std::env::remove_var("AISH_REASONING_MEMO_FORCE_RESCAN");
+        }
+        assert_eq!(s.overall.guessed, 1, "only the tracked decision is a guess");
+        assert_eq!(
+            s.overall.guess_wrong, 1,
+            "the post-rotation outcome folded onto the archived event"
+        );
+        assert_eq!(s.overall.guess_wrong_pct(), Some(100));
+        let high = s.by_complexity.get(&Level::High).copied().unwrap();
+        assert_eq!(high.guess_wrong_pct(), Some(100));
     }
 }

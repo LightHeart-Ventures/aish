@@ -6,30 +6,57 @@
 # execution with a mounted state volume (/aish/state) and a project tree bind
 # at the workdir (/aish/work).
 #
-# The `aish` binary is INJECTED from the build context (`target/release/aish`),
-# baked as a layer for a release image or bind-mounted over in dev. Build it via
-# `make worker-image` (which runs `cargo build --release` first).
+# ─── libc compatibility (why this is a MULTI-STAGE self-build) ───────────────
+# Historically this file `COPY`ed the HOST-built `target/release/aish` into the
+# runtime image. That coupled the runtime to the *host's* glibc: a binary built
+# on a modern host (e.g. Ubuntu 24.04 → glibc 2.39) will NOT run on the
+# debian:bookworm-slim base (glibc 2.36) — it dies at exec with
+#   /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found
+# Worse, the image *builds* successfully (the COPY works); it only fails when a
+# worker container is launched — so the host-fallback safety net in
+# `build_container_command` (which only triggers on a MISSING/unbuildable image)
+# never catches it, and the operator just sees failed background jobs.
 #
-# Caveat (cross-arch / libc): the injected binary must match the image's
-# platform + libc. A glibc host build (debian/bookworm-slim base) matches a
-# glibc host; building the image on macOS requires a linux/amd64|arm64 aish
-# build (e.g. cross or a CI runner) — the host Darwin binary will NOT run here.
-# This is why the container backend degrades to the host subprocess (AC9) when
-# the image is missing or unbuildable.
+# The fix: build the binary INSIDE the image, against the SAME base's glibc, so
+# the runtime libc always matches the compiled binary regardless of the
+# operator's host distro. `container.rs` additionally runs a one-shot
+# `<engine> run --rm <tag> --version` compat probe before committing a worker to
+# the container path, so even a hand-injected mismatched binary degrades to the
+# host subprocess with a clear diagnostic instead of hard-failing (belt + braces).
+#
+# ─── builder stage ───────────────────────────────────────────────────────────
+# Pinned to the bookworm-based Rust image so the builder's glibc == the runtime
+# base's glibc. Claude-only build (`--no-default-features`) — the heavy `local`
+# (llama.cpp / cmake) feature is never needed by a coordinator worker and only
+# adds compile time + build deps (see scripts/build.sh / Makefile build-fast).
+FROM rust:1-bookworm AS builder
 
+WORKDIR /src
+
+# The `.cargo/config.toml` in the context carries the per-build `jobs` cap, so
+# the in-image compile inherits the same OOM mitigation as host/worktree builds.
+# `.dockerignore` keeps the context lean (no target/, .git, worktrees).
+COPY . .
+
+# Claude-only, stripped release build (profile.release: opt-level=2, thin LTO,
+# strip). Matches the coordinator/CI build policy exactly.
+RUN cargo build --release --no-default-features \
+    && cp target/release/aish /aish-bin \
+    && /aish-bin --version
+
+# ─── runtime stage ───────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
 # git is needed by the coordinator's worktree/VCS tooling; ca-certificates for
-# HTTPS (MCP servers, gh, crates). Slim base keeps the image ≤ ~250 MB (AC perf).
+# HTTPS (MCP servers, gh, crates). Slim base keeps the image small (AC perf).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Inject the aish binary (baked layer for release; bind-mount in dev). The path
-# is relative to the build context (the repo root).
-ARG AISH_BIN=target/release/aish
-COPY ${AISH_BIN} /usr/local/bin/aish
-RUN chmod 0755 /usr/local/bin/aish
+# The binary built above shares this stage's glibc, so it always runs here.
+COPY --from=builder /aish-bin /usr/local/bin/aish
+RUN chmod 0755 /usr/local/bin/aish \
+    && /usr/local/bin/aish --version
 
 # Fixed mount points: the persistent state volume (AC4) and the project tree.
 RUN mkdir -p /aish/state /aish/work
