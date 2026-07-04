@@ -72,6 +72,18 @@ environment or ~/.aishrc"
         Ok(Self { auth })
     }
 
+    /// A non-secret label identifying which auth kind resolved — for
+    /// `describe()` / the statusline provider indicator. Never the token itself.
+    /// "subscription" for a Claude Max/Pro OAuth token (CLAUDE_CODE_OAUTH_TOKEN
+    /// or the Claude Code CLI's ~/.claude/.credentials.json); "api key" for a
+    /// metered ANTHROPIC_API_KEY.
+    pub fn auth_label(&self) -> &'static str {
+        match &self.auth {
+            Auth::Oauth(_) => "subscription",
+            Auth::ApiKey(_) => "api key",
+        }
+    }
+
     /// Add the auth header(s) for this credential to a Messages request. OAuth
     /// uses a Bearer header plus the oauth beta flag and must NOT also send
     /// `x-api-key`; a metered key uses `x-api-key`.
@@ -148,6 +160,12 @@ pub struct ClaudeBackend {
 }
 
 impl ClaudeBackend {
+    /// Non-secret auth-kind label for this backend's credential
+    /// ("subscription" | "api key") — surfaced in `describe()` / the statusline.
+    pub fn auth_label(&self) -> &'static str {
+        self.cred.auth_label()
+    }
+
     pub fn new(model: String, cred: Credential) -> Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()

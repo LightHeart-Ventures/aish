@@ -25,6 +25,7 @@ mod loopguard;
 mod mcp;
 mod md;
 mod memory;
+mod midturn_input;
 mod modelfetch;
 #[cfg(test)]
 mod oracle;
@@ -315,6 +316,16 @@ async fn main() -> Result<()> {
     // resolves its credential from those rc exports as well as the process env —
     // so `export CLAUDE_CODE_OAUTH_TOKEN=…` / `export ANTHROPIC_API_KEY=…` in
     // ~/.aishrc works for aish itself, not just the programs it spawns.
+    // Startup notices (store/init warnings) are COLLECTED here rather than
+    // written straight to stderr: on the interactive path `repl::run`'s
+    // `clear_screen()` (`\x1b[2J\x1b[H`) wipes the screen before the first
+    // prompt, so anything eprintln!'d during startup scrolls offscreen and the
+    // operator never sees it. We buffer them and hand them to `repl::run`, which
+    // renders them in the active output field above the prompt. Non-interactive
+    // entry paths (-c / --coordinator / script) have no REPL, so they still
+    // flush to stderr below.
+    let mut startup_notices: Vec<String> = Vec::new();
+
     let rc = rc::load();
     timer.mark("rc::load");
     let mut session = session::Session::new()?;
@@ -385,7 +396,7 @@ async fn main() -> Result<()> {
     let _ = std::fs::create_dir_all(&aish_dir);
     let _ = std::fs::create_dir_all(aish_dir.join("registry"));
     if let Err(e) = skill_provider::initialize_registry(&aish_dir) {
-        eprintln!("\x1b[33maish:\x1b[0m skill registry init failed: {e:#}");
+        startup_notices.push(format!("\x1b[33maish:\x1b[0m skill registry init failed: {e:#}"));
     }
     timer.mark("registry init");
 
@@ -430,7 +441,8 @@ async fn main() -> Result<()> {
                     eprintln!("\x1b[2m{}\x1b[0m", hwdetect::short_line(&sel));
                 }
                 Err(e) => {
-                    eprintln!("\x1b[33maish:\x1b[0m local model detection failed: {e:#}")
+                    startup_notices
+                        .push(format!("\x1b[33maish:\x1b[0m local model detection failed: {e:#}"))
                 }
             }
             backend::Backend::new_local()?
@@ -458,7 +470,7 @@ async fn main() -> Result<()> {
     // ~/.aish/database/plugins.db, initialized once here so plugin hooks can reach it via
     // `plugin_state::global()`. Non-fatal — a bad DB must never block startup.
     if let Err(e) = plugin_state::init_global(&db_paths::plugin_state_db_path()) {
-        eprintln!("\x1b[33maish:\x1b[0m plugin state store unavailable: {e}");
+        startup_notices.push(format!("\x1b[33maish:\x1b[0m plugin state store unavailable: {e}"));
     }
     // Plugin webhook dispatcher (Phase 1.6): route lifecycle events to plugins
     // that opt in via `webhook_url` / `webhook_command` in their manifest.
@@ -500,7 +512,7 @@ async fn main() -> Result<()> {
         let injected =
             plugins::collect_lifecycle_env(&aish_dir.join("plugins"), "on_init", &ambient);
         for w in &injected.warnings {
-            eprintln!("\x1b[33maish:\x1b[0m {w}");
+            startup_notices.push(format!("\x1b[33maish:\x1b[0m {w}"));
         }
         for (k, v) in injected.vars {
             session.set_var(&k, v);
@@ -539,7 +551,8 @@ async fn main() -> Result<()> {
     session.db = match db::Db::open(&db_paths::main_db_path()) {
         Ok(d) => Some(d),
         Err(e) => {
-            eprintln!("\x1b[33maish:\x1b[0m persistent store unavailable: {e:#}");
+            startup_notices
+                .push(format!("\x1b[33maish:\x1b[0m persistent store unavailable: {e:#}"));
             None
         }
     };
@@ -568,7 +581,9 @@ async fn main() -> Result<()> {
             session.batch_store = Some(store);
             batch::rehydrate(&mut session);
         }
-        Err(e) => eprintln!("\x1b[33maish:\x1b[0m batch store unavailable: {e:#}"),
+        Err(e) => {
+            startup_notices.push(format!("\x1b[33maish:\x1b[0m batch store unavailable: {e:#}"))
+        }
     }
     timer.mark("batch rehydrate");
 
@@ -579,7 +594,8 @@ async fn main() -> Result<()> {
             session.coordinator_store = Some(store);
             coordinator::rehydrate(&mut session);
         }
-        Err(e) => eprintln!("\x1b[33maish:\x1b[0m coordinator store unavailable: {e:#}"),
+        Err(e) => startup_notices
+            .push(format!("\x1b[33maish:\x1b[0m coordinator store unavailable: {e:#}")),
     }
     timer.mark("coordinator rehydrate");
 
@@ -588,7 +604,9 @@ async fn main() -> Result<()> {
     // for the goal domain model + tracker; failure here is non-fatal.
     match db::GoalStore::open(&db_paths::main_db_path()) {
         Ok(store) => session.goal_store = Some(store),
-        Err(e) => eprintln!("\x1b[33maish:\x1b[0m goal store unavailable: {e:#}"),
+        Err(e) => {
+            startup_notices.push(format!("\x1b[33maish:\x1b[0m goal store unavailable: {e:#}"))
+        }
     }
     timer.mark("goal store open");
 
@@ -597,7 +615,9 @@ async fn main() -> Result<()> {
     // semantic ones via the `set_alert` tool. Non-fatal on failure.
     match db::AlertStore::open(&db_paths::main_db_path()) {
         Ok(store) => session.alert_store = Some(store),
-        Err(e) => eprintln!("\x1b[33maish:\x1b[0m alert store unavailable: {e:#}"),
+        Err(e) => {
+            startup_notices.push(format!("\x1b[33maish:\x1b[0m alert store unavailable: {e:#}"))
+        }
     }
     timer.mark("alert store open");
 
@@ -608,6 +628,12 @@ async fn main() -> Result<()> {
     // a nested background coordinator (design §8 coordinator-parity).
     if !interactive {
         session.load_hooks();
+        // No REPL output field on the one-shot/script/coordinator paths — flush
+        // collected startup notices straight to stderr (their original behavior),
+        // ahead of any turn output. The interactive path hands them to repl::run.
+        for n in &startup_notices {
+            eprintln!("{n}");
+        }
     }
 
     if let Some(prompt) = args.command {
@@ -674,7 +700,15 @@ async fn main() -> Result<()> {
         let _ = d.route(plugin_dispatcher::Event::WorkspaceOpen);
     }
 
-    repl::run(backend, session, aliases, mcp_paths, skills_dir).await
+    repl::run(
+        backend,
+        session,
+        aliases,
+        mcp_paths,
+        skills_dir,
+        startup_notices,
+    )
+    .await
 }
 
 fn aish_dir() -> PathBuf {

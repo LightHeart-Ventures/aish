@@ -106,6 +106,7 @@ pub async fn run(
     aliases: HashMap<String, Vec<String>>,
     mcp_config_paths: Vec<PathBuf>,
     skills_dir: PathBuf,
+    startup_notices: Vec<String>,
 ) -> Result<()> {
     // Job-control signal disposition (TASK-115): aish ignores SIGINT/QUIT/TSTP/
     // TTOU/TTIN so a Ctrl-C/Ctrl-\/Ctrl-Z reaches the foreground child's process
@@ -282,6 +283,18 @@ pub async fn run(
         );
     }
 
+    // Startup notices (store/init warnings, hook-load failures, etc.) collected
+    // in `main` BEFORE the backend was built. `clear_screen()` above wiped the
+    // terminal, so these are rendered here — after the header, above the first
+    // prompt — where they land in the active output field instead of scrolling
+    // offscreen during startup. Each is styled as a warning line.
+    for notice in &startup_notices {
+        println!("{notice}");
+    }
+    if !startup_notices.is_empty() {
+        println!();
+    }
+
     // The startup block above already printed the statusline, and the first
     // `LoopTick::Idle` pass reprints it directly above the first prompt — which
     // would show the header twice. Suppress exactly that first idle refresh so
@@ -422,6 +435,21 @@ pub async fn run(
                             "\x1b[2m⇄ {short} finished — review mode: type a message to resume it, or :detach to return to your shell.\x1b[0m\n"
                         ));
                         finished_bell = true;
+                        // Hands-free redraw: the main loop is BLOCKED in
+                        // read_line while the operator watches the attached
+                        // worker. Printing the review notice above the prompt
+                        // does not, on its own, refresh the (now stale) prompt +
+                        // review-mode footer — they'd only redraw on the next
+                        // keypress, so the operator is left staring at a screen
+                        // with no visible prompt after the turn ends. Raise the
+                        // kernel-independent resume wake (and belt-and-suspenders
+                        // TIOCSTI nudge) so the parked read_line returns promptly
+                        // and the next loop pass reprints the prompt/footer in
+                        // review mode. take_resume_tick returns None while
+                        // attached, so this only redraws — it does NOT
+                        // auto-synthesize.
+                        crate::editor::arm_resume_wake();
+                        crate::editor::nudge_terminal_return();
                     }
                 }
                 // Notify (one line per finished job), don't dump the full result
@@ -592,11 +620,12 @@ pub async fn run(
                 }
             }
         }
-        // Colour the ⟳N badge by the most recent background-worker event
-        // (green ✓ tool success, red ✗ tool failure, magenta ⟳ turn
-        // completion), fading back to dim ⟳N after worker::PULSE_FADE.
-        let pulse = crate::worker::fresh_pulse(&session.worker_jobs);
-        let badge = crate::worker::pulse_badge(running, pulse);
+        // Colour the worker badge by the *state* of the workers: white ⟳N while
+        // any are live (received input / thinking / mid-turn), then once the live
+        // count hits 0 briefly flash the last terminal verdict — green ✓ done,
+        // red ✗ completed-but-failed — fading out after worker::PULSE_FADE.
+        let terminal = crate::worker::fresh_terminal(&session.worker_jobs);
+        let badge = crate::worker::pulse_badge(running, terminal);
         // The session name (`:rename`) is no longer shown in the prompt — it's
         // right-justified on the 2nd statusline instead (see
         // `coordinator_status_message`).
@@ -1236,9 +1265,9 @@ fn recent_message_row(baseline: String, flash: Option<String>) -> String {
 /// Build the coordinator status line shown in the footer's middle row (row H-1)
 /// — the "2nd statusline".
 ///
-/// - When attached to a coordinator it mirrors the Shift-Tab attach
-///   announcement — `⇄ attached to <id> (i/n · Shift-Tab to cycle, :detach to
-///   stop)` — with a review-mode variant for a coordinator that has finished.
+/// - When attached to a LIVE coordinator it shows the compact `⇄ attached to
+///   <id>` (plus a task hint); a coordinator that has FINISHED gets the
+///   review-mode variant `⇄ attached to <id> (finished) (i/n · review mode: …)`.
 /// - When NOT attached but coordinators exist to cycle into, it shows the
 ///   detached hint `⇄ detached — back to interactive (Shift-Tab to cycle into a
 ///   coordinator)` so the 2nd statusline reflects the interactive state instead
@@ -1372,9 +1401,10 @@ fn coordinator_status_line(
                             "⇄ attached to {short} (finished) ({idx}/{n} · review mode: type to resume, Shift-Tab to cycle, :detach to stop)"
                         )
                     } else {
-                        format!(
-                            "⇄ attached to {short} ({idx}/{n} · Shift-Tab to cycle, :detach to stop)"
-                        )
+                        // Live worker: keep the statusline compact — just the id
+                        // (the "(i/n · Shift-Tab to cycle, :detach to stop)" hint
+                        // was intentionally dropped).
+                        format!("⇄ attached to {short}")
                     };
                     // Append a compact hint of the task this worker is on, so the
                     // 2nd statusline says WHAT you're attached to, not just which id.
@@ -1493,6 +1523,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
         "remove the attached (or named) coordinator from the worker list + Shift-Tab rotation",
     ),
     ("compact", "compact history, offload to memory"),
+    ("config", "show aish's active configuration"),
     ("context", "show context-window usage"),
     ("detach", "stop watching the attached coordinator"),
     ("dispatch", "launch a background coordinator"),
@@ -2681,6 +2712,25 @@ async fn dispatch(
             builtin_wait(words.get(1).map(String::as_str), session).await;
             Dispatch::Handled
         }
+        "clear" => {
+            // Intercept `clear` as a builtin (instead of exec'ing clear(1)) so we
+            // can record WHERE in the conversation the operator cleared. Interactive
+            // backfill (`:detach` / Shift-Tab back to slot 0) replays only history
+            // at/after this mark, so a `clear` stays cleared when they return to the
+            // prompt instead of resurrecting the wiped scrollback.
+            session.clear_mark = session.history.len();
+            // Full clear, matching clear(1): \x1b[3J wipes scrollback, \x1b[2J the
+            // visible screen, \x1b[H homes the cursor. Only on a TTY (a piped
+            // stdout stays free of escape noise).
+            // SAFETY: plain isatty query.
+            if unsafe { libc::isatty(1) } == 1 {
+                print!("\x1b[3J\x1b[2J\x1b[H");
+                let _ = std::io::stdout().flush();
+                // Re-assert any bottom-anchored footer region the clear just wiped.
+                crate::terminal::restore_after_clear();
+            }
+            Dispatch::Handled
+        }
         cmd => {
             // Resolve against the session's PATH — which includes any
             // `export PATH="$PATH:…"` from ~/.aishrc — falling back to the
@@ -3843,7 +3893,12 @@ fn backfill_interactive(session: &Session) -> bool {
         return false;
     }
     const TAIL_LINES: usize = 40;
-    let rows = render_interactive_history_tail(&session.history, TAIL_LINES);
+    // Honor a `clear` the operator ran on the interactive console: replay only
+    // history at/after the clear mark, so returning to the prompt (`:detach` /
+    // Shift-Tab back to slot 0) doesn't resurrect the cleared scrollback.
+    // Clamp — history may have been compacted/truncated below the mark.
+    let start = session.clear_mark.min(session.history.len());
+    let rows = render_interactive_history_tail(&session.history[start..], TAIL_LINES);
     if rows.is_empty() {
         return false;
     }
@@ -5572,6 +5627,62 @@ fn handle_context(backend: &Backend, session: &Session) {
     }
 }
 
+/// `:config` — dump the live aish configuration to the console: backend/model,
+/// safety mode, background/batch settings, session identity, environment, and
+/// the loaded skill/MCP/persistence surface. Read-only snapshot of current state.
+fn handle_config(backend: &Backend, session: &Session) {
+    let window = backend.context_window();
+    let mcp_servers = session.mcp.server_names();
+    let mcp_line = if mcp_servers.is_empty() {
+        "(none)".to_string()
+    } else {
+        mcp_servers.join(", ")
+    };
+    println!("\x1b[1maish configuration\x1b[0m");
+    println!("  backend         {}", backend.describe());
+    println!("  backend kind    {}", session.backend_kind);
+    println!("  context window  {window} tokens");
+    println!("  mode            {}", session.mode.name());
+    println!(
+        "  session         {}{}",
+        session.session_id,
+        session
+            .name
+            .as_deref()
+            .map(|n| format!(" (name: {n})"))
+            .unwrap_or_default()
+    );
+    println!("  cwd             {}", session.cwd.display());
+    println!(
+        "  background      {} · model {} · force-batches {}",
+        if session.batch_mode { "on" } else { "off" },
+        session.batch_model,
+        if session.batch_force_batches { "on" } else { "off" }
+    );
+    println!(
+        "  raw tool output {}",
+        if session.raw_tool_output { "on" } else { "off" }
+    );
+    println!(
+        "  env exports     {} · skills {} · mcp {}",
+        session.env.len(),
+        session.skills.len(),
+        mcp_line
+    );
+    println!(
+        "  persistence     {}",
+        if session.db.is_some() {
+            "sqlite store open"
+        } else {
+            "unavailable (session-only)"
+        }
+    );
+    println!(
+        "  this session    {} turn(s) · {} tool call(s) · {} tokens in / {} out",
+        session.turns_total, session.tool_calls_total, session.tokens_in, session.tokens_out
+    );
+}
+
 /// `:reasoning` — render the reasoning-quality telemetry summary: the escalate
 /// rate, the guess→wrong-turn rate, and both broken down by complexity and risk.
 /// This is the ground-truth model of *when aish's own reasoning is good enough*
@@ -6120,6 +6231,7 @@ async fn handle_colon(
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
                  :context                            show context-window usage (tokens, %, memories)\n\
+                 :config                             show aish's active configuration (backend, mode, session, MCP, skills)\n\
                  :reasoning                          reasoning-quality telemetry: escalate-vs-guess rate + outcomes by complexity/risk\n\
                  :compact                            offload older history to long-term memory now\n\
                  :memories [organize]                list stored memories, or dedup them\n\
@@ -7151,6 +7263,7 @@ async fn handle_colon(
             }
         }
         Some("context") => handle_context(backend, session),
+        Some("config") => handle_config(backend, session),
         Some("reasoning") => handle_reasoning(),
         Some("metrics") => handle_metrics(),
         Some("compact") => handle_compact(backend, session),
@@ -8828,13 +8941,16 @@ mod tests {
     }
 
     #[test]
-    fn status_line_attached_is_yellow_and_indexed() {
+    fn status_line_attached_is_yellow_and_compact() {
         let ws = workers(&[("w_a", false), ("w_b", false)]);
         let s = coordinator_status_line(Some("w_a"), &ws, true);
         assert!(s.starts_with("\x1b[33m"));
         assert!(s.ends_with("\x1b[0m"));
         assert!(s.contains("attached to"));
-        assert!(s.contains("(1/2 · Shift-Tab to cycle, :detach to stop)"));
+        // The "(i/n · Shift-Tab to cycle, :detach to stop)" hint was dropped from
+        // the live-attached statusline.
+        assert!(!s.contains("Shift-Tab to cycle"), "unexpected status line: {s}");
+        assert!(!s.contains(":detach to stop"), "unexpected status line: {s}");
     }
 
     #[test]
@@ -8842,17 +8958,19 @@ mod tests {
         let ws = workers_with_task(&[("w_a", false, "fix the release workflow")]);
         let s = coordinator_status_line(Some("w_a"), &ws, false);
         assert!(
-            s.contains("(1/1 · Shift-Tab to cycle, :detach to stop) - fix the release workflow"),
+            s.contains("attached to w_a - fix the release workflow"),
             "unexpected status line: {s}"
         );
+        assert!(!s.contains("Shift-Tab to cycle"), "unexpected status line: {s}");
     }
 
     #[test]
     fn status_line_attached_no_task_has_no_suffix() {
         let ws = workers(&[("w_a", false)]);
         let s = coordinator_status_line(Some("w_a"), &ws, false);
-        assert!(s.ends_with("(1/1 · Shift-Tab to cycle, :detach to stop)"));
+        assert!(s.ends_with("attached to w_a"));
         assert!(!s.contains(" - "));
+        assert!(!s.contains("Shift-Tab to cycle"));
     }
 
     #[test]
