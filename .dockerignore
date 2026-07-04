@@ -4,7 +4,10 @@
 # this multi-stage build exists to avoid) or heavy/irrelevant dirs.
 
 # Host build artifacts — never inject a host-libc binary into the image.
+# Both the context-root target/ AND every nested crate target/ (e.g.
+# crates/*/target) — the bare `target/` pattern only matches the root.
 target/
+**/target/
 
 # VCS + coordinator worktrees / state.
 .git/
@@ -15,6 +18,8 @@ worktrees/
 *.log
 aish.db
 aish.db-*
+**/*.db
+**/*.db-*
 .DS_Store
 
 # Docs / examples aren't needed to compile the worker.

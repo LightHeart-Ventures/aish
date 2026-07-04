@@ -1,0 +1,49 @@
+# Fly.io configuration for the aish webhook receiver.
+#
+# Deploy from the REPO ROOT (the Docker build context must be the workspace
+# root so the Dockerfile's `COPY . .` sees the whole cargo workspace):
+#
+#   flyctl deploy . \
+#     --config crates/webhook-receiver/fly.toml \
+#     --dockerfile crates/webhook-receiver/Dockerfile -a aish-webhooks
+#
+# (deploy.sh does exactly this.)
+
+app = "aish-webhooks"
+primary_region = "iad"
+
+[build]
+dockerfile = "./Dockerfile"
+
+# NOTE: do NOT set WEBHOOK_SECRET here — an empty value would shadow the
+# runtime secret. Set it once with: fly secrets set WEBHOOK_SECRET=<secret>
+[env]
+RUST_LOG = "webhook_receiver=info"
+DATABASE_URL = "sqlite://:memory:"
+PORT = "8080"
+
+[http_service]
+internal_port = 8080
+force_https = true
+auto_start_machines = true
+auto_stop_machines = true
+min_machines_running = 1
+
+[http_service.concurrency]
+type = "requests"
+hard_limit = 100
+soft_limit = 80
+
+[[http_service.checks]]
+interval = "15s"
+timeout = "3s"
+grace_period = "10s"
+method = "get"
+path = "/health"
+
+# In-memory SQLite — no volume mount needed.
+# Remove the webhooks_data volume after deploying with: fly volumes destroy webhooks_data -a aish-webhooks
+
+[[vm]]
+size = "shared-cpu-1x"
+memory = "256mb"

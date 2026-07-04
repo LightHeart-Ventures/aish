@@ -1,0 +1,43 @@
+# Multi-stage build for the webhook-receiver service.
+#
+# NOTE: the canonical Dockerfile used by Fly deploys is
+# crates/webhook-receiver/Dockerfile (referenced by that crate's fly.toml).
+# This root-level copy is kept in sync for convenience / manual builds.
+#
+# Build context MUST be the repo root (cargo workspace root). Example:
+#   docker build -f Dockerfile.webhook-receiver -t aish-webhooks .
+FROM rust:1-bookworm AS builder
+
+WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y pkg-config libssl-dev sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the entire workspace (root member `aish` must resolve for the -p build).
+COPY . .
+
+RUN cargo build -p webhook-receiver --release
+
+# ---- Runtime stage -------------------------------------------------------
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y ca-certificates sqlite3 curl libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/webhook-receiver /usr/local/bin/
+
+RUN mkdir -p /data && chmod 755 /data
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+ENV DATABASE_URL=sqlite:////data/webhooks.db
+ENV PORT=8080
+ENV RUST_LOG=webhook_receiver=info
+
+EXPOSE 8080
+
+CMD ["webhook-receiver"]

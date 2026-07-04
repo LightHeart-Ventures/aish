@@ -1,0 +1,6 @@
+/target
+.env
+webhooks.db
+webhooks.db-shm
+webhooks.db-wal
+*.db

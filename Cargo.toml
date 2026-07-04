@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/webhook-receiver"]
+resolver = "2"
+
 [package]
 name = "aish"
 version = "0.31.1"
