@@ -191,6 +191,12 @@ pub async fn run(
         };
     let mut pending_update: Option<crate::update::UpdateInfo> = None;
 
+    // TASK-293: start the built-in Pulse metrics collector — the worked example
+    // of an external subscriber to the coordinator Pulse broadcast. It subscribes
+    // once and folds every published Pulse into the counters `:metrics` reads.
+    // Idempotent, so a `:restart` re-entry is harmless.
+    crate::pulse::start_metrics_collector();
+
     // The line editor is driven through the `LineEditor` trait (S5.1/TASK-130)
     // so the concrete editor — rustyline today, reedline-capable tomorrow — is a
     // one-line swap at this construction site. The rustyline impl configures
@@ -1506,6 +1512,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("loop", "re-run a prompt N times inline (status|stop)"),
     ("mcp", "manage MCP servers"),
     ("memories", "stored memories / organize"),
+    ("metrics", "coordinator pulse event counts (broadcast subscriber)"),
     ("mode", "set confirmation level"),
     ("model", "switch model (opus|sonnet|haiku)"),
     ("model-detect", "pick the best local model for this machine"),
@@ -5574,6 +5581,17 @@ fn handle_reasoning() {
     println!("{}", crate::reasoning_telemetry::render_report(&summary));
 }
 
+/// `:metrics` — display coordinator Pulse event counts (TASK-293). This is the
+/// worked example of an external subscriber to the Pulse broadcast: the built-in
+/// metrics collector (started at REPL boot via
+/// `crate::pulse::start_metrics_collector`) subscribes to the channel and folds
+/// every `ToolOk`/`ToolErr`/`Turn` into process-wide counters, which this command
+/// renders on demand.
+fn handle_metrics() {
+    let counts = crate::pulse::counts();
+    println!("{}", crate::pulse::render_report(&counts));
+}
+
 /// `:compact` — force a context compaction now: offload the oldest slice of the
 /// conversation to the SQLite memories table (recoverable via the recall tool,
 /// tagged `context-offload`) and replace it with a short in-context summary.
@@ -7134,6 +7152,7 @@ async fn handle_colon(
         }
         Some("context") => handle_context(backend, session),
         Some("reasoning") => handle_reasoning(),
+        Some("metrics") => handle_metrics(),
         Some("compact") => handle_compact(backend, session),
         Some("memories" | "memory") => handle_memories(parts.next(), session),
         Some("hooks") => handle_hooks(parts.next(), session),
