@@ -580,12 +580,6 @@ pub fn resume_footer_region() {
 }
 
 
-/// Whether a worker attach view currently owns the foreground. See
-/// [`open_attach_view`].
-pub fn attach_view_active() -> bool {
-    ATTACH_ACTIVE.load(Ordering::Relaxed)
-}
-
 /// Re-anchor the cursor into the bottom of the body after a screen wipe / buffer
 /// switch: footer mode re-asserts the region + repaints the footer (which homes
 /// into the bottom body row); inline mode homes to the last row. Shared by the
@@ -601,20 +595,19 @@ fn anchor_bottom_after_wipe() {
     }
 }
 
-/// Erase the current terminal line in place: carriage-return to column 1, then
-/// `ESC[2K` (clear entire line). Called at the top of [`open_attach_view`] to
-/// wipe the ephemeral interactive prompt/command row the cursor is parked on
-/// (rustyline's `Cmd::Interrupt` on a Shift-Tab hop leaves the cursor just past
-/// an empty prompt on the SAME row; a `:attach` command leaves the echoed
-/// command line above a blank row) so the attach header + backfill open on a
-/// clean row instead of starting ON the prompt. No-op off a tty.
-pub fn erase_current_line() {
+/// Clear the visible screen and home the cursor (`ESC[2J ESC[H`), then flush.
+/// The viewport is wiped so the next attach/detach view redraws on a clean
+/// screen, while the terminal's native scrollback is preserved — that would
+/// need `ESC[3J`, which we deliberately never send — so prior output stays
+/// reachable by wheel / PageUp. No-op off a tty. Callers pair it with
+/// [`anchor_bottom_after_wipe`] to repaint the footer + home into the body.
+fn clear_screen_wipe() {
     // SAFETY: plain isatty query.
     if unsafe { libc::isatty(1) } != 1 {
         return;
     }
     let mut out = std::io::stdout();
-    let _ = write!(out, "\r\x1b[2K");
+    let _ = write!(out, "\x1b[2J\x1b[H");
     let _ = out.flush();
 }
 
@@ -629,33 +622,28 @@ pub fn erase_current_line() {
 /// suppression installed with the footer region), so a worker's output scrolls
 /// exactly like interactive output.
 ///
-/// This is also non-destructive: it never wipes the screen, so the underlying
-/// interactive output is preserved (scrolled up into scrollback, not erased) —
-/// the same goal the earlier alt-screen overlay served, minus the scrollback
-/// loss. It only re-anchors the cursor to the bottom of the body so the attach
-/// header + backfilled tail trail the last output. Idempotent; no-op off a tty.
+/// On entry it clears the visible screen (`ESC[2J`, viewport only) so the attach
+/// header + backfilled tail redraw cleanly instead of piling under the prior
+/// prompt/output, then re-anchors the cursor to the bottom of the body. The wipe
+/// is viewport-only: scrollback is preserved (that would need `ESC[3J`, never
+/// sent), so the underlying interactive output stays reachable by wheel / PageUp.
+/// Idempotent; no-op off a tty.
 pub fn open_attach_view() {
     // SAFETY: plain isatty query.
     if unsafe { libc::isatty(1) } != 1 {
         return;
     }
-    // Only the FIRST hop off the interactive prompt should erase a line: that's
-    // the transition where the cursor is parked on the ephemeral prompt/command
-    // row. Subsequent Shift-Tab cycle hops (attach already active) must NOT
-    // erase, or they'd eat the last row of the previous worker's output.
-    let was_active = attach_view_active();
     ATTACH_ACTIVE.store(true, Ordering::Relaxed);
-    // Replace the ephemeral prompt/command row the cursor is parked on BEFORE
-    // the attach header + backfill print, so the worker view opens on a clean
-    // row instead of starting ON the prompt — the ":attach / Shift-Tab output
-    // starts at the prompt" UX bug. Centralized here so every attach entry point
-    // (`:attach`, `:attach goal`, and the Shift-Tab cycle) gets it uniformly on
-    // the first hop; callers no longer erase the line themselves.
-    if !was_active {
-        erase_current_line();
-    }
+    // Clear the visible screen before the attach header + backfill redraw, so
+    // every Shift-Tab / `:attach` hop opens on a fresh screen instead of piling
+    // under the prior interactive/worker output. `ESC[2J` blanks the viewport
+    // only — the terminal's native scrollback is preserved (that needs `ESC[3J`,
+    // which we deliberately never send) so earlier output stays reachable by
+    // wheel / PageUp. Centralized here so every attach entry point (`:attach`,
+    // `:attach goal`, and the Shift-Tab cycle) gets it uniformly.
+    clear_screen_wipe();
     // Re-assert the footer region + home into the bottom body row so the worker
-    // view grows up from the bottom, mirroring a fresh clear without the wipe.
+    // view grows up from the bottom, mirroring a fresh clear.
     anchor_bottom_after_wipe();
 }
 
@@ -673,6 +661,10 @@ pub fn close_attach_view() {
     if !ATTACH_ACTIVE.swap(false, Ordering::Relaxed) {
         return;
     }
+    // Clear the visible screen before the detach line + interactive backfill
+    // redraw, mirroring `open_attach_view` so detaching also opens on a fresh
+    // screen (scrollback preserved — `ESC[2J`, not `ESC[3J`).
+    clear_screen_wipe();
     anchor_bottom_after_wipe();
 }
 
