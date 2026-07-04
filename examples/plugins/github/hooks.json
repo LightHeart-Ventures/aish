@@ -1,0 +1,18 @@
+{
+  "//": "Webhook + lifecycle routing for the github plugin. aish reads this to know which",
+  "//1": "script to fork/exec for each inbound GitHub webhook event and each lifecycle moment.",
+
+  "lifecycle": {
+    "on_init": "hooks/on_init.sh",
+    "on_shell_ready": "hooks/on_shell_ready.sh",
+    "on_webhook_url_changed": "hooks/on_webhook_url_changed.sh"
+  },
+
+  "webhooks": {
+    "//": "Keyed by the GitHub X-GitHub-Event header. The raw JSON payload is passed on STDIN;",
+    "//1": "the event name is also exported as $GITHUB_EVENT and the delivery id as $GITHUB_DELIVERY.",
+    "pull_request": "handlers/pull_request.sh",
+    "issues": "handlers/issues.sh",
+    "pull_request_review": "handlers/review.sh"
+  }
+}

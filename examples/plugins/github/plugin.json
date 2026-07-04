@@ -1,0 +1,52 @@
+{
+  "id": "github",
+  "name": "GitHub Integration",
+  "version": "1.0.0",
+  "description": "First real aish plugin — GitHub PR/issue automation. Exercises every plugin surface: an MCP server, two skills, three tools, webhook handlers, lifecycle hooks, output schemas, plugin memory, and a login handler.",
+  "enabled": true,
+
+  "provides": {
+    "mcp_server": true,
+    "skills": ["github-pr-review", "github-issue-triage"],
+    "tools": ["create_pr", "list_issues", "add_comment"],
+    "webhooks": ["pull_request", "issues", "pull_request_review"],
+    "lifecycle_hooks": ["on_init", "on_shell_ready", "on_webhook_url_changed"],
+    "schemas": ["github-pr", "github-issue"],
+    "memory": true,
+    "login": "github"
+  },
+
+  "config_schema": {
+    "type": "object",
+    "required": ["owner", "repo"],
+    "properties": {
+      "owner": {
+        "type": "string",
+        "default": "${env:GITHUB_OWNER}",
+        "description": "GitHub org/user that owns the repo this plugin acts on."
+      },
+      "repo": {
+        "type": "string",
+        "default": "${env:GITHUB_REPO}",
+        "description": "Repository name (without owner prefix)."
+      },
+      "default_reviewers": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": [],
+        "description": "GitHub logins auto-requested on PRs opened via create_pr."
+      },
+      "triage_labels": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": ["bug", "enhancement", "question", "needs-triage"],
+        "description": "Label vocabulary the issue-triage skill is allowed to apply."
+      },
+      "auto_comment_on_open": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, the issues webhook handler posts an acknowledgement comment on newly opened issues."
+      }
+    }
+  }
+}
