@@ -103,7 +103,7 @@ impl CoordinatorStore {
                  run_id       TEXT PRIMARY KEY,
                  task         TEXT NOT NULL,
                  phase        TEXT NOT NULL CHECK (phase IN
-                              ('coordinating', 'awaiting_batch', 'done', 'failed')),
+                              ('coordinating', 'awaiting_batch', 'checkpoint', 'done', 'failed')),
                  result       TEXT,
                  error        TEXT,
                  session_id   TEXT,
@@ -178,6 +178,61 @@ impl CoordinatorStore {
                 &format!("ALTER TABLE coordinator_runs ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"),
                 [],
             );
+        }
+        // TASK-291: widen the phase CHECK constraint to admit the new
+        // terminal-but-resumable `checkpoint` phase (a round-cap run parked for
+        // review / `:resume`, distinct from `failed`). SQLite can't ALTER a
+        // CHECK in place, so when an older DB's stored schema predates
+        // 'checkpoint' we rebuild the table ONCE, copying rows by explicit
+        // column list (every additive `ADD COLUMN` above has already run, so the
+        // legacy table carries all columns). Guarded on the stored schema text
+        // → idempotent, and a no-op on fresh DBs whose CREATE already carries it.
+        let needs_checkpoint_migration = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='coordinator_runs'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|sql| !sql.contains("checkpoint"))
+            .unwrap_or(false);
+        if needs_checkpoint_migration {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE coordinator_runs RENAME TO coordinator_runs_legacy;
+                 CREATE TABLE coordinator_runs (
+                     run_id       TEXT PRIMARY KEY,
+                     task         TEXT NOT NULL,
+                     phase        TEXT NOT NULL CHECK (phase IN
+                                  ('coordinating', 'awaiting_batch', 'checkpoint', 'done', 'failed')),
+                     result       TEXT,
+                     error        TEXT,
+                     session_id   TEXT,
+                     session_name TEXT,
+                     created_at   TEXT NOT NULL DEFAULT current_timestamp,
+                     heartbeat_at TEXT NOT NULL DEFAULT current_timestamp,
+                     stand_down   INTEGER NOT NULL DEFAULT 0,
+                     container_id   TEXT,
+                     container_name TEXT,
+                     runtime        TEXT,
+                     tokens_in    INTEGER NOT NULL DEFAULT 0,
+                     tokens_out   INTEGER NOT NULL DEFAULT 0,
+                     turns        INTEGER NOT NULL DEFAULT 0,
+                     tool_calls   INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO coordinator_runs
+                     (run_id, task, phase, result, error, session_id, session_name,
+                      created_at, heartbeat_at, stand_down, container_id, container_name,
+                      runtime, tokens_in, tokens_out, turns, tool_calls)
+                 SELECT
+                     run_id, task, phase, result, error, session_id, session_name,
+                     created_at, heartbeat_at, stand_down, container_id, container_name,
+                     runtime, tokens_in, tokens_out, turns, tool_calls
+                 FROM coordinator_runs_legacy;
+                 DROP TABLE coordinator_runs_legacy;
+                 COMMIT;",
+            )
+            .context("coordinator_runs checkpoint-phase migration failed")?;
         }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -254,6 +309,20 @@ impl CoordinatorStore {
             "UPDATE coordinator_runs \
              SET phase = 'failed', error = ?2, heartbeat_at = current_timestamp WHERE run_id = ?1",
             (run_id, error),
+        )?;
+        Ok(())
+    }
+
+    /// TASK-291: park a run that hit the round cap in the terminal-but-resumable
+    /// `checkpoint` phase, persisting its `result` (the saved state snapshot)
+    /// so an operator can review it and a future `:resume` can continue it —
+    /// distinct from `set_failed`, which marks a dead run. Mirrors `set_done`'s
+    /// write shape (phase + result + heartbeat) but with the parked phase.
+    pub fn set_checkpoint(&self, run_id: &str, result: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE coordinator_runs \
+             SET phase = 'checkpoint', result = ?2, heartbeat_at = current_timestamp WHERE run_id = ?1",
+            (run_id, result),
         )?;
         Ok(())
     }

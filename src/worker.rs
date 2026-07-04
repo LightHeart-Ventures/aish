@@ -2396,7 +2396,11 @@ impl WorkerSpec {
 /// tiny pure predicate so the reconciliation policy is unit-testable without
 /// spawning a real child.
 fn phase_needs_reconcile(phase: &str) -> bool {
-    !matches!(phase, "done" | "failed")
+    // `checkpoint` (TASK-291) is the child's own authoritative round-cap verdict
+    // — a parked, resumable run — so the parent must NOT flip it to `done` when
+    // the (successfully-exiting) child process is reaped. Treat it as terminal
+    // alongside `done`/`failed`.
+    !matches!(phase, "done" | "failed" | "checkpoint")
 }
 
 impl WorkerJob {

@@ -348,8 +348,13 @@ pub enum Phase {
     AwaitingBatch,
     /// Terminal: the task finished, `result` holds the assembled output.
     Done,
-    /// Terminal: the run hit the round cap, errored, or was orphaned.
+    /// Terminal: the run errored or was orphaned.
     Failed,
+    /// Terminal-but-resumable: the run hit the round cap and was PARKED (not
+    /// failed). Its transcript/state is persisted so an operator can review it
+    /// and a future `:resume` can continue it. Distinct from `Failed`, which is
+    /// a dead run. (TASK-291)
+    Checkpoint,
 }
 
 impl Phase {
@@ -360,6 +365,7 @@ impl Phase {
             Phase::AwaitingBatch => "awaiting_batch",
             Phase::Done => "done",
             Phase::Failed => "failed",
+            Phase::Checkpoint => "checkpoint",
         }
     }
 
@@ -370,6 +376,7 @@ impl Phase {
             "coordinating" => Phase::Coordinating,
             "awaiting_batch" => Phase::AwaitingBatch,
             "done" => Phase::Done,
+            "checkpoint" => Phase::Checkpoint,
             _ => Phase::Failed,
         }
     }
@@ -380,7 +387,11 @@ impl Phase {
     // first non-test caller. `allow(dead_code)` keeps it without churn until then.
     #[allow(dead_code)]
     pub fn is_terminal(self) -> bool {
-        matches!(self, Phase::Done | Phase::Failed)
+        // A checkpoint has STOPPED executing (the loop exited, the worker
+        // process is gone), so it is terminal for reconcile/reap/`:tell`
+        // purposes even though `is_resumable` also admits it — the two axes
+        // (has-the-loop-stopped vs can-a-resume-continue) overlap only here.
+        matches!(self, Phase::Done | Phase::Failed | Phase::Checkpoint)
     }
 
     /// Whether a *resumed* run in this phase can keep running, or is finished.
@@ -388,7 +399,10 @@ impl Phase {
     /// `coordinating`/`awaiting_batch` → continue; `failed` → terminal.
     #[allow(dead_code)]
     pub fn is_resumable(self) -> bool {
-        matches!(self, Phase::Coordinating | Phase::AwaitingBatch)
+        matches!(
+            self,
+            Phase::Coordinating | Phase::AwaitingBatch | Phase::Checkpoint
+        )
     }
 }
 
@@ -638,16 +652,41 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
 
     loop {
         if rounds >= round_cap {
-            let error = format!("coordinator exceeded the {round_cap}-round cap");
-            if let Some(s) = store {
-                let _ = s.set_failed(run_id, &error);
-            }
+            // TASK-291: hitting the round cap is NOT a failure — it's a
+            // deliberate stop. Park the run in the terminal-but-resumable
+            // `checkpoint` phase, persisting the final state snapshot (the last
+            // assistant synthesis) so an operator can review it and a future
+            // `:resume` can continue from here. The full turn-by-turn transcript
+            // is already durable in the worker store on disk.
+            let banner = format!(
+                "[!] task exceeded max-rounds ({round_cap}). Transcript saved; operator review recommended."
+            );
+            // Surface the banner live to the operator pane (the worker forwards
+            // the coordinator's stderr).
+            eprintln!("{banner}");
+            let last_synth = session
+                .history
+                .iter()
+                .rev()
+                .find(|m| {
+                    matches!(m.role, crate::backend::Role::Assistant) && !m.text.trim().is_empty()
+                })
+                .map(|m| m.text.trim().to_string())
+                .unwrap_or_default();
+            let result = if last_synth.is_empty() {
+                banner.clone()
+            } else {
+                format!("{banner}\n\nLast progress before checkpoint:\n{last_synth}")
+            };
             record_run_metrics(store, run_id, session);
-            finalize_worker_store(run_id, "failed", None);
+            if let Some(s) = store {
+                let _ = s.set_checkpoint(run_id, &result);
+            }
+            finalize_worker_store(run_id, "checkpoint", Some(&result));
             return Outcome {
-                phase: Phase::Failed,
-                result: None,
-                error: Some(error),
+                phase: Phase::Checkpoint,
+                result: Some(result),
+                error: None,
                 rounds,
             };
         }
@@ -997,6 +1036,11 @@ pub fn rehydrate(session: &mut Session) {
                 }
             }
             Phase::Failed => {} // terminal, nothing to do (cleared below)
+            // TASK-291: a checkpointed run has stopped (round cap). It is
+            // retained (neither `reap_done_runs` nor `clear_finished` touch a
+            // non-done/failed row) so `:result`/`background_status`/a future
+            // `:resume` can reach it. Nothing to surface at rehydrate.
+            Phase::Checkpoint => {}
             Phase::Coordinating | Phase::AwaitingBatch => {
                 // Non-terminal. If it's ours (same session id — only possible
                 // after an in-process resume, since ids are per-run) or its
@@ -1336,20 +1380,30 @@ mod tests {
             Phase::AwaitingBatch,
             Phase::Done,
             Phase::Failed,
+            Phase::Checkpoint,
         ] {
             assert_eq!(Phase::parse(p.as_str()), p);
         }
+        // TASK-291: the checkpoint phase round-trips through its stored string.
+        assert_eq!(Phase::parse("checkpoint"), Phase::Checkpoint);
+        assert_eq!(Phase::Checkpoint.as_str(), "checkpoint");
         // Unknown/legacy phase strings are treated as a dead run.
         assert_eq!(Phase::parse("planning"), Phase::Failed);
         assert_eq!(Phase::parse(""), Phase::Failed);
     }
 
     #[test]
-    fn terminal_and_resumable_partition_the_phases() {
+    fn terminal_and_resumable_phase_matrix() {
+        // Non-terminal, resumable (still running).
         assert!(!Phase::Coordinating.is_terminal() && Phase::Coordinating.is_resumable());
         assert!(!Phase::AwaitingBatch.is_terminal() && Phase::AwaitingBatch.is_resumable());
+        // Terminal, NOT resumable (finished for good).
         assert!(Phase::Done.is_terminal() && !Phase::Done.is_resumable());
         assert!(Phase::Failed.is_terminal() && !Phase::Failed.is_resumable());
+        // TASK-291: checkpoint is the unique both-axes phase — the loop has
+        // STOPPED (terminal: no reconcile/reap, `:tell` refused) yet a future
+        // `:resume` CAN continue it (resumable).
+        assert!(Phase::Checkpoint.is_terminal() && Phase::Checkpoint.is_resumable());
     }
 
     #[test]

@@ -682,6 +682,21 @@ pub async fn run_coordinator(
             }
             Ok(())
         }
+        // TASK-291: a round-cap checkpoint is NOT a failure. Emit the saved
+        // state snapshot as the run's result (the worker captures stdout) and
+        // exit ZERO so the parent leaves the durable `checkpoint` phase intact
+        // for operator review / a future `:resume` — a non-zero exit here would
+        // reconcile the row to `failed`.
+        crate::coordinator::Phase::Checkpoint => {
+            if let Some(result) = &outcome.result {
+                if session.output_json {
+                    println!("{}", crate::json_ok(result));
+                } else {
+                    println!("{}", crate::md::render_stdout(result));
+                }
+            }
+            Ok(())
+        }
         // A failed run prints its error to stdout (the worker captures stdout as
         // the result) and propagates a non-zero exit so the parent marks it
         // failed. The durable row already records the failure for rehydrate. In

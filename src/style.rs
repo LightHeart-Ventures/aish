@@ -103,6 +103,9 @@ pub fn classify_status(status: &str) -> (&'static str, Color) {
         "queued" | "pending" | "dispatched" | "starting" | "waiting" | "scheduled" | "new" => {
             ("⏳", Color::Blue)
         }
+        // TASK-291: a round-cap run parked for review / `:resume` — terminal but
+        // not a failure, so a distinct "paused" glyph rather than ✅/❌.
+        "checkpoint" | "checkpointed" | "parked" | "paused" => ("⏸", Color::Blue),
         _ => {
             // Coordinator phase strings are free-form; treat anything that reads
             // like active work as running, otherwise a neutral dim bullet.
