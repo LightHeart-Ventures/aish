@@ -1,0 +1,10 @@
+target/
+tests/
+*.db
+*.db-wal
+*.db-shm
+.gitignore
+README.md
+deploy/
+Dockerfile
+.dockerignore
