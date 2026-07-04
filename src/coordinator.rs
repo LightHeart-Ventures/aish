@@ -776,6 +776,11 @@ final status plus your best partial result. After this turn you are terminated."
             eprintln!(
                 "⏸ checkpoint requested by parent — halting at round boundary (resumable)"
             );
+            // Atomically persist the resumable `checkpoint` phase together with
+            // the run's cumulative metrics in ONE store txn (TASK-285 pattern).
+            // Checkpoint is non-terminal, but `persist_terminal`/`finish_run` is
+            // just a phase+metrics UPDATE — passing `Phase::Checkpoint` with no
+            // result/error snapshots effort at the pause without a torn write.
             persist_terminal(store, run_id, Phase::Checkpoint, None, None, session);
             finalize_worker_store(run_id, "checkpoint", None);
             return Outcome {
