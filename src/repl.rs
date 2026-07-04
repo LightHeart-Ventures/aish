@@ -106,6 +106,7 @@ pub async fn run(
     aliases: HashMap<String, Vec<String>>,
     mcp_config_paths: Vec<PathBuf>,
     skills_dir: PathBuf,
+    startup_notices: Vec<String>,
 ) -> Result<()> {
     // Job-control signal disposition (TASK-115): aish ignores SIGINT/QUIT/TSTP/
     // TTOU/TTIN so a Ctrl-C/Ctrl-\/Ctrl-Z reaches the foreground child's process
@@ -280,6 +281,18 @@ pub async fn run(
         println!(
             "\x1b[2m:help for commands — :workers to monitor background tasks\x1b[0m"
         );
+    }
+
+    // Startup notices (store/init warnings, hook-load failures, etc.) collected
+    // in `main` BEFORE the backend was built. `clear_screen()` above wiped the
+    // terminal, so these are rendered here — after the header, above the first
+    // prompt — where they land in the active output field instead of scrolling
+    // offscreen during startup. Each is styled as a warning line.
+    for notice in &startup_notices {
+        println!("{notice}");
+    }
+    if !startup_notices.is_empty() {
+        println!();
     }
 
     // The startup block above already printed the statusline, and the first
