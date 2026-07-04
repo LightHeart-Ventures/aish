@@ -411,8 +411,8 @@ impl Backend {
 
     pub fn describe(&self) -> String {
         match self {
-            Backend::Claude(b) => format!("claude ({})", b.model),
-            Backend::Grok(b) => format!("grok ({} · {})", b.model, b.auth_label()),
+            Backend::Claude(b) => format!("claude ({} · {})", b.auth_label(), b.model),
+            Backend::Grok(b) => format!("grok ({} · {})", b.auth_label(), b.model),
             #[cfg(feature = "local")]
             Backend::Local(_) => format!("local ({})", crate::hwdetect::selected_model_id()),
         }
