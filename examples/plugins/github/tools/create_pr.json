@@ -1,0 +1,28 @@
+{
+  "name": "create_pr",
+  "description": "Open a pull request on the plugin's configured repo. Thin, auditable wrapper over the GitHub MCP server's create_pull_request — exists so aish can expose PR creation as a first-class plugin tool with defaults (base branch, auto-requested reviewers from config.default_reviewers) and github-pr.json-shaped output.",
+  "mutating": true,
+  "input_schema": {
+    "type": "object",
+    "required": ["title", "head"],
+    "properties": {
+      "title": { "type": "string", "description": "PR title." },
+      "head": { "type": "string", "description": "Branch containing the changes." },
+      "base": { "type": "string", "default": "main", "description": "Branch to merge into." },
+      "body": { "type": "string", "default": "", "description": "PR description (markdown)." },
+      "draft": { "type": "boolean", "default": false },
+      "reviewers": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Overrides config.default_reviewers when set."
+      }
+    }
+  },
+  "output_schema_ref": "github-pr",
+  "implementation": {
+    "kind": "mcp",
+    "server": "github",
+    "tool": "create_pull_request",
+    "note": "aish maps the input onto the MCP tool, injects owner/repo from plugin config, then reshapes the response to the github-pr schema."
+  }
+}

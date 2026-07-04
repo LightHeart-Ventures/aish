@@ -1,0 +1,20 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "github-issue",
+  "title": "GitHub Issue Observation",
+  "description": "Structured shape emitted by the issues webhook handler and the list_issues tool. Validated by aish before the payload reaches the model or the github-issue-triage skill.",
+  "type": "object",
+  "required": ["event", "action", "number", "title", "url"],
+  "additionalProperties": true,
+  "properties": {
+    "event": { "type": "string", "const": "issues" },
+    "action": { "type": "string", "description": "opened, edited, closed, reopened, labeled, ..." },
+    "number": { "type": "integer", "minimum": 0 },
+    "title": { "type": "string" },
+    "author": { "type": "string" },
+    "state": { "type": "string", "enum": ["open", "closed", ""] },
+    "labels": { "type": "array", "items": { "type": "string" } },
+    "url": { "type": "string" },
+    "needs_ack": { "type": "boolean", "description": "True when auto_comment_on_open is set and the issue was just opened — signals aish to run add_comment." }
+  }
+}

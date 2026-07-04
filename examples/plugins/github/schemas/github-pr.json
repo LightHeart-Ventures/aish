@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "github-pr",
+  "title": "GitHub Pull Request Observation",
+  "description": "Structured shape emitted by the pull_request and pull_request_review webhook handlers, and returned by the create_pr tool. aish validates handler/tool output against this before handing it to the model.",
+  "type": "object",
+  "required": ["event", "action", "number", "title", "url"],
+  "additionalProperties": true,
+  "properties": {
+    "event": { "type": "string", "enum": ["pull_request", "pull_request_review"] },
+    "action": { "type": "string", "description": "GitHub action, e.g. opened, synchronize, closed, submitted." },
+    "number": { "type": "integer", "minimum": 0 },
+    "title": { "type": "string" },
+    "author": { "type": "string" },
+    "branch": { "type": "string", "description": "head ref" },
+    "base": { "type": "string", "description": "base ref" },
+    "draft": { "type": "boolean" },
+    "url": { "type": "string", "description": "html_url of the PR" },
+    "review_state": { "type": "string", "enum": ["approved", "changes_requested", "commented", ""] },
+    "reviewer": { "type": "string" }
+  }
+}
