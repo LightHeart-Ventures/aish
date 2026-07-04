@@ -435,6 +435,21 @@ pub async fn run(
                             "\x1b[2m⇄ {short} finished — review mode: type a message to resume it, or :detach to return to your shell.\x1b[0m\n"
                         ));
                         finished_bell = true;
+                        // Hands-free redraw: the main loop is BLOCKED in
+                        // read_line while the operator watches the attached
+                        // worker. Printing the review notice above the prompt
+                        // does not, on its own, refresh the (now stale) prompt +
+                        // review-mode footer — they'd only redraw on the next
+                        // keypress, so the operator is left staring at a screen
+                        // with no visible prompt after the turn ends. Raise the
+                        // kernel-independent resume wake (and belt-and-suspenders
+                        // TIOCSTI nudge) so the parked read_line returns promptly
+                        // and the next loop pass reprints the prompt/footer in
+                        // review mode. take_resume_tick returns None while
+                        // attached, so this only redraws — it does NOT
+                        // auto-synthesize.
+                        crate::editor::arm_resume_wake();
+                        crate::editor::nudge_terminal_return();
                     }
                 }
                 // Notify (one line per finished job), don't dump the full result
