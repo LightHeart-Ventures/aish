@@ -25,6 +25,8 @@ jobs:
   smoke:
     name: aish REPL smoke
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      AGENT_TTY_VERSION: '0.5.0'
     steps:
       - uses: actions/checkout@v6
 
@@ -51,6 +53,16 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '24'
+
+      # Install agent-tty ONCE, globally, so every harness call resolves the same
+      # binary and reuses a single warm session-host. Cold-spawning `npx --yes`
+      # per call races the session-host bring-up on a fresh runner and surfaces as
+      # agent-tty exit 10 ("session host became unreachable"). A warm global bin
+      # sidesteps that. The harness auto-prefers an installed `agent-tty`.
+      - name: Install agent-tty
+        run: |
+          npm install -g "agent-tty@${AGENT_TTY_VERSION}"
+          agent-tty version
 
       # jq ships on ubuntu-2404 runners; assert it rather than assume.
       - name: Verify jq

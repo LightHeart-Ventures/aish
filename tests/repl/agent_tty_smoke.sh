@@ -124,7 +124,38 @@ done
 ok "doctor: snapshot + wait capabilities available"
 
 # ── helpers ─────────────────────────────────────────────────────────────────
-snapshot_text() { AT snapshot "$SID" --format text --json | jq -r '.result.text'; }
+snapshot_text() { AT snapshot "$SID" --format text --json 2>/dev/null | jq -r '.result.text' 2>/dev/null || true; }
+
+# at_try — run an agent-tty command capturing its --json envelope and exit code
+# WITHOUT tripping `set -e`/`pipefail`. Populates AT_OUT (stdout+stderr) and
+# AT_RC. agent-tty's stable exit codes matter here: 0=condition met,
+# 11=wait timed out (envelope has timedOut:true), 10=REPLAY_ERROR "session host
+# became unreachable" (a host-daemon cold-start/liveness transient). The old
+# `x="$(AT wait …)"` form let a non-zero code abort the whole script with an
+# opaque exit — swallowing the envelope, the snapshot, and the artifact upload.
+at_try() { # <agent-tty args...>
+  [ "${DEBUG:-0}" = "1" ] && set -x
+  AT_OUT="$("${ATTY[@]}" --home "$AGENT_HOME" "$@" 2>&1)" && AT_RC=0 || AT_RC=$?
+  { set +x; } 2>/dev/null
+  return 0
+}
+
+# wait_banner — poll for a rendered text with bounded retries so a transient
+# agent-tty host race (exit 10) or a slow cold boot (exit 11) self-heals instead
+# of hard-failing the first CI contact. Returns 0 on match; on exhaustion leaves
+# the last envelope in AT_OUT for the caller to dump.
+wait_banner() { # <needle> <per_try_timeout_ms> <attempts>
+  local needle="$1" tmo="$2" tries="${3:-3}" i
+  for ((i=1; i<=tries; i++)); do
+    at_try wait "$SID" --text "$needle" --timeout "$tmo" --json
+    if [ "$AT_RC" = "0" ] && \
+       [ "$(printf '%s' "$AT_OUT" | jq -r '.result.matched' 2>/dev/null)" = "true" ]; then
+      return 0
+    fi
+    [ "$i" -lt "$tries" ] && { say "boot wait ${i}/${tries} not satisfied (rc=$AT_RC) — settling then retrying"; sleep 2; }
+  done
+  return 1
+}
 
 assert_contains() { # <haystack> <needle> <label>
   if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else
@@ -138,9 +169,25 @@ SID="$(AT create --json --cols "$COLS" --rows "$ROWS" -- "$AISH_BIN" | jq -r '.r
 [ -n "$SID" ] && [ "$SID" != "null" ] || { bad "create returned no sessionId"; exit 1; }
 say "session    : $SID"
 
-booted="$(AT wait "$SID" --text 'AI-native shell' --timeout 20000 --json | jq -r '.result.matched')"
-[ "$booted" = "true" ] && ok "REPL booted (banner 'AI-native shell' rendered)" \
-                       || bad "REPL did not render boot banner within 20s"
+# Give the freshly-forked session-host a beat to attach the PTY before the first
+# render wait — cuts the cold-start race that surfaces as exit 10 on CI.
+sleep 1
+if wait_banner 'AI-native shell' 20000 3; then
+  ok "REPL booted (banner 'AI-native shell' rendered)"
+else
+  bad "REPL did not render boot banner (last agent-tty rc=$AT_RC)"
+  say "last wait envelope:"
+  printf '%s\n' "$AT_OUT" | head -30 | sed 's/^/      | /'
+  say "current screen:"
+  snapshot_text | tail -20 | sed 's/^/      » /'
+  # Definitive triage: did the child (aish) exit, and how? A Rust panic surfaces
+  # as exitCode 101; a segfault as exitSignal 11; status:running + renderer
+  # fallback means aish is alive and this is purely an agent-tty render/host
+  # fault, not an aish crash.
+  say "session inspect:"
+  at_try inspect "$SID" --json
+  printf '%s' "$AT_OUT" | jq -r '.result | "status=\(.session.status) exitCode=\(.session.exitCode) exitSignal=\(.session.exitSignal) termination=\(.terminationCategory) renderer=\(.rendererRuntime.backend)/\(.rendererRuntime.status) reason=\(.rendererRuntime.reason)"' 2>/dev/null | sed 's/^/      # /' || true
+fi
 
 boot_snap="$(snapshot_text)"
 assert_contains "$boot_snap" 'aish v'  "banner shows version string"
@@ -176,8 +223,11 @@ fi
 # `wait --exit` is a standalone verb (not a batch step), so type the command
 # first, then wait for the process to actually terminate.
 AT batch "$SID" '[{"type":":quit"},{"sendKeys":["Enter"]}]' --json >/dev/null 2>&1 || true
-timed_out="$(AT wait "$SID" --exit --timeout 10000 --json | jq -r '.result.timedOut')"
-if [ "$timed_out" = "false" ]; then
+at_try wait "$SID" --exit --timeout 10000 --json
+timed_out="$(printf '%s' "$AT_OUT" | jq -r '.result.timedOut' 2>/dev/null || echo true)"
+# rc 0 = process exited; a non-zero rc here (e.g. host already gone) still means
+# the REPL is no longer running, which is the outcome we're asserting.
+if [ "$timed_out" = "false" ] || [ "$AT_RC" = "0" ]; then
   term="$(AT inspect "$SID" --json 2>/dev/null | jq -r '.result.terminationCategory // "exited"' 2>/dev/null || echo exited)"
   ok ":quit terminated the REPL cleanly (${term})"
 else
