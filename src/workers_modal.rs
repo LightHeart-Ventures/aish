@@ -292,14 +292,24 @@ fn pad(s: &str, width: usize) -> String {
     }
 }
 
-/// Draw the modal in place. On the first paint `prev_lines == 0`; afterwards we
-/// move the cursor up over the previously-drawn block and clear each line so the
-/// popup redraws without scrolling scrollback. Returns the number of lines drawn.
-fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
-    let mut out = String::new();
-    if prev_lines > 0 {
-        out.push_str(&format!("\x1b[{prev_lines}A"));
+/// Absolute screen row the modal's FIRST line must start on so its LAST line
+/// lands exactly on `body_bottom` (the row just above the footer separator).
+/// `None` when the modal is taller than the available body (rows `1..=body_bottom`)
+/// — the caller then falls back to its in-place relative redraw. Pure for tests.
+fn anchor_start(total_lines: usize, body_bottom: usize) -> Option<usize> {
+    if total_lines == 0 || body_bottom == 0 || total_lines > body_bottom {
+        return None;
     }
+    Some(body_bottom - total_lines + 1)
+}
+
+/// Draw the modal. When a bottom-anchored footer region is installed the block
+/// is pinned so its LAST line sits directly above the statusline's horizontal
+/// rule (absolute-positioned each paint). Otherwise it redraws in place: on the
+/// first paint `prev_lines == 0`; afterwards the cursor moves up over the
+/// previously-drawn block and clears each line so the popup redraws without
+/// scrolling scrollback. Returns the number of lines drawn.
+fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
     let color = crate::style::colors_enabled();
 
     // Column widths from the id/status/runtime cells (task/result flow at the end).
@@ -373,11 +383,30 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
         "  ↑/↓ move · Enter attach · Del/d close · Esc/q dismiss".to_string()
     });
 
-    for line in &lines {
+    // Anchor the bottom line just above the footer separator when a footer
+    // region is installed and the block fits; else fall back to the in-place
+    // relative redraw (move up over the previous block).
+    let anchored = crate::terminal::footer_anchor_row()
+        .and_then(|bottom| anchor_start(lines.len(), bottom as usize));
+    let mut out = String::new();
+    if let Some(start) = anchored {
+        // Absolute-position each paint; no reliance on prev_lines.
+        out.push_str(&format!("\x1b[{start};1H"));
+    } else if prev_lines > 0 {
+        out.push_str(&format!("\x1b[{prev_lines}A"));
+    }
+    let last = lines.len().saturating_sub(1);
+    for (i, line) in lines.iter().enumerate() {
         // Clear the line then write it.
         out.push_str("\x1b[2K");
         out.push_str(line);
-        out.push_str("\r\n");
+        // In anchored mode, omit the trailing newline on the FINAL line so the
+        // cursor rests on `body_bottom` without forcing the scroll region to
+        // scroll (which would shove the pinned block up a row). Inline mode
+        // keeps the newline so the next relative redraw lands correctly.
+        if i < last || anchored.is_none() {
+            out.push_str("\r\n");
+        }
     }
     let _ = write!(io::stdout(), "{out}");
     let _ = io::stdout().flush();
@@ -542,5 +571,18 @@ mod tests {
     fn clip_adds_ellipsis() {
         assert_eq!(clip("short", 10), "short");
         assert_eq!(clip("abcdefghij", 5), "abcd…");
+    }
+
+    #[test]
+    fn anchor_start_pins_bottom() {
+        // 5-line block, body bottom at row 20 → first line at 16, last at 20.
+        assert_eq!(anchor_start(5, 20), Some(16));
+        // Exactly fills the body: first line homes to row 1.
+        assert_eq!(anchor_start(20, 20), Some(1));
+        // One taller than the body → no anchor (caller falls back to inline).
+        assert_eq!(anchor_start(21, 20), None);
+        // Degenerate inputs.
+        assert_eq!(anchor_start(0, 20), None);
+        assert_eq!(anchor_start(3, 0), None);
     }
 }

@@ -682,6 +682,24 @@ pub fn screen_rows() -> Option<u16> {
     term_size().map(|(rows, _)| rows)
 }
 
+/// The last usable body row — the one directly above the footer separator rule
+/// (row `H-2`) — when a bottom-anchored footer region is currently installed.
+/// `None` when no footer is active (piped output, too-short terminal, or the
+/// inline-statusline fallback), so a caller that wants to pin content just above
+/// the horizontal rule can bottom-anchor when this is `Some` and keep its
+/// ordinary inline rendering otherwise. Used by the `:workers` modal to anchor
+/// its bottom row immediately above the statusline's horizontal line.
+pub fn footer_anchor_row() -> Option<u16> {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    let (rows, _) = term_size()?;
+    if rows < MIN_FOOTER_ROWS {
+        return None;
+    }
+    Some(rows.saturating_sub(FOOTER_ROWS).max(1))
+}
+
 /// Cursor-home sequence to the bottom row, column 1 (`ESC[<rows>;1H`). Used by
 /// the inline-mode attach clear to anchor the view to the bottom of the screen
 /// (mirroring footer mode, where [`restore_after_clear`] homes to the bottom
