@@ -142,6 +142,10 @@ impl AuditSink for JsonlAuditSink {
             .open(&path)
             .await?;
         f.write_all(line.as_bytes()).await?;
+        // tokio::fs::File buffers writes internally and its Drop cannot await a
+        // flush, so without this an append can be silently lost (a subsequent
+        // read sees fewer lines than were written). Flush before returning.
+        f.flush().await?;
         Ok(())
     }
 }
