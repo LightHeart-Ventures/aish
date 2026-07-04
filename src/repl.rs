@@ -2697,6 +2697,25 @@ async fn dispatch(
             builtin_wait(words.get(1).map(String::as_str), session).await;
             Dispatch::Handled
         }
+        "clear" => {
+            // Intercept `clear` as a builtin (instead of exec'ing clear(1)) so we
+            // can record WHERE in the conversation the operator cleared. Interactive
+            // backfill (`:detach` / Shift-Tab back to slot 0) replays only history
+            // at/after this mark, so a `clear` stays cleared when they return to the
+            // prompt instead of resurrecting the wiped scrollback.
+            session.clear_mark = session.history.len();
+            // Full clear, matching clear(1): \x1b[3J wipes scrollback, \x1b[2J the
+            // visible screen, \x1b[H homes the cursor. Only on a TTY (a piped
+            // stdout stays free of escape noise).
+            // SAFETY: plain isatty query.
+            if unsafe { libc::isatty(1) } == 1 {
+                print!("\x1b[3J\x1b[2J\x1b[H");
+                let _ = std::io::stdout().flush();
+                // Re-assert any bottom-anchored footer region the clear just wiped.
+                crate::terminal::restore_after_clear();
+            }
+            Dispatch::Handled
+        }
         cmd => {
             // Resolve against the session's PATH — which includes any
             // `export PATH="$PATH:…"` from ~/.aishrc — falling back to the
@@ -3859,7 +3878,12 @@ fn backfill_interactive(session: &Session) -> bool {
         return false;
     }
     const TAIL_LINES: usize = 40;
-    let rows = render_interactive_history_tail(&session.history, TAIL_LINES);
+    // Honor a `clear` the operator ran on the interactive console: replay only
+    // history at/after the clear mark, so returning to the prompt (`:detach` /
+    // Shift-Tab back to slot 0) doesn't resurrect the cleared scrollback.
+    // Clamp — history may have been compacted/truncated below the mark.
+    let start = session.clear_mark.min(session.history.len());
+    let rows = render_interactive_history_tail(&session.history[start..], TAIL_LINES);
     if rows.is_empty() {
         return false;
     }
