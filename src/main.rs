@@ -37,6 +37,7 @@ mod plugin_phase05_consolidation_tests;
 mod plugin_state;
 mod plugins;
 mod present;
+mod pulse;
 mod rc;
 mod reasoning_telemetry;
 mod repl;

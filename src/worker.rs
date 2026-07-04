@@ -1150,8 +1150,18 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
         // Drive the prompt-badge pulse from EVERY line (independent of the
         // `:worker-output` forwarding gate) so the badge colour-pulses even when
         // the verbose stream is suppressed — the badge is the quiet liveness cue.
+        let event = classify_event(&line);
+        // TASK-293: re-publish every classified Pulse on the process-wide
+        // broadcast so external observers (monitors, dashboards, the `:metrics`
+        // command) can react without re-parsing stderr. Fire regardless of
+        // whether THIS worker drives a prompt badge, and independent of the
+        // `:worker-output` gate — publish is lossy + non-blocking, so it never
+        // back-pressures this hot stderr-drain loop.
+        if let Some(p) = event {
+            crate::pulse::publish(p);
+        }
         if let Some(job) = &pulse {
-            match classify_event(&line) {
+            match event {
                 Some(Pulse::ToolOk) => job.record_tool_outcome(true),
                 Some(Pulse::ToolErr) => job.record_tool_outcome(false),
                 Some(Pulse::Turn) => job.record_turn_completion(),
