@@ -665,13 +665,40 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
 
     loop {
         if rounds >= round_cap {
-            let error = format!("coordinator exceeded the {round_cap}-round cap");
-            persist_terminal(store, run_id, Phase::Failed, None, Some(&error), session);
-            finalize_worker_store(run_id, "failed", None);
+            // TASK-291: hitting the round cap is NOT a failure — park the run in
+            // the resumable `checkpoint` phase (TASK-294) with a state snapshot
+            // (the last assistant synthesis) so an operator can review it and a
+            // future `:resume` can continue from here. The full turn-by-turn
+            // transcript is already durable in the worker store on disk.
+            // Checkpoint rows are exempt from orphan reaping (see
+            // `is_orphaned_row`) and are retained (neither `clear_finished` nor
+            // the failed-reaper touch them), so the result stays reachable via
+            // `:result` / `background_status`. `persist_terminal` writes phase +
+            // result + metrics atomically (TASK-285 `finish_run`).
+            let banner = format!(
+                "[!] task exceeded max-rounds ({round_cap}). Transcript saved; operator review recommended."
+            );
+            eprintln!("{banner}");
+            let last_synth = session
+                .history
+                .iter()
+                .rev()
+                .find(|m| {
+                    matches!(m.role, crate::backend::Role::Assistant) && !m.text.trim().is_empty()
+                })
+                .map(|m| m.text.trim().to_string())
+                .unwrap_or_default();
+            let result = if last_synth.is_empty() {
+                banner.clone()
+            } else {
+                format!("{banner}\n\nLast progress before checkpoint:\n{last_synth}")
+            };
+            persist_terminal(store, run_id, Phase::Checkpoint, Some(&result), None, session);
+            finalize_worker_store(run_id, "checkpoint", Some(&result));
             return Outcome {
-                phase: Phase::Failed,
-                result: None,
-                error: Some(error),
+                phase: Phase::Checkpoint,
+                result: Some(result),
+                error: None,
                 rounds,
             };
         }

@@ -36,6 +36,9 @@ pub struct DispatchStats {
     pub done: usize,
     /// Terminal-failure rows (`phase = failed`).
     pub failed: usize,
+    /// Terminal round-cap rows (`phase = checkpoint`) — parked, not failed,
+    /// resumable. Counted as terminal for the completion rate. (TASK-291)
+    pub checkpoint: usize,
     /// Still-in-flight rows (`coordinating` | `awaiting_batch`).
     pub running: usize,
     /// Of the still-running, how many are parked awaiting a batch result — a
@@ -57,7 +60,7 @@ pub struct DispatchStats {
 impl DispatchStats {
     /// Fraction of dispatched jobs that reached a terminal state (0.0–1.0).
     pub fn completion_rate(&self) -> f64 {
-        let terminal = self.done + self.failed;
+        let terminal = self.done + self.failed + self.checkpoint;
         if self.dispatched == 0 {
             0.0
         } else {
@@ -158,6 +161,10 @@ pub fn summarize(rows: &[&CoordinatorRow]) -> DispatchStats {
             }
             "failed" => {
                 st.failed += 1;
+                true
+            }
+            "checkpoint" => {
+                st.checkpoint += 1;
                 true
             }
             "awaiting_batch" => {
