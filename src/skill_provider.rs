@@ -748,8 +748,6 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
     if results.is_empty() {
         return format!("No skills found for {query:?}.");
     }
-    const DESC_MAX: usize = 56;
-
     // Rank most-popular-first while keeping the registry's relative order as the
     // stable tiebreaker (sort_by is stable), so 0-star ties preserve relevance.
     let mut ranked: Vec<&SearchResult> = results.iter().collect();
@@ -764,10 +762,6 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
     let stars: Vec<String> = ranked
         .iter()
         .map(|r| if r.stars > 0 { format!("★ {}", r.stars) } else { "-".to_string() })
-        .collect();
-    let descs: Vec<String> = ranked
-        .iter()
-        .map(|r| truncate(&r.description, DESC_MAX))
         .collect();
     let statuses: Vec<String> = ranked
         .iter()
@@ -805,6 +799,24 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
         .max()
         .unwrap_or(6);
 
+    // DESCRIPTION is the last column and extends to the full terminal width:
+    // give it whatever columns remain after SKILL, STARS, STATUS and the three
+    // 2-space gutters. Off-tty (piped/captured) term_width() is usize::MAX, so
+    // the description is left untruncated and later wrapping is deferred to the
+    // rendering tty.
+    let sep = 2usize;
+    let prefix_w = name_w + sep + star_w + sep + status_w + sep;
+    let tw = crate::md::term_width();
+    let desc_w = if tw == usize::MAX {
+        usize::MAX
+    } else {
+        tw.saturating_sub(prefix_w).max(20)
+    };
+    let descs: Vec<String> = ranked
+        .iter()
+        .map(|r| truncate(&r.description, desc_w))
+        .collect();
+
     // Respect --no-color / NO_COLOR / a piped stdout so escape codes never leak
     // into a grep or a redirect (skill output is routinely piped).
     let color = crate::style::colors_enabled();
@@ -816,14 +828,14 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
 
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<name_w$}  {:>star_w$}  {:<DESC_MAX$}  {:<status_w$}\n",
-        "SKILL", "STARS", "DESCRIPTION", "STATUS"
+        "{:<name_w$}  {:>star_w$}  {:<status_w$}  {}\n",
+        "SKILL", "STARS", "STATUS", "DESCRIPTION"
     ));
     for i in 0..ranked.len() {
         let status_color = if statuses[i].is_empty() { dim } else { green };
         out.push_str(&format!(
-            "{bold}{:<name_w$}{reset}  {yellow}{:>star_w$}{reset}  {:<DESC_MAX$}  {status_color}{:<status_w$}{reset}\n",
-            names[i], stars[i], descs[i], statuses[i]
+            "{bold}{:<name_w$}{reset}  {yellow}{:>star_w$}{reset}  {status_color}{:<status_w$}{reset}  {}\n",
+            names[i], stars[i], statuses[i], descs[i]
         ));
     }
     // Echo the top hit so the suggested fetch command is copy-paste ready.
