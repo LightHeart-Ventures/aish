@@ -25,6 +25,7 @@ mod loopguard;
 mod mcp;
 mod md;
 mod memory;
+mod midturn_input;
 mod modelfetch;
 #[cfg(test)]
 mod oracle;
