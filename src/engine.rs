@@ -682,6 +682,19 @@ pub async fn run_coordinator(
             }
             Ok(())
         }
+        // A checkpointed run is a deliberate, resumable PAUSE (TASK-294), NOT a
+        // failure: emit any partial result and exit 0 so the parent doesn't mark
+        // it failed. The durable row stays at `checkpoint` for a later resume.
+        crate::coordinator::Phase::Checkpoint => {
+            if let Some(result) = &outcome.result {
+                if session.output_json {
+                    println!("{}", crate::json_ok(result));
+                } else {
+                    println!("{}", crate::md::render_stdout(result));
+                }
+            }
+            Ok(())
+        }
         // A failed run prints its error to stdout (the worker captures stdout as
         // the result) and propagates a non-zero exit so the parent marks it
         // failed. The durable row already records the failure for rehydrate. In
