@@ -24,6 +24,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use uuid::Uuid;
 
+use crate::transcript_ring::{LiveCursor, TranscriptRing};
+
 /// How long a worker may run before it's killed. Generous — these are deferred,
 /// possibly-long jobs — but bounded so a wedged child can't live forever.
 const WORKER_TIMEOUT: Duration = Duration::from_secs(60 * 60); // 1h
@@ -188,18 +190,6 @@ fn classify_event(line: &str) -> Option<Pulse> {
 /// accumulation was the OOM risk), so the failure path can only quote a bounded
 /// tail rather than the whole thing.
 const STDERR_TAIL_LINES: usize = 20;
-
-/// Max number of forwardable activity lines retained per worker for an
-/// `:attach` backfill replay. Bounds the per-worker transcript so a chatty
-/// coordinator can't grow the PARENT's memory without limit (the same OOM
-/// discipline as `read_capped`). Paired with [`TRANSCRIPT_MAX_BYTES`];
-/// whichever cap trips first evicts the oldest rows.
-const TRANSCRIPT_MAX_LINES: usize = 1000;
-
-/// Byte budget for the retained per-worker transcript (see
-/// [`TRANSCRIPT_MAX_LINES`]). Oldest rows are evicted once the running total
-/// of `(suffix + text)` bytes exceeds this.
-const TRANSCRIPT_MAX_BYTES: usize = 256 * 1024;
 
 /// Decide whether a single raw coordinator-stderr line is worth forwarding to
 /// the user's terminal, and if so return the cleaned text to forward.
@@ -1124,6 +1114,13 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
     // the moment the next forwarded line replaces it — exactly like the
     // interactive thinking spinner that animates then vanishes when output begins.
     let mut thinking: Option<ThinkingSpinner> = None;
+    // The LIVE read cursor over this worker's shared transcript ring. The live
+    // forward stream drains it every forwardable line (advancing it even while
+    // the `:worker-output` gate is closed, so it stays caught up and never
+    // re-dumps history that an `:attach` already replayed via the SEPARATE
+    // backfill cursor). Both cursors read the SAME ring — the attach replay
+    // can't drift from the live stream (TASK-298).
+    let mut live_cursor = LiveCursor::default();
     while let Ok(Some(line)) = lines.next_line().await {
         // A `message_console` note (📣) is the coordinator's ONE always-surfaced
         // channel: it reaches the operator's terminal IMMEDIATELY, bypassing the
@@ -1170,9 +1167,20 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
         // into `text` (engine::tool_glyph / the 🚀/🐌 narration prefix), so the
         // transcript suffix is empty and the pane gutter is just `[label]`.
         if let Some(text) = forward_decision(&line, true) {
-            if let Some(job) = &pulse {
+            // Record into the shared transcript ring (the single WRITE pointer),
+            // then drain the LIVE cursor over that SAME ring for what to print
+            // below. Draining every line (regardless of the gate) keeps the
+            // cursor caught up so an `:attach` backfill replay and this live
+            // stream can never diverge (TASK-298). Without a job there is no
+            // ring — and no `:attach` backfill either — so fall back to the
+            // freshly computed `text`, which is byte-identical to what would be
+            // stored.
+            let live_rows: Vec<(String, String)> = if let Some(job) = &pulse {
                 job.record_activity("", &text);
-            }
+                job.read_live_activity(&mut live_cursor)
+            } else {
+                vec![(String::new(), text.clone())]
+            };
             // Forward when the session-wide toggle is on OR this worker is the
             // one `:attach`ed to (the per-worker `:attach` stream).
             let attached_id = attached.lock().ok().and_then(|g| g.clone());
@@ -1212,7 +1220,9 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                     thinking =
                         ThinkingSpinner::start(label, show_output.clone(), attached.clone());
                     if thinking.is_none() {
-                        crate::tools::announce_raw(&render_row(&text));
+                        for (_s, t) in &live_rows {
+                            crate::tools::announce_raw(&render_row(t));
+                        }
                     }
                 } else {
                     // Any other forwarded line ENDS the thinking phase: stop +
@@ -1227,7 +1237,9 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                     // so coordinator activity reads as a bordered column rather
                     // than blending into the user's shell scroll. `announce_raw`
                     // prints the pre-framed row (which carries its own colour).
-                    crate::tools::announce_raw(&render_row(&text));
+                    for (_s, t) in &live_rows {
+                        crate::tools::announce_raw(&render_row(t));
+                    }
                 }
             } else if let Some(spin) = thinking.take() {
                 // Forwarding just turned off for this worker (e.g. `:detach`
@@ -2258,13 +2270,14 @@ struct JobInner {
     /// When the worker most recently emitted turn/narration text, for the
     /// magenta turn pulse. `None` until the first narration line.
     last_turn_completion: Option<Instant>,
-    /// Bounded transcript of forwardable activity lines (`(suffix, text)`)
-    /// captured from this worker's stderr REGARDLESS of the `:worker-output`
-    /// gate, so an `:attach` can replay the output-to-date before the live
-    /// stream resumes. Evicted oldest-first past the line/byte caps.
-    transcript: VecDeque<(String, String)>,
-    /// Running byte total of `transcript` entries, for the byte-budget cap.
-    transcript_bytes: usize,
+    /// Single-source-of-truth ring buffer of forwardable activity lines
+    /// (`(suffix, text)`) captured from this worker's stderr REGARDLESS of the
+    /// `:worker-output` gate. Both the `:attach` backfill replay
+    /// ([`TranscriptRing::backfill_tail`]) and the real-time forward stream
+    /// ([`TranscriptRing::read_live`] via a [`LiveCursor`]) read the SAME
+    /// entries, so the attach replay can never drift from the live stream
+    /// (TASK-298). Evicted oldest-first past the line/byte caps.
+    transcript: TranscriptRing,
     /// Wall-clock start (worker construction) — the base for the `:workers`
     /// Started / Runtime columns. Stored as `SystemTime` (not `Instant`) so it
     /// can render an absolute "started X ago" and reconcile with the durable
@@ -2396,7 +2409,11 @@ impl WorkerSpec {
 /// tiny pure predicate so the reconciliation policy is unit-testable without
 /// spawning a real child.
 fn phase_needs_reconcile(phase: &str) -> bool {
-    !matches!(phase, "done" | "failed")
+    // `checkpoint` (TASK-291) is the child's own authoritative round-cap verdict
+    // — a parked, resumable run — so the parent must NOT flip it to `done` when
+    // the (successfully-exiting) child process is reaped. Treat it as terminal
+    // alongside `done`/`failed`.
+    !matches!(phase, "done" | "failed" | "checkpoint")
 }
 
 impl WorkerJob {
@@ -2426,33 +2443,26 @@ impl WorkerJob {
     /// Append one forwardable activity line to this worker's bounded
     /// transcript so an `:attach` can replay the output-to-date before the
     /// live stream continues. Bounded by BOTH a line count and a byte budget
-    /// ([`TRANSCRIPT_MAX_LINES`]/[`TRANSCRIPT_MAX_BYTES`]) so a chatty
-    /// coordinator can't grow the parent's memory without limit — the oldest
-    /// rows are evicted first.
+    /// (`transcript_ring::MAX_LINES` / `MAX_BYTES`) so a chatty coordinator
+    /// can't grow the parent's memory without limit — the oldest rows are
+    /// evicted first.
     fn record_activity(&self, suffix: &str, text: &str) {
-        let mut i = self.inner.lock().unwrap();
-        i.transcript_bytes += suffix.len() + text.len();
-        i.transcript
-            .push_back((suffix.to_string(), text.to_string()));
-        while i.transcript.len() > TRANSCRIPT_MAX_LINES || i.transcript_bytes > TRANSCRIPT_MAX_BYTES
-        {
-            match i.transcript.pop_front() {
-                Some((s, t)) => i.transcript_bytes -= s.len() + t.len(),
-                None => break,
-            }
-        }
+        self.inner.lock().unwrap().transcript.push(suffix, text);
     }
 
     /// The retained transcript rows (`(suffix, text)`, oldest-first) captured
-    /// from this worker's activity — replayed on `:attach`.
+    /// from this worker's activity — replayed on `:attach` (the backfill read
+    /// cursor over the shared ring).
     pub fn transcript_rows(&self) -> Vec<(String, String)> {
-        self.inner
-            .lock()
-            .unwrap()
-            .transcript
-            .iter()
-            .cloned()
-            .collect()
+        self.inner.lock().unwrap().transcript.backfill_tail()
+    }
+
+    /// Drain the live read cursor: forwardable activity rows this consumer
+    /// hasn't emitted yet, advancing `cursor`. Backs the real-time forward
+    /// stream so it reads the SAME ring the `:attach` backfill replays —
+    /// guaranteeing the two never drift (TASK-298).
+    pub fn read_live_activity(&self, cursor: &mut LiveCursor) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().transcript.read_live(cursor)
     }
     /// Begin an ANIMATED "thinking…" row for this worker in the attach pane when
     /// an `:attach` lands before the coordinator has produced any forwardable
@@ -2545,7 +2555,6 @@ impl WorkerJob {
         i.last_tool_outcome = None;
         i.last_turn_completion = None;
         i.transcript.clear();
-        i.transcript_bytes = 0;
         if let Some(spin) = i.backfill_spinner.take() {
             spin.stop();
         }
@@ -2899,8 +2908,7 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
             branch: None,
             last_tool_outcome: None,
             last_turn_completion: None,
-            transcript: VecDeque::new(),
-            transcript_bytes: 0,
+            transcript: TranscriptRing::default(),
             backfill_spinner: None,
             started: SystemTime::now(),
             finished: None,
@@ -3561,8 +3569,7 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
-                transcript: VecDeque::new(),
-                transcript_bytes: 0,
+                transcript: TranscriptRing::default(),
             backfill_spinner: None,
             started: SystemTime::now(),
             finished: None,
@@ -3588,8 +3595,7 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
-                transcript: VecDeque::new(),
-                transcript_bytes: 0,
+                transcript: TranscriptRing::default(),
             backfill_spinner: None,
             started: SystemTime::now(),
             finished: None,
@@ -4126,25 +4132,25 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
-                transcript: VecDeque::new(),
-                transcript_bytes: 0,
+                transcript: TranscriptRing::default(),
             backfill_spinner: None,
             started: SystemTime::now(),
             finished: None,
             }),
         });
         // Record well past the line cap; the oldest rows are evicted.
-        for n in 0..(TRANSCRIPT_MAX_LINES + 50) {
+        const MAX_LINES: usize = crate::transcript_ring::MAX_LINES;
+        for n in 0..(MAX_LINES + 50) {
             job.record_activity("", &format!("line {n}"));
         }
         let rows = job.transcript_rows();
         assert!(
-            rows.len() <= TRANSCRIPT_MAX_LINES,
+            rows.len() <= MAX_LINES,
             "line cap enforced: {}",
             rows.len()
         );
         // The newest line is retained; the very first is gone.
-        let newest = format!("line {}", TRANSCRIPT_MAX_LINES + 49);
+        let newest = format!("line {}", MAX_LINES + 49);
         assert!(rows.last().unwrap().1.contains(&newest), "newest row kept");
         assert!(
             !rows.iter().any(|(_, t)| t == "line 0"),
@@ -4270,8 +4276,7 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
-                transcript: VecDeque::new(),
-                transcript_bytes: 0,
+                transcript: TranscriptRing::default(),
             backfill_spinner: None,
             started: SystemTime::now(),
             finished: None,
@@ -4338,8 +4343,7 @@ mod tests {
                 branch: None,
                 last_tool_outcome: None,
                 last_turn_completion: None,
-                transcript: VecDeque::new(),
-                transcript_bytes: 0,
+                transcript: TranscriptRing::default(),
             backfill_spinner: None,
             started: SystemTime::now(),
             finished: None,
@@ -4377,8 +4381,7 @@ mod tests {
                     branch: None,
                     last_tool_outcome: None,
                     last_turn_completion: None,
-                    transcript: VecDeque::new(),
-                    transcript_bytes: 0,
+                    transcript: TranscriptRing::default(),
             backfill_spinner: None,
             started: SystemTime::now(),
             finished: None,

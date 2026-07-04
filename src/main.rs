@@ -54,6 +54,7 @@ mod suggest;
 mod terminal;
 mod tools;
 mod tool_telemetry;
+mod transcript_ring;
 mod turn_audit;
 mod update;
 mod schedule;

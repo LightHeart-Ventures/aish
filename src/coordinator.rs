@@ -22,6 +22,11 @@
 //! ```
 //! `coordinating` — running agentic turns; the default resting phase.
 //! `awaiting_batch` — blocked on a spawned Batches job; heartbeats while it polls.
+//! `checkpoint` — a deliberate, resumable PAUSE (TASK-294): a parent asked the
+//!   run to halt at the next round boundary WITHOUT finishing. Unlike stand-down
+//!   (which ends the run) `drive` persists this phase and returns, leaving the
+//!   transcript/worktree intact for a later manual resume. Non-terminal, and
+//!   intentionally exempt from orphan reaping.
 //! `done` / `failed` — terminal. A `done` row is returned idempotently on resume.
 //!
 //! ## Operator mid-flight messaging (the `:tell` / SendMessage channel)
@@ -358,6 +363,10 @@ pub enum Phase {
     Coordinating,
     /// Blocked on a spawned Batches job; heartbeating while it polls.
     AwaitingBatch,
+    /// A deliberate, resumable PAUSE (TASK-294): a parent requested a halt at the
+    /// round boundary. Non-terminal — the run stops without finishing and can be
+    /// resumed manually later. Never orphan-reaped.
+    Checkpoint,
     /// Terminal: the task finished, `result` holds the assembled output.
     Done,
     /// Terminal: the run hit the round cap, errored, or was orphaned.
@@ -370,6 +379,7 @@ impl Phase {
         match self {
             Phase::Coordinating => "coordinating",
             Phase::AwaitingBatch => "awaiting_batch",
+            Phase::Checkpoint => "checkpoint",
             Phase::Done => "done",
             Phase::Failed => "failed",
         }
@@ -381,6 +391,7 @@ impl Phase {
         match s {
             "coordinating" => Phase::Coordinating,
             "awaiting_batch" => Phase::AwaitingBatch,
+            "checkpoint" => Phase::Checkpoint,
             "done" => Phase::Done,
             _ => Phase::Failed,
         }
@@ -400,7 +411,10 @@ impl Phase {
     /// `coordinating`/`awaiting_batch` → continue; `failed` → terminal.
     #[allow(dead_code)]
     pub fn is_resumable(self) -> bool {
-        matches!(self, Phase::Coordinating | Phase::AwaitingBatch)
+        matches!(
+            self,
+            Phase::Coordinating | Phase::AwaitingBatch | Phase::Checkpoint
+        )
     }
 }
 
@@ -508,6 +522,19 @@ pub async fn drive(
         // session.session_id/name were adopted from the LAUNCHING session at
         // startup (see main.rs), so the row attributes to who asked for the work.
         let _ = s.insert(run_id, &input, &session.session_id, session.name.as_deref());
+        // TASK-289: record this live coordinator PROCESS in the durable registry
+        // so a parent-death restart can reap our pid (and, once TASK-291 lands,
+        // resume an in-flight Batches job). `coord_id` == `run_id`; generation 0
+        // on first start; no batch job yet (the resume path stamps it later);
+        // phase mirrors the freshly-inserted `coordinating` row.
+        let _ = s.register_run(
+            run_id,
+            0,
+            std::process::id() as i64,
+            None,
+            "coordinating",
+            Some(&session.session_id),
+        );
     }
 
     // ── Pre-dispatch circuit breaker (loop guard, per the loop-exhaustion
@@ -659,16 +686,40 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
 
     loop {
         if rounds >= round_cap {
-            let error = format!("coordinator exceeded the {round_cap}-round cap");
-            if let Some(s) = store {
-                let _ = s.set_failed(run_id, &error);
-            }
-            record_run_metrics(store, run_id, session);
-            finalize_worker_store(run_id, "failed", None);
+            // TASK-291: hitting the round cap is NOT a failure — park the run in
+            // the resumable `checkpoint` phase (TASK-294) with a state snapshot
+            // (the last assistant synthesis) so an operator can review it and a
+            // future `:resume` can continue from here. The full turn-by-turn
+            // transcript is already durable in the worker store on disk.
+            // Checkpoint rows are exempt from orphan reaping (see
+            // `is_orphaned_row`) and are retained (neither `clear_finished` nor
+            // the failed-reaper touch them), so the result stays reachable via
+            // `:result` / `background_status`. `persist_terminal` writes phase +
+            // result + metrics atomically (TASK-285 `finish_run`).
+            let banner = format!(
+                "[!] task exceeded max-rounds ({round_cap}). Transcript saved; operator review recommended."
+            );
+            eprintln!("{banner}");
+            let last_synth = session
+                .history
+                .iter()
+                .rev()
+                .find(|m| {
+                    matches!(m.role, crate::backend::Role::Assistant) && !m.text.trim().is_empty()
+                })
+                .map(|m| m.text.trim().to_string())
+                .unwrap_or_default();
+            let result = if last_synth.is_empty() {
+                banner.clone()
+            } else {
+                format!("{banner}\n\nLast progress before checkpoint:\n{last_synth}")
+            };
+            persist_terminal(store, run_id, Phase::Checkpoint, Some(&result), None, session);
+            finalize_worker_store(run_id, "checkpoint", Some(&result));
             return Outcome {
-                phase: Phase::Failed,
-                result: None,
-                error: Some(error),
+                phase: Phase::Checkpoint,
+                result: Some(result),
+                error: None,
                 rounds,
             };
         }
@@ -780,10 +831,14 @@ final status plus your best partial result. After this turn you are terminated."
                     Ok(a) => a,
                     Err(e) => {
                         let error = format!("stand-down wrap-up turn failed: {e:#}");
-                        if let Some(s) = store {
-                            let _ = s.set_failed(run_id, &error);
-                        }
-                        record_run_metrics(store, run_id, session);
+                        persist_terminal(
+                            store,
+                            run_id,
+                            Phase::Failed,
+                            None,
+                            Some(&error),
+                            session,
+                        );
                         finalize_worker_store(run_id, "failed", None);
                         return Outcome {
                             phase: Phase::Failed,
@@ -800,14 +855,40 @@ final status plus your best partial result. After this turn you are terminated."
             if let Some(w) = session.worker_transcript.as_mut() {
                 w.record_message("assistant", "synthesis", &answer);
             }
-            if let Some(s) = store {
-                let _ = s.set_done(run_id, &answer);
-            }
-            record_run_metrics(store, run_id, session);
+            persist_terminal(store, run_id, Phase::Done, Some(&answer), None, session);
             finalize_worker_store(run_id, "done", Some(&answer));
             return Outcome {
                 phase: Phase::Done,
                 result: Some(answer),
+                error: None,
+                rounds,
+            };
+        }
+
+        // ── checkpoint: a parent requested a deliberate PAUSE (TASK-294). Unlike
+        // stand-down (which ENDS the run) a checkpoint HALTS it without finishing:
+        // persist the resumable `checkpoint` phase and return at the round
+        // boundary. NO wrap-up turn is taken — the transcript/worktree is left
+        // intact so the run can be resumed manually later, and the row is
+        // intentionally exempt from orphan reaping. Checked AFTER stand-down so a
+        // terminate order wins over a pause when both race.
+        let checkpointing = store
+            .map(|s| s.checkpoint_requested(run_id).unwrap_or(false))
+            .unwrap_or(false);
+        if checkpointing {
+            eprintln!(
+                "⏸ checkpoint requested by parent — halting at round boundary (resumable)"
+            );
+            // Atomically persist the resumable `checkpoint` phase together with
+            // the run's cumulative metrics in ONE store txn (TASK-285 pattern).
+            // Checkpoint is non-terminal, but `persist_terminal`/`finish_run` is
+            // just a phase+metrics UPDATE — passing `Phase::Checkpoint` with no
+            // result/error snapshots effort at the pause without a torn write.
+            persist_terminal(store, run_id, Phase::Checkpoint, None, None, session);
+            finalize_worker_store(run_id, "checkpoint", None);
+            return Outcome {
+                phase: Phase::Checkpoint,
+                result: None,
                 error: None,
                 rounds,
             };
@@ -825,10 +906,7 @@ final status plus your best partial result. After this turn you are terminated."
             Ok(a) => a,
             Err(e) => {
                 let error = format!("{e:#}");
-                if let Some(s) = store {
-                    let _ = s.set_failed(run_id, &error);
-                }
-                record_run_metrics(store, run_id, session);
+                persist_terminal(store, run_id, Phase::Failed, None, Some(&error), session);
                 finalize_worker_store(run_id, "failed", None);
                 return Outcome {
                     phase: Phase::Failed,
@@ -901,10 +979,7 @@ final status plus your best partial result. After this turn you are terminated."
                 reason.detail()
             );
             eprintln!("\x1b[2maish: {error}\x1b[0m");
-            if let Some(s) = store {
-                let _ = s.set_failed(run_id, &error);
-            }
-            record_run_metrics(store, run_id, session);
+            persist_terminal(store, run_id, Phase::Failed, None, Some(&error), session);
             finalize_worker_store(run_id, "failed", Some(&answer));
             return Outcome {
                 phase: Phase::Failed,
@@ -954,10 +1029,7 @@ delivered above). Fold them into your work: continue the task, or give the final
         }
 
         // No pending sub-work, no pending messages → done.
-        if let Some(s) = store {
-            let _ = s.set_done(run_id, &answer);
-        }
-        record_run_metrics(store, run_id, session);
+        persist_terminal(store, run_id, Phase::Done, Some(&answer), None, session);
         finalize_worker_store(run_id, "done", Some(&answer));
         return Outcome {
             phase: Phase::Done,
@@ -1068,6 +1140,11 @@ pub fn rehydrate(session: &mut Session) {
                 }
             }
             Phase::Failed => {} // terminal, nothing to do (cleared below)
+            // A checkpointed run is a DELIBERATE, resumable pause (TASK-294): it
+            // is left untouched on rehydrate — never surfaced, never reaped — so
+            // it stays parked at `checkpoint` for a later manual resume even when
+            // its launching session is gone.
+            Phase::Checkpoint => {}
             Phase::Coordinating | Phase::AwaitingBatch => {
                 // Non-terminal. If it's ours (same session id — only possible
                 // after an in-process resume, since ids are per-run) or its
@@ -1118,11 +1195,84 @@ pub fn rehydrate(session: &mut Session) {
         .map(|rows| rows.into_iter().map(|r| r.run_id).collect())
         .unwrap_or_default();
     let salvaged = salvage_orphaned_worktrees(&session.cwd, &store, &known_after, digest);
-    if digest && (surfaced > 0 || reaped > 0 || salvaged > 0 || reaped_failed > 0) {
+    // TASK-289: scan the durable coordinator registry — mark rows whose owning
+    // process is dead as `orphaned` (parent-death recovery) and log any that
+    // carried an in-flight batch job as resurrectable (full resume is TASK-291).
+    let (regs_reaped, regs_resurrectable) = scan_coordinator_registry(&store, digest);
+    if digest
+        && (surfaced > 0
+            || reaped > 0
+            || salvaged > 0
+            || reaped_failed > 0
+            || regs_reaped > 0
+            || regs_resurrectable > 0)
+    {
         eprintln!(
-            "\x1b[2maish: reattached coordinator runs ({surfaced} delivered, {reaped} reaped, {salvaged} salvaged, {reaped_failed} failed-pruned)\x1b[0m"
+            "\x1b[2maish: reattached coordinator runs ({surfaced} delivered, {reaped} reaped, {salvaged} salvaged, {reaped_failed} failed-pruned, {regs_reaped} registry-orphaned, {regs_resurrectable} resurrectable)\x1b[0m"
         );
     }
+}
+
+/// TASK-289 startup scan of the durable `coordinator_registry`: for every row
+/// still considered live, check whether its OS `pid` is alive. A dead pid means
+/// the owning coordinator process died without cleanly deregistering — mark the
+/// row `orphaned` (parent-death recovery). When such an orphan carried an
+/// in-flight `batch_job_id` it is RESURRECTABLE (its Batches job keeps running
+/// platform-side), so log it for the future resume path (TASK-291/SPR-059) —
+/// this scan does NOT itself resume anything. A row whose pid is still alive is
+/// left untouched. Returns `(reaped, resurrectable)` counts. Best-effort: a
+/// store error yields `(0, 0)` and never sinks startup.
+fn scan_coordinator_registry(store: &CoordinatorStore, digest: bool) -> (usize, usize) {
+    let rows = match store.get_live_runs() {
+        Ok(r) => r,
+        Err(e) => {
+            if digest {
+                eprintln!("\x1b[2maish: couldn't scan coordinator registry: {e:#}\x1b[0m");
+            }
+            return (0, 0);
+        }
+    };
+    let mut reaped = 0usize;
+    let mut resurrectable = 0usize;
+    for row in rows {
+        if pid_is_alive(row.pid) {
+            continue; // owner still running — not an orphan
+        }
+        if store.mark_orphaned(&row.coord_id).is_ok() {
+            reaped += 1;
+            if row.batch_job_id.is_some() {
+                resurrectable += 1;
+                if digest {
+                    eprintln!(
+                        "\x1b[2maish: coordinator {} orphaned (pid {} gone) — resurrectable via batch {} (resume: TASK-291)\x1b[0m",
+                        crate::batch::short_id(&row.coord_id),
+                        row.pid,
+                        row.batch_job_id.as_deref().unwrap_or("?"),
+                    );
+                }
+            }
+        }
+    }
+    (reaped, resurrectable)
+}
+
+/// True when process `pid` is alive (signal-0 probe). `kill(pid, 0)` sends no
+/// signal but performs the existence + permission check: `Ok`/`EPERM` ⇒ the
+/// process exists, `ESRCH` ⇒ it does not. A non-positive pid is never a live
+/// process. Used by the TASK-289 registry scan to reap dead coordinators.
+fn pid_is_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: kill with signal 0 is the documented liveness probe; it never
+    // delivers a signal, only reports existence/permission via errno.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    // rc == -1: alive only when the failure is EPERM (exists, not permitted),
+    // dead on ESRCH (no such process).
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Pure salvage decision: a worktree that still holds work but has NO surviving
@@ -1352,20 +1502,34 @@ fn finalize_worker_store(run_id: &str, status: &str, result: Option<&str>) {
     let _ = crate::worker_store::set_status(run_id, status);
 }
 
-/// Persist the run's cumulative cost/effort metrics — tokens in/out, agentic
-/// turns, and tool-call count — from the live coordinator session totals onto
-/// the durable `coordinator_runs` row. Called at every terminal exit just
-/// before `set_done`/`set_failed`. Best-effort: a store error is swallowed so a
-/// metrics write can never sink a completing run.
-fn record_run_metrics(store: Option<&CoordinatorStore>, run_id: &str, session: &Session) {
+/// Atomically persist a run's TERMINAL outcome — the terminal `phase` plus its
+/// `result`/`error` and the live session's cumulative cost/effort metrics
+/// (tokens in/out, agentic turns, tool-call count) — in ONE store transaction
+/// (TASK-285). Replaces the former `set_done`/`set_failed` followed by a
+/// separate `record_metrics` write: a panic/crash between those two statements
+/// used to leave the `coordinator_runs` row half-updated (terminal phase with
+/// zero metrics, or metrics under a still-`coordinating` phase, either of which
+/// muddies resume/reporting). Routed through [`CoordinatorStore::finish_run`],
+/// the phase, result/error, heartbeat, and metrics commit as a unit — a re-read
+/// after a rolled-back mid-write sees the prior resumable row intact.
+/// Best-effort: a store error is swallowed so persistence can never sink a
+/// completing run (the same contract the two calls it replaces had).
+fn persist_terminal(
+    store: Option<&CoordinatorStore>,
+    run_id: &str,
+    phase: Phase,
+    result: Option<&str>,
+    error: Option<&str>,
+    session: &Session,
+) {
     if let Some(s) = store {
-        let _ = s.record_metrics(
-            run_id,
-            session.tokens_in as u64,
-            session.tokens_out as u64,
-            session.turns_total as u64,
-            session.tool_calls_total as u64,
-        );
+        let metrics = crate::coordinator_store::RunMetrics {
+            tokens_in: session.tokens_in as u64,
+            tokens_out: session.tokens_out as u64,
+            turns: session.turns_total as u64,
+            tool_calls: session.tool_calls_total as u64,
+        };
+        let _ = s.finish_run(run_id, phase.as_str(), result, error, metrics);
     }
 }
 
@@ -1405,6 +1569,7 @@ mod tests {
         for p in [
             Phase::Coordinating,
             Phase::AwaitingBatch,
+            Phase::Checkpoint,
             Phase::Done,
             Phase::Failed,
         ] {
@@ -1419,6 +1584,8 @@ mod tests {
     fn terminal_and_resumable_partition_the_phases() {
         assert!(!Phase::Coordinating.is_terminal() && Phase::Coordinating.is_resumable());
         assert!(!Phase::AwaitingBatch.is_terminal() && Phase::AwaitingBatch.is_resumable());
+        // Checkpoint is a resumable, non-terminal pause (TASK-294).
+        assert!(!Phase::Checkpoint.is_terminal() && Phase::Checkpoint.is_resumable());
         assert!(Phase::Done.is_terminal() && !Phase::Done.is_resumable());
         assert!(Phase::Failed.is_terminal() && !Phase::Failed.is_resumable());
     }

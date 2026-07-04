@@ -5418,7 +5418,7 @@ fn stop_coordinator(id: Option<&str>, any: bool, session: &mut Session) {
             if hit(&r.run_id) && !candidates.iter().any(|(rid, _, _, _)| rid == &r.run_id) {
                 candidates.push((
                     r.run_id.clone(),
-                    matches!(r.phase.as_str(), "done" | "failed"),
+                    matches!(r.phase.as_str(), "done" | "failed" | "checkpoint"),
                     r.session_id.clone(),
                     None,
                 ));
@@ -6415,7 +6415,7 @@ async fn handle_colon(
                             .created_at
                             .as_deref()
                             .and_then(crate::style::parse_sqlite_utc);
-                        let terminal = matches!(r.phase.as_str(), "done" | "failed");
+                        let terminal = matches!(r.phase.as_str(), "done" | "failed" | "checkpoint");
                         let finished = if terminal {
                             r.heartbeat_at
                                 .as_deref()
