@@ -60,6 +60,7 @@ mod update;
 mod schedule;
 mod worker;
 mod worker_store;
+mod workers_modal;
 
 use anyhow::Result;
 use clap::Parser;

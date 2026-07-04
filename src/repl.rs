@@ -3536,6 +3536,56 @@ fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
 /// `worker::GOAL_STREAM_LABEL` / `should_forward`).
 const GOAL_ATTACH_ID: &str = crate::worker::GOAL_STREAM_LABEL;
 
+/// TASK-313: snapshot THIS session's in-memory coordinators (the actionable set
+/// the interactive `:workers` modal attaches/closes) into plain [`WorkerRow`]s,
+/// newest-first — the same live rows the static table's in-memory block renders.
+/// Durable rows from other sessions are intentionally excluded: `attach_worker`
+/// / `close_worker` only operate on `session.worker_jobs`, so they're the only
+/// rows the modal can act on. Recomputed each call so runtime cells tick and a
+/// close is reflected immediately.
+fn collect_worker_rows(session: &Session) -> Vec<crate::workers_modal::WorkerRow> {
+    let me_label = session
+        .name
+        .clone()
+        .unwrap_or_else(|| crate::batch::short_id(&session.session_id).to_string());
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let one_line = |t: &str| {
+        let s = t.split_whitespace().collect::<Vec<_>>().join(" ");
+        if s.chars().count() > 70 {
+            format!("{}…", s.chars().take(70).collect::<String>())
+        } else {
+            s
+        }
+    };
+    let mut in_mem: Vec<_> = session.worker_jobs.lock().unwrap().iter().cloned().collect();
+    in_mem.sort_by(|a, b| b.started_epoch().cmp(&a.started_epoch())); // newest-first
+    in_mem
+        .iter()
+        .map(|w| {
+            let (started_cell, runtime_cell) =
+                crate::style::time_cells(w.started_epoch(), w.finished_epoch(), now_epoch);
+            let id_cell = if w.thread_count() > 1 {
+                format!("{} ↻{}", w.id, w.thread_count())
+            } else {
+                w.id.clone()
+            };
+            crate::workers_modal::WorkerRow {
+                id: w.id.clone(),
+                id_cell,
+                session_label: format!("{me_label} *"),
+                status: w.status(),
+                started_cell,
+                runtime_cell,
+                task: one_line(&w.task),
+                result_cell: w.result_cell(),
+            }
+        })
+        .collect()
+}
+
 /// `:attach <id>` — attach the interactive session to a LIVE coordinator this
 /// session launched, so its activity streams live (per-worker, independent of the
 /// session-wide `:worker-output` toggle) and what you type is steered to it via
@@ -6273,6 +6323,48 @@ async fn handle_colon(
             // shows another terminal's background workers here. `:workers all`
             // widens to every session's durable runs (the old behavior).
             let show_all = matches!(parts.next(), Some("all"));
+
+            // TASK-313: on an interactive TTY, drive this session's live workers
+            // through a keyboard modal picker (↑/↓ select · Enter attach · Del/d
+            // close · Esc/q dismiss). `:workers all`, a non-TTY stdout, or an
+            // empty live set fall through to the static markdown table below —
+            // the graceful-degradation requirement. The modal only acts on the
+            // in-memory workers `attach_worker`/`close_worker` understand, so it
+            // reuses those exact paths rather than reimplementing them.
+            {
+                use std::io::IsTerminal as _;
+                let tty =
+                    std::io::stdout().is_terminal() && unsafe { libc::isatty(0) == 1 };
+                let live = collect_worker_rows(session);
+                if !show_all && tty && !crate::keywatch::installed() && !live.is_empty() {
+                    let mut sel = 0usize;
+                    loop {
+                        let rows = collect_worker_rows(session);
+                        if rows.is_empty() {
+                            println!("no background workers in this session");
+                            break;
+                        }
+                        sel = sel.min(rows.len() - 1);
+                        match crate::workers_modal::run(&rows, sel) {
+                            crate::workers_modal::ModalAction::Attach(id) => {
+                                attach_worker(Some(&id), session);
+                                break;
+                            }
+                            crate::workers_modal::ModalAction::Close(id) => {
+                                // Keep the highlight near the closed row, then
+                                // re-enter the modal over the refreshed list so
+                                // the operator can close several in a row.
+                                sel = rows.iter().position(|r| r.id == id).unwrap_or(0);
+                                close_worker(Some(&id), session);
+                                continue;
+                            }
+                            crate::workers_modal::ModalAction::Dismiss => break,
+                        }
+                    }
+                    return false;
+                }
+            }
+
             // Collapse a (possibly multi-line) task to one clipped line.
             let one_line = |t: &str| {
                 let s = t.split_whitespace().collect::<Vec<_>>().join(" ");
