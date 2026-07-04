@@ -1508,6 +1508,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
         "remove the attached (or named) coordinator from the worker list + Shift-Tab rotation",
     ),
     ("compact", "compact history, offload to memory"),
+    ("config", "show aish's active configuration"),
     ("context", "show context-window usage"),
     ("detach", "stop watching the attached coordinator"),
     ("dispatch", "launch a background coordinator"),
@@ -5611,6 +5612,62 @@ fn handle_context(backend: &Backend, session: &Session) {
     }
 }
 
+/// `:config` — dump the live aish configuration to the console: backend/model,
+/// safety mode, background/batch settings, session identity, environment, and
+/// the loaded skill/MCP/persistence surface. Read-only snapshot of current state.
+fn handle_config(backend: &Backend, session: &Session) {
+    let window = backend.context_window();
+    let mcp_servers = session.mcp.server_names();
+    let mcp_line = if mcp_servers.is_empty() {
+        "(none)".to_string()
+    } else {
+        mcp_servers.join(", ")
+    };
+    println!("\x1b[1maish configuration\x1b[0m");
+    println!("  backend         {}", backend.describe());
+    println!("  backend kind    {}", session.backend_kind);
+    println!("  context window  {window} tokens");
+    println!("  mode            {}", session.mode.name());
+    println!(
+        "  session         {}{}",
+        session.session_id,
+        session
+            .name
+            .as_deref()
+            .map(|n| format!(" (name: {n})"))
+            .unwrap_or_default()
+    );
+    println!("  cwd             {}", session.cwd.display());
+    println!(
+        "  background      {} · model {} · force-batches {}",
+        if session.batch_mode { "on" } else { "off" },
+        session.batch_model,
+        if session.batch_force_batches { "on" } else { "off" }
+    );
+    println!(
+        "  raw tool output {}",
+        if session.raw_tool_output { "on" } else { "off" }
+    );
+    println!(
+        "  env exports     {} · skills {} · mcp {}",
+        session.env.len(),
+        session.skills.len(),
+        mcp_line
+    );
+    println!(
+        "  persistence     {}",
+        if session.db.is_some() {
+            "sqlite store open"
+        } else {
+            "unavailable (session-only)"
+        }
+    );
+    println!(
+        "  this session    {} turn(s) · {} tool call(s) · {} tokens in / {} out",
+        session.turns_total, session.tool_calls_total, session.tokens_in, session.tokens_out
+    );
+}
+
 /// `:reasoning` — render the reasoning-quality telemetry summary: the escalate
 /// rate, the guess→wrong-turn rate, and both broken down by complexity and risk.
 /// This is the ground-truth model of *when aish's own reasoning is good enough*
@@ -6159,6 +6216,7 @@ async fn handle_colon(
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
                  :context                            show context-window usage (tokens, %, memories)\n\
+                 :config                             show aish's active configuration (backend, mode, session, MCP, skills)\n\
                  :reasoning                          reasoning-quality telemetry: escalate-vs-guess rate + outcomes by complexity/risk\n\
                  :compact                            offload older history to long-term memory now\n\
                  :memories [organize]                list stored memories, or dedup them\n\
@@ -7190,6 +7248,7 @@ async fn handle_colon(
             }
         }
         Some("context") => handle_context(backend, session),
+        Some("config") => handle_config(backend, session),
         Some("reasoning") => handle_reasoning(),
         Some("metrics") => handle_metrics(),
         Some("compact") => handle_compact(backend, session),
