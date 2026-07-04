@@ -8518,10 +8518,10 @@ mod tests {
                 .map(|p| p.replacement.trim_start_matches(':').trim_end().to_string())
                 .collect::<Vec<_>>()
         };
-        // commands starting with 'm': mcp, mode, model, model-detect.
+        // commands starting with 'm': mcp, memories, metrics, mode, model, model-detect.
         assert_eq!(
             names("m"),
-            vec!["mcp", "memories", "mode", "model", "model-detect"]
+            vec!["mcp", "memories", "metrics", "mode", "model", "model-detect"]
         );
         // typing m -> o -> d -> e -> l narrows down to model/model-detect
         assert_eq!(names("mo"), vec!["mode", "model", "model-detect"]);
