@@ -26,8 +26,8 @@ use std::io::{self, Write};
 
 /// One selectable row in the modal — the snapshot the caller collects from the
 /// session's live workers. Raw (un-styled) status/result strings are carried so
-/// the modal can either colorize them (unselected rows) or render them plain
-/// under inverse-video (the selected row).
+/// the modal can colorize them; the active row is marked with a `>` gutter
+/// caret rather than highlighting the whole row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerRow {
     /// Stable run id — the value handed to `attach_worker` / `close_worker`.
@@ -345,35 +345,25 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
 
     for (i, r) in rows.iter().enumerate() {
         let selected = i == sel;
-        let gutter = if selected { "❯ " } else { "  " };
-        let task = clip(&r.task, 48);
-        if selected {
-            // Selected row: plain text under inverse video (a `>` gutter too, so
-            // it's legible even when color is off).
-            let body = format!(
-                "{}{}  {}  {}  {}",
-                gutter,
-                pad(&r.id_cell, id_w),
-                pad(&r.status, st_w + 2),
-                pad(&r.runtime_cell, rt_w),
-                task
-            );
-            lines.push(if color {
-                format!("\x1b[7m{body}\x1b[0m")
-            } else {
-                body
-            });
+        // Mark the active row with a `>` indicator in the gutter instead of
+        // inverse-video highlighting the whole row. The two-column gutter keeps
+        // every row aligned; when color is on the caret is bold cyan so it's
+        // easy to spot, and it stays a plain `>` when piped / --no-color.
+        let gutter = if selected {
+            if color { "\x1b[1;36m>\x1b[0m " } else { "> " }
         } else {
-            let body = format!(
-                "{}{}  {}  {}  {}",
-                gutter,
-                pad(&r.id_cell, id_w),
-                pad(&crate::style::styled_status(&r.status), st_w + 2),
-                pad(&r.runtime_cell, rt_w),
-                task
-            );
-            lines.push(body);
-        }
+            "  "
+        };
+        let task = clip(&r.task, 60);
+        let body = format!(
+            "{}{}  {}  {}  {}",
+            gutter,
+            pad(&r.id_cell, id_w),
+            pad(&crate::style::styled_status(&r.status), st_w + 2),
+            pad(&r.runtime_cell, rt_w),
+            task
+        );
+        lines.push(body);
     }
 
     // Footer hint.
