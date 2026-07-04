@@ -180,6 +180,13 @@ else
   printf '%s\n' "$AT_OUT" | head -30 | sed 's/^/      | /'
   say "current screen:"
   snapshot_text | tail -20 | sed 's/^/      » /'
+  # Definitive triage: did the child (aish) exit, and how? A Rust panic surfaces
+  # as exitCode 101; a segfault as exitSignal 11; status:running + renderer
+  # fallback means aish is alive and this is purely an agent-tty render/host
+  # fault, not an aish crash.
+  say "session inspect:"
+  at_try inspect "$SID" --json
+  printf '%s' "$AT_OUT" | jq -r '.result | "status=\(.session.status) exitCode=\(.session.exitCode) exitSignal=\(.session.exitSignal) termination=\(.terminationCategory) renderer=\(.rendererRuntime.backend)/\(.rendererRuntime.status) reason=\(.rendererRuntime.reason)"' 2>/dev/null | sed 's/^/      # /' || true
 fi
 
 boot_snap="$(snapshot_text)"
