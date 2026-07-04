@@ -552,6 +552,40 @@ pub async fn run(
         // badge count; `:update` reuses the SAME helper to warn about version
         // skew before swapping the binary (ISS-2045).
         let running = background_running_count(&session);
+        // TASK-292: auto-show a SOLE running coordinator's live stream. We're at
+        // the idle prompt here — no interactive command is pending (AC1) — so
+        // this is the safe point to reconcile. In Auto mode the target is "one
+        // live worker and nothing else competing"; when that flips we open/close
+        // the contained pane and flip show_worker_output. A user `:worker-output
+        // on|off` pin forces the mode away from Auto, so auto_output_target
+        // returns None and this never overrides the pin (AC3).
+        {
+            let live_workers = crate::worker::running_count(&session.worker_jobs);
+            if let Some(desired) = crate::worker::auto_output_target(
+                session.worker_output_mode(),
+                live_workers,
+                running,
+            ) {
+                let current = session.show_worker_output.load(Ordering::SeqCst);
+                if desired != current {
+                    session.show_worker_output.store(desired, Ordering::SeqCst);
+                    if desired {
+                        // AC1: sole coordinator started → surface its stream.
+                        crate::tools::print_above_prompt(format!(
+                            "worker output AUTO-ON — a sole coordinator is running; streaming its live activity (:output off to silence):\n{}\n",
+                            crate::worker::pane_open()
+                        ));
+                    } else {
+                        // AC2: last coordinator finished (or a 2nd started) →
+                        // close the pane and fall back to the quiet default.
+                        crate::tools::print_above_prompt(format!(
+                            "{}\nworker output AUTO-OFF — no sole coordinator; back to quiet (⟳N pulse only)\n",
+                            crate::worker::pane_close()
+                        ));
+                    }
+                }
+            }
+        }
         // Colour the ⟳N badge by the most recent background-worker event
         // (green ✓ tool success, red ✗ tool failure, magenta ⟳ turn
         // completion), fading back to dim ⟳N after worker::PULSE_FADE.
@@ -1476,7 +1510,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("model", "switch model (opus|sonnet|haiku)"),
     ("model-detect", "pick the best local model for this machine"),
     ("new", "clear conversation history"),
-    ("output", "stream coordinators' activity"),
+    ("output", "stream coordinators' activity (on|off|auto)"),
     ("plugin", "plugin provenance (list|info <id>)"),
     ("quit", "exit aish"),
     ("reasoning", "show reasoning-quality telemetry (escalate vs guess)"),
@@ -3262,9 +3296,78 @@ impl Dispatched {
     }
 }
 
+/// TASK-290: default duplicate-dispatch suppression window, in seconds.
+const DISPATCH_DEDUP_SECS: u64 = 5;
+
+/// The dedup window for [`dispatch_coordinator`]. Defaults to
+/// [`DISPATCH_DEDUP_SECS`]; override with `AISH_DISPATCH_DEDUP_SECS=<secs>`
+/// (a `0` disables suppression entirely, e.g. for tests or power users who
+/// genuinely want back-to-back identical dispatches).
+fn dispatch_dedup_window() -> Duration {
+    std::env::var("AISH_DISPATCH_DEDUP_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DISPATCH_DEDUP_SECS))
+}
+
+/// Stable content hash of a task string used to key recent dispatches. Trims
+/// first so trailing/leading whitespace doesn't defeat dedup.
+fn task_hash(task: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    task.trim().hash(&mut h);
+    h.finish()
+}
+
+/// TASK-290: pure duplicate-dispatch check. Returns `Some(run_id)` when `task`
+/// was already dispatched within `window` of `now` (a still-fresh entry in
+/// `recent`), so the caller can reject the second launch pointing at the first.
+/// Returns `None` when there's no matching entry or the prior dispatch has aged
+/// out of the window. Kept side-effect-free (no pruning, no clock reads) so it's
+/// unit-testable with synthetic `Instant`s.
+fn duplicate_dispatch<'a>(
+    recent: &'a std::collections::HashMap<u64, (String, Instant)>,
+    task: &str,
+    now: Instant,
+    window: Duration,
+) -> Option<&'a str> {
+    if window.is_zero() {
+        return None;
+    }
+    recent.get(&task_hash(task)).and_then(|(id, when)| {
+        (now.duration_since(*when) < window).then_some(id.as_str())
+    })
+}
+
+/// TASK-280: goal-aware next-task routing for a task-less `:dispatch`. When the
+/// operator runs `:dispatch` with no task and there is a live, actionable goal,
+/// suggest the next aligned unit of work (its linked task framed by the next open
+/// milestone, or the milestone itself) and show the exact `:dispatch <task>` line
+/// to confirm it — rather than printing bare usage. Returns `None` when there is
+/// no active goal or nothing left to pick up, so the caller keeps current
+/// behavior unchanged (AC3).
+fn goal_next_work_suggestion(session: &Session) -> Option<String> {
+    let goal = session.active_goal()?;
+    let work = goal.next_aligned_work()?;
+    let title = crate::goal::truncate_ellipsis(&goal.title, 60);
+    Some(format!(
+        "\x1b[1;36m🎯 no task given\x1b[0m\x1b[2m — next aligned work for goal \x1b[0m\x1b[1m{title}\x1b[0m\x1b[2m:\x1b[0m\n\
+         \x1b[2m  →\x1b[0m {}\n\
+         \x1b[2m  confirm:\x1b[0m \x1b[1;36m:dispatch {}\x1b[0m\x1b[2m   ·   or :dispatch <task> for something else\x1b[0m",
+        work.summary(),
+        work.dispatch_text(),
+    ))
+}
+
 fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
     let task = task.trim();
     if task.is_empty() {
+        // TASK-280: with a live actionable goal, route toward its next aligned
+        // task instead of printing bare usage. No active goal → usage unchanged.
+        if let Some(suggestion) = goal_next_work_suggestion(session) {
+            return Dispatched::message_only(suggestion);
+        }
         return Dispatched::message_only(
             "usage: :dispatch <task>   — launch a background coordinator for <task>",
         );
@@ -3282,6 +3385,26 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
         return Dispatched::message_only(
             "no credential for the active backend — Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY",
         );
+    }
+    // Nesting-depth guard (TASK-287): refuse `:dispatch` once the spawn budget
+    // is exhausted, with a clear operator-facing error.
+    if let Err(msg) = crate::worker::spawn_budget_gate() {
+        return Dispatched::message_only(msg);
+    }
+    // TASK-290: suppress an accidental duplicate — the same task dispatched
+    // again within the dedup window (default 5s). Prevents double-spends of
+    // background work that may have external side effects (API calls, cost,
+    // writes). Point the operator at the still-running first launch instead of
+    // spawning a second identical coordinator.
+    let now = Instant::now();
+    let window = dispatch_dedup_window();
+    // Prune aged-out entries so the map stays tiny and a re-dispatch after the
+    // window naturally succeeds.
+    session
+        .recent_dispatches
+        .retain(|_, (_, when)| now.duration_since(*when) < window);
+    if let Some(run_id) = duplicate_dispatch(&session.recent_dispatches, task, now, window) {
+        return Dispatched::message_only(format!("task already running (run_id: {run_id})"));
     }
     match std::env::current_exe() {
         Ok(exe) => {
@@ -3313,6 +3436,11 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
                 coordinator_store: session.coordinator_store.clone(),
             };
             let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
+            // TASK-290: record this launch so an identical dispatch inside the
+            // dedup window is rejected pointing back at `id`.
+            session
+                .recent_dispatches
+                .insert(task_hash(task), (id.clone(), now));
             let message = format!(
                 "\x1b[2mdispatched background coordinator \x1b[0m\x1b[1;36m{id}\x1b[0m\x1b[2m \
 — runs here with the full toolset; result auto-delivers. \x1b[0m\x1b[36m:workers\x1b[0m\x1b[2m to check.\x1b[0m"
@@ -3598,7 +3726,6 @@ fn render_interactive_history_tail(
 ) -> Vec<String> {
     use crate::backend::Role;
     let mut rows: Vec<String> = Vec::new();
-    eprintln!("[DEBUG render_tail] processing {} messages", history.len());
     for m in history {
         match m.role {
             Role::User => {
@@ -3628,7 +3755,6 @@ fn render_interactive_history_tail(
                     // tests, piped runs) `render_stdout` returns the text
                     // unchanged, so the row content is stable to assert on.
                     let rendered = crate::md::render_stdout(text);
-                    eprintln!("[DEBUG render_tail] assistant text.len()={}, rendered.len()={}, lines={}", text.len(), rendered.len(), rendered.lines().count());
                     for line in rendered.lines() {
                         rows.push(line.to_string());
                     }
@@ -3661,7 +3787,6 @@ fn backfill_interactive(session: &Session) -> bool {
     }
     const TAIL_LINES: usize = 40;
     let rows = render_interactive_history_tail(&session.history, TAIL_LINES);
-    eprintln!("[DEBUG backfill] history.len()={}, rows.len()={}", session.history.len(), rows.len());
     if rows.is_empty() {
         return false;
     }
@@ -4342,12 +4467,9 @@ fn cycle_worker(session: &mut Session) -> bool {
     // Open the worker view inline on the primary buffer WITHOUT destroying
     // interactive scrollback: the interactive output scrolls up into scrollback
     // (not wiped), and the worker's output stays scrollable via the terminal's
-    // native scrollback. On the first hop off the prompt, erase the ephemeral
-    // interactive prompt row rustyline left behind so the attach header opens on
-    // a clean row instead of trailing a stray blank prompt.
-    if !crate::terminal::attach_view_active() {
-        crate::terminal::erase_current_line();
-    }
+    // native scrollback. `open_attach_view` erases the ephemeral interactive
+    // prompt row rustyline left behind so the attach header opens on a clean row
+    // instead of starting ON the prompt.
     crate::terminal::open_attach_view();
     // TASK-299/301: the goal is the last rotation slot — watch-only. Stream its
     // turns live and backfill its durable state (mirrors `:attach goal`), then
@@ -4660,6 +4782,166 @@ fn looks_like_date(tok: &str) -> bool {
     ok_chars && has_sep && has_digit && tok.len() >= 3
 }
 
+/// A 10-cell unicode progress bar for a 0..=100 percent (rounded to the nearest
+/// cell). Filled cells are `█`, empty cells `░` — no color, so it renders in any
+/// terminal and stays legible when copy-pasted.
+fn goal_progress_bar(pct: u8) -> String {
+    let filled = ((pct as usize * 10) + 50) / 100; // round half-up to nearest cell
+    let filled = filled.min(10);
+    let mut bar = String::with_capacity(10 * 3);
+    for _ in 0..filled {
+        bar.push('█');
+    }
+    for _ in 0..(10 - filled) {
+        bar.push('░');
+    }
+    bar
+}
+
+/// A glanceable emoji for a goal's lifecycle status.
+fn goal_status_emoji(s: crate::goal::GoalStatus) -> &'static str {
+    use crate::goal::GoalStatus;
+    match s {
+        GoalStatus::Active => "🟢",
+        GoalStatus::Paused => "⏸️",
+        GoalStatus::Completed => "✅",
+        GoalStatus::Abandoned => "🗑️",
+    }
+}
+
+/// Render the `:goal status` dashboard — a humanized, emoji-tagged overview of
+/// every tracked goal: its **statement** (title + description), a progress bar,
+/// the **work breakdown** (milestones + linked tasks) with a marker showing
+/// **where the goal currently is** in that breakdown, and any blockers. Also
+/// surfaces the live background-pursuit loop (`:goal <condition>`) at the top
+/// when one is running. Returns the text to print; never panics.
+fn goal_status_dashboard(session: &mut Session) -> String {
+    use crate::goal::{Goal, GoalStatus};
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    // Live background-pursuit loop (the `:goal <condition>` batch oracle), if any.
+    if let Some(loop_) = &session.goal {
+        let _ = writeln!(out, "⟳ \x1b[1mBackground pursuit\x1b[0m");
+        let _ = writeln!(out, "   {}", loop_.status_line());
+    }
+
+    if session.goals.is_empty() {
+        if out.is_empty() {
+            return "no goals yet — `:goal new <title>` to track one, or `:goal <condition>` to pursue one in the background".into();
+        }
+        // A pursuit loop is running but nothing durable is tracked yet.
+        let _ = write!(
+            out,
+            "\n\x1b[2mno tracked goals — `:goal new <title>` to break work into milestones\x1b[0m"
+        );
+        return out;
+    }
+
+    let current = session.current_goal().map(|g| g.id.clone());
+    let mut goals: Vec<&Goal> = session.goals.iter().collect();
+    goals.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let active = goals
+        .iter()
+        .filter(|g| g.status == GoalStatus::Active)
+        .count();
+
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    let _ = writeln!(
+        out,
+        "🎯 \x1b[1mGoals\x1b[0m — {} tracked · {active} active",
+        goals.len()
+    );
+
+    for g in goals {
+        let is_current = Some(&g.id) == current.as_ref();
+        let (m_done, m_total) = g.milestone_progress();
+        let (t_done, t_total) = g.linked_task_progress();
+        let pct = g.progress_percent();
+        let star = if is_current { "  \x1b[33m★ current\x1b[0m" } else { "" };
+
+        // ── Goal statement ────────────────────────────────────────────────
+        let _ = writeln!(
+            out,
+            "\n{} \x1b[1m{}\x1b[0m{star}  \x1b[2m{}\x1b[0m",
+            goal_status_emoji(g.status),
+            g.title,
+            goal_short(&g.id)
+        );
+        if !g.description.is_empty() {
+            let _ = writeln!(out, "   \x1b[2m{}\x1b[0m", g.description);
+        }
+
+        // ── Progress rollup bar ───────────────────────────────────────────
+        let _ = writeln!(
+            out,
+            "   Progress  {}  {pct:>3}%   \x1b[2m· updated {}\x1b[0m",
+            goal_progress_bar(pct),
+            goal_ago(g.updated_at)
+        );
+
+        // ── Work breakdown: milestones (▸ marks where we are right now) ────
+        if m_total > 0 {
+            let _ = writeln!(out, "   \x1b[1mMilestones ({m_done}/{m_total})\x1b[0m");
+            let next_open = g.next_open_milestone().map(|m| m.id.clone());
+            for m in &g.milestones {
+                if m.done {
+                    let _ = writeln!(out, "     ✅ \x1b[2m{}\x1b[0m", m.title);
+                } else if Some(&m.id) == next_open.as_ref() {
+                    let _ = writeln!(out, "     🔸 {}   \x1b[33m◀ you are here\x1b[0m", m.title);
+                } else {
+                    let _ = writeln!(out, "     ⬜ {}", m.title);
+                }
+            }
+        }
+
+        // ── Work breakdown: linked tasks ──────────────────────────────────
+        if t_total > 0 {
+            let _ = writeln!(out, "   \x1b[1mTasks ({t_done}/{t_total})\x1b[0m");
+            for t in &g.linked_tasks {
+                let mark = if t.done { "✅" } else { "⬜" };
+                match &t.title {
+                    Some(title) => {
+                        let _ = writeln!(out, "     {mark} {} \x1b[2m{}\x1b[0m", t.key, title);
+                    }
+                    None => {
+                        let _ = writeln!(out, "     {mark} {}", t.key);
+                    }
+                }
+            }
+        }
+
+        // ── Blockers ──────────────────────────────────────────────────────
+        if !g.blockers.is_empty() {
+            let open = g.open_blockers();
+            let _ = writeln!(out, "   ⛔ \x1b[1mBlockers ({open} open)\x1b[0m");
+            for b in &g.blockers {
+                if b.resolved {
+                    let _ = writeln!(out, "     ✓ \x1b[2m{}\x1b[0m", b.description);
+                } else {
+                    let _ = writeln!(out, "     ✗ {}", b.description);
+                }
+            }
+        }
+
+        // Nothing tracked yet — a friendly nudge instead of a bare bar.
+        if m_total == 0 && t_total == 0 && g.blockers.is_empty() {
+            let _ = writeln!(
+                out,
+                "   \x1b[2mno milestones yet — `:goal milestone <text>` to break it down\x1b[0m"
+            );
+        }
+    }
+
+    // Trim the trailing newline for tidy printing by the dispatcher.
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
 /// Render a goal's full detail block (used by `:goal show`).
 fn goal_detail(g: &crate::goal::Goal) -> String {
     use std::fmt::Write;
@@ -4759,38 +5041,7 @@ fn goal_command(session: &mut Session, sub: &str, args: &str) -> String {
                 None => format!("no goal matching \x1b[2m{args}\x1b[0m (ambiguous or unknown id)"),
             }
         }
-        "status" => {
-            let mut out = String::new();
-            if let Some(loop_) = &session.goal {
-                out.push_str(&loop_.status_line());
-                out.push('\n');
-            }
-            if session.goals.is_empty() {
-                out.push_str(
-                    "no goals yet — `:goal new <title>` to track one, or `:goal <condition>` to pursue one in the background",
-                );
-                return out;
-            }
-            let current = session.current_goal().map(|g| g.id.clone());
-            let mut goals: Vec<&Goal> = session.goals.iter().collect();
-            goals.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-            use std::fmt::Write;
-            let _ = write!(out, "{} goal(s):", goals.len());
-            for g in goals {
-                let (done, total) = g.milestone_progress();
-                let marker = if Some(&g.id) == current.as_ref() { "*" } else { " " };
-                let open = g.open_blockers();
-                let blk = if open > 0 { format!(", {open} blocker(s)") } else { String::new() };
-                let _ = write!(
-                    out,
-                    "\n {marker} [{}] \x1b[2m{}\x1b[0m {} — {done}/{total} milestones{blk}",
-                    g.status,
-                    goal_short(&g.id),
-                    g.title
-                );
-            }
-            out
-        }
+        "status" => goal_status_dashboard(session),
         "link" => {
             if args.is_empty() {
                 return "usage: :goal link <task-id> [title]".into();
@@ -5100,6 +5351,11 @@ fn spawn_alert_coordinator(session: &mut Session, id: i64, description: &str) ->
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
+    // Nesting-depth guard (TASK-287): an alert monitor is a background
+    // coordinator too — don't arm one once the spawn budget is exhausted.
+    if crate::worker::spawn_budget_gate().is_err() {
+        return false;
+    }
     let task = format!(
         "You are resolving an operator ALERT (the aish `:alert` feature). Watch for this \
 condition and, the INSTANT it is satisfied, call the `set_alert` tool with alert_id={id} and a \
@@ -5874,34 +6130,56 @@ async fn handle_colon(
             None => println!("usage: :kill <job-id>"),
         },
         Some("output" | "wo") => {
-            let target = match parts.next() {
-                Some("on") => Some(true),
-                Some("off") => Some(false),
-                None => Some(!session.show_worker_output.load(Ordering::SeqCst)),
+            use crate::worker::WorkerOutputMode;
+            // Tri-state: `on`/`off` PIN the stream (a pin always wins over
+            // auto-detection, AC3); `auto` hands control back to the sole-
+            // coordinator auto-show (TASK-292); bare toggles the effective value
+            // and pins it. `None` here means an unknown arg.
+            let target: Option<Option<bool>> = match parts.next() {
+                Some("on") => Some(Some(true)),
+                Some("off") => Some(Some(false)),
+                Some("auto") => Some(None),
+                None => Some(Some(!session.show_worker_output.load(Ordering::SeqCst))),
                 Some(_) => None,
             };
             match target {
-                Some(true) => {
-                    session.show_worker_output.store(true, Ordering::SeqCst);
+                // Pin ON.
+                Some(Some(true)) => {
+                    let was_on = session.show_worker_output.load(Ordering::SeqCst);
+                    session.set_worker_output_mode(WorkerOutputMode::ForcedOn);
                     println!(
-                        "worker output ON — background coordinators now stream their 💭 thinking, tool activity (🛠️ local · 🔧 MCP) and 🚀 standard/🐌 batch turn output, framed in a contained pane:"
+                        "worker output ON (pinned) — background coordinators now stream their 💭 thinking, tool activity (🛠️ local · 🔧 MCP) and 🚀 standard/🐌 batch turn output, framed in a contained pane:"
                     );
-                    // Open the contained pane: every streamed coordinator line
-                    // is now rendered as a bordered row under this top frame
-                    // (see worker::pane_row), so the activity reads as a
-                    // bordered side-column distinct from the user's own shell
-                    // scroll, not loose interleaved lines (w_sn1fHhd5).
-                    println!("{}", crate::worker::pane_open());
+                    // Open the contained pane only if it wasn't already open
+                    // (auto-show may already have opened it) so we never stack a
+                    // second top border. Every streamed coordinator line renders
+                    // as a bordered row under this frame (see worker::pane_row).
+                    if !was_on {
+                        println!("{}", crate::worker::pane_open());
+                    }
                 }
-                Some(false) => {
-                    session.show_worker_output.store(false, Ordering::SeqCst);
-                    // Close the contained pane, then report the quiet default.
-                    println!("{}", crate::worker::pane_close());
+                // Pin OFF.
+                Some(Some(false)) => {
+                    let was_on = session.show_worker_output.load(Ordering::SeqCst);
+                    session.set_worker_output_mode(WorkerOutputMode::ForcedOff);
+                    // Close the contained pane (only if it was open), then report.
+                    if was_on {
+                        println!("{}", crate::worker::pane_close());
+                    }
                     println!(
-                        "worker output OFF — background coordinators run quietly (only the ⟳N pulse + completion notice show)"
+                        "worker output OFF (pinned) — background coordinators run quietly (only the ⟳N pulse + completion notice show)"
                     );
                 }
-                None => println!("usage: :output [on|off]"),
+                // Hand back to auto-detection. The next prompt-render reconcile
+                // opens/closes the pane to match whether a sole coordinator is
+                // running, so we don't touch show_worker_output here.
+                Some(None) => {
+                    session.set_worker_output_mode(WorkerOutputMode::Auto);
+                    println!(
+                        "worker output AUTO — a sole running coordinator is auto-shown, then quiet again once it finishes (:output on|off to pin)"
+                    );
+                }
+                None => println!("usage: :output [on|off|auto]"),
             }
         }
         Some("runtime") => {
@@ -6083,7 +6361,21 @@ async fn handle_colon(
                         let b_ts = b.created_at.as_deref().and_then(crate::style::parse_sqlite_utc).unwrap_or(0);
                         b_ts.cmp(&a_ts)
                     });
+                    // TASK-302: the goal loop mints a fresh `goal-<uuid>` run per
+                    // turn, so every turn lands its own durable row — `:workers`
+                    // otherwise renders one row per turn (each a different phase),
+                    // which reads as "the goal coordinator appears twice". Rows are
+                    // sorted newest-first above, so keeping only the FIRST row per
+                    // recovered goal condition collapses a multi-turn goal to a
+                    // single row showing its latest phase. Non-goal rows return
+                    // `None` and pass through untouched.
+                    let mut seen_goal_conditions = std::collections::HashSet::new();
                     for r in durable {
+                        if let Some(cond) = crate::goal::goal_condition_from_directive(&r.task) {
+                            if !seen_goal_conditions.insert(cond) {
+                                continue;
+                            }
+                        }
                         any = true;
                         let is_me = r.session_id.as_deref() == Some(session.session_id.as_str());
                         let label = r
@@ -7296,6 +7588,107 @@ fn dirs_history_path() -> std::path::PathBuf {
 mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
+    use std::collections::HashMap;
+
+    // TASK-290: a second dispatch of the SAME task within the dedup window is
+    // detected as a duplicate and points at the first run's id.
+    #[test]
+    fn duplicate_dispatch_within_window_is_rejected() {
+        let now = Instant::now();
+        let window = Duration::from_secs(5);
+        let mut recent: HashMap<u64, (String, Instant)> = HashMap::new();
+        recent.insert(task_hash("build the thing"), ("w_abc123".into(), now));
+
+        // Same task, 2s later — still inside the 5s window → duplicate.
+        let two_s_later = now + Duration::from_secs(2);
+        assert_eq!(
+            duplicate_dispatch(&recent, "build the thing", two_s_later, window),
+            Some("w_abc123"),
+            "identical task inside the window must be flagged as a duplicate"
+        );
+        // Whitespace differences don't defeat dedup (task_hash trims).
+        assert_eq!(
+            duplicate_dispatch(&recent, "  build the thing  ", two_s_later, window),
+            Some("w_abc123"),
+            "leading/trailing whitespace must not bypass dedup"
+        );
+    }
+
+    // A dispatch AFTER the window elapses is allowed through (no stale match).
+    #[test]
+    fn duplicate_dispatch_after_window_is_allowed() {
+        let now = Instant::now();
+        let window = Duration::from_secs(5);
+        let mut recent: HashMap<u64, (String, Instant)> = HashMap::new();
+        recent.insert(task_hash("build the thing"), ("w_abc123".into(), now));
+
+        let six_s_later = now + Duration::from_secs(6);
+        assert_eq!(
+            duplicate_dispatch(&recent, "build the thing", six_s_later, window),
+            None,
+            "a dispatch past the window must NOT be treated as a duplicate"
+        );
+    }
+
+    // A DIFFERENT task within the window is not a duplicate.
+    #[test]
+    fn different_task_within_window_is_not_a_duplicate() {
+        let now = Instant::now();
+        let window = Duration::from_secs(5);
+        let mut recent: HashMap<u64, (String, Instant)> = HashMap::new();
+        recent.insert(task_hash("build the thing"), ("w_abc123".into(), now));
+
+        assert_eq!(
+            duplicate_dispatch(&recent, "ship the other thing", now, window),
+            None,
+            "a distinct task must dispatch even inside the window"
+        );
+    }
+
+    // A zero window disables suppression entirely (escape hatch).
+    #[test]
+    fn zero_window_disables_dedup() {
+        let now = Instant::now();
+        let mut recent: HashMap<u64, (String, Instant)> = HashMap::new();
+        recent.insert(task_hash("build the thing"), ("w_abc123".into(), now));
+
+        assert_eq!(
+            duplicate_dispatch(&recent, "build the thing", now, Duration::ZERO),
+            None,
+            "window of 0 must never flag a duplicate"
+        );
+    }
+
+    // The configurable window honors AISH_DISPATCH_DEDUP_SECS, falling back to
+    // the 5s default when unset/invalid.
+    #[test]
+    fn dedup_window_is_configurable() {
+        // NOTE: env is process-global; this test owns the var and restores it.
+        // SAFETY: no other thread reads this var concurrently during the test —
+        // only `dispatch_dedup_window` reads it and only this test writes it.
+        let prev = std::env::var("AISH_DISPATCH_DEDUP_SECS").ok();
+
+        unsafe { std::env::remove_var("AISH_DISPATCH_DEDUP_SECS") };
+        assert_eq!(dispatch_dedup_window(), Duration::from_secs(DISPATCH_DEDUP_SECS));
+
+        unsafe { std::env::set_var("AISH_DISPATCH_DEDUP_SECS", "12") };
+        assert_eq!(dispatch_dedup_window(), Duration::from_secs(12));
+
+        unsafe { std::env::set_var("AISH_DISPATCH_DEDUP_SECS", "0") };
+        assert_eq!(dispatch_dedup_window(), Duration::from_secs(0));
+
+        unsafe { std::env::set_var("AISH_DISPATCH_DEDUP_SECS", "not-a-number") };
+        assert_eq!(
+            dispatch_dedup_window(),
+            Duration::from_secs(DISPATCH_DEDUP_SECS),
+            "invalid value falls back to the default window"
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AISH_DISPATCH_DEDUP_SECS", v) },
+            None => unsafe { std::env::remove_var("AISH_DISPATCH_DEDUP_SECS") },
+        }
+    }
 
     // The attach-review claim is once-only per (marker, run_id): the first caller
     // to observe a finished attached worker prints its final result; the racing
@@ -9263,8 +9656,54 @@ mod tests {
         assert!(show.contains("Observe everything"), "got: {show}");
         assert!(show.contains("milestones (0/1)"), "got: {show}");
         let status = goal_command(&mut s, "status", "");
-        assert!(status.contains("1 goal(s):"), "got: {status}");
+        // Humanized dashboard header + the goal statement + a progress bar.
+        assert!(status.contains("🎯"), "got: {status}");
+        assert!(status.contains("1 tracked"), "got: {status}");
         assert!(status.contains("Observe everything"), "got: {status}");
+        assert!(status.contains("Progress"), "got: {status}");
+        // Work breakdown: the single open milestone is flagged as current.
+        assert!(status.contains("Milestones (0/1)"), "got: {status}");
+        assert!(status.contains("add tracing"), "got: {status}");
+        assert!(status.contains("you are here"), "got: {status}");
+    }
+
+    #[test]
+    fn goal_progress_bar_rounds_to_nearest_cell() {
+        assert_eq!(goal_progress_bar(0), "░░░░░░░░░░");
+        assert_eq!(goal_progress_bar(100), "██████████");
+        assert_eq!(goal_progress_bar(50), "█████░░░░░");
+        // 33% → 3.3 cells → 3 filled; 67% → 6.7 → 7 filled (half-up).
+        assert_eq!(goal_progress_bar(33), "███░░░░░░░");
+        assert_eq!(goal_progress_bar(67), "███████░░░");
+        // Never overflows past 10 cells even on a stray >100.
+        assert_eq!(goal_progress_bar(200).chars().count(), 10);
+    }
+
+    #[test]
+    fn goal_status_dashboard_shows_breakdown_and_current_position() {
+        let mut s = Session::new().unwrap();
+        goal_command(&mut s, "new", "Ship the dashboard");
+        goal_command(&mut s, "milestone", "design");
+        goal_command(&mut s, "milestone", "build");
+        goal_command(&mut s, "milestone", "release");
+        // Complete the first milestone so the "current" marker lands on #2.
+        {
+            let g = s.goals.last_mut().expect("current goal");
+            g.milestones[0].done = true;
+            g.touch();
+        }
+        let out = goal_command(&mut s, "status", "");
+        assert!(out.contains("🎯"), "header emoji: {out}");
+        assert!(out.contains("Ship the dashboard"), "statement: {out}");
+        assert!(out.contains("Milestones (1/3)"), "breakdown count: {out}");
+        assert!(out.contains("✅"), "done marker: {out}");
+        // The first not-done milestone is flagged as the current position.
+        let build_line = out
+            .lines()
+            .find(|l| l.contains("build"))
+            .unwrap_or_default();
+        assert!(build_line.contains("you are here"), "current: {out}");
+        assert!(out.contains("★ current"), "active-goal star: {out}");
     }
 
     #[test]
@@ -9283,5 +9722,49 @@ mod tests {
         goal_command(&mut s, "new", "A goal");
         let out = goal_command(&mut s, "show", "deadbeefcafe");
         assert!(out.contains("no goal matching"), "got: {out}");
+    }
+
+    // ───────── TASK-280: goal-aware task-less `:dispatch` routing ─────────
+
+    #[test]
+    fn goal_next_work_suggestion_none_without_active_goal() {
+        // No goals at all → no suggestion (usage stays unchanged, AC3).
+        let s = Session::new().unwrap();
+        assert!(goal_next_work_suggestion(&s).is_none());
+    }
+
+    #[test]
+    fn goal_next_work_suggestion_routes_to_linked_task_framed_by_milestone() {
+        let mut s = Session::new().unwrap();
+        goal_command(&mut s, "new", "Ship routing");
+        goal_command(&mut s, "milestone", "Build");
+        goal_command(&mut s, "link", "TASK-280 wire routing");
+        let out = goal_next_work_suggestion(&s).expect("actionable goal suggests work");
+        // Names the goal, the linked task, the framing milestone, and the exact
+        // confirmable dispatch line.
+        assert!(out.contains("Ship routing"), "goal title: {out}");
+        assert!(out.contains("TASK-280"), "task key: {out}");
+        assert!(out.contains("Build"), "milestone frame: {out}");
+        assert!(out.contains(":dispatch TASK-280"), "confirm line: {out}");
+    }
+
+    #[test]
+    fn taskless_dispatch_prefers_goal_suggestion_over_usage() {
+        let mut s = Session::new().unwrap();
+        goal_command(&mut s, "new", "Ship routing");
+        goal_command(&mut s, "link", "TASK-280 wire routing");
+        // Empty task + live actionable goal → routes toward the goal, not usage.
+        let d = dispatch_coordinator("   ", &mut s);
+        assert!(d.message.contains("TASK-280"), "routed: {}", d.message);
+        assert!(!d.message.starts_with("usage:"), "not usage: {}", d.message);
+        assert!(d.id.is_none(), "suggestion dispatches nothing yet");
+    }
+
+    #[test]
+    fn taskless_dispatch_without_goal_still_shows_usage() {
+        let mut s = Session::new().unwrap();
+        // No active goal → bare usage preserved (AC3 back-compat).
+        let d = dispatch_coordinator("", &mut s);
+        assert!(d.message.starts_with("usage:"), "usage: {}", d.message);
     }
 }

@@ -496,6 +496,19 @@ pub async fn drive(
         // session.session_id/name were adopted from the LAUNCHING session at
         // startup (see main.rs), so the row attributes to who asked for the work.
         let _ = s.insert(run_id, &input, &session.session_id, session.name.as_deref());
+        // TASK-289: record this live coordinator PROCESS in the durable registry
+        // so a parent-death restart can reap our pid (and, once TASK-291 lands,
+        // resume an in-flight Batches job). `coord_id` == `run_id`; generation 0
+        // on first start; no batch job yet (the resume path stamps it later);
+        // phase mirrors the freshly-inserted `coordinating` row.
+        let _ = s.register_run(
+            run_id,
+            0,
+            std::process::id() as i64,
+            None,
+            "coordinating",
+            Some(&session.session_id),
+        );
     }
 
     // ── Pre-dispatch circuit breaker (loop guard, per the loop-exhaustion

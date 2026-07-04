@@ -70,6 +70,74 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, cap: usize) -> S
 /// read as a transient "pulse", long enough to be seen at the next prompt draw.
 pub const PULSE_FADE: Duration = Duration::from_millis(900);
 
+// ---------------------------------------------------------------------------
+// Worker-output mode — auto-show a SOLE coordinator's live stream (TASK-292)
+// ---------------------------------------------------------------------------
+
+/// Tri-state controlling whether a background coordinator's live activity is
+/// forwarded to the terminal (the `:worker-output` toggle).
+///
+/// * `Auto` (the DEFAULT): aish decides. When exactly ONE background coordinator
+///   is running and nothing else competes for attention, the stream is shown;
+///   the moment it finishes (or a second job starts) it reverts to quiet. Makes
+///   single-job mode feel interactive without drowning the shell when several
+///   coordinators run at once.
+/// * `ForcedOn` / `ForcedOff`: the user pinned it with `:worker-output on|off`.
+///   A pin ALWAYS wins — auto-detection never touches a forced state (AC3). Run
+///   `:worker-output auto` to hand control back to auto-detection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum WorkerOutputMode {
+    /// aish auto-shows a sole coordinator and reverts when it finishes.
+    #[default]
+    Auto,
+    /// User pinned the stream ON — auto-detection is disabled.
+    ForcedOn,
+    /// User pinned the stream OFF — auto-detection is disabled.
+    ForcedOff,
+}
+
+impl WorkerOutputMode {
+    /// Serialize to the `u8` stored in the session's shared `AtomicU8`.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            WorkerOutputMode::Auto => 0,
+            WorkerOutputMode::ForcedOn => 1,
+            WorkerOutputMode::ForcedOff => 2,
+        }
+    }
+
+    /// Reconstruct from the stored `u8` (any unknown value decodes to `Auto`).
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => WorkerOutputMode::ForcedOn,
+            2 => WorkerOutputMode::ForcedOff,
+            _ => WorkerOutputMode::Auto,
+        }
+    }
+}
+
+/// Decide the effective auto target for the worker-output stream (TASK-292).
+///
+/// Returns `Some(true)` to auto-ENABLE the stream, `Some(false)` to auto-DISABLE
+/// it, or `None` when the mode is forced (a user `:worker-output on|off` pin
+/// wins — auto must NOT touch it, AC3).
+///
+/// The auto target is "a SOLE coordinator is running": exactly one live worker
+/// spawned by this session AND nothing else in the combined background tally
+/// competing for attention (`live_background == 1`). When that holds the stream
+/// is shown (AC1); when the last coordinator finishes — or a second job starts —
+/// it reverts to the quiet default (AC2). Pure, so it is unit-tested.
+pub fn auto_output_target(
+    mode: WorkerOutputMode,
+    live_workers: usize,
+    live_background: usize,
+) -> Option<bool> {
+    match mode {
+        WorkerOutputMode::Auto => Some(live_workers == 1 && live_background == 1),
+        WorkerOutputMode::ForcedOn | WorkerOutputMode::ForcedOff => None,
+    }
+}
+
 /// A single prompt-badge pulse event, derived from a coordinator's stderr.
 /// Most-recent-wins across all live workers (see [`fresh_pulse`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1244,6 +1312,68 @@ fn parse_u64_or(raw: Option<&str>, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+// ── Nesting-depth guard: coordinator spawn budget (TASK-287) ────────────────
+//
+// A cheap, hard backstop against a runaway nested-coordinator fork-bomb. Each
+// process carries a `AISH_SPAWN_BUDGET` env var = the number of further spawn
+// levels it is still allowed to fork. A root interactive session has no var set
+// and so defaults to `DEFAULT_SPAWN_BUDGET`. Every time we fork a child
+// coordinator (`worker_command` / container `env_inline`) we stamp the child's
+// env with our own budget MINUS ONE (`child_spawn_budget`). Before any fork the
+// dispatch sites call `spawn_budget_gate`, which refuses once the budget is
+// exhausted (`< 1`). This does NOT implement full nested support — it is only
+// the guard so nesting, whenever it is enabled, can't recurse without bound.
+
+/// Env var carrying the remaining spawn budget from a parent coordinator to its
+/// child. Unset ⇒ root session ⇒ `DEFAULT_SPAWN_BUDGET`.
+pub const SPAWN_BUDGET_ENV: &str = "AISH_SPAWN_BUDGET";
+
+/// Default budget for a root session (env var unset). `3` ⇒ a root may spawn
+/// three levels deep (L1, L2, L3) and the fourth spawn is refused — matching the
+/// TASK-287 acceptance criteria ("3 levels spawn OK, 4th is rejected").
+pub const DEFAULT_SPAWN_BUDGET: u32 = 3;
+
+/// Parse a raw `AISH_SPAWN_BUDGET` value. `None`/empty/unparseable ⇒ the root
+/// default; otherwise the parsed value (including a legitimate `0`, which the
+/// gate reads as "exhausted — refuse further spawns"). Pure → unit-tested
+/// without mutating process-wide env.
+fn parse_spawn_budget(raw: Option<&str>) -> u32 {
+    raw.and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_SPAWN_BUDGET)
+}
+
+/// This process's remaining spawn budget (from the inherited env, else default).
+pub fn spawn_budget() -> u32 {
+    parse_spawn_budget(std::env::var(SPAWN_BUDGET_ENV).ok().as_deref())
+}
+
+/// The budget to stamp on a child we are about to fork: our own minus one,
+/// saturating at zero. Pure → unit-tested.
+pub fn child_spawn_budget(current: u32) -> u32 {
+    current.saturating_sub(1)
+}
+
+/// Whether a process holding `current` budget may still fork a child. Pure.
+pub fn spawn_budget_ok(current: u32) -> bool {
+    current >= 1
+}
+
+/// Dispatch gate: `Ok(())` when this process may still fork a coordinator, else
+/// an `Err` carrying an operator-facing message. Called by every spawn site
+/// (`run_in_background`, `:dispatch`, scheduled/alert workers) BEFORE forking.
+pub fn spawn_budget_gate() -> Result<(), String> {
+    let budget = spawn_budget();
+    if spawn_budget_ok(budget) {
+        Ok(())
+    } else {
+        Err(format!(
+            "coordinator spawn budget exhausted ({SPAWN_BUDGET_ENV}={budget}) — refusing to spawn a \
+nested coordinator to prevent a runaway fork-bomb. This is the depth guard (TASK-287); raise the \
+budget only if you understand the recursion risk."
+        ))
+    }
+}
+
 /// Build the `tokio::process::Command` that re-execs aish in `--coordinator`
 /// mode for a single task. Centralises the args, env, pipes, AND the resource
 /// limits applied to the child, so `run_worker` and `run_once` stay in sync.
@@ -1286,6 +1416,12 @@ fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str, cwd: &std::path::
         // Nested-coordinator guard: an in-container/in-worker aish must never
         // spawn its own workers (no infinite recursion). The child reads this.
         .env("AISH_COORDINATOR", "1")
+        // Nesting-depth guard (TASK-287): hand the child our own spawn budget
+        // MINUS ONE, so a nested chain can fork at most `AISH_SPAWN_BUDGET`
+        // levels deep before `spawn_budget_gate` refuses. Single source of truth
+        // for the host vehicle; the container vehicle stamps the identical value
+        // via `env_inline` (see run_worker's container branch).
+        .env(SPAWN_BUDGET_ENV, child_spawn_budget(spawn_budget()).to_string())
         // Tie the work to the LAUNCHING session: the child adopts this id so its
         // durable records attribute to the session that asked for the work.
         .env("AISH_LAUNCH_SESSION_ID", &spec.launch_session_id)
@@ -2688,6 +2824,12 @@ fn build_container_command(
     // Non-secret control env passed inline.
     let mut env_inline = vec![
         ("AISH_COORDINATOR".to_string(), "1".to_string()),
+        // Nesting-depth guard (TASK-287): identical decrement to the host path
+        // in `worker_command` — stamp the container child's budget = ours − 1.
+        (
+            SPAWN_BUDGET_ENV.to_string(),
+            child_spawn_budget(spawn_budget()).to_string(),
+        ),
         (
             "AISH_LAUNCH_SESSION_ID".to_string(),
             spec.launch_session_id.clone(),
@@ -3314,6 +3456,59 @@ mod tests {
         }
         // All done → fully restored, no leak.
         assert_eq!(THINKING_ACTIVE.load(Ordering::Relaxed), base);
+    }
+
+    #[test]
+    fn spawn_budget_defaults_when_unset() {
+        // Root session (env var absent/empty/garbage) ⇒ the root default.
+        assert_eq!(parse_spawn_budget(None), DEFAULT_SPAWN_BUDGET);
+        assert_eq!(parse_spawn_budget(Some("")), DEFAULT_SPAWN_BUDGET);
+        assert_eq!(parse_spawn_budget(Some("  ")), DEFAULT_SPAWN_BUDGET);
+        assert_eq!(parse_spawn_budget(Some("nope")), DEFAULT_SPAWN_BUDGET);
+        // A legitimate value parses, including a literal 0 (exhausted).
+        assert_eq!(parse_spawn_budget(Some("5")), 5);
+        assert_eq!(parse_spawn_budget(Some(" 2 ")), 2);
+        assert_eq!(parse_spawn_budget(Some("0")), 0);
+    }
+
+    #[test]
+    fn spawn_budget_three_levels_ok_fourth_rejected() {
+        // AC (TASK-287): starting from a root default budget, three successive
+        // coordinator spawns are permitted and the fourth is refused. We model
+        // the real chain: at each level the gate checks THIS level's budget, then
+        // stamps the child with `child_spawn_budget` (= budget − 1).
+        let root = parse_spawn_budget(None); // 3
+        assert_eq!(root, 3);
+
+        // Level 1 spawn: root(3) may fork; child gets 2.
+        assert!(spawn_budget_ok(root), "L1 spawn must be allowed");
+        let l1 = child_spawn_budget(root);
+        assert_eq!(l1, 2);
+
+        // Level 2 spawn: l1(2) may fork; child gets 1.
+        assert!(spawn_budget_ok(l1), "L2 spawn must be allowed");
+        let l2 = child_spawn_budget(l1);
+        assert_eq!(l2, 1);
+
+        // Level 3 spawn: l2(1) may fork; child gets 0.
+        assert!(spawn_budget_ok(l2), "L3 spawn must be allowed");
+        let l3 = child_spawn_budget(l2);
+        assert_eq!(l3, 0);
+
+        // Level 4 spawn: l3(0) is exhausted — refused.
+        assert!(!spawn_budget_ok(l3), "L4 spawn must be rejected");
+
+        // saturating: a would-be level-5 budget never underflows below 0.
+        assert_eq!(child_spawn_budget(l3), 0);
+    }
+
+    #[test]
+    fn spawn_budget_gate_predicate_and_var_name() {
+        assert!(spawn_budget_ok(1));
+        assert!(!spawn_budget_ok(0));
+        // The rejection message (in `spawn_budget_gate`) names this var so an
+        // operator can act on it — pin the documented name.
+        assert_eq!(SPAWN_BUDGET_ENV, "AISH_SPAWN_BUDGET");
     }
 
     #[test]
@@ -4215,6 +4410,48 @@ mod tests {
             ));
         }
         assert_eq!(fresh_pulse(&jobs), None);
+    }
+
+    #[test]
+    fn worker_output_mode_u8_roundtrips() {
+        for m in [
+            WorkerOutputMode::Auto,
+            WorkerOutputMode::ForcedOn,
+            WorkerOutputMode::ForcedOff,
+        ] {
+            assert_eq!(WorkerOutputMode::from_u8(m.as_u8()), m);
+        }
+        // Default is Auto, and any unknown byte decodes to Auto (forward-compat).
+        assert_eq!(WorkerOutputMode::default(), WorkerOutputMode::Auto);
+        assert_eq!(WorkerOutputMode::from_u8(200), WorkerOutputMode::Auto);
+    }
+
+    #[test]
+    fn auto_output_target_shows_only_a_sole_coordinator() {
+        use WorkerOutputMode::*;
+        // AC1: exactly one live worker and nothing else competing → auto-ON.
+        assert_eq!(auto_output_target(Auto, 1, 1), Some(true));
+        // AC2: no coordinator running → auto-OFF (revert to quiet default).
+        assert_eq!(auto_output_target(Auto, 0, 0), Some(false));
+        // A second background job competing → not "sole" → auto-OFF.
+        assert_eq!(auto_output_target(Auto, 1, 2), Some(false));
+        // Two workers running → not sole → auto-OFF (streams would interleave).
+        assert_eq!(auto_output_target(Auto, 2, 2), Some(false));
+        // One worker but another (batch) job also live → not sole → auto-OFF.
+        assert_eq!(auto_output_target(Auto, 1, 3), Some(false));
+    }
+
+    #[test]
+    fn auto_output_target_never_overrides_a_user_pin() {
+        use WorkerOutputMode::*;
+        // AC3: a forced mode always returns None — auto-detection must not touch
+        // it, regardless of how many coordinators are (or aren't) running.
+        for workers in 0..=2 {
+            for background in 0..=3 {
+                assert_eq!(auto_output_target(ForcedOn, workers, background), None);
+                assert_eq!(auto_output_target(ForcedOff, workers, background), None);
+            }
+        }
     }
 
     #[test]

@@ -214,6 +214,43 @@ pub fn spawn(
     goal
 }
 
+/// Shared opening line of every goal-turn generator directive. Kept as a const
+/// so the builder ([`goal_directive`]) and its inverse
+/// ([`goal_condition_from_directive`]) can never drift apart — the inverse backs
+/// the `:workers` goal-turn coalescing (TASK-302).
+const GOAL_DIRECTIVE_PREFIX: &str =
+    "Work toward this goal, then report what you did and the evidence:\n";
+/// Marker separating the goal condition from the verifier's last-check guidance
+/// in a re-tried turn's directive.
+const GOAL_DIRECTIVE_GUIDANCE_MARKER: &str = "\n\nThe goal is NOT yet met — last check said: ";
+
+/// Build the per-turn generator directive. `guidance` is the verifier's feedback
+/// from the previous turn (`None` on the first turn). Single source of truth for
+/// the directive shape so [`goal_condition_from_directive`] can reverse it.
+pub(crate) fn goal_directive(condition: &str, guidance: Option<&str>) -> String {
+    match guidance {
+        Some(g) => {
+            format!("{GOAL_DIRECTIVE_PREFIX}{condition}{GOAL_DIRECTIVE_GUIDANCE_MARKER}{g}")
+        }
+        None => format!("{GOAL_DIRECTIVE_PREFIX}{condition}"),
+    }
+}
+
+/// Inverse of [`goal_directive`]: recover the goal condition from a persisted
+/// goal-turn `task` string. Returns `None` when `task` isn't a goal directive,
+/// so non-goal coordinator rows pass through un-grouped. Used by `:workers` to
+/// collapse a goal loop's per-turn `goal-<uuid>` coordinator rows under ONE goal
+/// — a multi-turn goal then renders a single row instead of one-per-turn
+/// (TASK-302).
+pub(crate) fn goal_condition_from_directive(task: &str) -> Option<String> {
+    let rest = task.strip_prefix(GOAL_DIRECTIVE_PREFIX)?;
+    let condition = match rest.split_once(GOAL_DIRECTIVE_GUIDANCE_MARKER) {
+        Some((cond, _guidance)) => cond,
+        None => rest,
+    };
+    Some(condition.to_string())
+}
+
 async fn run_goal(
     goal: Handle,
     spec: crate::worker::WorkerSpec,
@@ -243,17 +280,7 @@ async fn run_goal(
         };
 
         // Generator: a full-tool worker pursues the goal with the latest guidance.
-        let directive = match &guidance {
-            Some(g) => format!(
-                "Work toward this goal, then report what you did and the evidence:\n{}\n\n\
-                 The goal is NOT yet met — last check said: {}",
-                goal.condition, g
-            ),
-            None => format!(
-                "Work toward this goal, then report what you did and the evidence:\n{}",
-                goal.condition
-            ),
-        };
+        let directive = goal_directive(&goal.condition, guidance.as_deref());
         announce(&format!("turn {turn}: working…"));
         {
             let mut i = goal.inner.lock().unwrap();
@@ -714,6 +741,29 @@ impl Goal {
         self.milestones.iter().find(|m| !m.done)
     }
 
+    /// Goal-aware next-work selection (TASK-280): the next aligned unit of work
+    /// to advance this goal, or `None` when the goal isn't actionable
+    /// (paused / blocked / terminal / already complete) or has nothing left to
+    /// pick up. This is the seam the task-less `:dispatch` path consumes to route
+    /// work toward the live goal instead of printing bare usage.
+    ///
+    /// Precedence: the data model keeps `milestones` and `linked_tasks` as
+    /// sibling lists (no explicit task→milestone tag), so a still-open linked
+    /// task is the concrete unit of work — framed by the next incomplete
+    /// milestone it advances toward (AC2: prefer the next incomplete milestone's
+    /// tasks). When every linked task is done, the next incomplete milestone
+    /// itself becomes the suggested work.
+    pub fn next_aligned_work(&self) -> Option<NextWork<'_>> {
+        if !self.is_actionable() {
+            return None;
+        }
+        let milestone = self.next_open_milestone();
+        if let Some(task) = self.linked_tasks.iter().find(|t| !t.done) {
+            return Some(NextWork::Task { task, milestone });
+        }
+        milestone.map(NextWork::Milestone)
+    }
+
     /// Whether this goal is ready to be worked *right now*: it's `Active`, has no
     /// open blockers, and isn't already fully complete. Routing skips goals that
     /// are paused, blocked, terminal, or done.
@@ -819,6 +869,60 @@ pub fn subtree_percent(root_id: &str, all: &[Goal]) -> u8 {
         return 0;
     }
     (((done * 100) + total / 2) / total) as u8
+}
+
+/// A concrete next unit of work selected for an actionable goal (TASK-280) — what
+/// goal-aware routing surfaces when `:dispatch` is invoked with no task and there
+/// is a live goal to advance. Either a specific linked task to pick up (framed by
+/// the milestone in flight) or, when no linked tasks remain open, the next
+/// incomplete milestone itself. Borrows the goal so rendering stays allocation-light.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NextWork<'a> {
+    /// The next incomplete linked task to pick up, with the current open
+    /// milestone (if any) it advances toward.
+    Task {
+        task: &'a TaskRef,
+        milestone: Option<&'a Milestone>,
+    },
+    /// No linked tasks remain open — tackle the next incomplete milestone.
+    Milestone(&'a Milestone),
+}
+
+impl NextWork<'_> {
+    /// The task text a coordinator would be assigned for this unit of work — the
+    /// linked task's key (plus cached title) or the milestone title. This is the
+    /// concrete string the operator confirms via `:dispatch <text>`.
+    pub fn dispatch_text(&self) -> String {
+        match self {
+            NextWork::Task { task, .. } => match &task.title {
+                Some(t) => format!("{}: {t}", task.key),
+                None => task.key.clone(),
+            },
+            NextWork::Milestone(m) => m.title.clone(),
+        }
+    }
+
+    /// A one-line human summary of the suggested work, for the operator prompt.
+    pub fn summary(&self) -> String {
+        match self {
+            NextWork::Task { task, milestone } => {
+                let label = match &task.title {
+                    Some(t) => format!("{} ({t})", task.key),
+                    None => task.key.clone(),
+                };
+                match milestone {
+                    Some(m) => format!(
+                        "task {label} toward milestone \u{201c}{}\u{201d}",
+                        truncate_ellipsis(&m.title, 60)
+                    ),
+                    None => format!("task {label}"),
+                }
+            }
+            NextWork::Milestone(m) => {
+                format!("milestone \u{201c}{}\u{201d}", truncate_ellipsis(&m.title, 60))
+            }
+        }
+    }
 }
 
 /// Goal-aware routing selection: pick the next goal to work from a set. Returns
@@ -1130,6 +1234,95 @@ mod domain_tests {
         assert!(g.next_open_milestone().is_none(), "none when all done");
     }
 
+    // ── TASK-280: goal-aware next-work selection ────────────────────────────
+
+    #[test]
+    fn next_aligned_work_none_when_not_actionable() {
+        // Paused goal → no routing (task-less dispatch falls back to usage).
+        let mut g = Goal::new("G");
+        g.add_milestone("m1");
+        g.link_task(TaskRef::new("TASK-1"));
+        g.set_status(GoalStatus::Paused);
+        assert!(g.next_aligned_work().is_none(), "paused goal routes nothing");
+
+        // Blocked goal → no routing even while Active.
+        let mut g = Goal::new("G");
+        g.add_milestone("m1");
+        g.add_blocker("waiting on review");
+        assert!(g.next_aligned_work().is_none(), "blocked goal routes nothing");
+
+        // Fully complete goal → no routing.
+        let mut g = Goal::new("G");
+        g.add_milestone("m1");
+        g.milestones[0].done = true;
+        assert!(g.next_aligned_work().is_none(), "complete goal routes nothing");
+
+        // Empty active goal (nothing tracked) → nothing to pick up.
+        let g = Goal::new("G");
+        assert!(g.next_aligned_work().is_none(), "empty goal routes nothing");
+    }
+
+    #[test]
+    fn next_aligned_work_prefers_incomplete_task_framed_by_milestone() {
+        let mut g = Goal::new("Ship it");
+        g.add_milestone("Design");
+        g.add_milestone("Build");
+        g.milestones[0].done = true; // next open milestone == "Build"
+        g.link_task(TaskRef::with_title("TASK-9", "wire routing"));
+        g.link_task(TaskRef::new("TASK-10"));
+        g.linked_tasks[0].done = true; // first OPEN task == TASK-10
+
+        match g.next_aligned_work().expect("actionable goal routes work") {
+            NextWork::Task { task, milestone } => {
+                assert_eq!(task.key, "TASK-10", "picks first not-done linked task");
+                assert_eq!(
+                    milestone.map(|m| m.title.as_str()),
+                    Some("Build"),
+                    "AC2: frames by the next incomplete milestone"
+                );
+            }
+            other => panic!("expected a task suggestion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn next_aligned_work_falls_back_to_milestone_when_tasks_done() {
+        let mut g = Goal::new("Ship it");
+        g.add_milestone("Build");
+        g.link_task(TaskRef::new("TASK-1"));
+        g.linked_tasks[0].done = true; // all linked tasks done, milestone still open
+        match g.next_aligned_work().expect("milestone remains") {
+            NextWork::Milestone(m) => assert_eq!(m.title, "Build"),
+            other => panic!("expected a milestone suggestion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn next_work_dispatch_text_and_summary_render() {
+        let m = Milestone::new("Build");
+        let titled = TaskRef::with_title("TASK-9", "wire routing");
+        let bare = TaskRef::new("TASK-10");
+
+        let w = NextWork::Task {
+            task: &titled,
+            milestone: Some(&m),
+        };
+        assert_eq!(w.dispatch_text(), "TASK-9: wire routing");
+        assert!(w.summary().contains("TASK-9 (wire routing)"));
+        assert!(w.summary().contains("Build"));
+
+        let w = NextWork::Task {
+            task: &bare,
+            milestone: None,
+        };
+        assert_eq!(w.dispatch_text(), "TASK-10");
+        assert_eq!(w.summary(), "task TASK-10");
+
+        let w = NextWork::Milestone(&m);
+        assert_eq!(w.dispatch_text(), "Build");
+        assert!(w.summary().contains("Build"));
+    }
+
     // ── rollup: progress % (subtree aggregate) ──────────────────────────────
     #[test]
     fn subtree_progress_folds_in_descendants() {
@@ -1283,5 +1476,37 @@ mod domain_tests {
 
         // No linked tasks → nothing to nest.
         assert!(render_goal_hierarchy(&Goal::new("empty"), &[]).is_none());
+    }
+
+    // TASK-302: the goal loop mints a fresh `goal-<uuid>` coordinator each turn,
+    // so the ONLY stable key tying a goal's turns together is the condition
+    // embedded in the directive. `goal_condition_from_directive` must recover it
+    // for both directive shapes (first turn + re-tried turn) so `:workers` can
+    // collapse the turns into one row.
+    #[test]
+    fn goal_directive_round_trips_condition() {
+        let cond = "make the tests green\nacross the board";
+        // First turn (no guidance).
+        let first = goal_directive(cond, None);
+        assert_eq!(
+            goal_condition_from_directive(&first).as_deref(),
+            Some(cond),
+            "first-turn directive should round-trip the condition"
+        );
+        // Re-tried turn (verifier guidance appended) recovers the SAME condition,
+        // so both turns hash to one goal group regardless of changing guidance.
+        let retry = goal_directive(cond, Some("still 3 tests failing"));
+        assert_eq!(
+            goal_condition_from_directive(&retry).as_deref(),
+            Some(cond),
+            "re-tried directive should recover the identical condition"
+        );
+        assert_eq!(
+            goal_condition_from_directive(&first),
+            goal_condition_from_directive(&retry),
+            "every turn of one goal shares a grouping key"
+        );
+        // A plain (non-goal) coordinator task is not a directive → no key.
+        assert!(goal_condition_from_directive("fix the flaky CI run").is_none());
     }
 }
