@@ -2266,7 +2266,7 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
                 };
                 let result = format_result(r.result.as_ref(), r.error.as_ref());
                 // Append run telemetry (turns / tool calls / tokens in·out) to
-                // the status cell when we've captured any — see record_run_metrics.
+                // the status cell when we've captured any — see persist_terminal.
                 let phase_cell = if r.turns == 0
                     && r.tool_calls == 0
                     && r.tokens_in == 0

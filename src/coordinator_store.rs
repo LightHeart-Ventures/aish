@@ -13,7 +13,7 @@
 //! REPL both hold a handle.
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, Transaction};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 pub struct CoordinatorRow {
     pub run_id: String,
     pub task: String,
-    /// 'coordinating' | 'awaiting_batch' | 'done' | 'failed'.
+    /// 'coordinating' | 'awaiting_batch' | 'checkpoint' | 'done' | 'failed'.
     pub phase: String,
     pub result: Option<String>,
     /// Failure reason when phase='failed'. Persisted for rehydrate/diagnostics;
@@ -52,13 +52,32 @@ pub struct CoordinatorRow {
     pub tool_calls: u64,
 }
 
+/// Cumulative cost/effort counters for a run, persisted ATOMICALLY with the
+/// terminal phase transition (TASK-285). Grouping them into the SAME
+/// transaction as the `done`/`failed` write (via [`CoordinatorStore::finish_run`])
+/// means a crash mid-write can never tear the row into a half-state — a terminal
+/// phase with stale/zero metrics, or fresh metrics under a still-`coordinating`
+/// phase. The whole turn-outcome commit is all-or-nothing, so a re-read after a
+/// rolled-back write sees the prior (resumable) row unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunMetrics {
+    /// Prompt tokens consumed across the run.
+    pub tokens_in: u64,
+    /// Completion tokens produced across the run.
+    pub tokens_out: u64,
+    /// Agentic turns taken.
+    pub turns: u64,
+    /// Tool calls issued.
+    pub tool_calls: u64,
+}
+
 /// One run's terminal payload, read STRICTLY by `run_id` (TASK-205). A single
 /// keyed row read with no shared/global "last result" slot, so a concurrent
 /// completion of another run can never bleed into this lookup.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunResult {
     pub run_id: String,
-    /// 'coordinating' | 'awaiting_batch' | 'done' | 'failed'.
+    /// 'coordinating' | 'awaiting_batch' | 'checkpoint' | 'done' | 'failed'.
     pub phase: String,
     pub result: Option<String>,
     pub error: Option<String>,
@@ -79,6 +98,33 @@ impl RunResult {
             other => format!("run {} is still running (phase: {other}).", self.run_id),
         }
     }
+}
+
+/// One row of the TASK-289 `coordinator_registry` — a live coordinator PROCESS,
+/// captured for parent-death recovery + Batches resume. Distinct from
+/// [`CoordinatorRow`] (the per-run phase/result view): a registry row is keyed
+/// by the coordinator's `coord_id` and records the OS `pid`, the `generation`
+/// (restart counter), the in-flight Anthropic `batch_job_id` (the resume
+/// handle), the coarse `phase`, and the launching `owner_session`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoordinatorRegistryRow {
+    pub coord_id: String,
+    /// Restart counter — bumped each time this coord_id is re-registered by a
+    /// resurrected process, so a stale row can be told from a fresh generation.
+    pub generation: i64,
+    /// OS process id of the coordinator. Scanned at startup: a pid that is no
+    /// longer alive marks the row `orphaned`.
+    pub pid: i64,
+    /// In-flight Anthropic Batches job id, when the coordinator is awaiting one.
+    /// Its presence is what makes an orphaned row RESURRECTABLE (TASK-291).
+    pub batch_job_id: Option<String>,
+    /// Coarse lifecycle phase mirror (e.g. `coordinating`, `awaiting_batch`,
+    /// `orphaned`). Set to `orphaned` by the startup reaper.
+    pub phase: String,
+    pub started_at: Option<String>,
+    /// Launching interactive session (uuid) — used to attribute a row and to
+    /// tell "our" runs from another session's at startup.
+    pub owner_session: Option<String>,
 }
 
 /// Durable store for background coordinator runs — the resumable equivalent of
@@ -115,7 +161,13 @@ impl CoordinatorStore {
                  -- live coordinator takes ONE final graceful wrap-up turn at its
                  -- next round boundary and then terminates (see
                  -- `coordinator::drive`). 0 = run normally, 1 = stand down.
-                 stand_down   INTEGER NOT NULL DEFAULT 0
+                 stand_down   INTEGER NOT NULL DEFAULT 0,
+                 -- Checkpoint control flag (the `:checkpoint` channel, TASK-294 —
+                 -- a resumable-PAUSE sibling of `:stop`). When a parent raises it,
+                 -- the live coordinator halts at its next round boundary WITHOUT
+                 -- finishing, persists phase='checkpoint', and returns; the run can
+                 -- be resumed manually later. 0 = run normally, 1 = pause.
+                 checkpoint   INTEGER NOT NULL DEFAULT 0
              );
              -- Operator → coordinator mailbox (the :tell / SendMessage channel).
              -- A row is a clarification/instruction queued for an in-flight run;
@@ -142,7 +194,27 @@ impl CoordinatorStore {
                  created_at TEXT NOT NULL DEFAULT current_timestamp
              );
              CREATE INDEX IF NOT EXISTS idx_run_aliases_run
-                 ON run_aliases (run_id);",
+                 ON run_aliases (run_id);
+             -- TASK-289: durable coordinator registry for parent-death recovery
+             -- + Batches resume. One row per live coordinator PROCESS (distinct
+             -- from `coordinator_runs`, which is the per-run phase/result view):
+             -- captures the OS pid, the generation (restart counter), the
+             -- in-flight Anthropic batch job id (the resume handle), the coarse
+             -- phase, and the owning interactive session. On REPL startup the
+             -- registry is scanned: rows whose `pid` is no longer alive are
+             -- marked `orphaned`, and any that carried a `batch_job_id` are
+             -- logged as resurrectable (full resurrection is TASK-291/SPR-059).
+             CREATE TABLE IF NOT EXISTS coordinator_registry (
+                 coord_id      TEXT PRIMARY KEY,
+                 generation    INTEGER NOT NULL DEFAULT 0,
+                 pid           INTEGER NOT NULL,
+                 batch_job_id  TEXT,
+                 phase         TEXT NOT NULL,
+                 started_at    TEXT NOT NULL DEFAULT current_timestamp,
+                 owner_session TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_coord_registry_session
+                 ON coordinator_registry (owner_session);",
         )
         .context("coordinator_runs schema init failed")?;
         // Back-compat: add session_name to a table created before it existed.
@@ -179,14 +251,14 @@ impl CoordinatorStore {
                 [],
             );
         }
-        // TASK-291: widen the phase CHECK constraint to admit the new
-        // terminal-but-resumable `checkpoint` phase (a round-cap run parked for
-        // review / `:resume`, distinct from `failed`). SQLite can't ALTER a
-        // CHECK in place, so when an older DB's stored schema predates
-        // 'checkpoint' we rebuild the table ONCE, copying rows by explicit
-        // column list (every additive `ADD COLUMN` above has already run, so the
-        // legacy table carries all columns). Guarded on the stored schema text
-        // → idempotent, and a no-op on fresh DBs whose CREATE already carries it.
+        // TASK-294: widen the phase CHECK constraint to admit the resumable
+        // 'checkpoint' phase and add its `checkpoint` control-flag column. SQLite
+        // can't ALTER a CHECK, so a table predating the checkpoint phase is
+        // rebuilt: copy every row into a new table whose CHECK includes
+        // 'checkpoint' and which carries the flag column (default 0). Detect the
+        // old shape by the ABSENCE of the quoted 'checkpoint' literal in the
+        // stored CREATE SQL. Idempotent — once migrated (or freshly created with
+        // the widened schema) the literal is present and this is a no-op.
         let needs_checkpoint_migration = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='coordinator_runs'",
@@ -194,13 +266,12 @@ impl CoordinatorStore {
                 |r| r.get::<_, String>(0),
             )
             .optional()?
-            .map(|sql| !sql.contains("checkpoint"))
+            .map(|sql| !sql.contains("'checkpoint'"))
             .unwrap_or(false);
         if needs_checkpoint_migration {
             conn.execute_batch(
-                "BEGIN IMMEDIATE;
-                 ALTER TABLE coordinator_runs RENAME TO coordinator_runs_legacy;
-                 CREATE TABLE coordinator_runs (
+                "BEGIN;
+                 CREATE TABLE coordinator_runs_new (
                      run_id       TEXT PRIMARY KEY,
                      task         TEXT NOT NULL,
                      phase        TEXT NOT NULL CHECK (phase IN
@@ -212,6 +283,7 @@ impl CoordinatorStore {
                      created_at   TEXT NOT NULL DEFAULT current_timestamp,
                      heartbeat_at TEXT NOT NULL DEFAULT current_timestamp,
                      stand_down   INTEGER NOT NULL DEFAULT 0,
+                     checkpoint   INTEGER NOT NULL DEFAULT 0,
                      container_id   TEXT,
                      container_name TEXT,
                      runtime        TEXT,
@@ -220,16 +292,19 @@ impl CoordinatorStore {
                      turns        INTEGER NOT NULL DEFAULT 0,
                      tool_calls   INTEGER NOT NULL DEFAULT 0
                  );
-                 INSERT INTO coordinator_runs
+                 INSERT INTO coordinator_runs_new
                      (run_id, task, phase, result, error, session_id, session_name,
-                      created_at, heartbeat_at, stand_down, container_id, container_name,
-                      runtime, tokens_in, tokens_out, turns, tool_calls)
+                      created_at, heartbeat_at, stand_down,
+                      container_id, container_name, runtime,
+                      tokens_in, tokens_out, turns, tool_calls)
                  SELECT
                      run_id, task, phase, result, error, session_id, session_name,
-                     created_at, heartbeat_at, stand_down, container_id, container_name,
-                     runtime, tokens_in, tokens_out, turns, tool_calls
-                 FROM coordinator_runs_legacy;
-                 DROP TABLE coordinator_runs_legacy;
+                     created_at, heartbeat_at, stand_down,
+                     container_id, container_name, runtime,
+                     tokens_in, tokens_out, turns, tool_calls
+                 FROM coordinator_runs;
+                 DROP TABLE coordinator_runs;
+                 ALTER TABLE coordinator_runs_new RENAME TO coordinator_runs;
                  COMMIT;",
             )
             .context("coordinator_runs checkpoint-phase migration failed")?;
@@ -313,41 +388,64 @@ impl CoordinatorStore {
         Ok(())
     }
 
-    /// TASK-291: park a run that hit the round cap in the terminal-but-resumable
-    /// `checkpoint` phase, persisting its `result` (the saved state snapshot)
-    /// so an operator can review it and a future `:resume` can continue it —
-    /// distinct from `set_failed`, which marks a dead run. Mirrors `set_done`'s
-    /// write shape (phase + result + heartbeat) but with the parked phase.
-    pub fn set_checkpoint(&self, run_id: &str, result: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE coordinator_runs \
-             SET phase = 'checkpoint', result = ?2, heartbeat_at = current_timestamp WHERE run_id = ?1",
-            (run_id, result),
-        )?;
-        Ok(())
+    /// Run `f` inside a single SQLite transaction against the store connection,
+    /// committing on `Ok` and rolling back on `Err` (TASK-285). The rusqlite
+    /// [`Transaction`] guard also rolls back when dropped WITHOUT a commit — so a
+    /// panic inside `f`, or a hard crash/SIGKILL of the process before COMMIT,
+    /// leaves nothing half-written: the WAL never gains a commit frame for the
+    /// aborted transaction, and the next open recovers the prior state. This is
+    /// the atomic seam behind the coordinator's turn-state writes: a
+    /// multi-statement mutation (terminal phase + metrics) either lands whole or
+    /// not at all, so a mid-write failure never yields a torn, un-resumable row.
+    pub fn transact<T>(
+        &self,
+        f: impl FnOnce(&Transaction) -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
     }
 
-    /// Stamp the run's cumulative cost/effort counters — prompt (`tokens_in`)
-    /// and completion (`tokens_out`) tokens, agentic `turns`, and `tool_calls` —
-    /// captured from the coordinator [`crate::session::Session`] totals at
-    /// terminal exit. Keyed by `run_id`; leaves phase/result/heartbeat untouched
-    /// so it can be called just before `set_done`/`set_failed`. Best-effort at
-    /// the call site: a metrics-write error never gates run completion.
-    pub fn record_metrics(
+    /// Atomically finalize a run to a terminal `phase` (`done` or `failed`)
+    /// TOGETHER with its cumulative [`RunMetrics`], in ONE transaction (TASK-285).
+    /// Replaces the former `set_done`/`set_failed` followed by a SEPARATE
+    /// `record_metrics` write at the coordinator's terminal exits: a crash
+    /// between those two statements used to leave the row half-updated (terminal
+    /// phase with zero/stale metrics, or metrics under a non-terminal phase).
+    /// Wrapped in [`Self::transact`], the phase, result, error, heartbeat, and
+    /// metrics commit as a unit — a re-read after a rolled-back write sees the
+    /// prior resumable `coordinating` row intact. `result` is set for a `done`
+    /// exit (with `error = None`); `error` is set for a `failed` exit.
+    pub fn finish_run(
         &self,
         run_id: &str,
-        tokens_in: u64,
-        tokens_out: u64,
-        turns: u64,
-        tool_calls: u64,
+        phase: &str,
+        result: Option<&str>,
+        error: Option<&str>,
+        metrics: RunMetrics,
     ) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE coordinator_runs \
-             SET tokens_in = ?2, tokens_out = ?3, turns = ?4, tool_calls = ?5 \
-             WHERE run_id = ?1",
-            (run_id, tokens_in, tokens_out, turns, tool_calls),
-        )?;
-        Ok(())
+        self.transact(|tx| {
+            tx.execute(
+                "UPDATE coordinator_runs \
+                 SET phase = ?2, result = ?3, error = ?4, \
+                     tokens_in = ?5, tokens_out = ?6, turns = ?7, tool_calls = ?8, \
+                     heartbeat_at = current_timestamp \
+                 WHERE run_id = ?1",
+                rusqlite::params![
+                    run_id,
+                    phase,
+                    result,
+                    error,
+                    metrics.tokens_in,
+                    metrics.tokens_out,
+                    metrics.turns,
+                    metrics.tool_calls,
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Every persisted run, oldest first — used at startup to surface completed
@@ -499,6 +597,47 @@ impl CoordinatorStore {
             .is_some_and(|v| v != 0))
     }
 
+    /// Raise the CHECKPOINT flag on a run — the write side of the `:checkpoint`
+    /// channel (TASK-294), a resumable-PAUSE sibling of `:stop`. Where a
+    /// stand-down orders the coordinator to take a final wrap-up turn and
+    /// TERMINATE, a checkpoint asks it to HALT at its next round boundary WITHOUT
+    /// finishing: `coordinator::drive` persists phase='checkpoint' and returns,
+    /// leaving the transcript/worktree intact so the run can be resumed manually
+    /// later. Durable (survives a restart, applies cross-session) and idempotent
+    /// — re-raising, or raising on a finished run, is a harmless no-op. Bumps the
+    /// heartbeat since touching the row proves the parent is alive.
+    ///
+    /// `#[allow(dead_code)]`: this is the write side of the future `:checkpoint`
+    /// REPL command; it's exercised today by the store round-trip test and read
+    /// by `coordinator::drive` via [`Self::checkpoint_requested`].
+    #[allow(dead_code)]
+    pub fn request_checkpoint(&self, run_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE coordinator_runs SET checkpoint = 1, heartbeat_at = current_timestamp \
+             WHERE run_id = ?1",
+            [run_id],
+        )?;
+        Ok(())
+    }
+
+    /// Peek the checkpoint flag for a run (no clear). The coordinator checks this
+    /// at every round boundary; once set the run pauses at `checkpoint` and
+    /// exits, so there's nothing to clear here (a resume clears it explicitly).
+    /// Returns `false` when the row is absent or the flag was never raised.
+    pub fn checkpoint_requested(&self, run_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT checkpoint FROM coordinator_runs WHERE run_id = ?1",
+                [run_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|v| v != 0))
+    }
+
     /// Bind `alias`->`run_id` ONCE at run creation (TASK-205 AC1). The write is
     /// immutable: a second bind for the same alias is a no-op
     /// (`ON CONFLICT(alias) DO NOTHING`), so the mapping captured at run start
@@ -621,6 +760,69 @@ impl CoordinatorStore {
         );
         Ok(deleted)
     }
+
+    /// TASK-289: register (or re-register) a live coordinator PROCESS in the
+    /// `coordinator_registry`. Keyed by `coord_id`; a re-register from a
+    /// resurrected process upserts the pid/batch/phase and bumps `generation`
+    /// so a stale row can be told from a fresh generation.
+    pub fn register_run(
+        &self,
+        coord_id: &str,
+        generation: i64,
+        pid: i64,
+        batch_job_id: Option<&str>,
+        phase: &str,
+        owner_session: Option<&str>,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO coordinator_registry
+                 (coord_id, generation, pid, batch_job_id, phase, owner_session)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(coord_id) DO UPDATE SET
+                 generation    = excluded.generation,
+                 pid           = excluded.pid,
+                 batch_job_id  = excluded.batch_job_id,
+                 phase         = excluded.phase,
+                 owner_session = excluded.owner_session",
+            (coord_id, generation, pid, batch_job_id, phase, owner_session),
+        )?;
+        Ok(())
+    }
+
+    /// TASK-289: all registry rows NOT yet marked `orphaned` — the candidate set
+    /// the startup reaper scans for dead pids. Ordered by `started_at`.
+    pub fn get_live_runs(&self) -> Result<Vec<CoordinatorRegistryRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT coord_id, generation, pid, batch_job_id, phase, started_at, owner_session
+             FROM coordinator_registry
+             WHERE phase != 'orphaned'
+             ORDER BY started_at",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CoordinatorRegistryRow {
+                coord_id: r.get(0)?,
+                generation: r.get(1)?,
+                pid: r.get(2)?,
+                batch_job_id: r.get(3)?,
+                phase: r.get(4)?,
+                started_at: r.get(5)?,
+                owner_session: r.get(6)?,
+            })
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// TASK-289: flip a registry row to the `orphaned` phase — called by the
+    /// startup reaper for a `coord_id` whose `pid` is no longer alive. Rows that
+    /// carried a `batch_job_id` stay resurrectable (TASK-291/SPR-059).
+    pub fn mark_orphaned(&self, coord_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE coordinator_registry SET phase = 'orphaned' WHERE coord_id = ?1",
+            [coord_id],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -646,9 +848,16 @@ mod tests {
             (0, 0, 0, 0)
         );
 
-        // Stamp metrics, then close out — record_metrics must not touch phase.
-        store.record_metrics("run_m", 12_345, 6_789, 7, 42).unwrap();
-        store.set_done("run_m", "done").unwrap();
+        // Stamp metrics + terminal phase atomically (TASK-285 finish_run).
+        store
+            .finish_run(
+                "run_m",
+                "done",
+                Some("done"),
+                None,
+                RunMetrics { tokens_in: 12_345, tokens_out: 6_789, turns: 7, tool_calls: 42 },
+            )
+            .unwrap();
 
         // Survives a restart (persisted columns, not in-memory state).
         let reopened = CoordinatorStore::open(&path).unwrap();
@@ -658,7 +867,7 @@ mod tests {
         assert_eq!(r.tokens_out, 6_789);
         assert_eq!(r.turns, 7);
         assert_eq!(r.tool_calls, 42);
-        assert_eq!(r.phase, "done"); // metrics write left phase/result intact
+        assert_eq!(r.phase, "done"); // finish_run set phase + metrics as one unit
         assert_eq!(r.result.as_deref(), Some("done"));
         let _ = std::fs::remove_file(&path);
     }
@@ -782,6 +991,38 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_flag_and_phase_persist_across_reopen() {
+        // TASK-294: the checkpoint control flag round-trips, and the CHECK
+        // constraint admits phase='checkpoint' which survives a store reopen as a
+        // resumable (non-terminal) pause.
+        let path = std::env::temp_dir().join(format!("aish_coordckpt_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+
+        store
+            .insert("run_c", "long build", "sess-c", Some("gamma"))
+            .unwrap();
+        // Flag defaults to unset, is raised by request_checkpoint, and reads back.
+        assert!(!store.checkpoint_requested("run_c").unwrap());
+        store.request_checkpoint("run_c").unwrap();
+        assert!(store.checkpoint_requested("run_c").unwrap());
+        // An absent run reads back false (no row), never errors.
+        assert!(!store.checkpoint_requested("missing").unwrap());
+
+        // The coordinator halts by persisting phase='checkpoint' — the widened
+        // CHECK must accept it.
+        store.set_phase("run_c", "checkpoint").unwrap();
+
+        // A fresh store over the same file sees the paused, resumable run.
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        let rows = reopened.load_all().unwrap();
+        let c = rows.iter().find(|r| r.run_id == "run_c").unwrap();
+        assert_eq!(c.phase, "checkpoint");
+        assert!(reopened.checkpoint_requested("run_c").unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn coordinator_messages_enqueue_drain_and_purge() {
         let path = std::env::temp_dir().join(format!("aish_coordmsg_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -889,5 +1130,209 @@ mod tests {
         assert_eq!(store.failed_attempts("unrelated").unwrap(), 0);
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    // TASK-289: coordinator_registry round-trip + register/get/mark ops.
+    #[test]
+    fn registry_round_trip_and_orphan_flip() {
+        let path = std::env::temp_dir().join(format!("aish_coordreg_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+
+        // Empty registry → no live runs.
+        assert!(store.get_live_runs().unwrap().is_empty());
+
+        // Register two runs; one carries an in-flight batch job (resurrectable).
+        store
+            .register_run("c1", 0, 4242, None, "coordinating", Some("sess-a"))
+            .unwrap();
+        store
+            .register_run("c2", 0, 4243, Some("batch_zzz"), "awaiting_batch", Some("sess-a"))
+            .unwrap();
+
+        let live = store.get_live_runs().unwrap();
+        assert_eq!(live.len(), 2);
+        let c2 = live.iter().find(|r| r.coord_id == "c2").unwrap();
+        assert_eq!(c2.generation, 0);
+        assert_eq!(c2.pid, 4243);
+        assert_eq!(c2.batch_job_id.as_deref(), Some("batch_zzz"));
+        assert_eq!(c2.phase, "awaiting_batch");
+        assert_eq!(c2.owner_session.as_deref(), Some("sess-a"));
+        assert!(c2.started_at.is_some());
+
+        // Re-register c1 (resurrected process): upsert bumps generation + pid,
+        // does NOT create a duplicate row.
+        store
+            .register_run("c1", 1, 5555, Some("batch_new"), "awaiting_batch", Some("sess-b"))
+            .unwrap();
+        let live = store.get_live_runs().unwrap();
+        assert_eq!(live.len(), 2, "re-register must upsert, not duplicate");
+        let c1 = live.iter().find(|r| r.coord_id == "c1").unwrap();
+        assert_eq!(c1.generation, 1);
+        assert_eq!(c1.pid, 5555);
+        assert_eq!(c1.batch_job_id.as_deref(), Some("batch_new"));
+        assert_eq!(c1.owner_session.as_deref(), Some("sess-b"));
+
+        // Mark c2 orphaned → dropped from the live set, c1 remains.
+        store.mark_orphaned("c2").unwrap();
+        let live = store.get_live_runs().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].coord_id, "c1");
+
+        // Survives a restart (persisted columns, not in-memory state).
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        let live = reopened.get_live_runs().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].coord_id, "c1");
+        assert_eq!(live[0].generation, 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── TASK-285: transactional turn-state writes ───────────────────────────
+
+    /// `finish_run` writes the terminal phase, result/error, and metrics as one
+    /// atomic unit and survives a restart — the `done` and `failed` shapes.
+    #[test]
+    fn finish_run_persists_phase_and_metrics_atomically() {
+        let path =
+            std::env::temp_dir().join(format!("aish_t285_finish_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+
+        store.insert("run_done", "ship it", "s", None).unwrap();
+        store.insert("run_fail", "ship it", "s", None).unwrap();
+
+        let m = RunMetrics { tokens_in: 100, tokens_out: 55, turns: 4, tool_calls: 9 };
+        store
+            .finish_run("run_done", "done", Some("delivered"), None, m)
+            .unwrap();
+        store
+            .finish_run("run_fail", "failed", None, Some("kaboom"), m)
+            .unwrap();
+
+        // Survives a reopen (persisted columns, not in-memory state).
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        let rows = reopened.load_all().unwrap();
+
+        let d = rows.iter().find(|r| r.run_id == "run_done").unwrap();
+        assert_eq!(d.phase, "done");
+        assert_eq!(d.result.as_deref(), Some("delivered"));
+        assert_eq!(d.error, None);
+        assert_eq!((d.tokens_in, d.tokens_out, d.turns, d.tool_calls), (100, 55, 4, 9));
+
+        let f = rows.iter().find(|r| r.run_id == "run_fail").unwrap();
+        assert_eq!(f.phase, "failed");
+        assert_eq!(f.error.as_deref(), Some("kaboom"));
+        assert_eq!(f.result, None);
+        assert_eq!((f.tokens_in, f.tokens_out, f.turns, f.tool_calls), (100, 55, 4, 9));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A transaction that ERRORS mid-write (stand-in for a panic/crash before
+    /// COMMIT) must roll back cleanly, leaving the row in its prior resumable
+    /// `coordinating` state rather than a torn terminal half-write. This is the
+    /// core panic-safety guarantee behind TASK-285.
+    #[test]
+    fn transact_rolls_back_on_mid_write_error() {
+        let path =
+            std::env::temp_dir().join(format!("aish_t285_rollback_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+
+        store.insert("run_tx", "long task", "s", None).unwrap();
+        store.set_phase("run_tx", "coordinating").unwrap();
+
+        // Perform a terminal write, then bail BEFORE the implicit commit — the
+        // rusqlite Transaction guard rolls the whole thing back on drop.
+        let res: Result<()> = store.transact(|tx| {
+            tx.execute(
+                "UPDATE coordinator_runs \
+                 SET phase = 'done', result = 'SHOULD_NOT_PERSIST', tokens_in = 999 \
+                 WHERE run_id = 'run_tx'",
+                [],
+            )?;
+            anyhow::bail!("simulated crash mid-write");
+        });
+        assert!(res.is_err(), "the closure error must propagate");
+
+        // Re-read (including across a reopen): the aborted write left nothing.
+        for s in [&store, &CoordinatorStore::open(&path).unwrap()] {
+            let rows = s.load_all().unwrap();
+            let r = rows.iter().find(|r| r.run_id == "run_tx").unwrap();
+            assert_eq!(r.phase, "coordinating", "phase must roll back — row stays resumable");
+            assert_eq!(r.result, None, "result must roll back");
+            assert_eq!(r.tokens_in, 0, "metrics must roll back");
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// AC #3: SIGKILL a child process mid-write and verify the row is still
+    /// resumable. A re-exec of this very test binary opens the SAME db, begins a
+    /// terminal `finish_run`-shaped transaction, and hangs BEFORE commit; the
+    /// parent SIGKILLs it (`Child::kill()` sends SIGKILL on Unix). SQLite's WAL
+    /// never gained a commit frame for the aborted transaction, so on reopen the
+    /// run is still `coordinating` — never the torn `done` the child was writing.
+    #[test]
+    fn sigkill_mid_transaction_leaves_row_resumable() {
+        // Child leg: hold an uncommitted terminal write, then block so the parent
+        // can SIGKILL us mid-transaction. Guarded by an env flag so it only runs
+        // in the re-exec'd child, never during the normal suite pass.
+        if let Ok(db) = std::env::var("AISH_T285_KILL_DB") {
+            let store = CoordinatorStore::open(std::path::Path::new(&db)).unwrap();
+            let _ = store.transact::<()>(|tx| {
+                tx.execute(
+                    "UPDATE coordinator_runs \
+                     SET phase = 'done', result = 'SHOULD_NOT_PERSIST' WHERE run_id = 'run_kill'",
+                    [],
+                )?;
+                // Never reaches commit: block until the parent kills us.
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                Ok(())
+            });
+            std::process::exit(0);
+        }
+
+        let path =
+            std::env::temp_dir().join(format!("aish_t285_kill_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+        store.insert("run_kill", "long task", "s", None).unwrap();
+        store.set_phase("run_kill", "coordinating").unwrap();
+        // Drop our handle so the child is the only writer (avoids our own WAL
+        // lock interfering with the kill/reopen recovery).
+        drop(store);
+
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(exe)
+            // Unique substring filter — matches ONLY this test regardless of the
+            // crate's module-path prefix (no `--exact`, which would need the full
+            // `…::tests::…` path). The env guard above makes the child leg run.
+            .args(["sigkill_mid_transaction_leaves_row_resumable", "--test-threads=1"])
+            .env("AISH_T285_KILL_DB", &path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        // Give the child time to open the db and enter the write transaction.
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        // SIGKILL mid-write (std Child::kill == SIGKILL on Unix).
+        child.kill().unwrap();
+        let _ = child.wait();
+
+        // Reopen: the uncommitted terminal write must have rolled back.
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        let rows = reopened.load_all().unwrap();
+        let r = rows.iter().find(|r| r.run_id == "run_kill").unwrap();
+        assert_eq!(
+            r.phase, "coordinating",
+            "a SIGKILL'd mid-write must roll back — the run stays resumable"
+        );
+        assert_eq!(r.result, None, "the child's uncommitted result must not persist");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

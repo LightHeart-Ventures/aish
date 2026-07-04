@@ -682,11 +682,9 @@ pub async fn run_coordinator(
             }
             Ok(())
         }
-        // TASK-291: a round-cap checkpoint is NOT a failure. Emit the saved
-        // state snapshot as the run's result (the worker captures stdout) and
-        // exit ZERO so the parent leaves the durable `checkpoint` phase intact
-        // for operator review / a future `:resume` — a non-zero exit here would
-        // reconcile the row to `failed`.
+        // A checkpointed run is a deliberate, resumable PAUSE (TASK-294), NOT a
+        // failure: emit any partial result and exit 0 so the parent doesn't mark
+        // it failed. The durable row stays at `checkpoint` for a later resume.
         crate::coordinator::Phase::Checkpoint => {
             if let Some(result) = &outcome.result {
                 if session.output_json {
