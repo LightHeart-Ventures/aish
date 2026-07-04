@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
+use crate::audit::{AuditRecord, AuditSink, NoopAuditSink};
 use crate::envelope::Webhook;
 use crate::error::Result;
 
@@ -168,6 +169,7 @@ pub fn passes_filters(
 pub struct WebhookDispatcher {
     registry: Arc<PluginRegistry>,
     default_timeout: Duration,
+    audit: Arc<dyn AuditSink>,
 }
 
 impl WebhookDispatcher {
@@ -175,11 +177,20 @@ impl WebhookDispatcher {
         Self {
             registry,
             default_timeout: DEFAULT_HANDLER_TIMEOUT,
+            audit: Arc::new(NoopAuditSink),
         }
     }
 
     pub fn with_default_timeout(mut self, d: Duration) -> Self {
         self.default_timeout = d;
+        self
+    }
+
+    /// Attach an audit sink (TASK-268 §5.5). Every dispatched outcome —
+    /// executed, filtered, or failed — is written to the sink so handler
+    /// activity is durably auditable. Defaults to a no-op sink.
+    pub fn with_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
+        self.audit = sink;
         self
     }
 
@@ -249,6 +260,18 @@ impl WebhookDispatcher {
                     duration_ms = o.duration_ms, "handler ok");
             }
         }
+
+        // TASK-268 §5.5 — persist an auditable record of every outcome
+        // (executed, filtered, or failed). A sink write must never break
+        // dispatch, so failures are logged and swallowed.
+        for o in &outcomes {
+            let rec = AuditRecord::from_outcome(&webhook.id, &webhook.tenant_id, o);
+            if let Err(e) = self.audit.record(&rec).await {
+                tracing::warn!(error = %e, plugin_id = %o.plugin_id,
+                    "audit sink write failed");
+            }
+        }
+
         outcomes
     }
 }
