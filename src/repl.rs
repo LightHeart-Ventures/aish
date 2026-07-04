@@ -1250,9 +1250,9 @@ fn recent_message_row(baseline: String, flash: Option<String>) -> String {
 /// Build the coordinator status line shown in the footer's middle row (row H-1)
 /// — the "2nd statusline".
 ///
-/// - When attached to a coordinator it mirrors the Shift-Tab attach
-///   announcement — `⇄ attached to <id> (i/n · Shift-Tab to cycle, :detach to
-///   stop)` — with a review-mode variant for a coordinator that has finished.
+/// - When attached to a LIVE coordinator it shows the compact `⇄ attached to
+///   <id>` (plus a task hint); a coordinator that has FINISHED gets the
+///   review-mode variant `⇄ attached to <id> (finished) (i/n · review mode: …)`.
 /// - When NOT attached but coordinators exist to cycle into, it shows the
 ///   detached hint `⇄ detached — back to interactive (Shift-Tab to cycle into a
 ///   coordinator)` so the 2nd statusline reflects the interactive state instead
@@ -1386,9 +1386,10 @@ fn coordinator_status_line(
                             "⇄ attached to {short} (finished) ({idx}/{n} · review mode: type to resume, Shift-Tab to cycle, :detach to stop)"
                         )
                     } else {
-                        format!(
-                            "⇄ attached to {short} ({idx}/{n} · Shift-Tab to cycle, :detach to stop)"
-                        )
+                        // Live worker: keep the statusline compact — just the id
+                        // (the "(i/n · Shift-Tab to cycle, :detach to stop)" hint
+                        // was intentionally dropped).
+                        format!("⇄ attached to {short}")
                     };
                     // Append a compact hint of the task this worker is on, so the
                     // 2nd statusline says WHAT you're attached to, not just which id.
@@ -8842,13 +8843,16 @@ mod tests {
     }
 
     #[test]
-    fn status_line_attached_is_yellow_and_indexed() {
+    fn status_line_attached_is_yellow_and_compact() {
         let ws = workers(&[("w_a", false), ("w_b", false)]);
         let s = coordinator_status_line(Some("w_a"), &ws, true);
         assert!(s.starts_with("\x1b[33m"));
         assert!(s.ends_with("\x1b[0m"));
         assert!(s.contains("attached to"));
-        assert!(s.contains("(1/2 · Shift-Tab to cycle, :detach to stop)"));
+        // The "(i/n · Shift-Tab to cycle, :detach to stop)" hint was dropped from
+        // the live-attached statusline.
+        assert!(!s.contains("Shift-Tab to cycle"), "unexpected status line: {s}");
+        assert!(!s.contains(":detach to stop"), "unexpected status line: {s}");
     }
 
     #[test]
@@ -8856,17 +8860,19 @@ mod tests {
         let ws = workers_with_task(&[("w_a", false, "fix the release workflow")]);
         let s = coordinator_status_line(Some("w_a"), &ws, false);
         assert!(
-            s.contains("(1/1 · Shift-Tab to cycle, :detach to stop) - fix the release workflow"),
+            s.contains("attached to w_a - fix the release workflow"),
             "unexpected status line: {s}"
         );
+        assert!(!s.contains("Shift-Tab to cycle"), "unexpected status line: {s}");
     }
 
     #[test]
     fn status_line_attached_no_task_has_no_suffix() {
         let ws = workers(&[("w_a", false)]);
         let s = coordinator_status_line(Some("w_a"), &ws, false);
-        assert!(s.ends_with("(1/1 · Shift-Tab to cycle, :detach to stop)"));
+        assert!(s.ends_with("attached to w_a"));
         assert!(!s.contains(" - "));
+        assert!(!s.contains("Shift-Tab to cycle"));
     }
 
     #[test]
