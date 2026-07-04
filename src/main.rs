@@ -4,6 +4,7 @@ mod backend;
 mod batch;
 mod container;
 mod context;
+mod control;
 mod coordinator;
 mod coordinator_store;
 mod db;
