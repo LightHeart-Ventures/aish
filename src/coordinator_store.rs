@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 pub struct CoordinatorRow {
     pub run_id: String,
     pub task: String,
-    /// 'coordinating' | 'awaiting_batch' | 'done' | 'failed'.
+    /// 'coordinating' | 'awaiting_batch' | 'checkpoint' | 'done' | 'failed'.
     pub phase: String,
     pub result: Option<String>,
     /// Failure reason when phase='failed'. Persisted for rehydrate/diagnostics;
@@ -58,7 +58,7 @@ pub struct CoordinatorRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunResult {
     pub run_id: String,
-    /// 'coordinating' | 'awaiting_batch' | 'done' | 'failed'.
+    /// 'coordinating' | 'awaiting_batch' | 'checkpoint' | 'done' | 'failed'.
     pub phase: String,
     pub result: Option<String>,
     pub error: Option<String>,
@@ -103,7 +103,7 @@ impl CoordinatorStore {
                  run_id       TEXT PRIMARY KEY,
                  task         TEXT NOT NULL,
                  phase        TEXT NOT NULL CHECK (phase IN
-                              ('coordinating', 'awaiting_batch', 'done', 'failed')),
+                              ('coordinating', 'awaiting_batch', 'checkpoint', 'done', 'failed')),
                  result       TEXT,
                  error        TEXT,
                  session_id   TEXT,
@@ -115,7 +115,13 @@ impl CoordinatorStore {
                  -- live coordinator takes ONE final graceful wrap-up turn at its
                  -- next round boundary and then terminates (see
                  -- `coordinator::drive`). 0 = run normally, 1 = stand down.
-                 stand_down   INTEGER NOT NULL DEFAULT 0
+                 stand_down   INTEGER NOT NULL DEFAULT 0,
+                 -- Checkpoint control flag (the `:checkpoint` channel, TASK-294 —
+                 -- a resumable-PAUSE sibling of `:stop`). When a parent raises it,
+                 -- the live coordinator halts at its next round boundary WITHOUT
+                 -- finishing, persists phase='checkpoint', and returns; the run can
+                 -- be resumed manually later. 0 = run normally, 1 = pause.
+                 checkpoint   INTEGER NOT NULL DEFAULT 0
              );
              -- Operator → coordinator mailbox (the :tell / SendMessage channel).
              -- A row is a clarification/instruction queued for an in-flight run;
@@ -178,6 +184,64 @@ impl CoordinatorStore {
                 &format!("ALTER TABLE coordinator_runs ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"),
                 [],
             );
+        }
+        // TASK-294: widen the phase CHECK constraint to admit the resumable
+        // 'checkpoint' phase and add its `checkpoint` control-flag column. SQLite
+        // can't ALTER a CHECK, so a table predating the checkpoint phase is
+        // rebuilt: copy every row into a new table whose CHECK includes
+        // 'checkpoint' and which carries the flag column (default 0). Detect the
+        // old shape by the ABSENCE of the quoted 'checkpoint' literal in the
+        // stored CREATE SQL. Idempotent — once migrated (or freshly created with
+        // the widened schema) the literal is present and this is a no-op.
+        let needs_checkpoint_migration = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='coordinator_runs'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|sql| !sql.contains("'checkpoint'"))
+            .unwrap_or(false);
+        if needs_checkpoint_migration {
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE coordinator_runs_new (
+                     run_id       TEXT PRIMARY KEY,
+                     task         TEXT NOT NULL,
+                     phase        TEXT NOT NULL CHECK (phase IN
+                                  ('coordinating', 'awaiting_batch', 'checkpoint', 'done', 'failed')),
+                     result       TEXT,
+                     error        TEXT,
+                     session_id   TEXT,
+                     session_name TEXT,
+                     created_at   TEXT NOT NULL DEFAULT current_timestamp,
+                     heartbeat_at TEXT NOT NULL DEFAULT current_timestamp,
+                     stand_down   INTEGER NOT NULL DEFAULT 0,
+                     checkpoint   INTEGER NOT NULL DEFAULT 0,
+                     container_id   TEXT,
+                     container_name TEXT,
+                     runtime        TEXT,
+                     tokens_in    INTEGER NOT NULL DEFAULT 0,
+                     tokens_out   INTEGER NOT NULL DEFAULT 0,
+                     turns        INTEGER NOT NULL DEFAULT 0,
+                     tool_calls   INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO coordinator_runs_new
+                     (run_id, task, phase, result, error, session_id, session_name,
+                      created_at, heartbeat_at, stand_down,
+                      container_id, container_name, runtime,
+                      tokens_in, tokens_out, turns, tool_calls)
+                 SELECT
+                     run_id, task, phase, result, error, session_id, session_name,
+                     created_at, heartbeat_at, stand_down,
+                     container_id, container_name, runtime,
+                     tokens_in, tokens_out, turns, tool_calls
+                 FROM coordinator_runs;
+                 DROP TABLE coordinator_runs;
+                 ALTER TABLE coordinator_runs_new RENAME TO coordinator_runs;
+                 COMMIT;",
+            )
+            .context("coordinator_runs checkpoint-phase migration failed")?;
         }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -423,6 +487,47 @@ impl CoordinatorStore {
             .unwrap()
             .query_row(
                 "SELECT stand_down FROM coordinator_runs WHERE run_id = ?1",
+                [run_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|v| v != 0))
+    }
+
+    /// Raise the CHECKPOINT flag on a run — the write side of the `:checkpoint`
+    /// channel (TASK-294), a resumable-PAUSE sibling of `:stop`. Where a
+    /// stand-down orders the coordinator to take a final wrap-up turn and
+    /// TERMINATE, a checkpoint asks it to HALT at its next round boundary WITHOUT
+    /// finishing: `coordinator::drive` persists phase='checkpoint' and returns,
+    /// leaving the transcript/worktree intact so the run can be resumed manually
+    /// later. Durable (survives a restart, applies cross-session) and idempotent
+    /// — re-raising, or raising on a finished run, is a harmless no-op. Bumps the
+    /// heartbeat since touching the row proves the parent is alive.
+    ///
+    /// `#[allow(dead_code)]`: this is the write side of the future `:checkpoint`
+    /// REPL command; it's exercised today by the store round-trip test and read
+    /// by `coordinator::drive` via [`Self::checkpoint_requested`].
+    #[allow(dead_code)]
+    pub fn request_checkpoint(&self, run_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE coordinator_runs SET checkpoint = 1, heartbeat_at = current_timestamp \
+             WHERE run_id = ?1",
+            [run_id],
+        )?;
+        Ok(())
+    }
+
+    /// Peek the checkpoint flag for a run (no clear). The coordinator checks this
+    /// at every round boundary; once set the run pauses at `checkpoint` and
+    /// exits, so there's nothing to clear here (a resume clears it explicitly).
+    /// Returns `false` when the row is absent or the flag was never raised.
+    pub fn checkpoint_requested(&self, run_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT checkpoint FROM coordinator_runs WHERE run_id = ?1",
                 [run_id],
                 |r| r.get::<_, i64>(0),
             )
@@ -709,6 +814,38 @@ mod tests {
         // delete_runs trims a retained failed row explicitly (the reaper's primitive).
         assert_eq!(reopened.delete_runs(&["run_1".to_string()]).unwrap(), 1);
         assert!(reopened.load_all().unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn checkpoint_flag_and_phase_persist_across_reopen() {
+        // TASK-294: the checkpoint control flag round-trips, and the CHECK
+        // constraint admits phase='checkpoint' which survives a store reopen as a
+        // resumable (non-terminal) pause.
+        let path = std::env::temp_dir().join(format!("aish_coordckpt_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+
+        store
+            .insert("run_c", "long build", "sess-c", Some("gamma"))
+            .unwrap();
+        // Flag defaults to unset, is raised by request_checkpoint, and reads back.
+        assert!(!store.checkpoint_requested("run_c").unwrap());
+        store.request_checkpoint("run_c").unwrap();
+        assert!(store.checkpoint_requested("run_c").unwrap());
+        // An absent run reads back false (no row), never errors.
+        assert!(!store.checkpoint_requested("missing").unwrap());
+
+        // The coordinator halts by persisting phase='checkpoint' — the widened
+        // CHECK must accept it.
+        store.set_phase("run_c", "checkpoint").unwrap();
+
+        // A fresh store over the same file sees the paused, resumable run.
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        let rows = reopened.load_all().unwrap();
+        let c = rows.iter().find(|r| r.run_id == "run_c").unwrap();
+        assert_eq!(c.phase, "checkpoint");
+        assert!(reopened.checkpoint_requested("run_c").unwrap());
         let _ = std::fs::remove_file(&path);
     }
 
