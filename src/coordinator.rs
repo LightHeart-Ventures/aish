@@ -510,6 +510,19 @@ pub async fn drive(
         // session.session_id/name were adopted from the LAUNCHING session at
         // startup (see main.rs), so the row attributes to who asked for the work.
         let _ = s.insert(run_id, &input, &session.session_id, session.name.as_deref());
+        // TASK-289: record this live coordinator PROCESS in the durable registry
+        // so a parent-death restart can reap our pid (and, once TASK-291 lands,
+        // resume an in-flight Batches job). `coord_id` == `run_id`; generation 0
+        // on first start; no batch job yet (the resume path stamps it later);
+        // phase mirrors the freshly-inserted `coordinating` row.
+        let _ = s.register_run(
+            run_id,
+            0,
+            std::process::id() as i64,
+            None,
+            "coordinating",
+            Some(&session.session_id),
+        );
     }
 
     // ── Pre-dispatch circuit breaker (loop guard, per the loop-exhaustion
@@ -768,8 +781,6 @@ final status plus your best partial result. After this turn you are terminated."
             // Checkpoint is non-terminal, but `persist_terminal`/`finish_run` is
             // just a phase+metrics UPDATE — passing `Phase::Checkpoint` with no
             // result/error snapshots effort at the pause without a torn write.
-            // (Replaces the former `set_phase` + deleted `record_run_metrics`
-            // pair that TASK-285's refactor left dangling on the checkpoint path.)
             persist_terminal(store, run_id, Phase::Checkpoint, None, None, session);
             finalize_worker_store(run_id, "checkpoint", None);
             return Outcome {
@@ -1086,11 +1097,84 @@ pub fn rehydrate(session: &mut Session) {
         .map(|rows| rows.into_iter().map(|r| r.run_id).collect())
         .unwrap_or_default();
     let salvaged = salvage_orphaned_worktrees(&session.cwd, &store, &known_after, digest);
-    if digest && (surfaced > 0 || reaped > 0 || salvaged > 0 || reaped_failed > 0) {
+    // TASK-289: scan the durable coordinator registry — mark rows whose owning
+    // process is dead as `orphaned` (parent-death recovery) and log any that
+    // carried an in-flight batch job as resurrectable (full resume is TASK-291).
+    let (regs_reaped, regs_resurrectable) = scan_coordinator_registry(&store, digest);
+    if digest
+        && (surfaced > 0
+            || reaped > 0
+            || salvaged > 0
+            || reaped_failed > 0
+            || regs_reaped > 0
+            || regs_resurrectable > 0)
+    {
         eprintln!(
-            "\x1b[2maish: reattached coordinator runs ({surfaced} delivered, {reaped} reaped, {salvaged} salvaged, {reaped_failed} failed-pruned)\x1b[0m"
+            "\x1b[2maish: reattached coordinator runs ({surfaced} delivered, {reaped} reaped, {salvaged} salvaged, {reaped_failed} failed-pruned, {regs_reaped} registry-orphaned, {regs_resurrectable} resurrectable)\x1b[0m"
         );
     }
+}
+
+/// TASK-289 startup scan of the durable `coordinator_registry`: for every row
+/// still considered live, check whether its OS `pid` is alive. A dead pid means
+/// the owning coordinator process died without cleanly deregistering — mark the
+/// row `orphaned` (parent-death recovery). When such an orphan carried an
+/// in-flight `batch_job_id` it is RESURRECTABLE (its Batches job keeps running
+/// platform-side), so log it for the future resume path (TASK-291/SPR-059) —
+/// this scan does NOT itself resume anything. A row whose pid is still alive is
+/// left untouched. Returns `(reaped, resurrectable)` counts. Best-effort: a
+/// store error yields `(0, 0)` and never sinks startup.
+fn scan_coordinator_registry(store: &CoordinatorStore, digest: bool) -> (usize, usize) {
+    let rows = match store.get_live_runs() {
+        Ok(r) => r,
+        Err(e) => {
+            if digest {
+                eprintln!("\x1b[2maish: couldn't scan coordinator registry: {e:#}\x1b[0m");
+            }
+            return (0, 0);
+        }
+    };
+    let mut reaped = 0usize;
+    let mut resurrectable = 0usize;
+    for row in rows {
+        if pid_is_alive(row.pid) {
+            continue; // owner still running — not an orphan
+        }
+        if store.mark_orphaned(&row.coord_id).is_ok() {
+            reaped += 1;
+            if row.batch_job_id.is_some() {
+                resurrectable += 1;
+                if digest {
+                    eprintln!(
+                        "\x1b[2maish: coordinator {} orphaned (pid {} gone) — resurrectable via batch {} (resume: TASK-291)\x1b[0m",
+                        crate::batch::short_id(&row.coord_id),
+                        row.pid,
+                        row.batch_job_id.as_deref().unwrap_or("?"),
+                    );
+                }
+            }
+        }
+    }
+    (reaped, resurrectable)
+}
+
+/// True when process `pid` is alive (signal-0 probe). `kill(pid, 0)` sends no
+/// signal but performs the existence + permission check: `Ok`/`EPERM` ⇒ the
+/// process exists, `ESRCH` ⇒ it does not. A non-positive pid is never a live
+/// process. Used by the TASK-289 registry scan to reap dead coordinators.
+fn pid_is_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: kill with signal 0 is the documented liveness probe; it never
+    // delivers a signal, only reports existence/permission via errno.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    // rc == -1: alive only when the failure is EPERM (exists, not permitted),
+    // dead on ESRCH (no such process).
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Pure salvage decision: a worktree that still holds work but has NO surviving

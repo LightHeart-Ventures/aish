@@ -100,6 +100,33 @@ impl RunResult {
     }
 }
 
+/// One row of the TASK-289 `coordinator_registry` — a live coordinator PROCESS,
+/// captured for parent-death recovery + Batches resume. Distinct from
+/// [`CoordinatorRow`] (the per-run phase/result view): a registry row is keyed
+/// by the coordinator's `coord_id` and records the OS `pid`, the `generation`
+/// (restart counter), the in-flight Anthropic `batch_job_id` (the resume
+/// handle), the coarse `phase`, and the launching `owner_session`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoordinatorRegistryRow {
+    pub coord_id: String,
+    /// Restart counter — bumped each time this coord_id is re-registered by a
+    /// resurrected process, so a stale row can be told from a fresh generation.
+    pub generation: i64,
+    /// OS process id of the coordinator. Scanned at startup: a pid that is no
+    /// longer alive marks the row `orphaned`.
+    pub pid: i64,
+    /// In-flight Anthropic Batches job id, when the coordinator is awaiting one.
+    /// Its presence is what makes an orphaned row RESURRECTABLE (TASK-291).
+    pub batch_job_id: Option<String>,
+    /// Coarse lifecycle phase mirror (e.g. `coordinating`, `awaiting_batch`,
+    /// `orphaned`). Set to `orphaned` by the startup reaper.
+    pub phase: String,
+    pub started_at: Option<String>,
+    /// Launching interactive session (uuid) — used to attribute a row and to
+    /// tell "our" runs from another session's at startup.
+    pub owner_session: Option<String>,
+}
+
 /// Durable store for background coordinator runs — the resumable equivalent of
 /// `BatchStore`, ported from atum_cli's batch-controller store. Kept in its own
 /// connection (the coordinator drives turns + batch waits off the main thread)
@@ -167,7 +194,27 @@ impl CoordinatorStore {
                  created_at TEXT NOT NULL DEFAULT current_timestamp
              );
              CREATE INDEX IF NOT EXISTS idx_run_aliases_run
-                 ON run_aliases (run_id);",
+                 ON run_aliases (run_id);
+             -- TASK-289: durable coordinator registry for parent-death recovery
+             -- + Batches resume. One row per live coordinator PROCESS (distinct
+             -- from `coordinator_runs`, which is the per-run phase/result view):
+             -- captures the OS pid, the generation (restart counter), the
+             -- in-flight Anthropic batch job id (the resume handle), the coarse
+             -- phase, and the owning interactive session. On REPL startup the
+             -- registry is scanned: rows whose `pid` is no longer alive are
+             -- marked `orphaned`, and any that carried a `batch_job_id` are
+             -- logged as resurrectable (full resurrection is TASK-291/SPR-059).
+             CREATE TABLE IF NOT EXISTS coordinator_registry (
+                 coord_id      TEXT PRIMARY KEY,
+                 generation    INTEGER NOT NULL DEFAULT 0,
+                 pid           INTEGER NOT NULL,
+                 batch_job_id  TEXT,
+                 phase         TEXT NOT NULL,
+                 started_at    TEXT NOT NULL DEFAULT current_timestamp,
+                 owner_session TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_coord_registry_session
+                 ON coordinator_registry (owner_session);",
         )
         .context("coordinator_runs schema init failed")?;
         // Back-compat: add session_name to a table created before it existed.
@@ -713,6 +760,69 @@ impl CoordinatorStore {
         );
         Ok(deleted)
     }
+
+    /// TASK-289: register (or re-register) a live coordinator PROCESS in the
+    /// `coordinator_registry`. Keyed by `coord_id`; a re-register from a
+    /// resurrected process upserts the pid/batch/phase and bumps `generation`
+    /// so a stale row can be told from a fresh generation.
+    pub fn register_run(
+        &self,
+        coord_id: &str,
+        generation: i64,
+        pid: i64,
+        batch_job_id: Option<&str>,
+        phase: &str,
+        owner_session: Option<&str>,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO coordinator_registry
+                 (coord_id, generation, pid, batch_job_id, phase, owner_session)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(coord_id) DO UPDATE SET
+                 generation    = excluded.generation,
+                 pid           = excluded.pid,
+                 batch_job_id  = excluded.batch_job_id,
+                 phase         = excluded.phase,
+                 owner_session = excluded.owner_session",
+            (coord_id, generation, pid, batch_job_id, phase, owner_session),
+        )?;
+        Ok(())
+    }
+
+    /// TASK-289: all registry rows NOT yet marked `orphaned` — the candidate set
+    /// the startup reaper scans for dead pids. Ordered by `started_at`.
+    pub fn get_live_runs(&self) -> Result<Vec<CoordinatorRegistryRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT coord_id, generation, pid, batch_job_id, phase, started_at, owner_session
+             FROM coordinator_registry
+             WHERE phase != 'orphaned'
+             ORDER BY started_at",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CoordinatorRegistryRow {
+                coord_id: r.get(0)?,
+                generation: r.get(1)?,
+                pid: r.get(2)?,
+                batch_job_id: r.get(3)?,
+                phase: r.get(4)?,
+                started_at: r.get(5)?,
+                owner_session: r.get(6)?,
+            })
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// TASK-289: flip a registry row to the `orphaned` phase — called by the
+    /// startup reaper for a `coord_id` whose `pid` is no longer alive. Rows that
+    /// carried a `batch_job_id` stay resurrectable (TASK-291/SPR-059).
+    pub fn mark_orphaned(&self, coord_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE coordinator_registry SET phase = 'orphaned' WHERE coord_id = ?1",
+            [coord_id],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1020,6 +1130,63 @@ mod tests {
         assert_eq!(store.failed_attempts("unrelated").unwrap(), 0);
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    // TASK-289: coordinator_registry round-trip + register/get/mark ops.
+    #[test]
+    fn registry_round_trip_and_orphan_flip() {
+        let path = std::env::temp_dir().join(format!("aish_coordreg_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+
+        // Empty registry → no live runs.
+        assert!(store.get_live_runs().unwrap().is_empty());
+
+        // Register two runs; one carries an in-flight batch job (resurrectable).
+        store
+            .register_run("c1", 0, 4242, None, "coordinating", Some("sess-a"))
+            .unwrap();
+        store
+            .register_run("c2", 0, 4243, Some("batch_zzz"), "awaiting_batch", Some("sess-a"))
+            .unwrap();
+
+        let live = store.get_live_runs().unwrap();
+        assert_eq!(live.len(), 2);
+        let c2 = live.iter().find(|r| r.coord_id == "c2").unwrap();
+        assert_eq!(c2.generation, 0);
+        assert_eq!(c2.pid, 4243);
+        assert_eq!(c2.batch_job_id.as_deref(), Some("batch_zzz"));
+        assert_eq!(c2.phase, "awaiting_batch");
+        assert_eq!(c2.owner_session.as_deref(), Some("sess-a"));
+        assert!(c2.started_at.is_some());
+
+        // Re-register c1 (resurrected process): upsert bumps generation + pid,
+        // does NOT create a duplicate row.
+        store
+            .register_run("c1", 1, 5555, Some("batch_new"), "awaiting_batch", Some("sess-b"))
+            .unwrap();
+        let live = store.get_live_runs().unwrap();
+        assert_eq!(live.len(), 2, "re-register must upsert, not duplicate");
+        let c1 = live.iter().find(|r| r.coord_id == "c1").unwrap();
+        assert_eq!(c1.generation, 1);
+        assert_eq!(c1.pid, 5555);
+        assert_eq!(c1.batch_job_id.as_deref(), Some("batch_new"));
+        assert_eq!(c1.owner_session.as_deref(), Some("sess-b"));
+
+        // Mark c2 orphaned → dropped from the live set, c1 remains.
+        store.mark_orphaned("c2").unwrap();
+        let live = store.get_live_runs().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].coord_id, "c1");
+
+        // Survives a restart (persisted columns, not in-memory state).
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        let live = reopened.get_live_runs().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].coord_id, "c1");
+        assert_eq!(live[0].generation, 1);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     // ── TASK-285: transactional turn-state writes ───────────────────────────
