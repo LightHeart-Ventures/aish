@@ -605,11 +605,12 @@ pub async fn run(
                 }
             }
         }
-        // Colour the ⟳N badge by the most recent background-worker event
-        // (green ✓ tool success, red ✗ tool failure, magenta ⟳ turn
-        // completion), fading back to dim ⟳N after worker::PULSE_FADE.
-        let pulse = crate::worker::fresh_pulse(&session.worker_jobs);
-        let badge = crate::worker::pulse_badge(running, pulse);
+        // Colour the worker badge by the *state* of the workers: white ⟳N while
+        // any are live (received input / thinking / mid-turn), then once the live
+        // count hits 0 briefly flash the last terminal verdict — green ✓ done,
+        // red ✗ completed-but-failed — fading out after worker::PULSE_FADE.
+        let terminal = crate::worker::fresh_terminal(&session.worker_jobs);
+        let badge = crate::worker::pulse_badge(running, terminal);
         // The session name (`:rename`) is no longer shown in the prompt — it's
         // right-justified on the 2nd statusline instead (see
         // `coordinator_status_message`).
