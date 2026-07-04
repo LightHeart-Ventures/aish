@@ -5966,6 +5966,55 @@ fn pretty_json(v: &serde_json::Value) -> String {
 /// stats (which tools fail most, with what error class, and whether retries
 /// recover), or wipe the telemetry table. Feeds the "is this error worth
 /// retrying vs. escalating?" repair heuristic (see crate::tool_telemetry).
+/// TASK-325 — `:tokens` token-spend dashboard. Aggregates input/output tokens,
+/// the input:output ratio, and the top token-spending runs across every
+/// persisted coordinator run (the durable metrics stamped by TASK-285).
+fn handle_tokens(session: &Session) {
+    let Some(store) = &session.coordinator_store else {
+        println!("token store unavailable");
+        return;
+    };
+    let summary = match store.cost_summary() {
+        Ok(s) => s,
+        Err(e) => {
+            println!("tokens query failed: {e:#}");
+            return;
+        }
+    };
+    if summary.runs == 0 {
+        println!("no coordinator runs recorded yet");
+        return;
+    }
+    println!("token spend across {} run(s):", summary.runs);
+    println!("  input   {:>12}", summary.tokens_in);
+    println!("  output  {:>12}", summary.tokens_out);
+    println!("  total   {:>12}", summary.total_tokens());
+    println!("  in:out  {:>12.2}", summary.ratio());
+    println!(
+        "  turns   {:>12}   tool-calls {}",
+        summary.turns, summary.tool_calls
+    );
+    if let Ok(top) = store.top_expensive_runs(5) {
+        let top: Vec<_> = top
+            .into_iter()
+            .filter(|r| r.tokens_in + r.tokens_out > 0)
+            .collect();
+        if !top.is_empty() {
+            println!("\ntop runs by token spend:");
+            for r in top {
+                let task: String = r.task.chars().take(48).collect();
+                println!(
+                    "  {:>12}  {:>10}  {}",
+                    r.run_id,
+                    r.tokens_in + r.tokens_out,
+                    task
+                );
+            }
+        }
+    }
+}
+
+
 fn handle_telemetry(sub: Option<&str>, session: &mut Session) {
     if session.db.is_none() {
         println!("telemetry store unavailable");
@@ -6264,6 +6313,7 @@ async fn handle_colon(
                  :compact                            offload older history to long-term memory now\n\
                  :memories [organize]                list stored memories, or dedup them\n\
                  :telemetry [clear]                  tool-call failure/retry-recovery stats (or wipe them)\n\
+                 :tokens                             per-run/aggregate token spend, in:out ratio, top spenders\n\
                  :version                            show aish version + backend (also `aish --version`)\n\
                  :update [prod|dev|ci]               check GitHub for a newer release and upgrade;\n\
                                                      optional channel is a one-off override of AISH_UPDATE_CHANNEL\n\
@@ -7299,6 +7349,7 @@ async fn handle_colon(
         Some("hooks") => handle_hooks(parts.next(), session),
         Some("plugin" | "plugins") => handle_plugin(parts.collect()),
         Some("telemetry" | "tool-stats") => handle_telemetry(parts.next(), session),
+        Some("tokens" | "token-spend") => handle_tokens(session),
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
     }
