@@ -25,6 +25,13 @@ yes please thanks                                    -> model   [looks_like_pros
 test -f file                                         -> direct  [auto]
 test the connection right now                        -> model   [looks_like_prose]
 
+## intent-phrase guard — a common 2-word intent whose lead word is a real binary routes to the model (open pr = open a pull request)
+open pr                                              -> model   [intent-phrase guard]
+Open PR                                              -> model   [intent-phrase guard]
+open pr now                                          -> model   [intent-phrase guard]
+open file.txt                                        -> direct  [auto]
+open the door slowly                                 -> model   [looks_like_prose]
+
 ## !/? force routing — explicit escape hatches override every other heuristic
 !who is zachary hohertz                              -> direct  [! force]
 !ls -la                                              -> direct  [! force]

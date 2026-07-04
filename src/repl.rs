@@ -1967,6 +1967,7 @@ fn route_preview(
     if !aliased
         && (looks_like_prose(l, &words)
             || is_stray_confirmation(&words)
+            || is_intent_phrase(&words)
             || looks_like_command_arg_intent(&words, cwd, path))
     {
         return Preview::Model;
@@ -2535,6 +2536,32 @@ fn is_stray_confirmation(words: &[String]) -> bool {
     matches!(words, [w] if matches!(w.to_ascii_lowercase().as_str(), "y" | "yes" | "n" | "no"))
 }
 
+/// Multi-word phrases that are always *intent*, never a literal invocation —
+/// even though the lead word resolves to a real binary and the line is too
+/// short for `looks_like_prose` (which only fires at >= 3 words). `open pr` is
+/// the canonical case: `open` is a real program, so the bare 2-word "open pr"
+/// would otherwise dispatch `/usr/bin/open` with a `pr` argument. Users type
+/// "open pr" to mean "open a pull request" — a phrase common enough that it
+/// should reach the agent. Matched case-insensitively against the *leading*
+/// tokens, so "open pr", "Open PR", and "open pr now" all route to the model,
+/// while a flag/path-bearing `open` invocation is unaffected (nothing here
+/// matches it). Surface-form stopgap; superseded by model route preview (S5/S6:
+/// TASK-132/137), which understands the line instead of matching its lead words.
+const INTENT_PHRASES: &[&[&str]] = &[&["open", "pr"]];
+
+/// True when `words` begins with one of the [`INTENT_PHRASES`]. Case-insensitive
+/// on the phrase tokens; a forced `!` line bypasses this upstream, and an alias
+/// on the lead word wins over it (same precedence as the other route guards).
+fn is_intent_phrase(words: &[String]) -> bool {
+    INTENT_PHRASES.iter().any(|phrase| {
+        words.len() >= phrase.len()
+            && words
+                .iter()
+                .zip(phrase.iter())
+                .all(|(w, p)| w.eq_ignore_ascii_case(p))
+    })
+}
+
 /// Variable resolver for direct-dispatch `$VAR` expansion. Resolution order:
 /// session `export`s first (so a user override wins), then the TASK-13
 /// last-output bindings `$LAST` / `$_` (the most recent recorded output,
@@ -2641,6 +2668,7 @@ async fn dispatch(
         && !aliases.contains_key(first)
         && (looks_like_prose(line, &words)
             || is_stray_confirmation(&words)
+            || is_intent_phrase(&words)
             || looks_like_command_arg_intent(&words, &session.cwd, &session_path(session)))
     {
         return Dispatch::NotACommand;
@@ -8272,6 +8300,26 @@ mod tests {
     }
 
     #[test]
+    fn intent_phrase_detection() {
+        let intent = |l: &str| is_intent_phrase(&rc::tokenize(l).unwrap());
+        // "open pr" is intent regardless of case or trailing tokens: `open` is a
+        // real binary and the bare 2-word form is too short for looks_like_prose,
+        // so without this guard it would dispatch /usr/bin/open with a `pr` arg.
+        assert!(intent("open pr"));
+        assert!(intent("Open PR")); // case-insensitive on the phrase tokens
+        assert!(intent("OPEN Pr"));
+        assert!(intent("open pr now")); // leading tokens match; trailing ignored
+        assert!(intent("open pr for the release"));
+        // Real `open` invocations and unrelated lines are untouched: the guard
+        // only fires when the second token is exactly `pr`.
+        assert!(!intent("open file.txt"));
+        assert!(!intent("open project readme"));
+        assert!(!intent("open")); // lone lead word — not the phrase
+        assert!(!intent("pr 22 merged")); // `pr`-led, not `open`-led
+        assert!(!intent("prepare release")); // must be the whole token `pr`
+    }
+
+    #[test]
     fn command_arg_intent_detection() {
         use std::os::unix::fs::PermissionsExt;
         let tok = |s: &str| rc::tokenize(s).unwrap();
@@ -9557,6 +9605,8 @@ mod tests {
                 Some(words) => {
                     if is_stray_confirmation(&words) {
                         "model   [bare-yes guard]"
+                    } else if is_intent_phrase(&words) {
+                        "model   [intent-phrase guard]"
                     } else if looks_like_prose(&rest, &words) {
                         "model   [looks_like_prose]"
                     } else {
@@ -9600,6 +9650,16 @@ mod tests {
                     "yes please thanks",
                     "test -f file",
                     "test the connection right now",
+                ],
+            ),
+            (
+                "intent-phrase guard — a common 2-word intent whose lead word is a real binary routes to the model (open pr = open a pull request)",
+                &[
+                    "open pr",
+                    "Open PR",
+                    "open pr now",
+                    "open file.txt",
+                    "open the door slowly",
                 ],
             ),
             (
