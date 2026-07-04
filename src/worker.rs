@@ -2607,6 +2607,20 @@ impl WorkerJob {
             (None, None) => None,
         }
     }
+    /// This worker's TERMINAL outcome, if it has reached one: `Some((true, when))`
+    /// when it finished successfully (`done`), `Some((false, when))` when it
+    /// completed but failed (`failed`), `None` while it is still running. `when`
+    /// is the finish timestamp, used to pick the most-recent verdict for the
+    /// prompt badge's completion flash.
+    fn terminal_outcome(&self) -> Option<(bool, SystemTime)> {
+        let i = self.inner.lock().unwrap();
+        match (i.status.as_str(), i.finished) {
+            ("done", Some(t)) => Some((true, t)),
+            ("failed", Some(t)) => Some((false, t)),
+            _ => None,
+        }
+    }
+
     fn set_failed(&self, err: String) {
         let mut i = self.inner.lock().unwrap();
         i.status = "failed".into();
@@ -3424,24 +3438,49 @@ pub fn fresh_pulse(jobs: &WorkerJobs) -> Option<Pulse> {
         .map(|(p, _)| p)
 }
 
-/// Build the prompt's `⟳N` background-jobs badge, coloured by the most recent
-/// background-worker event:
-///   * green `✓N`   — a tool call just succeeded,
-///   * red `✗N`     — a tool call just failed,
-///   * magenta `⟳N` — the model just emitted a turn/narration line,
-///   * dim `⟳N`     — idle (no recent event, or the pulse has faded).
-/// `running` is the TOTAL live background-job count (workers + batches); the
-/// badge is empty when nothing is running. `pulse` is [`fresh_pulse`]'s verdict.
+/// The most-recently-finished worker's terminal verdict, if that finish is still
+/// "fresh" (within [`PULSE_FADE`] of now): `Some(true)` = completed successfully
+/// (done → green ✓), `Some(false)` = completed but failed (red ✗), `None` when no
+/// worker has finished recently. Only consulted for the prompt badge once the
+/// live count drops to 0, so the badge flashes the last outcome and then clears.
+pub fn fresh_terminal(jobs: &WorkerJobs) -> Option<bool> {
+    let now = SystemTime::now();
+    jobs.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|j| j.terminal_outcome())
+        .filter(|(_, when)| {
+            now.duration_since(*when)
+                .map(|d| d < PULSE_FADE)
+                .unwrap_or(false)
+        })
+        .max_by_key(|&(_, when)| when)
+        .map(|(ok, _)| ok)
+}
+
+/// Build the prompt's background-jobs badge, coloured by the *state* of the
+/// worker(s) rather than by transient per-tool events:
+///   * white `⟳N`  — one or more workers are RUNNING (received input,
+///                    thinking, mid-turn, a tool in flight — all "busy"),
+///   * green `✓`    — no worker is live and the most-recently-finished worker
+///                    completed successfully (done),
+///   * red   `✗`    — no worker is live and the most-recently-finished worker
+///                    completed but FAILED.
+/// `running` is the TOTAL live background-job count (workers + batches). While
+/// anything is live the badge is white ⟳N; once the live count hits 0 it briefly
+/// flashes the last terminal outcome ([`fresh_terminal`]) and is otherwise empty.
 /// Pure, so the colour/glyph mapping is unit-testable.
-pub fn pulse_badge(running: usize, pulse: Option<Pulse>) -> String {
-    if running == 0 {
-        return String::new();
+pub fn pulse_badge(running: usize, terminal: Option<bool>) -> String {
+    // A live worker is "running" in the broad sense — thinking, mid-turn, or
+    // driving a tool. All of those states read as white.
+    if running > 0 {
+        return format!("\x1b[37m⟳{running}\x1b[0m "); // white — running
     }
-    match pulse {
-        Some(Pulse::ToolOk) => format!("\x1b[32m✓{running}\x1b[0m "), // green tick
-        Some(Pulse::ToolErr) => format!("\x1b[31m✗{running}\x1b[0m "), // red cross
-        Some(Pulse::Turn) => format!("\x1b[1;35m⟳{running}\x1b[0m "), // bright magenta
-        None => format!("\x1b[2m⟳{running}\x1b[0m "),                 // idle dim
+    // Nothing live: flash the most-recent terminal verdict.
+    match terminal {
+        Some(true) => "\x1b[32m✓\x1b[0m ".to_string(),  // green — done
+        Some(false) => "\x1b[31m✗\x1b[0m ".to_string(), // red — completed but failed
+        None => String::new(),
     }
 }
 
@@ -4404,14 +4443,14 @@ mod tests {
         let reader = lines.as_bytes();
         let attached = Arc::new(Mutex::new(None));
         let _tail = stream_stderr(reader, "worker_1", show, attached, Some(job.clone())).await;
-        // Most recent event was the tool FAILURE -> red cross pulse.
+        // Most recent event was the tool FAILURE -> red cross pulse (per-tool
+        // pulse tracking still records it for other consumers).
         assert_eq!(job.latest_pulse().map(|(p, _)| p), Some(Pulse::ToolErr));
-        // And it is fresh, so the aggregate badge is the red-cross variant.
+        // But the prompt badge is state-based now: the worker is still RUNNING
+        // (not terminal), so the badge is white ⟳1 regardless of the last tool.
         let jobs: WorkerJobs = Arc::new(Mutex::new(vec![job]));
-        assert_eq!(
-            pulse_badge(1, fresh_pulse(&jobs)),
-            "\x1b[31m\u{2717}1\x1b[0m "
-        );
+        assert_eq!(fresh_terminal(&jobs), None);
+        assert_eq!(pulse_badge(1, fresh_terminal(&jobs)), "\x1b[37m⟳1\x1b[0m ");
     }
 
     #[test]
@@ -4569,17 +4608,18 @@ mod tests {
     }
 
     #[test]
-    fn pulse_badge_colours_by_event_and_count() {
-        // Nothing running → empty badge regardless of pulse.
-        assert_eq!(pulse_badge(0, Some(Pulse::ToolOk)), "");
-        // Idle (no recent event) → dim ⟳N.
-        assert_eq!(pulse_badge(2, None), "\x1b[2m⟳2\x1b[0m ");
-        // Tool success → green ✓N.
-        assert_eq!(pulse_badge(1, Some(Pulse::ToolOk)), "\x1b[32m✓1\x1b[0m ");
-        // Tool failure → red ✗N.
-        assert_eq!(pulse_badge(1, Some(Pulse::ToolErr)), "\x1b[31m✗1\x1b[0m ");
-        // Turn completion → bright magenta ⟳N.
-        assert_eq!(pulse_badge(3, Some(Pulse::Turn)), "\x1b[1;35m⟳3\x1b[0m ");
+    fn pulse_badge_colours_by_worker_state() {
+        // Any worker live → white ⟳N (running: got input, thinking, mid-turn),
+        // regardless of the pending terminal verdict.
+        assert_eq!(pulse_badge(1, None), "\x1b[37m⟳1\x1b[0m ");
+        assert_eq!(pulse_badge(2, Some(true)), "\x1b[37m⟳2\x1b[0m ");
+        assert_eq!(pulse_badge(3, Some(false)), "\x1b[37m⟳3\x1b[0m ");
+        // Nothing live + last worker finished OK → green ✓ (done).
+        assert_eq!(pulse_badge(0, Some(true)), "\x1b[32m✓\x1b[0m ");
+        // Nothing live + last worker FAILED → red ✗.
+        assert_eq!(pulse_badge(0, Some(false)), "\x1b[31m✗\x1b[0m ");
+        // Nothing live, no fresh terminal → empty badge.
+        assert_eq!(pulse_badge(0, None), "");
     }
 
     #[test]
