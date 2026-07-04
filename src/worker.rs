@@ -161,6 +161,106 @@ fn has_tool_glyph(line: &str) -> bool {
     line.contains('🔧') || line.contains('🛠') || line.contains('🤝')
 }
 
+/// A coordinator-stderr line, lexed ONCE into a typed activity event. This is
+/// the single source of truth for parsing a coordinator's stderr (TASK-296):
+/// the prompt-badge pulse driver, the `:worker-output` forward stream, and the
+/// always-surfaced `message_console` channel all read from ONE `ActivityEvent`
+/// (via [`lex_activity`] in `stream_stderr`) rather than each re-scanning the
+/// raw line for glyphs. The named consumers below (`classify_event`,
+/// `forward_decision`, `console_message`, `is_thinking_notice`) are thin shims
+/// that derive from the SAME lexer, so no line is parsed twice.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum ActivityEvent {
+    /// `📣` `message_console` note — ALWAYS surfaced (bypasses the gate). Text is
+    /// the cleaned note after the sentinel (never empty).
+    Console(String),
+    /// `💭` model-reasoning notice. Text is the cleaned notice (never empty).
+    Thinking(String),
+    /// A `✓/✗ <glyph>` tool RESULT line. `ok` is the outcome; `text` is the
+    /// cleaned line to forward (`None` when it cleans to empty — the pulse still
+    /// fires from `ok`).
+    ToolResult { ok: bool, text: Option<String> },
+    /// A bare `<glyph> <desc>` tool START line — no outcome yet. Drives no pulse
+    /// and is dropped from the forward stream (forwarding it too was the
+    /// duplicate tool-call log).
+    ToolStart,
+    /// `🗨` turn narration. `text` is the cleaned narration (`None` when empty —
+    /// the turn pulse still fires, matching the legacy `classify_event`).
+    Turn { text: Option<String> },
+    /// `📦` batch fan-out notice. Text is the cleaned notice (never empty).
+    Batch(String),
+    /// Anything else — a banner, a blank line, unrecognized prose. No event.
+    Noise,
+}
+
+/// The ONE coordinator-stderr lexer (TASK-296). Classify a raw line into a typed
+/// [`ActivityEvent`]. Pure, so it's unit-testable without a pipe. Match order
+/// mirrors the legacy consumers exactly: `📣` console first (it was matched
+/// before everything else in `stream_stderr`), then tool-glyph lines (via the
+/// shared [`clean_activity_line`] sub-parser, as in the old `classify_event` /
+/// `clean_activity_line`), then the `💭` / `🗨` / `📦` sentinels.
+fn lex_activity(raw: &str) -> ActivityEvent {
+    // 📣 console note — always-surfaced, so it wins over every other shape.
+    if let Some(note) = strip_sentinel(raw, "📣") {
+        return ActivityEvent::Console(note);
+    }
+    // Tool lines carry a source glyph (🔧 MCP · 🛠️ local · 🤝 escalate). A ✓/✗
+    // alongside it is a RESULT (outcome); a bare glyph is the START line.
+    if has_tool_glyph(raw) {
+        if raw.contains('✓') {
+            return ActivityEvent::ToolResult { ok: true, text: clean_activity_line(raw) };
+        }
+        if raw.contains('✗') {
+            return ActivityEvent::ToolResult { ok: false, text: clean_activity_line(raw) };
+        }
+        return ActivityEvent::ToolStart;
+    }
+    if let Some(text) = strip_sentinel(raw, "💭") {
+        return ActivityEvent::Thinking(text);
+    }
+    // 🗨 turn narration: the pulse fires on the sentinel even with empty text
+    // (legacy `classify_event` semantics), so carry `text` as an Option.
+    if raw.trim_start().starts_with('🗨') {
+        return ActivityEvent::Turn { text: strip_sentinel(raw, "🗨") };
+    }
+    if let Some(text) = strip_sentinel(raw, "📦") {
+        return ActivityEvent::Batch(text);
+    }
+    ActivityEvent::Noise
+}
+
+impl ActivityEvent {
+    /// Map to a prompt-badge pulse (the quiet liveness cue), or `None`. A tool
+    /// RESULT pulses green/red by outcome; a turn pulses magenta. START / console
+    /// / thinking / batch / noise drive no pulse. Mirrors the legacy
+    /// `classify_event`.
+    fn pulse(&self) -> Option<Pulse> {
+        match self {
+            ActivityEvent::ToolResult { ok: true, .. } => Some(Pulse::ToolOk),
+            ActivityEvent::ToolResult { ok: false, .. } => Some(Pulse::ToolErr),
+            ActivityEvent::Turn { .. } => Some(Pulse::Turn),
+            _ => None,
+        }
+    }
+
+    /// The cleaned text to forward to the `:worker-output` pane (computed as if
+    /// the gate were open), or `None` to drop. A tool RESULT forwards VERBATIM
+    /// (its single source glyph is already stamped); 💭/🗨/📦 get their
+    /// alignment-padded glyph prefix. START / console / noise / empty-text turns
+    /// forward nothing. Mirrors the legacy `forward_decision` (the `show_output`
+    /// gate is applied by the caller / wrapper).
+    fn forward_text(&self) -> Option<String> {
+        match self {
+            ActivityEvent::ToolResult { text, .. } => text.clone(),
+            ActivityEvent::Thinking(t) => Some(format!("{NARRATION_ALIGN_PAD}💭 {t}")),
+            ActivityEvent::Turn { text: Some(t) } => Some(format!("{NARRATION_ALIGN_PAD}🚀 {t}")),
+            ActivityEvent::Batch(t) => Some(format!("{NARRATION_ALIGN_PAD}🐌 {t}")),
+            _ => None,
+        }
+    }
+}
+
+
 /// Classify ONE raw coordinator-stderr line into a prompt-badge pulse event, or
 /// `None` when it carries no event. Pure, so it's unit-testable without a pipe.
 ///
@@ -169,20 +269,9 @@ fn has_tool_glyph(line: &str) -> bool {
 /// the wrench is a success, a `✗` a failure. A bare `🔧 <desc>` START line (no
 /// status glyph) is the tool *beginning*, not an outcome → `None`. A `🗨` line is
 /// turn narration (`engine::emit_narration`) → a turn-completion pulse.
+#[cfg_attr(not(test), allow(dead_code))] // shim over `lex_activity`; the hot path in `stream_stderr` reads `event.pulse()` directly.
 fn classify_event(line: &str) -> Option<Pulse> {
-    if has_tool_glyph(line) {
-        if line.contains('✓') {
-            return Some(Pulse::ToolOk);
-        }
-        if line.contains('✗') {
-            return Some(Pulse::ToolErr);
-        }
-        return None; // a bare start line — no outcome yet
-    }
-    if line.trim_start().starts_with('🗨') {
-        return Some(Pulse::Turn);
-    }
-    None
+    lex_activity(line).pulse()
 }
 
 /// How many of the child's most-recent stderr lines we retain for the failure
@@ -241,8 +330,12 @@ fn strip_sentinel(raw: &str, mark: &str) -> Option<String> {
 /// bypasses the `:worker-output` suppression gate — so the stream loop matches it
 /// FIRST, before the normal forward/suppress logic. Returns the cleaned note text
 /// after the sentinel, or `None`. Pure → unit-testable without a pipe.
+#[cfg_attr(not(test), allow(dead_code))] // shim over `lex_activity`; `stream_stderr` reads the `Console` event directly.
 fn console_message(raw: &str) -> Option<String> {
-    strip_sentinel(raw, "📣")
+    match lex_activity(raw) {
+        ActivityEvent::Console(note) => Some(note),
+        _ => None,
+    }
 }
 
 /// Decide what (if anything) to forward to the user's terminal for ONE raw
@@ -261,38 +354,14 @@ fn console_message(raw: &str) -> Option<String> {
 /// - tool activity (the `✓/✗ <glyph>` RESULT line, once per call) → `[label] ✓ <glyph> …`
 /// - `🗨` turn text (a standard model call) → `[label]   🚀 …` (glyph aligned under the tool glyph)
 /// - `📦` batch fan-out notice → `[label]   🐌 …` (glyph aligned under the tool glyph)
+#[cfg_attr(not(test), allow(dead_code))] // shim over `lex_activity`; `stream_stderr` reads `event.forward_text()` directly.
 fn forward_decision(line: &str, show_output: bool) -> Option<String> {
     if !show_output {
         // Default: keep background coordinators quiet. The job's liveness is
         // shown by the ⟳N prompt pulse + completion notice, not this stream.
         return None;
     }
-    if let Some(activity) = clean_activity_line(line) {
-        // The coordinator already stamped the single source glyph between the
-        // status icon and the desc (🔧 MCP · 🛠️ local · 🤝 escalate), so the
-        // RESULT line is forwarded VERBATIM — no extra decoration, so a line
-        // never carries two source glyphs.
-        return Some(activity);
-    }
-    if let Some(text) = strip_sentinel(line, "💭") {
-        // Thinking notice: the 💭 glyph rides AFTER the worker-id gutter, padded
-        // by NARRATION_ALIGN_PAD so it lines up under the tool glyph / 🚀 rocket
-        // (the shared "rocket alignment" column) → `[label]   💭 …`.
-        return Some(format!("{NARRATION_ALIGN_PAD}💭 {text}"));
-    }
-    if let Some(text) = strip_sentinel(line, "🗨") {
-        // Turn narration: the 🚀 rocket rides AFTER the worker-id gutter, as a
-        // prefix to the text. The 2-col NARRATION_ALIGN_PAD stands in for the
-        // `✓ ` status mark on a tool RESULT line so the rocket lines up under
-        // the tool glyph → `[label]   🚀 …`.
-        return Some(format!("{NARRATION_ALIGN_PAD}🚀 {text}"));
-    }
-    if let Some(text) = strip_sentinel(line, "📦") {
-        // Batch fan-out: the 🐌 marker prefixes the text, padded by
-        // NARRATION_ALIGN_PAD so it aligns under the tool glyph → `[label]   🐌 …`.
-        return Some(format!("{NARRATION_ALIGN_PAD}🐌 {text}"));
-    }
-    None
+    lex_activity(line).forward_text()
 }
 
 // ---------------------------------------------------------------------------
@@ -873,8 +942,9 @@ fn stderr_is_tty() -> bool {
 /// (`💭 thinking…`, emitted once per round by `engine::emit_thinking`). The
 /// parent renders this as an ANIMATED thinking row in the `:output` pane —
 /// matching the interactive `Spinner` — instead of a static row. Pure.
+#[cfg_attr(not(test), allow(dead_code))] // shim over `lex_activity`; `stream_stderr` matches the `Thinking` event directly.
 fn is_thinking_notice(raw: &str) -> bool {
-    strip_sentinel(raw, "💭").is_some()
+    matches!(lex_activity(raw), ActivityEvent::Thinking(_))
 }
 
 /// A transient, animated "thinking…" row for ONE worker in the `:output` pane —
@@ -1129,7 +1199,12 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
         // so the note lands on a clean line, print it with its distinct console
         // framing, retain it in the failure tail, and move on — it is never
         // routed through `forward_decision` (which would drop it when output is off).
-        if let Some(note) = console_message(&line) {
+        // Lex the raw line ONCE into a typed ActivityEvent (TASK-296). The
+        // always-surfaced console channel, the prompt-badge pulse, and the
+        // `:worker-output` forward stream all read from THIS single event below
+        // — the line is never parsed twice.
+        let event = lex_activity(&line);
+        if let ActivityEvent::Console(note) = &event {
             if let Some(spin) = thinking.take() {
                 spin.stop();
             }
@@ -1140,7 +1215,7 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
             // single trailing newline (ending the note's own line), so the extra
             // leading `\n` gives the blank line ABOVE and the extra trailing `\n`
             // gives the blank line BELOW.
-            crate::tools::announce_raw(&format!("\n{}\n", console_row(label, &note)));
+            crate::tools::announce_raw(&format!("\n{}\n", console_row(label, note)));
             if tail.len() == STDERR_TAIL_LINES {
                 tail.pop_front();
             }
@@ -1150,18 +1225,18 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
         // Drive the prompt-badge pulse from EVERY line (independent of the
         // `:worker-output` forwarding gate) so the badge colour-pulses even when
         // the verbose stream is suppressed — the badge is the quiet liveness cue.
-        let event = classify_event(&line);
         // TASK-293: re-publish every classified Pulse on the process-wide
         // broadcast so external observers (monitors, dashboards, the `:metrics`
         // command) can react without re-parsing stderr. Fire regardless of
         // whether THIS worker drives a prompt badge, and independent of the
         // `:worker-output` gate — publish is lossy + non-blocking, so it never
-        // back-pressures this hot stderr-drain loop.
-        if let Some(p) = event {
+        // back-pressures this hot stderr-drain loop. Reads from the SAME
+        // `event` lexed once above (TASK-296) — no re-parse of the raw line.
+        if let Some(p) = event.pulse() {
             crate::pulse::publish(p);
         }
         if let Some(job) = &pulse {
-            match event {
+            match event.pulse() {
                 Some(Pulse::ToolOk) => job.record_tool_outcome(true),
                 Some(Pulse::ToolErr) => job.record_tool_outcome(false),
                 Some(Pulse::Turn) => job.record_turn_completion(),
@@ -1176,7 +1251,7 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
         // was off the whole time. The single source glyph is already stamped
         // into `text` (engine::tool_glyph / the 🚀/🐌 narration prefix), so the
         // transcript suffix is empty and the pane gutter is just `[label]`.
-        if let Some(text) = forward_decision(&line, true) {
+        if let Some(text) = event.forward_text() {
             // Record into the shared transcript ring (the single WRITE pointer),
             // then drain the LIVE cursor over that SAME ring for what to print
             // below. Draining every line (regardless of the gate) keeps the
@@ -1214,7 +1289,7 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                 if let Some(job) = &pulse {
                     job.stop_backfill_thinking();
                 }
-                if is_thinking_notice(&line) {
+                if matches!(event, ActivityEvent::Thinking(_)) {
                     // Model-reasoning phase: replace any prior thinking row, then
                     // animate THIS one in place (transient) until the worker's
                     // next forwarded line lands — matching the interactive
@@ -3775,6 +3850,28 @@ mod tests {
         assert!(!is_thinking_notice("\x1b[2m  ✓ 🔧 read /etc/hosts\x1b[0m"));
         assert!(!is_thinking_notice("💭")); // bare sentinel, no text -> not a notice
         assert!(!is_thinking_notice(""));
+    }
+
+    #[test]
+    fn console_message_extracts_only_the_console_sentinel() {
+        // The 📣 note is the always-surfaced channel — the shim derives it from
+        // the same lexer, returning the cleaned text after the sentinel.
+        assert_eq!(
+            console_message("📣 build is taking a while"),
+            Some("build is taking a while".to_string())
+        );
+        assert_eq!(
+            console_message("  📣 heads-up"), // leading indent tolerated
+            Some("heads-up".to_string())
+        );
+        // Every non-console shape (thinking, narration, batch, tool RESULT,
+        // noise, bare sentinel) yields None.
+        assert_eq!(console_message("💭 thinking…"), None);
+        assert_eq!(console_message("🗨 planning the migration"), None);
+        assert_eq!(console_message("📦 fanned 3 sub-task(s) out"), None);
+        assert_eq!(console_message("\x1b[2m  ✓ 🔧 read /etc/hosts\x1b[0m"), None);
+        assert_eq!(console_message("📣"), None); // bare sentinel, no text
+        assert_eq!(console_message(""), None);
     }
 
     #[test]
