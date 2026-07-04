@@ -2960,6 +2960,10 @@ fn build_container_command(
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| c::default_network(rt, std::env::consts::OS).to_string()),
         workdir: "/aish/work".to_string(),
+        // Nested-capable OCI runtime (Sysbox) when configured + registered with
+        // dockerd — lets this container's inner aish spawn grandchild containers
+        // with correct path semantics. `None` keeps the stock runc/crun path.
+        runtime_override: c::resolve_runtime_override(rt),
     };
 
     let mut cmd = Command::new(rt.bin());
