@@ -1,0 +1,5 @@
+# agent-tty smoke artifacts are generated at run time — keep the dir, drop the output.
+aish_repl_smoke.cast
+aish_repl_smoke.png
+*.cast
+*.png

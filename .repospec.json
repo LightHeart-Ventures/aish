@@ -1,7 +1,7 @@
 {
   "schema": "repospec/v1",
   "name": "aish",
-  "version": "0.28.1",
+  "version": "0.29.5",
   "description": "An AI-native Linux shell that routes commands and intent to Claude or local LLMs",
   "repository": "https://github.com/LightHeart-Ventures/aish",
   "license": "Apache-2.0",
@@ -466,6 +466,8 @@
     "unit": "Inline `#[test]` and `#[tokio::test]` in source files; run with `cargo test --lib`",
     "integration": "tests/ directory; routes, dispatch routing, oracle tests (bash compatibility checks)",
     "fixtures": "tests/golden/ (golden snapshot files); test data embedded in test functions",
+    "pty": "tests/pty_harness.rs exercises kernel job-control invariants at the syscall level",
+    "repl_smoke": "tests/repl/agent_tty_smoke.sh drives the real alt-screen TUI REPL through coder/agent-tty (npx agent-tty@0.5.0) and asserts on rendered terminal state (boot banner, :help, clean :quit); hermetic (built-ins only, no model/API key). Run via `make test-repl`; CI: .github/workflows/repl-smoke.yml (Node >=24). See tests/repl/README.md",
     "run": "cargo test --all (unit + integration + doc tests); CARGO_BUILD_JOBS=4 for low-memory machines"
   },
   "infrastructure": [

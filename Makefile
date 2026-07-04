@@ -32,7 +32,7 @@ else
 LOCKED      = $(FLOCK) $(BUILD_LOCK)
 endif
 
-.PHONY: all build build-fast test test-local install sign uninstall clean register-shell worker-image worker-image-multiarch
+.PHONY: all build build-fast test test-local test-repl install sign uninstall clean register-shell worker-image worker-image-multiarch
 
 all: build
 
@@ -59,6 +59,18 @@ test:
 # Opt back in to the mistralrs-backed local-inference path for tests.
 test-local:
 	$(LOCKED) $(CARGO) test --features local $(CARGO_TEST_ARGS)
+
+# End-to-end REPL smoke: drive the real aish TUI through coder/agent-tty and
+# assert on rendered terminal state (boot banner, :help, clean :quit). Hermetic
+# (built-ins only — no model call / API key). Auto-detects the binary; builds a
+# fast Claude-only release first if none is present. Needs Node >=24 + jq; SKIPs
+# cleanly when a prerequisite is absent (set AISH_REPL_STRICT=1 to hard-fail).
+# See tests/repl/README.md.
+test-repl:
+	@if [ ! -x "$(RELEASE)" ] && [ -z "$(AISH_BIN)" ] && ! command -v aish >/dev/null 2>&1; then \
+		$(MAKE) --no-print-directory build-fast ; \
+	fi
+	tests/repl/agent_tty_smoke.sh
 
 # Build, copy onto PATH, then re-sign (macOS). Depends on `build` so the
 # binary is always current.
