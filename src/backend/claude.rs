@@ -294,8 +294,8 @@ impl ClaudeBackend {
         tools: &[ToolDef],
         stream: bool,
     ) -> Value {
-        let messages = render_messages(history);
-        let tool_defs: Vec<Value> = tools
+        let mut messages = render_messages(history);
+        let mut tool_defs: Vec<Value> = tools
             .iter()
             .map(|t| {
                 json!({
@@ -305,6 +305,27 @@ impl ClaudeBackend {
                 })
             })
             .collect();
+
+        // Prompt caching (TASK-320). A top-level `cache_control` is NOT a valid
+        // Messages-API field — the breakpoint must ride on individual content
+        // blocks, and the API caches the whole prompt prefix ending at each one.
+        // We place THREE ephemeral breakpoints (well within the 4-breakpoint cap)
+        // at the largest stable boundaries, in prompt order (tools → system →
+        // messages):
+        //   1. the last tool schema  → caches the entire tools block,
+        //   2. the last system block → caches tools + system,
+        //   3. the last content block of the final message → a rolling breakpoint
+        //      that caches the whole conversation prefix.
+        // Breakpoints 1 & 2 are byte-identical every turn, so after the first
+        // request they're pure cache_reads. Breakpoint 3 rolls forward each turn:
+        // the delta since last turn is cache_creation, everything before it is a
+        // cache_read — the standard incremental-caching pattern that keeps the
+        // hit rate near 100% across a multi-turn coordinator session.
+        if let Some(last) = tool_defs.last_mut() {
+            last["cache_control"] = cache_breakpoint();
+        }
+        let system = cache_system(self.cred.system_value(system));
+        cache_last_message(&mut messages);
 
         let mut body = json!({
             "model": self.model,
@@ -316,12 +337,9 @@ impl ClaudeBackend {
             // OAuth (subscription) credentials require the Claude Code identity
             // as the first system block; API keys take the prompt as a plain
             // string. See Credential::system_value.
-            "system": self.cred.system_value(system),
+            "system": system,
             "tools": tool_defs,
             "messages": messages,
-            // Auto-cache the growing conversation prefix — a shell session is
-            // exactly the multi-turn shape prompt caching is for.
-            "cache_control": {"type": "ephemeral"},
         });
         if stream {
             body["stream"] = json!(true);
@@ -890,6 +908,53 @@ fn wants_thinking(model: &str, history: &[Msg]) -> bool {
 /// IO) so the truncation handling is unit-testable. Splits content into text +
 /// tool calls, preserves `raw` for adaptive-thinking history, and applies the
 /// max_tokens truncation policy (see below).
+/// An ephemeral prompt-cache breakpoint marker. Attached to a content block, it
+/// tells the Messages API to cache the whole prompt prefix ending at that block.
+fn cache_breakpoint() -> Value {
+    json!({"type": "ephemeral"})
+}
+
+/// Attach a cache breakpoint to the last block of a `system` value, normalizing
+/// a bare-string system (the API-key shape from [`Credential::system_value`])
+/// into single-text-block form so the breakpoint has a block to ride on. Array
+/// systems (the OAuth shape) get the breakpoint on their final block.
+fn cache_system(system: Value) -> Value {
+    match system {
+        Value::String(s) => {
+            json!([{ "type": "text", "text": s, "cache_control": cache_breakpoint() }])
+        }
+        Value::Array(mut blocks) => {
+            if let Some(obj) = blocks.last_mut().and_then(Value::as_object_mut) {
+                obj.insert("cache_control".into(), cache_breakpoint());
+            }
+            Value::Array(blocks)
+        }
+        other => other,
+    }
+}
+
+/// Attach a rolling cache breakpoint to the last content block of the final
+/// message, caching the entire conversation prefix. Handles both the array and
+/// bare-string content shapes; a no-op on an empty message list.
+fn cache_last_message(messages: &mut [Value]) {
+    let Some(last) = messages.last_mut() else {
+        return;
+    };
+    match last.get_mut("content") {
+        Some(Value::Array(blocks)) => {
+            if let Some(obj) = blocks.last_mut().and_then(Value::as_object_mut) {
+                obj.insert("cache_control".into(), cache_breakpoint());
+            }
+        }
+        Some(Value::String(_)) => {
+            let s = last["content"].as_str().unwrap_or_default().to_string();
+            last["content"] =
+                json!([{ "type": "text", "text": s, "cache_control": cache_breakpoint() }]);
+        }
+        _ => {}
+    }
+}
+
 fn parse_response(v: &Value) -> Result<Turn> {
     let stop_reason = v["stop_reason"].as_str().unwrap_or("");
     let content = v["content"]
@@ -962,10 +1027,24 @@ same oversized call.]",
         let g = |k: &str| u.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
         // Sum the plain + cached input buckets so the figure reflects the FULL
         // prompt the model saw, not just the uncached remainder.
+        let uncached = g("input_tokens");
+        let cache_read = g("cache_read_input_tokens");
+        let cache_creation = g("cache_creation_input_tokens");
+        // Per-turn cache telemetry (TASK-320). hit rate = cached-read fraction of
+        // the total input prompt; a healthy multi-turn session trends toward the
+        // high 90s. Emitted dim so it sits quietly alongside the retry/status
+        // lines that already use eprintln + \x1b[2m.
+        let total_input = uncached + cache_read + cache_creation;
+        if total_input > 0 {
+            let hit_pct = (cache_read as f64 / total_input as f64) * 100.0;
+            eprintln!(
+                "\x1b[2m  cache: {cache_read} read + {cache_creation} write + {uncached} uncached \
+                 in ({hit_pct:.0}% hit) → {out} out\x1b[0m",
+                out = g("output_tokens"),
+            );
+        }
         crate::context::Usage {
-            input_tokens: g("input_tokens")
-                + g("cache_read_input_tokens")
-                + g("cache_creation_input_tokens"),
+            input_tokens: uncached + cache_read + cache_creation,
             output_tokens: g("output_tokens"),
         }
     });
@@ -1403,6 +1482,43 @@ mod tests {
         // A response with no usage block leaves it None.
         let bare = json!({"stop_reason": "end_turn", "content": [{"type":"text","text":"x"}]});
         assert!(parse_response(&bare).unwrap().usage.is_none());
+    }
+
+    #[test]
+    fn cache_breakpoints_land_on_blocks_not_top_level() {
+        // API-key (string) system is normalized into a single text block that
+        // carries the breakpoint.
+        let sys = cache_system(json!("you are aish"));
+        assert_eq!(sys[0]["type"], "text");
+        assert_eq!(sys[0]["text"], "you are aish");
+        assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
+
+        // OAuth (array) system gets the breakpoint on its LAST block only.
+        let sys = cache_system(json!([
+            {"type": "text", "text": "spoof"},
+            {"type": "text", "text": "real"},
+        ]));
+        assert!(sys[0].get("cache_control").is_none());
+        assert_eq!(sys[1]["cache_control"]["type"], "ephemeral");
+
+        // Last message's final content block gets the rolling breakpoint.
+        let mut msgs = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "a"}]}),
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "b"},
+                {"type": "tool_result", "tool_use_id": "t1", "content": "r"},
+            ]}),
+        ];
+        cache_last_message(&mut msgs);
+        assert!(msgs[0]["content"][0].get("cache_control").is_none());
+        assert!(msgs[1]["content"][0].get("cache_control").is_none());
+        assert_eq!(msgs[1]["content"][1]["cache_control"]["type"], "ephemeral");
+
+        // String-content message is normalized into a text block with the marker.
+        let mut msgs = vec![json!({"role": "user", "content": "hello"})];
+        cache_last_message(&mut msgs);
+        assert_eq!(msgs[0]["content"][0]["text"], "hello");
+        assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
     }
 
     // Credentials. Built directly (not via resolve) so the tests never depend on

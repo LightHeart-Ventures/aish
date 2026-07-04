@@ -223,6 +223,14 @@ async fn run_turn_inner(
     // only for this turn (dropped with the function) so nothing bleeds across.
     let mut repeat_guard = crate::loopguard::RepeatGuard::default();
 
+    // TASK-324 AC2: detect drip-fed single read turns (grep→read→grep→read…) and
+    // fold a one-shot "batch your independent reads" nudge into the NEXT round's
+    // prompt. `batch_guard` tallies consecutive lone-read turns; `pending_batch_nudge`
+    // carries the nudge forward exactly one round, then is dropped so the base
+    // prompt stays byte-stable for cache reuse.
+    let mut batch_guard = crate::loopguard::BatchGuard::default();
+    let mut pending_batch_nudge: Option<String> = None;
+
     for iteration in 1..=MAX_ITERATIONS {
         // ── Operator interrupt seam (Ctrl-C on an `:attach`ed worker). A
         // coordinator installs a SIGINT handler that latches an interrupt flag
@@ -267,12 +275,21 @@ async fn run_turn_inner(
         let force = matches!(phase, crate::loopguard::BudgetPhase::ForceSummarize);
         // The base prompt stays byte-stable (prompt-cache friendly); the budget
         // suffix is appended only while converging/forcing.
-        let effective_system = match phase {
-            crate::loopguard::BudgetPhase::Normal => system.clone(),
-            other => format!(
-                "{system}{}",
-                crate::loopguard::budget_suffix(other, MAX_ITERATIONS.saturating_sub(iteration))
-            ),
+        let effective_system = {
+            let budget = match phase {
+                crate::loopguard::BudgetPhase::Normal => String::new(),
+                other => crate::loopguard::budget_suffix(
+                    other,
+                    MAX_ITERATIONS.saturating_sub(iteration),
+                ),
+            };
+            // One-shot batch nudge from a prior round's drip-feed streak (AC2).
+            let nudge = pending_batch_nudge.take().unwrap_or_default();
+            if budget.is_empty() && nudge.is_empty() {
+                system.clone()
+            } else {
+                format!("{system}{nudge}{budget}")
+            }
         };
         // No tools on the forced-summarize step — the model literally cannot keep
         // looping, so a final (possibly partial) answer is guaranteed.
@@ -405,6 +422,20 @@ async fn run_turn_inner(
         // lines stay dim, so the rounds still read as structured.
         if !turn.text.trim().is_empty() {
             emit_narration(session, &turn.text);
+        }
+
+        // TASK-324 AC2: record this executing turn's tool-call shape. When the
+        // model has drip-fed a lone batchable read for `BATCH_NUDGE_STREAK` turns
+        // running, arm a one-shot nudge for the next round's prompt.
+        {
+            let names: Vec<&str> = turn.tool_calls.iter().map(|c| c.name.as_str()).collect();
+            if let Some(nudge) = batch_guard.record(&names) {
+                eprintln!(
+                    "\x1b[2m  ⚠ batch-guard: {} single-read turns in a row — nudging to batch independent reads\x1b[0m",
+                    crate::loopguard::BATCH_NUDGE_STREAK
+                );
+                pending_batch_nudge = Some(nudge);
+            }
         }
 
         let mut results: Vec<ToolResult> = Vec::with_capacity(turn.tool_calls.len());
