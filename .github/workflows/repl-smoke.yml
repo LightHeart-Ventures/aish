@@ -62,7 +62,7 @@ jobs:
       - name: Install agent-tty
         run: |
           npm install -g "agent-tty@${AGENT_TTY_VERSION}"
-          agent-tty --version
+          agent-tty version
 
       # jq ships on ubuntu-2404 runners; assert it rather than assume.
       - name: Verify jq
