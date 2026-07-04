@@ -194,6 +194,12 @@ pub struct Session {
     pub cwd: PathBuf,
     /// Normalized conversation history (backend-agnostic).
     pub history: Vec<Msg>,
+    /// Index into `history` marking where the operator last ran `clear` on the
+    /// interactive console. Interactive backfill (`:detach` / Shift-Tab back to
+    /// slot 0) replays only history AT OR AFTER this mark, so a `clear` the
+    /// operator performed stays cleared when they return to the prompt. Reset to
+    /// 0 whenever `history` is cleared (`:new`).
+    pub clear_mark: usize,
     /// How much the safety gate asks before acting (paranoid → yolo).
     pub mode: Mode,
     /// Optional session name, shown as a `[NAME] |` prefix on the prompt. Set
@@ -536,6 +542,7 @@ impl Session {
         Ok(Self {
             cwd,
             history: Vec::new(),
+            clear_mark: 0,
             mode: Mode::default(),
             name: None,
             session_id: uuid::Uuid::new_v4().to_string(),
@@ -666,6 +673,10 @@ impl Session {
     /// them here keeps the status line honest for the new conversation.
     pub fn reset_conversation(&mut self) {
         self.history.clear();
+        // History is gone, so the clear mark (an index into it) must reset too —
+        // otherwise a stale, out-of-range mark would suppress the fresh
+        // conversation's backfill.
+        self.clear_mark = 0;
         // Stop the prior conversation's final reply from bleeding back in via the
         // TASK-13 last-output seed: an empty history is exactly the condition
         // seed_context uses to re-inject $LAST. Consumed one-shot on next turn.
