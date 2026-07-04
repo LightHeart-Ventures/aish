@@ -465,7 +465,11 @@ async fn main() -> Result<()> {
     // Initialized once here, atop the state store, so hook sites can reach it
     // via `plugin_dispatcher::dispatcher()`. Non-fatal if the state store failed.
     if let Some(state) = plugin_state::global() {
-        plugin_dispatcher::init_global(&aish_dir.join("plugins"), state.clone());
+        plugin_dispatcher::init_global(
+            &aish_dir.join("plugins"),
+            state.clone(),
+            Some(session.flash.clone()),
+        );
     }
     let mcp_config = aish_dir.join(".mcp.json");
     if !mcp_config.exists() {

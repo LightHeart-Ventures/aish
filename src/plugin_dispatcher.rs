@@ -32,8 +32,16 @@ use crate::plugin_state::PluginStateStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// A handle to the SecondStatusLine's single most-recent-wins "flash" slot
+/// (`session.flash`). When a subscribed plugin's `webhook_command` prints a
+/// line, the dispatcher drops it here (capped at 60 chars) so the plugin's
+/// reaction to a received webhook surfaces live on the footer's 2nd statusline.
+/// `Option`al so the dispatcher stays usable (and unit-testable) without a live
+/// session — tests construct it with no sink.
+pub type FlashSink = Arc<Mutex<Option<String>>>;
 
 /// Lifecycle events a plugin can subscribe to. The wire name (`as_str`) is the
 /// stable identifier sent to webhooks and logged on the `plugin-events` channel.
@@ -103,6 +111,8 @@ pub struct PluginDispatcher {
     state: PluginStateStore,
     http: reqwest::Client,
     http_timeout: Duration,
+    /// Optional SecondStatusLine sink (see [`FlashSink`]). `None` in tests.
+    flash: Option<FlashSink>,
 }
 
 impl PluginDispatcher {
@@ -114,7 +124,15 @@ impl PluginDispatcher {
             state,
             http: reqwest::Client::new(),
             http_timeout: Duration::from_secs(10),
+            flash: None,
         }
+    }
+
+    /// Attach a SecondStatusLine [`FlashSink`] — the slot a subscribed plugin's
+    /// command output is surfaced to. Builder-style; consumes and returns self.
+    pub fn with_flash(mut self, flash: FlashSink) -> Self {
+        self.flash = Some(flash);
+        self
     }
 
     /// Scan every enabled plugin manifest and collect the ones subscribing to a
@@ -290,7 +308,38 @@ impl PluginDispatcher {
                 out.status.code()
             ));
         }
+        // Surface the plugin's reaction on the SecondStatusLine (≤60 chars,
+        // most-recent-wins). This is the "plugin received a webhook → show it on
+        // the 2nd statusline" path: the plugin decides the text, the engine caps
+        // and routes it.
+        if let Some(flash) = &self.flash {
+            if let Some(msg) = nline_message(&String::from_utf8_lossy(&out.stdout)) {
+                if let Ok(mut slot) = flash.lock() {
+                    *slot = Some(msg);
+                }
+            }
+        }
     }
+}
+
+/// Distill a webhook command's stdout into the one-line SecondStatusLine
+/// message: the first non-empty (trimmed) line, hard-capped at 60 display
+/// characters (`…` elision when longer). `None` when the command printed
+/// nothing surfaceable. Pure + char-aware (never splits a UTF-8 codepoint).
+pub fn nline_message(stdout: &str) -> Option<String> {
+    let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(cap_chars(line, 60))
+}
+
+/// Truncate `s` to at most `max` Unicode scalar values, appending `…` (counted
+/// within the budget) when elided. Operates on `char`s so a multibyte glyph is
+/// never cut mid-sequence.
+fn cap_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", head.trim_end())
 }
 
 /// Unix epoch seconds, saturating to 0 before the epoch (never panics).
@@ -319,11 +368,19 @@ static GLOBAL: OnceLock<PluginDispatcher> = OnceLock::new();
 /// Initialize (once) and return the global dispatcher. Idempotent: the first
 /// successful call wins; later calls return the existing dispatcher and ignore
 /// the arguments.
-pub fn init_global(plugins_dir: &Path, state: PluginStateStore) -> &'static PluginDispatcher {
+pub fn init_global(
+    plugins_dir: &Path,
+    state: PluginStateStore,
+    flash: Option<FlashSink>,
+) -> &'static PluginDispatcher {
     if let Some(existing) = GLOBAL.get() {
         return existing;
     }
-    let _ = GLOBAL.set(PluginDispatcher::new(plugins_dir.to_path_buf(), state));
+    let mut dispatcher = PluginDispatcher::new(plugins_dir.to_path_buf(), state);
+    if let Some(f) = flash {
+        dispatcher = dispatcher.with_flash(f);
+    }
+    let _ = GLOBAL.set(dispatcher);
     GLOBAL.get().expect("global set above")
 }
 
@@ -331,4 +388,51 @@ pub fn init_global(plugins_dir: &Path, state: PluginStateStore) -> &'static Plug
 /// this to route events without threading the dispatcher through every call.
 pub fn dispatcher() -> Option<&'static PluginDispatcher> {
     GLOBAL.get()
+}
+
+#[cfg(test)]
+mod flash_tests {
+    use super::nline_message;
+
+    #[test]
+    fn first_nonempty_line_is_used() {
+        // Leading blank/whitespace lines are skipped; the first real line wins,
+        // and trailing lines are ignored (single-slot, one-line footer).
+        assert_eq!(
+            nline_message("\n  \n👋 hello-world: webhook received\nsecond\n").as_deref(),
+            Some("👋 hello-world: webhook received"),
+        );
+    }
+
+    #[test]
+    fn empty_or_blank_stdout_is_none() {
+        assert_eq!(nline_message(""), None);
+        assert_eq!(nline_message("   \n\t\n"), None);
+    }
+
+    #[test]
+    fn caps_at_60_display_chars_with_ellipsis() {
+        let out = nline_message(&"x".repeat(200)).unwrap();
+        assert!(
+            out.chars().count() <= 60,
+            "must cap to 60 chars, got {}",
+            out.chars().count(),
+        );
+        assert!(out.ends_with('…'), "an over-long line must be elided: {out}");
+    }
+
+    #[test]
+    fn never_splits_a_multibyte_codepoint() {
+        // 100 four-byte emoji: the cap must land on a char boundary (String
+        // construction would panic otherwise) and stay within the 60-char budget.
+        let out = nline_message(&"🚀".repeat(100)).unwrap();
+        assert!(out.chars().count() <= 60);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn a_line_at_the_limit_is_kept_verbatim() {
+        let sixty = "y".repeat(60);
+        assert_eq!(nline_message(&sixty).as_deref(), Some(sixty.as_str()));
+    }
 }
