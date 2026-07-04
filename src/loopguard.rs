@@ -520,6 +520,77 @@ impl RoundExit {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Batch-nudge guard — encourage batching independent read-only calls
+// ---------------------------------------------------------------------------
+
+/// Consecutive turns that EACH issue exactly one batchable read-only tool call
+/// before the model is nudged to batch. Three lone-read turns in a row is the
+/// "drip-feeding reads" pattern TASK-324 targets (grep→read→grep→read…), where
+/// each extra round needlessly re-sends the whole context.
+pub const BATCH_NUDGE_STREAK: usize = 3;
+
+/// Whether a tool is a side-effect-free read whose INDEPENDENT calls should be
+/// batched into a single turn (front-loaded context-gathering). Only the pure
+/// inspection tools qualify; anything that mutates or runs a program
+/// (`run_program`, `edit_file`, `write_file`, …) is excluded because ordering
+/// and side effects can matter, so serial calls there aren't a batching failure.
+pub fn is_batchable_read(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "grep_files" | "list_dir" | "glob_expand" | "stat_file" | "diff_files"
+    )
+}
+
+/// Tracks consecutive single-read turns across one `run_turn` and decides when
+/// to fold a one-shot "batch your independent reads" nudge into the next round's
+/// prompt. Lives for the duration of one turn and is dropped with it, so the
+/// streak never bleeds across turns.
+#[derive(Default)]
+pub struct BatchGuard {
+    /// Consecutive turns that each issued exactly one batchable read.
+    streak: usize,
+    /// True once the current streak has already been nudged, so the model is
+    /// nudged AT MOST once per streak (no per-round nagging).
+    nudged: bool,
+}
+
+impl BatchGuard {
+    /// Record one executed turn's tool-call names and return the nudge string
+    /// the first time the drip-feed threshold is crossed this streak. A turn
+    /// that batches (≥2 calls) or does anything other than a lone batchable read
+    /// RESETS the streak and re-arms the nudge for a future streak.
+    pub fn record(&mut self, tool_names: &[&str]) -> Option<String> {
+        let lone_read = tool_names.len() == 1 && is_batchable_read(tool_names[0]);
+        if !lone_read {
+            self.streak = 0;
+            self.nudged = false;
+            return None;
+        }
+        self.streak += 1;
+        if self.streak >= BATCH_NUDGE_STREAK && !self.nudged {
+            self.nudged = true;
+            return Some(batch_nudge_suffix());
+        }
+        None
+    }
+}
+
+/// The one-shot system-prompt suffix that nudges the model to batch independent
+/// reads. Appended to the NEXT round's prompt only when [`BatchGuard::record`]
+/// trips, then dropped — so the base prompt stays byte-stable for cache reuse
+/// (same discipline as [`budget_suffix`]).
+pub fn batch_nudge_suffix() -> String {
+    String::from(
+        "\n\n[BATCH — you've issued several single-tool read turns in a row \
+(read_file/grep_files/list_dir/glob_expand/stat_file/diff_files). These independent reads should \
+go OUT TOGETHER: fire ALL the reads/greps/lists you already know you need in ONE turn, not one per \
+round. Every extra round re-sends the whole context, so front-load your inspection calls now. Only \
+serialize a call that genuinely DEPENDS on a previous call's output (e.g. grep to find a line, THEN \
+read that exact line).]",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,5 +876,79 @@ mod tests {
         assert_eq!(flagged.disposition, Disposition::FlagOperator);
         assert_eq!(flagged.recovery_count, max);
         assert!(flagged.directive().is_none());
+    }
+
+    // ── batch-nudge guard ─────────────────────────────────────────────────
+    #[test]
+    fn is_batchable_read_only_pure_inspection_tools() {
+        for name in [
+            "read_file",
+            "grep_files",
+            "list_dir",
+            "glob_expand",
+            "stat_file",
+            "diff_files",
+        ] {
+            assert!(is_batchable_read(name), "{name} should be batchable");
+        }
+        // Mutating / program-running tools are NOT batchable reads.
+        for name in [
+            "run_program",
+            "edit_file",
+            "write_file",
+            "rename_file",
+            "append_file",
+            "run_in_background",
+        ] {
+            assert!(!is_batchable_read(name), "{name} must not be batchable");
+        }
+    }
+
+    #[test]
+    fn batch_guard_nudges_after_three_lone_reads() {
+        let mut g = BatchGuard::default();
+        assert!(g.record(&["read_file"]).is_none(), "1st lone read: no nudge");
+        assert!(g.record(&["grep_files"]).is_none(), "2nd lone read: no nudge");
+        let nudge = g.record(&["list_dir"]).expect("3rd lone read trips nudge");
+        assert!(nudge.contains("[BATCH"));
+        // At most once per streak — the 4th lone read stays silent.
+        assert!(g.record(&["stat_file"]).is_none(), "no per-round nagging");
+    }
+
+    #[test]
+    fn batch_guard_batched_turn_resets_streak() {
+        let mut g = BatchGuard::default();
+        g.record(&["read_file"]);
+        g.record(&["read_file"]);
+        // A batched turn (≥2 calls) resets the streak and re-arms the nudge.
+        assert!(g.record(&["read_file", "grep_files"]).is_none());
+        assert!(g.record(&["read_file"]).is_none(), "streak restarted at 1");
+        assert!(g.record(&["read_file"]).is_none(), "streak at 2");
+        assert!(
+            g.record(&["read_file"]).is_some(),
+            "streak at 3 → nudge again after reset"
+        );
+    }
+
+    #[test]
+    fn batch_guard_non_read_turn_resets_streak() {
+        let mut g = BatchGuard::default();
+        g.record(&["read_file"]);
+        g.record(&["grep_files"]);
+        // A turn that runs a program is not a lone batchable read → reset.
+        assert!(g.record(&["run_program"]).is_none());
+        assert!(g.record(&["read_file"]).is_none(), "streak restarted");
+        assert!(g.record(&["read_file"]).is_none());
+        assert!(g.record(&["read_file"]).is_some(), "nudge after fresh streak");
+    }
+
+    #[test]
+    fn batch_guard_empty_turn_resets_streak() {
+        let mut g = BatchGuard::default();
+        g.record(&["read_file"]);
+        g.record(&["read_file"]);
+        // A no-tool turn breaks the streak.
+        assert!(g.record(&[]).is_none());
+        assert!(g.record(&["read_file"]).is_none(), "streak restarted at 1");
     }
 }
