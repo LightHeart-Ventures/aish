@@ -4,8 +4,19 @@ The broker is a single self-contained binary with an embedded SQLite engine. Its
 only runtime dependency is a writable path for the database file. This guide
 covers Docker, systemd, and AWS (EC2 / ECS / Lambda), plus TLS and hardening.
 
-> The Dockerfile, systemd unit, and task definitions below are **templates** —
-> they aren't shipped in the crate. Copy them into your deploy repo.
+> **Shipped deploy assets (PR #516).** Ready-to-use copies live in the crate — you
+> don't need to hand-write them:
+>
+> | Asset | Path |
+> |-------|------|
+> | Container image | `Dockerfile` (+ `.dockerignore`) |
+> | Compose stack | `deploy/docker-compose.yml` |
+> | systemd unit | `deploy/aish-webhook-broker.service` |
+> | Env template | `deploy/broker.env.example` |
+> | Deploy notes | `deploy/README.md` |
+>
+> The AWS ECS/EC2 task definitions further below remain **templates** — copy them
+> into your infra repo and fill in account/region/ARNs.
 
 ## Build
 
@@ -38,7 +49,16 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 ## Docker
 
-`Dockerfile`:
+The crate ships a working `Dockerfile`, `.dockerignore`, and
+`deploy/docker-compose.yml` — the listings below are annotated copies. Build
+straight from the crate root:
+
+```bash
+docker build -t aish-webhook-broker .          # uses the shipped Dockerfile
+docker compose -f deploy/docker-compose.yml up  # uses the shipped compose file
+```
+
+`Dockerfile` (shipped):
 
 ```dockerfile
 # ---- build ----
@@ -95,7 +115,15 @@ Health check: `GET /health` → `200`. Add to compose with
 
 ## systemd (self-hosted / bare EC2)
 
-`/etc/systemd/system/aish-webhook-broker.service`:
+Install the shipped unit (`deploy/aish-webhook-broker.service`) and env template
+(`deploy/broker.env.example`) rather than retyping them:
+
+```bash
+sudo install -m0644 deploy/aish-webhook-broker.service /etc/systemd/system/
+sudo install -m0640 deploy/broker.env.example /etc/aish-webhook-broker.env  # then edit
+```
+
+`deploy/aish-webhook-broker.service` (shipped):
 
 ```ini
 [Unit]

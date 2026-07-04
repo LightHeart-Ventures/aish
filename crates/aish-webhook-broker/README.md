@@ -10,7 +10,10 @@ One broker serves an entire organization: webhooks are keyed by
 
 - **Crate:** `aish-webhook-broker` (standalone workspace — no parent `aish` build graph)
 - **Binary:** `aish-webhook-broker` (~10 MB, statically-bundled SQLite)
-- **Ships in:** PR #515 / SPR-059 (Phase 4)
+- **Ships in:** SPR-059 — the broker (PR #515), deploy assets (#516,
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)), the GitHub reference plugin (#517,
+  [docs/PLUGINS.md](docs/PLUGINS.md)), and the `aish-webhook-client` consumer
+  (#518, [docs/CLIENT.md](docs/CLIENT.md))
 
 ## Documentation
 
@@ -18,7 +21,9 @@ One broker serves an entire organization: webhooks are keyed by
 |-----|----------|
 | [docs/API.md](docs/API.md) | Full endpoint spec, WebSocket protocol, signature verification, envelope shape |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Every CLI flag + env var, defaults, tuning guidance |
-| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Docker, systemd, AWS (EC2/ECS/Lambda), TLS, hardening |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Docker, systemd, AWS (EC2/ECS/Lambda), TLS, hardening; shipped `deploy/` assets (#516) |
+| [docs/CLIENT.md](docs/CLIENT.md) | `aish-webhook-client` (#518): `broker.json`, reconnect/backoff, WS protocol, handler dispatch |
+| [docs/PLUGINS.md](docs/PLUGINS.md) | Authoring webhook handlers; the GitHub reference plugin (#517) |
 
 ## Architecture
 
