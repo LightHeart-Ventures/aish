@@ -252,6 +252,47 @@ pub fn resource_flags(mem_mb: u64, cpus: Option<f64>, pids_limit: Option<u64>) -
     out
 }
 
+/// The configured Sysbox OCI runtime name (`AISH_SYSBOX_RUNTIME`), trimmed and
+/// non-empty, or `None` when unset. This is the single knob that opts a launch
+/// into the nested-capable runtime; unset keeps the stock runc/crun path. Pure.
+pub fn sysbox_runtime_from_env() -> Option<String> {
+    std::env::var("AISH_SYSBOX_RUNTIME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Is `runtime_name` actually registered with the given engine's daemon? Probes
+/// `<bin> info` and substring-matches the runtime name in the reported runtimes.
+/// Cheap and best-effort: any error (daemon down, engine missing) → false, so a
+/// misconfigured host silently falls back instead of emitting a `--runtime` flag
+/// the daemon would reject. Sysbox is a Docker-only runtime in practice.
+pub fn sysbox_registered(rt: Runtime, runtime_name: &str) -> bool {
+    std::process::Command::new(rt.bin())
+        .args(["info", "--format", "{{json .Runtimes}}"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(runtime_name))
+        .unwrap_or(false)
+}
+
+/// Resolve the `--runtime` override for a worker launch: the configured Sysbox
+/// runtime name, but ONLY when it is actually registered with `rt`'s daemon
+/// (verified via `sysbox_registered`). Returns `None` otherwise so the launch
+/// stays on the default runtime. Docker-only: Podman ignores the probe and
+/// returns `None` (Sysbox targets dockerd). Not pure (probes the daemon) — call
+/// once at spawn time and stash the result on the `ContainerSpec`.
+pub fn resolve_runtime_override(rt: Runtime) -> Option<String> {
+    let name = sysbox_runtime_from_env()?;
+    if rt == Runtime::Docker && sysbox_registered(rt, &name) {
+        Some(name)
+    } else {
+        None
+    }
+}
+
 /// Everything needed to launch one worker container. Owns its data so the
 /// spawning task is self-contained (mirrors `WorkerSpec`).
 #[derive(Clone, Debug)]
@@ -288,6 +329,14 @@ pub struct ContainerSpec {
     pub network: String,
     /// Working dir inside the container.
     pub workdir: String,
+    /// Optional OCI runtime override → `--runtime=<val>` (e.g. `sysbox-runc`).
+    /// This is the nested-container enabler: a coordinator worker that itself
+    /// spawns containers needs a nesting-capable runtime (Sysbox) so its inner
+    /// `dockerd` works WITHOUT `--privileged` or a shared host `docker.sock`.
+    /// `None` uses the engine's default runtime (runc/crun) — byte-for-byte
+    /// unchanged, so hosts without Sysbox are unaffected. Populated from
+    /// `AISH_SYSBOX_RUNTIME`; see [`resolve_runtime_override`].
+    pub runtime_override: Option<String>,
 }
 
 /// The in-container path the state volume always mounts at (AC4).
@@ -306,6 +355,24 @@ pub fn run_argv(spec: &ContainerSpec) -> Vec<String> {
         "--name".into(),
         spec.name.clone(),
     ];
+    // Nested-capable OCI runtime (e.g. `sysbox-runc`) for a coordinator worker
+    // that itself spawns containers. Only emitted when explicitly configured
+    // (`AISH_SYSBOX_RUNTIME`), so the default runc/crun path is byte-for-byte
+    // unchanged and hosts without Sysbox are unaffected.
+    let nested = spec
+        .runtime_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(rt) = nested {
+        a.push(format!("--runtime={rt}"));
+        // Tell the entrypoint wrapper to boot a private in-container dockerd
+        // before handing off to the coordinator, so the in-container aish's own
+        // `run_argv` has a real daemon to talk to. Gated ONLY on the nested
+        // runtime: stock-runtime workers never see this and exec aish directly.
+        a.push("-e".into());
+        a.push("AISH_START_INNER_DOCKERD=1".into());
+    }
     // Identity labels.
     for (k, v) in &spec.labels {
         a.push("--label".into());
@@ -316,8 +383,18 @@ pub fn run_argv(spec: &ContainerSpec) -> Vec<String> {
     // Network.
     a.push("--network".into());
     a.push(spec.network.clone());
-    // Hardening.
-    a.push("--cap-drop=ALL".into());
+    // Hardening. Default path: drop ALL caps (the worker is an unprivileged
+    // coordinator that never needs any). Nested/Sysbox path: `--cap-drop=ALL`
+    // would override the OCI capability set Sysbox grants the container's init,
+    // starving the inner `dockerd` of the caps it needs (CAP_SYS_ADMIN, etc.)
+    // and breaking nested Docker. Under Sysbox those caps are SAFE — they are
+    // confined to the container's shifted user namespace (container root maps to
+    // an unprivileged host uid), which is the whole point of the runtime. So we
+    // let Sysbox assign its default set rather than dropping them. Still never
+    // `--privileged`; still no shared host `docker.sock`.
+    if nested.is_none() {
+        a.push("--cap-drop=ALL".into());
+    }
     // Secrets via env-file (0600), non-secrets inline.
     if let Some(ef) = &spec.env_file {
         a.push("--env-file".into());
@@ -705,6 +782,7 @@ mod tests {
             pids_limit: Some(512),
             network: "host".into(),
             workdir: "/aish/work".into(),
+            runtime_override: None,
         }
     }
 
@@ -762,6 +840,39 @@ mod tests {
             &argv[img + 1..],
             &["-c", "do the thing", "--coordinator", "--run-id", "w1"]
         );
+    }
+
+    #[test]
+    fn run_argv_nested_runtime_emits_flag_and_keeps_caps() {
+        let mut spec = sample_spec();
+        spec.runtime_override = Some("sysbox-runc".into());
+        let argv = run_argv(&spec);
+        assert!(
+            argv.iter().any(|s| s == "--runtime=sysbox-runc"),
+            "expected --runtime=sysbox-runc, got: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|s| s == "--cap-drop=ALL"),
+            "nested runtime must not --cap-drop=ALL (breaks inner dockerd)"
+        );
+        assert!(!argv.iter().any(|s| s == "--privileged"));
+        assert!(!argv.iter().any(|s| s.contains("docker.sock")));
+        // Entrypoint must be told to boot the inner dockerd.
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "AISH_START_INNER_DOCKERD=1"),
+            "expected -e AISH_START_INNER_DOCKERD=1, got: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn run_argv_default_path_has_no_runtime_flag() {
+        let mut spec = sample_spec();
+        spec.runtime_override = Some("   ".into());
+        let argv = run_argv(&spec);
+        assert!(!argv.iter().any(|s| s.starts_with("--runtime=")));
+        assert!(argv.iter().any(|s| s == "--cap-drop=ALL"));
+        assert!(!argv.iter().any(|s| s == "AISH_START_INNER_DOCKERD=1"));
     }
 
     #[test]

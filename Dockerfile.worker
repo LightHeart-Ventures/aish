@@ -81,6 +81,28 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
+# ─── inner Docker daemon (nested-container path, Sysbox only) ────────────────
+# A coordinator worker can itself decide to run ITS workers in containers. For
+# that the in-container aish needs a real Docker daemon reachable at the normal
+# socket. We ship the full engine (dockerd + containerd + CLI), not just the CLI,
+# because the daemon runs INSIDE this container — a true private nested daemon,
+# not a shared host socket. The daemon is only ever STARTED when the container is
+# launched under a nested-capable runtime (sysbox-runc): container.rs sets
+# AISH_START_INNER_DOCKERD=1 and the entrypoint boots it. Under the stock runtime
+# these packages are dead weight (never started), so non-nested workers are
+# functionally unchanged — just a heavier image. Host requirement: sysbox-ce must
+# be installed and registered with the host dockerd (see docs/sysbox.md).
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg \
+         -o /etc/apt/keyrings/docker.asc \
+    && chmod go+r /etc/apt/keyrings/docker.asc \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" \
+         > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        docker-ce docker-ce-cli containerd.io \
+    && rm -rf /var/lib/apt/lists/*
+
 # The worker's project tree is a git WORKTREE bind-mounted from the host, owned
 # by the host uid but read by root in the container — git 2.35.2+ refuses such a
 # repo with "detected dubious ownership" and aborts every VCS op. The container
@@ -104,5 +126,9 @@ WORKDIR /aish/work
 ENV AISH_COORDINATOR=1
 
 # The container command is the coordinator argv supplied at `run` time
-# (`-c <task> --coordinator --run-id <id> …`), so aish is the entrypoint.
-ENTRYPOINT ["/usr/local/bin/aish"]
+# (`-c <task> --coordinator --run-id <id> …`). The entrypoint wrapper execs aish
+# directly for normal workers, and (only under a nested-capable runtime, gated by
+# AISH_START_INNER_DOCKERD=1) first boots a private in-container dockerd.
+COPY scripts/worker-entrypoint.sh /usr/local/bin/worker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/worker-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/worker-entrypoint.sh"]
