@@ -1,0 +1,65 @@
+# Standalone workspace root: this empty [workspace] table decouples the broker
+# crate from the parent `aish` package (which is a package, not a workspace),
+# so `cargo build`/`cargo test` run here without the parent's heavy build graph
+# (llama.cpp et al.) ever being pulled in. See TASK-257 (SPR-059).
+[workspace]
+
+[package]
+name = "aish-webhook-broker"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["LightHeart Ventures <dev@lightheartventures.com>"]
+description = "Self-hosted webhook broker for aish plugin system — routes webhooks from external services (GitHub, Slack, etc) to connected aish clients"
+license = "Apache-2.0"
+repository = "https://github.com/LightHeart-Ventures/aish"
+keywords = ["webhook", "broker", "plugin", "routing", "aish"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.36", features = ["full"] }
+
+# Web framework (built-in WebSocket upgrade via the `ws` feature — no separate
+# tokio-tungstenite needed for the server side)
+axum = { version = "0.7", features = ["ws", "macros"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Database — rusqlite (bundled SQLite, same as the parent aish crate) behind an
+# r2d2 connection pool. Avoids the libsqlite3-sys linking conflicts and the
+# compile-time DATABASE_URL requirement that sqlx would impose.
+rusqlite = { version = "0.32", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+
+# Cryptography (HMAC-SHA256 webhook signature verification)
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+# Utilities
+uuid = { version = "1.6", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+
+[dev-dependencies]
+tempfile = "3.8"
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
+
+[[bin]]
+name = "aish-webhook-broker"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

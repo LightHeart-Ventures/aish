@@ -1,0 +1,37 @@
+[Unit]
+Description=aish Webhook Broker
+Documentation=https://github.com/LightHeart-Ventures/aish
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust the binary path if you installed it elsewhere (e.g. /opt/aish/bin).
+ExecStart=/usr/local/bin/aish-webhook-broker
+# Configuration is via environment (see src/main.rs for every knob). Either set
+# them inline here or drop an EnvironmentFile at /etc/aish-broker/broker.env.
+Environment=BROKER_LISTEN=0.0.0.0:8080
+Environment=BROKER_DB=/var/lib/aish-broker/aish-broker.db
+Environment=BROKER_LOG_LEVEL=info
+EnvironmentFile=-/etc/aish-broker/broker.env
+
+# Run under a dedicated, unprivileged system account:
+#   sudo useradd --system --home-dir /var/lib/aish-broker --create-home aish-broker
+User=aish-broker
+Group=aish-broker
+
+# Hardening.
+Restart=on-failure
+RestartSec=10
+StateDirectory=aish-broker
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/aish-broker
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
