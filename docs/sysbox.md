@@ -48,7 +48,18 @@ namespace.
 
 ## Host setup (one-time, per machine that runs workers)
 
-Sysbox must be installed and registered with the host `dockerd`:
+Sysbox must be installed and registered with the host `dockerd`. Use the
+turnkey installer — it checksum-verifies the release `.deb`, installs it,
+registers the `sysbox-runc` runtime with dockerd, and runs an **end-to-end
+nested-docker smoke test** (a Sysbox container running its own `dockerd` that
+runs a container):
+
+```
+sudo bash scripts/install-sysbox.sh
+```
+
+It is idempotent (safe to re-run) and self-verifying. If you prefer the manual
+path:
 
 ```
 # Nestybox / Docker sysbox-ce release .deb
@@ -58,6 +69,12 @@ docker info --format '{{json .Runtimes}}'   # verify sysbox-runc is listed
 
 Requires a modern kernel with unprivileged user namespaces enabled
 (Ubuntu 24.04 is fine out of the box).
+
+> **WSL2:** Sysbox is officially unsupported on WSL2. In practice the two classic
+> blockers are cleared on a modern WSL2 kernel (systemd running as PID 1 +
+> idmapped-mount support, so `shiftfs` isn't needed), so the installer will
+> attempt it and let its smoke test be the arbiter. If the smoke test fails,
+> run heavy nested workloads on a native Linux host or CI runner instead.
 
 Then opt workers in:
 
