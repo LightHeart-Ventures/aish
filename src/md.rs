@@ -301,7 +301,7 @@ fn render_table(block: &[&str], indent: &str, base: &str, out: &mut Vec<String>)
 /// Otherwise (piped/captured) we honor an explicit `$COLUMNS`, and with none we
 /// return a huge width so captured output is never wrapped — the wrapping then
 /// happens later when a tty actually renders it.
-fn term_width() -> usize {
+pub(crate) fn term_width() -> usize {
     // A caller inside `render_within` / `render_pane` pins the fitting width so
     // markdown bound for a bordered pane fits the width LEFT after the gutter.
     if let Some(w) = WIDTH_OVERRIDE.with(|c| c.get()) {
