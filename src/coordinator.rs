@@ -68,9 +68,21 @@
 //! transcript persistence (atum's `saveStep`) is the next increment.
 
 use crate::backend::Backend;
+use crate::control::{ControlChannel, ControlSignal};
 use crate::db::CoordinatorStore;
 use crate::session::Session;
 use crate::tools;
+
+/// Reassess directive folded into the next round when an operator interrupt
+/// (Ctrl-C) is observed. Shared by the two interrupt seams so they stay
+/// identical: the engine mid-turn abort path (which returns an `Interrupted`
+/// banner handled after the turn) and the unified control channel's boundary
+/// drain (a between-turns interrupt latched before the turn ran — TASK-297).
+const OPERATOR_REASSESS: &str = "[operator interrupt] The operator pressed Ctrl-C to interrupt your \
+previous turn mid-flight. Stop what you were doing — do NOT blindly resume it. Re-read the task \
+and any newer operator messages, reassess your approach, and either continue with the most \
+sensible next step or, if you should wait for direction, give a brief status plus your best \
+partial result.";
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -636,6 +648,15 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
         cwd = session.cwd.display(),
     );
 
+    // ── Unified operator-control channel (TASK-297). The three operator-control
+    // paths — the `:tell` steer mailbox, the Ctrl-C interrupt latch, and the
+    // live-stream (`:worker-output`) toggle — are normalized into ONE prioritized
+    // queue and drained once per round boundary (see `crate::control`). `control`
+    // is owned here (the sole consumer); `last_output_mode` tracks the toggle so
+    // only a CHANGE is enqueued.
+    let mut control = ControlChannel::new();
+    let mut last_output_mode = session.worker_output_mode();
+
     loop {
         if rounds >= round_cap {
             let error = format!("coordinator exceeded the {round_cap}-round cap");
@@ -660,14 +681,69 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
             let _ = s.heartbeat(run_id);
         }
 
-        // ── operator messages: fold any `:tell`/SendMessage interjections that
-        // arrived before this round into the upcoming turn. Delivery is
-        // round-boundary — a message sent mid-turn lands on the next round.
-        let folded = fold_operator_messages(store, run_id, &mut next_input);
-        if folded > 0 {
+        // ── Unified operator-control drain (TASK-297). Normalize the three
+        // control sources into the prioritized channel, then drain ONCE at this
+        // round boundary and dispatch highest-priority first (interrupt > steer
+        // > output-mode). Delivery is round-boundary — a signal that arrives
+        // mid-turn lands on the next round.
+        //
+        //  * interrupt — a Ctrl-C latched BETWEEN turns (an in-turn Ctrl-C is
+        //    consumed by the engine seam, which ends the turn with an
+        //    `Interrupted` banner handled after the turn; the atomic swap means
+        //    only one of the two seams ever sees a given interrupt).
+        //  * steer     — durable `:tell`/SendMessage interjections from the mailbox.
+        //  * output-mode — a change to the live-stream (`:worker-output`) toggle.
+        //    Producer today is the self-poll below; the channel is the seam a
+        //    future inbound parent→coordinator transport plugs into.
+        if take_interrupt() {
+            control.sender().interrupt();
+        }
+        if let Some(s) = store {
+            for m in s.drain_messages(run_id).unwrap_or_default() {
+                control.sender().steer(m);
+            }
+        }
+        {
+            let mode = session.worker_output_mode();
+            if mode != last_output_mode {
+                control.sender().output_mode(mode);
+                last_output_mode = mode;
+            }
+        }
+
+        let mut interrupted = false;
+        let mut steers: Vec<String> = Vec::new();
+        for signal in control.drain_prioritized() {
+            match signal {
+                ControlSignal::Interrupt => interrupted = true,
+                ControlSignal::Steer(m) => steers.push(m),
+                ControlSignal::OutputMode(mode) => {
+                    session.set_worker_output_mode(mode);
+                    eprintln!("\x1b[2maish: operator set worker-output {mode:?}\x1b[0m");
+                }
+            }
+        }
+        if interrupted {
+            // A between-turns interrupt: reassess before doing more work. Same
+            // directive the engine-banner path folds, so the two seams match.
+            next_input = if next_input.trim().is_empty() {
+                OPERATOR_REASSESS.to_string()
+            } else {
+                format!("{OPERATOR_REASSESS}\n\n{next_input}")
+            };
+            eprintln!(
+                "\x1b[2maish: operator interrupt (between turns) — reassessing this round\x1b[0m"
+            );
+        }
+        if !steers.is_empty() {
+            // Prepend so the operator's steer is the first thing the model reads
+            // this round, ahead of the task continuation text (matches the prior
+            // `fold_operator_messages` framing/order).
+            let interjection = format_interjection(&steers);
+            next_input = format!("{interjection}\n\n{next_input}");
             // Plain (no 🔧/🗨/📦 sentinel) so the parent's worker stream leaves it
             // in the failure tail without forwarding or pulsing the prompt badge.
-            eprintln!("✉ folded {folded} operator message(s) into this round");
+            eprintln!("✉ folded {} operator message(s) into this round", steers.len());
         }
 
         // ── stand-down: a parent raised the harsh `:stop` flag (harsher than a
@@ -791,12 +867,7 @@ final status plus your best partial result. After this turn you are terminated."
                 eprintln!(
                     "\x1b[2maish: round {rounds} interrupted by operator (Ctrl-C) — reassessing\x1b[0m"
                 );
-                next_input = "[operator interrupt] The operator pressed Ctrl-C to interrupt your \
-previous turn mid-flight. Stop what you were doing — do NOT blindly resume it. Re-read the task \
-and any newer operator messages, reassess your approach, and either continue with the most \
-sensible next step or, if you should wait for direction, give a brief status plus your best \
-partial result."
-                    .to_string();
+                next_input = OPERATOR_REASSESS.to_string();
                 continue;
             }
             let disp = crate::loopguard::classify_disposition(
