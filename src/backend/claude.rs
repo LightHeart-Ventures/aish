@@ -5,6 +5,111 @@ use std::time::Duration;
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 
+/// Retry bookkeeping shared by the buffered ([`ClaudeBackend::post_with_retry`])
+/// and streaming ([`ClaudeBackend::stream_with_retry`]) loops. Two INDEPENDENT
+/// budgets keep a rate limit and a flaky network from cannibalizing each other's
+/// retries:
+///
+/// * **Transient** faults (connection resets, timeouts, 5xx, non-JSON edge
+///   bodies) get a short exponential backoff — 2s doubling, capped at
+///   [`RetryBudget::TRANSIENT_MAX_DELAY`] — for up to
+///   [`RetryBudget::TRANSIENT_MAX_ATTEMPTS`] tries.
+/// * **Rate limits** (HTTP 429) get a LONG ride-out: the exponential backoff
+///   climbs to a 5-minute ceiling ([`RetryBudget::RATE_LIMIT_MAX_DELAY`]) and
+///   then retries at that steady 5-minute cadence, riding the limit out for up
+///   to one hour total ([`RetryBudget::RATE_LIMIT_MAX_ELAPSED`]). A headless
+///   coordinator would rather sleep than fail the turn and be respawned as a
+///   brand-new worker.
+struct RetryBudget {
+    /// Transient tries already consumed (across network/5xx/non-JSON).
+    transient_attempts: u32,
+    /// Current transient backoff (doubles each try, capped).
+    transient_delay: Duration,
+    /// Current rate-limit backoff (doubles each 429, capped at 5 min).
+    rl_delay: Duration,
+    /// Cumulative time already slept riding out a 429.
+    rl_elapsed: Duration,
+}
+
+impl RetryBudget {
+    const TRANSIENT_MAX_ATTEMPTS: u32 = 8;
+    const TRANSIENT_MAX_DELAY: Duration = Duration::from_secs(60);
+    /// 5-minute ceiling for the rate-limit backoff.
+    const RATE_LIMIT_MAX_DELAY: Duration = Duration::from_secs(300);
+    /// Ride a 429 out for at most one hour of cumulative sleep.
+    const RATE_LIMIT_MAX_ELAPSED: Duration = Duration::from_secs(3600);
+
+    fn new() -> Self {
+        Self {
+            transient_attempts: 0,
+            transient_delay: Duration::from_secs(2),
+            rl_delay: Duration::from_secs(2),
+            rl_elapsed: Duration::ZERO,
+        }
+    }
+
+    /// The next sleep for a transient fault, or `None` once the transient
+    /// attempt budget is spent (the caller then surfaces the error). Advances
+    /// the exponential backoff.
+    fn next_transient(&mut self) -> Option<Duration> {
+        if self.transient_attempts + 1 >= Self::TRANSIENT_MAX_ATTEMPTS {
+            return None;
+        }
+        let wait = self.transient_delay;
+        self.transient_attempts += 1;
+        self.transient_delay = (self.transient_delay * 2).min(Self::TRANSIENT_MAX_DELAY);
+        Some(wait)
+    }
+
+    /// The next sleep for a 429, honoring a server `Retry-After` when present
+    /// (capped at the 5-minute ceiling), or `None` once the one-hour ride-out
+    /// budget is spent. Accumulates elapsed sleep and advances the backoff.
+    fn next_rate_limit(&mut self, retry_after: Option<Duration>) -> Option<Duration> {
+        if self.rl_elapsed >= Self::RATE_LIMIT_MAX_ELAPSED {
+            return None;
+        }
+        let wait = retry_after
+            .unwrap_or(self.rl_delay)
+            .min(Self::RATE_LIMIT_MAX_DELAY);
+        self.rl_elapsed += wait;
+        self.rl_delay = (self.rl_delay * 2).min(Self::RATE_LIMIT_MAX_DELAY);
+        Some(wait)
+    }
+}
+
+/// Parse a numeric `Retry-After` (seconds) header into a `Duration`, if present
+/// and well-formed. Anthropic sends this on 429s; its window routinely exceeds
+/// the exponential cap, so honoring it lets the worker ride out the limit.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get("retry-after")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+/// Whether an HTTP status + error message indicates an auth failure that no
+/// amount of retrying will fix (401/403, or a 400 whose message names an
+/// invalid/expired/unauthorized credential).
+fn is_auth_error(status: u16, msg: &str) -> bool {
+    matches!(status, 401 | 403)
+        || (status == 400 && {
+            let m = msg.to_ascii_lowercase();
+            m.contains("invalid") || m.contains("expired") || m.contains("unauthorized")
+        })
+}
+
+/// Print the Claude subscription (OAuth) token-refresh guidance to stderr.
+fn eprint_oauth_expired_hint() {
+    eprintln!("\x1b[1m\n⚠ Claude OAuth token expired\x1b[0m");
+    eprintln!(
+        "  Your Claude Max/Pro subscription token needs to be refreshed.\n\
+  Run: \x1b[1mclaude setup-token\x1b[0m\n\
+  Then set CLAUDE_CODE_OAUTH_TOKEN in your shell or ~/.aishrc"
+    );
+    eprintln!();
+}
+
 /// Subscription OAuth tokens (Claude Max/Pro, via `claude setup-token`) are only
 /// honored when the request identifies as Claude Code: the first system block
 /// must be this exact string, or the API rejects the credential. Metered API
@@ -274,12 +379,8 @@ impl ClaudeBackend {
         // each sleep at MAX_DELAY, and on 429 honor the server's `Retry-After`
         // (capped at RATE_LIMIT_MAX_DELAY) since its window routinely exceeds
         // the exponential cap.
-        const MAX_ATTEMPTS: u32 = 8;
-        const MAX_DELAY: Duration = Duration::from_secs(60);
-        const RATE_LIMIT_MAX_DELAY: Duration = Duration::from_secs(90);
-        let mut delay = Duration::from_secs(2);
-        for attempt in 0..MAX_ATTEMPTS {
-            let last = attempt + 1 == MAX_ATTEMPTS;
+        let mut budget = RetryBudget::new();
+        loop {
             let req = self
                 .client
                 .post(API_URL)
@@ -289,107 +390,104 @@ impl ClaudeBackend {
 
             match resp {
                 Ok(r) => {
-                    // Capture Retry-After BEFORE the body is consumed — Anthropic
-                    // sends it on 429s and its window (often 60s) routinely
-                    // exceeds our exponential cap. Honoring it lets this worker
-                    // ride out the rate limit instead of exhausting retries.
-                    let retry_after = r
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|h| h.to_str().ok())
-                        .and_then(|s| s.trim().parse::<u64>().ok())
-                        .map(Duration::from_secs);
+                    // Capture Retry-After BEFORE the body is consumed.
+                    let retry_after = parse_retry_after(r.headers());
                     // Decode to text first so a non-JSON gateway/edge body (502/503
                     // HTML, empty body, Cloudflare page) is a retryable signal, not a
                     // fatal decode error that stops the worker. See
                     // `super::read_status_and_json`.
                     let (status, parsed) = match super::read_status_and_json(r).await {
                         Ok(p) => p,
-                        Err(e) if !last => {
-                            eprintln!(
-                                "\x1b[2m  network error reading body ({e}), retrying…\x1b[0m"
-                            );
-                            tokio::time::sleep(delay).await;
-                            delay = (delay * 2).min(MAX_DELAY);
-                            continue;
-                        }
-                        Err(e) => return Err(e).context("reading claude api response body"),
+                        Err(e) => match budget.next_transient() {
+                            Some(wait) => {
+                                eprintln!(
+                                    "\x1b[2m  network error reading body ({e}), retrying…\x1b[0m"
+                                );
+                                tokio::time::sleep(wait).await;
+                                continue;
+                            }
+                            None => return Err(e).context("reading claude api response body"),
+                        },
                     };
                     let v = match parsed {
                         Ok(v) => v,
-                        Err(snippet) => {
-                            // Non-JSON body: almost always a transient intermediary
-                            // failure (the API itself answers 4xx/5xx in JSON). Retry
-                            // it like any other transient error rather than aborting.
-                            if !last {
+                        // Non-JSON body: almost always a transient intermediary
+                        // failure (the API itself answers 4xx/5xx in JSON). Retry
+                        // it like any other transient error rather than aborting.
+                        Err(snippet) => match budget.next_transient() {
+                            Some(wait) => {
                                 eprintln!(
                                     "\x1b[2m  api returned non-JSON ({status}), retrying…\x1b[0m"
                                 );
-                                tokio::time::sleep(delay).await;
-                                delay = (delay * 2).min(MAX_DELAY);
+                                tokio::time::sleep(wait).await;
                                 continue;
                             }
-                            bail!("claude api ({status}): non-JSON response: {snippet}");
-                        }
+                            None => bail!("claude api ({status}): non-JSON response: {snippet}"),
+                        },
                     };
                     if status == 200 {
                         return Ok(v);
                     }
                     let msg = v["error"]["message"].as_str().unwrap_or("unknown error");
                     let kind = v["error"]["type"].as_str().unwrap_or("error");
-                    // Detect auth failures on OAuth tokens and guide user to refresh.
-                    let is_auth_error = matches!(status, 401 | 403)
-                        || (status == 400 && {
-                            let m = msg.to_ascii_lowercase();
-                            m.contains("invalid") || m.contains("expired") || m.contains("unauthorized")
-                        });
-                    if is_auth_error && matches!(self.cred.auth, Auth::Oauth(_)) && !last {
-                        eprintln!(
-                            "\x1b[1m\n⚠ Claude OAuth token expired\x1b[0m"
-                        );
-                        eprintln!(
-                            "  Your Claude Max/Pro subscription token needs to be refreshed.\n\
-  Run: \x1b[1mclaude setup-token\x1b[0m\n\
-  Then set CLAUDE_CODE_OAUTH_TOKEN in your shell or ~/.aishrc"
-                        );
-                        eprintln!();
-                        bail!(
-                            "claude api authentication failed ({status}): {msg} — \
+                    // Auth failures never clear on retry — surface immediately,
+                    // with a token-refresh nudge for subscription (OAuth) creds.
+                    if is_auth_error(status, msg) {
+                        if matches!(self.cred.auth, Auth::Oauth(_)) {
+                            eprint_oauth_expired_hint();
+                            bail!(
+                                "claude api authentication failed ({status}): {msg} — \
 please refresh your token with `claude setup-token`"
-                        );
+                            );
+                        }
+                        bail!("claude api {kind} ({status}): {msg}");
                     }
-                    // Retry only what's retryable: rate limits (429) and 5xx.
-                    // Other 4xx (bad request, auth, …) fail fast — retrying can't help.
-                    if (status == 429 || status >= 500) && !last {
-                        // On 429, prefer the server-advertised Retry-After (capped
-                        // so a pathological value can't park the worker forever);
-                        // otherwise fall back to the exponential backoff.
-                        let wait = if status == 429 {
-                            retry_after.unwrap_or(delay).min(RATE_LIMIT_MAX_DELAY)
-                        } else {
-                            delay
-                        };
-                        eprintln!(
-                            "\x1b[2m  api {kind} ({status}), retrying in {}s…\x1b[0m",
-                            wait.as_secs()
-                        );
-                        tokio::time::sleep(wait).await;
-                        delay = (delay * 2).min(MAX_DELAY);
-                        continue;
+                    // 429: ride out the rate limit on the long budget — exponential
+                    // up to a 5-minute ceiling, then steady 5-minute retries for up
+                    // to an hour, honoring the server's Retry-After when present.
+                    if status == 429 {
+                        match budget.next_rate_limit(retry_after) {
+                            Some(wait) => {
+                                eprintln!(
+                                    "\x1b[2m  api {kind} ({status}), retrying in {}s…\x1b[0m",
+                                    wait.as_secs()
+                                );
+                                tokio::time::sleep(wait).await;
+                                continue;
+                            }
+                            None => bail!(
+                                "claude api rate limit ({status}) did not clear within the 1h \
+ride-out budget: {msg}"
+                            ),
+                        }
                     }
+                    // 5xx: transient upstream — short exponential backoff.
+                    if status >= 500 {
+                        match budget.next_transient() {
+                            Some(wait) => {
+                                eprintln!(
+                                    "\x1b[2m  api {kind} ({status}), retrying in {}s…\x1b[0m",
+                                    wait.as_secs()
+                                );
+                                tokio::time::sleep(wait).await;
+                                continue;
+                            }
+                            None => bail!("claude api {kind} ({status}): {msg}"),
+                        }
+                    }
+                    // Other 4xx (bad request, …): not retryable.
                     bail!("claude api {kind} ({status}): {msg}");
                 }
-                // Transport-level error (connect reset, timeout, dns): transient,
-                // retry until attempts are exhausted.
-                Err(e) if !last => {
-                    eprintln!("\x1b[2m  network error ({e}), retrying…\x1b[0m");
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(MAX_DELAY);
-                }
-                Err(e) => return Err(e).context("request to claude api failed"),
+                // Transport-level error (connect reset, timeout, dns): transient.
+                Err(e) => match budget.next_transient() {
+                    Some(wait) => {
+                        eprintln!("\x1b[2m  network error ({e}), retrying…\x1b[0m");
+                        tokio::time::sleep(wait).await;
+                    }
+                    None => return Err(e).context("request to claude api failed"),
+                },
             }
         }
-        unreachable!()
     }
 
     /// Establish the SSE stream, retrying only the CONNECTION on the same
