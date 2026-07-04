@@ -936,57 +936,65 @@ final status plus your best partial result. After this turn you are terminated."
         // with a parseable banner on the first line of the answer. Decide a
         // recovery disposition rather than treating the (possibly partial) answer
         // as a finished result.
-        if let Some(reason) = crate::loopguard::ExitReason::parse_banner(&answer) {
-            // Operator Ctrl-C interrupt: NOT a failure and NOT an auto-recovery.
-            // Keep the coordinator alive, fold a reassess directive, and drive
-            // the next round — where fold_operator_messages also picks up any
-            // fresh `:tell` steer the operator sent alongside the interrupt.
-            if matches!(reason, crate::loopguard::ExitReason::Interrupted) {
-                eprintln!(
-                    "\x1b[2maish: round {rounds} interrupted by operator (Ctrl-C) — reassessing\x1b[0m"
-                );
-                next_input = OPERATOR_REASSESS.to_string();
-                continue;
-            }
-            let disp = crate::loopguard::classify_disposition(
-                &reason,
-                auto_recoveries,
-                crate::loopguard::MAX_AUTO_RECOVERIES,
-            );
-            if disp.is_recovery() {
+        if let Some(exit) =
+            crate::loopguard::RoundExit::evaluate(&answer, auto_recoveries, crate::loopguard::MAX_AUTO_RECOVERIES)
+        {
+            // One evaluated `RoundExit` bundles the stop's reason AND its
+            // disposition, so this single `match` decides the recovery action in
+            // one place — the reason and the action can't drift across separate
+            // reads. Only an ABNORMAL stop reaches here (a normal answer has no
+            // banner and `evaluate` returns `None`).
+            match exit.disposition {
+                // Operator Ctrl-C interrupt — the only abnormal reason that
+                // classifies to `None`: NOT a failure and NOT an auto-recovery.
+                // Keep the coordinator alive, fold a reassess directive, and
+                // drive the next round — where fold_operator_messages also picks
+                // up any fresh `:tell` steer sent alongside the interrupt.
+                crate::loopguard::Disposition::None => {
+                    eprintln!(
+                        "\x1b[2maish: round {rounds} interrupted by operator (Ctrl-C) — reassessing\x1b[0m"
+                    );
+                    next_input = OPERATOR_REASSESS.to_string();
+                    continue;
+                }
                 // Auto-resume the work from where it left off, or nudge the model
                 // off a loop — feed the matching directive into the next round and
                 // keep driving (still bounded by `round_cap`). The completed work
                 // is preserved in history + the turn-audit replay, so a resume
                 // continues rather than restarting from scratch.
-                auto_recoveries += 1;
-                eprintln!(
-                    "\x1b[2maish: round {rounds} ended [{}] — {} (auto-recovery {auto_recoveries}/{})\x1b[0m",
-                    reason.tag(),
-                    disp.verb(),
-                    crate::loopguard::MAX_AUTO_RECOVERIES,
-                );
-                next_input = crate::loopguard::recovery_directive(disp, &reason)
-                    .unwrap_or_else(|| "Continue the task from where you left off.".to_string());
-                continue;
+                crate::loopguard::Disposition::Resume | crate::loopguard::Disposition::Nudge => {
+                    auto_recoveries += 1;
+                    eprintln!(
+                        "\x1b[2maish: round {rounds} ended [{}] — {} (auto-recovery {auto_recoveries}/{})\x1b[0m",
+                        exit.reason.tag(),
+                        exit.disposition.verb(),
+                        crate::loopguard::MAX_AUTO_RECOVERIES,
+                    );
+                    next_input = exit
+                        .directive()
+                        .unwrap_or_else(|| "Continue the task from where you left off.".to_string());
+                    continue;
+                }
+                // FlagOperator: auto-recovery is exhausted (or the stop isn't one
+                // to paper over). Stop the run and record a clear, human-actionable
+                // failure so the operator can take over — the partial answer is
+                // preserved on the worktree branch + the turn-audit journal.
+                crate::loopguard::Disposition::FlagOperator => {
+                    let error = format!(
+                        "flagged for operator after {auto_recoveries} auto-recovery attempt(s): {}",
+                        exit.reason.detail()
+                    );
+                    eprintln!("\x1b[2maish: {error}\x1b[0m");
+                    persist_terminal(store, run_id, Phase::Failed, None, Some(&error), session);
+                    finalize_worker_store(run_id, "failed", Some(&answer));
+                    return Outcome {
+                        phase: Phase::Failed,
+                        result: Some(answer),
+                        error: Some(error),
+                        rounds,
+                    };
+                }
             }
-            // FlagOperator: auto-recovery is exhausted (or the stop isn't one to
-            // paper over). Stop the run and record a clear, human-actionable
-            // failure so the operator can take over — the partial answer is
-            // preserved on the worktree branch + the turn-audit journal.
-            let error = format!(
-                "flagged for operator after {auto_recoveries} auto-recovery attempt(s): {}",
-                reason.detail()
-            );
-            eprintln!("\x1b[2maish: {error}\x1b[0m");
-            persist_terminal(store, run_id, Phase::Failed, None, Some(&error), session);
-            finalize_worker_store(run_id, "failed", Some(&answer));
-            return Outcome {
-                phase: Phase::Failed,
-                result: Some(answer),
-                error: Some(error),
-                rounds,
-            };
         }
 
         // ── awaiting_batch: did this round fan work out to the Batches API? ──
