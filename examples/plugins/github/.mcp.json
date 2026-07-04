@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${profile:github.access_token}"
+      },
+      "description": "Official GitHub MCP server. The token is resolved from the [profile:github] credential section written by `aish login github` (login.sh) — never hard-coded here."
+    }
+  }
+}
