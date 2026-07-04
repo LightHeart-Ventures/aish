@@ -420,11 +420,6 @@ impl Disposition {
             Disposition::FlagOperator => "flagging for operator",
         }
     }
-
-    /// Whether this disposition keeps the run going (vs. terminating it).
-    pub fn is_recovery(self) -> bool {
-        matches!(self, Disposition::Resume | Disposition::Nudge)
-    }
 }
 
 /// Decide how to handle a worker that ended with `reason`, given how many
@@ -478,6 +473,50 @@ hand back your best partial result instead of retrying.",
             ))
         }
         Disposition::None | Disposition::FlagOperator => None,
+    }
+}
+
+/// The evaluated outcome of a single coordinator round: WHY the worker's turn
+/// ended ([`ExitReason`]), WHAT the coordinator should do about it
+/// ([`Disposition`]), and HOW MANY auto-recoveries had already been spent this
+/// run when the disposition was chosen. Merging the two tightly-coupled reads —
+/// the reason and the action — into one value lets the drive loop decide both in
+/// a single `match`, so they can no longer drift apart across separate call
+/// sites. Only produced for an ABNORMAL stop: a normal completion carries no
+/// banner and [`RoundExit::evaluate`] yields `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoundExit {
+    /// Why the round's agentic turn stopped.
+    pub reason: ExitReason,
+    /// What the coordinator should do about it, per [`classify_disposition`].
+    pub disposition: Disposition,
+    /// How many auto-recoveries had been spent BEFORE this round — the value the
+    /// disposition was classified against.
+    pub recovery_count: usize,
+}
+
+impl RoundExit {
+    /// Evaluate a finished round's `answer`: parse the exit banner and, when the
+    /// turn ended abnormally, classify the recovery [`Disposition`] against how
+    /// many auto-recoveries have already been spent. Returns `None` for a normal
+    /// (un-bannered) answer — the round produced a real result, nothing to
+    /// recover. Composes [`ExitReason::parse_banner`] + [`classify_disposition`]
+    /// so a caller reads the reason and its disposition as one unit.
+    pub fn evaluate(answer: &str, auto_recoveries: usize, max_auto: usize) -> Option<RoundExit> {
+        let reason = ExitReason::parse_banner(answer)?;
+        let disposition = classify_disposition(&reason, auto_recoveries, max_auto);
+        Some(RoundExit {
+            reason,
+            disposition,
+            recovery_count: auto_recoveries,
+        })
+    }
+
+    /// The directive to fold into the NEXT round for a recovery disposition
+    /// (`Resume`/`Nudge`), or `None` for a terminal one. Thin pass-through to
+    /// [`recovery_directive`] over the bundled reason + disposition.
+    pub fn directive(&self) -> Option<String> {
+        recovery_directive(self.disposition, &self.reason)
     }
 }
 
@@ -716,12 +755,55 @@ mod tests {
     }
 
     #[test]
-    fn disposition_verbs_and_recovery_flag() {
-        assert!(Disposition::Resume.is_recovery());
-        assert!(Disposition::Nudge.is_recovery());
-        assert!(!Disposition::FlagOperator.is_recovery());
-        assert!(!Disposition::None.is_recovery());
+    fn disposition_verbs() {
+        assert_eq!(Disposition::None.verb(), "continuing");
         assert_eq!(Disposition::Resume.verb(), "auto-resuming");
+        assert_eq!(Disposition::Nudge.verb(), "nudging");
         assert_eq!(Disposition::FlagOperator.verb(), "flagging for operator");
+    }
+
+    // ── merged round-exit evaluation ──────────────────────────────────────
+    #[test]
+    fn round_exit_evaluate_bundles_reason_and_disposition() {
+        let max = MAX_AUTO_RECOVERIES;
+
+        // A normal (un-bannered) answer is not an exit — nothing to recover.
+        assert_eq!(RoundExit::evaluate("here is your answer", 0, max), None);
+
+        // A forced-summarize banner → resume, with the reason + count bundled.
+        let banner = ExitReason::ForcedSummarize { iterations: 45 }.banner();
+        let exit = RoundExit::evaluate(&banner, 0, max).expect("abnormal → Some");
+        assert_eq!(exit.reason.tag(), "forced-summarize");
+        assert_eq!(exit.disposition, Disposition::Resume);
+        assert_eq!(exit.recovery_count, 0);
+        assert!(
+            exit.directive()
+                .expect("resume has a directive")
+                .contains("[auto-resume]")
+        );
+
+        // A loop banner → nudge.
+        let loop_banner = ExitReason::LoopDetected {
+            call: "read a".into(),
+            count: 4,
+        }
+        .banner();
+        let looped = RoundExit::evaluate(&loop_banner, 0, max).expect("abnormal → Some");
+        assert_eq!(looped.disposition, Disposition::Nudge);
+        assert!(looped.directive().unwrap().contains("[nudge]"));
+
+        // Interrupt → the sole abnormal reason that classifies to `None`; it is
+        // NOT a recovery and carries no directive.
+        let intr = RoundExit::evaluate(&ExitReason::Interrupted.banner(), 0, max)
+            .expect("abnormal → Some");
+        assert_eq!(intr.disposition, Disposition::None);
+        assert!(intr.directive().is_none());
+
+        // Once auto-recoveries are spent, an abnormal stop flags the operator —
+        // terminal, no directive.
+        let flagged = RoundExit::evaluate(&banner, max, max).expect("abnormal → Some");
+        assert_eq!(flagged.disposition, Disposition::FlagOperator);
+        assert_eq!(flagged.recovery_count, max);
+        assert!(flagged.directive().is_none());
     }
 }
