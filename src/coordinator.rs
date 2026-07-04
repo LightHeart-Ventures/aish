@@ -22,6 +22,11 @@
 //! ```
 //! `coordinating` — running agentic turns; the default resting phase.
 //! `awaiting_batch` — blocked on a spawned Batches job; heartbeats while it polls.
+//! `checkpoint` — a deliberate, resumable PAUSE (TASK-294): a parent asked the
+//!   run to halt at the next round boundary WITHOUT finishing. Unlike stand-down
+//!   (which ends the run) `drive` persists this phase and returns, leaving the
+//!   transcript/worktree intact for a later manual resume. Non-terminal, and
+//!   intentionally exempt from orphan reaping.
 //! `done` / `failed` — terminal. A `done` row is returned idempotently on resume.
 //!
 //! ## Operator mid-flight messaging (the `:tell` / SendMessage channel)
@@ -346,6 +351,10 @@ pub enum Phase {
     Coordinating,
     /// Blocked on a spawned Batches job; heartbeating while it polls.
     AwaitingBatch,
+    /// A deliberate, resumable PAUSE (TASK-294): a parent requested a halt at the
+    /// round boundary. Non-terminal — the run stops without finishing and can be
+    /// resumed manually later. Never orphan-reaped.
+    Checkpoint,
     /// Terminal: the task finished, `result` holds the assembled output.
     Done,
     /// Terminal: the run hit the round cap, errored, or was orphaned.
@@ -358,6 +367,7 @@ impl Phase {
         match self {
             Phase::Coordinating => "coordinating",
             Phase::AwaitingBatch => "awaiting_batch",
+            Phase::Checkpoint => "checkpoint",
             Phase::Done => "done",
             Phase::Failed => "failed",
         }
@@ -369,6 +379,7 @@ impl Phase {
         match s {
             "coordinating" => Phase::Coordinating,
             "awaiting_batch" => Phase::AwaitingBatch,
+            "checkpoint" => Phase::Checkpoint,
             "done" => Phase::Done,
             _ => Phase::Failed,
         }
@@ -388,7 +399,10 @@ impl Phase {
     /// `coordinating`/`awaiting_batch` → continue; `failed` → terminal.
     #[allow(dead_code)]
     pub fn is_resumable(self) -> bool {
-        matches!(self, Phase::Coordinating | Phase::AwaitingBatch)
+        matches!(
+            self,
+            Phase::Coordinating | Phase::AwaitingBatch | Phase::Checkpoint
+        )
     }
 }
 
@@ -735,6 +749,33 @@ final status plus your best partial result. After this turn you are terminated."
             };
         }
 
+        // ── checkpoint: a parent requested a deliberate PAUSE (TASK-294). Unlike
+        // stand-down (which ENDS the run) a checkpoint HALTS it without finishing:
+        // persist the resumable `checkpoint` phase and return at the round
+        // boundary. NO wrap-up turn is taken — the transcript/worktree is left
+        // intact so the run can be resumed manually later, and the row is
+        // intentionally exempt from orphan reaping. Checked AFTER stand-down so a
+        // terminate order wins over a pause when both race.
+        let checkpointing = store
+            .map(|s| s.checkpoint_requested(run_id).unwrap_or(false))
+            .unwrap_or(false);
+        if checkpointing {
+            eprintln!(
+                "⏸ checkpoint requested by parent — halting at round boundary (resumable)"
+            );
+            if let Some(s) = store {
+                let _ = s.set_phase(run_id, Phase::Checkpoint.as_str());
+            }
+            record_run_metrics(store, run_id, session);
+            finalize_worker_store(run_id, "checkpoint", None);
+            return Outcome {
+                phase: Phase::Checkpoint,
+                result: None,
+                error: None,
+                rounds,
+            };
+        }
+
         // ── coordinating: one full-tool agentic turn ────────────────────────
         if let Some(s) = store {
             let _ = s.set_phase(run_id, Phase::Coordinating.as_str());
@@ -986,6 +1027,11 @@ pub fn rehydrate(session: &mut Session) {
                 }
             }
             Phase::Failed => {} // terminal, nothing to do (cleared below)
+            // A checkpointed run is a DELIBERATE, resumable pause (TASK-294): it
+            // is left untouched on rehydrate — never surfaced, never reaped — so
+            // it stays parked at `checkpoint` for a later manual resume even when
+            // its launching session is gone.
+            Phase::Checkpoint => {}
             Phase::Coordinating | Phase::AwaitingBatch => {
                 // Non-terminal. If it's ours (same session id — only possible
                 // after an in-process resume, since ids are per-run) or its
@@ -1337,6 +1383,7 @@ mod tests {
         for p in [
             Phase::Coordinating,
             Phase::AwaitingBatch,
+            Phase::Checkpoint,
             Phase::Done,
             Phase::Failed,
         ] {
@@ -1351,6 +1398,8 @@ mod tests {
     fn terminal_and_resumable_partition_the_phases() {
         assert!(!Phase::Coordinating.is_terminal() && Phase::Coordinating.is_resumable());
         assert!(!Phase::AwaitingBatch.is_terminal() && Phase::AwaitingBatch.is_resumable());
+        // Checkpoint is a resumable, non-terminal pause (TASK-294).
+        assert!(!Phase::Checkpoint.is_terminal() && Phase::Checkpoint.is_resumable());
         assert!(Phase::Done.is_terminal() && !Phase::Done.is_resumable());
         assert!(Phase::Failed.is_terminal() && !Phase::Failed.is_resumable());
     }
