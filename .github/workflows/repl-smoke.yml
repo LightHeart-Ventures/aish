@@ -2,7 +2,12 @@ name: REPL smoke (agent-tty)
 
 # End-to-end smoke that drives the real aish TUI REPL through coder/agent-tty
 # and asserts on rendered terminal state. Hermetic: only built-in `:commands`
-# are exercised, so NO model call and NO ANTHROPIC_API_KEY are needed.
+# are exercised, so NO model call is made. A DUMMY ANTHROPIC_API_KEY is still
+# required though: aish resolves a backend credential at BOOT (main.rs builds
+# the default `claude` backend via Credential::resolve before the REPL starts),
+# so with no credential on the runner aish exits 1 before rendering a prompt.
+# The key is never sent anywhere — the smoke fires no turn — it only satisfies
+# the boot-time presence check.
 #
 # Kept as a SEPARATE workflow from ci.yml (cargo test) because it needs Node +
 # npx (agent-tty) on top of the Rust toolchain. Runs on PRs that touch the REPL
@@ -74,6 +79,10 @@ jobs:
           AISH_REPL_STRICT: '1'          # missing prereqs are hard failures here
           AGENT_TTY_VERSION: '0.5.0'
           ARTIFACT_DIR: ${{ github.workspace }}/tests/repl/artifacts
+          # Dummy, non-empty key: satisfies aish's boot-time Credential::resolve
+          # so the `claude` backend builds and the REPL renders. Never sent — the
+          # smoke exercises only built-in `:commands` and fires no model turn.
+          ANTHROPIC_API_KEY: 'sk-ant-smoke-dummy-not-a-real-key'
         run: tests/repl/agent_tty_smoke.sh
 
       - name: Upload REPL artifacts
