@@ -1,0 +1,38 @@
+# aish-webhook-broker — docker-compose deployment (TASK-263 / SPR-059 Phase 4.7)
+#
+#   docker compose -f deploy/docker-compose.yml up -d
+#   curl http://localhost:8080/health
+#
+# The build context is the parent crate directory so the standalone workspace
+# (crates/aish-webhook-broker/) builds in isolation from the parent aish crate.
+services:
+  aish-webhook-broker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: aish-webhook-broker:latest
+    container_name: aish-webhook-broker
+    ports:
+      - "8080:8080"
+    environment:
+      # See src/main.rs for the full CLI/env surface.
+      BROKER_LISTEN: "0.0.0.0:8080"
+      BROKER_DB: "/var/lib/aish-broker.db"
+      BROKER_MAX_QUEUE_SIZE: "1000"
+      BROKER_WS_HEARTBEAT_SECS: "30"
+      BROKER_POLL_TIMEOUT_SECS: "60"
+      BROKER_MSG_TTL_SECS: "604800"
+      BROKER_LOG_LEVEL: "info"
+    volumes:
+      # Persist the SQLite database across restarts.
+      - broker_data:/var/lib
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  broker_data:

@@ -1,0 +1,26 @@
+{
+  "name": "add_comment",
+  "description": "Post a comment on an issue or pull request (they share a number space on GitHub). Used by the issue-triage skill and, when config.auto_comment_on_open is set, by the issues webhook handler's needs_ack signal.",
+  "mutating": true,
+  "input_schema": {
+    "type": "object",
+    "required": ["number", "body"],
+    "properties": {
+      "number": { "type": "integer", "minimum": 1, "description": "Issue or PR number." },
+      "body": { "type": "string", "description": "Comment body (markdown)." }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "id": { "type": "integer" },
+      "url": { "type": "string" }
+    }
+  },
+  "implementation": {
+    "kind": "mcp",
+    "server": "github",
+    "tool": "add_issue_comment",
+    "note": "owner/repo injected from plugin config."
+  }
+}

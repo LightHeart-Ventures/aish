@@ -1,0 +1,21 @@
+{
+  "name": "list_issues",
+  "description": "List issues on the plugin's configured repo, newest first, filtered by state and optional labels. Read-only. Returns an array of github-issue.json-shaped objects.",
+  "mutating": false,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "state": { "type": "string", "enum": ["open", "closed", "all"], "default": "open" },
+      "labels": { "type": "array", "items": { "type": "string" }, "description": "Only issues carrying ALL of these labels." },
+      "limit": { "type": "integer", "default": 30, "minimum": 1, "maximum": 100 }
+    }
+  },
+  "output_schema_ref": "github-issue",
+  "output_is_array": true,
+  "implementation": {
+    "kind": "mcp",
+    "server": "github",
+    "tool": "list_issues",
+    "note": "owner/repo injected from plugin config; each returned item reshaped to the github-issue schema."
+  }
+}

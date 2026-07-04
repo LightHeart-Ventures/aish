@@ -1,0 +1,8 @@
+{
+  "//": "Overrides the config_schema defaults in plugin.json. Secrets never live here —",
+  "//1": "owner/repo may be literals or left to the ${env:...} schema defaults, and the",
+  "//2": "GitHub token is resolved from [profile:github] at MCP connect time, not from disk.",
+  "default_reviewers": [],
+  "triage_labels": ["bug", "enhancement", "question", "needs-triage", "security"],
+  "auto_comment_on_open": true
+}
