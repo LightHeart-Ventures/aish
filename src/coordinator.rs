@@ -639,10 +639,7 @@ plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
     loop {
         if rounds >= round_cap {
             let error = format!("coordinator exceeded the {round_cap}-round cap");
-            if let Some(s) = store {
-                let _ = s.set_failed(run_id, &error);
-            }
-            record_run_metrics(store, run_id, session);
+            persist_terminal(store, run_id, Phase::Failed, None, Some(&error), session);
             finalize_worker_store(run_id, "failed", None);
             return Outcome {
                 phase: Phase::Failed,
@@ -704,10 +701,14 @@ final status plus your best partial result. After this turn you are terminated."
                     Ok(a) => a,
                     Err(e) => {
                         let error = format!("stand-down wrap-up turn failed: {e:#}");
-                        if let Some(s) = store {
-                            let _ = s.set_failed(run_id, &error);
-                        }
-                        record_run_metrics(store, run_id, session);
+                        persist_terminal(
+                            store,
+                            run_id,
+                            Phase::Failed,
+                            None,
+                            Some(&error),
+                            session,
+                        );
                         finalize_worker_store(run_id, "failed", None);
                         return Outcome {
                             phase: Phase::Failed,
@@ -724,10 +725,7 @@ final status plus your best partial result. After this turn you are terminated."
             if let Some(w) = session.worker_transcript.as_mut() {
                 w.record_message("assistant", "synthesis", &answer);
             }
-            if let Some(s) = store {
-                let _ = s.set_done(run_id, &answer);
-            }
-            record_run_metrics(store, run_id, session);
+            persist_terminal(store, run_id, Phase::Done, Some(&answer), None, session);
             finalize_worker_store(run_id, "done", Some(&answer));
             return Outcome {
                 phase: Phase::Done,
@@ -749,10 +747,7 @@ final status plus your best partial result. After this turn you are terminated."
             Ok(a) => a,
             Err(e) => {
                 let error = format!("{e:#}");
-                if let Some(s) = store {
-                    let _ = s.set_failed(run_id, &error);
-                }
-                record_run_metrics(store, run_id, session);
+                persist_terminal(store, run_id, Phase::Failed, None, Some(&error), session);
                 finalize_worker_store(run_id, "failed", None);
                 return Outcome {
                     phase: Phase::Failed,
@@ -830,10 +825,7 @@ partial result."
                 reason.detail()
             );
             eprintln!("\x1b[2maish: {error}\x1b[0m");
-            if let Some(s) = store {
-                let _ = s.set_failed(run_id, &error);
-            }
-            record_run_metrics(store, run_id, session);
+            persist_terminal(store, run_id, Phase::Failed, None, Some(&error), session);
             finalize_worker_store(run_id, "failed", Some(&answer));
             return Outcome {
                 phase: Phase::Failed,
@@ -883,10 +875,7 @@ delivered above). Fold them into your work: continue the task, or give the final
         }
 
         // No pending sub-work, no pending messages → done.
-        if let Some(s) = store {
-            let _ = s.set_done(run_id, &answer);
-        }
-        record_run_metrics(store, run_id, session);
+        persist_terminal(store, run_id, Phase::Done, Some(&answer), None, session);
         finalize_worker_store(run_id, "done", Some(&answer));
         return Outcome {
             phase: Phase::Done,
@@ -1281,20 +1270,34 @@ fn finalize_worker_store(run_id: &str, status: &str, result: Option<&str>) {
     let _ = crate::worker_store::set_status(run_id, status);
 }
 
-/// Persist the run's cumulative cost/effort metrics — tokens in/out, agentic
-/// turns, and tool-call count — from the live coordinator session totals onto
-/// the durable `coordinator_runs` row. Called at every terminal exit just
-/// before `set_done`/`set_failed`. Best-effort: a store error is swallowed so a
-/// metrics write can never sink a completing run.
-fn record_run_metrics(store: Option<&CoordinatorStore>, run_id: &str, session: &Session) {
+/// Atomically persist a run's TERMINAL outcome — the terminal `phase` plus its
+/// `result`/`error` and the live session's cumulative cost/effort metrics
+/// (tokens in/out, agentic turns, tool-call count) — in ONE store transaction
+/// (TASK-285). Replaces the former `set_done`/`set_failed` followed by a
+/// separate `record_metrics` write: a panic/crash between those two statements
+/// used to leave the `coordinator_runs` row half-updated (terminal phase with
+/// zero metrics, or metrics under a still-`coordinating` phase, either of which
+/// muddies resume/reporting). Routed through [`CoordinatorStore::finish_run`],
+/// the phase, result/error, heartbeat, and metrics commit as a unit — a re-read
+/// after a rolled-back mid-write sees the prior resumable row intact.
+/// Best-effort: a store error is swallowed so persistence can never sink a
+/// completing run (the same contract the two calls it replaces had).
+fn persist_terminal(
+    store: Option<&CoordinatorStore>,
+    run_id: &str,
+    phase: Phase,
+    result: Option<&str>,
+    error: Option<&str>,
+    session: &Session,
+) {
     if let Some(s) = store {
-        let _ = s.record_metrics(
-            run_id,
-            session.tokens_in as u64,
-            session.tokens_out as u64,
-            session.turns_total as u64,
-            session.tool_calls_total as u64,
-        );
+        let metrics = crate::coordinator_store::RunMetrics {
+            tokens_in: session.tokens_in as u64,
+            tokens_out: session.tokens_out as u64,
+            turns: session.turns_total as u64,
+            tool_calls: session.tool_calls_total as u64,
+        };
+        let _ = s.finish_run(run_id, phase.as_str(), result, error, metrics);
     }
 }
 
