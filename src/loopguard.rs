@@ -683,11 +683,10 @@ impl SerialChainGuard {
 /// that case a natural checkpoint so the durable coordinator loop can re-plan with
 /// fresh context. Soft advisory at [`CALL_BUDGET_SOFT`] (logged only); hard yield
 /// once the tally crosses [`CALL_BUDGET_HARD`].
-pub const CALL_BUDGET_SOFT: usize = 40;
+pub const CALL_BUDGET_SOFT: usize = 20;
 /// Hard per-turn cumulative tool-call budget — the turn yields (resumably) once
-/// the cumulative count crosses this. Chosen comfortably above the round budget's
-/// reach for typical batch widths so it only bites genuinely wide turns.
-pub const CALL_BUDGET_HARD: usize = 60;
+/// the cumulative count crosses this. Per the TASK-357 card: soft @ 20, hard @ 30.
+pub const CALL_BUDGET_HARD: usize = 30;
 
 /// What the [`CallBudgetGuard`] wants the caller to do after a round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
