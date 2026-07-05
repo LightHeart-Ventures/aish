@@ -1881,11 +1881,127 @@ event_id={id} + outcome=correct|wrong_turn.",
     }
 }
 
+/// Do two task strings describe "the same work" for the duplicate-offload guard?
+/// Pure / side-effect-free so it is directly unit-testable. A match on ANY of:
+///   * case- and whitespace-normalized exact equality;
+///   * long-substring containment (the shorter, ≥20 normalized chars, sits
+///     inside the longer — a re-offload that pasted extra context around the
+///     same ask);
+///   * Jaccard token-overlap ≥ 0.8.
+/// An empty (post-normalization) string never matches — nothing can duplicate
+/// "no task".
+fn tasks_are_duplicate(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    }
+    let (na, nb) = (norm(a), norm(b));
+    if na.is_empty() || nb.is_empty() {
+        return false;
+    }
+    if na == nb {
+        return true;
+    }
+    // Containment.
+    let (short, long) = if na.len() <= nb.len() { (&na, &nb) } else { (&nb, &na) };
+    if short.len() >= 20 && long.contains(short.as_str()) {
+        return true;
+    }
+    // Jaccard token overlap.
+    use std::collections::HashSet;
+    let ta: HashSet<&str> = na.split(' ').collect();
+    let tb: HashSet<&str> = nb.split(' ').collect();
+    let union = ta.union(&tb).count();
+    if union == 0 {
+        return false;
+    }
+    let inter = ta.intersection(&tb).count();
+    (inter as f64) / (union as f64) >= 0.8
+}
+
+/// Truncate a task string for a one-line duplicate-guard message.
+fn truncate_task(t: &str) -> String {
+    let one_line = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= 80 {
+        one_line
+    } else {
+        let head: String = one_line.chars().take(77).collect();
+        format!("{head}…")
+    }
+}
+
+/// Pre-flight for `run_in_background`: is there ALREADY in-flight background work
+/// whose task matches `task`? Scans (a) this session's live worker-job table and
+/// (b) the durable coordinator store across ALL sessions (a sibling process's
+/// in-flight run counts too). Non-terminal == still running. Returns a human
+/// describing string on the first hit, else None. Read-only.
+fn find_duplicate_running_work(session: &Session, task: &str) -> Option<String> {
+    // (a) Live worker jobs in THIS session — anything not terminal is in flight.
+    for w in session.worker_jobs.lock().unwrap().iter() {
+        let st = w.status();
+        if matches!(st.as_str(), "done" | "failed") {
+            continue;
+        }
+        if tasks_are_duplicate(&w.task, task) {
+            return Some(format!(
+                "a background coordinator (`{}`, {}) is already running matching work: \"{}\"",
+                crate::batch::short_id(&w.id),
+                st,
+                truncate_task(&w.task),
+            ));
+        }
+    }
+    // (b) Durable coordinator rows — every session's, deduped on run_id against
+    // the in-memory workers already checked above.
+    if let Some(store) = &session.coordinator_store {
+        if let Ok(rows) = store.load_all() {
+            let live: std::collections::HashSet<String> =
+                session.worker_jobs.lock().unwrap().iter().map(|w| w.id.clone()).collect();
+            for r in rows {
+                if live.contains(&r.run_id) {
+                    continue;
+                }
+                if matches!(r.phase.as_str(), "done" | "failed") {
+                    continue;
+                }
+                if tasks_are_duplicate(&r.task, task) {
+                    return Some(format!(
+                        "a durable coordinator run (`{}`, phase {}) is already running matching work: \"{}\"",
+                        crate::batch::short_id(&r.run_id),
+                        r.phase,
+                        truncate_task(&r.task),
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
     let task = call.args["task"].as_str().map(str::trim).unwrap_or("");
     if task.is_empty() {
         anyhow::bail!("`task` is required");
     }
+
+    // ── Duplicate-work guard (the :goal / offload dedupe ask) ─────────────────
+    // Before spending a credential or a host fork, check whether this exact work
+    // is ALREADY in flight — a live worker job in this session, or a non-terminal
+    // durable coordinator row in ANY session. On a hit, refuse and point at the
+    // existing run so the model steers it instead of spawning a twin. Bypass with
+    // `force: true` or AISH_BG_ALLOW_DUP=1 for a deliberate re-run.
+    let allow_dup = call.args["force"].as_bool().unwrap_or(false)
+        || std::env::var("AISH_BG_ALLOW_DUP")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    if !allow_dup {
+        if let Some(dup) = find_duplicate_running_work(session, task) {
+            anyhow::bail!(
+                "not offloading — {dup}. Check `background_status` for progress, `tell` it to \
+steer, or pass `force: true` (or set AISH_BG_ALLOW_DUP=1) to spawn a duplicate anyway."
+            );
+        }
+    }
+
     // A background coordinator (a re-exec'd headless aish) runs on the SAME
     // backend as this session (full parity), so it needs a credential for THAT
     // backend — both inherited by the child (env + ~/.aishrc exports, and for
@@ -4167,6 +4283,35 @@ fn char_ceil(s: &str, mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dup_guard_exact_and_normalized_match() {
+        assert!(tasks_are_duplicate("Build the report", "build   the\nreport"));
+        assert!(tasks_are_duplicate("Fix CI on main", "fix ci on main"));
+        assert!(!tasks_are_duplicate("", "anything"));
+        assert!(!tasks_are_duplicate("anything", "   "));
+        assert!(!tasks_are_duplicate("build the report", "delete the database"));
+    }
+
+    #[test]
+    fn dup_guard_containment_and_jaccard() {
+        // Long-substring containment: same ask with extra context wrapped around it.
+        let core = "generate the quarterly revenue summary spreadsheet";
+        let wrapped = format!("please {core} and email it to finance");
+        assert!(tasks_are_duplicate(core, &wrapped));
+        // Short overlaps must NOT trip containment.
+        assert!(!tasks_are_duplicate("ci", "run ci on the pr branch now please thanks"));
+        // Jaccard ≥ 0.8: near-identical token sets.
+        assert!(tasks_are_duplicate(
+            "audit the aws cost report for october",
+            "audit the aws cost report for october now",
+        ));
+        // Low token overlap stays distinct.
+        assert!(!tasks_are_duplicate(
+            "audit the aws cost report for october",
+            "refactor the postgres connection pool logic",
+        ));
+    }
 
     #[test]
     fn to_crlf_rewrites_bare_lf_and_is_idempotent() {
