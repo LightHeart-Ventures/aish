@@ -6248,7 +6248,7 @@ async fn handle_skill_command(args: &[&str], session: &mut Session) -> Result<()
         SkillCmd::Add(reference) => skill_add(&reference, session).await,
         SkillCmd::Search(query) => skill_search(&query).await,
         SkillCmd::List => {
-            skill_list();
+            skill_list(session);
             Ok(())
         }
         SkillCmd::Remove(name) => skill_remove(&name, session),
@@ -6298,19 +6298,85 @@ async fn skill_search(query: &str) -> Result<()> {
     Ok(())
 }
 
-/// `:skill list` — list the locally installed skills (name + description).
-fn skill_list() {
-    let skills = crate::skills::load(&skills_dir_path());
-    if skills.is_empty() {
+/// Classify a skill's on-disk `SKILL.md` path into a `:skill search`-style
+/// source label: `Plugin:<id>` when it lives under `~/.aish/plugins/<id>/…`,
+/// otherwise `Skill:<folder>` for a locally-installed `~/.aish/skills/<folder>`.
+fn skill_source(path: &std::path::Path) -> String {
+    let comps: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if let Some(pos) = comps.iter().position(|c| c == "plugins") {
+        if let Some(plugin) = comps.get(pos + 1) {
+            return format!("Plugin:{plugin}");
+        }
+    }
+    let folder = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("Skill:{folder}")
+}
+
+/// `:skill list` — list every available skill as a `:skill search`-style table:
+/// SKILL | SOURCE | DESCRIPTION. Sources are `Skill:<folder>` (locally
+/// installed), `Plugin:<id>` (contributed by a discovered plugin), or
+/// `MCP:<server>` (published by a connected MCP server). Rows are sorted by
+/// skill name.
+fn skill_list(session: &Session) {
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+    for s in crate::skills::load_catalog(&skills_dir_path()) {
+        rows.push((s.name, skill_source(&s.path), s.description));
+    }
+    for sk in session.mcp.skills() {
+        rows.push((sk.name, format!("MCP:{}", sk.server), sk.description));
+    }
+    if rows.is_empty() {
         println!("No skills installed. `:skill search <query>` to find some.");
         return;
     }
-    for s in &skills {
-        if s.description.is_empty() {
-            println!("\x1b[1m{}\x1b[0m", s.name);
-        } else {
-            println!("\x1b[1m{}\x1b[0m — {}", s.name, s.description);
-        }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Respect --no-color / NO_COLOR / a piped stdout so escape codes never leak.
+    let color = crate::style::colors_enabled();
+    let (bold, cyan, reset) = if color {
+        ("\x1b[1m", "\x1b[36m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+
+    let name_w = rows
+        .iter()
+        .map(|r| r.0.chars().count())
+        .chain(std::iter::once("SKILL".len()))
+        .max()
+        .unwrap_or(5);
+    let src_w = rows
+        .iter()
+        .map(|r| r.1.chars().count())
+        .chain(std::iter::once("SOURCE".len()))
+        .max()
+        .unwrap_or(6);
+
+    // DESCRIPTION takes the remaining terminal width (untruncated when piped,
+    // where term_width() is usize::MAX).
+    let sep = 2usize;
+    let prefix_w = name_w + sep + src_w + sep;
+    let tw = crate::md::term_width();
+    let desc_w = if tw == usize::MAX {
+        usize::MAX
+    } else {
+        tw.saturating_sub(prefix_w).max(20)
+    };
+
+    println!(
+        "{:<name_w$}  {:<src_w$}  {}",
+        "SKILL", "SOURCE", "DESCRIPTION"
+    );
+    for (name, src, desc) in &rows {
+        let desc = crate::skill_provider::truncate(desc, desc_w);
+        println!("{bold}{name:<name_w$}{reset}  {cyan}{src:<src_w$}{reset}  {desc}");
     }
 }
 
@@ -9755,6 +9821,29 @@ mod tests {
     fn skill_in_colon_catalog() {
         // The catalog carries :skill so the palette + completion offer it.
         assert!(colon_command_matches("sk").contains(&"skill"));
+    }
+
+    #[test]
+    fn skill_source_classifies_paths() {
+        use std::path::Path;
+        // Locally-installed skill → Skill:<folder>.
+        assert_eq!(
+            skill_source(Path::new("/home/u/.aish/skills/fix-ci/SKILL.md")),
+            "Skill:fix-ci"
+        );
+        // Plugin-contributed skill → Plugin:<plugin-id> (not the leaf folder).
+        assert_eq!(
+            skill_source(Path::new(
+                "/home/u/.aish/plugins/hello-world/skills/hello-world/SKILL.md"
+            )),
+            "Plugin:hello-world"
+        );
+        assert_eq!(
+            skill_source(Path::new(
+                "/home/u/.aish/plugins/aish/skills/alert-batch-composition/SKILL.md"
+            )),
+            "Plugin:aish"
+        );
     }
 
     #[test]
