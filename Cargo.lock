@@ -42,6 +42,7 @@ dependencies = [
 name = "aish"
 version = "0.33.0"
 dependencies = [
+ "aish-webhook-client",
  "anyhow",
  "clap",
  "flate2",
@@ -58,6 +59,7 @@ dependencies = [
  "sqlite-vec",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "unicode-width 0.2.2",
  "urlencoding",
  "uuid",

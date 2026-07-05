@@ -518,12 +518,12 @@ ride-out budget: {msg}"
         body: &Value,
         sink: super::StreamSink<'_>,
     ) -> Result<Value> {
-        const MAX_ATTEMPTS: u32 = 8;
-        const MAX_DELAY: Duration = Duration::from_secs(60);
-        const RATE_LIMIT_MAX_DELAY: Duration = Duration::from_secs(90);
-        let mut delay = Duration::from_secs(2);
-        for attempt in 0..MAX_ATTEMPTS {
-            let last = attempt + 1 == MAX_ATTEMPTS;
+        // Mirror the buffered path's two-budget retry policy
+        // ([`RetryBudget`]): transient faults get a short exponential backoff,
+        // 429s ride out on the long rate-limit budget. Only the CONNECTION is
+        // retried — once a 200 is streaming, `consume_stream` owns the body.
+        let mut budget = RetryBudget::new();
+        loop {
             let req = self
                 .client
                 .post(API_URL)
@@ -532,13 +532,15 @@ ride-out budget: {msg}"
                 .header("accept", "text/event-stream");
             let resp = match self.cred.apply(req).json(body).send().await {
                 Ok(r) => r,
-                Err(e) if !last => {
-                    eprintln!("\x1b[2m  network error ({e}), retrying…\x1b[0m");
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(MAX_DELAY);
-                    continue;
-                }
-                Err(e) => return Err(e).context("request to claude api (stream) failed"),
+                // Transport-level error (connect reset, timeout, dns): transient.
+                Err(e) => match budget.next_transient() {
+                    Some(wait) => {
+                        eprintln!("\x1b[2m  network error ({e}), retrying…\x1b[0m");
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    None => return Err(e).context("request to claude api (stream) failed"),
+                },
             };
 
             let status = resp.status().as_u16();
@@ -550,71 +552,80 @@ ride-out budget: {msg}"
 
             // Non-200: the error body is a normal (non-streamed) JSON document —
             // classify it exactly as the buffered path does.
-            let retry_after = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .map(Duration::from_secs);
+            let retry_after = parse_retry_after(resp.headers());
             let (status, parsed) = match super::read_status_and_json(resp).await {
                 Ok(p) => p,
-                Err(e) if !last => {
-                    eprintln!("\x1b[2m  network error reading body ({e}), retrying…\x1b[0m");
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(MAX_DELAY);
-                    continue;
-                }
-                Err(e) => return Err(e).context("reading claude api (stream) response body"),
+                Err(e) => match budget.next_transient() {
+                    Some(wait) => {
+                        eprintln!("\x1b[2m  network error reading body ({e}), retrying…\x1b[0m");
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    None => return Err(e).context("reading claude api (stream) response body"),
+                },
             };
             let v = match parsed {
                 Ok(v) => v,
-                Err(snippet) => {
-                    if !last {
+                // Non-JSON body: transient intermediary failure — retry it.
+                Err(snippet) => match budget.next_transient() {
+                    Some(wait) => {
                         eprintln!("\x1b[2m  api returned non-JSON ({status}), retrying…\x1b[0m");
-                        tokio::time::sleep(delay).await;
-                        delay = (delay * 2).min(MAX_DELAY);
+                        tokio::time::sleep(wait).await;
                         continue;
                     }
-                    bail!("claude api ({status}): non-JSON response: {snippet}");
-                }
+                    None => bail!("claude api ({status}): non-JSON response: {snippet}"),
+                },
             };
             let msg = v["error"]["message"].as_str().unwrap_or("unknown error");
             let kind = v["error"]["type"].as_str().unwrap_or("error");
-            let is_auth_error = matches!(status, 401 | 403)
-                || (status == 400 && {
-                    let m = msg.to_ascii_lowercase();
-                    m.contains("invalid") || m.contains("expired") || m.contains("unauthorized")
-                });
-            if is_auth_error && matches!(self.cred.auth, Auth::Oauth(_)) && !last {
-                eprintln!("\x1b[1m\n⚠ Claude OAuth token expired\x1b[0m");
-                eprintln!(
-                    "  Your Claude Max/Pro subscription token needs to be refreshed.\n\
-  Run: \x1b[1mclaude setup-token\x1b[0m\n\
-  Then set CLAUDE_CODE_OAUTH_TOKEN in your shell or ~/.aishrc"
-                );
-                eprintln!();
-                bail!(
-                    "claude api authentication failed ({status}): {msg} — \
+            // Auth failures never clear on retry — surface immediately, with a
+            // token-refresh nudge for subscription (OAuth) creds.
+            if is_auth_error(status, msg) {
+                if matches!(self.cred.auth, Auth::Oauth(_)) {
+                    eprint_oauth_expired_hint();
+                    bail!(
+                        "claude api authentication failed ({status}): {msg} — \
 please refresh your token with `claude setup-token`"
-                );
+                    );
+                }
+                bail!("claude api {kind} ({status}): {msg}");
             }
-            if (status == 429 || status >= 500) && !last {
-                let wait = if status == 429 {
-                    retry_after.unwrap_or(delay).min(RATE_LIMIT_MAX_DELAY)
-                } else {
-                    delay
-                };
-                eprintln!(
-                    "\x1b[2m  api {kind} ({status}), retrying in {}s…\x1b[0m",
-                    wait.as_secs()
-                );
-                tokio::time::sleep(wait).await;
-                delay = (delay * 2).min(MAX_DELAY);
-                continue;
+            // 429: ride out the rate limit on the long budget — exponential up to
+            // a 5-minute ceiling, then steady 5-minute retries for up to an hour,
+            // honoring the server's Retry-After when present.
+            if status == 429 {
+                match budget.next_rate_limit(retry_after) {
+                    Some(wait) => {
+                        eprintln!(
+                            "\x1b[2m  api {kind} ({status}), retrying in {}s…\x1b[0m",
+                            wait.as_secs()
+                        );
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    None => bail!(
+                        "claude api rate limit ({status}) did not clear within the 1h \
+ride-out budget: {msg}"
+                    ),
+                }
             }
+            // 5xx: transient upstream — short exponential backoff.
+            if status >= 500 {
+                match budget.next_transient() {
+                    Some(wait) => {
+                        eprintln!(
+                            "\x1b[2m  api {kind} ({status}), retrying in {}s…\x1b[0m",
+                            wait.as_secs()
+                        );
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    None => bail!("claude api {kind} ({status}): {msg}"),
+                }
+            }
+            // Other 4xx (bad request, …): not retryable.
             bail!("claude api {kind} ({status}): {msg}");
         }
-        unreachable!()
     }
 
     /// Drive a 200 SSE body to completion: frame raw bytes into events
