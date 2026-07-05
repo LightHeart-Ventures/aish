@@ -674,6 +674,15 @@ pub fn screen_rows() -> Option<u16> {
     term_size().map(|(rows, _)| rows)
 }
 
+/// Whether a bottom-anchored footer scroll region is currently installed. True
+/// only while the three-row footer (rule + status + statusline) is live, so a
+/// caller can decide whether the last scrolling body row (`rows - FOOTER_ROWS`)
+/// really sits directly above the horizontal rule. Used by the `:workers` tray
+/// to bottom-anchor itself only when there is a rule to anchor above.
+pub fn footer_active() -> bool {
+    ACTIVE.load(Ordering::Relaxed)
+}
+
 /// Cursor-home sequence to the bottom row, column 1 (`ESC[<rows>;1H`). Used by
 /// the inline-mode attach clear to anchor the view to the bottom of the screen
 /// (mirroring footer mode, where [`restore_after_clear`] homes to the bottom
