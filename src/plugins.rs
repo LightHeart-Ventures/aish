@@ -87,6 +87,46 @@ pub struct Provides {
     /// contributes no login command. See [`crate::plugin_auth`].
     #[serde(default)]
     pub login: Option<String>,
+    /// Phase 1 (plugin-skill-sources, design §3): declares this plugin a
+    /// **skill source** — a federated search/add provider that joins the
+    /// `:skill search` fan-out and `:skill add` priority-resolution. Absent →
+    /// the plugin contributes no skill source. Consumed by
+    /// [`discover_skill_sources`] and (later phases) the `SkillSource` façade
+    /// and `:skill` verb handlers.
+    #[serde(default)]
+    pub skill_source: Option<SkillSource>,
+}
+
+/// The `provides.skill_source` block (design
+/// `docs/design/plugin-skill-sources.md` §3): declares a plugin as a federated
+/// skill **search/add** provider. Every field is optional so a source may be
+/// search-only, add-only, or a bare priority-labelled façade; unknown keys are
+/// dropped by serde for the same forward/backward-compat story as the rest of
+/// the manifest surface.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct SkillSource {
+    /// Source label shown in the SOURCE column and `:skill sources`. Defaults
+    /// to the owning plugin id when absent (resolved in
+    /// [`discover_skill_sources`]).
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Merge/precedence rank — higher wins on ref/name-dedup ties and orders
+    /// `add` attempts. The built-in embedded index sits at a low fixed priority
+    /// so plugins can outrank it. Defaults to `0`.
+    #[serde(default)]
+    pub priority: i64,
+    /// Handler script (relative to the plugin dir) answering `:skill search`.
+    /// `None` → the source is add-only.
+    #[serde(default)]
+    pub search: Option<String>,
+    /// Handler script resolving a `:skill add <ref>`. `None` → search-only.
+    #[serde(default)]
+    pub add: Option<String>,
+    /// Glob/prefix patterns of `reference` namespaces this source claims for
+    /// `add` routing (e.g. `"github:*"`, `"acme/*"`, `"*"`). Drives which
+    /// source(s) a given `:skill add` is offered to, in priority order.
+    #[serde(default)]
+    pub handles: Vec<String>,
 }
 
 impl PluginManifest {
@@ -112,6 +152,14 @@ impl PluginManifest {
     /// `Some("mycompany")`, `aish login mycompany` routes here (Phase 0.5.5).
     pub fn login_command(&self) -> Option<&str> {
         self.provides.as_ref().and_then(|p| p.login.as_deref())
+    }
+
+    /// This plugin's `provides.skill_source` block, if it declares one
+    /// (plugin-skill-sources design §3). `None` when the plugin contributes no
+    /// skill source. The paired discovery helper is [`discover_skill_sources`].
+    #[allow(dead_code)] // consumed by the Phase 2+ SkillSource façade / `:skill` verb handlers
+    pub fn skill_source(&self) -> Option<&SkillSource> {
+        self.provides.as_ref().and_then(|p| p.skill_source.as_ref())
     }
 
 
@@ -485,6 +533,64 @@ pub fn discover(dir: &Path) -> Vec<Plugin> {
 /// then skill name (each plugin's `skills::load` already pre-sorts by name).
 pub fn plugin_skills(dir: &Path) -> Vec<Skill> {
     discover(dir).into_iter().flat_map(|p| p.skills).collect()
+}
+
+/// A discovered plugin that declares `provides.skill_source`, resolved and
+/// paired with the plugin directory its handler scripts run in. Produced by
+/// [`discover_skill_sources`], one per skill-source plugin.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // fields consumed by the Phase 2+ SkillSource façade / search fan-out
+pub struct ResolvedSkillSource {
+    /// Owning plugin id (`manifest.id`).
+    pub plugin_id: String,
+    /// Source label — `skill_source.id` when set, else the owning plugin id.
+    pub id: String,
+    /// Merge/precedence rank; higher wins. Mirrors `skill_source.priority`.
+    pub priority: i64,
+    /// `search` handler script (relative to `dir`), if the source answers search.
+    pub search: Option<String>,
+    /// `add` handler script (relative to `dir`), if the source resolves add.
+    pub add: Option<String>,
+    /// `handles` globs the source claims for `:skill add` routing.
+    pub handles: Vec<String>,
+    /// Plugin directory the handler scripts are exec'd in.
+    pub dir: PathBuf,
+}
+
+/// Collect every discovered plugin that declares a `provides.skill_source`
+/// block into [`ResolvedSkillSource`]s, ordered by `priority` **descending**
+/// then source `id` **ascending** — the deterministic merge order the
+/// `:skill search` fan-out and `:skill add` priority-resolution consume
+/// (design §4). A source's `id` defaults to the owning plugin id when the
+/// manifest leaves `skill_source.id` unset. Mirrors [`plugin_skills`]'s
+/// `discover`-then-traverse shape and inherits its forgiving discovery — a
+/// broken plugin is skipped, never fatal.
+#[allow(dead_code)] // WIRED by TASK-342 (`:skill search` fan-out) / TASK-343 (`add` resolution)
+pub fn discover_skill_sources(dir: &Path) -> Vec<ResolvedSkillSource> {
+    let mut sources: Vec<ResolvedSkillSource> = discover(dir)
+        .into_iter()
+        .filter_map(|p| {
+            let src = p
+                .manifest
+                .provides
+                .as_ref()
+                .and_then(|pr| pr.skill_source.clone())?;
+            let plugin_id = p.manifest.id.clone();
+            let id = src.id.clone().unwrap_or_else(|| plugin_id.clone());
+            Some(ResolvedSkillSource {
+                plugin_id,
+                id,
+                priority: src.priority,
+                search: src.search,
+                add: src.add,
+                handles: src.handles,
+                dir: p.dir,
+            })
+        })
+        .collect();
+    // priority desc, then id asc — stable, total, deterministic.
+    sources.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
+    sources
 }
 
 // ---- Phase 0.5.3: `.mcp.json` merge from plugins into the client MCP set ----
@@ -1785,6 +1891,103 @@ mod tests {
         let plugins = discover(&tmp);
         let ids: Vec<_> = plugins.iter().map(|p| p.manifest.id.clone()).collect();
         assert_eq!(ids, vec!["alpha", "zeta"]);
+    }
+
+    // ---- Phase 1 (plugin-skill-sources, TASK-336 manifest / TASK-337 discovery) ----
+
+    #[test]
+    fn provides_skill_source_parses_all_fields() {
+        let m = manifest(
+            r#"{"id":"skillfish","provides":{"skill_source":{
+                "id":"skillfish","priority":100,"search":"search.sh","add":"add.sh",
+                "handles":["*","skillfish:*","*/*"]}}}"#,
+        );
+        let src = m.skill_source().expect("skill_source parsed");
+        assert_eq!(src.id.as_deref(), Some("skillfish"));
+        assert_eq!(src.priority, 100);
+        assert_eq!(src.search.as_deref(), Some("search.sh"));
+        assert_eq!(src.add.as_deref(), Some("add.sh"));
+        assert_eq!(src.handles, vec!["*", "skillfish:*", "*/*"]);
+    }
+
+    #[test]
+    fn provides_without_skill_source_is_none() {
+        // A `provides` block that declares only other capabilities → no source.
+        let m = manifest(r#"{"id":"p","provides":{"login":"acme"}}"#);
+        assert!(m.skill_source().is_none());
+    }
+
+    #[test]
+    fn skill_source_defaults_are_empty() {
+        // A bare block: search/add/id absent, priority 0, no handles.
+        let m = manifest(r#"{"id":"p","provides":{"skill_source":{}}}"#);
+        let src = m.skill_source().expect("empty block still parses");
+        assert!(src.id.is_none());
+        assert_eq!(src.priority, 0);
+        assert!(src.search.is_none() && src.add.is_none());
+        assert!(src.handles.is_empty());
+    }
+
+    #[test]
+    fn discover_skill_sources_collects_only_skill_source_plugins() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "plain", r#"{"id":"plain"}"#, Some(("s", "d")));
+        write_plugin(
+            &tmp,
+            "fish",
+            r#"{"id":"fish","provides":{"skill_source":{"search":"search.sh"}}}"#,
+            Some(("s", "d")),
+        );
+        let sources = discover_skill_sources(&tmp);
+        assert_eq!(sources.len(), 1, "only the skill_source plugin is collected");
+        assert_eq!(sources[0].plugin_id, "fish");
+        // id defaults to the owning plugin id when the block omits it.
+        assert_eq!(sources[0].id, "fish");
+        assert_eq!(sources[0].search.as_deref(), Some("search.sh"));
+        assert!(sources[0].add.is_none());
+        assert_eq!(sources[0].dir, tmp.join("fish"));
+    }
+
+    #[test]
+    fn discover_skill_sources_sorted_by_priority_desc_then_id_asc() {
+        let tmp = tempdir();
+        // Two sources share priority 50 → the tie breaks by id asc (aaa < bbb).
+        write_plugin(
+            &tmp,
+            "p_hi",
+            r#"{"id":"p_hi","provides":{"skill_source":{"id":"hi","priority":100}}}"#,
+            None,
+        );
+        write_plugin(
+            &tmp,
+            "p_bbb",
+            r#"{"id":"p_bbb","provides":{"skill_source":{"id":"bbb","priority":50}}}"#,
+            None,
+        );
+        write_plugin(
+            &tmp,
+            "p_aaa",
+            r#"{"id":"p_aaa","provides":{"skill_source":{"id":"aaa","priority":50}}}"#,
+            None,
+        );
+        write_plugin(
+            &tmp,
+            "p_lo",
+            r#"{"id":"p_lo","provides":{"skill_source":{"id":"lo","priority":1}}}"#,
+            None,
+        );
+        let ids: Vec<_> = discover_skill_sources(&tmp)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, vec!["hi", "aaa", "bbb", "lo"]);
+    }
+
+    #[test]
+    fn discover_skill_sources_empty_when_no_sources() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "plain", r#"{"id":"plain"}"#, Some(("s", "d")));
+        assert!(discover_skill_sources(&tmp).is_empty());
     }
 
     // ---- Phase 0.5.3: `.mcp.json` merge from plugins into the client set ----
