@@ -758,14 +758,20 @@ pub async fn run_coordinator(
 /// model's window. A no-op until usage is known (`context_used` > 0) and the
 /// conversation is long enough to split on a safe assistant boundary.
 fn maybe_compact(backend: &Backend, session: &mut Session) {
-    let window = backend.context_window();
-    if !crate::context::should_compact(
-        session.context_used,
-        window,
-        crate::context::COMPACT_THRESHOLD_PCT,
-    ) {
+    let budget = crate::context::CompactBudget {
+        window: backend.context_window(),
+        threshold_pct: crate::context::COMPACT_THRESHOLD_PCT,
+        tool_call_ceiling: session.compact_tool_call_ceiling,
+        token_ceiling: session.compact_token_ceiling,
+    };
+    // In-context tool calls = session total minus the watermark set at the last
+    // compaction (the calls the retained transcript still carries). (TASK-321)
+    let tool_calls_in_context = session
+        .tool_calls_total
+        .saturating_sub(session.tool_calls_at_last_compact);
+    let Some(trigger) = budget.trigger(session.context_used, tool_calls_in_context) else {
         return;
-    }
+    };
     let Some(plan) =
         crate::context::plan_compaction(&session.history, crate::context::KEEP_RECENT_MSGS)
     else {
@@ -783,9 +789,14 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
     crate::context::apply_compaction(&mut session.history, &plan);
     // Exact next-turn usage isn't known yet; re-seat the figure from an estimate.
     session.context_used = crate::context::estimate_history_tokens(&session.history);
+    // Re-seat the tool-call watermark so the in-context count reflects only the
+    // calls the retained transcript still carries. (TASK-321)
+    session.tool_calls_at_last_compact = session
+        .tool_calls_total
+        .saturating_sub(crate::context::count_tool_calls(&session.history));
     eprintln!(
-        "\x1b[2maish: context at/over {}% — compacted {dropped} earlier message(s) to memory\x1b[0m",
-        crate::context::COMPACT_THRESHOLD_PCT
+        "\x1b[2maish: {} tripped — compacted {dropped} earlier message(s) to memory\x1b[0m",
+        trigger.label()
     );
 }
 

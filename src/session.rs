@@ -288,6 +288,22 @@ pub struct Session {
     /// Count of logical agentic turns taken this session (one per `run_turn`).
     /// Feeds the status line's `turns: …`.
     pub turns_total: usize,
+    /// Value of [`tool_calls_total`] at the most recent compaction. The engine
+    /// derives how many tool calls are still retained *in-context*
+    /// (`tool_calls_total - tool_calls_at_last_compact`) to enforce the TASK-321
+    /// tool-call ceiling. Advanced by `maybe_compact`; reset with the
+    /// conversation. Session-local.
+    pub tool_calls_at_last_compact: usize,
+    /// Resolved tool-call compaction ceiling for this session (0 = lever off).
+    /// Seeded from `AISH_COMPACT_TOOL_CALLS` (falling back to
+    /// [`crate::context::COMPACT_TOOL_CALL_CEILING`]) once at construction so the
+    /// hot compaction check does no env I/O. (TASK-321)
+    pub compact_tool_call_ceiling: usize,
+    /// Resolved absolute-token compaction ceiling for this session (0 = lever
+    /// off; the %-window trigger still applies). Seeded from
+    /// `AISH_COMPACT_TOKEN_BUDGET` (falling back to
+    /// [`crate::context::COMPACT_TOKEN_CEILING`]). (TASK-321)
+    pub compact_token_ceiling: usize,
     /// Interactive background mode (on by default, persisted; toggle with `:batch`).
     /// When on, the agent gets the run_in_background/background_status tools and a
     /// system-prompt nudge to offload deferrable work to a full background
@@ -579,6 +595,15 @@ impl Session {
             cache_creation_total: 0,
             tool_calls_total: 0,
             turns_total: 0,
+            tool_calls_at_last_compact: 0,
+            compact_tool_call_ceiling: crate::context::parse_ceiling(
+                std::env::var("AISH_COMPACT_TOOL_CALLS").ok().as_deref(),
+                crate::context::COMPACT_TOOL_CALL_CEILING,
+            ),
+            compact_token_ceiling: crate::context::parse_ceiling(
+                std::env::var("AISH_COMPACT_TOKEN_BUDGET").ok().as_deref(),
+                crate::context::COMPACT_TOKEN_CEILING,
+            ),
             batch_mode: true,
             batch_model: crate::batch::DEFAULT_BATCH_MODEL.to_string(),
             batch_force_batches: false,
@@ -703,6 +728,10 @@ impl Session {
         self.cache_creation_total = 0;
         self.tool_calls_total = 0;
         self.turns_total = 0;
+        // The in-context tool-call watermark is meaningless once history is gone;
+        // reset it so the fresh conversation counts from zero. The resolved
+        // ceilings are session config and intentionally persist. (TASK-321)
+        self.tool_calls_at_last_compact = 0;
         // TASK-282 AC1/AC3: the durable goal tree is independent of the
         // conversation. Re-hydrate it from aish.db and re-assert the single
         // active-goal invariant so the goal (and its rollup) survives `:new`.
