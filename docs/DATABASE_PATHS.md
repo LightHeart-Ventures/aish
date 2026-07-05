@@ -1,81 +1,75 @@
-# Database Paths
+# Database Path Migration
 
-aish keeps all of its on-disk SQLite databases under a single directory,
-`~/.aish/database/`, rather than scattering `*.db` files loose in the config
-home. This keeps `~/.aish/` tidy and gives callers one canonical place to
-resolve a database path.
+## Status
 
-Path resolution lives in [`src/db_paths.rs`](../src/db_paths.rs). Every DB open
-in `src/main.rs` routes through it.
+**Active migration in progress:** SQLite databases are being consolidated from the flat `~/.aish/` layout into an organized `~/.aish/database/` subdirectory.
 
-## Layout
+## Old Layout (Deprecated)
 
 ```text
 ~/.aish/
-├── .mcp.json              # MCP server config
-├── skills/                # local skill catalog
-├── registry/              # skill provider registry
-├── plugins/               # installed plugins
-└── database/              # ← all SQLite databases
-    ├── aish.db            # main store: history, memory (vector recall),
-    │                      #   batch jobs, coordinator runs
-    ├── plugins.db         # plugin-scoped key/value state (Phase 1.5)
-    └── *.db-wal, *.db-shm # WAL sidecars (normal for WAL journaling)
+├── aish.db                  # ❌ DEPRECATED
+├── plugins.db               # ❌ DEPRECATED
+├── goal-coordinator-plan.db # ❌ DEPRECATED (exploratory)
+├── ...other config files
 ```
 
-## Databases
+## New Layout (Canonical)
 
-| File | Constant (`db_paths`) | Accessor | Contents |
-|------|-----------------------|----------|----------|
-| `aish.db` | `MAIN_DB` | `main_db_path()` | Command history, vector memories (sqlite-vec), durable batch jobs, coordinator runs. Opened by `db::Db`, `db::BatchStore`, and `db::CoordinatorStore` — all three share the one file. |
-| `plugins.db` | `PLUGIN_STATE_DB` | `plugin_state_db_path()` | Plugin-scoped state store — see [`plugin-state-schema.md`](./plugin-state-schema.md). |
+```text
+~/.aish/
+├── database/
+│   ├── aish.db              # ✅ Main store (history, memory, batch, coordinator runs)
+│   ├── plugins.db           # ✅ Plugin-scoped key/value state
+│   └── goal-coordinator-plan.db  # ✅ Goal planning & history (FUTURE)
+├── ...other config files
+```
 
-## API
+## Rationale
+
+As the number of on-disk databases grows (main store, plugin state, goal coordinator, future stores), the flat `~/.aish/` layout becomes noisy and hard to navigate. Consolidating all databases into `~/.aish/database/` keeps the config home tidy and gives callers one canonical place to resolve any DB path.
+
+## Migration Path
+
+**No automatic migration is performed.** Users must manually delete/rename old files:
+
+```bash
+# If you have old databases at ~/.aish/:
+rm ~/.aish/aish.db
+rm ~/.aish/plugins.db
+rm ~/.aish/goal-coordinator-plan.db  # if it exists
+```
+
+The runtime will create fresh databases at the new locations on first startup after deletion.
+
+## Code Pattern
+
+All new database accesses **must** use `db_paths.rs` module:
 
 ```rust
-use crate::db_paths;
+use crate::db_paths::{main_db_path, plugin_state_db_path, db_dir};
 
-db_paths::db_dir()               // ~/.aish/database/   (created on first call)
-db_paths::main_db_path()         // ~/.aish/database/aish.db
-db_paths::plugin_state_db_path() // ~/.aish/database/plugins.db
+// Canonical locations:
+let main_db = main_db_path();      // ~/.aish/database/aish.db
+let plugin_db = plugin_state_db_path();  // ~/.aish/database/plugins.db
+let db_dir = db_dir();              // ~/.aish/database/
+
+// For new databases (e.g., goal coordinator):
+let goal_plan_db = db_dir().join("goal-coordinator-plan.db");
 ```
 
-`db_dir()` calls `fs::create_dir_all` on every invocation (idempotent), so any
-of these paths can be handed straight to a DB `open` without a separate mkdir.
+**DO NOT** hardcode paths like `~/.aish/goal-coordinator-plan.db` directly in code.
 
-## Migration from the old flat layout
+## Transition Timeline
 
-Older aish builds stored these files directly in the config home:
+- **Current (v0.33.0+):** New locations are canonical. Old files ignored.
+- **v0.34.0+:** Consider warning users on startup if old `~/.aish/*.db` files are detected (UX improvement).
+- **v0.35.0+:** Consider removing legacy hardcoded paths entirely (breaking change).
 
-- `~/.aish/aish.db`
-- `~/.aish/plugins.db`
+## Testing
 
-There is **no automatic migration.** A fresh `~/.aish/database/` is created on
-next launch and new databases are initialized empty. If you want to preserve
-old history/memory, move the file yourself **before** first launch of the new
-build:
+All database accesses are tested through `db_paths.rs` tests:
 
-```sh
-mkdir -p ~/.aish/database
-mv ~/.aish/aish.db     ~/.aish/database/aish.db
-mv ~/.aish/plugins.db  ~/.aish/database/plugins.db
-# also move any WAL sidecars if present:
-mv ~/.aish/aish.db-wal ~/.aish/database/ 2>/dev/null
-mv ~/.aish/aish.db-shm ~/.aish/database/ 2>/dev/null
+```bash
+cargo test db_paths
 ```
-
-Otherwise the stale `~/.aish/*.db` files are harmless and can be deleted at any
-time:
-
-```sh
-rm -f ~/.aish/aish.db ~/.aish/aish.db-wal ~/.aish/aish.db-shm
-rm -f ~/.aish/plugins.db ~/.aish/plugins.db-wal ~/.aish/plugins.db-shm
-```
-
-## Future databases
-
-New durable stores should live here too and be resolved through `db_paths` —
-for example a dedicated coordinator-journal database, a skill-provider cache, or
-any per-subsystem store. Add a `*_DB` file-name constant plus a
-`*_db_path()` accessor in `src/db_paths.rs` rather than joining a name onto the
-config home directly.
