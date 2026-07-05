@@ -61,7 +61,8 @@ every coordinator**, not just a new toy tool.
    over a grep loop. *[prompt + docs, free via MCP]*
 5. **Team-shared graph artifact convention** — document
    `.codebase-memory/graph.db.zst` (commit once, teammates skip reindex)
-   alongside the `.repospec.json` habit. *[docs]*
+   alongside the `.repospec.json` habit. *[docs]* — see
+   [`docs/codebase-memory-graph-artifact.md`](../codebase-memory-graph-artifact.md).
 6. **ADR management (optional / stretch)** — surface `manage_adr` so
    architectural decisions persist across sessions, complementing `memory.rs`.
 
