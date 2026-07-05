@@ -115,9 +115,10 @@ See [`AISH.md`](../AISH.md) for the agent-facing overview.
 
 On startup aish parses the metadata for every installed skill. Missing fields
 are **non-fatal**: a skill without `categories`/`applies-to` still loads and
-functions. aish emits a yellow startup notice naming any skill missing both, so
-authors can backfill against this document. There is no crash on a pre-schema
-SKILL.md — the three fields simply default to empty arrays.
+functions, with no startup warning. There is no crash on a pre-schema
+SKILL.md — the three fields simply default to empty arrays. Backfilling
+`categories`/`applies-to` still improves skill-match ranking (see the matching
+notes above), so authors are encouraged to add them against this document.
 
 ## Complete example
 
