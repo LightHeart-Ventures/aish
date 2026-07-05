@@ -1643,7 +1643,6 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("new", "clear conversation history"),
     ("output", "stream coordinators' activity (on|off|auto)"),
     ("plugin", "plugin provenance (list|info <id>)"),
-    ("webhook", "webhook broker client (status|reload|logs [N])"),
     ("quit", "exit aish"),
     ("reasoning", "show reasoning-quality telemetry (escalate vs guess)"),
     ("rename", "rename this session"),
@@ -1675,6 +1674,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ),
     ("update", "upgrade aish to the latest release"),
     ("version", "show aish version + backend"),
+    ("webhook", "webhook broker client (status|reload|logs [N])"),
     (
         "workers",
         "list this session's coordinators (all = every session)",
