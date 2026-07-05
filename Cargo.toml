@@ -28,62 +28,44 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # backend — no C/zlib, already vendored transitively so this edge is free).
 flate2 = "1"
 rustyline = "18.0.0"
-tokio = { version = "1.43", features = ["macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-ansi_term = "0.12"
-strip-ansi-escapes = "0.2"
-log = "0.4"
-env_logger = { version = "0.11", default-features = false }
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.6", features = ["v4", "serde"] }
-# CLI state machine, command history
-indicatif = "0.17"
-duct = "0.13"
-dirs = "5.0"
-# Terminfo parsing
-terminfo = "0.8"
-termios = "0.3"
-# Password prompts (GitHub token entry)
-rpassword = "7.3"
-# Reasoning telemetry (file logging, rotation)
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sqlite-vec = "0.1.6"
+tokio = { version = "1.52.3", features = ["full"] }
+unicode-width = "^0.2"
+urlencoding = "2.1.3"
+uuid = { version = "1", features = ["v4"] }
+miette = { version = "7", features = ["fancy"] }
+thiserror = "2"
 tracing = "0.1"
-tracing-appender = "0.2"
-# MCP transport (json-rpc, stdio stream)
-jsonrpc-lite = "0.6"
-hex = "0.4"
-indexmap = "2.0"
-# Skill compilation and formatting
-markdown = "1.0.0-alpha.16"
-regex-syntax = "0.8"
-# SVG → TEXT art
-svg2polylines = "0.2"
-# Cloud cost analytics (FinOps FOCUS dataset parsing)
-csv = "1.3"
-ipnetwork = "0.21"
-parking_lot = "0.12"
-
-[dev-dependencies]
-tempfile = "3"
-mockall = "0.12"
+# SPR-059 (TASK-264/265): webhook broker client — background WebSocket message
+# loop that dispatches broker-delivered webhooks to plugin handlers. Keeps its
+# default `net` feature (tungstenite transport) on regardless of aish's own
+# `--no-default-features` CI gate, which only toggles aish's `local` feature.
+aish-webhook-client = { path = "crates/aish-webhook-client" }
 
 [features]
-# Opt-in heavy reasoning feature (local llama.cpp):
-# cargo build --release --features reasoning
-# This bundles a 2GB+ llama-cpp binary in the release.
-# For CI (GitHub Actions), we explicitly gate this OFF:
-# cargo build --release --no-default-features
-reasoning = ["llama-cpp-2"]
-# default includes reasoning for local development (for fast reasoning);
-# CI runs with --no-default-features to keep artifacts lean
-default = ["reasoning"]
+default = []
+# Local in-process inference via llama.cpp (GGUF models). Off by default — the
+# native llama.cpp build is heavy; opt in with `cargo build --features local`.
+local = ["dep:llama-cpp-2"]
+cuda = ["llama-cpp-2/cuda"]
 
-[[bin]]
-name = "aish"
-path = "src/main.rs"
+[profile.dev]
+# Full DWARF debuginfo for the whole dependency graph is a major peak-memory
+# contributor during compile + link (and a frequent OOM trigger alongside high
+# parallelism). Line tables still give file:line in backtraces — enough for
+# dev debugging — at a fraction of the memory/IO cost. See .cargo/config.toml
+# for the companion jobs cap.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Native/ML deps (e.g. the llama.cpp bindings) are unusably slow unoptimized — always optimize deps.
+opt-level = 3
 
 [profile.release]
-lto = true
-opt-level = 3
-codegen-units = 1
+# A small, stripped release binary (the same binary a background coordinator job
+# re-execs) without paying for a full opt-level=3 / fat-LTO compile.
+opt-level = 2
+lto = "thin"
 strip = true
