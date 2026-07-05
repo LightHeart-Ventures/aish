@@ -1411,12 +1411,50 @@ fn coordinator_status_message(session: &Session) -> String {
     left = recent_message_row(left, session.flash.lock().ok().and_then(|b| b.clone()));
     // Right-justify the session name (`:rename`) on this row, directly above the
     // clock on the statusline below — in bold magenta. Blank when unnamed.
+    // Append live status badges to the RIGHT of the name: 🤖 when a background
+    // coordinator is still working, ⏰ when an `:alert` monitor is armed, 🎯 when
+    // a goal is active. Only shown when the session is named (there's no label
+    // to hang them off otherwise).
+    let decorated = session.name.as_ref().map(|n| {
+        let mut s = n.clone();
+        let badges = status_badges(session, &workers);
+        if !badges.is_empty() {
+            s.push(' ');
+            s.push_str(&badges);
+        }
+        s
+    });
     crate::style::second_statusline_at(
         &left,
-        session.name.as_deref(),
+        decorated.as_deref(),
         crate::style::footer_width(),
         color_on,
     )
+}
+
+/// Compose the live status-badge suffix appended to the right of the `:rename`
+/// label on the SecondStatusLine: 🤖 when any background coordinator is still
+/// running (non-terminal), ⏰ when at least one `:alert` monitor is armed, and
+/// 🎯 when a goal is active. Order is fixed (workers · alert · goal); each badge
+/// is a single 2-col emoji joined by a space. Empty string when none apply.
+fn status_badges(session: &Session, workers: &[(String, bool, String)]) -> String {
+    let mut badges: Vec<&str> = Vec::new();
+    if workers.iter().any(|(_, terminal, _)| !terminal) {
+        badges.push("🤖");
+    }
+    let alert_active = session
+        .alert_store
+        .as_ref()
+        .and_then(|s| s.armed_alerts().ok())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if alert_active {
+        badges.push("⏰");
+    }
+    if session.active_goal().is_some() {
+        badges.push("🎯");
+    }
+    badges.join(" ")
 }
 
 /// Max visible width of the task-hint suffix appended to an attached
@@ -9879,6 +9917,19 @@ mod tests {
         let d = dispatch_coordinator("fix the failing test", &mut session);
         assert!(d.id.is_none(), "nested dispatch must not spawn");
         assert!(d.message.contains("nested"), "{}", d.message);
+    }
+
+    #[test]
+    fn status_badges_reflects_active_workers() {
+        let session = Session::new().unwrap();
+        // No workers, no alert, no goal → no badges.
+        assert_eq!(status_badges(&session, &[]), "");
+        // A terminal (finished) worker contributes no robot badge.
+        let done = vec![("w1".to_string(), true, "task".to_string())];
+        assert_eq!(status_badges(&session, &done), "");
+        // A live (non-terminal) worker shows the robot badge.
+        let live = vec![("w2".to_string(), false, "task".to_string())];
+        assert_eq!(status_badges(&session, &live), "🤖");
     }
 
     #[test]
