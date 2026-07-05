@@ -11,6 +11,16 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 const MAX_OUTPUT: usize = 50_000; // bytes of program output fed back to the model
 const MAX_FILE_READ: usize = 100_000;
+/// TASK-322: whole-file reads larger than this are rejected by the tool layer —
+/// the agent must pass `line_start`/`line_end` to slice the file (or use
+/// `grep_files` to locate the region first). Bulk unranged reads blow the
+/// model's context budget; a ranged read is always cheaper. A file of EXACTLY
+/// this size still reads whole; one byte over is rejected.
+const RANGED_READ_MAX_BYTES: usize = 5 * 1024; // 5 KiB
+/// TASK-322: default cap on the number of entries `list_dir` returns before it
+/// truncates and warns. Overridable per-call via the `max` arg. Bans a single
+/// listing of a huge directory from flooding the model's context.
+const LIST_DIR_MAX_ENTRIES: usize = 1000;
 const DEFAULT_TIMEOUT_SECS: u64 = 120; // run_program kill deadline unless the call overrides it
 const MAX_TIMEOUT_SECS: u64 = 3600;
 // After the child exits, wait this long for its pipes to EOF — a daemonized
@@ -2874,6 +2884,20 @@ fn read_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) 
         return Ok(truncate_middle(format!("{header}{sliced}"), MAX_FILE_READ));
     }
 
+    // TASK-322 system-level enforcement: a whole-file read of a file larger than
+    // RANGED_READ_MAX_BYTES is rejected at the tool layer. The agent must pass
+    // line_start/line_end to read a slice, or grep_files to find the region of
+    // interest first. Files at or below the cap read whole (back-compat).
+    if content.len() > RANGED_READ_MAX_BYTES {
+        return Err(anyhow::anyhow!(
+            "{} is {} bytes (> {} KiB): bulk reads without line bounds are disallowed. \
+Pass line_start/line_end to read a slice, or use grep_files to locate the region first.",
+            full.display(),
+            content.len(),
+            RANGED_READ_MAX_BYTES / 1024,
+        ));
+    }
+
     Ok(truncate_middle(content, MAX_FILE_READ))
 }
 
@@ -3121,6 +3145,9 @@ fn edit_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) 
 
 fn list_dir(call: &ToolCall, session: &Session) -> Result<(String, serde_json::Value)> {
     let path = call.args["path"].as_str().unwrap_or(".");
+    // TASK-322: cap the number of entries returned (overridable via `max`) so a
+    // single listing of a huge directory can't flood the model's context.
+    let max = call.args["max"].as_u64().unwrap_or(LIST_DIR_MAX_ENTRIES as u64) as usize;
     let full = resolve(session, path);
     // Each row carries its rendered line (the source of truth) and the typed
     // record built from the SAME metadata, so the text and JSON can never drift.
@@ -3151,11 +3178,24 @@ fn list_dir(call: &ToolCall, session: &Session) -> Result<(String, serde_json::V
         rows.push((line, serde_json::Value::Object(rec)));
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
-    let payload = serde_json::Value::Array(rows.iter().map(|(_, v)| v.clone()).collect());
     if rows.is_empty() {
-        return Ok(("[empty directory]".into(), payload));
+        return Ok(("[empty directory]".into(), serde_json::Value::Array(vec![])));
     }
-    let text = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
+    // TASK-322: cap oversized listings. Truncate BOTH the text and the JSON
+    // payload to the same `max` entries and warn so the agent narrows the path
+    // (or re-lists with a higher `max`) instead of drowning in output.
+    let total = rows.len();
+    let truncated = total > max;
+    if truncated {
+        rows.truncate(max);
+    }
+    let payload = serde_json::Value::Array(rows.iter().map(|(_, v)| v.clone()).collect());
+    let mut text = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
+    if truncated {
+        text.push_str(&format!(
+            "\n…[showing {max} of {total} entries; narrow the path or pass a higher `max`]"
+        ));
+    }
     Ok((truncate_middle(text, MAX_OUTPUT), payload))
 }
 
@@ -5189,6 +5229,77 @@ mod fileops_tests {
         let arr = r.structured.as_ref().expect("list_dir carries a payload").as_array().unwrap().clone();
         assert!(arr.iter().any(|e| e["name"] == "f.txt" && e["type"] == "file" && e["size"] == 3));
         assert!(arr.iter().any(|e| e["name"] == "sub" && e["type"] == "dir" && e["size"].is_null()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // TASK-322: a whole-file read of a file EXACTLY at the cap still reads
+    // whole; one byte over is rejected unless line bounds are supplied.
+    #[tokio::test]
+    async fn read_file_ranged_read_enforcement() {
+        let dir = tmp("rangedread");
+        let mut s = yolo_session(&dir);
+
+        // Exactly RANGED_READ_MAX_BYTES (5 KiB) — reads whole.
+        std::fs::write(dir.join("at_cap"), vec![b'a'; RANGED_READ_MAX_BYTES]).unwrap();
+        let r = run(&mut s, "read_file", json!({"path": "at_cap"})).await;
+        assert!(!r.is_error, "file at cap must read whole: {}", r.content);
+        assert_eq!(r.content.len(), RANGED_READ_MAX_BYTES);
+
+        // One byte over — rejected without line bounds.
+        std::fs::write(dir.join("over_cap"), vec![b'a'; RANGED_READ_MAX_BYTES + 1]).unwrap();
+        let r = run(&mut s, "read_file", json!({"path": "over_cap"})).await;
+        assert!(r.is_error, "file over cap must be rejected: {}", r.content);
+        assert!(r.content.contains("bulk reads without line bounds are disallowed"), "{}", r.content);
+
+        // Same oversized file reads fine WITH line bounds.
+        let mut big = String::new();
+        for i in 0..2000 {
+            big.push_str(&format!("line {i}\n"));
+        }
+        assert!(big.len() > RANGED_READ_MAX_BYTES);
+        std::fs::write(dir.join("big"), big.as_bytes()).unwrap();
+        let r = run(&mut s, "read_file", json!({"path": "big", "line_start": 1, "line_end": 3})).await;
+        assert!(!r.is_error, "ranged read of large file must succeed: {}", r.content);
+        assert!(r.content.contains("line 0") && r.content.contains("line 2"), "{}", r.content);
+
+        // Empty file reads whole (below cap).
+        std::fs::write(dir.join("empty"), b"").unwrap();
+        let r = run(&mut s, "read_file", json!({"path": "empty"})).await;
+        assert!(!r.is_error, "empty file must read: {}", r.content);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // TASK-322: an oversized listing truncates to `max` and warns.
+    #[tokio::test]
+    async fn list_dir_caps_and_warns() {
+        let dir = tmp("listcap");
+        for i in 0..10 {
+            std::fs::write(dir.join(format!("f{i:02}")), b"x").unwrap();
+        }
+        let mut s = yolo_session(&dir);
+        let r = run(&mut s, "list_dir", json!({"max": 3})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("showing 3 of 10 entries"), "{}", r.content);
+        // JSON payload is truncated to the same cap.
+        let arr = r.structured.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 3, "payload truncated to max");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // TASK-322: glob_expand truncates to `max` and appends the warning marker.
+    #[tokio::test]
+    async fn glob_expand_caps_and_warns() {
+        let dir = tmp("globcap");
+        for i in 0..10 {
+            std::fs::write(dir.join(format!("g{i:02}.txt")), b"x").unwrap();
+        }
+        let mut s = yolo_session(&dir);
+        let r = run(&mut s, "glob_expand", json!({"pattern": "*.txt", "max": 4})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("results truncated"), "{}", r.content);
+        let arr = r.structured.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 4, "payload truncated to max");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
