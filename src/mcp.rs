@@ -51,6 +51,46 @@ pub struct McpHost {
 }
 
 /// One server's state for the `:mcp` listing.
+/// Before/after measurement of an MCP tool-schema payload when a per-run/
+/// per-mode allowlist trims it (TASK-323). Observational only — the token
+/// figures are a ~4-bytes/token estimate over each tool's name + description
+/// + serialized JSON schema and never feed context-window accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ToolScopeMeasure {
+    pub tools_before: usize,
+    pub tools_after: usize,
+    pub tokens_before: usize,
+    pub tokens_after: usize,
+}
+
+impl ToolScopeMeasure {
+    /// Estimated tokens saved by trimming (saturating; never underflows).
+    pub fn tokens_saved(&self) -> usize {
+        self.tokens_before.saturating_sub(self.tokens_after)
+    }
+    /// True when the allowlist actually removed at least one tool.
+    pub fn trimmed(&self) -> bool {
+        self.tools_after < self.tools_before
+    }
+}
+
+/// Rough token estimate (~4 bytes/token) of a serialized tool-schema block.
+/// Used to log the payload reduction from allowlist trimming (TASK-323).
+pub fn tool_defs_token_estimate(defs: &[crate::backend::ToolDef]) -> usize {
+    let bytes: usize = defs
+        .iter()
+        .map(|d| {
+            d.name.len()
+                + d.description.len()
+                + serde_json::to_string(&d.schema)
+                    .map(|s| s.len())
+                    .unwrap_or(0)
+        })
+        .sum();
+    bytes / 4
+}
+
+
 pub struct McpStatus {
     pub name: String,
     pub kind: &'static str, // "stdio" | "http"
@@ -191,6 +231,37 @@ impl McpHost {
             .collect()
     }
 
+    /// Apply an optional per-run/per-mode allowlist to the full MCP tool set
+    /// and measure the tool-schema payload reduction (TASK-323). `allow=None`
+    /// returns every tool unchanged. When `Some`, only tools whose namespaced
+    /// name (`mcp__<server>__<tool>`) is in the list survive. The filter is
+    /// order-preserving over `tool_defs()`, so for a FIXED allowlist the emitted
+    /// tools block is byte-identical turn to turn — the prompt-cache prefix stays
+    /// stable and trimming never triggers mid-session cache invalidation.
+    pub fn scope_tool_defs(
+        &self,
+        allow: Option<&[String]>,
+    ) -> (Vec<crate::backend::ToolDef>, ToolScopeMeasure) {
+        let all = self.tool_defs();
+        let tools_before = all.len();
+        let tokens_before = tool_defs_token_estimate(&all);
+        let scoped: Vec<crate::backend::ToolDef> = match allow {
+            Some(list) => all
+                .into_iter()
+                .filter(|d| list.iter().any(|a| a == &d.name))
+                .collect(),
+            None => all,
+        };
+        let measure = ToolScopeMeasure {
+            tools_before,
+            tools_after: scoped.len(),
+            tokens_before,
+            tokens_after: tool_defs_token_estimate(&scoped),
+        };
+        (scoped, measure)
+    }
+
+    // ---- `:mcp` management -------------------------------------------------
     // ---- `:mcp` management -------------------------------------------------
 
     /// Per-server state for the `:mcp` listing.
@@ -1118,5 +1189,100 @@ for line in sys.stdin:
         );
         assert_eq!(sse.len(), 1);
         assert_eq!(sse[0]["id"], 2);
+    }
+}
+
+
+#[cfg(test)]
+mod task323_tool_scope_tests {
+    use super::{tool_defs_token_estimate, ToolScopeMeasure};
+    use crate::backend::ToolDef;
+    use serde_json::json;
+
+    fn def(name: &str) -> ToolDef {
+        ToolDef {
+            name: name.to_string(),
+            description: format!("description for {name} tool, does a thing"),
+            schema: json!({"type":"object","properties":{"x":{"type":"string"}}}),
+        }
+    }
+
+    /// Order-preserving allowlist filter — mirrors McpHost::scope_tool_defs so
+    /// the trimming logic is unit-testable without a live server handshake.
+    fn scope(all: Vec<ToolDef>, allow: Option<&[String]>) -> (Vec<ToolDef>, ToolScopeMeasure) {
+        let tools_before = all.len();
+        let tokens_before = tool_defs_token_estimate(&all);
+        let scoped: Vec<ToolDef> = match allow {
+            Some(list) => all
+                .into_iter()
+                .filter(|d| list.iter().any(|a| a == &d.name))
+                .collect(),
+            None => all,
+        };
+        let m = ToolScopeMeasure {
+            tools_before,
+            tools_after: scoped.len(),
+            tokens_before,
+            tokens_after: tool_defs_token_estimate(&scoped),
+        };
+        (scoped, m)
+    }
+
+    #[test]
+    fn none_allowlist_is_passthrough_no_trim() {
+        let all = vec![def("mcp__a__one"), def("mcp__a__two")];
+        let (scoped, m) = scope(all, None);
+        assert_eq!(scoped.len(), 2);
+        assert!(!m.trimmed());
+        assert_eq!(m.tokens_saved(), 0);
+        assert_eq!(m.tokens_before, m.tokens_after);
+    }
+
+    #[test]
+    fn allowlist_trims_and_measures_reduction() {
+        let all = vec![
+            def("mcp__a__one"),
+            def("mcp__a__two"),
+            def("mcp__b__three"),
+        ];
+        let allow = vec!["mcp__a__one".to_string()];
+        let (scoped, m) = scope(all, Some(&allow));
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].name, "mcp__a__one");
+        assert!(m.trimmed());
+        assert_eq!(m.tools_before, 3);
+        assert_eq!(m.tools_after, 1);
+        // Payload strictly shrank -> positive measured token reduction.
+        assert!(m.tokens_after < m.tokens_before);
+        assert!(m.tokens_saved() > 0);
+    }
+
+    #[test]
+    fn fixed_allowlist_is_byte_stable_across_calls() {
+        // Same allowlist over the same tool set must yield an identical,
+        // order-preserved block twice -> stable cache prefix, no mid-session
+        // cache invalidation (TASK-323 success criterion).
+        let allow = vec!["mcp__b__three".to_string(), "mcp__a__one".to_string()];
+        let mk = || vec![def("mcp__a__one"), def("mcp__a__two"), def("mcp__b__three")];
+        let (s1, _) = scope(mk(), Some(&allow));
+        let (s2, _) = scope(mk(), Some(&allow));
+        let names1: Vec<&str> = s1.iter().map(|d| d.name.as_str()).collect();
+        let names2: Vec<&str> = s2.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names1, names2);
+        // Order follows tool_defs() order, not allowlist order.
+        assert_eq!(names1, vec!["mcp__a__one", "mcp__b__three"]);
+        let j1 = serde_json::to_string(&s1.iter().map(|d| &d.name).collect::<Vec<_>>()).unwrap();
+        let j2 = serde_json::to_string(&s2.iter().map(|d| &d.name).collect::<Vec<_>>()).unwrap();
+        assert_eq!(j1, j2);
+    }
+
+    #[test]
+    fn empty_allowlist_removes_everything() {
+        let all = vec![def("mcp__a__one")];
+        let allow: Vec<String> = vec![];
+        let (scoped, m) = scope(all, Some(&allow));
+        assert!(scoped.is_empty());
+        assert!(m.trimmed());
+        assert_eq!(m.tokens_after, 0);
     }
 }

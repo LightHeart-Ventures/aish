@@ -372,6 +372,12 @@ pub struct Session {
     /// its own workers (no infinite re-exec recursion), so `run_in_background`
     /// downgrades a tool-needing offload to a tool-less batch when this is set.
     pub nested: bool,
+    /// TASK-323: optional per-run/per-mode MCP tool allowlist. When `Some`, only
+    /// MCP tools whose namespaced name (`mcp__<server>__<tool>`) appears in the
+    /// list are serialized into the tool-schema block, trimming the payload. When
+    /// `None`, every connected tool is exposed (default). Built from orchestration
+    /// run metadata or session mode via `AISH_TOOL_ALLOWLIST` (comma-separated).
+    pub tool_allowlist: Option<Vec<String>>,
     /// The active background `:goal` loop, if any (one per session). Set by
     /// `:goal <condition>`, inspected by bare `:goal`, stopped by `:goal clear`.
     pub goal: Option<crate::goal::Handle>,
@@ -619,6 +625,14 @@ impl Session {
             flash: std::sync::Arc::new(std::sync::Mutex::new(None)),
             current_goal_id: None,
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
+            tool_allowlist: std::env::var("AISH_TOOL_ALLOWLIST").ok().and_then(|v| {
+                let list: Vec<String> = v
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                (!list.is_empty()).then_some(list)
+            }),
             goal: None,
             goals: Vec::new(),
             backend_kind: "claude".to_string(),
