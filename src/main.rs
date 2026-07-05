@@ -542,6 +542,13 @@ async fn main() -> Result<()> {
     } else {
         let refs: Vec<&Path> = mcp_paths.iter().map(|p| p.as_path()).collect();
         session.mcp = mcp::McpHost::start(&refs).await;
+        // One-shot / coordinator run: no interactive statusline to surface a
+        // "statusline alert" on, so flush any skipped-server notices to stderr
+        // (the interactive REPL routes these to the SecondStatusLine + `:activity`
+        // instead — see `surface_mcp_skips`).
+        for line in session.mcp.take_skipped() {
+            eprintln!("\x1b[33maish:\x1b[0m {line}");
+        }
         timer.mark("MCP connect");
         let local = skills::load_catalog(&skills_dir);
         session.skills_prompt = skills::render_prompt_section(&local, &session.mcp.skills());
