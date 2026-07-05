@@ -251,6 +251,15 @@ async fn run_turn_inner(
     let mut batch_guard = crate::loopguard::BatchGuard::default();
     let mut pending_batch_nudge: Option<String> = None;
 
+    // TASK-358: serial-chain depth yield. Tracks the current run of consecutive
+    // single-tool-call rounds ACROSS iterations of this turn (unlike the
+    // round-local guards above). A deep serial chain (grep→read→edit→run→…)
+    // drains the rate-limit window — every round re-sends the whole context —
+    // even when the calls differ (not a loop) and the budget is not yet spent.
+    // Past `SERIAL_CHAIN_YIELD_DEPTH` the turn yields with a resumable banner so
+    // the durable coordinator loop checkpoints and re-plans toward batching.
+    let mut serial_chain_guard = crate::loopguard::SerialChainGuard::default();
+
     for iteration in 1..=MAX_ITERATIONS {
         // ── Operator interrupt seam (Ctrl-C on an `:attach`ed worker). A
         // coordinator installs a SIGINT handler that latches an interrupt flag
@@ -464,6 +473,20 @@ async fn run_turn_inner(
                 );
                 pending_batch_nudge = Some(nudge);
             }
+        }
+
+        // TASK-358: record this round's tool-call shape for serial-chain depth.
+        // A round with exactly one call EXTENDS the chain; a batched (≥2) or
+        // no-call round RESETS it. When the chain first exceeds
+        // `SERIAL_CHAIN_YIELD_DEPTH` we still let THIS round's call execute below
+        // (so the tool_use is paired with its tool_result and history stays
+        // well-formed), then yield AFTER the round — see the `serial_yield`
+        // check past the tool loop.
+        let serial_yield = serial_chain_guard.record(turn.tool_calls.len());
+        if let Some(depth) = serial_yield {
+            eprintln!(
+                "\x1b[2m  ⚠ serial-chain-guard: {depth} consecutive single-call rounds — yielding to re-plan toward batching\x1b[0m"
+            );
         }
 
         let mut results: Vec<ToolResult> = Vec::with_capacity(turn.tool_calls.len());
@@ -690,6 +713,26 @@ async fn run_turn_inner(
             eprintln!("\x1b[2maish: {}\x1b[0m", reason.log_line());
             let partial = if turn.text.trim().is_empty() {
                 "Stopped by the loop guard before a final answer was produced.".to_string()
+            } else {
+                turn.text.clone()
+            };
+            return Ok(crate::loopguard::with_banner(&reason, &partial));
+        }
+
+        // TASK-358: deep serial chain this turn → graceful yield with a resumable
+        // banner. Fires AFTER the round's tool_results are appended (history is
+        // well-formed) and after the loop_break check (a confirmed loop is the
+        // more specific stop and takes precedence). The coordinator classifies
+        // `serial-chain-yield` as a Resume disposition, so the next round picks up
+        // from the checkpoint and re-plans toward batching independent calls.
+        if let Some(depth) = serial_yield {
+            let reason = crate::loopguard::ExitReason::SerialChainYield { depth };
+            eprintln!("\x1b[2maish: {}\x1b[0m", reason.log_line());
+            let partial = if turn.text.trim().is_empty() {
+                format!(
+                    "Yielded after a deep serial call chain ({depth} consecutive single-call \
+rounds) to re-plan toward batching independent calls."
+                )
             } else {
                 turn.text.clone()
             };
