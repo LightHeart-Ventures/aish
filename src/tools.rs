@@ -1972,6 +1972,40 @@ short, natural sentence that you're working on it and the answer will appear her
     // process's spawn budget is exhausted. Only the worker-spawn path is gated —
     // the tool-less batch tier above returns before here, and a batch offload is
     // an API call, not a host fork, so it carries no fork-bomb risk.
+    // ── Host-brokered sibling spawn (PR #597 follow-up: the EMIT SITE) ────────
+    // When we ARE a nested coordinator AND the spawn broker is enabled, do NOT
+    // fork / docker-run the sibling ourselves. Emit a non-secret `SpawnRequest`
+    // into the mounted state spool for the HOST `aish` to service as a FLAT
+    // sibling — no docker-in-docker, and host cleanup + observability see every
+    // coordinator. On ANY emit failure we fall through to the legacy in-process
+    // path so a broker hiccup never silently drops the user's work.
+    if session.nested && crate::spawn_broker::broker_enabled() {
+        let isolate = call.args["isolate"].as_bool().unwrap_or(true);
+        let base = match call.args["base"].as_str() {
+            Some(b) if b.eq_ignore_ascii_case("head") => "head",
+            _ => "main",
+        };
+        match crate::worker::emit_spawn_request(session, task, isolate, base) {
+            Ok(path) => {
+                let fname = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                return Ok(format!(
+                    "Queued a background coordinator via the host spawn-broker (flat sibling; full \
+toolset + MCP in this directory). The host launches it and its result auto-delivers here when it's \
+done — do NOT poll for it. Spool request: {fname}. Now reply to the user with one short, natural \
+sentence that you're on it and the answer will appear when ready."
+                ));
+            }
+            Err(e) => {
+                eprintln!(
+                    "aish: spawn-broker emit failed ({e}); falling back to in-process coordinator"
+                );
+            }
+        }
+    }
+
     crate::worker::spawn_budget_gate().map_err(|e| anyhow::anyhow!(e))?;
 
     let exe = std::env::current_exe()
