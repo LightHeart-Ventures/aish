@@ -28,7 +28,7 @@ concurrency:
 jobs:
   verify-version:
     name: verify version match
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
@@ -78,7 +78,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: aish-aarch64-apple-darwin
-          - os: ubuntu-latest
+          - os: blacksmith-4vcpu-ubuntu-2404
             target: x86_64-unknown-linux-gnu
             asset: aish-x86_64-unknown-linux-gnu
     steps:
@@ -132,7 +132,7 @@ jobs:
   release:
     name: publish release
     needs: [verify-version, build]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
 

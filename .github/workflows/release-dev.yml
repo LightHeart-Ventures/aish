@@ -54,7 +54,7 @@ concurrency:
 jobs:
   setup:
     name: resolve build matrix
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
       expected_assets: ${{ steps.set.outputs.expected_assets }}
@@ -88,7 +88,7 @@ jobs:
           # Scheduled runs carry no input → default to linux-only.
           platforms="${{ github.event.inputs.platforms || 'linux' }}"
 
-          linux='{"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","asset":"aish-x86_64-unknown-linux-gnu"}'
+          linux='{"os":"blacksmith-4vcpu-ubuntu-2404","target":"x86_64-unknown-linux-gnu","asset":"aish-x86_64-unknown-linux-gnu"}'
           macos_x86='{"os":"macos-latest","target":"x86_64-apple-darwin","asset":"aish-x86_64-apple-darwin"}'
           macos_arm='{"os":"macos-latest","target":"aarch64-apple-darwin","asset":"aish-aarch64-apple-darwin"}'
 
@@ -263,7 +263,7 @@ jobs:
     name: publish dev release
     needs: [setup, build]
     if: needs.setup.result == 'success' && needs.build.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
 
@@ -336,7 +336,7 @@ jobs:
   prune:
     name: prune old dev releases
     needs: release
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: always()
     steps:
       - name: Prune releases older than 5 latest
