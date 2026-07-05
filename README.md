@@ -232,12 +232,44 @@ table of defaults and how to force a fresh update check / reasoning rescan.
 · `:yolo` — shorthand for `:mode yolo`
 · `:new` — start a fresh session
 · `:goal <new|show|status|link|block|unblock|milestone|complete>` — manage long-horizon goals (see [Goals](#goals--long-horizon-work-with-goal))
+· `:webhook <status|reload|logs [N]>` — inspect the webhook broker client (see [Webhook Integration](#webhook-integration))
 · `:help` — show all commands
 · `:quit` (or Ctrl-D / `exit`) — exit
 
 Ctrl-C aborts the current turn; during TTY hand-off (interactive programs like
 `vim`, `ssh`) it interrupts the foreground child, exactly like a shell.
 `→`/`Ctrl-F` accept history ghost-text suggestions.
+
+## Webhook Integration
+
+aish can connect to an external webhook broker to receive real-time events
+(card moves, orchestration runs, alerts) and dispatch them to registered
+handlers. The integration is **opt-in** and **lazy** — it does nothing unless
+`WEBHOOK_BROKER_URL` is set in the environment when the REPL starts.
+
+```bash
+# Enable the webhook client for this session
+export WEBHOOK_BROKER_URL="wss://broker.example.com/tenant/t_abc123/stream"
+aish
+# → 🪝 webhook: connecting to wss://broker.example.com/… (tenant t_abc123, N handler(s))
+```
+
+On startup aish spawns a non-blocking background task that maintains the broker
+connection and drains the message loop; it never blocks the prompt. The client
+is stored in session state and shut down cleanly on `:quit`.
+
+### `:webhook` commands
+
+| Command | Description |
+| --- | --- |
+| `:webhook status` | Connection state (connected/disconnected), broker URL, uptime, handler count |
+| `:webhook reload` | Manually reconnect and reload handlers from installed plugins |
+| `:webhook logs [N]` | Show the last N received events (default 20) |
+
+When `WEBHOOK_BROKER_URL` is unset, `:webhook status` reports
+`not configured` and no connection is attempted — zero cost in the common case.
+Nested background coordinators skip the broker entirely (it's an
+interactive-session affordance).
 
 ## Goals — long-horizon work with `:goal`
 

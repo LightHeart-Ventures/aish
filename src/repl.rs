@@ -183,6 +183,20 @@ pub async fn run(
             .fire_observe(crate::hooks::HookEvent::SessionStart, p);
     }
 
+    // SPR-059 (TASK-264/265): connect to the webhook broker when
+    // WEBHOOK_BROKER_URL is set. Skipped in nested background coordinators — the
+    // broker client is an interactive-session affordance. Soft no-op (returns
+    // None) when the env var is unset, which is the common case.
+    if !session.nested {
+        if let Some(h) = crate::webhook::WebhookHandle::spawn_from_env() {
+            println!(
+                "\x1b[2m🪝 webhook: connecting to {} (tenant {}, {} handler(s))\x1b[0m",
+                h.broker_url, h.tenant_id, h.handler_count
+            );
+            session.webhook = Some(h);
+        }
+    }
+
     // Install the process-wide SIGINT handler up front. A Ctrl-C during a
     // direct-dispatch child is delivered by the terminal straight to that child's
     // own process group (it leads its own pgrp and owns the tty via tcsetpgrp), so
@@ -1660,6 +1674,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ),
     ("update", "upgrade aish to the latest release"),
     ("version", "show aish version + backend"),
+    ("webhook", "webhook broker client (status|reload|logs [N])"),
     (
         "workers",
         "list this session's coordinators (all = every session)",
@@ -6475,7 +6490,47 @@ async fn handle_colon(
 ) -> bool {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
-        Some("q" | "quit" | "exit") => return true,
+        Some("q" | "quit" | "exit") => {
+            // SPR-059: stop the webhook broker service gracefully before exit.
+            if let Some(h) = &session.webhook {
+                h.shutdown();
+            }
+            return true;
+        }
+        Some("webhook") => match parts.next() {
+            None | Some("status") => match &session.webhook {
+                Some(h) => println!("\x1b[2m{}\x1b[0m", h.status_lines()),
+                None => println!(
+                    "\x1b[2m🪝 webhook: not configured — set WEBHOOK_BROKER_URL and restart to enable\x1b[0m"
+                ),
+            },
+            Some("reload") => match crate::webhook::reload(&mut session.webhook) {
+                Ok(n) => println!("\x1b[32m🪝\x1b[0m webhook reloaded — {n} handler(s) from plugins"),
+                Err(e) => println!("\x1b[33m🪝\x1b[0m {e}"),
+            },
+            Some("logs") => {
+                let n = parts
+                    .next()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(20);
+                match &session.webhook {
+                    Some(h) => {
+                        let logs = h.recent_logs(n);
+                        if logs.is_empty() {
+                            println!("\x1b[2mno webhook events yet\x1b[0m");
+                        } else {
+                            for r in &logs {
+                                println!("\x1b[2m{}\x1b[0m", crate::webhook::fmt_record(r));
+                            }
+                        }
+                    }
+                    None => println!("\x1b[2m🪝 webhook: not configured\x1b[0m"),
+                }
+            }
+            Some(other) => println!(
+                "\x1b[2musage: :webhook [status|reload|logs [N]]  (unknown subcommand: {other})\x1b[0m"
+            ),
+        },
         Some("loop") => match parts.next() {
             // Bare `:loop` or `:loop status` — report the active loop, if any.
             None | Some("status") => println!("\x1b[2m{}\x1b[0m", session.loop_status()),
