@@ -102,6 +102,12 @@ struct Inner {
     /// Shift-Tab so the goal's history renders like a worker's. Capped at
     /// [`TRANSCRIPT_CAP`] lines.
     transcript: Vec<String>,
+    /// Operator steer mailbox — instructions queued via `:tell goal <msg>` or by
+    /// typing while `:attach`ed to the goal. Drained at the START of each turn
+    /// (see [`GoalLoop::take_steers`]) and folded into that turn's generator
+    /// directive by [`compose_guidance`], so the human can course-correct a
+    /// running goal mid-flight the way `:tell` steers a coordinator. FIFO.
+    steers: Vec<String>,
 }
 
 pub type Handle = Arc<GoalLoop>;
@@ -121,6 +127,36 @@ impl GoalLoop {
         if i.status == Status::Active {
             i.status = Status::Cleared;
         }
+    }
+
+    /// Queue an operator steer instruction (`:tell goal <msg>` or a line typed
+    /// while `:attach`ed to the goal). Folded into the NEXT turn's generator
+    /// directive so the human can course-correct a running goal without killing
+    /// it — the goal analogue of `:tell`-ing a coordinator. Returns `false`
+    /// (nothing queued) when the message is blank or the loop is no longer
+    /// active, so the caller can tell the operator there was nothing to steer.
+    pub fn steer(&self, msg: &str) -> bool {
+        let msg = msg.trim();
+        if msg.is_empty() {
+            return false;
+        }
+        {
+            let mut i = self.inner.lock().unwrap();
+            if i.status != Status::Active || i.cancel {
+                return false;
+            }
+            i.steers.push(msg.to_string());
+        }
+        self.note(&format!("operator steer queued: {msg}"));
+        true
+    }
+
+    /// Drain the pending operator steer messages (FIFO). Called once at the top
+    /// of each turn so a steer applies to the turn it precedes and is not
+    /// replayed on later turns (one-shot, like a coordinator `:tell`).
+    fn take_steers(&self) -> Vec<String> {
+        let mut i = self.inner.lock().unwrap();
+        std::mem::take(&mut i.steers)
     }
 
     /// Fire a goal-lifecycle hook (observe-only, best-effort, off the hot path).
@@ -290,6 +326,7 @@ pub fn spawn(
             turn_started: None,
             phase: Step::Idle,
             transcript: Vec::new(),
+            steers: Vec::new(),
         }),
     });
     tokio::spawn(run_goal(goal.clone(), spec, model, cred));
@@ -401,6 +438,33 @@ pub(crate) fn goal_condition_from_directive(task: &str) -> Option<String> {
     Some(condition.to_string())
 }
 
+/// Merge the carried-forward verifier guidance with any fresh operator steer
+/// messages (`:tell goal <msg>` or input typed while `:attach`ed) into the
+/// single `guidance` string folded into this turn's generator directive.
+///
+/// Steer text is framed as a priority operator instruction. When a verifier
+/// note is also pending, both are carried (steer first, since an explicit human
+/// course-correction outranks the machine judge's last critique). Returns `None`
+/// when there is neither, so the first unsteered turn's directive stays clean
+/// and [`goal_condition_from_directive`] recovers a bare condition. Routed
+/// through the SAME [`GOAL_DIRECTIVE_GUIDANCE_MARKER`] channel as verifier
+/// feedback, so the `:workers` reverse-parser strips it identically and the
+/// goal-coalescing key stays stable regardless of steer content.
+pub(crate) fn compose_guidance(verifier: Option<&str>, steers: &[String]) -> Option<String> {
+    if steers.is_empty() {
+        return verifier.map(str::to_string);
+    }
+    let joined = steers.join(" | ");
+    let steer_block = format!(
+        "the operator steered this goal mid-flight — treat this as a priority \
+         instruction and fold it into your approach: {joined}"
+    );
+    match verifier {
+        Some(v) if !v.is_empty() => Some(format!("{steer_block}\n\n(prior verifier note: {v})")),
+        _ => Some(steer_block),
+    }
+}
+
 /// Terminal outcome of a goal pursuit, surfaced on the `GoalEnd` hook payload.
 struct GoalOutcome {
     /// Wire status: `"achieved"` | `"failed"` | `"cleared"`.
@@ -477,8 +541,20 @@ async fn run_goal_loop(
             i.turns
         };
 
+        // Fold any operator steer messages (`:tell goal` / typed input while
+        // `:attach`ed) into this turn's guidance so the human can course-correct
+        // a running goal mid-flight. Drained one-shot; `guidance` (verifier
+        // feedback) still carries across turns independently.
+        let steers = goal.take_steers();
+        if !steers.is_empty() {
+            goal.note(&format!(
+                "turn {turn}: folding {} operator steer(s) into this turn",
+                steers.len()
+            ));
+        }
+        let effective = compose_guidance(guidance.as_deref(), &steers);
         // Generator: a full-tool worker pursues the goal with the latest guidance.
-        let directive = goal_directive(&goal.condition, guidance.as_deref());
+        let directive = goal_directive(&goal.condition, effective.as_deref());
         goal.note(&format!("turn {turn}: working…"));
         {
             let mut i = goal.inner.lock().unwrap();
@@ -1218,8 +1294,80 @@ mod tests {
                 turn_started: turn_started.then(Instant::now),
                 phase,
                 transcript: Vec::new(),
+                steers: Vec::new(),
             }),
         }
+    }
+
+    // compose_guidance: no verifier note and no steers → clean (None) so the
+    // first turn's directive recovers a bare condition.
+    #[test]
+    fn compose_guidance_empty_is_none() {
+        assert_eq!(compose_guidance(None, &[]), None);
+    }
+
+    // Verifier feedback with no steer is carried through verbatim.
+    #[test]
+    fn compose_guidance_verifier_only_passthrough() {
+        assert_eq!(
+            compose_guidance(Some("tighten the error handling"), &[]),
+            Some("tighten the error handling".to_string())
+        );
+    }
+
+    // A steer with no verifier note is framed as a priority operator instruction.
+    #[test]
+    fn compose_guidance_steer_only_is_priority_block() {
+        let out = compose_guidance(None, &["prefer sqlite over postgres".to_string()]).unwrap();
+        assert!(out.contains("operator steered this goal"), "framed: {out}");
+        assert!(out.contains("prefer sqlite over postgres"), "carries msg: {out}");
+        assert!(!out.contains("prior verifier note"), "no verifier tail: {out}");
+    }
+
+    // Steer + verifier: both carried, steer FIRST (human course-correction
+    // outranks the machine judge's last critique), verifier demoted to a tail.
+    #[test]
+    fn compose_guidance_steer_and_verifier_orders_steer_first() {
+        let out = compose_guidance(
+            Some("add tests"),
+            &["ship it as a draft PR".to_string()],
+        )
+        .unwrap();
+        let steer_at = out.find("ship it as a draft PR").unwrap();
+        let verifier_at = out.find("add tests").unwrap();
+        assert!(steer_at < verifier_at, "steer precedes verifier: {out}");
+        assert!(out.contains("prior verifier note"), "verifier demoted: {out}");
+    }
+
+    // Multiple steers are joined FIFO into one directive.
+    #[test]
+    fn compose_guidance_joins_multiple_steers() {
+        let out = compose_guidance(
+            None,
+            &["first".to_string(), "second".to_string()],
+        )
+        .unwrap();
+        assert!(out.contains("first | second"), "FIFO join: {out}");
+    }
+
+    // steer(): queues on an active goal, is drained one-shot by take_steers,
+    // and a blank message is rejected.
+    #[test]
+    fn test_steer_queues_and_drains_once() {
+        let g = goal_with(Status::Active, Step::Working, true);
+        assert!(g.steer("narrow to the parser"), "active goal accepts steer");
+        assert!(!g.steer("   "), "blank steer rejected");
+        let drained = g.take_steers();
+        assert_eq!(drained, vec!["narrow to the parser".to_string()]);
+        assert!(g.take_steers().is_empty(), "one-shot: second drain empty");
+    }
+
+    // steer(): a finished (or cancelled) goal has nothing to steer.
+    #[test]
+    fn test_steer_rejected_when_not_active() {
+        let g = goal_with(Status::Achieved, Step::Idle, false);
+        assert!(!g.steer("too late"), "inactive goal rejects steer");
+        assert!(g.take_steers().is_empty());
     }
 
     // TASK-301: `:attach goal` history backfill surfaces the goal's durable
