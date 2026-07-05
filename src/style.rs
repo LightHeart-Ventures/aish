@@ -541,7 +541,10 @@ pub fn second_statusline_at(left: &str, name: Option<&str>, width: usize, color_
     };
     let width = width.max(80);
     let lw = visible_cols(left);
-    let rw = name.chars().count();
+    // `visible_cols` (not chars) so emoji status badges appended to the name —
+    // 🤖 workers / ⏰ alert / 🎯 goal, each 2 display cols — don't push the
+    // right edge past the terminal width.
+    let rw = visible_cols(name);
     let gap = width.saturating_sub(lw + rw).max(1);
     let spaces = " ".repeat(gap);
     if color_on {
