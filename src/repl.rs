@@ -3751,6 +3751,7 @@ fn collect_worker_rows(session: &Session) -> Vec<crate::workers_modal::WorkerRow
             };
             crate::workers_modal::WorkerRow {
                 id: w.id.clone(),
+                type_emoji: crate::style::job_activity_emoji(&w.task).to_string(),
                 id_cell,
                 session_label: format!("{me_label} *"),
                 status: w.status(),
