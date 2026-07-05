@@ -1151,6 +1151,105 @@ pub struct GoalTaskLink {
     pub created_at: String,
 }
 
+/// Durable ring buffer for the `:activity` tray (recoverable history). Every
+/// fired `:alert` (and any future notable event) is appended here so the
+/// operator can `:activity` to review the last N entries after they scrolled
+/// off the single-line footer. Own connection on the shared aish.db, cloneable
+/// (Arc) so the presenter records and the REPL command reads through one store.
+#[derive(Clone)]
+pub struct ActivityStore {
+    conn: Arc<Mutex<Connection>>,
+    /// How many rows to retain (older rows pruned on insert).
+    cap: i64,
+}
+
+impl ActivityStore {
+    /// Open (idempotently create) the activity table on the shared aish.db.
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)
+            .with_context(|| format!("can't open activity store at {}", path.display()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             CREATE TABLE IF NOT EXISTS activity (
+                 id        INTEGER PRIMARY KEY,
+                 ts        INTEGER NOT NULL DEFAULT 0,
+                 severity  TEXT NOT NULL DEFAULT 'info',
+                 short     TEXT NOT NULL,
+                 detail    TEXT,
+                 source    TEXT NOT NULL DEFAULT 'alert'
+             );
+             CREATE INDEX IF NOT EXISTS idx_activity_id ON activity (id DESC);",
+        )
+        .context("activity schema init failed")?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            cap: 200,
+        })
+    }
+
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Append one activity entry, then prune to the newest `cap` rows.
+    pub fn record(&self, severity: &str, short: &str, detail: &str, source: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO activity (ts, severity, short, detail, source)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![Self::now(), severity, short, detail, source],
+        )
+        .context("insert activity failed")?;
+        let id = conn.last_insert_rowid();
+        // Keep only the newest `cap` rows (subquery returns nothing when the
+        // table is already within cap, so this is a no-op until it grows).
+        conn.execute(
+            "DELETE FROM activity WHERE id <= (
+                 SELECT id FROM activity ORDER BY id DESC LIMIT 1 OFFSET ?1
+             )",
+            rusqlite::params![self.cap],
+        )
+        .context("prune activity failed")?;
+        Ok(id)
+    }
+
+    /// The most-recent `limit` entries, newest first:
+    /// `(id, ts, severity, short, detail, source)`.
+    pub fn recent(&self, limit: i64) -> Result<Vec<(i64, i64, String, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, ts, severity, short, detail, source
+             FROM activity ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map([limit], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    r.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Clear the entire tray. Returns rows removed.
+    pub fn clear(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute("DELETE FROM activity", [])
+            .context("clear activity failed")?;
+        Ok(n)
+    }
+}
+
 /// Durable store for `:alert` monitors. Own SQLite connection against the
 /// shared `aish.db` (same table the main [`Db`] schema declares), cloneable so
 /// the interactive presenter, the REPL command handler, and a delegated
