@@ -1379,6 +1379,19 @@ pub fn print_above_prompt(text: String) -> bool {
     false
 }
 
+/// Whether the REPL's above-the-prompt [`ExternalPrinter`] is installed — i.e.
+/// we're at a LIVE interactive prompt where any raw in-place stderr write (a
+/// `\r\x1b[2K…` spinner frame) would trample the prompt line instead of scrolling
+/// above it. Worker "thinking…" animation consults this to choose a
+/// prompt-preserving committed line over in-place animation, keeping the prompt
+/// visible so the user can always queue input or type a `:` command.
+pub fn external_printer_installed() -> bool {
+    printer_slot()
+        .lock()
+        .map(|slot| slot.is_some())
+        .unwrap_or(false)
+}
+
 /// Rewrite bare LF into CRLF for the rustyline `ExternalPrinter`, which writes
 /// the message VERBATIM while the terminal is in RAW mode (the prompt is live).
 /// In raw mode a lone `\n` is a line-feed ONLY — the cursor drops a row but keeps

@@ -969,6 +969,11 @@ struct ThinkingSpinner {
     /// spinner's task and lets `stop`/natural-exit unregister itself.
     id: u64,
     task: tokio::task::JoinHandle<()>,
+    /// True when this spinner ran in prompt-preserving mode (an `ExternalPrinter`
+    /// was installed at `start`, so it committed a static line instead of
+    /// animating in place). `stop` then must NOT emit a raw `\r\x1b[2K` — that
+    /// would erase the live prompt line the printer keeps below the stream.
+    printer: bool,
 }
 
 /// Monotonic id source for live thinking spinners.
@@ -1061,7 +1066,15 @@ impl ThinkingSpinner {
         if !stderr_is_tty() {
             return None;
         }
-        eprint!("\x1b[?25l"); // hide the cursor while the spinner turns
+        // At a LIVE interactive prompt (an above-the-prompt `ExternalPrinter` is
+        // installed) in-place animation would trample the prompt line. In that
+        // case run prompt-preserving: commit a single static "thinking…" line via
+        // `announce_raw` (like the concurrent-thinker path) so the prompt stays
+        // visible and the user can queue input or type a `:` command mid-think.
+        let printer = crate::tools::external_printer_installed();
+        if !printer {
+            eprint!("\x1b[?25l"); // hide the cursor while the spinner turns in place
+        }
         let label = label.to_string();
         let id = SPINNER_SEQ.fetch_add(1, Ordering::Relaxed);
         // Count this thinker BEFORE spawning its task, so every already-running
@@ -1095,8 +1108,10 @@ impl ThinkingSpinner {
                         // don't erase the current line (it's fresh / the prompt) —
                         // just restore the cursor.
                         eprint!("\x1b[?25h");
-                    } else {
+                    } else if !printer {
                         // Erase the transient in-place animated row + restore cursor.
+                        // Skipped in printer mode: no in-place row exists and a raw
+                        // `\r\x1b[2K` would wipe the live prompt line.
                         eprint!("\r\x1b[2K\x1b[?25h");
                     }
                     break;
@@ -1117,7 +1132,10 @@ impl ThinkingSpinner {
                 // commits its notice as its OWN newline-terminated line via
                 // `announce_raw` (prompt-preserving), so every "thinking…" stays
                 // on a separate line.
-                if THINKING_ACTIVE.load(Ordering::Relaxed) > 1 {
+                // `printer`: a live interactive prompt is up — in-place `\r`
+                // animation would trample it, so commit a static line instead
+                // (same prompt-preserving path as the multi-thinker case).
+                if printer || THINKING_ACTIVE.load(Ordering::Relaxed) > 1 {
                     let body = format!(
                         "{NARRATION_ALIGN_PAD}\x1b[36m{}\x1b[0m \x1b[2;36mthinking…\x1b[0m",
                         THINKING_FRAMES[0]
@@ -1156,7 +1174,7 @@ impl ThinkingSpinner {
             unregister_spinner(id);
         });
         register_spinner(id, task.abort_handle());
-        Some(Self { id, task })
+        Some(Self { id, task, printer })
     }
 
     /// Stop animating and erase the spinner row, restoring the cursor. The next
@@ -1166,7 +1184,14 @@ impl ThinkingSpinner {
     fn stop(self) {
         self.task.abort();
         unregister_spinner(self.id);
-        eprint!("\r\x1b[2K\x1b[?25h");
+        if self.printer {
+            // Prompt-preserving mode committed a static line (no in-place row to
+            // erase); a raw `\r\x1b[2K` here would wipe the live prompt line.
+            // The committed "thinking…" line stays in scrollback, like any other
+            // above-the-prompt notice. Cursor was never hidden, so nothing to do.
+        } else {
+            eprint!("\r\x1b[2K\x1b[?25h");
+        }
     }
 }
 
