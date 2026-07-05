@@ -2373,6 +2373,52 @@ pub fn coordinator_model(backend_kind: &str, batch_model: &str) -> String {
     }
 }
 
+/// Resolve the state-root spool a NESTED coordinator writes spawn requests into.
+/// Inside a container the host mounts the per-worker state volume at
+/// [`crate::container::STATE_MOUNT`] (`/aish/state`); a host-subprocess coordinator has no such
+/// mount and falls back to its own worker state dir. The HOST accept loop polls
+/// the matching path (see `spawn_broker_host::serve_pending`).
+fn in_worker_spool_root() -> PathBuf {
+    let mount = std::path::Path::new(crate::container::STATE_MOUNT);
+    if mount.is_dir() {
+        return mount.to_path_buf();
+    }
+    worker_state_root()
+}
+
+/// Emit a host-brokered sibling-spawn request — the EMIT SITE for the PR #597
+/// follow-up. Builds a non-secret [`crate::spawn_broker::SpawnRequest`] from the
+/// nested session and writes it atomically into the mounted state spool for the
+/// host `aish` to service as a flat sibling coordinator. Returns the spool path
+/// on success. Credentials are NEVER included — the host injects those from its
+/// own env when it rebuilds the argv via `coordinator_argv`.
+pub fn emit_spawn_request(
+    session: &crate::session::Session,
+    task: &str,
+    isolate: bool,
+    base: &str,
+) -> std::io::Result<PathBuf> {
+    let launch_session_id = std::env::var("AISH_LAUNCH_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| session.session_id.clone());
+    let requested_by_worker = std::env::var("AISH_RUN_ID").ok().filter(|s| !s.is_empty());
+    let req = crate::spawn_broker::SpawnRequest::new(
+        Uuid::new_v4().to_string(),
+        task,
+        session.cwd.display().to_string(),
+        session.backend_kind.clone(),
+        coordinator_model(&session.backend_kind, &session.batch_model),
+        isolate,
+        base,
+        crate::spawn_broker::current_budget(),
+        launch_session_id,
+        requested_by_worker,
+    );
+    let root = in_worker_spool_root();
+    crate::spawn_broker::write_request(&root, &req)
+}
+
 /// A background worker subprocess, tracked for the life of the session. Shared
 /// between the REPL (which lists/surfaces it) and the run task (which mutates it).
 pub struct WorkerJob {
