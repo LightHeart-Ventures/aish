@@ -6382,6 +6382,7 @@ async fn handle_colon(
                  :mcp add <name> <command|url> [args] connect + save an MCP server (~/.aish/.mcp.json)\n\
                  :mcp remove <name>                  disconnect + unsave an MCP server\n\
                  :mcp tools [name]                   list MCP tools\n\
+                 :mcp test [name|all]                live-probe MCP server(s) — tools/list round-trip + latency\n\
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
                  :context                            show context-window usage (tokens, %, memories)\n\
@@ -7793,9 +7794,29 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
                 }
             }
         }
+        Some((&"test", rest)) => {
+            let names: Vec<String> = if rest.is_empty() {
+                session.mcp.server_names()
+            } else {
+                rest.iter().map(|s| s.to_string()).collect()
+            };
+            if names.is_empty() {
+                println!("no MCP servers connected");
+            }
+            for n in names {
+                match session.mcp.test(&n).await {
+                    Ok((tools, rtt)) => println!(
+                        "  ✓ {n} — healthy, {tools} tool{} ({} ms)",
+                        if tools == 1 { "" } else { "s" },
+                        rtt.as_millis()
+                    ),
+                    Err(e) => println!("  ✗ {n} — {e:#}"),
+                }
+            }
+        }
         Some((other, _)) => {
             println!(
-                "unknown :mcp subcommand '{other}' — usage: :mcp [list|reconnect|add|remove|tools]"
+                "unknown :mcp subcommand '{other}' — usage: :mcp [list|reconnect|reload|add|remove|tools|test]"
             )
         }
     }

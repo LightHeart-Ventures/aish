@@ -37,6 +37,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Round-trip budget for a `:mcp test` health probe. Short: a live server
+/// answers `tools/list` in well under a second; anything slower is a signal.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 pub struct McpHost {
@@ -476,6 +479,27 @@ impl McpHost {
             .find(|s| s.name == server_name)
             .and_then(|s| s.tools.iter().find(|t| t.name == tool))
             .is_some_and(|t| t.read_only)
+    }
+
+    /// Live health-probe one connected server: issue a `tools/list` round-trip
+    /// and time it. Ok((tool_count, round_trip)) when the server answers within
+    /// PROBE_TIMEOUT; Err when the server is unknown, unreachable, or slow. This
+    /// exercises the real transport (stdio pipe / HTTP POST) rather than trusting
+    /// the cached connect-time state, so a server whose child died or whose
+    /// endpoint went away is caught here instead of at the next tool call.
+    pub async fn test(&mut self, name: &str) -> Result<(usize, Duration)> {
+        let server = self
+            .servers
+            .iter_mut()
+            .find(|s| s.name == name)
+            .ok_or_else(|| anyhow::anyhow!("unknown mcp server: {name}"))?;
+        let start = std::time::Instant::now();
+        let result = server
+            .request("tools/list", json!({}), PROBE_TIMEOUT)
+            .await?;
+        let elapsed = start.elapsed();
+        let count = result["tools"].as_array().map_or(0, Vec::len);
+        Ok((count, elapsed))
     }
 
     /// Route an `mcp__server__tool` call to its server.
