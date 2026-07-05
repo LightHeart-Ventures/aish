@@ -1533,6 +1533,10 @@ struct CmdCache {
 /// `:` at the start of a line (or TABs a `:` prefix). Keep this in sync with the
 /// arms of `handle_colon` and the `:help` text.
 const COLON_COMMANDS: &[(&str, &str)] = &[
+    (
+        "activity",
+        "recoverable tray of fired :alerts / notable events (last N); clear",
+    ),
     ("allow", "list / revoke always-allowed tools & dir grants"),
     (
         "attach",
