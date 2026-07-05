@@ -543,18 +543,19 @@ async fn main() -> Result<()> {
     } else {
         let refs: Vec<&Path> = mcp_paths.iter().map(|p| p.as_path()).collect();
         session.mcp = mcp::McpHost::start(&refs).await;
+        // One-shot / coordinator run: no interactive statusline to surface a
+        // "statusline alert" on, so flush any skipped-server notices to stderr
+        // (the interactive REPL routes these to the SecondStatusLine + `:activity`
+        // instead — see `surface_mcp_skips`).
+        for line in session.mcp.take_skipped() {
+            eprintln!("\x1b[33maish:\x1b[0m {line}");
+        }
         timer.mark("MCP connect");
         let local = skills::load_catalog(&skills_dir);
         session.skills_prompt = skills::render_prompt_section(&local, &session.mcp.skills());
         session.skills = local;
     }
     timer.mark("skills render");
-    // TASK-331 — surface any skills missing semantic metadata as a non-fatal
-    // startup notice so authors can backfill categories/applies-to per
-    // SKILL-FORMAT.md. Skills without the fields still load and function.
-    for w in skills::metadata_warnings(&session.skills) {
-        startup_notices.push(format!("\x1b[33maish:\x1b[0m {w}"));
-    }
     session.db = match db::Db::open(&db_paths::main_db_path()) {
         Ok(d) => Some(d),
         Err(e) => {

@@ -186,31 +186,6 @@ fn parse_list_field(front: &str, key: &str) -> Vec<String> {
     Vec::new()
 }
 
-/// TASK-331 — validate the semantic metadata across a loaded catalog and return
-/// human-readable warnings (surfaced as startup notices). A skill missing BOTH
-/// `categories` and `applies-to` is flagged so authors can backfill the schema.
-/// Non-fatal: skills still load and function without the fields.
-pub fn metadata_warnings(skills: &[Skill]) -> Vec<String> {
-    let mut warnings = Vec::new();
-    for sk in skills {
-        let mut missing = Vec::new();
-        if sk.categories.is_empty() {
-            missing.push("categories");
-        }
-        if sk.applies_to.is_empty() {
-            missing.push("applies-to");
-        }
-        if !missing.is_empty() {
-            warnings.push(format!(
-                "skill '{}' missing semantic metadata: {} (see SKILL-FORMAT.md)",
-                sk.name,
-                missing.join(", ")
-            ));
-        }
-    }
-    warnings
-}
-
 /// The system-prompt section advertising available skills from both sources.
 pub fn render_prompt_section(skills: &[Skill], mcp_skills: &[crate::mcp::McpSkill]) -> String {
     let mut s = String::new();
@@ -425,26 +400,4 @@ unwanted-for:\n  - infrastructure\n  - perf\n---\nbody";
         assert!(c2.is_empty() && a2.is_empty() && u2.is_empty());
     }
 
-    #[test]
-    fn metadata_warnings_flags_missing_fields() {
-        let complete = Skill {
-            name: "aish_sre".into(),
-            description: "d".into(),
-            categories: vec!["infrastructure".into()],
-            applies_to: vec!["aish".into()],
-            ..Default::default()
-        };
-        let bare = Skill {
-            name: "legacy".into(),
-            description: "d".into(),
-            ..Default::default()
-        };
-        let warns = metadata_warnings(std::slice::from_ref(&complete));
-        assert!(warns.is_empty(), "complete skill should not warn: {warns:?}");
-        let warns = metadata_warnings(&[complete, bare]);
-        assert_eq!(warns.len(), 1);
-        assert!(warns[0].contains("legacy"));
-        assert!(warns[0].contains("categories"));
-        assert!(warns[0].contains("applies-to"));
-    }
 }

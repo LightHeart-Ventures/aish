@@ -36,6 +36,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// a background loop can't be watched, so we cap it.
 const MAX_TURNS: usize = 25;
 
+/// How many times the goal loop will REVIEW-ANALYZE-REPLAN after a worker turn
+/// ends abnormally (most often the coordinator flagging for operator once its
+/// own serial-chain / loop-guard auto-recovery budget is spent) before treating
+/// the goal as failed. A worker failure is NOT proof the goal is impossible, so
+/// we fold the error into the next turn's guidance and drive another attempt —
+/// bounded here so a persistently-failing worker still terminates the goal. The
+/// streak resets after any productive (non-erroring) turn, so this caps
+/// CONSECUTIVE failures, not lifetime ones.
+const MAX_GOAL_RECOVERIES: usize = 3;
+
 /// Bounded transcript ring the goal keeps for `:attach goal` / Shift-Tab replay
 /// — the goal analogue of a worker's captured activity. A goal is essentially a
 /// specialized worker, so its attach/cycle UI mirrors a worker's: header + input
@@ -68,6 +78,14 @@ pub struct GoalLoop {
     pub condition: String,
     /// When the goal was first spawned — basis for total elapsed time.
     started: Instant,
+    /// Lifecycle-hook registry inherited from the launching session, plus the
+    /// envelope fields (`session_id`/`cwd`/`mode`) every hook payload carries.
+    /// The goal loop is decoupled from `Session`, so it snapshots what it needs
+    /// to build + fire `GoalStart`/`GoalTurnEnd`/`GoalEnd` payloads on its own.
+    hooks: crate::hooks::HookSet,
+    session_id: String,
+    cwd: std::path::PathBuf,
+    mode: String,
     inner: Mutex<Inner>,
 }
 
@@ -103,6 +121,30 @@ impl GoalLoop {
         if i.status == Status::Active {
             i.status = Status::Cleared;
         }
+    }
+
+    /// Fire a goal-lifecycle hook (observe-only, best-effort, off the hot path).
+    /// No-op with zero allocation when no hook listens for `event`. The payload
+    /// is stamped with [`crate::hooks::Agent::Goal`] so a hook can scope itself
+    /// to the autonomous goal loop; `build` attaches the event-specific fields
+    /// (condition, turn, met, status, reason). Requires a tokio runtime in scope
+    /// — every call site is inside `run_goal`, which is spawned onto one.
+    fn fire_hook(
+        &self,
+        event: crate::hooks::HookEvent,
+        build: impl FnOnce(crate::hooks::HookPayload) -> crate::hooks::HookPayload,
+    ) {
+        if !self.hooks.has(event) {
+            return;
+        }
+        let p = crate::hooks::HookPayload::new(
+            event,
+            &self.session_id,
+            crate::hooks::Agent::Goal,
+            &self.cwd,
+            &self.mode,
+        );
+        self.hooks.fire_observe(event, build(p));
     }
 
     /// One-line `:goal` status report — includes overall + current-turn elapsed
@@ -229,10 +271,17 @@ pub fn spawn(
     spec: crate::worker::WorkerSpec,
     model: String,
     cred: crate::backend::claude::Credential,
+    hooks: crate::hooks::HookSet,
+    mode: String,
 ) -> Handle {
     let goal = Arc::new(GoalLoop {
         condition,
         started: Instant::now(),
+        hooks,
+        // The launching session's id + cwd, snapshotted for the hook envelope.
+        session_id: spec.launch_session_id.clone(),
+        cwd: spec.cwd.clone(),
+        mode,
         inner: Mutex::new(Inner {
             status: Status::Active,
             turns: 0,
@@ -304,6 +353,39 @@ pub(crate) fn goal_directive(condition: &str, guidance: Option<&str>) -> String 
     }
 }
 
+/// Build the guidance woven into the NEXT goal-turn directive after a worker turn
+/// ended abnormally (`run_once` returned `Err`). Framed to read naturally after
+/// the [`GOAL_DIRECTIVE_GUIDANCE_MARKER`] ("last check said: …") so the generator
+/// treats it as an interruption to recover from, not a fresh goal. It carries the
+/// raw error (so the model can REVIEW + ANALYZE the actual cause) and, when the
+/// error is the tell-tale serial-chain / single-call / batching flag, an explicit
+/// instruction to batch independent tool calls — the exact re-plan the loop guard
+/// was asking for. Kept as a named helper so it is unit-testable in isolation.
+pub(crate) fn recovery_guidance(err: &str) -> String {
+    let low = err.to_lowercase();
+    let batching_flag = low.contains("single-call")
+        || low.contains("serial chain")
+        || low.contains("serial-chain")
+        || low.contains("batch");
+    let mut g = format!(
+        "your previous work turn was cut short by an internal execution guard, \
+         NOT because the goal is impossible: {err}. Do not restart from scratch and \
+         do not abandon the goal — REVIEW that error, ANALYZE the root cause, then \
+         resume from where you left off and adjust your approach so the same guard \
+         does not trip again."
+    );
+    if batching_flag {
+        g.push_str(
+            " In particular: fire every INDEPENDENT tool call together in ONE turn \
+             (one batch of reads/greps/list_dirs/status queries up front) instead of \
+             one call per round — only keep a call serial when its input genuinely \
+             depends on a previous call's output. Front-load your context-gathering, \
+             then act.",
+        );
+    }
+    g
+}
+
 /// Inverse of [`goal_directive`]: recover the goal condition from a persisted
 /// goal-turn `task` string. Returns `None` when `task` isn't a goal directive,
 /// so non-goal coordinator rows pass through un-grouped. Used by `:workers` to
@@ -319,6 +401,16 @@ pub(crate) fn goal_condition_from_directive(task: &str) -> Option<String> {
     Some(condition.to_string())
 }
 
+/// Terminal outcome of a goal pursuit, surfaced on the `GoalEnd` hook payload.
+struct GoalOutcome {
+    /// Wire status: `"achieved"` | `"failed"` | `"cleared"`.
+    status: &'static str,
+    /// Turns executed when the loop ended.
+    turns: usize,
+    /// Final one-line reason/verdict, when there is one.
+    reason: Option<String>,
+}
+
 async fn run_goal(
     goal: Handle,
     spec: crate::worker::WorkerSpec,
@@ -326,22 +418,60 @@ async fn run_goal(
     cred: crate::backend::claude::Credential,
 ) {
     goal.note(&format!("started — {}", goal.condition));
+    goal.fire_hook(crate::hooks::HookEvent::GoalStart, |p| {
+        p.with("condition", goal.condition.clone())
+    });
+
+    let outcome = run_goal_loop(&goal, spec, model, cred).await;
+
+    goal.fire_hook(crate::hooks::HookEvent::GoalEnd, |p| {
+        let p = p
+            .with("status", outcome.status)
+            .with("turns", outcome.turns as u64);
+        match &outcome.reason {
+            Some(r) => p.with("reason", r.clone()),
+            None => p,
+        }
+    });
+}
+
+/// The generator/verifier loop. Returns the terminal [`GoalOutcome`] so the
+/// caller ([`run_goal`]) can fire `GoalEnd` from exactly one place regardless of
+/// which stopping condition ended the pursuit.
+async fn run_goal_loop(
+    goal: &Handle,
+    spec: crate::worker::WorkerSpec,
+    model: String,
+    cred: crate::backend::claude::Credential,
+) -> GoalOutcome {
     let mut guidance: Option<String> = None;
+    // Consecutive abnormal-worker-turn recoveries spent so far (reset by any
+    // productive turn). Bounds the REVIEW-ANALYZE-REPLAN loop below.
+    let mut recoveries: usize = 0;
 
     loop {
         // Stop checks between turns.
         let turn = {
             let mut i = goal.inner.lock().unwrap();
             if i.cancel {
-                return;
+                return GoalOutcome {
+                    status: "cleared",
+                    turns: i.turns,
+                    reason: None,
+                };
             }
             if i.turns >= MAX_TURNS {
                 i.status = Status::Failed;
+                let turns = i.turns;
                 drop(i);
-                goal.note(&format!(
-                    "stopped — hit the {MAX_TURNS}-turn backstop without meeting the goal"
-                ));
-                return;
+                let reason =
+                    format!("hit the {MAX_TURNS}-turn backstop without meeting the goal");
+                goal.note(&format!("stopped — {reason}"));
+                return GoalOutcome {
+                    status: "failed",
+                    turns,
+                    reason: Some(reason),
+                };
             }
             i.turns += 1;
             i.turns
@@ -357,37 +487,76 @@ async fn run_goal(
         }
         let run_id = format!("goal-{}", uuid::Uuid::new_v4());
         let output = match crate::worker::run_once(&spec, &directive, &run_id).await {
-            Ok(o) => o,
+            Ok(o) => {
+                // Productive turn — clear the failure streak so intermittent,
+                // spread-out worker hiccups don't accumulate toward the cap.
+                recoveries = 0;
+                o
+            }
             Err(e) => {
+                // A worker turn can end abnormally — most commonly the nested
+                // coordinator FLAGGING FOR OPERATOR once its own loop / serial-
+                // chain guards exhaust their auto-recovery budget (e.g. "yielded
+                // after N consecutive single-call rounds … re-plan toward
+                // batching"). That is an execution-shape complaint, NOT proof the
+                // goal is impossible. So instead of dying, the goal agent REVIEWS
+                // the error, ANALYZES it, folds it into the next turn's guidance,
+                // and drives another attempt that re-plans (e.g. batches the
+                // independent calls). Bounded by MAX_GOAL_RECOVERIES so a
+                // persistently-failing worker still terminates the goal.
+                if recoveries < MAX_GOAL_RECOVERIES {
+                    recoveries += 1;
+                    goal.note(&format!(
+                        "turn {turn} interrupted — reviewing, re-planning, retrying \
+                         (recovery {recoveries}/{MAX_GOAL_RECOVERIES}): {e}"
+                    ));
+                    goal.set(Status::Active, Some(format!("recovering: {e}")));
+                    guidance = Some(recovery_guidance(&e));
+                    continue;
+                }
                 goal.set(Status::Failed, Some(e.clone()));
-                goal.note(&format!("failed — {e}"));
-                return;
+                goal.note(&format!(
+                    "failed after {recoveries} recovery attempt(s) — {e}"
+                ));
+                return GoalOutcome {
+                    status: "failed",
+                    turns: turn,
+                    reason: Some(e),
+                };
             }
         };
         if !goal.is_active() {
-            return;
+            return GoalOutcome {
+                status: "cleared",
+                turns: turn,
+                reason: None,
+            };
         }
 
         // Verifier: the batch model judges whether the output demonstrates the goal.
         goal.note(&format!("turn {turn}: checking…"));
         goal.inner.lock().unwrap().phase = Step::Checking;
-        match judge(&cred, &model, &goal.condition, &output).await {
-            Ok((true, reason)) => {
-                goal.set(Status::Achieved, Some(reason.clone()));
-                deliver(&goal, turn, &reason, &output);
-                return;
-            }
-            Ok((false, reason)) => {
-                goal.set(Status::Active, Some(reason.clone()));
-                guidance = Some(reason);
-            }
-            Err(e) => {
-                // Couldn't verify — keep going but record why; don't silently stop.
-                let note = format!("could not verify this turn: {e}");
-                goal.set(Status::Active, Some(note.clone()));
-                guidance = Some(note);
-            }
+        let (met, reason) = match judge(&cred, &model, &goal.condition, &output).await {
+            Ok((met, reason)) => (met, reason),
+            // Couldn't verify — keep going but record why; don't silently stop.
+            Err(e) => (false, format!("could not verify this turn: {e}")),
+        };
+        goal.fire_hook(crate::hooks::HookEvent::GoalTurnEnd, |p| {
+            p.with("turn", turn as u64)
+                .with("met", met)
+                .with("reason", reason.clone())
+        });
+        if met {
+            goal.set(Status::Achieved, Some(reason.clone()));
+            deliver(goal, turn, &reason, &output);
+            return GoalOutcome {
+                status: "achieved",
+                turns: turn,
+                reason: Some(reason),
+            };
         }
+        goal.set(Status::Active, Some(reason.clone()));
+        guidance = Some(reason);
     }
 }
 
@@ -1037,6 +1206,10 @@ mod tests {
         GoalLoop {
             condition: "Complete the work".to_string(),
             started: Instant::now(),
+            hooks: crate::hooks::HookSet::empty(),
+            session_id: "test-session".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            mode: "build".to_string(),
             inner: Mutex::new(Inner {
                 status,
                 turns: 3,
@@ -1626,6 +1799,56 @@ mod domain_tests {
         );
         // A plain (non-goal) coordinator task is not a directive → no key.
         assert!(goal_condition_from_directive("fix the flaky CI run").is_none());
+    }
+
+    // A worker turn flagged for operator by the serial-chain guard is recoverable:
+    // the goal loop must be able to analyze it and re-plan toward batching. The
+    // guidance it feeds the next turn carries the raw error AND the explicit
+    // batch-independent-calls instruction.
+    #[test]
+    fn recovery_guidance_carries_error_and_batching_directive() {
+        let err = "goal worker exited unsuccessfully (exit status: 1): flagged for \
+                   operator after 2 auto-recovery attempt(s): yielded after 9 \
+                   consecutive single-call rounds (a deep serial chain) to re-plan \
+                   toward batching independent calls";
+        let g = recovery_guidance(err);
+        // Carries the raw error so the model can review/analyze the real cause.
+        assert!(g.contains("single-call rounds"), "guidance must quote the error");
+        // Recognizes the batching flag and gives the concrete re-plan.
+        assert!(
+            g.to_lowercase().contains("independent tool call"),
+            "serial-chain flag must yield an explicit batch-independent-calls instruction"
+        );
+        // Framed as an interruption to recover from, not a fresh goal.
+        assert!(
+            g.to_lowercase().contains("not because the goal is impossible")
+                || g.to_lowercase().contains("do not restart"),
+            "guidance must tell the agent to resume, not restart"
+        );
+    }
+
+    // A non-batching failure (e.g. an OOM kill) still yields review/analyze
+    // guidance, but WITHOUT the batching-specific paragraph.
+    #[test]
+    fn recovery_guidance_omits_batching_para_for_unrelated_errors() {
+        let g = recovery_guidance(
+            "goal worker was killed by the OS (signal 9) — most likely out of memory",
+        );
+        assert!(g.to_lowercase().contains("review"), "still asks the agent to review");
+        assert!(
+            !g.to_lowercase().contains("independent tool call"),
+            "unrelated failures must not get the batching instruction"
+        );
+    }
+
+    // The recovery cap must stay a small, sane bound so a persistently-failing
+    // worker still terminates the goal.
+    #[test]
+    fn goal_recovery_cap_is_bounded() {
+        assert!(
+            (1..=5).contains(&MAX_GOAL_RECOVERIES),
+            "MAX_GOAL_RECOVERIES must be a small positive bound"
+        );
     }
 
     // The per-turn directive must tell the (nested) worker to surface progress

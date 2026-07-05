@@ -1172,6 +1172,12 @@ together; reading three files you already know you need is ONE turn of three rea
 turns. Grep-then-read of the SAME file IS dependent (you need the line number first) — that's the \
 one case to serialize. Denser turns, fewer \
 no-op closes that waste a round-trip (and trip the continue-nudge).\n\
+- Ranged I/O (narrow reads by default): reading a file larger than 5KB WITHOUT line_start/line_end \
+is rejected at the tool layer — always pass a line range for big files. For a large source file, \
+grep_files FIRST to locate the region, THEN ranged-read only that slice; for grep hits read just the \
+matched lines plus ~5 lines of context. Never list a directory with >100 entries — use a glob or a \
+narrow grep instead. Prefer one batched block of ranged reads over re-reading the same file end to \
+end.\n\
 - NO shell syntax: no pipes, globs, redirection, &&/||, command substitution. Use list_dir + \
 run_program chains. Filter/aggregate yourself.\n\
 - change_dir updates session state for everything after.\n\
@@ -1718,6 +1724,22 @@ mod tests {
             assert!(
                 p.contains("SAME turn"),
                 "missing batch-independent-calls directive"
+            );
+        }
+    }
+
+    #[test]
+    fn system_prompt_carries_ranged_io_rule() {
+        // TASK-334: ranged I/O enforcement is a baked-in prompt rule so the agent
+        // defaults to narrow reads (line_start/line_end) on files >5KB and
+        // greps-then-ranged-reads large sources instead of bulk-reading them.
+        let session = Session::new().unwrap();
+        for escalate in [false, true] {
+            let p = session.system_prompt(escalate);
+            assert!(p.contains("Ranged I/O"), "missing ranged-io rule");
+            assert!(
+                p.contains("line_start/line_end"),
+                "missing ranged-read directive"
             );
         }
     }

@@ -90,6 +90,10 @@ pub enum HookEvent {
     BatchFanOut,
     BackgroundJobStart,
     BackgroundJobStop,
+    // Goal loop (background stopping-oracle pursuit)
+    GoalStart,
+    GoalTurnEnd,
+    GoalEnd,
     // System
     UpdateAvailable,
     UpdateApplied,
@@ -130,6 +134,9 @@ impl HookEvent {
             Self::BatchFanOut => "BatchFanOut",
             Self::BackgroundJobStart => "BackgroundJobStart",
             Self::BackgroundJobStop => "BackgroundJobStop",
+            Self::GoalStart => "GoalStart",
+            Self::GoalTurnEnd => "GoalTurnEnd",
+            Self::GoalEnd => "GoalEnd",
             Self::UpdateAvailable => "UpdateAvailable",
             Self::UpdateApplied => "UpdateApplied",
             Self::SkillMatched => "SkillMatched",
@@ -140,7 +147,7 @@ impl HookEvent {
     /// typo in config is rejected at load instead of silently never firing.
     pub fn parse(s: &str) -> Option<Self> {
         // Every variant round-trips through `as_str`; enumerate them once.
-        const ALL: [HookEvent; 33] = [
+        const ALL: [HookEvent; 36] = [
             HookEvent::SessionStart,
             HookEvent::SessionEnd,
             HookEvent::InstructionsLoaded,
@@ -171,6 +178,9 @@ impl HookEvent {
             HookEvent::BatchFanOut,
             HookEvent::BackgroundJobStart,
             HookEvent::BackgroundJobStop,
+            HookEvent::GoalStart,
+            HookEvent::GoalTurnEnd,
+            HookEvent::GoalEnd,
             HookEvent::UpdateAvailable,
             HookEvent::UpdateApplied,
             HookEvent::SkillMatched,
@@ -230,9 +240,9 @@ pub struct PluginHookFragment {
 /// The autonomy descriptor carried on every payload so a consumer can tell a
 /// human turn from an autonomous one (design §3.1). Hooks that are noisy in
 /// autonomous mode scope themselves with `matcher.agent == "interactive"`.
-/// `Goal`/`Script`/`Oneshot` are reserved for the finer agent-context split
-/// (design §3.1) the later wiring phases stamp; only `Interactive`/`Coordinator`
-/// are produced today.
+/// `Goal` is stamped on the background goal-loop's lifecycle events
+/// (`GoalStart`/`GoalTurnEnd`/`GoalEnd`); `Script`/`Oneshot` remain reserved for
+/// the finer agent-context split (design §3.1) later wiring phases stamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum Agent {

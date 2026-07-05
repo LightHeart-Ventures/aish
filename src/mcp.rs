@@ -37,6 +37,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Round-trip budget for a `:mcp test` health probe. Short: a live server
+/// answers `tools/list` in well under a second; anything slower is a signal.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 pub struct McpHost {
@@ -48,6 +51,12 @@ pub struct McpHost {
     /// `:mcp reload` can re-scan them and connect servers added to the file
     /// since startup.
     config_paths: Vec<PathBuf>,
+    /// Servers that failed to start/handshake this connect pass, formatted as
+    /// one detail line each (e.g. `mcp server signoz-mcp skipped: …`). Collected
+    /// here instead of printed to stderr so the caller can surface them on the
+    /// SecondStatusLine "statusline alert" + `:activity` tray. Drained by
+    /// [`McpHost::take_skipped`]; a bad entry never takes the shell down.
+    skipped: Vec<String>,
 }
 
 /// One server's state for the `:mcp` listing.
@@ -203,7 +212,12 @@ impl McpHost {
                         self.servers.push(s);
                         added.push(name.clone());
                     }
-                    Err(e) => eprintln!("\x1b[33maish:\x1b[0m mcp server {name} skipped: {e:#}"),
+                    Err(e) => {
+                        // Collect rather than print: the caller surfaces these on
+                        // the SecondStatusLine "statusline alert" + `:activity`
+                        // tray (interactive), or flushes them to stderr (one-shot).
+                        self.skipped.push(format!("mcp server {name} skipped: {e:#}"));
+                    }
                 }
             }
         }
@@ -302,6 +316,15 @@ impl McpHost {
     /// Connected server names.
     pub fn server_names(&self) -> Vec<String> {
         self.servers.iter().map(|s| s.name.clone()).collect()
+    }
+
+    /// Drain the skipped-server notices collected during the last connect pass
+    /// (one detail line per server that failed to start/handshake). The caller
+    /// surfaces them — on the SecondStatusLine flash + `:activity` tray in the
+    /// interactive REPL, or to stderr in a one-shot/coordinator run. Draining
+    /// leaves the list empty so a later `:mcp reload` only reports NEW failures.
+    pub fn take_skipped(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.skipped)
     }
 
     /// `(tool name, read_only)` for one server, or None if it isn't connected.
@@ -476,6 +499,27 @@ impl McpHost {
             .find(|s| s.name == server_name)
             .and_then(|s| s.tools.iter().find(|t| t.name == tool))
             .is_some_and(|t| t.read_only)
+    }
+
+    /// Live health-probe one connected server: issue a `tools/list` round-trip
+    /// and time it. Ok((tool_count, round_trip)) when the server answers within
+    /// PROBE_TIMEOUT; Err when the server is unknown, unreachable, or slow. This
+    /// exercises the real transport (stdio pipe / HTTP POST) rather than trusting
+    /// the cached connect-time state, so a server whose child died or whose
+    /// endpoint went away is caught here instead of at the next tool call.
+    pub async fn test(&mut self, name: &str) -> Result<(usize, Duration)> {
+        let server = self
+            .servers
+            .iter_mut()
+            .find(|s| s.name == name)
+            .ok_or_else(|| anyhow::anyhow!("unknown mcp server: {name}"))?;
+        let start = std::time::Instant::now();
+        let result = server
+            .request("tools/list", json!({}), PROBE_TIMEOUT)
+            .await?;
+        let elapsed = start.elapsed();
+        let count = result["tools"].as_array().map_or(0, Vec::len);
+        Ok((count, elapsed))
     }
 
     /// Route an `mcp__server__tool` call to its server.

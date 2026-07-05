@@ -30,21 +30,74 @@ fn install_mcp_if_ready(
         return;
     };
     match receiver.try_recv() {
-        Ok((host, skills_prompt)) => {
+        Ok((mut host, skills_prompt)) => {
             let n = host.server_names().len();
+            // Servers that failed to start/handshake are no longer dumped to
+            // stderr at connect time — surface them as a "statusline alert":
+            // the full detail above the prompt, a shortened warn-badge on the
+            // SecondStatusLine flash (most-recent wins), and a recoverable
+            // `:activity` entry.
+            let skipped = host.take_skipped();
             session.mcp = host;
             session.skills_prompt = skills_prompt;
             *rx = None;
+            surface_mcp_skips(session, &skipped);
             if n > 0 {
-                eprintln!(
-                    "\x1b[2mmcp: ready — {n} server{} connected\x1b[0m",
+                // Surface the readiness notice on the SecondStatusLine flash slot
+                // (most-recent wins) instead of printing it to stderr above the
+                // prompt — keeps the startup header clean, matching how worker-done
+                // notices and fired-`:alert` badges are moved onto the footer.
+                let plain = format!(
+                    "mcp: ready — {n} server{} connected",
                     if n == 1 { "" } else { "s" }
                 );
+                if let Ok(mut f) = session.flash.lock() {
+                    *f = Some(format!("\x1b[2m{plain}\x1b[0m"));
+                }
+                // Also append it to the recoverable `:activity` tray so the notice
+                // is inspectable after the flash slot is overwritten by the next
+                // most-recent message (info tier, source "mcp").
+                if let Some(act) = &session.activity_store {
+                    let _ = act.record(
+                        crate::style::Severity::Info.as_str(),
+                        "mcp: ready",
+                        &plain,
+                        "mcp",
+                    );
+                }
             }
         }
         // Still connecting, or the connect task died — leave the placeholder.
         Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
         Err(tokio::sync::oneshot::error::TryRecvError::Closed) => *rx = None,
+    }
+}
+
+/// Surface MCP servers that failed to start/handshake as a "statusline alert"
+/// (instead of a raw stderr dump): the full detail above the prompt, a shortened
+/// warn-badge on the SecondStatusLine flash (`session.flash`, most-recent wins),
+/// and a recoverable `:activity` entry (source `mcp`). No-op on an empty list.
+/// Shared by the background-install path and `:mcp reload`.
+fn surface_mcp_skips(session: &Session, skips: &[String]) {
+    for detail in skips {
+        // Compact footer banner: "mcp {name} skipped" — the verbose error tail
+        // stays in the above-prompt line + the `:activity` detail column.
+        let short = detail
+            .strip_prefix("mcp server ")
+            .and_then(|s| s.split_once(" skipped:").map(|(name, _)| name))
+            .map(|name| format!("mcp {name} skipped"))
+            .unwrap_or_else(|| detail.clone());
+        crate::tools::print_above_prompt(format!("\x1b[33maish:\x1b[0m {detail}\n"));
+        if let Some(act) = &session.activity_store {
+            let _ = act.record(crate::style::Severity::Warn.as_str(), &short, detail, "mcp");
+        }
+        if let Ok(mut f) = session.flash.lock() {
+            *f = Some(crate::style::severity_badge(
+                &short,
+                crate::style::Severity::Warn,
+                crate::style::colors_enabled(),
+            ));
+        }
     }
 }
 
@@ -1547,6 +1600,10 @@ struct CmdCache {
 /// `:` at the start of a line (or TABs a `:` prefix). Keep this in sync with the
 /// arms of `handle_colon` and the `:help` text.
 const COLON_COMMANDS: &[(&str, &str)] = &[
+    (
+        "activity",
+        "recoverable tray of fired :alerts / notable events (last N); clear",
+    ),
     ("allow", "list / revoke always-allowed tools & dir grants"),
     (
         "attach",
@@ -6106,12 +6163,44 @@ fn handle_tokens(session: &Session) {
 }
 
 
-fn handle_telemetry(sub: Option<&str>, session: &mut Session) {
+fn handle_telemetry(args: Vec<&str>, session: &mut Session) {
+    // `:telemetry skill-match <task>` — TASK-335 debug transparency: run the
+    // same semantic scorer used per-turn (crate::skill_match::skill_match) and
+    // print which skills were considered and WHY the top-2 were chosen (keyword
+    // relevance, intent→category boost, applies-to repo multiplier, unwanted-for
+    // suppression). Lets a new agent understand skill ranking without the env
+    // var (AISH_SKILL_MATCH_DEBUG) or reading the code.
+    if matches!(args.first().copied(), Some("skill-match" | "skill-matching")) {
+        let task = args[1..].join(" ");
+        if task.trim().is_empty() {
+            println!("usage: :telemetry skill-match <task text>");
+            return;
+        }
+        let scored = crate::skill_match::skill_match(&task, None, &session.skills);
+        if scored.is_empty() {
+            println!("no installed skill scored above zero for that task");
+            return;
+        }
+        println!("skill-match reasoning for: {task}");
+        for s in &scored {
+            println!(
+                "  {:<28} score={:>3}  {}",
+                s.skill.name,
+                s.score,
+                if s.reasons.is_empty() {
+                    "no signal".to_string()
+                } else {
+                    s.reasons.join("; ")
+                }
+            );
+        }
+        return;
+    }
     if session.db.is_none() {
         println!("telemetry store unavailable");
         return;
     }
-    match sub {
+    match args.first().copied() {
         Some("clear" | "reset" | "wipe") => {
             let db = session.db.as_ref().unwrap();
             match db.clear_tool_telemetry() {
@@ -6209,7 +6298,7 @@ async fn handle_skill_command(args: &[&str], session: &mut Session) -> Result<()
         SkillCmd::Add(reference) => skill_add(&reference, session).await,
         SkillCmd::Search(query) => skill_search(&query).await,
         SkillCmd::List => {
-            skill_list();
+            skill_list(session);
             Ok(())
         }
         SkillCmd::Remove(name) => skill_remove(&name, session),
@@ -6259,19 +6348,85 @@ async fn skill_search(query: &str) -> Result<()> {
     Ok(())
 }
 
-/// `:skill list` — list the locally installed skills (name + description).
-fn skill_list() {
-    let skills = crate::skills::load(&skills_dir_path());
-    if skills.is_empty() {
+/// Classify a skill's on-disk `SKILL.md` path into a `:skill search`-style
+/// source label: `Plugin:<id>` when it lives under `~/.aish/plugins/<id>/…`,
+/// otherwise `Skill:<folder>` for a locally-installed `~/.aish/skills/<folder>`.
+fn skill_source(path: &std::path::Path) -> String {
+    let comps: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if let Some(pos) = comps.iter().position(|c| c == "plugins") {
+        if let Some(plugin) = comps.get(pos + 1) {
+            return format!("Plugin:{plugin}");
+        }
+    }
+    let folder = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("Skill:{folder}")
+}
+
+/// `:skill list` — list every available skill as a `:skill search`-style table:
+/// SKILL | SOURCE | DESCRIPTION. Sources are `Skill:<folder>` (locally
+/// installed), `Plugin:<id>` (contributed by a discovered plugin), or
+/// `MCP:<server>` (published by a connected MCP server). Rows are sorted by
+/// skill name.
+fn skill_list(session: &Session) {
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+    for s in crate::skills::load_catalog(&skills_dir_path()) {
+        rows.push((s.name, skill_source(&s.path), s.description));
+    }
+    for sk in session.mcp.skills() {
+        rows.push((sk.name, format!("MCP:{}", sk.server), sk.description));
+    }
+    if rows.is_empty() {
         println!("No skills installed. `:skill search <query>` to find some.");
         return;
     }
-    for s in &skills {
-        if s.description.is_empty() {
-            println!("\x1b[1m{}\x1b[0m", s.name);
-        } else {
-            println!("\x1b[1m{}\x1b[0m — {}", s.name, s.description);
-        }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Respect --no-color / NO_COLOR / a piped stdout so escape codes never leak.
+    let color = crate::style::colors_enabled();
+    let (bold, cyan, reset) = if color {
+        ("\x1b[1m", "\x1b[36m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+
+    let name_w = rows
+        .iter()
+        .map(|r| r.0.chars().count())
+        .chain(std::iter::once("SKILL".len()))
+        .max()
+        .unwrap_or(5);
+    let src_w = rows
+        .iter()
+        .map(|r| r.1.chars().count())
+        .chain(std::iter::once("SOURCE".len()))
+        .max()
+        .unwrap_or(6);
+
+    // DESCRIPTION takes the remaining terminal width (untruncated when piped,
+    // where term_width() is usize::MAX).
+    let sep = 2usize;
+    let prefix_w = name_w + sep + src_w + sep;
+    let tw = crate::md::term_width();
+    let desc_w = if tw == usize::MAX {
+        usize::MAX
+    } else {
+        tw.saturating_sub(prefix_w).max(20)
+    };
+
+    println!(
+        "{:<name_w$}  {:<src_w$}  {}",
+        "SKILL", "SOURCE", "DESCRIPTION"
+    );
+    for (name, src, desc) in &rows {
+        let desc = crate::skill_provider::truncate(desc, desc_w);
+        println!("{bold}{name:<name_w$}{reset}  {cyan}{src:<src_w$}{reset}  {desc}");
     }
 }
 
@@ -6436,6 +6591,7 @@ async fn handle_colon(
                  :mcp add <name> <command|url> [args] connect + save an MCP server (~/.aish/.mcp.json)\n\
                  :mcp remove <name>                  disconnect + unsave an MCP server\n\
                  :mcp tools [name]                   list MCP tools\n\
+                 :mcp test [name|all]                live-probe MCP server(s) — tools/list round-trip + latency\n\
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
                  :context                            show context-window usage (tokens, %, memories)\n\
@@ -6444,6 +6600,7 @@ async fn handle_colon(
                  :compact                            offload older history to long-term memory now\n\
                  :memories [organize]                list stored memories, or dedup them\n\
                  :telemetry [clear]                  tool-call failure/retry-recovery stats (or wipe them)\n\
+                 :telemetry skill-match <task>       show why the semantic matcher ranks skills for a task\n\
                  :tokens                             per-run/aggregate token spend, in:out ratio, top spenders\n\
                  :version                            show aish version + backend (also `aish --version`)\n\
                  :update [prod|dev|ci]               check GitHub for a newer release and upgrade;\n\
@@ -7366,6 +7523,8 @@ async fn handle_colon(
                                     spec,
                                     session.batch_model.clone(),
                                     cred,
+                                    session.hooks.clone(),
+                                    session.mode.name().to_string(),
                                 );
                                 session.goal = Some(g);
                                 println!(
@@ -7538,7 +7697,7 @@ async fn handle_colon(
         Some("memories" | "memory") => handle_memories(parts.next(), session),
         Some("hooks") => handle_hooks(parts.next(), session),
         Some("plugin" | "plugins") => handle_plugin(parts.collect()),
-        Some("telemetry" | "tool-stats") => handle_telemetry(parts.next(), session),
+        Some("telemetry" | "tool-stats") => handle_telemetry(parts.collect(), session),
         Some("tokens" | "token-spend") => handle_tokens(session),
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
@@ -7788,6 +7947,10 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
                     added.join(", ")
                 );
             }
+            // Any server that failed THIS reload pass gets the same statusline
+            // alert treatment as startup (drained, so only new failures show).
+            let skipped = session.mcp.take_skipped();
+            surface_mcp_skips(session, &skipped);
         }
         Some((&"add", rest)) => {
             let Some((&name, tail)) = rest.split_first() else {
@@ -7846,9 +8009,29 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
                 }
             }
         }
+        Some((&"test", rest)) => {
+            let names: Vec<String> = if rest.is_empty() {
+                session.mcp.server_names()
+            } else {
+                rest.iter().map(|s| s.to_string()).collect()
+            };
+            if names.is_empty() {
+                println!("no MCP servers connected");
+            }
+            for n in names {
+                match session.mcp.test(&n).await {
+                    Ok((tools, rtt)) => println!(
+                        "  ✓ {n} — healthy, {tools} tool{} ({} ms)",
+                        if tools == 1 { "" } else { "s" },
+                        rtt.as_millis()
+                    ),
+                    Err(e) => println!("  ✗ {n} — {e:#}"),
+                }
+            }
+        }
         Some((other, _)) => {
             println!(
-                "unknown :mcp subcommand '{other}' — usage: :mcp [list|reconnect|add|remove|tools]"
+                "unknown :mcp subcommand '{other}' — usage: :mcp [list|reconnect|reload|add|remove|tools|test]"
             )
         }
     }
@@ -9732,6 +9915,29 @@ mod tests {
     fn skill_in_colon_catalog() {
         // The catalog carries :skill so the palette + completion offer it.
         assert!(colon_command_matches("sk").contains(&"skill"));
+    }
+
+    #[test]
+    fn skill_source_classifies_paths() {
+        use std::path::Path;
+        // Locally-installed skill → Skill:<folder>.
+        assert_eq!(
+            skill_source(Path::new("/home/u/.aish/skills/fix-ci/SKILL.md")),
+            "Skill:fix-ci"
+        );
+        // Plugin-contributed skill → Plugin:<plugin-id> (not the leaf folder).
+        assert_eq!(
+            skill_source(Path::new(
+                "/home/u/.aish/plugins/hello-world/skills/hello-world/SKILL.md"
+            )),
+            "Plugin:hello-world"
+        );
+        assert_eq!(
+            skill_source(Path::new(
+                "/home/u/.aish/plugins/aish/skills/alert-batch-composition/SKILL.md"
+            )),
+            "Plugin:aish"
+        );
     }
 
     #[test]
