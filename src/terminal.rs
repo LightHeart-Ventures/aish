@@ -61,6 +61,56 @@ static ALT_SCROLL_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 /// threading the strings back through.
 static LAST_FOOTER: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
 
+/// Mid-turn type-ahead override for the footer's status-message row (row H-1).
+/// When `Some`, the footer paints THIS string in the message row instead of the
+/// cached coordinator status message — so the operator sees the line they are
+/// typing WHILE a model turn runs (thinking / mid tool-call). Set/cleared by the
+/// keywatch reader thread via [`set_midturn_input`] / [`clear_midturn_input`].
+static MIDTURN_INPUT: Mutex<Option<String>> = Mutex::new(None);
+
+/// The status-message row to actually paint: the mid-turn type-ahead line when
+/// one is active, otherwise the caller's cached coordinator status message. The
+/// raw status message is always what gets cached in `LAST_FOOTER`; the override
+/// is applied only at paint time so a resize/idle repaint reflects live typing.
+fn effective_status_msg(cached: &str) -> String {
+    match MIDTURN_INPUT.lock().unwrap().as_ref() {
+        Some(s) => s.clone(),
+        None => cached.to_string(),
+    }
+}
+
+/// Paint the operator's mid-turn type-ahead line into the footer's message row.
+/// `styled_prompt` is emitted verbatim (already colour-styled) before `text`; an
+/// empty `text` clears the override so the normal status message returns. No
+/// visible effect when no footer region is installed (short terminal / non-tty),
+/// but the override slot is still updated. Safe to call from the keywatch reader
+/// thread — it locks stdout + a mutex exactly like the idle heartbeat repaint.
+pub fn set_midturn_input(styled_prompt: &str, text: &str) {
+    {
+        let mut slot = MIDTURN_INPUT.lock().unwrap();
+        *slot = if text.is_empty() {
+            None
+        } else {
+            Some(format!("{styled_prompt}{text}"))
+        };
+    }
+    paint_cached_footer(false);
+}
+
+/// Clear any mid-turn type-ahead override and repaint the normal footer. Called
+/// when a turn ends (guard teardown) and after each submitted line. Idempotent —
+/// returns early (no repaint) when nothing was overridden.
+pub fn clear_midturn_input() {
+    {
+        let mut slot = MIDTURN_INPUT.lock().unwrap();
+        if slot.is_none() {
+            return;
+        }
+        *slot = None;
+    }
+    paint_cached_footer(false);
+}
+
 // ---------------------------------------------------------------------------
 // Heartbeat footer repaint (idle-timeout self-heal).
 //
@@ -192,6 +242,8 @@ fn paint_cached_footer(home_body: bool) {
         return;
     }
     let (msg, bar) = LAST_FOOTER.lock().map(|l| l.clone()).unwrap_or_default();
+    // Mid-turn type-ahead, when active, takes over the message row.
+    let msg = effective_status_msg(&msg);
     let utf8 = utf8_locale();
     let sep = separator_line(cols, utf8, crate::style::colors_enabled());
     // footer_seq re-asserts the scroll region internally (inside its DECSC/DECRC
@@ -462,7 +514,13 @@ impl Terminal {
         // footer_seq re-asserts the scroll region internally, INSIDE its
         // DECSC/DECRC save-restore, so the DECSTBM cursor-home side effect never
         // leaks out and strands the next prompt at the top of the screen.
-        buf.push_str(&footer_seq(self.rows, self.cols, &sep, status_msg, statusline));
+        buf.push_str(&footer_seq(
+            self.rows,
+            self.cols,
+            &sep,
+            &effective_status_msg(status_msg),
+            statusline,
+        ));
         let mut out = std::io::stdout();
         let _ = write!(out, "{buf}");
         let _ = out.flush();

@@ -377,6 +377,14 @@ pub async fn run(
     // through the SAME dispatch path as a typed line — no logic is duplicated.
     let mut injected: Option<String> = None;
 
+    // Mid-turn type-ahead. Lines the operator submits WHILE a model turn runs —
+    // captured by the keywatch reader through `midturn_input` and echoed into the
+    // pinned footer — are queued here and consumed like `injected` on subsequent
+    // iterations, in FIFO order, so each runs as a normal command once the turn
+    // that captured it finishes. (Design semantic: type-ahead, not injection —
+    // the in-flight turn is never mutated.)
+    let mut typeahead: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+
     // Background-result presenter. When interactive, finished batch/worker jobs
     // queue their results (present::enable_deferred) and this task prints them
     // ABOVE the prompt via rustyline's ExternalPrinter — but only at a pause in
@@ -727,7 +735,7 @@ pub async fn run(
         // iteration, before falling back to the editor. A loop iteration is fed
         // to the model inline via the `?` route escape so it runs as an agentic
         // turn — never shell-dispatched or auto-offloaded to a coordinator.
-        let outcome = match injected.take() {
+        let outcome = match injected.take().or_else(|| typeahead.pop_front()) {
             Some(l) => ReadOutcome::Line(l),
             // Auto-resume drain: when the last fanned-out coordinator of this
             // session has finished, the presenter armed a coalesced resume (see
@@ -1138,8 +1146,22 @@ pub async fn run(
                                 goal_active,
                             );
                         });
+                    // Mid-turn type-ahead is enabled only when the pinned footer
+                    // is active (so the typed line can be echoed into its message
+                    // row). Escape hatch: set AISH_MIDTURN_INPUT=0 to disable and
+                    // fall back to the legacy Shift-Tab-only reader.
+                    let midturn_on = footer_active
+                        && std::env::var("AISH_MIDTURN_INPUT")
+                            .map(|v| v != "0")
+                            .unwrap_or(true);
+                    let (mt_line_tx, mut mt_line_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<String>();
+                    let midturn = midturn_on.then(|| crate::keywatch::MidturnCfg {
+                        line_tx: mt_line_tx,
+                        prompt: "\x1b[2m❯\x1b[0m ".to_string(),
+                    });
                     let mut keywatch =
-                        crate::keywatch::TurnKeyWatch::install(Some(on_shift_tab));
+                        crate::keywatch::TurnKeyWatch::install(Some(on_shift_tab), midturn);
                     let turn = engine::run_turn(&backend, &mut session, line, &mut confirm);
                     tokio::pin!(turn);
                     loop {
@@ -1168,6 +1190,14 @@ pub async fn run(
                             },
                         }
                     }
+                    // Drain any type-ahead the operator queued during the turn,
+                    // in submission order, for the REPL to run next. Clear the
+                    // footer echo now that the turn (and its capture) is ending
+                    // (the guard's Drop also clears it — this is belt-and-braces).
+                    while let Ok(l) = mt_line_rx.try_recv() {
+                        typeahead.push_back(l);
+                    }
+                    crate::terminal::clear_midturn_input();
                 }
                 if aborted {
                     // A half-finished turn can leave a dangling tool_use with no

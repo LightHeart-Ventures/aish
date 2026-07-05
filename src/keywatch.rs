@@ -45,6 +45,22 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+use crate::midturn_input::{Action, KeyParser, LineBuf};
+
+/// Configuration for mid-turn **type-ahead** capture. When supplied to
+/// [`TurnKeyWatch::install`], the reader decodes the FULL key stream (not just
+/// Shift-Tab), folds it into a [`LineBuf`], echoes the in-progress line into the
+/// footer's message row (via [`crate::terminal::set_midturn_input`]), and sends
+/// each submitted (Enter-terminated, non-empty) line on `line_tx` for the REPL
+/// to run as the next command once the current turn finishes. Absent ⇒ the
+/// reader keeps its legacy Shift-Tab-only `scan_csi_z` behaviour, byte-for-byte.
+pub struct MidturnCfg {
+    /// Submitted lines, drained by the REPL as type-ahead after the turn.
+    pub line_tx: mpsc::UnboundedSender<String>,
+    /// Styled prompt sigil painted before the typed text in the footer row.
+    pub prompt: String,
+}
+
 /// A callback the reader thread invokes DIRECTLY on a mid-turn Shift-Tab, so the
 /// worker-cycle happens even when the async turn task is blocked and can't drain
 /// the channel. It must only touch `Send + Sync` shared state (the attach-cursor
@@ -194,13 +210,22 @@ fn scan_csi_z(mut state: u8, bytes: &[u8]) -> (u8, usize) {
 /// The reader loop, run on a dedicated std thread for the life of one turn.
 /// Owns cbreak↔cooked flips for the foreground-pgrp handoff; never touches
 /// termios while `suspend` is set (the confirm path owns it then).
-fn reader_loop(tx: mpsc::UnboundedSender<TurnKey>, on_shift_tab: Option<ShiftTabFn>) {
+fn reader_loop(
+    tx: mpsc::UnboundedSender<TurnKey>,
+    on_shift_tab: Option<ShiftTabFn>,
+    midturn: Option<MidturnCfg>,
+) {
     let g = gate();
     // We applied cbreak at install; track it so we only flip on transitions.
     let mut have_cbreak = true;
-    // CSI parser state: 0 = ground, 1 = saw ESC, 2 = saw ESC '['.
+    // CSI parser state: 0 = ground, 1 = saw ESC, 2 = saw ESC '[' (legacy path).
     let mut state: u8 = 0;
     let mut buf = [0u8; 64];
+    // Mid-turn type-ahead: a full-key parser + line editor, live only when a
+    // `MidturnCfg` was supplied. When absent we fall through to the legacy
+    // Shift-Tab-only `scan_csi_z` scan below, unchanged.
+    let mut parser = KeyParser::new();
+    let mut linebuf = LineBuf::new();
     loop {
         if g.stop.load(Ordering::Acquire) {
             break;
@@ -248,20 +273,49 @@ fn reader_loop(tx: mpsc::UnboundedSender<TurnKey>, on_shift_tab: Option<ShiftTab
         if n <= 0 {
             continue;
         }
-        let (next_state, hits) = scan_csi_z(state, &buf[..n as usize]);
-        state = next_state;
-        for _ in 0..hits {
-            // Shift-Tab. Act on it TWO ways so it lands regardless of whether the
-            // hosting `select!` gets re-polled: (1) invoke the direct callback on
-            // THIS thread — it only touches `Arc<Mutex>` attach-cursor handles, so
-            // it cycles the view even while the async turn task is stuck in a
-            // blocking / CPU-bound stretch that never yields to drain the channel;
-            // (2) also push onto the channel for any `select!` consumer that still
-            // wants the event. Best-effort send; a closed channel just drops it.
-            if let Some(cb) = on_shift_tab.as_ref() {
-                cb();
+        let chunk = &buf[..n as usize];
+        if let Some(cfg) = midturn.as_ref() {
+            // Full mid-turn line editor. Decode every key, fold it into the line
+            // buffer, and echo the in-progress line into the pinned footer. A
+            // submitted line is queued for the REPL to run after the turn; a
+            // Shift-Tab still cycles the attach view (same two-way handling as the
+            // legacy path). `KeyParser` is a strict superset of `scan_csi_z`, so
+            // fragmented CSI/UTF-8 across `read()` chunks decodes correctly.
+            for key in parser.decode(chunk) {
+                match linebuf.apply(key) {
+                    Action::None => {
+                        crate::terminal::set_midturn_input(&cfg.prompt, &linebuf.as_string());
+                    }
+                    Action::Submit(line) => {
+                        let _ = cfg.line_tx.send(line);
+                        // Line consumed → restore the normal status message.
+                        crate::terminal::set_midturn_input(&cfg.prompt, "");
+                    }
+                    Action::CycleWorker => {
+                        if let Some(cb) = on_shift_tab.as_ref() {
+                            cb();
+                        }
+                        let _ = tx.send(TurnKey::ShiftTab);
+                    }
+                }
             }
-            let _ = tx.send(TurnKey::ShiftTab);
+        } else {
+            let (next_state, hits) = scan_csi_z(state, chunk);
+            state = next_state;
+            for _ in 0..hits {
+                // Shift-Tab. Act on it TWO ways so it lands regardless of whether
+                // the hosting `select!` gets re-polled: (1) invoke the direct
+                // callback on THIS thread — it only touches `Arc<Mutex>`
+                // attach-cursor handles, so it cycles the view even while the async
+                // turn task is stuck in a blocking / CPU-bound stretch that never
+                // yields to drain the channel; (2) also push onto the channel for
+                // any `select!` consumer that still wants the event. Best-effort
+                // send; a closed channel just drops it.
+                if let Some(cb) = on_shift_tab.as_ref() {
+                    cb();
+                }
+                let _ = tx.send(TurnKey::ShiftTab);
+            }
         }
     }
 }
@@ -288,7 +342,12 @@ impl TurnKeyWatch {
     /// each mid-turn Shift-Tab, so the worker-cycle fires even while the async
     /// turn task is stuck in a blocking / CPU-bound stretch that never yields to
     /// drain the channel `select!` awaits. The channel event is still emitted.
-    pub fn install(on_shift_tab: Option<ShiftTabFn>) -> Self {
+    ///
+    /// `midturn` (when `Some`) enables full mid-turn type-ahead: the reader
+    /// decodes the whole key stream, echoes the in-progress line into the footer,
+    /// and forwards submitted lines on the supplied channel. `None` keeps the
+    /// legacy Shift-Tab-only behaviour. Ignored on an inert (non-tty) guard.
+    pub fn install(on_shift_tab: Option<ShiftTabFn>, midturn: Option<MidturnCfg>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let g = gate();
         if !stdin_is_tty() || g.installed.load(Ordering::Acquire) {
@@ -315,7 +374,7 @@ impl TurnKeyWatch {
         let reader_tx = tx.clone();
         let handle = std::thread::Builder::new()
             .name("aish-keywatch".into())
-            .spawn(move || reader_loop(reader_tx, on_shift_tab))
+            .spawn(move || reader_loop(reader_tx, on_shift_tab, midturn))
             .ok();
         TurnKeyWatch {
             active: handle.is_some(),
@@ -344,6 +403,9 @@ impl Drop for TurnKeyWatch {
             let _ = h.join();
         }
         apply_cooked();
+        // Drop any mid-turn type-ahead echo so the footer returns to its normal
+        // coordinator status message once the turn's capture ends.
+        crate::terminal::clear_midturn_input();
         g.installed.store(false, Ordering::Release);
     }
 }
