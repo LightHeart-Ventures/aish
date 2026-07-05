@@ -1353,6 +1353,43 @@ fn printer_slot() -> &'static std::sync::Mutex<Option<Box<dyn crate::editor::Lin
     EXTERNAL_PRINTER.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+// While background workers are outstanding, the editor's idle read takes a
+// custom `poll(2)` loop (`poll_until_wake_or_key`) that draws its OWN prompt
+// with a raw `write!` instead of going through rustyline's `readline()`. In
+// that state rustyline's `ExternalPrinter` has no active edit-state, so a
+// forwarded worker row printed via [`print_above_prompt`] lands at the cursor —
+// right after the raw-drawn `prompt> ` — producing the reported
+// `prompt> worker output` glue (a race: only when a row arrives after the idle
+// prompt is drawn but before a keystroke hands control to rustyline).
+//
+// These two flags let the poll loop and the printer coordinate the same
+// erase→print→repaint dance rustyline does internally: while `IDLE_PROMPT_ACTIVE`
+// is set, `print_above_prompt` erases the stranded idle prompt line before it
+// prints and raises `IDLE_PROMPT_DIRTY`; the poll loop drains the dirty flag on
+// its next tick and repaints the prompt below the freshly-printed output.
+static IDLE_PROMPT_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static IDLE_PROMPT_DIRTY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Mark (or clear) the "editor idle-poll loop has drawn its own raw prompt"
+/// state. Set to `true` right after the idle prompt is drawn and back to `false`
+/// at every exit of the poll loop. Clearing also drops any pending dirty flag so
+/// a stale repaint can't bleed into the next read.
+pub fn set_idle_prompt_active(active: bool) {
+    IDLE_PROMPT_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
+    if !active {
+        IDLE_PROMPT_DIRTY.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Consume the "an external print erased the idle prompt, repaint it" flag.
+/// Returns `true` at most once per erasing print; the editor's poll loop calls
+/// this each tick and repaints the prompt when it returns `true`.
+pub fn take_idle_prompt_dirty() -> bool {
+    IDLE_PROMPT_DIRTY.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Install the REPL's above-the-prompt printer for the whole process. Called
 /// once at interactive startup with the editor's `ExternalPrinter`; after this,
 /// [`announce`] / [`announce_raw`] emit prompt-preserving lines through it
@@ -1372,6 +1409,18 @@ pub fn install_external_printer(printer: Box<dyn crate::editor::LinePrinter>) {
 pub fn print_above_prompt(text: String) -> bool {
     if let Ok(mut slot) = printer_slot().lock() {
         if let Some(printer) = slot.as_mut() {
+            // When the editor's idle-poll loop drew its own raw prompt, rustyline
+            // has no edit-state to erase it, so the row would glue onto the
+            // `prompt> ` line. Wipe the stranded prompt line ourselves (still
+            // inside the printer mutex, so it's serialised against other worker
+            // streams) and flag the loop to repaint the prompt afterward.
+            if IDLE_PROMPT_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+                use std::io::Write;
+                let mut out = std::io::stdout();
+                let _ = write!(out, "\r\x1b[2K");
+                let _ = out.flush();
+                IDLE_PROMPT_DIRTY.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             printer.print(to_crlf(&text));
             return true;
         }
