@@ -271,6 +271,16 @@ pub struct Session {
     /// Cumulative completion (output) tokens the model has produced this session
     /// (companion to [`tokens_in`]). Feeds the status line's `tokens out: …`.
     pub tokens_out: usize,
+    /// Cumulative prompt tokens served from the model's cache this session
+    /// (Anthropic `cache_read_input_tokens`, summed per turn). Numerator of the
+    /// session-level cache hit rate surfaced on the statusline and `:context`
+    /// (TASK-320 AC#3). Session-local.
+    pub cache_read_total: usize,
+    /// Cumulative prompt tokens spent WRITING cache entries this session
+    /// (`cache_creation_input_tokens`, summed per turn). Reported alongside the
+    /// hit rate so a session churning the cache (high write, low read) is
+    /// distinguishable from a healthy one. Session-local. (TASK-320)
+    pub cache_creation_total: usize,
     /// Count of tool calls executed this session — every `escalate`, dispatch
     /// (`run_in_background`), and ordinary tool run tallied once when it finishes.
     /// Feeds the status line's `tool calls: …`.
@@ -278,6 +288,22 @@ pub struct Session {
     /// Count of logical agentic turns taken this session (one per `run_turn`).
     /// Feeds the status line's `turns: …`.
     pub turns_total: usize,
+    /// Value of [`tool_calls_total`] at the most recent compaction. The engine
+    /// derives how many tool calls are still retained *in-context*
+    /// (`tool_calls_total - tool_calls_at_last_compact`) to enforce the TASK-321
+    /// tool-call ceiling. Advanced by `maybe_compact`; reset with the
+    /// conversation. Session-local.
+    pub tool_calls_at_last_compact: usize,
+    /// Resolved tool-call compaction ceiling for this session (0 = lever off).
+    /// Seeded from `AISH_COMPACT_TOOL_CALLS` (falling back to
+    /// [`crate::context::COMPACT_TOOL_CALL_CEILING`]) once at construction so the
+    /// hot compaction check does no env I/O. (TASK-321)
+    pub compact_tool_call_ceiling: usize,
+    /// Resolved absolute-token compaction ceiling for this session (0 = lever
+    /// off; the %-window trigger still applies). Seeded from
+    /// `AISH_COMPACT_TOKEN_BUDGET` (falling back to
+    /// [`crate::context::COMPACT_TOKEN_CEILING`]). (TASK-321)
+    pub compact_token_ceiling: usize,
     /// Interactive background mode (on by default, persisted; toggle with `:batch`).
     /// When on, the agent gets the run_in_background/background_status tools and a
     /// system-prompt nudge to offload deferrable work to a full background
@@ -326,6 +352,8 @@ pub struct Session {
     /// background presenter, the `:alert` command handler, and the `set_alert`
     /// tool all hold a handle. None if it failed to open.
     pub alert_store: Option<crate::db::AlertStore>,
+    /// Recoverable `:activity` tray — last N fired alerts / notable events.
+    pub activity_store: Option<crate::db::ActivityStore>,
     /// The single most-recent "flash" message for the SecondStatusLine's
     /// recent-message slot, shared with the background presenter. This row shows
     /// exactly ONE message at a time (most-recent wins): the presenter overwrites
@@ -344,6 +372,12 @@ pub struct Session {
     /// its own workers (no infinite re-exec recursion), so `run_in_background`
     /// downgrades a tool-needing offload to a tool-less batch when this is set.
     pub nested: bool,
+    /// TASK-323: optional per-run/per-mode MCP tool allowlist. When `Some`, only
+    /// MCP tools whose namespaced name (`mcp__<server>__<tool>`) appears in the
+    /// list are serialized into the tool-schema block, trimming the payload. When
+    /// `None`, every connected tool is exposed (default). Built from orchestration
+    /// run metadata or session mode via `AISH_TOOL_ALLOWLIST` (comma-separated).
+    pub tool_allowlist: Option<Vec<String>>,
     /// The active background `:goal` loop, if any (one per session). Set by
     /// `:goal <condition>`, inspected by bare `:goal`, stopped by `:goal clear`.
     pub goal: Option<crate::goal::Handle>,
@@ -563,8 +597,19 @@ impl Session {
             context_used: 0,
             tokens_in: 0,
             tokens_out: 0,
+            cache_read_total: 0,
+            cache_creation_total: 0,
             tool_calls_total: 0,
             turns_total: 0,
+            tool_calls_at_last_compact: 0,
+            compact_tool_call_ceiling: crate::context::parse_ceiling(
+                std::env::var("AISH_COMPACT_TOOL_CALLS").ok().as_deref(),
+                crate::context::COMPACT_TOOL_CALL_CEILING,
+            ),
+            compact_token_ceiling: crate::context::parse_ceiling(
+                std::env::var("AISH_COMPACT_TOKEN_BUDGET").ok().as_deref(),
+                crate::context::COMPACT_TOKEN_CEILING,
+            ),
             batch_mode: true,
             batch_model: crate::batch::DEFAULT_BATCH_MODEL.to_string(),
             batch_force_batches: false,
@@ -576,9 +621,18 @@ impl Session {
             coordinator_store: None,
             goal_store: None,
             alert_store: None,
+            activity_store: None,
             flash: std::sync::Arc::new(std::sync::Mutex::new(None)),
             current_goal_id: None,
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
+            tool_allowlist: std::env::var("AISH_TOOL_ALLOWLIST").ok().and_then(|v| {
+                let list: Vec<String> = v
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                (!list.is_empty()).then_some(list)
+            }),
             goal: None,
             goals: Vec::new(),
             backend_kind: "claude".to_string(),
@@ -684,8 +738,14 @@ impl Session {
         self.context_used = 0;
         self.tokens_in = 0;
         self.tokens_out = 0;
+        self.cache_read_total = 0;
+        self.cache_creation_total = 0;
         self.tool_calls_total = 0;
         self.turns_total = 0;
+        // The in-context tool-call watermark is meaningless once history is gone;
+        // reset it so the fresh conversation counts from zero. The resolved
+        // ceilings are session config and intentionally persist. (TASK-321)
+        self.tool_calls_at_last_compact = 0;
         // TASK-282 AC1/AC3: the durable goal tree is independent of the
         // conversation. Re-hydrate it from aish.db and re-assert the single
         // active-goal invariant so the goal (and its rollup) survives `:new`.
@@ -1101,7 +1161,11 @@ Core Rules (NEVER break these):\n\
 call in a turn together, so front-load your context-gathering (one up-front block of reads, greps, \
 list_dirs, status queries covering the whole toolset you'll need) instead of drip-feeding one per \
 round; then go STRAIGHT to the action batch — don't close a turn just to 'think' about output you \
-already have. Only serialize a call when it depends on an earlier call's result. Denser turns, fewer \
+already have. Only serialize a call when it depends on an earlier call's result. Concretely: a grep to \
+locate a symbol and the read_file of a DIFFERENT already-known path are independent — fire them \
+together; reading three files you already know you need is ONE turn of three read_files, not three \
+turns. Grep-then-read of the SAME file IS dependent (you need the line number first) — that's the \
+one case to serialize. Denser turns, fewer \
 no-op closes that waste a round-trip (and trip the continue-nudge).\n\
 - NO shell syntax: no pipes, globs, redirection, &&/||, command substitution. Use list_dir + \
 run_program chains. Filter/aggregate yourself.\n\

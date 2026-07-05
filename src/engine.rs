@@ -101,7 +101,27 @@ async fn run_turn_inner(
     let system = session.system_prompt(escalate_available);
     let mut tool_defs = tools::tool_defs(session.batch_mode, escalate_available, session.nested);
     if backend.include_mcp_tools() {
-        tool_defs.extend(session.mcp.tool_defs());
+        // TASK-323: apply the per-run/per-mode tool allowlist BEFORE serializing
+        // the MCP tool-schema block, and measure the payload reduction. The
+        // filter is order-preserving, so for a fixed allowlist the emitted tools
+        // block is byte-identical turn to turn — no mid-session cache invalidation.
+        let (scoped, measure) = session
+            .mcp
+            .scope_tool_defs(session.tool_allowlist.as_deref());
+        if measure.trimmed() {
+            static SCOPE_LOG: std::sync::Once = std::sync::Once::new();
+            SCOPE_LOG.call_once(|| {
+                eprintln!(
+                    "[tool-scope] MCP tools {}->{} (~{} tokens saved: {}->{})",
+                    measure.tools_before,
+                    measure.tools_after,
+                    measure.tokens_saved(),
+                    measure.tokens_before,
+                    measure.tokens_after,
+                );
+            });
+        }
+        tool_defs.extend(scoped);
     }
     // TASK-13: on a fresh conversation, seed the turn with the previous recorded
     // output so a prompt like "summarize that" can reference it without
@@ -223,6 +243,14 @@ async fn run_turn_inner(
     // only for this turn (dropped with the function) so nothing bleeds across.
     let mut repeat_guard = crate::loopguard::RepeatGuard::default();
 
+    // TASK-324 AC2: detect drip-fed single read turns (grep→read→grep→read…) and
+    // fold a one-shot "batch your independent reads" nudge into the NEXT round's
+    // prompt. `batch_guard` tallies consecutive lone-read turns; `pending_batch_nudge`
+    // carries the nudge forward exactly one round, then is dropped so the base
+    // prompt stays byte-stable for cache reuse.
+    let mut batch_guard = crate::loopguard::BatchGuard::default();
+    let mut pending_batch_nudge: Option<String> = None;
+
     for iteration in 1..=MAX_ITERATIONS {
         // ── Operator interrupt seam (Ctrl-C on an `:attach`ed worker). A
         // coordinator installs a SIGINT handler that latches an interrupt flag
@@ -267,12 +295,21 @@ async fn run_turn_inner(
         let force = matches!(phase, crate::loopguard::BudgetPhase::ForceSummarize);
         // The base prompt stays byte-stable (prompt-cache friendly); the budget
         // suffix is appended only while converging/forcing.
-        let effective_system = match phase {
-            crate::loopguard::BudgetPhase::Normal => system.clone(),
-            other => format!(
-                "{system}{}",
-                crate::loopguard::budget_suffix(other, MAX_ITERATIONS.saturating_sub(iteration))
-            ),
+        let effective_system = {
+            let budget = match phase {
+                crate::loopguard::BudgetPhase::Normal => String::new(),
+                other => crate::loopguard::budget_suffix(
+                    other,
+                    MAX_ITERATIONS.saturating_sub(iteration),
+                ),
+            };
+            // One-shot batch nudge from a prior round's drip-feed streak (AC2).
+            let nudge = pending_batch_nudge.take().unwrap_or_default();
+            if budget.is_empty() && nudge.is_empty() {
+                system.clone()
+            } else {
+                format!("{system}{nudge}{budget}")
+            }
         };
         // No tools on the forced-summarize step — the model literally cannot keep
         // looping, so a final (possibly partial) answer is guaranteed.
@@ -304,6 +341,14 @@ async fn run_turn_inner(
         if let Some(u) = usage {
             session.tokens_in = session.tokens_in.saturating_add(u.input_tokens);
             session.tokens_out = session.tokens_out.saturating_add(u.output_tokens);
+            // TASK-320: track cache read/write volume so the status line and
+            // `:context` can report a session-level cache hit rate. Purely
+            // observational — these never affect context-window math.
+            session.cache_read_total =
+                session.cache_read_total.saturating_add(u.cache_read_tokens);
+            session.cache_creation_total = session
+                .cache_creation_total
+                .saturating_add(u.cache_creation_tokens);
         }
 
         // ── Forced summarize: graceful degradation before the hard limit. The
@@ -405,6 +450,20 @@ async fn run_turn_inner(
         // lines stay dim, so the rounds still read as structured.
         if !turn.text.trim().is_empty() {
             emit_narration(session, &turn.text);
+        }
+
+        // TASK-324 AC2: record this executing turn's tool-call shape. When the
+        // model has drip-fed a lone batchable read for `BATCH_NUDGE_STREAK` turns
+        // running, arm a one-shot nudge for the next round's prompt.
+        {
+            let names: Vec<&str> = turn.tool_calls.iter().map(|c| c.name.as_str()).collect();
+            if let Some(nudge) = batch_guard.record(&names) {
+                eprintln!(
+                    "\x1b[2m  ⚠ batch-guard: {} single-read turns in a row — nudging to batch independent reads\x1b[0m",
+                    crate::loopguard::BATCH_NUDGE_STREAK
+                );
+                pending_batch_nudge = Some(nudge);
+            }
         }
 
         let mut results: Vec<ToolResult> = Vec::with_capacity(turn.tool_calls.len());
@@ -719,14 +778,20 @@ pub async fn run_coordinator(
 /// model's window. A no-op until usage is known (`context_used` > 0) and the
 /// conversation is long enough to split on a safe assistant boundary.
 fn maybe_compact(backend: &Backend, session: &mut Session) {
-    let window = backend.context_window();
-    if !crate::context::should_compact(
-        session.context_used,
-        window,
-        crate::context::COMPACT_THRESHOLD_PCT,
-    ) {
+    let budget = crate::context::CompactBudget {
+        window: backend.context_window(),
+        threshold_pct: crate::context::COMPACT_THRESHOLD_PCT,
+        tool_call_ceiling: session.compact_tool_call_ceiling,
+        token_ceiling: session.compact_token_ceiling,
+    };
+    // In-context tool calls = session total minus the watermark set at the last
+    // compaction (the calls the retained transcript still carries). (TASK-321)
+    let tool_calls_in_context = session
+        .tool_calls_total
+        .saturating_sub(session.tool_calls_at_last_compact);
+    let Some(trigger) = budget.trigger(session.context_used, tool_calls_in_context) else {
         return;
-    }
+    };
     let Some(plan) =
         crate::context::plan_compaction(&session.history, crate::context::KEEP_RECENT_MSGS)
     else {
@@ -744,9 +809,14 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
     crate::context::apply_compaction(&mut session.history, &plan);
     // Exact next-turn usage isn't known yet; re-seat the figure from an estimate.
     session.context_used = crate::context::estimate_history_tokens(&session.history);
+    // Re-seat the tool-call watermark so the in-context count reflects only the
+    // calls the retained transcript still carries. (TASK-321)
+    session.tool_calls_at_last_compact = session
+        .tool_calls_total
+        .saturating_sub(crate::context::count_tool_calls(&session.history));
     eprintln!(
-        "\x1b[2maish: context at/over {}% — compacted {dropped} earlier message(s) to memory\x1b[0m",
-        crate::context::COMPACT_THRESHOLD_PCT
+        "\x1b[2maish: {} tripped — compacted {dropped} earlier message(s) to memory\x1b[0m",
+        trigger.label()
     );
 }
 
@@ -831,9 +901,19 @@ pub fn statusline_stats(session: &Session) -> String {
     {
         return String::new();
     }
+    // TASK-320 AC#3: append a session-level cache-read hit rate when the backend
+    // reported any cache activity — the numerator is cumulative cached-read
+    // tokens, the denominator the full input tally (which already includes the
+    // cached prefix). Omitted for cache-less sessions so the line stays clean.
+    let cache = if session.cache_read_total > 0 && session.tokens_in > 0 {
+        let pct = (session.cache_read_total as f64 / session.tokens_in as f64) * 100.0;
+        format!(", cache: {pct:.0}% hit")
+    } else {
+        String::new()
+    };
     format!(
-        "tokens: {} in / {} out, tool calls: {}, turns: {}",
-        session.tokens_in, session.tokens_out, session.tool_calls_total, session.turns_total
+        "tokens: {} in / {} out, tool calls: {}, turns: {}{}",
+        session.tokens_in, session.tokens_out, session.tool_calls_total, session.turns_total, cache
     )
 }
 

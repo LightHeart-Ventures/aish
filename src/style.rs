@@ -224,6 +224,75 @@ pub fn alert_badge(banner: &str, color_on: bool) -> String {
     }
 }
 
+/// Severity tier for a fired `:alert` / `:activity` entry — drives badge color.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Severity {
+    Info,
+    Warn,
+    Critical,
+}
+
+impl Severity {
+    /// Canonical lowercase tag (persisted in the activity store).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Info => "info",
+            Severity::Warn => "warn",
+            Severity::Critical => "critical",
+        }
+    }
+
+    /// Parse a persisted tag back into a tier (unknown → Info).
+    pub fn from_tag(s: &str) -> Severity {
+        match s.trim().to_lowercase().as_str() {
+            "critical" | "crit" | "fatal" | "error" => Severity::Critical,
+            "warn" | "warning" => Severity::Warn,
+            _ => Severity::Info,
+        }
+    }
+
+    /// Infer a tier from free banner/detail text by keyword.
+    pub fn infer(text: &str) -> Severity {
+        let t = text.to_lowercase();
+        if t.contains("critical")
+            || t.contains("fatal")
+            || t.contains("error")
+            || t.contains("fail")
+            || t.contains("panic")
+            || t.contains('❌')
+        {
+            Severity::Critical
+        } else if t.contains("warn")
+            || t.contains("slow")
+            || t.contains("retry")
+            || t.contains("degrad")
+        {
+            Severity::Warn
+        } else {
+            Severity::Info
+        }
+    }
+
+    /// SGR prefix (bold + color) for this tier.
+    fn sgr(self) -> &'static str {
+        match self {
+            Severity::Info => "1;36",     // cyan
+            Severity::Warn => "1;33",     // yellow
+            Severity::Critical => "1;31", // red
+        }
+    }
+}
+
+/// Severity-tiered variant of [`alert_badge`]: same glyph + layout, but the
+/// color reflects the tier (cyan=info, yellow=warn, red=critical). Pure.
+pub fn severity_badge(banner: &str, sev: Severity, color_on: bool) -> String {
+    if color_on {
+        format!("\x1b[{}m{ALERT_GLYPH} {banner}\x1b[0m", sev.sgr())
+    } else {
+        format!("{ALERT_GLYPH} {banner}")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Time formatting — start/stop timestamps + durations for the `:workers` table
 // ---------------------------------------------------------------------------

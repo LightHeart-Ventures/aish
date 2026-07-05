@@ -27,11 +27,31 @@ use crate::backend::{Msg, Role};
 pub struct Usage {
     pub input_tokens: usize,
     pub output_tokens: usize,
+    /// Portion of `input_tokens` that was served from the model's prompt cache
+    /// (Anthropic `cache_read_input_tokens`). A high fraction of the input means
+    /// the stable system+tools prefix is being reused instead of re-billed at
+    /// full rate. Zero when the backend reports no cache buckets. (TASK-320)
+    pub cache_read_tokens: usize,
+    /// Portion of `input_tokens` spent WRITING new entries into the prompt cache
+    /// (Anthropic `cache_creation_input_tokens`) — billed at a premium, paid once
+    /// when a fresh prefix is cached. Zero when unreported. (TASK-320)
+    pub cache_creation_tokens: usize,
 }
 
 impl Usage {
     pub fn total(self) -> usize {
         self.input_tokens + self.output_tokens
+    }
+
+    /// Cache-read hit rate for THIS usage: cached-read tokens as a fraction of
+    /// the full input prompt, 0.0–100.0. Returns `None` when there was no input
+    /// to measure against. AC #3's measurement primitive (TASK-320).
+    pub fn cache_hit_pct(self) -> Option<f64> {
+        if self.input_tokens == 0 {
+            None
+        } else {
+            Some((self.cache_read_tokens as f64 / self.input_tokens as f64) * 100.0)
+        }
     }
 }
 
@@ -64,6 +84,95 @@ pub fn should_compact(used: usize, window: usize, threshold_pct: usize) -> bool 
     window > 0 && used.saturating_mul(100) >= window.saturating_mul(threshold_pct)
 }
 
+/// Default ceiling on the number of tool calls retained *in context* before a
+/// compaction is forced — independent of the % window. This is TASK-321's core
+/// lever: on a large-window model (Claude, 200k) the %-window trigger alone
+/// doesn't fire until ~150k tokens are live, by which point a tool-heavy
+/// coordinator run has already re-sent a growing transcript across ~100+ turns
+/// and billed millions of cumulative input tokens. Capping the live tool-call
+/// count compacts *far* earlier, bounding per-turn transcript size (and thus the
+/// quadratic cumulative cost of a run). Overridable via `AISH_COMPACT_TOOL_CALLS`
+/// (`off`/`none`/`0` disables). (TASK-321)
+pub const COMPACT_TOOL_CALL_CEILING: usize = 50;
+
+/// Default absolute cumulative-token ceiling before a compaction is forced,
+/// independent of the % window. `0` (the default) leaves the token lever to the
+/// existing percentage-of-window trigger (itself a token budget, expressed
+/// relative to the model). Set an absolute figure via `AISH_COMPACT_TOKEN_BUDGET`
+/// to compact at a fixed token count regardless of window size. (TASK-321)
+pub const COMPACT_TOKEN_CEILING: usize = 0;
+
+/// Parse a compaction-ceiling override from an env value: `None`/empty → the
+/// compiled-in `default`; `off`/`none` (case-insensitive) → `0` (lever disabled);
+/// a valid non-negative integer → that value (`0` also disables); anything else
+/// → `default` (a typo must not silently drop the guard). (TASK-321)
+pub fn parse_ceiling(raw: Option<&str>, default: usize) -> usize {
+    match raw.map(str::trim) {
+        None | Some("") => default,
+        Some(s) if s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("none") => 0,
+        Some(s) => s.parse::<usize>().unwrap_or(default),
+    }
+}
+
+/// Which lever tripped a compaction — surfaced in the log line so an operator
+/// can see whether the context window, the tool-call cap, or the token cap fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactTrigger {
+    /// Live token usage reached `threshold_pct`% of the model window.
+    WindowPct,
+    /// Live in-context tool-call count reached the tool-call ceiling.
+    ToolCalls,
+    /// Live token usage reached the absolute token ceiling.
+    TokenBudget,
+}
+
+impl CompactTrigger {
+    /// Short human label for the compaction log line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WindowPct => "context window",
+            Self::ToolCalls => "tool-call cap",
+            Self::TokenBudget => "token budget",
+        }
+    }
+}
+
+/// A resolved compaction budget: the three OR'd ceilings the engine evaluates
+/// before every model call. A ceiling of `0` disables that individual lever
+/// (`window == 0` disables the percentage lever, matching [`should_compact`]).
+#[derive(Debug, Clone, Copy)]
+pub struct CompactBudget {
+    /// Model context window (tokens); `0` = unknown/disabled.
+    pub window: usize,
+    /// Percentage of `window` at which to compact.
+    pub threshold_pct: usize,
+    /// Max tool calls retained in-context before forcing a compaction; `0` = off.
+    pub tool_call_ceiling: usize,
+    /// Absolute live-token ceiling before forcing a compaction; `0` = off.
+    pub token_ceiling: usize,
+}
+
+impl CompactBudget {
+    /// Decide whether — and why — to compact now. `used` is the running live
+    /// token figure; `tool_calls_in_context` is how many tool calls the current
+    /// (uncompacted) transcript still carries. The tool-call cap is checked
+    /// first (the cheap, early lever that bounds cost before the window fills),
+    /// then the absolute token cap, then the percentage window. `None` ⇒ leave
+    /// history intact.
+    pub fn trigger(&self, used: usize, tool_calls_in_context: usize) -> Option<CompactTrigger> {
+        if self.tool_call_ceiling > 0 && tool_calls_in_context >= self.tool_call_ceiling {
+            return Some(CompactTrigger::ToolCalls);
+        }
+        if self.token_ceiling > 0 && used >= self.token_ceiling {
+            return Some(CompactTrigger::TokenBudget);
+        }
+        if should_compact(used, self.window, self.threshold_pct) {
+            return Some(CompactTrigger::WindowPct);
+        }
+        None
+    }
+}
+
 /// Rough token estimate for a string (~4 chars/token). The fallback when a
 /// backend doesn't report [`Usage`].
 pub fn estimate_text_tokens(s: &str) -> usize {
@@ -86,6 +195,16 @@ pub fn estimate_history_tokens(history: &[Msg]) -> usize {
     }
     n
 }
+
+/// Count the tool calls carried by a history slice — the assistant-side tool
+/// invocations across every message. Used to re-seat the tool-call watermark
+/// after a compaction so the *in-context* tool-call count (`tool_calls_total -
+/// tool_calls_at_last_compact`) reflects only the calls the retained transcript
+/// still carries. (TASK-321)
+pub fn count_tool_calls(history: &[Msg]) -> usize {
+    history.iter().map(|m| m.tool_calls.len()).sum()
+}
+
 
 /// The largest prefix length `split` such that compacting `history[..split]`:
 ///   * keeps at least `keep_recent` messages in `history[split..]`, and
@@ -251,6 +370,60 @@ mod tests {
         assert!(should_compact(900, 1000, 75));
         // A zero/unknown window never triggers (avoids div-by-zero surprises).
         assert!(!should_compact(10, 0, 75));
+    }
+
+    #[test]
+    fn parse_ceiling_handles_overrides_and_typos() {
+        // Absent/empty → default.
+        assert_eq!(parse_ceiling(None, 50), 50);
+        assert_eq!(parse_ceiling(Some(""), 50), 50);
+        assert_eq!(parse_ceiling(Some("   "), 50), 50);
+        // Explicit disables.
+        assert_eq!(parse_ceiling(Some("0"), 50), 0);
+        assert_eq!(parse_ceiling(Some("off"), 50), 0);
+        assert_eq!(parse_ceiling(Some("None"), 50), 0);
+        // Valid integer (with surrounding whitespace).
+        assert_eq!(parse_ceiling(Some("30"), 50), 30);
+        assert_eq!(parse_ceiling(Some(" 128 "), 50), 128);
+        // Garbage must NOT silently disable the guard — fall back to default.
+        assert_eq!(parse_ceiling(Some("banana"), 50), 50);
+    }
+
+    #[test]
+    fn budget_trigger_prefers_tool_call_cap_then_token_then_window() {
+        let b = CompactBudget {
+            window: 200_000,
+            threshold_pct: 75,
+            tool_call_ceiling: 50,
+            token_ceiling: 120_000,
+        };
+        // Nothing tripped.
+        assert_eq!(b.trigger(10_000, 3), None);
+        // Tool-call cap fires first, before either token lever.
+        assert_eq!(b.trigger(10_000, 50), Some(CompactTrigger::ToolCalls));
+        // Below the cap but over the absolute token ceiling.
+        assert_eq!(b.trigger(120_000, 10), Some(CompactTrigger::TokenBudget));
+        // Below both absolute caps but at the % window (150k of 200k).
+        let b2 = CompactBudget { token_ceiling: 0, ..b };
+        assert_eq!(b2.trigger(150_000, 10), Some(CompactTrigger::WindowPct));
+        assert_eq!(b2.trigger(149_999, 10), None);
+    }
+
+    #[test]
+    fn budget_ceilings_are_individually_disablable() {
+        // Tool-call lever off (0) — only the token/window levers remain.
+        let b = CompactBudget {
+            window: 0,
+            threshold_pct: 75,
+            tool_call_ceiling: 0,
+            token_ceiling: 0,
+        };
+        // Every lever off ⇒ never compacts, even with a huge transcript.
+        assert_eq!(b.trigger(10_000_000, 10_000), None);
+        // Only the tool-call lever on.
+        let b = CompactBudget { tool_call_ceiling: 40, ..b };
+        assert_eq!(b.trigger(10_000_000, 39), None);
+        assert_eq!(b.trigger(0, 40), Some(CompactTrigger::ToolCalls));
     }
 
     #[test]

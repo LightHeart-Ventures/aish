@@ -42,6 +42,7 @@
 //! # }
 //! ```
 
+pub mod audit;
 pub mod backoff;
 pub mod client;
 pub mod dispatcher;
@@ -50,6 +51,7 @@ pub mod error;
 pub mod service;
 pub mod transport;
 
+pub use audit::{AuditRecord, AuditSink, JsonlAuditSink, MemoryAuditSink, NoopAuditSink};
 pub use backoff::ExponentialBackoff;
 pub use client::{BrokerClient, ConnState};
 pub use dispatcher::{

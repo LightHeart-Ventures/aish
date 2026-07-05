@@ -627,6 +627,17 @@ async fn main() -> Result<()> {
     }
     timer.mark("alert store open");
 
+    // Durable `:activity` tray: recoverable history of fired alerts / notable
+    // events (last N), so the operator can review what scrolled off the
+    // single-line footer. Non-fatal on failure.
+    match db::ActivityStore::open(&db_paths::main_db_path()) {
+        Ok(store) => session.activity_store = Some(store),
+        Err(e) => {
+            startup_notices.push(format!("\x1b[33maish:\x1b[0m activity store unavailable: {e:#}"))
+        }
+    }
+    timer.mark("activity store open");
+
     // Load the lifecycle-hook registry for the non-interactive entry paths
     // (one-shot `-c`, background coordinator, script). The interactive REPL loads
     // it itself in `repl::run` (right before firing SessionStart). This is what
