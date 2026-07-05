@@ -30,11 +30,18 @@ fn install_mcp_if_ready(
         return;
     };
     match receiver.try_recv() {
-        Ok((host, skills_prompt)) => {
+        Ok((mut host, skills_prompt)) => {
             let n = host.server_names().len();
+            // Servers that failed to start/handshake are no longer dumped to
+            // stderr at connect time — surface them as a "statusline alert":
+            // the full detail above the prompt, a shortened warn-badge on the
+            // SecondStatusLine flash (most-recent wins), and a recoverable
+            // `:activity` entry.
+            let skipped = host.take_skipped();
             session.mcp = host;
             session.skills_prompt = skills_prompt;
             *rx = None;
+            surface_mcp_skips(session, &skipped);
             if n > 0 {
                 eprintln!(
                     "\x1b[2mmcp: ready — {n} server{} connected\x1b[0m",
@@ -45,6 +52,34 @@ fn install_mcp_if_ready(
         // Still connecting, or the connect task died — leave the placeholder.
         Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
         Err(tokio::sync::oneshot::error::TryRecvError::Closed) => *rx = None,
+    }
+}
+
+/// Surface MCP servers that failed to start/handshake as a "statusline alert"
+/// (instead of a raw stderr dump): the full detail above the prompt, a shortened
+/// warn-badge on the SecondStatusLine flash (`session.flash`, most-recent wins),
+/// and a recoverable `:activity` entry (source `mcp`). No-op on an empty list.
+/// Shared by the background-install path and `:mcp reload`.
+fn surface_mcp_skips(session: &Session, skips: &[String]) {
+    for detail in skips {
+        // Compact footer banner: "mcp {name} skipped" — the verbose error tail
+        // stays in the above-prompt line + the `:activity` detail column.
+        let short = detail
+            .strip_prefix("mcp server ")
+            .and_then(|s| s.split_once(" skipped:").map(|(name, _)| name))
+            .map(|name| format!("mcp {name} skipped"))
+            .unwrap_or_else(|| detail.clone());
+        crate::tools::print_above_prompt(format!("\x1b[33maish:\x1b[0m {detail}\n"));
+        if let Some(act) = &session.activity_store {
+            let _ = act.record(crate::style::Severity::Warn.as_str(), &short, detail, "mcp");
+        }
+        if let Ok(mut f) = session.flash.lock() {
+            *f = Some(crate::style::severity_badge(
+                &short,
+                crate::style::Severity::Warn,
+                crate::style::colors_enabled(),
+            ));
+        }
     }
 }
 
@@ -7740,6 +7775,10 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
                     added.join(", ")
                 );
             }
+            // Any server that failed THIS reload pass gets the same statusline
+            // alert treatment as startup (drained, so only new failures show).
+            let skipped = session.mcp.take_skipped();
+            surface_mcp_skips(session, &skipped);
         }
         Some((&"add", rest)) => {
             let Some((&name, tail)) = rest.split_first() else {

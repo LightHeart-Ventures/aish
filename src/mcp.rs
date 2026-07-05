@@ -51,6 +51,12 @@ pub struct McpHost {
     /// `:mcp reload` can re-scan them and connect servers added to the file
     /// since startup.
     config_paths: Vec<PathBuf>,
+    /// Servers that failed to start/handshake this connect pass, formatted as
+    /// one detail line each (e.g. `mcp server signoz-mcp skipped: …`). Collected
+    /// here instead of printed to stderr so the caller can surface them on the
+    /// SecondStatusLine "statusline alert" + `:activity` tray. Drained by
+    /// [`McpHost::take_skipped`]; a bad entry never takes the shell down.
+    skipped: Vec<String>,
 }
 
 /// One server's state for the `:mcp` listing.
@@ -206,7 +212,12 @@ impl McpHost {
                         self.servers.push(s);
                         added.push(name.clone());
                     }
-                    Err(e) => eprintln!("\x1b[33maish:\x1b[0m mcp server {name} skipped: {e:#}"),
+                    Err(e) => {
+                        // Collect rather than print: the caller surfaces these on
+                        // the SecondStatusLine "statusline alert" + `:activity`
+                        // tray (interactive), or flushes them to stderr (one-shot).
+                        self.skipped.push(format!("mcp server {name} skipped: {e:#}"));
+                    }
                 }
             }
         }
@@ -305,6 +316,15 @@ impl McpHost {
     /// Connected server names.
     pub fn server_names(&self) -> Vec<String> {
         self.servers.iter().map(|s| s.name.clone()).collect()
+    }
+
+    /// Drain the skipped-server notices collected during the last connect pass
+    /// (one detail line per server that failed to start/handshake). The caller
+    /// surfaces them — on the SecondStatusLine flash + `:activity` tray in the
+    /// interactive REPL, or to stderr in a one-shot/coordinator run. Draining
+    /// leaves the list empty so a later `:mcp reload` only reports NEW failures.
+    pub fn take_skipped(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.skipped)
     }
 
     /// `(tool name, read_only)` for one server, or None if it isn't connected.
