@@ -214,12 +214,28 @@ pub fn spawn(
     goal
 }
 
-/// Shared opening line of every goal-turn generator directive. Kept as a const
+/// Shared opening block of every goal-turn generator directive. Kept as a const
 /// so the builder ([`goal_directive`]) and its inverse
 /// ([`goal_condition_from_directive`]) can never drift apart — the inverse backs
 /// the `:workers` goal-turn coalescing (TASK-302).
+///
+/// Because each goal turn runs as a full-tool coordinator subprocess
+/// ([`crate::worker::run_once`]), it has the always-surfaced `message_console`
+/// channel. We instruct it to post a per-turn note so the operator sees live
+/// progress even while the goal loop runs unattended: (1) a turn summary, and
+/// (2) any pull request it opened, with a one-line summary. `message_console`
+/// emits a `📣` sentinel line that is surfaced to the operator regardless of the
+/// `:worker-output` gate, without polluting the stdout result the verifier judges.
+///
+/// The reverse-parser strips this ENTIRE prefix, so keeping the reporting
+/// instructions here (before the condition) leaves the recovered condition clean
+/// and the `:workers` grouping key stable.
 const GOAL_DIRECTIVE_PREFIX: &str =
-    "Work toward this goal, then report what you did and the evidence:\n";
+    "Work toward this goal, then report what you did and the evidence.\n\n\
+Before you finish this turn, call the `message_console` tool once to surface your progress to the operator:\n\
+1. A one- to two-line summary of what you did this turn and the evidence for it.\n\
+2. If you opened a pull request this turn, include its number/URL and a one-line summary of what it changes.\n\n\
+Goal:\n";
 /// Marker separating the goal condition from the verifier's last-check guidance
 /// in a re-tried turn's directive.
 const GOAL_DIRECTIVE_GUIDANCE_MARKER: &str = "\n\nThe goal is NOT yet met — last check said: ";
@@ -1508,5 +1524,29 @@ mod domain_tests {
         );
         // A plain (non-goal) coordinator task is not a directive → no key.
         assert!(goal_condition_from_directive("fix the flaky CI run").is_none());
+    }
+
+    // The per-turn directive must tell the (nested) worker to surface progress
+    // via `message_console`: a turn summary AND any PR it opened (with summary).
+    #[test]
+    fn goal_directive_instructs_message_console_turn_summary_and_pr() {
+        let d = goal_directive("ship the fix", None);
+        assert!(
+            d.contains("message_console"),
+            "directive should instruct the worker to use message_console"
+        );
+        assert!(
+            d.to_lowercase().contains("summary of what you did this turn"),
+            "directive should ask for a per-turn summary"
+        );
+        assert!(
+            d.to_lowercase().contains("pull request"),
+            "directive should ask for any opened PR with a summary"
+        );
+        // Instructions live in the prefix, so the condition still round-trips clean.
+        assert_eq!(
+            goal_condition_from_directive(&d).as_deref(),
+            Some("ship the fix")
+        );
     }
 }
