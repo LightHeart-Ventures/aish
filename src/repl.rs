@@ -340,6 +340,7 @@ pub async fn run(
         // poll native alerts / claim fired ones, and the banner slot the
         // SecondStatusLine reads. Clones are cheap (Arc handles).
         let alert_store = session.alert_store.clone();
+        let activity_store = session.activity_store.clone();
         let flash = session.flash.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(400));
@@ -391,11 +392,20 @@ pub async fn run(
                         let mut ring = false;
                         for (_id, detail, short, audible) in fired {
                             crate::tools::print_above_prompt(format!("{detail}\n"));
+                            // Severity-tiered: infer the tier from the banner +
+                            // detail text so the footer badge is colored by
+                            // seriousness, and append the event to the
+                            // recoverable `:activity` tray.
+                            let sev = crate::style::Severity::infer(&format!("{short} {detail}"));
+                            if let Some(act) = &activity_store {
+                                let _ = act.record(sev.as_str(), &short, &detail, "alert");
+                            }
                             // Most-recent wins: overwrite the single flash slot
-                            // with the colorized alert badge (no stacking).
+                            // with the severity-colored alert badge (no stacking).
                             if let Ok(mut f) = flash.lock() {
-                                *f = Some(crate::style::alert_badge(
+                                *f = Some(crate::style::severity_badge(
                                     &short,
+                                    sev,
                                     crate::style::colors_enabled(),
                                 ));
                             }
@@ -6963,6 +6973,51 @@ async fn handle_colon(
                 println!("session named \x1b[1;35m[{rest}]\x1b[0m");
             }
         }
+        Some("activity") => {
+            // Recoverable activity tray (persist last N) — review fired alerts
+            // and notable events that scrolled past the single-line footer.
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            let arg = rest.trim().to_lowercase();
+            match session.activity_store.clone() {
+                None => println!(
+                    "activity store unavailable — `:activity` needs the shared aish.db (check startup warnings)"
+                ),
+                Some(store) if arg == "clear" => match store.clear() {
+                    Ok(n) => {
+                        println!("cleared {n} activity entr{}", if n == 1 { "y" } else { "ies" })
+                    }
+                    Err(e) => println!("activity clear failed: {e:#}"),
+                },
+                Some(store) => {
+                    let limit: i64 = arg.parse().unwrap_or(20).clamp(1, 200);
+                    match store.recent(limit) {
+                        Ok(rows) if rows.is_empty() => println!(
+                            "no activity yet — fired :alerts and notable events land here"
+                        ),
+                        Ok(rows) => {
+                            let color = crate::style::colors_enabled();
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            println!("\x1b[1m recent activity (newest first)\x1b[0m");
+                            for (_id, ts, sev, short, _detail, source) in rows {
+                                let s = crate::style::Severity::from_tag(&sev);
+                                let badge = crate::style::severity_badge(&short, s, color);
+                                let age =
+                                    crate::style::fmt_duration((now - ts).max(0) as u64);
+                                println!("{age:>7} ago  {badge}  \x1b[2m({source})\x1b[0m");
+                            }
+                            println!(
+                                "\x1b[2m:activity <n> to show N  ·  :activity clear\x1b[0m"
+                            );
+                        }
+                        Err(e) => println!("activity list failed: {e:#}"),
+                    }
+                }
+            }
+        }
+        Some("alert") => {
         Some("alert") => {
             let rest = parts.collect::<Vec<_>>().join(" ");
             let rest = rest.trim().to_string();

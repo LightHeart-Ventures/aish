@@ -326,6 +326,8 @@ pub struct Session {
     /// background presenter, the `:alert` command handler, and the `set_alert`
     /// tool all hold a handle. None if it failed to open.
     pub alert_store: Option<crate::db::AlertStore>,
+    /// Recoverable `:activity` tray — last N fired alerts / notable events.
+    pub activity_store: Option<crate::db::ActivityStore>,
     /// The single most-recent "flash" message for the SecondStatusLine's
     /// recent-message slot, shared with the background presenter. This row shows
     /// exactly ONE message at a time (most-recent wins): the presenter overwrites
@@ -576,6 +578,7 @@ impl Session {
             coordinator_store: None,
             goal_store: None,
             alert_store: None,
+            activity_store: None,
             flash: std::sync::Arc::new(std::sync::Mutex::new(None)),
             current_goal_id: None,
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
