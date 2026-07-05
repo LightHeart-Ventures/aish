@@ -1611,6 +1611,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("plugin", "plugin provenance (list|info <id>)"),
     ("quit", "exit aish"),
     ("reasoning", "show reasoning-quality telemetry (escalate vs guess)"),
+    (
+        "remember",
+        "capture a rich, context-enriched memory from a short note",
+    ),
     ("rename", "rename this session"),
     (
         "restart",
@@ -3668,12 +3672,10 @@ fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
         print_escalation_banner(&short);
         return;
     }
+    // Fire-and-forget: unlike the old behaviour we do NOT auto-attach or turn
+    // `:output` on. The one-line `message` already carries the :attach/:output
+    // guidance (built in dispatch_coordinator), so print it and we're done.
     println!("{message}");
-    // Fire-and-forget: unlike the old behaviour we do NOT auto-attach or
-    // turn `:output` on — surface how to opt into watching/steering instead.
-    println!(
-        "\x1b[1;36m:attach {short}\x1b[0m\x1b[2m to watch + steer it · \x1b[0m\x1b[36m:output on\x1b[0m\x1b[2m to stream coordinator activity\x1b[0m"
-    );
 }
 
 /// Sentinel id `:attach goal` resolves to. Equal to the goal loop's live
@@ -6448,6 +6450,35 @@ fn rebuild_local_backend(_backend: &mut Backend, _session: &mut Session) -> anyh
     anyhow::bail!("built without the 'local' feature")
 }
 
+/// `:remember <note>` — capture a rich, context-enriched memory. Unlike the
+/// `remember` tool (which stores its argument verbatim), this synthesizes the
+/// operator's short note together with recent session context (recent prose +
+/// typed commands) into ONE durable, self-contained memory, then persists it
+/// via the memories table. Degrades gracefully: if no backend can enrich the
+/// note, the raw note is stored instead.
+async fn handle_remember(backend: &Backend, session: &mut Session, note: &str) {
+    let note = note.trim();
+    if note.is_empty() {
+        println!(
+            "\x1b[2musage: :remember <note> — captures a rich, context-enriched memory\x1b[0m"
+        );
+        return;
+    }
+    if session.db.is_none() {
+        println!("\x1b[33m✎\x1b[0m memory store unavailable — nothing saved");
+        return;
+    }
+    let syn = crate::remember::synthesize(backend, session, note).await;
+    match session.db.as_ref().map(|db| db.remember(&syn.text, None)) {
+        Some(Ok(_)) => {
+            let tag = if syn.enriched { "enriched" } else { "raw note" };
+            println!("\x1b[32m✎\x1b[0m remembered ({tag}): {}", syn.text);
+        }
+        Some(Err(e)) => println!("\x1b[33m✎\x1b[0m failed to save memory: {e}"),
+        None => println!("\x1b[33m✎\x1b[0m memory store unavailable — nothing saved"),
+    }
+}
+
 async fn handle_colon(
     cmd: &str,
     backend: &mut Backend,
@@ -6565,6 +6596,7 @@ async fn handle_colon(
                  :reasoning                          reasoning-quality telemetry: escalate-vs-guess rate + outcomes by complexity/risk\n\
                  :compact                            offload older history to long-term memory now\n\
                  :memories [organize]                list stored memories, or dedup them\n\
+                 :remember <note>                    capture a rich, context-enriched memory — folds your short note together with recent session context into ONE durable memory\n\
                  :telemetry [clear]                  tool-call failure/retry-recovery stats (or wipe them)\n\
                  :telemetry skill-match <task>       show why the semantic matcher ranks skills for a task\n\
                  :tokens                             per-run/aggregate token spend, in:out ratio, top spenders\n\
@@ -7647,6 +7679,10 @@ async fn handle_colon(
         Some("reasoning") => handle_reasoning(),
         Some("metrics") => handle_metrics(),
         Some("compact") => handle_compact(backend, session),
+        Some("remember") => {
+            let note = parts.collect::<Vec<_>>().join(" ");
+            handle_remember(backend, session, &note).await;
+        }
         Some("memories" | "memory") => handle_memories(parts.next(), session),
         Some("hooks") => handle_hooks(parts.next(), session),
         Some("plugin" | "plugins") => handle_plugin(parts.collect()),
@@ -9130,9 +9166,10 @@ mod tests {
 
         // Typing narrows it in place: `:re` -> reasoning + rename + restart + result + rewrite.
         let re = palette_hint(":re", 3, usize::MAX)
-            .expect("`:re` matches reasoning + rename + restart + result + rewrite");
-        assert_eq!(re.matches('\n').count(), 5);
+            .expect("`:re` matches reasoning + remember + rename + restart + result + rewrite");
+        assert_eq!(re.matches('\n').count(), 6);
         assert!(re.contains(":reasoning"));
+        assert!(re.contains(":remember"));
         assert!(re.contains(":rename"));
         assert!(re.contains(":restart"));
         assert!(re.contains(":result"));
