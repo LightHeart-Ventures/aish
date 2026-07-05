@@ -113,6 +113,41 @@ doing THIS task. IF the feature already exists — STOP and report \"Feature alr
 defer or `tell`-coordinate instead of duplicating. ONLY when the existence check comes back empty \
 do you proceed to build. This is cheap insurance on every build task — a 2–3 call guard that \
 prevents an 87-call runaway.";
+
+/// The 5-PHASE PIPELINE directive (TASK-356). Complements `PHASE0_GUARD` by
+/// restructuring the *rest* of the run into discrete, parallel phases so a
+/// coordinator stops thrashing one tool-call per turn (the w_nMYxaem3 run
+/// emitted 87 serial calls). The rule is: batch ALL context reads in Phase 1
+/// BEFORE any write, do Phase 2 planning with ZERO tool calls (pure reasoning),
+/// then fire ALL Phase 3 writes/commits in one parallel batch and TRUST them
+/// (no read-back verification), collapsing an 87-call serial chain to ~15–20
+/// calls. Phase transition markers ("--- PHASE n ---") let turn logging count
+/// calls per phase. See `docs/coordinator-patterns.md` (TASK-359) for the full
+/// pipeline table and batching rules. Held as a `const` so it is unit-testable
+/// without driving a whole run.
+const PHASE_PIPELINE: &str = "5-PHASE PIPELINE — after the Phase-0 guard clears, run the work in \
+these five ordered phases and emit a one-line phase marker (e.g. \"--- PHASE 1: DISCOVERY ---\") at \
+the start of each so turn logging can attribute calls. The goal is to collapse a serial \
+one-call-per-turn chain (the failure mode that produced an 87-call runaway) down to ~15–20 total \
+calls.\n\
+--- PHASE 1: DISCOVERY --- (3–5 calls, ALL PARALLEL) Front-load EVERY context read you know you'll \
+need in ONE batch — glob_expand, list_dir, git status, grep_files, and ranged read_file of every \
+already-known path fired together in a single turn. Do not read one file, think, then read the \
+next; independent reads have no dependency and MUST batch. The only serial exception is \
+grep-then-read of the SAME file (you need the line number first).\n\
+--- PHASE 2: PLANNING --- (0 calls, REASONING ONLY) Decide the smallest correct change and the \
+exact list of files to touch using ONLY the context from Phase 1. You are FORBIDDEN from making ANY \
+tool call in this phase — no reads, no greps, no status checks. If you find you need another read, \
+that read belonged in Phase 1; note it and fold it into the Phase 3 batch, do not spend a planning \
+turn on it.\n\
+--- PHASE 3: ACTIONS --- (5–10 calls, ALL PARALLEL) Fire every independent write in ONE batch — \
+write_file / edit_file to different files, plus independent commands — together. TRUST your writes: \
+do NOT read a file back to confirm a write landed; the tool result already tells you it succeeded. \
+Serialize ONLY genuine state transitions (git checkout -b → commit → push → gh pr create) and any \
+write whose content depends on a value you have not yet read.\n\
+--- PHASE 4: VALIDATION --- (1–2 calls, SERIAL) Run the canonical gate once (for aish: \
+`cargo test --no-default-features --locked`) and confirm green, then open/finish the PR. One check, \
+not a re-inspection of every file you just wrote.";
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -702,7 +737,7 @@ feature branch (you are typically already on a dedicated work branch — commit 
 or push the default branch), push it, and open a DRAFT pull request with `gh pr create --draft --fill` \
 (pass `--title`/`--body` when `--fill` cannot infer them). Put the PR URL in your final answer. If there \
 are no committable changes, or `gh`/the remote is unavailable, skip the PR and report the branch name \
-plus `git status` instead — do not fail the run over it.\n\n{PHASE0_GUARD}\n\nTASK:\n{input}",
+plus `git status` instead — do not fail the run over it.\n\n{PHASE0_GUARD}\n\n{PHASE_PIPELINE}\n\nTASK:\n{input}",
         cwd = session.cwd.display(),
     );
 
@@ -1624,6 +1659,56 @@ mod tests {
         assert!(
             g.contains("already shipped"),
             "reports the already-shipped conclusion with evidence"
+        );
+    }
+
+    #[test]
+    fn phase_pipeline_enforces_five_phase_batching_discipline() {
+        // TASK-356: the pipeline directive must (a) name all five phases with
+        // transition markers, (b) forbid tool calls in the planning phase,
+        // (c) mandate batching all reads in Phase 1 before any Phase 3 write,
+        // (d) tell the model to TRUST writes (no read-back), and (e) frame the
+        // 87→~15 call reduction so the intent is unambiguous.
+        let p = PHASE_PIPELINE;
+        // Phase transition markers present for every phase (turn logging keys on these).
+        for marker in [
+            "--- PHASE 1: DISCOVERY ---",
+            "--- PHASE 2: PLANNING ---",
+            "--- PHASE 3: ACTIONS ---",
+            "--- PHASE 4: VALIDATION ---",
+        ] {
+            assert!(p.contains(marker), "missing phase marker: {marker}");
+        }
+        // Planning phase forbids ANY tool call (pure reasoning).
+        assert!(
+            p.contains("REASONING ONLY") && p.contains("FORBIDDEN"),
+            "Phase 2 must forbid tool calls"
+        );
+        // Reads batched in Phase 1 before writes; writes batched in Phase 3.
+        assert!(p.contains("ALL PARALLEL"), "phases mandate parallel batching");
+        assert!(
+            p.contains("Front-load"),
+            "Phase 1 front-loads every context read in one batch"
+        );
+        // Trust writes — no read-back verification in the action phase.
+        assert!(
+            p.contains("TRUST your writes") && p.contains("do NOT read a file back"),
+            "Phase 3 must trust writes without read-back verification"
+        );
+        // The call-reduction target is stated (87 → ~15–20).
+        assert!(p.contains("87") && p.contains("15"), "states the 87→~15 reduction target");
+    }
+
+    #[test]
+    fn assembled_coordinator_prompt_carries_both_guard_and_pipeline() {
+        // The runtime prompt template (see `drive`) prepends BOTH the Phase-0
+        // guard and the 5-phase pipeline just before the TASK. Guard against a
+        // future edit dropping either directive from the wire.
+        let template = format!("{PHASE0_GUARD}\n\n{PHASE_PIPELINE}");
+        assert!(template.contains("PHASE-0 GUARD"), "guard survives in the template");
+        assert!(
+            template.contains("--- PHASE 2: PLANNING ---"),
+            "pipeline survives in the template"
         );
     }
 
