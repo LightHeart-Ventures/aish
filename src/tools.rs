@@ -2368,13 +2368,18 @@ fn message_console(call: &ToolCall, session: &Session) -> Result<String> {
         return Ok("message_console is only available to a background coordinator — an \
 interactive session has no parent console to message".into());
     }
-    // One sentinel line per physical line so a multi-line note is forwarded
-    // intact and the operator sees the coordinator's intended line breaks. The
-    // parent re-frames each line as a console row. Mirrors how the coordinator's
-    // narration/thinking sentinels are emitted on stderr.
-    for line in message.lines() {
-        eprintln!("📣 {line}");
-    }
+    // Emit the note as ONE 📣 sentinel line so the parent frames the 📣 [label]
+    // prefix exactly ONCE for the whole note. A multi-line note's physical
+    // newlines are encoded as CONSOLE_LINE_SEP (a non-`\n` separator) so the note
+    // survives the newline-delimited stderr transport on a single line; the
+    // parent's `worker::console_row` decodes them back into aligned continuation
+    // lines. (Previously we emitted one sentinel per physical line, which
+    // repeated the 📣 [label] prefix on every line of a multi-line note.)
+    let encoded = message
+        .lines()
+        .collect::<Vec<_>>()
+        .join(&crate::worker::CONSOLE_LINE_SEP.to_string());
+    eprintln!("📣 {encoded}");
     Ok("delivered to the operator's console".into())
 }
 
