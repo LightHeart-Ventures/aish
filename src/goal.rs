@@ -36,6 +36,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// a background loop can't be watched, so we cap it.
 const MAX_TURNS: usize = 25;
 
+/// Bounded transcript ring the goal keeps for `:attach goal` / Shift-Tab replay
+/// — the goal analogue of a worker's captured activity. A goal is essentially a
+/// specialized worker, so its attach/cycle UI mirrors a worker's: header + input
+/// row + activity tail. We cap the ring so a long-running (up to `MAX_TURNS`)
+/// pursuit can't grow it unbounded; the replay tails the last ~screen anyway.
+const TRANSCRIPT_CAP: usize = 200;
+
 const MESSAGES_API: &str = "https://api.anthropic.com/v1/messages";
 /// Cap the work output handed to the judge so a chatty turn can't blow the
 /// verifier's context.
@@ -81,6 +88,10 @@ struct Inner {
     turn_started: Option<Instant>,
     /// Current phase within the loop.
     phase: Step,
+    /// Bounded activity transcript (newest last), replayed on `:attach goal` /
+    /// Shift-Tab so the goal's history renders like a worker's. Capped at
+    /// [`TRANSCRIPT_CAP`] lines.
+    transcript: Vec<String>,
 }
 
 pub type Handle = Arc<GoalLoop>;
@@ -168,15 +179,36 @@ impl GoalLoop {
         }
     }
 
-    /// Backfill lines for `:attach goal` (TASK-301) — the goal analogue of a
-    /// worker's replayed history tail. A `GoalLoop` keeps NO full transcript
-    /// (each turn runs an ephemeral `run_once` worker under a throwaway id), so
-    /// we surface the durable state it DOES hold: the full condition plus the
-    /// current status line (phase, turn count, elapsed, last verifier check).
-    /// Returned newest-context-last so the caller can dim + print them above the
-    /// resuming live stream.
+    /// Record an activity line into the bounded replay transcript, then surface
+    /// it as a transient `[goal]` progress line over the prompt. A goal is a
+    /// specialized worker, so — like a worker capturing its forwarded activity —
+    /// every per-turn announcement is also retained so `:attach goal` /
+    /// Shift-Tab can replay the goal's history tail (see [`attach_backfill`]).
+    fn note(&self, line: &str) {
+        {
+            let mut i = self.inner.lock().unwrap();
+            i.transcript.push(line.to_string());
+            let len = i.transcript.len();
+            if len > TRANSCRIPT_CAP {
+                i.transcript.drain(0..len - TRANSCRIPT_CAP);
+            }
+        }
+        announce(line);
+    }
+
+    /// Backfill rows for `:attach goal` / Shift-Tab (TASK-301) — the goal
+    /// analogue of a worker's replayed activity tail. A goal is essentially a
+    /// specialized worker, so its attach UI is rendered identically (header +
+    /// input row + activity rows) by [`crate::repl::backfill_goal_attached`].
+    /// This returns the ACTIVITY rows: the captured per-turn transcript, with
+    /// the current one-line status appended last so the tail always shows live
+    /// phase/turn/elapsed/last-verifier-check context. Newest last.
     pub fn attach_backfill(&self) -> Vec<String> {
-        vec![format!("🎯 goal: {}", self.condition), self.status_line()]
+        let i = self.inner.lock().unwrap();
+        let mut rows = i.transcript.clone();
+        drop(i);
+        rows.push(self.status_line());
+        rows
     }
 
 
@@ -247,6 +279,7 @@ pub fn spawn(
             cancel: false,
             turn_started: None,
             phase: Step::Idle,
+            transcript: Vec::new(),
         }),
     });
     tokio::spawn(run_goal(goal.clone(), spec, model, cred));
@@ -257,6 +290,15 @@ pub fn spawn(
 /// so the builder ([`goal_directive`]) and its inverse
 /// ([`goal_condition_from_directive`]) can never drift apart — the inverse backs
 /// the `:workers` goal-turn coalescing (TASK-302).
+///
+/// The prefix also encodes the operator-requested plan-first + task-lifecycle
+/// discipline: the first turn must deconstruct/restate the goal, state its
+/// constraints and a measurable definition of success, map dependencies and
+/// parallelism, and persist that plan durably BEFORE building. Execution then
+/// fans independent sub-work out via `run_in_background`, tracks the work as a
+/// board task (spec/comments/branch/PR kept current, moved to completed only once
+/// verified), and has an independent verifier fact-check key results so a wrong
+/// intermediate answer can't cascade.
 ///
 /// Because each goal turn runs as a full-tool coordinator subprocess
 /// ([`crate::worker::run_once`]), it has the always-surfaced `message_console`
@@ -271,8 +313,18 @@ pub fn spawn(
 /// and the `:workers` grouping key stable.
 const GOAL_DIRECTIVE_PREFIX: &str =
     "Work toward this goal, then report what you did and the evidence.\n\n\
+Plan before you build. On your FIRST turn (and whenever no plan exists yet), do this BEFORE writing any code or opening any change:\n\
+1. Deconstruct the goal and restate it in your own words in 60 characters or less.\n\
+2. Identify the constraints and limits — time, budget, access, and the tools/permissions the work needs.\n\
+3. State concretely and measurably what success looks like — the evidence that will prove the goal is met.\n\
+4. Review the existing work, map the dependencies between sub-tasks, and note which sub-tasks can run in parallel.\n\
+5. Persist that plan durably so it survives a restart: record the goal, its sub-tasks/milestones, dependencies, and success criteria in a durable store (the goal store or an aish.db table). Mark each sub-task complete in that store as you finish it.\n\n\
+Then build toward the goal:\n\
+6. Do the independent sub-tasks in parallel where it helps, using the run_in_background tool; keep serial only the work with real dependencies.\n\
+7. Track the work as a board task: open a task (or reuse the linked one), keep its spec, comments, branch, and pull-request fields up to date as you progress, and move it to completed only once the goal is verified done.\n\
+8. Guard against cascading errors: have an independent agent or verifier fact-check each key result before you build further on it.\n\n\
 Before you finish this turn, call the `message_console` tool once to surface your progress to the operator:\n\
-1. A one- to two-line summary of what you did this turn and the evidence for it.\n\
+1. A one- to two-line summary of what you did this turn and the evidence for it (on the first turn, include your 60-character restatement and your success definition).\n\
 2. If you opened a pull request this turn, include its number/URL and a one-line summary of what it changes.\n\n\
 Goal:\n";
 /// Marker separating the goal condition from the verifier's last-check guidance
@@ -322,7 +374,7 @@ async fn run_goal(
     model: String,
     cred: crate::backend::claude::Credential,
 ) {
-    announce(&format!("started — {}", goal.condition));
+    goal.note(&format!("started — {}", goal.condition));
     goal.fire_hook(crate::hooks::HookEvent::GoalStart, |p| {
         p.with("condition", goal.condition.clone())
     });
@@ -368,7 +420,7 @@ async fn run_goal_loop(
                 drop(i);
                 let reason =
                     format!("hit the {MAX_TURNS}-turn backstop without meeting the goal");
-                announce(&format!("stopped — {reason}"));
+                goal.note(&format!("stopped — {reason}"));
                 return GoalOutcome {
                     status: "failed",
                     turns,
@@ -381,7 +433,7 @@ async fn run_goal_loop(
 
         // Generator: a full-tool worker pursues the goal with the latest guidance.
         let directive = goal_directive(&goal.condition, guidance.as_deref());
-        announce(&format!("turn {turn}: working…"));
+        goal.note(&format!("turn {turn}: working…"));
         {
             let mut i = goal.inner.lock().unwrap();
             i.turn_started = Some(Instant::now());
@@ -392,7 +444,7 @@ async fn run_goal_loop(
             Ok(o) => o,
             Err(e) => {
                 goal.set(Status::Failed, Some(e.clone()));
-                announce(&format!("failed — {e}"));
+                goal.note(&format!("failed — {e}"));
                 return GoalOutcome {
                     status: "failed",
                     turns: turn,
@@ -409,7 +461,7 @@ async fn run_goal_loop(
         }
 
         // Verifier: the batch model judges whether the output demonstrates the goal.
-        announce(&format!("turn {turn}: checking…"));
+        goal.note(&format!("turn {turn}: checking…"));
         goal.inner.lock().unwrap().phase = Step::Checking;
         let (met, reason) = match judge(&cred, &model, &goal.condition, &output).await {
             Ok((met, reason)) => (met, reason),
@@ -1092,6 +1144,7 @@ mod tests {
                 cancel: false,
                 turn_started: turn_started.then(Instant::now),
                 phase,
+                transcript: Vec::new(),
             }),
         }
     }
@@ -1118,6 +1171,55 @@ mod tests {
         assert!(
             joined.contains("last check: not yet"),
             "backfill shows the last verifier check: {joined}"
+        );
+    }
+
+    // A goal is a specialized worker: its per-turn activity is captured into a
+    // bounded transcript (via `note`) and replayed by `:attach goal` /
+    // Shift-Tab, oldest-first, with the live status line appended last — exactly
+    // how a worker's forwarded activity tail replays on worker-entry.
+    #[test]
+    fn test_attach_goal_replays_captured_transcript_then_status() {
+        let g = goal_with(Status::Active, Step::Working, true);
+        g.note("started — Complete the work");
+        g.note("turn 1: working…");
+        g.note("turn 1: checking…");
+        let lines = g.attach_backfill();
+        // Activity rows come first, in capture order…
+        assert_eq!(lines[0], "started — Complete the work");
+        assert_eq!(lines[1], "turn 1: working…");
+        assert_eq!(lines[2], "turn 1: checking…");
+        // …and the live one-line status is appended last.
+        assert!(
+            lines.last().unwrap().contains("goal [active"),
+            "status line appended last: {lines:?}"
+        );
+    }
+
+    // The transcript is bounded — old rows drop off so a long-running goal's
+    // replay stays ~1 screen, mirroring the worker replay budget.
+    #[test]
+    fn goal_transcript_is_bounded() {
+        let g = goal_with(Status::Active, Step::Working, true);
+        for n in 0..(TRANSCRIPT_CAP + 25) {
+            g.note(&format!("turn {n}: working…"));
+        }
+        let rows = g.attach_backfill();
+        // transcript capped, plus the appended status line.
+        assert!(
+            rows.len() <= TRANSCRIPT_CAP + 1,
+            "transcript stays bounded: {} rows",
+            rows.len()
+        );
+        // Oldest rows evicted — the newest survive.
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains(&format!("turn {}: working…", TRANSCRIPT_CAP + 24)),
+            "newest activity retained: {joined}"
+        );
+        assert!(
+            !joined.contains("turn 0: working…"),
+            "oldest activity evicted: {joined}"
         );
     }
 
@@ -1646,6 +1748,38 @@ mod domain_tests {
         // Instructions live in the prefix, so the condition still round-trips clean.
         assert_eq!(
             goal_condition_from_directive(&d).as_deref(),
+            Some("ship the fix")
+        );
+    }
+
+    // The per-turn directive must also encode the plan-first + task-lifecycle
+    // discipline: deconstruct/restate, constraints, measurable success, dependency
+    // + parallel mapping, durable plan persistence, board-task lifecycle, and
+    // independent verification — all inside the prefix so the condition round-trips.
+    #[test]
+    fn goal_directive_instructs_plan_first_and_task_lifecycle() {
+        let d = goal_directive("ship the fix", None).to_lowercase();
+        for needle in [
+            "plan before you build",
+            "restate it in your own words",
+            "constraints and limits",
+            "success looks like",
+            "map the dependencies",
+            "in parallel",
+            "persist that plan",
+            "run_in_background",
+            "board task",
+            "to completed",
+            "independent",
+        ] {
+            assert!(
+                d.contains(needle),
+                "plan-first directive missing instruction: {needle:?}"
+            );
+        }
+        // Instructions still live in the prefix → condition round-trips clean.
+        assert_eq!(
+            goal_condition_from_directive(&goal_directive("ship the fix", None)).as_deref(),
             Some("ship the fix")
         );
     }
