@@ -321,6 +321,14 @@ async fn run_turn_inner(
         if let Some(u) = usage {
             session.tokens_in = session.tokens_in.saturating_add(u.input_tokens);
             session.tokens_out = session.tokens_out.saturating_add(u.output_tokens);
+            // TASK-320: track cache read/write volume so the status line and
+            // `:context` can report a session-level cache hit rate. Purely
+            // observational — these never affect context-window math.
+            session.cache_read_total =
+                session.cache_read_total.saturating_add(u.cache_read_tokens);
+            session.cache_creation_total = session
+                .cache_creation_total
+                .saturating_add(u.cache_creation_tokens);
         }
 
         // ── Forced summarize: graceful degradation before the hard limit. The
@@ -862,9 +870,19 @@ pub fn statusline_stats(session: &Session) -> String {
     {
         return String::new();
     }
+    // TASK-320 AC#3: append a session-level cache-read hit rate when the backend
+    // reported any cache activity — the numerator is cumulative cached-read
+    // tokens, the denominator the full input tally (which already includes the
+    // cached prefix). Omitted for cache-less sessions so the line stays clean.
+    let cache = if session.cache_read_total > 0 && session.tokens_in > 0 {
+        let pct = (session.cache_read_total as f64 / session.tokens_in as f64) * 100.0;
+        format!(", cache: {pct:.0}% hit")
+    } else {
+        String::new()
+    };
     format!(
-        "tokens: {} in / {} out, tool calls: {}, turns: {}",
-        session.tokens_in, session.tokens_out, session.tool_calls_total, session.turns_total
+        "tokens: {} in / {} out, tool calls: {}, turns: {}{}",
+        session.tokens_in, session.tokens_out, session.tool_calls_total, session.turns_total, cache
     )
 }
 
