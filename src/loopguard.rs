@@ -285,6 +285,15 @@ pub enum ExitReason {
     /// checkpoints and the next round re-plans toward batching. `depth` is the
     /// streak length reached. NOT a failure — auto-resumes.
     SerialChainYield { depth: usize },
+    /// TASK-357: the turn hit the per-turn tool-call HARD budget
+    /// ([`CALL_BUDGET_HARD`]). Distinct from the round/iteration budget
+    /// (`BudgetExhausted`, which counts model rounds) and the serial-chain shape
+    /// guard: this counts the CUMULATIVE number of individual tool calls executed
+    /// across the whole turn and yields once it crosses the hard cap — spreading
+    /// load across the rate-limit window and creating a natural checkpoint. A
+    /// soft advisory fires earlier at [`CALL_BUDGET_SOFT`] (logged, no stop).
+    /// `count` is the cumulative call tally reached. NOT a failure — auto-resumes.
+    CallBudgetExceeded { count: usize },
 }
 
 impl ExitReason {
@@ -297,6 +306,7 @@ impl ExitReason {
             ExitReason::BudgetExhausted { .. } => "budget-exhausted",
             ExitReason::Interrupted => "interrupted",
             ExitReason::SerialChainYield { .. } => "serial-chain-yield",
+            ExitReason::CallBudgetExceeded { .. } => "call-budget-exceeded",
         }
     }
 
@@ -330,6 +340,12 @@ impl ExitReason {
 re-plan toward batching independent calls"
                 )
             }
+            ExitReason::CallBudgetExceeded { count } => {
+                format!(
+                    "yielded after {count} tool calls this turn (per-turn hard budget) to spread \
+load across the rate-limit window and resume with fresh context"
+                )
+            }
         }
     }
 
@@ -352,6 +368,8 @@ re-plan toward batching independent calls"
             // Carry `depth` in the `count` field of the banner (round-tripped
             // back into `depth` by parse_banner).
             ExitReason::SerialChainYield { depth } => (0, *depth),
+            // Carry the cumulative call tally in the banner `count` field.
+            ExitReason::CallBudgetExceeded { count } => (0, *count),
         };
         format!(
             "[aish-stop tag={} iterations={iters} count={count}] {}",
@@ -384,6 +402,7 @@ re-plan toward batching independent calls"
             "budget-exhausted" => Some(ExitReason::BudgetExhausted { iterations: iters }),
             "interrupted" => Some(ExitReason::Interrupted),
             "serial-chain-yield" => Some(ExitReason::SerialChainYield { depth: count }),
+            "call-budget-exceeded" => Some(ExitReason::CallBudgetExceeded { count }),
             "loop-detected" => Some(ExitReason::LoopDetected {
                 call: String::new(),
                 count,
@@ -461,7 +480,8 @@ pub fn classify_disposition(
         ExitReason::LoopDetected { .. } => Disposition::Nudge,
         ExitReason::ForcedSummarize { .. }
         | ExitReason::BudgetExhausted { .. }
-        | ExitReason::SerialChainYield { .. } => Disposition::Resume,
+        | ExitReason::SerialChainYield { .. }
+        | ExitReason::CallBudgetExceeded { .. } => Disposition::Resume,
     }
 }
 
@@ -651,6 +671,61 @@ impl SerialChainGuard {
             self.depth = 0;
         }
         None
+    }
+}
+
+/// TASK-357: per-turn CUMULATIVE tool-call budget. Where [`SerialChainGuard`]
+/// watches the *shape* of rounds (consecutive lone calls) and the round/iteration
+/// budget counts model *rounds*, this counts the total number of individual tool
+/// calls executed across the whole turn — a batched round of 5 advances it by 5.
+/// A very wide turn (many big batches) can drain the rate-limit window and grow
+/// history without ever tripping the serial-chain or round guards; this cap gives
+/// that case a natural checkpoint so the durable coordinator loop can re-plan with
+/// fresh context. Soft advisory at [`CALL_BUDGET_SOFT`] (logged only); hard yield
+/// once the tally crosses [`CALL_BUDGET_HARD`].
+pub const CALL_BUDGET_SOFT: usize = 20;
+/// Hard per-turn cumulative tool-call budget — the turn yields (resumably) once
+/// the cumulative count crosses this. Per the TASK-357 card: soft @ 20, hard @ 30.
+pub const CALL_BUDGET_HARD: usize = 30;
+
+/// What the [`CallBudgetGuard`] wants the caller to do after a round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallBudgetAction {
+    /// Under the soft cap — carry on.
+    Continue,
+    /// Crossed the soft cap this round (fires once) — log an advisory but keep
+    /// going. `count` is the cumulative tally reached.
+    SoftWarn { count: usize },
+    /// Crossed the hard cap — the caller should finish the round's bookkeeping
+    /// then yield with [`ExitReason::CallBudgetExceeded`]. `count` is the tally.
+    HardYield { count: usize },
+}
+
+/// Accumulates the cumulative count of tool calls executed within one `run_turn`
+/// and signals soft/hard budget crossings. Lives for one turn and is dropped with
+/// it, so the tally never bleeds across turns.
+#[derive(Default)]
+pub struct CallBudgetGuard {
+    /// Cumulative tool calls executed so far this turn.
+    count: usize,
+    /// Latches once the soft advisory has fired, so it warns at most once.
+    soft_fired: bool,
+}
+
+impl CallBudgetGuard {
+    /// Record a round that executed `calls_this_round` tool calls, advancing the
+    /// cumulative tally. Returns the action the caller should take. Hard takes
+    /// precedence over soft; the soft advisory fires at most once per turn.
+    pub fn record(&mut self, calls_this_round: usize) -> CallBudgetAction {
+        self.count = self.count.saturating_add(calls_this_round);
+        if self.count > CALL_BUDGET_HARD {
+            return CallBudgetAction::HardYield { count: self.count };
+        }
+        if self.count > CALL_BUDGET_SOFT && !self.soft_fired {
+            self.soft_fired = true;
+            return CallBudgetAction::SoftWarn { count: self.count };
+        }
+        CallBudgetAction::Continue
     }
 }
 
@@ -1074,6 +1149,68 @@ mod tests {
             classify_disposition(&reason, 0, max),
             Disposition::Resume
         );
+        assert_eq!(
+            classify_disposition(&reason, max, max),
+            Disposition::FlagOperator
+        );
+        // End-to-end through RoundExit: resume with the auto-resume directive.
+        let exit = RoundExit::evaluate(&with_banner(&reason, "partial"), 0, max)
+            .expect("abnormal → Some");
+        assert_eq!(exit.disposition, Disposition::Resume);
+        assert!(exit.directive().unwrap().contains("[auto-resume]"));
+    }
+
+    // ── cumulative per-turn call budget (TASK-357) ────────────────────────
+    #[test]
+    fn call_budget_guard_soft_then_hard_crossings() {
+        let mut g = CallBudgetGuard::default();
+        // Stay under the soft cap → Continue, no advisory.
+        assert_eq!(g.record(CALL_BUDGET_SOFT), CallBudgetAction::Continue);
+        // Cross the soft cap → SoftWarn once, carrying the tally.
+        assert_eq!(
+            g.record(1),
+            CallBudgetAction::SoftWarn {
+                count: CALL_BUDGET_SOFT + 1
+            }
+        );
+        // Soft fires at most once — subsequent under-hard rounds are Continue.
+        assert_eq!(g.record(1), CallBudgetAction::Continue);
+        // Advance to just past the hard cap → HardYield with the tally.
+        let need = CALL_BUDGET_HARD.saturating_sub(CALL_BUDGET_SOFT + 2) + 1;
+        assert_eq!(
+            g.record(need),
+            CallBudgetAction::HardYield {
+                count: CALL_BUDGET_HARD + 1
+            }
+        );
+    }
+
+    #[test]
+    fn call_budget_guard_hard_takes_precedence_over_soft() {
+        // A single very-wide round that leaps past the hard cap yields HardYield,
+        // never a SoftWarn — hard precedence.
+        let mut g = CallBudgetGuard::default();
+        assert_eq!(
+            g.record(CALL_BUDGET_HARD + 5),
+            CallBudgetAction::HardYield {
+                count: CALL_BUDGET_HARD + 5
+            }
+        );
+    }
+
+    #[test]
+    fn call_budget_exceeded_banner_round_trips_and_resumes() {
+        let reason = ExitReason::CallBudgetExceeded { count: 61 };
+        assert_eq!(reason.tag(), "call-budget-exceeded");
+        assert!(reason.is_abnormal());
+        // count survives the banner round-trip (carried in the `count` field).
+        let parsed =
+            ExitReason::parse_banner(&reason.banner()).expect("call-budget banner must parse");
+        assert_eq!(parsed, ExitReason::CallBudgetExceeded { count: 61 });
+        // Recoverable stop → Resume (auto-continue); flags the operator once the
+        // auto-recovery budget is spent.
+        let max = MAX_AUTO_RECOVERIES;
+        assert_eq!(classify_disposition(&reason, 0, max), Disposition::Resume);
         assert_eq!(
             classify_disposition(&reason, max, max),
             Disposition::FlagOperator
