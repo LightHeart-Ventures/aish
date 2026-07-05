@@ -252,6 +252,15 @@ pub fn spawn(
 /// ([`goal_condition_from_directive`]) can never drift apart — the inverse backs
 /// the `:workers` goal-turn coalescing (TASK-302).
 ///
+/// The prefix also encodes the operator-requested plan-first + task-lifecycle
+/// discipline: the first turn must deconstruct/restate the goal, state its
+/// constraints and a measurable definition of success, map dependencies and
+/// parallelism, and persist that plan durably BEFORE building. Execution then
+/// fans independent sub-work out via `run_in_background`, tracks the work as a
+/// board task (spec/comments/branch/PR kept current, moved to completed only once
+/// verified), and has an independent verifier fact-check key results so a wrong
+/// intermediate answer can't cascade.
+///
 /// Because each goal turn runs as a full-tool coordinator subprocess
 /// ([`crate::worker::run_once`]), it has the always-surfaced `message_console`
 /// channel. We instruct it to post a per-turn note so the operator sees live
@@ -265,8 +274,18 @@ pub fn spawn(
 /// and the `:workers` grouping key stable.
 const GOAL_DIRECTIVE_PREFIX: &str =
     "Work toward this goal, then report what you did and the evidence.\n\n\
+Plan before you build. On your FIRST turn (and whenever no plan exists yet), do this BEFORE writing any code or opening any change:\n\
+1. Deconstruct the goal and restate it in your own words in 60 characters or less.\n\
+2. Identify the constraints and limits — time, budget, access, and the tools/permissions the work needs.\n\
+3. State concretely and measurably what success looks like — the evidence that will prove the goal is met.\n\
+4. Review the existing work, map the dependencies between sub-tasks, and note which sub-tasks can run in parallel.\n\
+5. Persist that plan durably so it survives a restart: record the goal, its sub-tasks/milestones, dependencies, and success criteria in a durable store (the goal store or an aish.db table). Mark each sub-task complete in that store as you finish it.\n\n\
+Then build toward the goal:\n\
+6. Do the independent sub-tasks in parallel where it helps, using the run_in_background tool; keep serial only the work with real dependencies.\n\
+7. Track the work as a board task: open a task (or reuse the linked one), keep its spec, comments, branch, and pull-request fields up to date as you progress, and move it to completed only once the goal is verified done.\n\
+8. Guard against cascading errors: have an independent agent or verifier fact-check each key result before you build further on it.\n\n\
 Before you finish this turn, call the `message_console` tool once to surface your progress to the operator:\n\
-1. A one- to two-line summary of what you did this turn and the evidence for it.\n\
+1. A one- to two-line summary of what you did this turn and the evidence for it (on the first turn, include your 60-character restatement and your success definition).\n\
 2. If you opened a pull request this turn, include its number/URL and a one-line summary of what it changes.\n\n\
 Goal:\n";
 /// Marker separating the goal condition from the verifier's last-check guidance
@@ -1629,6 +1648,38 @@ mod domain_tests {
         // Instructions live in the prefix, so the condition still round-trips clean.
         assert_eq!(
             goal_condition_from_directive(&d).as_deref(),
+            Some("ship the fix")
+        );
+    }
+
+    // The per-turn directive must also encode the plan-first + task-lifecycle
+    // discipline: deconstruct/restate, constraints, measurable success, dependency
+    // + parallel mapping, durable plan persistence, board-task lifecycle, and
+    // independent verification — all inside the prefix so the condition round-trips.
+    #[test]
+    fn goal_directive_instructs_plan_first_and_task_lifecycle() {
+        let d = goal_directive("ship the fix", None).to_lowercase();
+        for needle in [
+            "plan before you build",
+            "restate it in your own words",
+            "constraints and limits",
+            "success looks like",
+            "map the dependencies",
+            "in parallel",
+            "persist that plan",
+            "run_in_background",
+            "board task",
+            "to completed",
+            "independent",
+        ] {
+            assert!(
+                d.contains(needle),
+                "plan-first directive missing instruction: {needle:?}"
+            );
+        }
+        // Instructions still live in the prefix → condition round-trips clean.
+        assert_eq!(
+            goal_condition_from_directive(&goal_directive("ship the fix", None)).as_deref(),
             Some("ship the fix")
         );
     }
