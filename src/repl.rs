@@ -6945,7 +6945,15 @@ async fn handle_colon(
             // launched from this terminal — so a busy multi-terminal host never
             // shows another terminal's background workers here. `:workers all`
             // widens to every session's durable runs (the old behavior).
-            let show_all = matches!(parts.next(), Some("all"));
+            // `:workers diagram` (aliases: `states`, `lifecycle`) prints the
+            // validated worker/coordinator lifecycle transition table — the same
+            // machine the coordinator enforces — instead of the live worker list.
+            let sub = parts.next();
+            if matches!(sub, Some("diagram") | Some("states") | Some("lifecycle")) {
+                print!("{}", crate::lifecycle::diagram());
+                return false;
+            }
+            let show_all = matches!(sub, Some("all"));
 
             // TASK-313: on an interactive TTY, drive this session's live workers
             // through a keyboard modal picker (↑/↓ select · Enter attach · Del/d
@@ -7204,7 +7212,15 @@ async fn handle_colon(
             // shows how offloading is paying off — outcomes (done/failed/running),
             // latency distribution, and a missed-inline heuristic. Scoped to THIS
             // session by default; `all` widens to every session's runs.
-            let show_all = matches!(parts.next(), Some("all"));
+            // `:workers diagram` (aliases: `states`, `lifecycle`) prints the
+            // validated worker/coordinator lifecycle transition table — the same
+            // machine the coordinator enforces — instead of the live worker list.
+            let sub = parts.next();
+            if matches!(sub, Some("diagram") | Some("states") | Some("lifecycle")) {
+                print!("{}", crate::lifecycle::diagram());
+                return false;
+            }
+            let show_all = matches!(sub, Some("all"));
             let scope = if show_all { "all sessions" } else { "this session" };
             match &session.coordinator_store {
                 Some(store) => match store.load_all() {
