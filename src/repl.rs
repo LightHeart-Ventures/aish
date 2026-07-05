@@ -43,10 +43,28 @@ fn install_mcp_if_ready(
             *rx = None;
             surface_mcp_skips(session, &skipped);
             if n > 0 {
-                eprintln!(
-                    "\x1b[2mmcp: ready — {n} server{} connected\x1b[0m",
+                // Surface the readiness notice on the SecondStatusLine flash slot
+                // (most-recent wins) instead of printing it to stderr above the
+                // prompt — keeps the startup header clean, matching how worker-done
+                // notices and fired-`:alert` badges are moved onto the footer.
+                let plain = format!(
+                    "mcp: ready — {n} server{} connected",
                     if n == 1 { "" } else { "s" }
                 );
+                if let Ok(mut f) = session.flash.lock() {
+                    *f = Some(format!("\x1b[2m{plain}\x1b[0m"));
+                }
+                // Also append it to the recoverable `:activity` tray so the notice
+                // is inspectable after the flash slot is overwritten by the next
+                // most-recent message (info tier, source "mcp").
+                if let Some(act) = &session.activity_store {
+                    let _ = act.record(
+                        crate::style::Severity::Info.as_str(),
+                        "mcp: ready",
+                        &plain,
+                        "mcp",
+                    );
+                }
             }
         }
         // Still connecting, or the connect task died — leave the placeholder.
@@ -3758,13 +3776,10 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
                 println!(
                     "\x1b[1;33m⇄ attached to the goal\x1b[0m — streaming its turns live. \x1b[2mgoals are watch-only; :goal clear to stop it, :detach to stop watching.\x1b[0m"
                 );
-                // TASK-301: backfill the goal's durable state (condition, status,
-                // turn progress, last verifier check) so attaching shows context
-                // above the resuming live stream — mirrors a worker's replayed
-                // history tail.
-                for line in g.attach_backfill() {
-                    println!("\x1b[2m{line}\x1b[0m");
-                }
+                // TASK-301: replay the goal's history the same way a worker's is
+                // replayed — header + input row + activity tail — so goal and
+                // worker attach UIs are uniform (a goal is a specialized worker).
+                backfill_goal_attached(g);
             }
             Some(_) => println!("the goal has already finished — `:goal` for its final status"),
             None => println!("no goal set — `:goal <condition>` to start one (requires :batch on)"),
@@ -3888,6 +3903,42 @@ fn backfill_attached(run_id: &str, session: &Session) {
             };
             println!("{}", crate::worker::pane_row(run_id, &row));
         }
+    }
+}
+
+/// Replay the active `:goal` loop's history the SAME way `backfill_attached`
+/// replays a worker's — a goal is essentially a specialized worker, so its
+/// `:attach goal` / Shift-Tab UI is rendered identically: a `pane_replay_header`,
+/// the goal condition as the set-apart `pane_input_row` (the goal's "input"),
+/// then the captured activity tail as `pane_row`s under the same `[goal]` gutter
+/// the live stream uses. Keeps goal and worker attach output visually uniform.
+fn backfill_goal_attached(g: &crate::goal::GoalLoop) {
+    // Label matches the goal's live stderr stream label (`GOAL_STREAM_LABEL`)
+    // so replay rows and the live rows that follow share one `[goal]` gutter.
+    let label = GOAL_ATTACH_ID;
+    println!("{}", crate::worker::pane_replay_header(label));
+    // The goal CONDITION is the "input" — the START of the pursuit. Rendered
+    // set-apart (💬 + bold) by `pane_input_row`, exactly like a worker's task.
+    println!("{}", crate::worker::pane_input_row(label, &g.condition));
+    let mut rows = g.attach_backfill();
+    if rows.is_empty() {
+        println!(
+            "{}",
+            crate::worker::pane_row(
+                label,
+                "\u{b7}thinking (no activity captured yet \u{2014} live output follows)",
+            )
+        );
+        return;
+    }
+    // Tail to the last ~screen of activity, matching the worker replay budget.
+    const TAIL_LINES: usize = 40;
+    let total = rows.len();
+    if total > TAIL_LINES {
+        rows = rows.into_iter().skip(total - TAIL_LINES).collect();
+    }
+    for row in rows {
+        println!("{}", crate::worker::pane_row(label, &row));
     }
 }
 
@@ -4690,9 +4741,7 @@ fn cycle_worker(session: &mut Session) -> bool {
             attach_task_suffix(&task)
         );
         if let Some(g) = &session.goal {
-            for line in g.attach_backfill() {
-                println!("\x1b[2m{line}\x1b[0m");
-            }
+            backfill_goal_attached(g);
         }
         return true;
     }
