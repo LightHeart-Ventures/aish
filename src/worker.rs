@@ -884,7 +884,54 @@ pub fn pane_replay_header(short: &str) -> String {
 /// \x1b[0m`). Framed as a normal pane row so it still carries the cyan border +
 /// `[label]` gutter. Pure — unit-tested.
 pub fn pane_input_row(label: &str, task: &str) -> String {
-    pane_row(label, &format!("\x1b[1m💬 task: {task}\x1b[0m"))
+    pane_row(label, &format!("\x1b[1m💬 task: {}\x1b[0m", task_headline(task)))
+}
+
+/// Max visible chars of the task shown in an `:attach`/replay INPUT row before
+/// it's clipped with an ellipsis. Bounded so an auto-offloaded or resumed task —
+/// which carries a large machine-facing prompt (embedded conversation digest,
+/// prior-result scaffold) — renders as a readable one-liner instead of a wall of
+/// wrapped pane rows.
+const TASK_HEADLINE_MAX: usize = 200;
+
+/// Reduce a coordinator's (possibly huge, machine-facing) task string to a short
+/// HUMAN-READABLE headline for the replay input row.
+///
+/// Auto-offloaded tasks are prefixed with a `=== Recent conversation context …
+/// === End context ===` digest, and resumed tasks are wrapped in
+/// `=== ORIGINAL TASK === / === YOUR PRIOR RESULT === / === OPERATOR'S FOLLOW-UP ===`
+/// scaffolding. In both cases the LOAD-BEARING instruction is the text AFTER the
+/// last such marker — the operator's actual ask — so we peel that out (checking
+/// the follow-up marker first, since a resumed task's original section may itself
+/// still contain an `End context` marker), then collapse whitespace and clip to
+/// [`TASK_HEADLINE_MAX`]. A plain task with no markers just gets the
+/// collapse-and-clip. Pure — unit-tested.
+fn task_headline(task: &str) -> String {
+    const FOLLOW_UP: &str = "=== OPERATOR'S FOLLOW-UP ===";
+    const END_CTX: &str = "=== End context ===";
+    let core = if let Some(idx) = task.rfind(FOLLOW_UP) {
+        &task[idx + FOLLOW_UP.len()..]
+    } else if let Some(idx) = task.rfind(END_CTX) {
+        &task[idx + END_CTX.len()..]
+    } else {
+        task
+    };
+    let collapsed = core.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Fall back to the whole task if peeling left nothing (e.g. a marker with no
+    // trailing instruction) so the row is never blank.
+    let collapsed = if collapsed.is_empty() {
+        task.split_whitespace().collect::<Vec<_>>().join(" ")
+    } else {
+        collapsed
+    };
+    if collapsed.chars().count() > TASK_HEADLINE_MAX {
+        format!(
+            "{}…",
+            collapsed.chars().take(TASK_HEADLINE_MAX).collect::<String>()
+        )
+    } else {
+        collapsed
+    }
 }
 
 /// Frame a coordinator's `message_console` note for the operator's terminal.
@@ -4220,6 +4267,60 @@ mod tests {
         );
         // The bold is closed so it doesn't bleed into following rows.
         assert!(row.ends_with("\x1b[0m"), "bold is reset at the end: {row}");
+    }
+
+    #[test]
+    fn task_headline_peels_context_digest_to_the_operator_ask() {
+        // An auto-offloaded task: big machine-facing digest, then the real ask.
+        let task = "=== Recent conversation context (for reference) ===\n\
+                    Operator: can the remaining tasks be parallelized\n\
+                    Assistant: yes, five of them...\n\
+                    === End context ===\n\n\
+                    build 2 and 3, add it to ~/.aish/skills/aish";
+        let h = task_headline(task);
+        assert_eq!(h, "build 2 and 3, add it to ~/.aish/skills/aish");
+        assert!(!h.contains("Recent conversation"), "digest peeled off: {h}");
+        assert!(!h.contains('\n'), "single line: {h:?}");
+    }
+
+    #[test]
+    fn task_headline_prefers_the_resume_follow_up() {
+        // A resumed task nests the original (which itself still carries an
+        // End-context marker) — the follow-up marker must win.
+        let task = "=== ORIGINAL TASK ===\n\
+                    === End context ===\n\n do the first thing\n\
+                    === YOUR PRIOR RESULT ===\n did the first thing\n\
+                    === OPERATOR'S FOLLOW-UP ===\n now also do the second thing";
+        let h = task_headline(task);
+        assert_eq!(h, "now also do the second thing");
+    }
+
+    #[test]
+    fn task_headline_clips_long_tasks_with_an_ellipsis() {
+        let long = "word ".repeat(100); // 500 chars, no markers
+        let h = task_headline(&long);
+        assert!(h.ends_with('…'), "clipped with ellipsis: {h:?}");
+        assert!(
+            h.chars().count() == TASK_HEADLINE_MAX + 1,
+            "clipped to the bound (+ellipsis): {}",
+            h.chars().count()
+        );
+    }
+
+    #[test]
+    fn task_headline_passes_plain_tasks_through() {
+        assert_eq!(task_headline("review the design doc"), "review the design doc");
+        // Whitespace/newlines collapse to single spaces.
+        assert_eq!(task_headline("do  a\n\nand b"), "do a and b");
+    }
+
+    #[test]
+    fn task_headline_falls_back_when_marker_has_no_trailing_ask() {
+        // A trailing marker with nothing after it must not yield a blank row.
+        let task = "just do the thing\n=== End context ===";
+        let h = task_headline(task);
+        assert!(!h.is_empty(), "never blank: {h:?}");
+        assert!(h.contains("just do the thing"), "falls back to full task: {h}");
     }
 
     #[test]
