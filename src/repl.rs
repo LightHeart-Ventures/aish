@@ -6060,12 +6060,44 @@ fn handle_tokens(session: &Session) {
 }
 
 
-fn handle_telemetry(sub: Option<&str>, session: &mut Session) {
+fn handle_telemetry(args: Vec<&str>, session: &mut Session) {
+    // `:telemetry skill-match <task>` — TASK-335 debug transparency: run the
+    // same semantic scorer used per-turn (crate::skill_match::skill_match) and
+    // print which skills were considered and WHY the top-2 were chosen (keyword
+    // relevance, intent→category boost, applies-to repo multiplier, unwanted-for
+    // suppression). Lets a new agent understand skill ranking without the env
+    // var (AISH_SKILL_MATCH_DEBUG) or reading the code.
+    if matches!(args.first().copied(), Some("skill-match" | "skill-matching")) {
+        let task = args[1..].join(" ");
+        if task.trim().is_empty() {
+            println!("usage: :telemetry skill-match <task text>");
+            return;
+        }
+        let scored = crate::skill_match::skill_match(&task, None, &session.skills);
+        if scored.is_empty() {
+            println!("no installed skill scored above zero for that task");
+            return;
+        }
+        println!("skill-match reasoning for: {task}");
+        for s in &scored {
+            println!(
+                "  {:<28} score={:>3}  {}",
+                s.skill.name,
+                s.score,
+                if s.reasons.is_empty() {
+                    "no signal".to_string()
+                } else {
+                    s.reasons.join("; ")
+                }
+            );
+        }
+        return;
+    }
     if session.db.is_none() {
         println!("telemetry store unavailable");
         return;
     }
-    match sub {
+    match args.first().copied() {
         Some("clear" | "reset" | "wipe") => {
             let db = session.db.as_ref().unwrap();
             match db.clear_tool_telemetry() {
@@ -6358,6 +6390,7 @@ async fn handle_colon(
                  :compact                            offload older history to long-term memory now\n\
                  :memories [organize]                list stored memories, or dedup them\n\
                  :telemetry [clear]                  tool-call failure/retry-recovery stats (or wipe them)\n\
+                 :telemetry skill-match <task>       show why the semantic matcher ranks skills for a task\n\
                  :tokens                             per-run/aggregate token spend, in:out ratio, top spenders\n\
                  :version                            show aish version + backend (also `aish --version`)\n\
                  :update [prod|dev|ci]               check GitHub for a newer release and upgrade;\n\
@@ -7452,7 +7485,7 @@ async fn handle_colon(
         Some("memories" | "memory") => handle_memories(parts.next(), session),
         Some("hooks") => handle_hooks(parts.next(), session),
         Some("plugin" | "plugins") => handle_plugin(parts.collect()),
-        Some("telemetry" | "tool-stats") => handle_telemetry(parts.next(), session),
+        Some("telemetry" | "tool-stats") => handle_telemetry(parts.collect(), session),
         Some("tokens" | "token-spend") => handle_tokens(session),
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
