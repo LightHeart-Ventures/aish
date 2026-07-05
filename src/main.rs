@@ -555,12 +555,6 @@ async fn main() -> Result<()> {
         session.skills = local;
     }
     timer.mark("skills render");
-    // TASK-331 — surface any skills missing semantic metadata as a non-fatal
-    // startup notice so authors can backfill categories/applies-to per
-    // SKILL-FORMAT.md. Skills without the fields still load and function.
-    for w in skills::metadata_warnings(&session.skills) {
-        startup_notices.push(format!("\x1b[33maish:\x1b[0m {w}"));
-    }
     session.db = match db::Db::open(&db_paths::main_db_path()) {
         Ok(d) => Some(d),
         Err(e) => {
