@@ -41,6 +41,7 @@ mod present;
 mod pulse;
 mod rc;
 mod reasoning_telemetry;
+mod remember;
 mod repl;
 mod rewrite;
 mod scope;
