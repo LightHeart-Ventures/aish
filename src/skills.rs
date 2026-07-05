@@ -12,11 +12,19 @@
 
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Skill {
     pub name: String,
     pub description: String,
     pub path: PathBuf,
+    /// TASK-332 semantic metadata (optional frontmatter keys `categories:`,
+    /// `applies-to:`, `unwanted-for:`). Empty when the SKILL.md omits them, so
+    /// legacy skills keep working and only fall back to generic keyword matching.
+    /// Consumed by [`crate::skill_match::skill_match`] for intent/repo-scoped
+    /// ranking. All values are lowercased at parse time.
+    pub categories: Vec<String>,
+    pub applies_to: Vec<String>,
+    pub unwanted_for: Vec<String>,
 }
 
 /// Scan a skills directory. Missing dir → no skills; malformed entries are
@@ -32,10 +40,14 @@ pub fn load(dir: &Path) -> Vec<Skill> {
             continue;
         };
         if let Some((name, description)) = parse_frontmatter(&text) {
+            let (categories, applies_to, unwanted_for) = parse_semantic_meta(&text);
             skills.push(Skill {
                 name,
                 description,
                 path: skill_md,
+                categories,
+                applies_to,
+                unwanted_for,
             });
         }
     }
@@ -84,6 +96,44 @@ pub fn parse_frontmatter(text: &str) -> Option<(String, String)> {
         }
     }
     Some((name?, description?))
+}
+
+/// TASK-332: pull the optional comma-separated `categories:`, `applies-to:`, and
+/// `unwanted-for:` lists out of a `---`-fenced frontmatter block. Absent keys →
+/// empty vecs. Kept SEPARATE from [`parse_frontmatter`] (which stays a 2-tuple
+/// shared with the skill.fish importer) so adding semantic metadata never
+/// changes name/description parsing. Values are trimmed and lowercased so
+/// matching is case-insensitive.
+pub fn parse_semantic_meta(text: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut categories = Vec::new();
+    let mut applies_to = Vec::new();
+    let mut unwanted_for = Vec::new();
+    let Some(rest) = text.strip_prefix("---") else {
+        return (categories, applies_to, unwanted_for);
+    };
+    let Some(end) = rest.find("\n---") else {
+        return (categories, applies_to, unwanted_for);
+    };
+    for line in rest[..end].lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("categories:") {
+            categories = split_list(v);
+        } else if let Some(v) = line.strip_prefix("applies-to:") {
+            applies_to = split_list(v);
+        } else if let Some(v) = line.strip_prefix("unwanted-for:") {
+            unwanted_for = split_list(v);
+        }
+    }
+    (categories, applies_to, unwanted_for)
+}
+
+/// Split a single-line comma-separated frontmatter value into trimmed,
+/// lowercased, non-empty entries.
+fn split_list(v: &str) -> Vec<String> {
+    v.split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// The system-prompt section advertising available skills from both sources.
@@ -174,6 +224,7 @@ mod tests {
             name: "deploy".into(),
             description: "Ship it.".into(),
             path: PathBuf::from("/s/deploy/SKILL.md"),
+            ..Default::default()
         }];
         let mcp = vec![crate::mcp::McpSkill {
             server: "atum".into(),
