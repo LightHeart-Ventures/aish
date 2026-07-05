@@ -468,7 +468,9 @@
     "fixtures": "tests/golden/ (golden snapshot files); test data embedded in test functions",
     "pty": "tests/pty_harness.rs exercises kernel job-control invariants at the syscall level",
     "repl_smoke": "tests/repl/agent_tty_smoke.sh drives the real alt-screen TUI REPL through coder/agent-tty (npx agent-tty@0.5.0) and asserts on rendered terminal state (boot banner, :help, clean :quit); hermetic (built-ins only, no model/API key). Run via `make test-repl`; CI: .github/workflows/repl-smoke.yml (Node >=24). See tests/repl/README.md",
-    "run": "cargo test --all (unit + integration + doc tests); CARGO_BUILD_JOBS=4 for low-memory machines"
+    "run": "cargo test --all (unit + integration + doc tests); CARGO_BUILD_JOBS=4 for low-memory machines",
+    "policy": "MANDATORY: run all build/test validation on Blacksmith Testbox (blacksmith.sh), NOT locally. Local cargo builds of aish OOM-kill in coordinator worktrees (heavy `local` mistralrs feature). Follow the `blacksmith-testbox` skill: `blacksmith testbox warmup .github/workflows/ci-testbox.yml --job testbox` → save the ID → `blacksmith testbox run --id <ID> \"cargo test --no-default-features --locked\"` (the exact CI gate). Local cargo is ONLY acceptable for a zero-dependency `cargo fmt`/`cargo clippy` quick check.",
+    "gate": "cargo test --no-default-features --locked (run via Blacksmith Testbox — matches .github/workflows/ci.yml and ci-testbox.yml)"
   },
   "infrastructure": [
     {
