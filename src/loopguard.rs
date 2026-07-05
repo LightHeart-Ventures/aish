@@ -276,6 +276,15 @@ pub enum ExitReason {
     /// NOT a failure: the coordinator stays alive, folds a reassess directive,
     /// and drives the next round. Carries no counters.
     Interrupted,
+    /// TASK-358: the turn ran a deep SERIAL chain — more than
+    /// [`SERIAL_CHAIN_YIELD_DEPTH`] consecutive rounds that each issued exactly
+    /// ONE tool call (grep→read→edit→run→…), never batching. This is not a loop
+    /// (the calls differ) and not a budget stop, but a token-wasteful,
+    /// rate-limit-concentrating shape: every round re-sends the whole context.
+    /// The coordinator yields with a resumable banner so the durable loop
+    /// checkpoints and the next round re-plans toward batching. `depth` is the
+    /// streak length reached. NOT a failure — auto-resumes.
+    SerialChainYield { depth: usize },
 }
 
 impl ExitReason {
@@ -287,6 +296,7 @@ impl ExitReason {
             ExitReason::LoopDetected { .. } => "loop-detected",
             ExitReason::BudgetExhausted { .. } => "budget-exhausted",
             ExitReason::Interrupted => "interrupted",
+            ExitReason::SerialChainYield { .. } => "serial-chain-yield",
         }
     }
 
@@ -314,6 +324,12 @@ impl ExitReason {
                 format!("exhausted the {iterations}-round tool-call budget without a final answer")
             }
             ExitReason::Interrupted => "was interrupted by the operator (Ctrl-C)".to_string(),
+            ExitReason::SerialChainYield { depth } => {
+                format!(
+                    "yielded after {depth} consecutive single-call rounds (a deep serial chain) to \
+re-plan toward batching independent calls"
+                )
+            }
         }
     }
 
@@ -333,6 +349,9 @@ impl ExitReason {
             ExitReason::BudgetExhausted { iterations } => (*iterations, 0),
             ExitReason::Interrupted => (0, 0),
             ExitReason::LoopDetected { count, .. } => (0, *count),
+            // Carry `depth` in the `count` field of the banner (round-tripped
+            // back into `depth` by parse_banner).
+            ExitReason::SerialChainYield { depth } => (0, *depth),
         };
         format!(
             "[aish-stop tag={} iterations={iters} count={count}] {}",
@@ -364,6 +383,7 @@ impl ExitReason {
             "forced-summarize" => Some(ExitReason::ForcedSummarize { iterations: iters }),
             "budget-exhausted" => Some(ExitReason::BudgetExhausted { iterations: iters }),
             "interrupted" => Some(ExitReason::Interrupted),
+            "serial-chain-yield" => Some(ExitReason::SerialChainYield { depth: count }),
             "loop-detected" => Some(ExitReason::LoopDetected {
                 call: String::new(),
                 count,
@@ -439,9 +459,9 @@ pub fn classify_disposition(
         ExitReason::Completed | ExitReason::Interrupted => Disposition::None,
         _ if auto_recoveries >= max_auto => Disposition::FlagOperator,
         ExitReason::LoopDetected { .. } => Disposition::Nudge,
-        ExitReason::ForcedSummarize { .. } | ExitReason::BudgetExhausted { .. } => {
-            Disposition::Resume
-        }
+        ExitReason::ForcedSummarize { .. }
+        | ExitReason::BudgetExhausted { .. }
+        | ExitReason::SerialChainYield { .. } => Disposition::Resume,
     }
 }
 
@@ -589,6 +609,49 @@ round. Every extra round re-sends the whole context, so front-load your inspecti
 serialize a call that genuinely DEPENDS on a previous call's output (e.g. grep to find a line, THEN \
 read that exact line).]",
     )
+}
+
+// ---------------------------------------------------------------------------
+// TASK-358: serial-chain depth yield
+// ---------------------------------------------------------------------------
+
+/// Consecutive rounds that EACH issue exactly one tool call (a deep SERIAL
+/// chain: grep→read→edit→run→…) before the coordinator gracefully YIELDS to
+/// re-plan toward batching. Unlike [`BATCH_NUDGE_STREAK`] this counts ANY lone
+/// call (not just batchable reads) and drives a turn-yield rather than a mere
+/// prompt nudge: a long serial chain drains the rate-limit window — every round
+/// re-sends the whole context — even when the individual calls differ (so it is
+/// not a loop) and the budget is not yet spent. Set to 8 per the card's ">8
+/// sequential calls" policy, so the 9th consecutive lone call trips the yield.
+pub const SERIAL_CHAIN_YIELD_DEPTH: usize = 8;
+
+/// Tracks the current run of consecutive single-tool-call rounds within one
+/// `run_turn` and signals when the chain has grown deep enough to yield. Lives
+/// for the duration of one turn and is dropped with it, so the streak never
+/// bleeds across turns (same discipline as [`BatchGuard`]).
+#[derive(Default)]
+pub struct SerialChainGuard {
+    /// Length of the current uninterrupted run of single-call rounds.
+    depth: usize,
+}
+
+impl SerialChainGuard {
+    /// Record one executed round's tool-call count. A round with exactly one
+    /// call EXTENDS the serial chain; a batched round (≥2 calls) or a no-call
+    /// round RESETS it. Returns `Some(depth)` once the chain first exceeds
+    /// [`SERIAL_CHAIN_YIELD_DEPTH`] so the caller can yield. Because a yield
+    /// ends the turn (dropping this guard), it fires at most once per chain.
+    pub fn record(&mut self, calls_this_round: usize) -> Option<usize> {
+        if calls_this_round == 1 {
+            self.depth += 1;
+            if self.depth > SERIAL_CHAIN_YIELD_DEPTH {
+                return Some(self.depth);
+            }
+        } else {
+            self.depth = 0;
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -950,5 +1013,75 @@ mod tests {
         // A no-tool turn breaks the streak.
         assert!(g.record(&[]).is_none());
         assert!(g.record(&["read_file"]).is_none(), "streak restarted at 1");
+    }
+
+    // ── serial-chain depth yield (TASK-358) ───────────────────────────────
+    #[test]
+    fn serial_chain_guard_yields_after_depth_exceeds_threshold() {
+        let mut g = SerialChainGuard::default();
+        // The first SERIAL_CHAIN_YIELD_DEPTH single-call rounds do NOT yield…
+        for i in 1..=SERIAL_CHAIN_YIELD_DEPTH {
+            assert!(
+                g.record(1).is_none(),
+                "round {i} (≤ threshold) must not yield"
+            );
+        }
+        // …the very next one (the 9th with the default threshold of 8) trips it,
+        // reporting the streak length reached.
+        assert_eq!(
+            g.record(1),
+            Some(SERIAL_CHAIN_YIELD_DEPTH + 1),
+            "the round past the threshold yields with the depth"
+        );
+    }
+
+    #[test]
+    fn serial_chain_guard_batched_or_empty_round_resets() {
+        let mut g = SerialChainGuard::default();
+        for _ in 0..SERIAL_CHAIN_YIELD_DEPTH {
+            assert!(g.record(1).is_none());
+        }
+        // A batched round (≥2 calls) resets the chain — no yield, and the streak
+        // must climb from scratch again.
+        assert!(g.record(3).is_none(), "batched round resets the chain");
+        for i in 1..=SERIAL_CHAIN_YIELD_DEPTH {
+            assert!(g.record(1).is_none(), "post-reset round {i} must not yield");
+        }
+        assert_eq!(g.record(1), Some(SERIAL_CHAIN_YIELD_DEPTH + 1));
+
+        // A no-call round also resets.
+        let mut g2 = SerialChainGuard::default();
+        for _ in 0..SERIAL_CHAIN_YIELD_DEPTH {
+            assert!(g2.record(1).is_none());
+        }
+        assert!(g2.record(0).is_none(), "no-call round resets the chain");
+        assert!(g2.record(1).is_none(), "streak restarted at 1");
+    }
+
+    #[test]
+    fn serial_chain_yield_banner_round_trips_and_resumes() {
+        let reason = ExitReason::SerialChainYield { depth: 9 };
+        assert_eq!(reason.tag(), "serial-chain-yield");
+        assert!(reason.is_abnormal());
+        // depth survives the banner round-trip (carried in the `count` field).
+        let parsed =
+            ExitReason::parse_banner(&reason.banner()).expect("serial-chain banner must parse");
+        assert_eq!(parsed, ExitReason::SerialChainYield { depth: 9 });
+        // A deep serial chain is a recoverable stop → Resume (auto-continue),
+        // and once auto-recoveries are spent it flags the operator.
+        let max = MAX_AUTO_RECOVERIES;
+        assert_eq!(
+            classify_disposition(&reason, 0, max),
+            Disposition::Resume
+        );
+        assert_eq!(
+            classify_disposition(&reason, max, max),
+            Disposition::FlagOperator
+        );
+        // End-to-end through RoundExit: resume with the auto-resume directive.
+        let exit = RoundExit::evaluate(&with_banner(&reason, "partial"), 0, max)
+            .expect("abnormal → Some");
+        assert_eq!(exit.disposition, Disposition::Resume);
+        assert!(exit.directive().unwrap().contains("[auto-resume]"));
     }
 }
