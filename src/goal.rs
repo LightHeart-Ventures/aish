@@ -1081,6 +1081,10 @@ mod tests {
         GoalLoop {
             condition: "Complete the work".to_string(),
             started: Instant::now(),
+            hooks: crate::hooks::HookSet::empty(),
+            session_id: "test-session".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            mode: "build".to_string(),
             inner: Mutex::new(Inner {
                 status,
                 turns: 3,
