@@ -4,6 +4,9 @@ description: Triage a newly opened or untriaged GitHub issue — classify it, ap
 version: 1.0.0
 provides_tools: [list_issues, add_comment]
 mcp_server: github
+categories: [review, troubleshooting]
+applies-to: [all]
+unwanted-for: [design]
 ---
 
 # GitHub Issue Triage

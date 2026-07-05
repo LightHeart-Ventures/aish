@@ -4,6 +4,9 @@ description: Review a GitHub pull request end-to-end — fetch metadata + diff, 
 version: 1.0.0
 provides_tools: [list_issues, add_comment]
 mcp_server: github
+categories: [review]
+applies-to: [all]
+unwanted-for: [infrastructure, perf]
 ---
 
 # GitHub PR Review

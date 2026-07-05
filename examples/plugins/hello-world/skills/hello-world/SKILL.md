@@ -1,6 +1,9 @@
 ---
 name: hello-world
 description: Greet the user with a friendly, personalized "Hello, World!" — the canonical smoke-test that proves a plugin's skill reached the agent's catalog.
+categories: [example]
+applies-to: [all]
+unwanted-for: []
 ---
 
 # Hello World

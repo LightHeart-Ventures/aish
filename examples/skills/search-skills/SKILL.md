@@ -10,6 +10,9 @@ description: >
 user-invocable: true
 argument-hint: "<task description or keywords>"
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/*), Bash(find ~/.aish/skills -name "SKILL.md"), Read, Grep
+categories: [discovery]
+applies-to: [all]
+unwanted-for: []
 ---
 
 # Search & Recommend Skills
