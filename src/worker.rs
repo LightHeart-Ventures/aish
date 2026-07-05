@@ -914,8 +914,35 @@ fn task_headline(task: &str) -> String {
 /// the contained activity stream — it's an out-of-band interjection). Pure —
 /// unit-tested.
 pub fn console_row(label: &str, text: &str) -> String {
-    format!("\x1b[1;36m📣 [{label}]\x1b[0m {text}")
+    // A note may be multi-line. Over the line-oriented stderr transport the
+    // coordinator encodes its physical newlines as `CONSOLE_LINE_SEP` (a
+    // non-`\n` separator) so the whole note arrives as ONE sentinel line and the
+    // 📣 megaphone + `[label]` prefix is framed exactly ONCE — not repeated on
+    // every physical line (the old bug). Continuation lines are indented to align
+    // under the first line's text so the note reads as one tidy block.
+    let prefix = format!("\x1b[1;36m📣 [{label}]\x1b[0m ");
+    let mut lines = text.split(CONSOLE_LINE_SEP);
+    let first = lines.next().unwrap_or("");
+    let mut out = format!("{prefix}{first}");
+    // Indent = visible width of "📣 [label] ": the megaphone renders 2 cols, plus
+    // " [" (2) + label + "] " (2) → label width + 6. Worker labels are ASCII ids
+    // so char count == display width. ANSI codes in `prefix` have zero width.
+    let indent = " ".repeat(label.chars().count() + 6);
+    for line in lines {
+        out.push('\n');
+        out.push_str(&indent);
+        out.push_str(line);
+    }
+    out
 }
+
+/// Separator the coordinator's `message_console` uses to encode a multi-line
+/// note's physical newlines into a SINGLE `📣` sentinel line, so the note
+/// survives the newline-delimited stderr transport intact and the parent frames
+/// its 📣 `[label]` prefix exactly once. U+2028 (LINE SEPARATOR) is not `\n`, so
+/// `AsyncBufRead::next_line` keeps the encoded note on one line; `console_row`
+/// decodes it back into aligned continuation lines.
+pub const CONSOLE_LINE_SEP: char = '\u{2028}';
 
 /// Stream a child's stderr line by line, forwarding the interesting lines to the
 /// user's terminal live via `announce`, and retaining only the last
@@ -4037,6 +4064,24 @@ mod tests {
         assert_eq!(console_message("\x1b[2m  ✓ 🔧 read /etc/hosts\x1b[0m"), None);
         assert_eq!(console_message("📣"), None); // bare sentinel, no text
         assert_eq!(console_message(""), None);
+    }
+
+    #[test]
+    fn console_row_frames_prefix_once_for_multiline_notes() {
+        assert_eq!(
+            console_row("goal", "build is taking a while"),
+            "\x1b[1;36m📣 [goal]\x1b[0m build is taking a while"
+        );
+        let encoded = format!("update:{0}• one{0}• two", CONSOLE_LINE_SEP);
+        let rendered = console_row("goal", &encoded);
+        assert_eq!(rendered.matches('📣').count(), 1);
+        assert_eq!(rendered.matches("[goal]").count(), 1);
+        let indent = " ".repeat("goal".len() + 6);
+        assert_eq!(
+            rendered,
+            format!("\x1b[1;36m📣 [goal]\x1b[0m update:\n{indent}• one\n{indent}• two")
+        );
+        assert!(!rendered.contains(CONSOLE_LINE_SEP));
     }
 
     #[test]
