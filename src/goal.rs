@@ -36,6 +36,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// a background loop can't be watched, so we cap it.
 const MAX_TURNS: usize = 25;
 
+/// Bounded transcript ring the goal keeps for `:attach goal` / Shift-Tab replay
+/// — the goal analogue of a worker's captured activity. A goal is essentially a
+/// specialized worker, so its attach/cycle UI mirrors a worker's: header + input
+/// row + activity tail. We cap the ring so a long-running (up to `MAX_TURNS`)
+/// pursuit can't grow it unbounded; the replay tails the last ~screen anyway.
+const TRANSCRIPT_CAP: usize = 200;
+
 const MESSAGES_API: &str = "https://api.anthropic.com/v1/messages";
 /// Cap the work output handed to the judge so a chatty turn can't blow the
 /// verifier's context.
@@ -73,6 +80,10 @@ struct Inner {
     turn_started: Option<Instant>,
     /// Current phase within the loop.
     phase: Step,
+    /// Bounded activity transcript (newest last), replayed on `:attach goal` /
+    /// Shift-Tab so the goal's history renders like a worker's. Capped at
+    /// [`TRANSCRIPT_CAP`] lines.
+    transcript: Vec<String>,
 }
 
 pub type Handle = Arc<GoalLoop>;
@@ -136,15 +147,36 @@ impl GoalLoop {
         }
     }
 
-    /// Backfill lines for `:attach goal` (TASK-301) — the goal analogue of a
-    /// worker's replayed history tail. A `GoalLoop` keeps NO full transcript
-    /// (each turn runs an ephemeral `run_once` worker under a throwaway id), so
-    /// we surface the durable state it DOES hold: the full condition plus the
-    /// current status line (phase, turn count, elapsed, last verifier check).
-    /// Returned newest-context-last so the caller can dim + print them above the
-    /// resuming live stream.
+    /// Record an activity line into the bounded replay transcript, then surface
+    /// it as a transient `[goal]` progress line over the prompt. A goal is a
+    /// specialized worker, so — like a worker capturing its forwarded activity —
+    /// every per-turn announcement is also retained so `:attach goal` /
+    /// Shift-Tab can replay the goal's history tail (see [`attach_backfill`]).
+    fn note(&self, line: &str) {
+        {
+            let mut i = self.inner.lock().unwrap();
+            i.transcript.push(line.to_string());
+            let len = i.transcript.len();
+            if len > TRANSCRIPT_CAP {
+                i.transcript.drain(0..len - TRANSCRIPT_CAP);
+            }
+        }
+        announce(line);
+    }
+
+    /// Backfill rows for `:attach goal` / Shift-Tab (TASK-301) — the goal
+    /// analogue of a worker's replayed activity tail. A goal is essentially a
+    /// specialized worker, so its attach UI is rendered identically (header +
+    /// input row + activity rows) by [`crate::repl::backfill_goal_attached`].
+    /// This returns the ACTIVITY rows: the captured per-turn transcript, with
+    /// the current one-line status appended last so the tail always shows live
+    /// phase/turn/elapsed/last-verifier-check context. Newest last.
     pub fn attach_backfill(&self) -> Vec<String> {
-        vec![format!("🎯 goal: {}", self.condition), self.status_line()]
+        let i = self.inner.lock().unwrap();
+        let mut rows = i.transcript.clone();
+        drop(i);
+        rows.push(self.status_line());
+        rows
     }
 
 
@@ -208,6 +240,7 @@ pub fn spawn(
             cancel: false,
             turn_started: None,
             phase: Step::Idle,
+            transcript: Vec::new(),
         }),
     });
     tokio::spawn(run_goal(goal.clone(), spec, model, cred));
@@ -273,7 +306,7 @@ async fn run_goal(
     model: String,
     cred: crate::backend::claude::Credential,
 ) {
-    announce(&format!("started — {}", goal.condition));
+    goal.note(&format!("started — {}", goal.condition));
     let mut guidance: Option<String> = None;
 
     loop {
@@ -286,7 +319,7 @@ async fn run_goal(
             if i.turns >= MAX_TURNS {
                 i.status = Status::Failed;
                 drop(i);
-                announce(&format!(
+                goal.note(&format!(
                     "stopped — hit the {MAX_TURNS}-turn backstop without meeting the goal"
                 ));
                 return;
@@ -297,7 +330,7 @@ async fn run_goal(
 
         // Generator: a full-tool worker pursues the goal with the latest guidance.
         let directive = goal_directive(&goal.condition, guidance.as_deref());
-        announce(&format!("turn {turn}: working…"));
+        goal.note(&format!("turn {turn}: working…"));
         {
             let mut i = goal.inner.lock().unwrap();
             i.turn_started = Some(Instant::now());
@@ -308,7 +341,7 @@ async fn run_goal(
             Ok(o) => o,
             Err(e) => {
                 goal.set(Status::Failed, Some(e.clone()));
-                announce(&format!("failed — {e}"));
+                goal.note(&format!("failed — {e}"));
                 return;
             }
         };
@@ -317,7 +350,7 @@ async fn run_goal(
         }
 
         // Verifier: the batch model judges whether the output demonstrates the goal.
-        announce(&format!("turn {turn}: checking…"));
+        goal.note(&format!("turn {turn}: checking…"));
         goal.inner.lock().unwrap().phase = Step::Checking;
         match judge(&cred, &model, &goal.condition, &output).await {
             Ok((true, reason)) => {
@@ -992,6 +1025,7 @@ mod tests {
                 cancel: false,
                 turn_started: turn_started.then(Instant::now),
                 phase,
+                transcript: Vec::new(),
             }),
         }
     }
@@ -1018,6 +1052,55 @@ mod tests {
         assert!(
             joined.contains("last check: not yet"),
             "backfill shows the last verifier check: {joined}"
+        );
+    }
+
+    // A goal is a specialized worker: its per-turn activity is captured into a
+    // bounded transcript (via `note`) and replayed by `:attach goal` /
+    // Shift-Tab, oldest-first, with the live status line appended last — exactly
+    // how a worker's forwarded activity tail replays on worker-entry.
+    #[test]
+    fn test_attach_goal_replays_captured_transcript_then_status() {
+        let g = goal_with(Status::Active, Step::Working, true);
+        g.note("started — Complete the work");
+        g.note("turn 1: working…");
+        g.note("turn 1: checking…");
+        let lines = g.attach_backfill();
+        // Activity rows come first, in capture order…
+        assert_eq!(lines[0], "started — Complete the work");
+        assert_eq!(lines[1], "turn 1: working…");
+        assert_eq!(lines[2], "turn 1: checking…");
+        // …and the live one-line status is appended last.
+        assert!(
+            lines.last().unwrap().contains("goal [active"),
+            "status line appended last: {lines:?}"
+        );
+    }
+
+    // The transcript is bounded — old rows drop off so a long-running goal's
+    // replay stays ~1 screen, mirroring the worker replay budget.
+    #[test]
+    fn goal_transcript_is_bounded() {
+        let g = goal_with(Status::Active, Step::Working, true);
+        for n in 0..(TRANSCRIPT_CAP + 25) {
+            g.note(&format!("turn {n}: working…"));
+        }
+        let rows = g.attach_backfill();
+        // transcript capped, plus the appended status line.
+        assert!(
+            rows.len() <= TRANSCRIPT_CAP + 1,
+            "transcript stays bounded: {} rows",
+            rows.len()
+        );
+        // Oldest rows evicted — the newest survive.
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains(&format!("turn {}: working…", TRANSCRIPT_CAP + 24)),
+            "newest activity retained: {joined}"
+        );
+        assert!(
+            !joined.contains("turn 0: working…"),
+            "oldest activity evicted: {joined}"
         );
     }
 
