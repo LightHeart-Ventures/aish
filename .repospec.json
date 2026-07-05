@@ -6,6 +6,21 @@
   "repository": "https://github.com/LightHeart-Ventures/aish",
   "license": "Apache-2.0",
   "summary": "AI-native shell: type commands to run directly, intent to an agent that plans, executes, and iterates until done.",
+  "worktreeRetention": {
+    "ttlIdleDays": 30,
+    "maxConcurrentPerBranch": 1,
+    "allowedPrefixes": ["feat/", "fix/", "docs/", "aish/w_", "release/"],
+    "autoCleanupSchedule": "0 2 * * *",
+    "auditSchedule": "0 3 1 * *",
+    "worktreeRoot": "~/.aish/worktrees",
+    "tooling": {
+      "freshnessGate": "scripts/check-branch-freshness.sh",
+      "removeOnComplete": "scripts/remove-worktree-on-complete.sh",
+      "cleanup": "scripts/cleanup-worktrees.sh",
+      "audit": "scripts/audit-worktrees.sh"
+    },
+    "why": "SPR-064 (FR-328): eliminate worktree collisions at the source and reclaim leaked disk. Single source of truth for the hygiene tooling."
+  },
   "entrypoints": [
     {
       "name": "aish-repl",
