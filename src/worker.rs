@@ -1183,19 +1183,29 @@ impl ThinkingSpinner {
                 // animation would trample it, so commit a static line instead
                 // (same prompt-preserving path as the multi-thinker case).
                 if printer || THINKING_ACTIVE.load(Ordering::Relaxed) > 1 {
-                    let body = format!(
-                        "{NARRATION_ALIGN_PAD}\x1b[36m{}\x1b[0m \x1b[2;36mthinking…\x1b[0m",
-                        THINKING_FRAMES[0]
-                    );
+                    // Prompt-preserving mode CANNOT animate: rustyline's
+                    // `ExternalPrinter` only APPENDS above the prompt, so
+                    // re-emitting a braille frame every 80ms would waterfall a
+                    // fresh "thinking…" line down the scrollback instead of
+                    // spinning one glyph in place. So commit a single SETTLED
+                    // notice — the same 💭 glyph the forwarded per-round thinking
+                    // rows use (`💭 thinking…`) — which reads as an intentional
+                    // static line rather than a frozen braille frame `⠋` that
+                    // merely looks stuck. A trailing blank line sets it apart from
+                    // the next forwarded row / the redrawn prompt below it.
+                    let body =
+                        format!("{NARRATION_ALIGN_PAD}💭 \x1b[2;36mthinking…\x1b[0m");
                     let row = if live {
                         pane_row_live(&label, &body)
                     } else {
                         pane_row(&label, &body)
                     };
                     // Un-hide the cursor `start` hid — there is no in-place
-                    // animation to conceal — then commit the row on its own line.
+                    // animation to conceal — then commit the row on its own line,
+                    // followed by a blank line (announce_raw appends one `\n`; the
+                    // extra `\n` here yields the separating blank row).
                     eprint!("\x1b[?25h");
-                    crate::tools::announce_raw(&row);
+                    crate::tools::announce_raw(&format!("{row}\n"));
                     committed_static = true;
                     continue;
                 }
