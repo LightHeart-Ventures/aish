@@ -351,7 +351,10 @@ pub fn spawn(
 ///
 /// The prefix also encodes the operator-requested plan-first + task-lifecycle
 /// discipline: the first turn must deconstruct/restate the goal, state its
-/// constraints and a measurable definition of success, map dependencies and
+/// constraints and a measurable definition of success, break the goal into
+/// bite-size, right-sized sub-tasks (a review→design→build pipeline for a
+/// mega-task; file-locality grouping so several TODOs touching one file go to a
+/// single worker instead of colliding parallel ones), map dependencies and
 /// parallelism, and persist that plan durably BEFORE building. Execution then
 /// fans independent sub-work out via `run_in_background`, tracks the work as a
 /// board task (spec/comments/branch/PR kept current, moved to completed only once
@@ -375,10 +378,14 @@ Plan before you build. On your FIRST turn (and whenever no plan exists yet), do 
 1. Deconstruct the goal and restate it in your own words in 60 characters or less.\n\
 2. Identify the constraints and limits — time, budget, access, and the tools/permissions the work needs.\n\
 3. State concretely and measurably what success looks like — the evidence that will prove the goal is met.\n\
-4. Review the existing work, map the dependencies between sub-tasks, and note which sub-tasks can run in parallel.\n\
+4. Break the goal into bite-size sub-tasks and right-size the work so no single worker bites off more than it can finish in one focused pass:\n\
+   a. Decompose a large or multi-phase goal into a logical pipeline of stages with real dependencies — e.g. review → design → build → test — and run the stages in order rather than handing one worker the whole mega-task at once.\n\
+   b. Size each sub-task so ONE worker can complete it in a single focused pass; if a unit spans many files or several unrelated concerns, split it further until each piece is self-contained.\n\
+   c. Optimize by file locality: bundle sub-tasks or TODOs that all touch the SAME file(s) into ONE worker so it does them together — do NOT split edits to a shared file across parallel workers that would collide, reload the same context, or conflict on the same lines.\n\
+   Then map the dependencies between the bite-size sub-tasks and note which are independent and file-disjoint (safe to run in parallel) versus which must wait on an upstream stage.\n\
 5. Persist that plan durably so it survives a restart: record the goal, its sub-tasks/milestones, dependencies, and success criteria in a durable store (the goal store or an aish.db table). Mark each sub-task complete in that store as you finish it.\n\n\
 Then build toward the goal:\n\
-6. Do the independent sub-tasks in parallel where it helps, using the run_in_background tool; keep serial only the work with real dependencies.\n\
+6. Dispatch the independent, file-disjoint sub-tasks in parallel with the run_in_background tool — one worker per bite-size unit, and one worker for all the TODOs that share a file — keeping serial only the work with real dependencies or that touches shared files.\n\
 7. Track the work as a board task: open a task (or reuse the linked one), keep its spec, comments, branch, and pull-request fields up to date as you progress, and move it to completed only once the goal is verified done.\n\
 8. Guard against cascading errors: have an independent agent or verifier fact-check each key result before you build further on it.\n\n\
 Before you finish this turn, call the `message_console` tool once to surface your progress to the operator:\n\
@@ -2033,6 +2040,38 @@ mod domain_tests {
             Some("ship the fix")
         );
     }
+
+    // The per-turn directive must tell the worker to right-size sub-tasks so it
+    // does not bite off more than it can chew: decompose a mega-task into a
+    // review→design→build pipeline, cap each unit at one focused worker pass, and
+    // group work by file locality (TODOs touching one file → one worker). This is
+    // the operator-requested anti-"mega-task" discipline (bite-size chunking +
+    // file-change optimization).
+    #[test]
+    fn goal_directive_instructs_bite_size_and_file_locality() {
+        let d = goal_directive("ship the fix", None).to_lowercase();
+        for needle in [
+            "bite-size",
+            "right-size",
+            "pipeline of stages",
+            "focused pass",
+            "file locality",
+            "same file",
+            "one worker",
+        ] {
+            assert!(
+                d.contains(needle),
+                "bite-size/file-locality directive missing instruction: {needle:?}"
+            );
+        }
+        // Instructions live in the prefix → the condition still round-trips clean,
+        // so `:workers` goal-turn coalescing is unaffected.
+        assert_eq!(
+            goal_condition_from_directive(&goal_directive("ship the fix", None)).as_deref(),
+            Some("ship the fix")
+        );
+    }
+
 
     // The per-turn directive must also encode the plan-first + task-lifecycle
     // discipline: deconstruct/restate, constraints, measurable success, dependency
