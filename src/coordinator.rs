@@ -88,6 +88,31 @@ previous turn mid-flight. Stop what you were doing — do NOT blindly resume it.
 and any newer operator messages, reassess your approach, and either continue with the most \
 sensible next step or, if you should wait for direction, give a brief status plus your best \
 partial result.";
+
+/// PHASE-0 existence guard folded into the coordinator's first-turn prompt
+/// (TASK-355). A headless coordinator handed a "build feature X" task sometimes
+/// re-implements something already shipped — a silent, expensive failure mode
+/// (the motivating w_nMYxaem3 run issued 87 tool calls before rate-limiting
+/// because it never checked whether the activity-tray feature already existed).
+/// This directive makes the model run a cheap existence check FIRST: read the
+/// repo's `.repospec.json` `features` array, grep the feature's key symbol(s)
+/// across `src/`+`tests/`, and scan `git`/`gh` + `background_status` for an
+/// existing branch, PR, or peer coordinator on the same task — and STOP with
+/// evidence instead of rebuilding when the work is already done. It turns an
+/// 87-call runaway into 2–3 calls. Held as a `const` so it is unit-testable
+/// without driving a whole run.
+const PHASE0_GUARD: &str = "PHASE-0 GUARD — verify the work isn't already done BEFORE you build \
+it: for any feature/fix/refactor task, run a cheap existence check before writing a single line of \
+code — re-implementing something already shipped is a silent, expensive failure mode. (1) If the \
+repo has a `.repospec.json`, read its `features`/`modules` arrays to learn the intended symbol and \
+file names; (2) grep the feature's key symbol(s) across `src/` and `tests/`, and check `git log` / \
+`git branch` / `gh pr list` for a matching branch or merged PR; (3) also call `background_status` \
+and `git worktree list` to see whether a PEER coordinator or existing branch/worktree is ALREADY \
+doing THIS task. IF the feature already exists — STOP and report \"Feature already shipped via \
+<PR/commit/branch>\" with the evidence, rather than rebuilding it. IF a peer is already on it — \
+defer or `tell`-coordinate instead of duplicating. ONLY when the existence check comes back empty \
+do you proceed to build. This is cheap insurance on every build task — a 2–3 call guard that \
+prevents an 87-call runaway.";
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -635,6 +660,12 @@ pub async fn drive(
     // session. Isolated workers otherwise strand their commits on `aish/<id>`
     // with no PR; this nudge closes that gap while staying opt-out for read-only
     // tasks that produced nothing committable.
+    //
+    // The PHASE-0 GUARD block (see `PHASE0_GUARD`) is prepended just before the
+    // TASK so it is the last directive the model reads before starting: run a
+    // cheap existence check (.repospec.json → grep → git/gh/background_status)
+    // and STOP if the feature already shipped or a peer is already building it,
+    // rather than re-implementing shipped work (TASK-355).
     let mut next_input = format!(
         "You are running headless as an autonomous aish coordinator in {cwd}. You have your FULL \
 toolset RIGHT NOW — read_file, write_file, list_dir, change_dir, run_program (build, test, git, \
@@ -671,7 +702,7 @@ feature branch (you are typically already on a dedicated work branch — commit 
 or push the default branch), push it, and open a DRAFT pull request with `gh pr create --draft --fill` \
 (pass `--title`/`--body` when `--fill` cannot infer them). Put the PR URL in your final answer. If there \
 are no committable changes, or `gh`/the remote is unavailable, skip the PR and report the branch name \
-plus `git status` instead — do not fail the run over it.\n\nTASK:\n{input}",
+plus `git status` instead — do not fail the run over it.\n\n{PHASE0_GUARD}\n\nTASK:\n{input}",
         cwd = session.cwd.display(),
     );
 
@@ -1571,6 +1602,30 @@ fn worker_store_repo_key(dir: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase0_guard_directs_existence_check_before_build() {
+        // TASK-355: the guard must tell a coordinator to verify the work isn't
+        // already done before building — repospec + grep + git/gh/peer scan,
+        // then STOP with evidence instead of re-implementing shipped work.
+        let g = PHASE0_GUARD;
+        assert!(g.contains("PHASE-0 GUARD"), "labelled block header present");
+        assert!(g.contains(".repospec.json"), "reads the repospec features map");
+        assert!(g.contains("grep"), "greps for the feature symbol");
+        assert!(
+            g.contains("gh pr list") || g.contains("git branch"),
+            "checks git/gh for an existing branch or PR"
+        );
+        assert!(
+            g.contains("background_status"),
+            "checks for a peer coordinator already on the task"
+        );
+        assert!(g.contains("STOP"), "instructs the model to STOP when work exists");
+        assert!(
+            g.contains("already shipped"),
+            "reports the already-shipped conclusion with evidence"
+        );
+    }
 
     #[test]
     fn phase_string_roundtrip_is_total() {
