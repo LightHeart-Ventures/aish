@@ -141,13 +141,25 @@ pub fn rank<'a>(task: &str, skills: &'a [Skill]) -> Vec<Match<'a>> {
 /// skill clears the bar. Names up to [`MAX_HINTS`] top matches and points the
 /// model at each one's SKILL.md. Pure + unit-tested; the engine does the prepend.
 pub fn hint(task: &str, skills: &[Skill]) -> Option<String> {
-    let matches = rank(task, skills);
-    if matches.is_empty() {
+    // Semantic ranking (TASK-332): metadata-aware when a skill carries
+    // `categories`/`applies-to`/`unwanted-for` frontmatter, and identical to the
+    // lexical baseline for metadata-free skills (base score == keyword
+    // relevance, no boosts/suppression). `repo` is None here — production
+    // repo-detection for the `applies-to` boost is a follow-up, so that factor
+    // stays dormant until then. The `>= MIN_SCORE` gate preserves the
+    // pre-TASK-332 quality bar so a single incidental keyword never trips a nudge
+    // (`skill_match` itself only filters `score > 0`).
+    let ranked = skill_match(task, None, skills);
+    let top: Vec<&Scored> = ranked
+        .iter()
+        .filter(|s| s.score >= MIN_SCORE as i32)
+        .take(MAX_HINTS)
+        .collect();
+    if top.is_empty() {
         return None;
     }
-    let top = &matches[..matches.len().min(MAX_HINTS)];
     if top.len() == 1 {
-        let m = &top[0];
+        let m = top[0];
         Some(format!(
             "[aish skill-awareness] Your installed `{}` skill fits this task. USING a skill just \
 means reading its SKILL.md and carrying out its steps yourself with your normal tools — there is \
@@ -162,7 +174,7 @@ attempting the task manually ({}).",
             "[aish skill-awareness] These installed skills look relevant to this task — \
 read the best-fitting one FIRST with read_file and follow it:",
         );
-        for m in top {
+        for m in &top {
             s.push_str(&format!(
                 "\n- `{}` ({}): {}",
                 m.skill.name,
@@ -282,6 +294,202 @@ run, or silently hand-roll, a skill that isn't installed — surface the recomme
     Some(Recommendation { reference, note })
 }
 
+// ---------------------------------------------------------------------------
+// TASK-332: semantic skill-matching over the optional frontmatter metadata
+// (`categories:`, `applies-to:`, `unwanted-for:` — see `skills::parse_semantic_meta`).
+//
+// The keyword nudge above ([`hint`]) is purely lexical. This layer adds INTENT:
+// a task's wording implies category tags (e.g. "token efficiency" → performance
+// + infrastructure), which (a) BOOST skills whose `categories` overlap the
+// intent, (b) SUPPRESS skills that list a matched intent in `unwanted-for`, and
+// (c) get a repo-scope 2× multiplier when the skill's `applies-to` names the
+// current repo. Skills with no metadata simply fall back to the generic keyword
+// relevance score, so nothing regresses.
+// ---------------------------------------------------------------------------
+
+/// Points added per intent→category overlap. Larger than a description keyword
+/// hit (weight 1) and equal to a name hit ([`NAME_WEIGHT`]), so a single
+/// declared-category match outweighs incidental prose overlap.
+const INTENT_WEIGHT: i32 = 5;
+
+/// Multiplier applied to a skill's score when its `applies-to` names the active
+/// repo — an in-repo skill is far more likely to be the right playbook.
+const REPO_BOOST: i32 = 2;
+
+/// Cap on semantic matches returned, mirroring [`MAX_HINTS`].
+pub const MAX_MATCHES: usize = 2;
+
+/// Keyword → intent-category map. A task token that matches an entry (via the
+/// same prefix-aware [`token_matches`] used everywhere else) contributes that
+/// category to the task's intent set. Several efficiency/ops words map to BOTH
+/// `performance` and `infrastructure` (TASK-332: "token/performance/metrics"
+/// signals favor infra + perf skills), so they appear twice on purpose.
+const INTENT_KEYWORDS: &[(&str, &str)] = &[
+    // performance / efficiency signals (dual-tagged perf + infra)
+    ("token", "performance"),
+    ("token", "infrastructure"),
+    ("performance", "performance"),
+    ("performance", "infrastructure"),
+    ("metrics", "performance"),
+    ("metrics", "infrastructure"),
+    // performance-only signals
+    ("perf", "performance"),
+    ("latency", "performance"),
+    ("throughput", "performance"),
+    ("optimize", "performance"),
+    ("optimization", "performance"),
+    ("efficiency", "performance"),
+    ("efficient", "performance"),
+    ("profiling", "performance"),
+    ("benchmark", "performance"),
+    ("memory", "performance"),
+    // infrastructure / ops signals
+    ("infrastructure", "infrastructure"),
+    ("deploy", "infrastructure"),
+    ("terraform", "infrastructure"),
+    ("release", "infrastructure"),
+    ("cargo", "infrastructure"),
+    // code-review signals
+    ("review", "code-review"),
+    ("diff", "code-review"),
+    ("correctness", "code-review"),
+    ("lint", "code-review"),
+    ("refactor", "code-review"),
+    ("pull", "code-review"),
+];
+
+/// Derive the set of intent-category tags a task's wording implies. Empty when
+/// the task uses no recognized signal word — callers then fall back to generic
+/// keyword relevance.
+fn task_intents(task: &str) -> HashSet<String> {
+    let toks = tokens(task);
+    let mut intents = HashSet::new();
+    for t in &toks {
+        for (kw, tag) in INTENT_KEYWORDS {
+            if token_matches(t, kw) {
+                intents.insert((*tag).to_string());
+            }
+        }
+    }
+    intents
+}
+
+/// One semantically-scored skill with a human-readable explanation of every
+/// factor that moved its score — surfaced under `AISH_SKILL_MATCH_DEBUG` so an
+/// operator can see WHY each skill ranked where it did.
+#[derive(Debug, Clone)]
+pub struct Scored<'a> {
+    pub skill: &'a Skill,
+    pub score: i32,
+    pub reasons: Vec<String>,
+}
+
+/// Semantic match of `task` (optionally scoped to `repo`) against a skill
+/// catalog, using the TASK-332 frontmatter metadata on top of keyword
+/// relevance. Returns up to [`MAX_MATCHES`] skills, highest score first (ties
+/// broken by name), excluding any skill suppressed by an `unwanted-for`
+/// anti-match or scoring zero.
+///
+/// Scoring per skill:
+///   1. `unwanted-for ∩ task-intent` non-empty → hard-suppress (score 0).
+///   2. generic keyword relevance → base score (metadata-free fallback).
+///   3. `categories ∩ task-intent` → `+INTENT_WEIGHT` each.
+///   4. `applies-to` contains `repo` → whole score `× REPO_BOOST`.
+pub fn skill_match<'a>(task: &str, repo: Option<&str>, skills: &'a [Skill]) -> Vec<Scored<'a>> {
+    let task_tokens = tokens(task);
+    let intents = task_intents(task);
+    let repo_l = repo.map(|r| r.to_ascii_lowercase());
+
+    let mut scored: Vec<Scored<'a>> = Vec::with_capacity(skills.len());
+    for skill in skills {
+        let mut reasons = Vec::new();
+
+        // (1) Anti-match: a task intent the skill explicitly opts out of → drop it.
+        let anti: Vec<&str> = skill
+            .unwanted_for
+            .iter()
+            .filter(|u| intents.contains(u.as_str()))
+            .map(|u| u.as_str())
+            .collect();
+        if !anti.is_empty() {
+            reasons.push(format!("suppressed: task intent {anti:?} in unwanted-for"));
+            scored.push(Scored {
+                skill,
+                score: 0,
+                reasons,
+            });
+            continue;
+        }
+
+        // (2) Generic keyword relevance (works for metadata-free skills too).
+        let base = relevance(&task_tokens, skill) as i32;
+        if base > 0 {
+            reasons.push(format!("keyword relevance +{base}"));
+        }
+        let mut score = base;
+
+        // (3) Intent → declared-category boost.
+        let hits: Vec<&str> = skill
+            .categories
+            .iter()
+            .filter(|c| intents.contains(c.as_str()))
+            .map(|c| c.as_str())
+            .collect();
+        if !hits.is_empty() {
+            let add = INTENT_WEIGHT * hits.len() as i32;
+            score += add;
+            reasons.push(format!("intent/category {hits:?} +{add}"));
+        }
+
+        // (4) Repo-scope multiplier.
+        if let Some(r) = &repo_l {
+            if skill.applies_to.iter().any(|a| a == r) {
+                score *= REPO_BOOST;
+                reasons.push(format!("applies-to '{r}' ×{REPO_BOOST}"));
+            }
+        }
+
+        scored.push(Scored {
+            skill,
+            score,
+            reasons,
+        });
+    }
+
+    if skill_match_debug_enabled() {
+        for s in &scored {
+            eprintln!(
+                "[skill-match] {:<28} score={:>3} :: {}",
+                s.skill.name,
+                s.score,
+                if s.reasons.is_empty() {
+                    "no signal".to_string()
+                } else {
+                    s.reasons.join("; ")
+                }
+            );
+        }
+    }
+
+    let mut ranked: Vec<Scored<'a>> = scored.into_iter().filter(|s| s.score > 0).collect();
+    ranked.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.skill.name.cmp(&b.skill.name))
+    });
+    ranked.truncate(MAX_MATCHES);
+    ranked
+}
+
+/// Whether `AISH_SKILL_MATCH_DEBUG` requests per-skill scoring diagnostics on
+/// stderr (`1`/`true`/`on`).
+fn skill_match_debug_enabled() -> bool {
+    matches!(
+        std::env::var("AISH_SKILL_MATCH_DEBUG").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,7 +500,144 @@ mod tests {
             name: name.into(),
             description: description.into(),
             path: PathBuf::from(format!("/skills/{name}/SKILL.md")),
+            ..Default::default()
         }
+    }
+
+    /// Build a skill WITH the TASK-332 semantic metadata populated.
+    fn skill_meta(
+        name: &str,
+        description: &str,
+        categories: &[&str],
+        applies_to: &[&str],
+        unwanted_for: &[&str],
+    ) -> Skill {
+        let lower = |xs: &[&str]| xs.iter().map(|s| s.to_ascii_lowercase()).collect();
+        Skill {
+            name: name.into(),
+            description: description.into(),
+            path: PathBuf::from(format!("/skills/{name}/SKILL.md")),
+            categories: lower(categories),
+            applies_to: lower(applies_to),
+            unwanted_for: lower(unwanted_for),
+        }
+    }
+
+    /// Catalog modeled on the real installed skills, annotated with metadata.
+    fn semantic_catalog() -> Vec<Skill> {
+        vec![
+            skill_meta(
+                "aish_sre",
+                "SRE playbook for aish: releases, CI, OOM, coordinators.",
+                &["infrastructure", "performance"],
+                &["aish"],
+                &["code-review"],
+            ),
+            skill_meta(
+                "rust-pro",
+                "Master Rust with async, the type system, and performance.",
+                &["performance", "rust"],
+                &["aish"],
+                &["code-review"],
+            ),
+            skill_meta(
+                "code-review-excellence",
+                "Effective code review, PR feedback, catch bugs early.",
+                &["code-review"],
+                &[],
+                &["performance", "infrastructure"],
+            ),
+            skill_meta(
+                "terraform-aws-modules",
+                "Reusable Terraform AWS modules and state management.",
+                &["infrastructure"],
+                &["cloudinero"],
+                &["code-review"],
+            ),
+        ]
+    }
+
+    #[test]
+    fn token_efficiency_ranks_infra_perf_and_filters_code_review() {
+        let c = semantic_catalog();
+        let r = skill_match("implement token efficiency in the shell", Some("aish"), &c);
+        let names: Vec<&str> = r.iter().map(|s| s.skill.name.as_str()).collect();
+        assert_eq!(names.len(), 2, "got {names:?}");
+        assert!(names.contains(&"aish_sre"), "got {names:?}");
+        assert!(names.contains(&"rust-pro"), "got {names:?}");
+        assert!(!names.contains(&"code-review-excellence"), "got {names:?}");
+        // aish_sre has 2 category hits vs rust-pro's 1; equal repo boost → aish_sre first.
+        assert_eq!(r[0].skill.name, "aish_sre");
+    }
+
+    #[test]
+    fn code_review_task_surfaces_review_skill_and_filters_infra() {
+        let c = semantic_catalog();
+        let r = skill_match("code review the auth module changes", Some("aish"), &c);
+        let names: Vec<&str> = r.iter().map(|s| s.skill.name.as_str()).collect();
+        assert!(names.contains(&"code-review-excellence"), "got {names:?}");
+        assert!(!names.contains(&"aish_sre"), "got {names:?}");
+        assert!(!names.contains(&"terraform-aws-modules"), "got {names:?}");
+        assert_eq!(r[0].skill.name, "code-review-excellence");
+    }
+
+    #[test]
+    fn repo_scope_boost_promotes_applies_to_match() {
+        let c = vec![
+            skill_meta("rust-pro", "Rust performance.", &["performance"], &["aish"], &[]),
+            skill_meta(
+                "perf-generic",
+                "Generic performance tuning.",
+                &["performance"],
+                &["other"],
+                &[],
+            ),
+        ];
+        let r = skill_match("optimize performance", Some("aish"), &c);
+        assert_eq!(r[0].skill.name, "rust-pro");
+        assert!(r[0].score > r[1].score, "repo-scoped skill should outrank: {r:?}");
+    }
+
+    #[test]
+    fn anti_match_suppresses_even_on_keyword_overlap() {
+        // Description keyword-matches the task, but unwanted-for lists the intent.
+        let c = vec![skill_meta(
+            "no-perf-here",
+            "Handles performance metrics dashboards.",
+            &[],
+            &[],
+            &["performance"],
+        )];
+        let r = skill_match("improve performance metrics", None, &c);
+        assert!(r.is_empty(), "anti-match should suppress: {r:?}");
+    }
+
+    #[test]
+    fn generic_keyword_fallback_when_no_intent() {
+        // No intent keyword present → generic name/description relevance decides.
+        let c = vec![
+            skill_meta(
+                "dependency-audit",
+                "Audit dependencies for vulnerabilities and licenses.",
+                &[],
+                &[],
+                &[],
+            ),
+            skill_meta("rust-pro", "Rust patterns.", &["performance"], &[], &[]),
+        ];
+        let r = skill_match("audit our dependencies for vulnerabilities", None, &c);
+        assert_eq!(r[0].skill.name, "dependency-audit");
+    }
+
+    #[test]
+    fn returns_at_most_two_matches() {
+        let c = semantic_catalog();
+        let r = skill_match(
+            "optimize token performance and infrastructure metrics",
+            Some("aish"),
+            &c,
+        );
+        assert!(r.len() <= MAX_MATCHES, "got {} matches", r.len());
     }
 
     /// A small catalog modeled on the real installed skills.
