@@ -231,15 +231,26 @@ impl GoalLoop {
     /// every per-turn announcement is also retained so `:attach goal` /
     /// Shift-Tab can replay the goal's history tail (see [`attach_backfill`]).
     fn note(&self, line: &str) {
-        {
-            let mut i = self.inner.lock().unwrap();
-            i.transcript.push(line.to_string());
-            let len = i.transcript.len();
-            if len > TRANSCRIPT_CAP {
-                i.transcript.drain(0..len - TRANSCRIPT_CAP);
-            }
-        }
+        self.record(line);
         announce(line);
+    }
+
+    /// Like [`note`], but records the line into the replay transcript WITHOUT
+    /// surfacing a transient `[goal]` line over the prompt. Used for the noisy
+    /// per-turn `working…`/`checking…` progress ticks: they stay available for
+    /// `:attach goal` / Shift-Tab replay but no longer spam the live console.
+    fn note_quiet(&self, line: &str) {
+        self.record(line);
+    }
+
+    /// Append `line` to the bounded replay transcript (no console output).
+    fn record(&self, line: &str) {
+        let mut i = self.inner.lock().unwrap();
+        i.transcript.push(line.to_string());
+        let len = i.transcript.len();
+        if len > TRANSCRIPT_CAP {
+            i.transcript.drain(0..len - TRANSCRIPT_CAP);
+        }
     }
 
     /// Backfill rows for `:attach goal` / Shift-Tab (TASK-301) — the goal
@@ -555,7 +566,7 @@ async fn run_goal_loop(
         let effective = compose_guidance(guidance.as_deref(), &steers);
         // Generator: a full-tool worker pursues the goal with the latest guidance.
         let directive = goal_directive(&goal.condition, effective.as_deref());
-        goal.note(&format!("turn {turn}: working…"));
+        goal.note_quiet(&format!("turn {turn}: working…"));
         {
             let mut i = goal.inner.lock().unwrap();
             i.turn_started = Some(Instant::now());
@@ -610,7 +621,7 @@ async fn run_goal_loop(
         }
 
         // Verifier: the batch model judges whether the output demonstrates the goal.
-        goal.note(&format!("turn {turn}: checking…"));
+        goal.note_quiet(&format!("turn {turn}: checking…"));
         goal.inner.lock().unwrap().phase = Step::Checking;
         let (met, reason) = match judge(&cred, &model, &goal.condition, &output).await {
             Ok((met, reason)) => (met, reason),
