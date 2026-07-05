@@ -101,7 +101,27 @@ async fn run_turn_inner(
     let system = session.system_prompt(escalate_available);
     let mut tool_defs = tools::tool_defs(session.batch_mode, escalate_available, session.nested);
     if backend.include_mcp_tools() {
-        tool_defs.extend(session.mcp.tool_defs());
+        // TASK-323: apply the per-run/per-mode tool allowlist BEFORE serializing
+        // the MCP tool-schema block, and measure the payload reduction. The
+        // filter is order-preserving, so for a fixed allowlist the emitted tools
+        // block is byte-identical turn to turn — no mid-session cache invalidation.
+        let (scoped, measure) = session
+            .mcp
+            .scope_tool_defs(session.tool_allowlist.as_deref());
+        if measure.trimmed() {
+            static SCOPE_LOG: std::sync::Once = std::sync::Once::new();
+            SCOPE_LOG.call_once(|| {
+                eprintln!(
+                    "[tool-scope] MCP tools {}->{} (~{} tokens saved: {}->{})",
+                    measure.tools_before,
+                    measure.tools_after,
+                    measure.tokens_saved(),
+                    measure.tokens_before,
+                    measure.tokens_after,
+                );
+            });
+        }
+        tool_defs.extend(scoped);
     }
     // TASK-13: on a fresh conversation, seed the turn with the previous recorded
     // output so a prompt like "summarize that" can reference it without
