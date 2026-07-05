@@ -1353,6 +1353,43 @@ fn printer_slot() -> &'static std::sync::Mutex<Option<Box<dyn crate::editor::Lin
     EXTERNAL_PRINTER.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+// While background workers are outstanding, the editor's idle read takes a
+// custom `poll(2)` loop (`poll_until_wake_or_key`) that draws its OWN prompt
+// with a raw `write!` instead of going through rustyline's `readline()`. In
+// that state rustyline's `ExternalPrinter` has no active edit-state, so a
+// forwarded worker row printed via [`print_above_prompt`] lands at the cursor —
+// right after the raw-drawn `prompt> ` — producing the reported
+// `prompt> worker output` glue (a race: only when a row arrives after the idle
+// prompt is drawn but before a keystroke hands control to rustyline).
+//
+// These two flags let the poll loop and the printer coordinate the same
+// erase→print→repaint dance rustyline does internally: while `IDLE_PROMPT_ACTIVE`
+// is set, `print_above_prompt` erases the stranded idle prompt line before it
+// prints and raises `IDLE_PROMPT_DIRTY`; the poll loop drains the dirty flag on
+// its next tick and repaints the prompt below the freshly-printed output.
+static IDLE_PROMPT_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static IDLE_PROMPT_DIRTY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Mark (or clear) the "editor idle-poll loop has drawn its own raw prompt"
+/// state. Set to `true` right after the idle prompt is drawn and back to `false`
+/// at every exit of the poll loop. Clearing also drops any pending dirty flag so
+/// a stale repaint can't bleed into the next read.
+pub fn set_idle_prompt_active(active: bool) {
+    IDLE_PROMPT_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
+    if !active {
+        IDLE_PROMPT_DIRTY.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Consume the "an external print erased the idle prompt, repaint it" flag.
+/// Returns `true` at most once per erasing print; the editor's poll loop calls
+/// this each tick and repaints the prompt when it returns `true`.
+pub fn take_idle_prompt_dirty() -> bool {
+    IDLE_PROMPT_DIRTY.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Install the REPL's above-the-prompt printer for the whole process. Called
 /// once at interactive startup with the editor's `ExternalPrinter`; after this,
 /// [`announce`] / [`announce_raw`] emit prompt-preserving lines through it
@@ -1372,11 +1409,36 @@ pub fn install_external_printer(printer: Box<dyn crate::editor::LinePrinter>) {
 pub fn print_above_prompt(text: String) -> bool {
     if let Ok(mut slot) = printer_slot().lock() {
         if let Some(printer) = slot.as_mut() {
+            // When the editor's idle-poll loop drew its own raw prompt, rustyline
+            // has no edit-state to erase it, so the row would glue onto the
+            // `prompt> ` line. Wipe the stranded prompt line ourselves (still
+            // inside the printer mutex, so it's serialised against other worker
+            // streams) and flag the loop to repaint the prompt afterward.
+            if IDLE_PROMPT_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+                use std::io::Write;
+                let mut out = std::io::stdout();
+                let _ = write!(out, "\r\x1b[2K");
+                let _ = out.flush();
+                IDLE_PROMPT_DIRTY.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             printer.print(to_crlf(&text));
             return true;
         }
     }
     false
+}
+
+/// Whether the REPL's above-the-prompt [`ExternalPrinter`] is installed — i.e.
+/// we're at a LIVE interactive prompt where any raw in-place stderr write (a
+/// `\r\x1b[2K…` spinner frame) would trample the prompt line instead of scrolling
+/// above it. Worker "thinking…" animation consults this to choose a
+/// prompt-preserving committed line over in-place animation, keeping the prompt
+/// visible so the user can always queue input or type a `:` command.
+pub fn external_printer_installed() -> bool {
+    printer_slot()
+        .lock()
+        .map(|slot| slot.is_some())
+        .unwrap_or(false)
 }
 
 /// Rewrite bare LF into CRLF for the rustyline `ExternalPrinter`, which writes
@@ -2889,12 +2951,22 @@ fn read_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) 
     // line_start/line_end to read a slice, or grep_files to find the region of
     // interest first. Files at or below the cap read whole (back-compat).
     if content.len() > RANGED_READ_MAX_BYTES {
+        // TASK-333: turn the refusal into an ACTIONABLE, context-sensitive hint.
+        // It reports the file's line count and suggests a concrete first slice so
+        // the agent can retry immediately with real bounds instead of guessing.
+        let total = content.lines().count();
+        let suggested_end = total.min(200).max(1);
         return Err(anyhow::anyhow!(
-            "{} is {} bytes (> {} KiB): bulk reads without line bounds are disallowed. \
-Pass line_start/line_end to read a slice, or use grep_files to locate the region first.",
+            "{} is {} bytes / {} lines (> {} KiB): bulk reads without line bounds are disallowed. \
+Read a slice — e.g. line_start=1, line_end={} (first {} of {} lines) — or use grep_files to \
+locate the region first.",
             full.display(),
             content.len(),
+            total,
             RANGED_READ_MAX_BYTES / 1024,
+            suggested_end,
+            suggested_end,
+            total,
         ));
     }
 
@@ -5266,6 +5338,35 @@ mod fileops_tests {
         std::fs::write(dir.join("empty"), b"").unwrap();
         let r = run(&mut s, "read_file", json!({"path": "empty"})).await;
         assert!(!r.is_error, "empty file must read: {}", r.content);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // TASK-333: the oversize refusal must be an ACTIONABLE, context-sensitive
+    // hint — it reports the file's line count and suggests a concrete slice the
+    // agent can retry with, across a range of oversized files.
+    #[tokio::test]
+    async fn read_file_oversize_hint_is_actionable() {
+        let dir = tmp("readhint");
+        let mut s = yolo_session(&dir);
+
+        // ~8 KiB (600 lines) and ~20 KiB (1500 lines): both over the 5 KiB cap.
+        for (name, lines) in [("mid", 600usize), ("big", 1500usize)] {
+            let mut body = String::new();
+            for i in 0..lines {
+                body.push_str(&format!("line {i}\n"));
+            }
+            assert!(body.len() > RANGED_READ_MAX_BYTES);
+            std::fs::write(dir.join(name), body.as_bytes()).unwrap();
+            let r = run(&mut s, "read_file", json!({"path": name})).await;
+            assert!(r.is_error, "oversized {name} must be refused: {}", r.content);
+            // Reports the real line count.
+            assert!(r.content.contains(&format!("{lines} lines")), "hint must state line count: {}", r.content);
+            // Suggests a concrete, retryable slice (capped at 200 lines).
+            assert!(r.content.contains("line_start=1"), "hint must suggest a slice: {}", r.content);
+            assert!(r.content.contains("line_end=200"), "hint must cap the suggested slice: {}", r.content);
+            assert!(r.content.contains("grep_files"), "hint must mention grep_files: {}", r.content);
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

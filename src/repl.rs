@@ -942,13 +942,15 @@ pub async fn run(
                 }
 
                 // Attached to a coordinator: a plain line is operator input steered
-                // to it (the `:tell` channel), not a local command or a model turn.
-                // `:`-commands above still run — `:detach` ends it.
+                // to it (the `:tell` channel) — BUT only if it's model-bound. A
+                // real shell command (`ls ~/.aish/skills`, `cat foo`, …) that the
+                // shell-first dispatch below would run must execute LOCALLY, exactly
+                // as in an unattached interactive session, instead of being fired at
+                // the worker as a steering message. So we capture the attach target
+                // here and defer the steer until AFTER dispatch has had its chance
+                // to peel off a genuine command. `:`-commands above still run —
+                // `:detach` ends the attachment.
                 let attached_run = session.attached.lock().unwrap().clone();
-                if let Some(run_id) = attached_run {
-                    send_to_attached(&run_id, &line, &mut session);
-                    continue;
-                }
 
                 if let Some(db) = &session.db {
                     db.record("input", &session.cwd.to_string_lossy(), &line);
@@ -978,6 +980,16 @@ pub async fn run(
                         Dispatch::Quit => break,
                         Dispatch::NotACommand => {}
                     }
+                }
+
+                // Reached here → the line was NOT run as a local command (it's
+                // prose, or `?`-forced to the model). If we're attached to a
+                // coordinator, THIS is what gets steered to it via the `:tell`
+                // channel — real commands already ran locally above and
+                // `continue`d, so only genuine operator intent reaches the worker.
+                if let Some(run_id) = attached_run {
+                    send_to_attached(&run_id, &line, &mut session);
+                    continue;
                 }
 
                 // Auto-offload heavy work to a background coordinator. A
@@ -4902,6 +4914,17 @@ fn goal_short(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
+/// Does `tok` look like a goal-id reference (the optional arg of `:goal show`
+/// / `:goal complete`) rather than the start of a natural-language pursuit
+/// goal? Goal ids are uuids — hex digits plus `-` separators, no whitespace.
+/// A phrase like "the remaining tasks in SPR-063" has spaces (and non-hex
+/// letters), so it is NOT a ref and routes to the pursuit loop instead.
+fn looks_like_goal_ref(tok: &str) -> bool {
+    !tok.is_empty()
+        && tok.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        && tok.chars().any(|c| c.is_ascii_hexdigit())
+}
+
 /// Coarse "N<unit> ago" for a unix-seconds stamp. Never panics on skew.
 fn goal_ago(secs: i64) -> String {
     let now = std::time::SystemTime::now()
@@ -7183,8 +7206,21 @@ async fn handle_colon(
                 // Persisted-goal subcommands (TASK-278) — CRUD on the durable
                 // `Goal` records. Unrecognized heads fall through to the
                 // back-compat batch pursuit loop below.
-                "new" | "show" | "status" | "link" | "block" | "unblock" | "milestone"
-                | "complete" => println!("{}", goal_command(session, goal_head, goal_tail)),
+                "new" | "status" | "link" | "block" | "unblock" | "milestone" => {
+                    println!("{}", goal_command(session, goal_head, goal_tail))
+                }
+                // `show`/`complete` take an OPTIONAL goal-id argument, so they
+                // collide with natural-language pursuit goals that merely start
+                // with those words (e.g. `:goal complete the tasks in SPR-063`).
+                // Only treat them as CRUD when the tail is empty or a goal-id-
+                // shaped token; otherwise fall through to the pursuit loop so
+                // the whole phrase becomes the goal (bug: was "no goal matching
+                // the remaining tasks…").
+                "show" | "complete"
+                    if goal_tail.is_empty() || looks_like_goal_ref(goal_tail) =>
+                {
+                    println!("{}", goal_command(session, goal_head, goal_tail))
+                }
                 // Bare `:goal`: the live loop's status if one is running, else a
                 // persisted-goal overview (which prints its own empty-state hint).
                 "" => match &session.goal {
@@ -7960,6 +7996,22 @@ mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
     use std::collections::HashMap;
+
+    // `:goal complete <phrase>` must route to the pursuit loop, not the CRUD
+    // `complete` subcommand — only goal-id-shaped (hex/uuid) tails are refs.
+    #[test]
+    fn goal_ref_vs_pursuit_phrase() {
+        // uuid-shaped tails ARE refs (route to CRUD `:goal complete <id>`).
+        assert!(looks_like_goal_ref("a1b2c3d4"));
+        assert!(looks_like_goal_ref("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(looks_like_goal_ref("deadbeef"));
+        // Natural-language pursuit phrases are NOT refs (route to pursuit loop).
+        assert!(!looks_like_goal_ref("the remaining tasks in SPR-063"));
+        assert!(!looks_like_goal_ref("SPR-063")); // has non-hex letters (S,P,R)
+        assert!(!looks_like_goal_ref("complete")); // 'l','t' aren't hex
+        assert!(!looks_like_goal_ref("")); // empty is not a ref
+        assert!(!looks_like_goal_ref("----")); // dashes only, no hex digit
+    }
 
     // TASK-290: a second dispatch of the SAME task within the dedup window is
     // detected as a duplicate and points at the first run's id.
