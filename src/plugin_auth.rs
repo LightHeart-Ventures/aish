@@ -139,21 +139,56 @@ pub fn run_login_handler(
         );
     }
 
-    // Freshly-written handler scripts can race the kernel's ETXTBSY guard: if
-    // any thread in this process forked (for another spawn) while the handler's
-    // write fd was still open, the forked child holds that fd and execve() of
-    // the handler fails with `Text file busy` (os error 26). It's transient —
-    // retry a few times with a short backoff before giving up.
+    // Curated env for the login handler. The shared exec core
+    // ([`run_plugin_handler`]) inherits stdin+stderr, captures stdout, and
+    // retries on ETXTBSY — identical behavior to before this was factored out.
+    let env = [
+        ("AISH_PLUGIN_ID", plugin_id.to_string()),
+        ("AISH_LOGIN_NAME", login_name.to_string()),
+        ("AISH_TENANT_ID", tenant_id.unwrap_or_default().to_string()),
+        (
+            "AISH_CREDENTIALS_FILE",
+            credentials_path().to_string_lossy().into_owned(),
+        ),
+    ];
+    run_plugin_handler(&handler, plugin_dir, &env)
+}
+
+/// Fork/exec a plugin handler `script` inside `plugin_dir` with a curated `env`,
+/// capturing its **stdout** and returning it as a `String`. This is the shared
+/// exec core behind every `provides.*` script handler — `login.sh` today, and
+/// (per `docs/design/plugin-skill-sources.md` §2, §6) the `search.sh` / `add.sh`
+/// skill-source handlers next.
+///
+/// Contract (byte-identical to the exec that used to live inline in
+/// [`run_login_handler`]):
+///   * `plugin_dir` is the child's working directory;
+///   * each `(key, value)` in `env` is set on the child — curated env in;
+///   * **stdin + stderr are inherited** so an interactive/device-code flow can
+///     prompt and print status; only **stdout** (the JSON payload) is captured;
+///   * a freshly-written script can race the kernel's ETXTBSY guard (another
+///     thread forked while the script's write fd was still open → execve fails
+///     with `Text file busy`, os error 26). It's transient — retry a few times
+///     with a short backoff before giving up;
+///   * a non-zero exit is an error (the handler's stderr already reached the
+///     terminal, so we surface the exit status); non-UTF-8 stdout is an error.
+///
+/// The caller verifies the script exists and owns any actionable "handler
+/// missing" message; this helper reports a generic spawn failure otherwise.
+pub fn run_plugin_handler(
+    script: &Path,
+    plugin_dir: &Path,
+    env: &[(&str, String)],
+) -> Result<String> {
     let build_cmd = || {
-        let mut cmd = Command::new(&handler);
+        let mut cmd = Command::new(script);
         cmd.current_dir(plugin_dir)
-            .env("AISH_PLUGIN_ID", plugin_id)
-            .env("AISH_LOGIN_NAME", login_name)
-            .env("AISH_TENANT_ID", tenant_id.unwrap_or_default())
-            .env("AISH_CREDENTIALS_FILE", credentials_path())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .stdin(std::process::Stdio::inherit());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         cmd
     };
 
@@ -167,7 +202,7 @@ pub fn run_login_handler(
             }
             Err(e) => {
                 return Err(e).with_context(|| {
-                    format!("failed to run login handler {}", handler.display())
+                    format!("failed to run plugin handler {}", script.display())
                 });
             }
         }
@@ -179,11 +214,10 @@ pub fn run_login_handler(
             .code()
             .map(|c| c.to_string())
             .unwrap_or_else(|| "signal".into());
-        bail!("login handler for `{login_name}` exited with status {code}");
+        bail!("plugin handler {} exited with status {code}", script.display());
     }
 
-    String::from_utf8(output.stdout)
-        .context("login handler stdout was not valid UTF-8")
+    String::from_utf8(output.stdout).context("plugin handler stdout was not valid UTF-8")
 }
 
 /// Parse a login handler's stdout into a flat map of credential fields.
@@ -551,6 +585,48 @@ mod tests {
         std::fs::create_dir_all(&pdir).unwrap();
         let err = run_login_handler("demo", "demo", &pdir, None).unwrap_err();
         assert!(err.to_string().contains("no login handler"), "{err}");
+        let _ = std::fs::remove_dir_all(&pdir);
+    }
+
+    // ---- shared run_plugin_handler (reused by skill-source handlers) ------
+
+    #[cfg(unix)]
+    #[test]
+    fn run_plugin_handler_captures_stdout_with_curated_env() {
+        use std::os::unix::fs::PermissionsExt;
+        let pdir = std::env::temp_dir().join(format!("aish-pluginh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&pdir);
+        std::fs::create_dir_all(&pdir).unwrap();
+
+        // A search-style handler: noise on stderr, JSON echoing a curated env
+        // var on stdout. Proves env-in + stdout-capture + stderr-inherit.
+        let script = pdir.join("search.sh");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env bash\necho searching... >&2\nprintf '{\"q\":\"%s\"}\\n' \"$AISH_PLUGIN_Q\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out =
+            run_plugin_handler(&script, &pdir, &[("AISH_PLUGIN_Q", "rust".to_string())]).unwrap();
+        assert_eq!(out.trim(), r#"{"q":"rust"}"#);
+        let _ = std::fs::remove_dir_all(&pdir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_plugin_handler_nonzero_exit_is_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let pdir = std::env::temp_dir().join(format!("aish-pluginh-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&pdir);
+        std::fs::create_dir_all(&pdir).unwrap();
+        let script = pdir.join("add.sh");
+        std::fs::write(&script, "#!/usr/bin/env bash\necho boom >&2\nexit 3\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = run_plugin_handler(&script, &pdir, &[]).unwrap_err();
+        assert!(err.to_string().contains("status 3"), "{err}");
         let _ = std::fs::remove_dir_all(&pdir);
     }
 
