@@ -79,13 +79,46 @@ unwanted-for:
 Items are trimmed and a single pair of surrounding quotes is stripped, so
 `- "code-quality"` and `- 'all'` are accepted. Empty entries are dropped.
 
+## Matching algorithm (TASK-332)
+
+The three metadata fields feed the per-turn semantic matcher
+(`src/skill_match.rs`, `skill_match()`). Each skill is scored, in order:
+
+1. **Anti-match.** If a task's implied intent is listed in the skill's
+   `unwanted-for`, the skill is hard-suppressed (score 0) and dropped.
+2. **Keyword relevance** (base score). Distinct task words matched against the
+   skill name (weight 3) and description (weight 1), prefix-aware so `review`
+   matches `reviewer`. Metadata-free skills rely solely on this, so they never
+   regress.
+3. **Intent → category boost.** The task's wording implies intent tags via a
+   keyword map (e.g. `token`/`performance`/`metrics` → `performance` +
+   `infrastructure`; `deploy`/`terraform`/`release` → `infrastructure`;
+   `review`/`diff`/`lint` → `code-review`). Each overlap with the skill's
+   declared `categories` adds `+5`.
+4. **Repo-scope multiplier.** When `applies-to` names the active repo, the
+   whole score is multiplied `×2`.
+
+The top **2** skills by score (ties broken by name, zero/suppressed dropped) are
+surfaced as the `[aish skill-awareness]` nudge. When no installed skill fits a
+substantial task, aish recommends an installable one instead (`:skill add`).
+
+### Inspecting the ranking
+
+- `:telemetry skill-match <task>` — run the live scorer against your installed
+  catalog and print each surfaced skill's score + the reasons that moved it.
+- `AISH_SKILL_MATCH_DEBUG=1` — log a `[skill-match] <name> score=NN :: reasons`
+  line for every candidate on every turn (stderr).
+
+See [`AISH.md`](../AISH.md) for the agent-facing overview.
+
 ## Validation
 
 On startup aish parses the metadata for every installed skill. Missing fields
 are **non-fatal**: a skill without `categories`/`applies-to` still loads and
-functions. aish emits a yellow startup notice naming any skill missing both, so
-authors can backfill against this document. There is no crash on a pre-schema
-SKILL.md — the three fields simply default to empty arrays.
+functions, with no startup warning. There is no crash on a pre-schema
+SKILL.md — the three fields simply default to empty arrays. Backfilling
+`categories`/`applies-to` still improves skill-match ranking (see the matching
+notes above), so authors are encouraged to add them against this document.
 
 ## Complete example
 

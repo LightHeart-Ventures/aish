@@ -30,21 +30,74 @@ fn install_mcp_if_ready(
         return;
     };
     match receiver.try_recv() {
-        Ok((host, skills_prompt)) => {
+        Ok((mut host, skills_prompt)) => {
             let n = host.server_names().len();
+            // Servers that failed to start/handshake are no longer dumped to
+            // stderr at connect time — surface them as a "statusline alert":
+            // the full detail above the prompt, a shortened warn-badge on the
+            // SecondStatusLine flash (most-recent wins), and a recoverable
+            // `:activity` entry.
+            let skipped = host.take_skipped();
             session.mcp = host;
             session.skills_prompt = skills_prompt;
             *rx = None;
+            surface_mcp_skips(session, &skipped);
             if n > 0 {
-                eprintln!(
-                    "\x1b[2mmcp: ready — {n} server{} connected\x1b[0m",
+                // Surface the readiness notice on the SecondStatusLine flash slot
+                // (most-recent wins) instead of printing it to stderr above the
+                // prompt — keeps the startup header clean, matching how worker-done
+                // notices and fired-`:alert` badges are moved onto the footer.
+                let plain = format!(
+                    "mcp: ready — {n} server{} connected",
                     if n == 1 { "" } else { "s" }
                 );
+                if let Ok(mut f) = session.flash.lock() {
+                    *f = Some(format!("\x1b[2m{plain}\x1b[0m"));
+                }
+                // Also append it to the recoverable `:activity` tray so the notice
+                // is inspectable after the flash slot is overwritten by the next
+                // most-recent message (info tier, source "mcp").
+                if let Some(act) = &session.activity_store {
+                    let _ = act.record(
+                        crate::style::Severity::Info.as_str(),
+                        "mcp: ready",
+                        &plain,
+                        "mcp",
+                    );
+                }
             }
         }
         // Still connecting, or the connect task died — leave the placeholder.
         Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
         Err(tokio::sync::oneshot::error::TryRecvError::Closed) => *rx = None,
+    }
+}
+
+/// Surface MCP servers that failed to start/handshake as a "statusline alert"
+/// (instead of a raw stderr dump): the full detail above the prompt, a shortened
+/// warn-badge on the SecondStatusLine flash (`session.flash`, most-recent wins),
+/// and a recoverable `:activity` entry (source `mcp`). No-op on an empty list.
+/// Shared by the background-install path and `:mcp reload`.
+fn surface_mcp_skips(session: &Session, skips: &[String]) {
+    for detail in skips {
+        // Compact footer banner: "mcp {name} skipped" — the verbose error tail
+        // stays in the above-prompt line + the `:activity` detail column.
+        let short = detail
+            .strip_prefix("mcp server ")
+            .and_then(|s| s.split_once(" skipped:").map(|(name, _)| name))
+            .map(|name| format!("mcp {name} skipped"))
+            .unwrap_or_else(|| detail.clone());
+        crate::tools::print_above_prompt(format!("\x1b[33maish:\x1b[0m {detail}\n"));
+        if let Some(act) = &session.activity_store {
+            let _ = act.record(crate::style::Severity::Warn.as_str(), &short, detail, "mcp");
+        }
+        if let Ok(mut f) = session.flash.lock() {
+            *f = Some(crate::style::severity_badge(
+                &short,
+                crate::style::Severity::Warn,
+                crate::style::colors_enabled(),
+            ));
+        }
     }
 }
 
@@ -128,6 +181,20 @@ pub async fn run(
         session
             .hooks
             .fire_observe(crate::hooks::HookEvent::SessionStart, p);
+    }
+
+    // SPR-059 (TASK-264/265): connect to the webhook broker when
+    // WEBHOOK_BROKER_URL is set. Skipped in nested background coordinators — the
+    // broker client is an interactive-session affordance. Soft no-op (returns
+    // None) when the env var is unset, which is the common case.
+    if !session.nested {
+        if let Some(h) = crate::webhook::WebhookHandle::spawn_from_env() {
+            println!(
+                "\x1b[2m🪝 webhook: connecting to {} (tenant {}, {} handler(s))\x1b[0m",
+                h.broker_url, h.tenant_id, h.handler_count
+            );
+            session.webhook = Some(h);
+        }
     }
 
     // Install the process-wide SIGINT handler up front. A Ctrl-C during a
@@ -942,13 +1009,15 @@ pub async fn run(
                 }
 
                 // Attached to a coordinator: a plain line is operator input steered
-                // to it (the `:tell` channel), not a local command or a model turn.
-                // `:`-commands above still run — `:detach` ends it.
+                // to it (the `:tell` channel) — BUT only if it's model-bound. A
+                // real shell command (`ls ~/.aish/skills`, `cat foo`, …) that the
+                // shell-first dispatch below would run must execute LOCALLY, exactly
+                // as in an unattached interactive session, instead of being fired at
+                // the worker as a steering message. So we capture the attach target
+                // here and defer the steer until AFTER dispatch has had its chance
+                // to peel off a genuine command. `:`-commands above still run —
+                // `:detach` ends the attachment.
                 let attached_run = session.attached.lock().unwrap().clone();
-                if let Some(run_id) = attached_run {
-                    send_to_attached(&run_id, &line, &mut session);
-                    continue;
-                }
 
                 if let Some(db) = &session.db {
                     db.record("input", &session.cwd.to_string_lossy(), &line);
@@ -978,6 +1047,16 @@ pub async fn run(
                         Dispatch::Quit => break,
                         Dispatch::NotACommand => {}
                     }
+                }
+
+                // Reached here → the line was NOT run as a local command (it's
+                // prose, or `?`-forced to the model). If we're attached to a
+                // coordinator, THIS is what gets steered to it via the `:tell`
+                // channel — real commands already ran locally above and
+                // `continue`d, so only genuine operator intent reaches the worker.
+                if let Some(run_id) = attached_run {
+                    send_to_attached(&run_id, &line, &mut session);
+                    continue;
                 }
 
                 // Auto-offload heavy work to a background coordinator. A
@@ -1521,6 +1600,10 @@ struct CmdCache {
 /// `:` at the start of a line (or TABs a `:` prefix). Keep this in sync with the
 /// arms of `handle_colon` and the `:help` text.
 const COLON_COMMANDS: &[(&str, &str)] = &[
+    (
+        "activity",
+        "recoverable tray of fired :alerts / notable events (last N); clear",
+    ),
     ("allow", "list / revoke always-allowed tools & dir grants"),
     (
         "attach",
@@ -1591,6 +1674,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ),
     ("update", "upgrade aish to the latest release"),
     ("version", "show aish version + backend"),
+    ("webhook", "webhook broker client (status|reload|logs [N])"),
     (
         "workers",
         "list this session's coordinators (all = every session)",
@@ -3705,13 +3789,10 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
                 println!(
                     "\x1b[1;33m⇄ attached to the goal\x1b[0m — streaming its turns live. \x1b[2mgoals are watch-only; :goal clear to stop it, :detach to stop watching.\x1b[0m"
                 );
-                // TASK-301: backfill the goal's durable state (condition, status,
-                // turn progress, last verifier check) so attaching shows context
-                // above the resuming live stream — mirrors a worker's replayed
-                // history tail.
-                for line in g.attach_backfill() {
-                    println!("\x1b[2m{line}\x1b[0m");
-                }
+                // TASK-301: replay the goal's history the same way a worker's is
+                // replayed — header + input row + activity tail — so goal and
+                // worker attach UIs are uniform (a goal is a specialized worker).
+                backfill_goal_attached(g);
             }
             Some(_) => println!("the goal has already finished — `:goal` for its final status"),
             None => println!("no goal set — `:goal <condition>` to start one (requires :batch on)"),
@@ -3835,6 +3916,42 @@ fn backfill_attached(run_id: &str, session: &Session) {
             };
             println!("{}", crate::worker::pane_row(run_id, &row));
         }
+    }
+}
+
+/// Replay the active `:goal` loop's history the SAME way `backfill_attached`
+/// replays a worker's — a goal is essentially a specialized worker, so its
+/// `:attach goal` / Shift-Tab UI is rendered identically: a `pane_replay_header`,
+/// the goal condition as the set-apart `pane_input_row` (the goal's "input"),
+/// then the captured activity tail as `pane_row`s under the same `[goal]` gutter
+/// the live stream uses. Keeps goal and worker attach output visually uniform.
+fn backfill_goal_attached(g: &crate::goal::GoalLoop) {
+    // Label matches the goal's live stderr stream label (`GOAL_STREAM_LABEL`)
+    // so replay rows and the live rows that follow share one `[goal]` gutter.
+    let label = GOAL_ATTACH_ID;
+    println!("{}", crate::worker::pane_replay_header(label));
+    // The goal CONDITION is the "input" — the START of the pursuit. Rendered
+    // set-apart (💬 + bold) by `pane_input_row`, exactly like a worker's task.
+    println!("{}", crate::worker::pane_input_row(label, &g.condition));
+    let mut rows = g.attach_backfill();
+    if rows.is_empty() {
+        println!(
+            "{}",
+            crate::worker::pane_row(
+                label,
+                "\u{b7}thinking (no activity captured yet \u{2014} live output follows)",
+            )
+        );
+        return;
+    }
+    // Tail to the last ~screen of activity, matching the worker replay budget.
+    const TAIL_LINES: usize = 40;
+    let total = rows.len();
+    if total > TAIL_LINES {
+        rows = rows.into_iter().skip(total - TAIL_LINES).collect();
+    }
+    for row in rows {
+        println!("{}", crate::worker::pane_row(label, &row));
     }
 }
 
@@ -4637,9 +4754,7 @@ fn cycle_worker(session: &mut Session) -> bool {
             attach_task_suffix(&task)
         );
         if let Some(g) = &session.goal {
-            for line in g.attach_backfill() {
-                println!("\x1b[2m{line}\x1b[0m");
-            }
+            backfill_goal_attached(g);
         }
         return true;
     }
@@ -4898,6 +5013,17 @@ fn take_any_flag<'a>(toks: &[&'a str]) -> (bool, Vec<&'a str>) {
 /// Short, stable handle for a goal in listings — the first 8 chars of its uuid.
 fn goal_short(id: &str) -> &str {
     &id[..id.len().min(8)]
+}
+
+/// Does `tok` look like a goal-id reference (the optional arg of `:goal show`
+/// / `:goal complete`) rather than the start of a natural-language pursuit
+/// goal? Goal ids are uuids — hex digits plus `-` separators, no whitespace.
+/// A phrase like "the remaining tasks in SPR-063" has spaces (and non-hex
+/// letters), so it is NOT a ref and routes to the pursuit loop instead.
+fn looks_like_goal_ref(tok: &str) -> bool {
+    !tok.is_empty()
+        && tok.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        && tok.chars().any(|c| c.is_ascii_hexdigit())
 }
 
 /// Coarse "N<unit> ago" for a unix-seconds stamp. Never panics on skew.
@@ -6035,12 +6161,44 @@ fn handle_tokens(session: &Session) {
 }
 
 
-fn handle_telemetry(sub: Option<&str>, session: &mut Session) {
+fn handle_telemetry(args: Vec<&str>, session: &mut Session) {
+    // `:telemetry skill-match <task>` — TASK-335 debug transparency: run the
+    // same semantic scorer used per-turn (crate::skill_match::skill_match) and
+    // print which skills were considered and WHY the top-2 were chosen (keyword
+    // relevance, intent→category boost, applies-to repo multiplier, unwanted-for
+    // suppression). Lets a new agent understand skill ranking without the env
+    // var (AISH_SKILL_MATCH_DEBUG) or reading the code.
+    if matches!(args.first().copied(), Some("skill-match" | "skill-matching")) {
+        let task = args[1..].join(" ");
+        if task.trim().is_empty() {
+            println!("usage: :telemetry skill-match <task text>");
+            return;
+        }
+        let scored = crate::skill_match::skill_match(&task, None, &session.skills);
+        if scored.is_empty() {
+            println!("no installed skill scored above zero for that task");
+            return;
+        }
+        println!("skill-match reasoning for: {task}");
+        for s in &scored {
+            println!(
+                "  {:<28} score={:>3}  {}",
+                s.skill.name,
+                s.score,
+                if s.reasons.is_empty() {
+                    "no signal".to_string()
+                } else {
+                    s.reasons.join("; ")
+                }
+            );
+        }
+        return;
+    }
     if session.db.is_none() {
         println!("telemetry store unavailable");
         return;
     }
-    match sub {
+    match args.first().copied() {
         Some("clear" | "reset" | "wipe") => {
             let db = session.db.as_ref().unwrap();
             match db.clear_tool_telemetry() {
@@ -6138,7 +6296,7 @@ async fn handle_skill_command(args: &[&str], session: &mut Session) -> Result<()
         SkillCmd::Add(reference) => skill_add(&reference, session).await,
         SkillCmd::Search(query) => skill_search(&query).await,
         SkillCmd::List => {
-            skill_list();
+            skill_list(session);
             Ok(())
         }
         SkillCmd::Remove(name) => skill_remove(&name, session),
@@ -6188,19 +6346,85 @@ async fn skill_search(query: &str) -> Result<()> {
     Ok(())
 }
 
-/// `:skill list` — list the locally installed skills (name + description).
-fn skill_list() {
-    let skills = crate::skills::load(&skills_dir_path());
-    if skills.is_empty() {
+/// Classify a skill's on-disk `SKILL.md` path into a `:skill search`-style
+/// source label: `Plugin:<id>` when it lives under `~/.aish/plugins/<id>/…`,
+/// otherwise `Skill:<folder>` for a locally-installed `~/.aish/skills/<folder>`.
+fn skill_source(path: &std::path::Path) -> String {
+    let comps: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if let Some(pos) = comps.iter().position(|c| c == "plugins") {
+        if let Some(plugin) = comps.get(pos + 1) {
+            return format!("Plugin:{plugin}");
+        }
+    }
+    let folder = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("Skill:{folder}")
+}
+
+/// `:skill list` — list every available skill as a `:skill search`-style table:
+/// SKILL | SOURCE | DESCRIPTION. Sources are `Skill:<folder>` (locally
+/// installed), `Plugin:<id>` (contributed by a discovered plugin), or
+/// `MCP:<server>` (published by a connected MCP server). Rows are sorted by
+/// skill name.
+fn skill_list(session: &Session) {
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+    for s in crate::skills::load_catalog(&skills_dir_path()) {
+        rows.push((s.name, skill_source(&s.path), s.description));
+    }
+    for sk in session.mcp.skills() {
+        rows.push((sk.name, format!("MCP:{}", sk.server), sk.description));
+    }
+    if rows.is_empty() {
         println!("No skills installed. `:skill search <query>` to find some.");
         return;
     }
-    for s in &skills {
-        if s.description.is_empty() {
-            println!("\x1b[1m{}\x1b[0m", s.name);
-        } else {
-            println!("\x1b[1m{}\x1b[0m — {}", s.name, s.description);
-        }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Respect --no-color / NO_COLOR / a piped stdout so escape codes never leak.
+    let color = crate::style::colors_enabled();
+    let (bold, cyan, reset) = if color {
+        ("\x1b[1m", "\x1b[36m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+
+    let name_w = rows
+        .iter()
+        .map(|r| r.0.chars().count())
+        .chain(std::iter::once("SKILL".len()))
+        .max()
+        .unwrap_or(5);
+    let src_w = rows
+        .iter()
+        .map(|r| r.1.chars().count())
+        .chain(std::iter::once("SOURCE".len()))
+        .max()
+        .unwrap_or(6);
+
+    // DESCRIPTION takes the remaining terminal width (untruncated when piped,
+    // where term_width() is usize::MAX).
+    let sep = 2usize;
+    let prefix_w = name_w + sep + src_w + sep;
+    let tw = crate::md::term_width();
+    let desc_w = if tw == usize::MAX {
+        usize::MAX
+    } else {
+        tw.saturating_sub(prefix_w).max(20)
+    };
+
+    println!(
+        "{:<name_w$}  {:<src_w$}  {}",
+        "SKILL", "SOURCE", "DESCRIPTION"
+    );
+    for (name, src, desc) in &rows {
+        let desc = crate::skill_provider::truncate(desc, desc_w);
+        println!("{bold}{name:<name_w$}{reset}  {cyan}{src:<src_w$}{reset}  {desc}");
     }
 }
 
@@ -6264,7 +6488,47 @@ async fn handle_colon(
 ) -> bool {
     let mut parts = cmd.split_whitespace();
     match parts.next() {
-        Some("q" | "quit" | "exit") => return true,
+        Some("q" | "quit" | "exit") => {
+            // SPR-059: stop the webhook broker service gracefully before exit.
+            if let Some(h) = &session.webhook {
+                h.shutdown();
+            }
+            return true;
+        }
+        Some("webhook") => match parts.next() {
+            None | Some("status") => match &session.webhook {
+                Some(h) => println!("\x1b[2m{}\x1b[0m", h.status_lines()),
+                None => println!(
+                    "\x1b[2m🪝 webhook: not configured — set WEBHOOK_BROKER_URL and restart to enable\x1b[0m"
+                ),
+            },
+            Some("reload") => match crate::webhook::reload(&mut session.webhook) {
+                Ok(n) => println!("\x1b[32m🪝\x1b[0m webhook reloaded — {n} handler(s) from plugins"),
+                Err(e) => println!("\x1b[33m🪝\x1b[0m {e}"),
+            },
+            Some("logs") => {
+                let n = parts
+                    .next()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(20);
+                match &session.webhook {
+                    Some(h) => {
+                        let logs = h.recent_logs(n);
+                        if logs.is_empty() {
+                            println!("\x1b[2mno webhook events yet\x1b[0m");
+                        } else {
+                            for r in &logs {
+                                println!("\x1b[2m{}\x1b[0m", crate::webhook::fmt_record(r));
+                            }
+                        }
+                    }
+                    None => println!("\x1b[2m🪝 webhook: not configured\x1b[0m"),
+                }
+            }
+            Some(other) => println!(
+                "\x1b[2musage: :webhook [status|reload|logs [N]]  (unknown subcommand: {other})\x1b[0m"
+            ),
+        },
         Some("loop") => match parts.next() {
             // Bare `:loop` or `:loop status` — report the active loop, if any.
             None | Some("status") => println!("\x1b[2m{}\x1b[0m", session.loop_status()),
@@ -6325,6 +6589,7 @@ async fn handle_colon(
                  :mcp add <name> <command|url> [args] connect + save an MCP server (~/.aish/.mcp.json)\n\
                  :mcp remove <name>                  disconnect + unsave an MCP server\n\
                  :mcp tools [name]                   list MCP tools\n\
+                 :mcp test [name|all]                live-probe MCP server(s) — tools/list round-trip + latency\n\
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
                  :context                            show context-window usage (tokens, %, memories)\n\
@@ -6333,6 +6598,7 @@ async fn handle_colon(
                  :compact                            offload older history to long-term memory now\n\
                  :memories [organize]                list stored memories, or dedup them\n\
                  :telemetry [clear]                  tool-call failure/retry-recovery stats (or wipe them)\n\
+                 :telemetry skill-match <task>       show why the semantic matcher ranks skills for a task\n\
                  :tokens                             per-run/aggregate token spend, in:out ratio, top spenders\n\
                  :version                            show aish version + backend (also `aish --version`)\n\
                  :update [prod|dev|ci]               check GitHub for a newer release and upgrade;\n\
@@ -7181,8 +7447,21 @@ async fn handle_colon(
                 // Persisted-goal subcommands (TASK-278) — CRUD on the durable
                 // `Goal` records. Unrecognized heads fall through to the
                 // back-compat batch pursuit loop below.
-                "new" | "show" | "status" | "link" | "block" | "unblock" | "milestone"
-                | "complete" => println!("{}", goal_command(session, goal_head, goal_tail)),
+                "new" | "status" | "link" | "block" | "unblock" | "milestone" => {
+                    println!("{}", goal_command(session, goal_head, goal_tail))
+                }
+                // `show`/`complete` take an OPTIONAL goal-id argument, so they
+                // collide with natural-language pursuit goals that merely start
+                // with those words (e.g. `:goal complete the tasks in SPR-063`).
+                // Only treat them as CRUD when the tail is empty or a goal-id-
+                // shaped token; otherwise fall through to the pursuit loop so
+                // the whole phrase becomes the goal (bug: was "no goal matching
+                // the remaining tasks…").
+                "show" | "complete"
+                    if goal_tail.is_empty() || looks_like_goal_ref(goal_tail) =>
+                {
+                    println!("{}", goal_command(session, goal_head, goal_tail))
+                }
                 // Bare `:goal`: the live loop's status if one is running, else a
                 // persisted-goal overview (which prints its own empty-state hint).
                 "" => match &session.goal {
@@ -7242,6 +7521,8 @@ async fn handle_colon(
                                     spec,
                                     session.batch_model.clone(),
                                     cred,
+                                    session.hooks.clone(),
+                                    session.mode.name().to_string(),
                                 );
                                 session.goal = Some(g);
                                 println!(
@@ -7414,7 +7695,7 @@ async fn handle_colon(
         Some("memories" | "memory") => handle_memories(parts.next(), session),
         Some("hooks") => handle_hooks(parts.next(), session),
         Some("plugin" | "plugins") => handle_plugin(parts.collect()),
-        Some("telemetry" | "tool-stats") => handle_telemetry(parts.next(), session),
+        Some("telemetry" | "tool-stats") => handle_telemetry(parts.collect(), session),
         Some("tokens" | "token-spend") => handle_tokens(session),
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
@@ -7664,6 +7945,10 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
                     added.join(", ")
                 );
             }
+            // Any server that failed THIS reload pass gets the same statusline
+            // alert treatment as startup (drained, so only new failures show).
+            let skipped = session.mcp.take_skipped();
+            surface_mcp_skips(session, &skipped);
         }
         Some((&"add", rest)) => {
             let Some((&name, tail)) = rest.split_first() else {
@@ -7722,9 +8007,29 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
                 }
             }
         }
+        Some((&"test", rest)) => {
+            let names: Vec<String> = if rest.is_empty() {
+                session.mcp.server_names()
+            } else {
+                rest.iter().map(|s| s.to_string()).collect()
+            };
+            if names.is_empty() {
+                println!("no MCP servers connected");
+            }
+            for n in names {
+                match session.mcp.test(&n).await {
+                    Ok((tools, rtt)) => println!(
+                        "  ✓ {n} — healthy, {tools} tool{} ({} ms)",
+                        if tools == 1 { "" } else { "s" },
+                        rtt.as_millis()
+                    ),
+                    Err(e) => println!("  ✗ {n} — {e:#}"),
+                }
+            }
+        }
         Some((other, _)) => {
             println!(
-                "unknown :mcp subcommand '{other}' — usage: :mcp [list|reconnect|add|remove|tools]"
+                "unknown :mcp subcommand '{other}' — usage: :mcp [list|reconnect|reload|add|remove|tools|test]"
             )
         }
     }
@@ -7958,6 +8263,22 @@ mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
     use std::collections::HashMap;
+
+    // `:goal complete <phrase>` must route to the pursuit loop, not the CRUD
+    // `complete` subcommand — only goal-id-shaped (hex/uuid) tails are refs.
+    #[test]
+    fn goal_ref_vs_pursuit_phrase() {
+        // uuid-shaped tails ARE refs (route to CRUD `:goal complete <id>`).
+        assert!(looks_like_goal_ref("a1b2c3d4"));
+        assert!(looks_like_goal_ref("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(looks_like_goal_ref("deadbeef"));
+        // Natural-language pursuit phrases are NOT refs (route to pursuit loop).
+        assert!(!looks_like_goal_ref("the remaining tasks in SPR-063"));
+        assert!(!looks_like_goal_ref("SPR-063")); // has non-hex letters (S,P,R)
+        assert!(!looks_like_goal_ref("complete")); // 'l','t' aren't hex
+        assert!(!looks_like_goal_ref("")); // empty is not a ref
+        assert!(!looks_like_goal_ref("----")); // dashes only, no hex digit
+    }
 
     // TASK-290: a second dispatch of the SAME task within the dedup window is
     // detected as a duplicate and points at the first run's id.
@@ -9592,6 +9913,29 @@ mod tests {
     fn skill_in_colon_catalog() {
         // The catalog carries :skill so the palette + completion offer it.
         assert!(colon_command_matches("sk").contains(&"skill"));
+    }
+
+    #[test]
+    fn skill_source_classifies_paths() {
+        use std::path::Path;
+        // Locally-installed skill → Skill:<folder>.
+        assert_eq!(
+            skill_source(Path::new("/home/u/.aish/skills/fix-ci/SKILL.md")),
+            "Skill:fix-ci"
+        );
+        // Plugin-contributed skill → Plugin:<plugin-id> (not the leaf folder).
+        assert_eq!(
+            skill_source(Path::new(
+                "/home/u/.aish/plugins/hello-world/skills/hello-world/SKILL.md"
+            )),
+            "Plugin:hello-world"
+        );
+        assert_eq!(
+            skill_source(Path::new(
+                "/home/u/.aish/plugins/aish/skills/alert-batch-composition/SKILL.md"
+            )),
+            "Plugin:aish"
+        );
     }
 
     #[test]

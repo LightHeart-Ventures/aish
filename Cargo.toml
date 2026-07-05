@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "aish"
-version = "0.31.3"
+version = "0.33.1"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -37,6 +37,12 @@ urlencoding = "2.1.3"
 uuid = { version = "1", features = ["v4"] }
 miette = { version = "7", features = ["fancy"] }
 thiserror = "2"
+tracing = "0.1"
+# SPR-059 (TASK-264/265): webhook broker client — background WebSocket message
+# loop that dispatches broker-delivered webhooks to plugin handlers. Keeps its
+# default `net` feature (tungstenite transport) on regardless of aish's own
+# `--no-default-features` CI gate, which only toggles aish's `local` feature.
+aish-webhook-client = { path = "crates/aish-webhook-client" }
 
 [features]
 default = []

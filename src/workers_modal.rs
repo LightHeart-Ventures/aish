@@ -292,14 +292,15 @@ fn pad(s: &str, width: usize) -> String {
     }
 }
 
-/// Draw the modal in place. On the first paint `prev_lines == 0`; afterwards we
-/// move the cursor up over the previously-drawn block and clear each line so the
-/// popup redraws without scrolling scrollback. Returns the number of lines drawn.
+/// Draw the modal as a bottom-anchored "tray". When a footer scroll region is
+/// live the tray's BOTTOM line is pinned to the last scrolling body row
+/// (`rows - FOOTER_ROWS`) — directly above the footer's horizontal rule — using
+/// absolute cursor addressing wrapped in DECSC/DECRC so the operator's prompt
+/// cursor is left untouched. `prev_lines` is the row count painted by the
+/// previous call, used to erase stale rows when the tray shrinks. Without a
+/// footer region (piped stdout / terminal too short) it falls back to the
+/// legacy in-place redraw. Returns the number of rows actually painted.
 fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
-    let mut out = String::new();
-    if prev_lines > 0 {
-        out.push_str(&format!("\x1b[{prev_lines}A"));
-    }
     let color = crate::style::colors_enabled();
 
     // Column widths from the id/status/runtime cells (task/result flow at the end).
@@ -373,15 +374,75 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
         "  ↑/↓ move · Enter attach · Del/d close · Esc/q dismiss".to_string()
     });
 
+    let n = lines.len();
+    let mut out = String::new();
+    if let (true, Some(total)) =
+        (crate::terminal::footer_active(), crate::terminal::screen_rows())
+    {
+        // Last scrolling body row = row directly above the footer rule.
+        let body_bottom = total.saturating_sub(crate::terminal::FOOTER_ROWS).max(1);
+        let avail = body_bottom as usize;
+        // If the tray is taller than the body area, keep the BOTTOM `avail`
+        // lines so it never writes into (and corrupts) the footer rows.
+        let start = n.saturating_sub(avail);
+        let visible = &lines[start..];
+        let vn = visible.len() as u16;
+        let top = body_bottom - vn + 1; // vn <= avail ⇒ top >= 1
+        out.push_str("\x1b7"); // DECSC — save the caller's cursor
+        // A shorter repaint (a worker closed) leaves stale rows above the new
+        // top — clear them so the tray shrinks cleanly from the top.
+        if prev_lines > vn as usize {
+            let prev_top = body_bottom
+                .saturating_sub(prev_lines as u16 - 1)
+                .max(1);
+            for row in prev_top..top {
+                out.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+            }
+        }
+        for (i, line) in visible.iter().enumerate() {
+            let row = top + i as u16;
+            out.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+            out.push_str(line);
+        }
+        out.push_str("\x1b8"); // DECRC — restore the caller's cursor
+        let _ = write!(io::stdout(), "{out}");
+        let _ = io::stdout().flush();
+        return vn as usize;
+    }
+    // Legacy in-place redraw (no footer region).
+    if prev_lines > 0 {
+        out.push_str(&format!("\x1b[{prev_lines}A"));
+    }
     for line in &lines {
-        // Clear the line then write it.
         out.push_str("\x1b[2K");
         out.push_str(line);
         out.push_str("\r\n");
     }
     let _ = write!(io::stdout(), "{out}");
     let _ = io::stdout().flush();
-    lines.len()
+    n
+}
+
+/// Erase the bottom-anchored tray band on exit and leave the cursor on the last
+/// body row so the RawGuard's trailing CRLF and the next prompt land just above
+/// the footer rule. No-op without a footer region (the legacy path leaves its
+/// in-place block in scrollback, matching the pre-tray behavior).
+fn clear_tray(prev_lines: usize) {
+    if prev_lines == 0 || !crate::terminal::footer_active() {
+        return;
+    }
+    let Some(total) = crate::terminal::screen_rows() else {
+        return;
+    };
+    let body_bottom = total.saturating_sub(crate::terminal::FOOTER_ROWS).max(1);
+    let top = body_bottom.saturating_sub(prev_lines as u16 - 1).max(1);
+    let mut out = String::new();
+    for row in top..=body_bottom {
+        out.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+    }
+    out.push_str(&format!("\x1b[{body_bottom};1H"));
+    let _ = write!(io::stdout(), "{out}");
+    let _ = io::stdout().flush();
 }
 
 /// Clip to `max` display columns with an ellipsis.
@@ -411,18 +472,22 @@ pub fn run(rows: &[WorkerRow], initial_sel: usize) -> ModalAction {
     let mut state: u8 = 0;
     let mut queue: VecDeque<Key> = VecDeque::new();
     let mut prev_lines = 0usize;
-    loop {
+    let action = loop {
         prev_lines = render(rows, sel, prev_lines);
         let Some(key) = read_key(&mut state, &mut queue) else {
-            return ModalAction::Dismiss;
+            break ModalAction::Dismiss;
         };
         match key {
             Key::Up | Key::Down => sel = move_selection(sel, rows.len(), key),
-            Key::Enter => return ModalAction::Attach(rows[sel].id.clone()),
-            Key::Delete => return ModalAction::Close(rows[sel].id.clone()),
-            Key::Dismiss => return ModalAction::Dismiss,
+            Key::Enter => break ModalAction::Attach(rows[sel].id.clone()),
+            Key::Delete => break ModalAction::Close(rows[sel].id.clone()),
+            Key::Dismiss => break ModalAction::Dismiss,
         }
-    }
+    };
+    // Erase the anchored tray band so the popup closes cleanly instead of
+    // leaving a stale block covering the row above the rule.
+    clear_tray(prev_lines);
+    action
     // `_guard` drops here → cooked mode restored, cursor shown.
 }
 
