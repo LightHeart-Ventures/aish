@@ -7433,6 +7433,8 @@ async fn handle_colon(
                                     spec,
                                     session.batch_model.clone(),
                                     cred,
+                                    session.hooks.clone(),
+                                    session.mode.name().to_string(),
                                 );
                                 session.goal = Some(g);
                                 println!(
