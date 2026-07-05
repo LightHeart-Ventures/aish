@@ -942,13 +942,15 @@ pub async fn run(
                 }
 
                 // Attached to a coordinator: a plain line is operator input steered
-                // to it (the `:tell` channel), not a local command or a model turn.
-                // `:`-commands above still run — `:detach` ends it.
+                // to it (the `:tell` channel) — BUT only if it's model-bound. A
+                // real shell command (`ls ~/.aish/skills`, `cat foo`, …) that the
+                // shell-first dispatch below would run must execute LOCALLY, exactly
+                // as in an unattached interactive session, instead of being fired at
+                // the worker as a steering message. So we capture the attach target
+                // here and defer the steer until AFTER dispatch has had its chance
+                // to peel off a genuine command. `:`-commands above still run —
+                // `:detach` ends the attachment.
                 let attached_run = session.attached.lock().unwrap().clone();
-                if let Some(run_id) = attached_run {
-                    send_to_attached(&run_id, &line, &mut session);
-                    continue;
-                }
 
                 if let Some(db) = &session.db {
                     db.record("input", &session.cwd.to_string_lossy(), &line);
@@ -978,6 +980,16 @@ pub async fn run(
                         Dispatch::Quit => break,
                         Dispatch::NotACommand => {}
                     }
+                }
+
+                // Reached here → the line was NOT run as a local command (it's
+                // prose, or `?`-forced to the model). If we're attached to a
+                // coordinator, THIS is what gets steered to it via the `:tell`
+                // channel — real commands already ran locally above and
+                // `continue`d, so only genuine operator intent reaches the worker.
+                if let Some(run_id) = attached_run {
+                    send_to_attached(&run_id, &line, &mut session);
+                    continue;
                 }
 
                 // Auto-offload heavy work to a background coordinator. A
