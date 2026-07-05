@@ -68,6 +68,14 @@ pub struct GoalLoop {
     pub condition: String,
     /// When the goal was first spawned — basis for total elapsed time.
     started: Instant,
+    /// Lifecycle-hook registry inherited from the launching session, plus the
+    /// envelope fields (`session_id`/`cwd`/`mode`) every hook payload carries.
+    /// The goal loop is decoupled from `Session`, so it snapshots what it needs
+    /// to build + fire `GoalStart`/`GoalTurnEnd`/`GoalEnd` payloads on its own.
+    hooks: crate::hooks::HookSet,
+    session_id: String,
+    cwd: std::path::PathBuf,
+    mode: String,
     inner: Mutex<Inner>,
 }
 
@@ -103,6 +111,30 @@ impl GoalLoop {
         if i.status == Status::Active {
             i.status = Status::Cleared;
         }
+    }
+
+    /// Fire a goal-lifecycle hook (observe-only, best-effort, off the hot path).
+    /// No-op with zero allocation when no hook listens for `event`. The payload
+    /// is stamped with [`crate::hooks::Agent::Goal`] so a hook can scope itself
+    /// to the autonomous goal loop; `build` attaches the event-specific fields
+    /// (condition, turn, met, status, reason). Requires a tokio runtime in scope
+    /// — every call site is inside `run_goal`, which is spawned onto one.
+    fn fire_hook(
+        &self,
+        event: crate::hooks::HookEvent,
+        build: impl FnOnce(crate::hooks::HookPayload) -> crate::hooks::HookPayload,
+    ) {
+        if !self.hooks.has(event) {
+            return;
+        }
+        let p = crate::hooks::HookPayload::new(
+            event,
+            &self.session_id,
+            crate::hooks::Agent::Goal,
+            &self.cwd,
+            &self.mode,
+        );
+        self.hooks.fire_observe(event, build(p));
     }
 
     /// One-line `:goal` status report — includes overall + current-turn elapsed
@@ -229,10 +261,17 @@ pub fn spawn(
     spec: crate::worker::WorkerSpec,
     model: String,
     cred: crate::backend::claude::Credential,
+    hooks: crate::hooks::HookSet,
+    mode: String,
 ) -> Handle {
     let goal = Arc::new(GoalLoop {
         condition,
         started: Instant::now(),
+        hooks,
+        // The launching session's id + cwd, snapshotted for the hook envelope.
+        session_id: spec.launch_session_id.clone(),
+        cwd: spec.cwd.clone(),
+        mode,
         inner: Mutex::new(Inner {
             status: Status::Active,
             turns: 0,
@@ -319,6 +358,16 @@ pub(crate) fn goal_condition_from_directive(task: &str) -> Option<String> {
     Some(condition.to_string())
 }
 
+/// Terminal outcome of a goal pursuit, surfaced on the `GoalEnd` hook payload.
+struct GoalOutcome {
+    /// Wire status: `"achieved"` | `"failed"` | `"cleared"`.
+    status: &'static str,
+    /// Turns executed when the loop ended.
+    turns: usize,
+    /// Final one-line reason/verdict, when there is one.
+    reason: Option<String>,
+}
+
 async fn run_goal(
     goal: Handle,
     spec: crate::worker::WorkerSpec,
@@ -326,6 +375,32 @@ async fn run_goal(
     cred: crate::backend::claude::Credential,
 ) {
     goal.note(&format!("started — {}", goal.condition));
+    goal.fire_hook(crate::hooks::HookEvent::GoalStart, |p| {
+        p.with("condition", goal.condition.clone())
+    });
+
+    let outcome = run_goal_loop(&goal, spec, model, cred).await;
+
+    goal.fire_hook(crate::hooks::HookEvent::GoalEnd, |p| {
+        let p = p
+            .with("status", outcome.status)
+            .with("turns", outcome.turns as u64);
+        match &outcome.reason {
+            Some(r) => p.with("reason", r.clone()),
+            None => p,
+        }
+    });
+}
+
+/// The generator/verifier loop. Returns the terminal [`GoalOutcome`] so the
+/// caller ([`run_goal`]) can fire `GoalEnd` from exactly one place regardless of
+/// which stopping condition ended the pursuit.
+async fn run_goal_loop(
+    goal: &Handle,
+    spec: crate::worker::WorkerSpec,
+    model: String,
+    cred: crate::backend::claude::Credential,
+) -> GoalOutcome {
     let mut guidance: Option<String> = None;
 
     loop {
@@ -333,15 +408,24 @@ async fn run_goal(
         let turn = {
             let mut i = goal.inner.lock().unwrap();
             if i.cancel {
-                return;
+                return GoalOutcome {
+                    status: "cleared",
+                    turns: i.turns,
+                    reason: None,
+                };
             }
             if i.turns >= MAX_TURNS {
                 i.status = Status::Failed;
+                let turns = i.turns;
                 drop(i);
-                goal.note(&format!(
-                    "stopped — hit the {MAX_TURNS}-turn backstop without meeting the goal"
-                ));
-                return;
+                let reason =
+                    format!("hit the {MAX_TURNS}-turn backstop without meeting the goal");
+                goal.note(&format!("stopped — {reason}"));
+                return GoalOutcome {
+                    status: "failed",
+                    turns,
+                    reason: Some(reason),
+                };
             }
             i.turns += 1;
             i.turns
@@ -361,33 +445,45 @@ async fn run_goal(
             Err(e) => {
                 goal.set(Status::Failed, Some(e.clone()));
                 goal.note(&format!("failed — {e}"));
-                return;
+                return GoalOutcome {
+                    status: "failed",
+                    turns: turn,
+                    reason: Some(e),
+                };
             }
         };
         if !goal.is_active() {
-            return;
+            return GoalOutcome {
+                status: "cleared",
+                turns: turn,
+                reason: None,
+            };
         }
 
         // Verifier: the batch model judges whether the output demonstrates the goal.
         goal.note(&format!("turn {turn}: checking…"));
         goal.inner.lock().unwrap().phase = Step::Checking;
-        match judge(&cred, &model, &goal.condition, &output).await {
-            Ok((true, reason)) => {
-                goal.set(Status::Achieved, Some(reason.clone()));
-                deliver(&goal, turn, &reason, &output);
-                return;
-            }
-            Ok((false, reason)) => {
-                goal.set(Status::Active, Some(reason.clone()));
-                guidance = Some(reason);
-            }
-            Err(e) => {
-                // Couldn't verify — keep going but record why; don't silently stop.
-                let note = format!("could not verify this turn: {e}");
-                goal.set(Status::Active, Some(note.clone()));
-                guidance = Some(note);
-            }
+        let (met, reason) = match judge(&cred, &model, &goal.condition, &output).await {
+            Ok((met, reason)) => (met, reason),
+            // Couldn't verify — keep going but record why; don't silently stop.
+            Err(e) => (false, format!("could not verify this turn: {e}")),
+        };
+        goal.fire_hook(crate::hooks::HookEvent::GoalTurnEnd, |p| {
+            p.with("turn", turn as u64)
+                .with("met", met)
+                .with("reason", reason.clone())
+        });
+        if met {
+            goal.set(Status::Achieved, Some(reason.clone()));
+            deliver(goal, turn, &reason, &output);
+            return GoalOutcome {
+                status: "achieved",
+                turns: turn,
+                reason: Some(reason),
+            };
         }
+        goal.set(Status::Active, Some(reason.clone()));
+        guidance = Some(reason);
     }
 }
 
@@ -1037,6 +1133,10 @@ mod tests {
         GoalLoop {
             condition: "Complete the work".to_string(),
             started: Instant::now(),
+            hooks: crate::hooks::HookSet::empty(),
+            session_id: "test-session".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            mode: "build".to_string(),
             inner: Mutex::new(Inner {
                 status,
                 turns: 3,
