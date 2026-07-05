@@ -182,7 +182,7 @@ mod tests {
         assert!(ControlSignal::Interrupt.priority() < ControlSignal::Steer(String::new()).priority());
         assert!(
             ControlSignal::Steer(String::new()).priority()
-                < ControlSignal::OutputMode(WorkerOutputMode::Auto).priority()
+                < ControlSignal::OutputMode(WorkerOutputMode::Off).priority()
         );
     }
 
@@ -191,7 +191,7 @@ mod tests {
         let mut ch = ControlChannel::new();
         let tx = ch.sender();
         // Send lowest-priority first, interrupt last.
-        assert!(tx.output_mode(WorkerOutputMode::ForcedOn));
+        assert!(tx.output_mode(WorkerOutputMode::On));
         assert!(tx.steer("do X"));
         assert!(tx.interrupt());
 
@@ -201,7 +201,7 @@ mod tests {
             vec![
                 ControlSignal::Interrupt,
                 ControlSignal::Steer("do X".to_string()),
-                ControlSignal::OutputMode(WorkerOutputMode::ForcedOn),
+                ControlSignal::OutputMode(WorkerOutputMode::On),
             ]
         );
     }
@@ -290,7 +290,7 @@ mod tests {
         assert_eq!(ControlSignal::Interrupt.tag(), "interrupt");
         assert_eq!(ControlSignal::Steer(String::new()).tag(), "steer");
         assert_eq!(
-            ControlSignal::OutputMode(WorkerOutputMode::Auto).tag(),
+            ControlSignal::OutputMode(WorkerOutputMode::Off).tag(),
             "output-mode"
         );
     }
