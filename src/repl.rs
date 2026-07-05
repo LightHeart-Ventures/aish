@@ -5719,6 +5719,18 @@ fn handle_config(backend: &Backend, session: &Session) {
         "  this session    {} turn(s) · {} tool call(s) · {} tokens in / {} out",
         session.turns_total, session.tool_calls_total, session.tokens_in, session.tokens_out
     );
+    // TASK-320 AC#3: prove the stable-prefix cache is landing hits. Show the
+    // session cache-read hit rate plus the raw read/write split so a healthy
+    // session (high read, low write) is distinguishable from one churning the
+    // cache. Only rendered when the backend reported cache buckets.
+    if session.cache_read_total > 0 || session.cache_creation_total > 0 {
+        let denom = session.tokens_in.max(1);
+        let pct = (session.cache_read_total as f64 / denom as f64) * 100.0;
+        println!(
+            "  prompt cache    {:.0}% read-hit · {} cached-read / {} cache-write tokens",
+            pct, session.cache_read_total, session.cache_creation_total
+        );
+    }
 }
 
 /// `:reasoning` — render the reasoning-quality telemetry summary: the escalate

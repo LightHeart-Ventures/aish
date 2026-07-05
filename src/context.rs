@@ -27,11 +27,31 @@ use crate::backend::{Msg, Role};
 pub struct Usage {
     pub input_tokens: usize,
     pub output_tokens: usize,
+    /// Portion of `input_tokens` that was served from the model's prompt cache
+    /// (Anthropic `cache_read_input_tokens`). A high fraction of the input means
+    /// the stable system+tools prefix is being reused instead of re-billed at
+    /// full rate. Zero when the backend reports no cache buckets. (TASK-320)
+    pub cache_read_tokens: usize,
+    /// Portion of `input_tokens` spent WRITING new entries into the prompt cache
+    /// (Anthropic `cache_creation_input_tokens`) — billed at a premium, paid once
+    /// when a fresh prefix is cached. Zero when unreported. (TASK-320)
+    pub cache_creation_tokens: usize,
 }
 
 impl Usage {
     pub fn total(self) -> usize {
         self.input_tokens + self.output_tokens
+    }
+
+    /// Cache-read hit rate for THIS usage: cached-read tokens as a fraction of
+    /// the full input prompt, 0.0–100.0. Returns `None` when there was no input
+    /// to measure against. AC #3's measurement primitive (TASK-320).
+    pub fn cache_hit_pct(self) -> Option<f64> {
+        if self.input_tokens == 0 {
+            None
+        } else {
+            Some((self.cache_read_tokens as f64 / self.input_tokens as f64) * 100.0)
+        }
     }
 }
 

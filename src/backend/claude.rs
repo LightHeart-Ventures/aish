@@ -1046,6 +1046,8 @@ same oversized call.]",
         crate::context::Usage {
             input_tokens: uncached + cache_read + cache_creation,
             output_tokens: g("output_tokens"),
+            cache_read_tokens: cache_read,
+            cache_creation_tokens: cache_creation,
         }
     });
     Ok(Turn {

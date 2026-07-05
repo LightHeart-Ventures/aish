@@ -271,6 +271,16 @@ pub struct Session {
     /// Cumulative completion (output) tokens the model has produced this session
     /// (companion to [`tokens_in`]). Feeds the status line's `tokens out: …`.
     pub tokens_out: usize,
+    /// Cumulative prompt tokens served from the model's cache this session
+    /// (Anthropic `cache_read_input_tokens`, summed per turn). Numerator of the
+    /// session-level cache hit rate surfaced on the statusline and `:context`
+    /// (TASK-320 AC#3). Session-local.
+    pub cache_read_total: usize,
+    /// Cumulative prompt tokens spent WRITING cache entries this session
+    /// (`cache_creation_input_tokens`, summed per turn). Reported alongside the
+    /// hit rate so a session churning the cache (high write, low read) is
+    /// distinguishable from a healthy one. Session-local. (TASK-320)
+    pub cache_creation_total: usize,
     /// Count of tool calls executed this session — every `escalate`, dispatch
     /// (`run_in_background`), and ordinary tool run tallied once when it finishes.
     /// Feeds the status line's `tool calls: …`.
@@ -565,6 +575,8 @@ impl Session {
             context_used: 0,
             tokens_in: 0,
             tokens_out: 0,
+            cache_read_total: 0,
+            cache_creation_total: 0,
             tool_calls_total: 0,
             turns_total: 0,
             batch_mode: true,
@@ -687,6 +699,8 @@ impl Session {
         self.context_used = 0;
         self.tokens_in = 0;
         self.tokens_out = 0;
+        self.cache_read_total = 0;
+        self.cache_creation_total = 0;
         self.tool_calls_total = 0;
         self.turns_total = 0;
         // TASK-282 AC1/AC3: the durable goal tree is independent of the
