@@ -21,6 +21,7 @@ mod hooks;
 mod hwdetect;
 mod jobs;
 mod keywatch;
+mod lifecycle;
 mod loopguard;
 mod mcp;
 mod md;
