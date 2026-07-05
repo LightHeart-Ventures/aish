@@ -52,6 +52,7 @@ mod skill_provider;
 mod skills;
 mod spawn_broker;
 mod spawn_broker_host;
+mod spawn_broker_registry;
 mod stream_cancel;
 mod stream_render;
 mod style;
