@@ -3788,7 +3788,7 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
                 crate::terminal::open_attach_view();
                 *session.attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
                 println!(
-                    "\x1b[1;33m⇄ attached to the goal\x1b[0m — streaming its turns live. \x1b[2mgoals are watch-only; :goal clear to stop it, :detach to stop watching.\x1b[0m"
+                    "\x1b[1;33m⇄ attached to the goal\x1b[0m — streaming its turns live. \x1b[2mtype a line to steer it (or :tell goal <msg>); :goal clear to stop it, :detach to stop watching.\x1b[0m"
                 );
                 // TASK-301: replay the goal's history the same way a worker's is
                 // replayed — header + input row + activity tail — so goal and
@@ -4398,18 +4398,38 @@ fn interrupt_attached_worker(session: &Session) -> bool {
 /// read a mailbox message — it RESUMES the run instead (relaunch seeded with the
 /// prior context + this message; see `resume_coordinator`). Called for every
 /// plain line typed while attached.
+/// Steer the active background `:goal` — queue an operator instruction that the
+/// goal folds into its next turn (see [`crate::goal::GoalLoop::steer`]). Shared
+/// by `:tell goal <msg>` and a line typed while `:attach`ed to the goal. Prints
+/// a confirmation, or a helpful notice when there is no active goal to steer.
+fn steer_active_goal(message: &str, session: &mut Session) {
+    let message = message.trim();
+    if message.is_empty() {
+        println!("usage: :tell goal <instruction>   — steer the active background goal");
+        return;
+    }
+    match &session.goal {
+        Some(g) if g.steer(message) => println!(
+            "\x1b[1;33m🎯 steer queued\x1b[0m \x1b[2m— folded into the goal's next turn\x1b[0m"
+        ),
+        Some(_) => {
+            println!("the goal has already finished — nothing to steer (`:goal` for status)")
+        }
+        None => println!("no goal set — `:goal <condition>` to start one (requires :batch on)"),
+    }
+}
+
+
 fn send_to_attached(run_id: &str, message: &str, session: &mut Session) {
     let message = message.trim();
     if message.is_empty() {
         return;
     }
-    // A goal is verifier-driven and has no operator mailbox — it can't be
-    // steered mid-flight. Say so rather than silently dropping the line into a
-    // coordinator-tell with no recipient.
+    // A line typed while `:attach`ed to the goal STEERS it: the message is
+    // queued and folded into the goal's next turn (the goal analogue of
+    // `:tell`-ing a coordinator). No coordinator mailbox is involved.
     if run_id == GOAL_ATTACH_ID {
-        println!(
-            "\x1b[2mthe goal is watch-only — it can't be steered. `:goal clear` to stop it, `:detach` to stop watching.\x1b[0m"
-        );
+        steer_active_goal(message, session);
         return;
     }
     // A TERMINAL (done/failed) coordinator has nothing to read a mailbox
@@ -4737,7 +4757,7 @@ fn cycle_worker(session: &mut Session) -> bool {
     // prompt row rustyline left behind so the attach header opens on a clean row
     // instead of starting ON the prompt.
     crate::terminal::open_attach_view();
-    // TASK-299/301: the goal is the last rotation slot — watch-only. Stream its
+    // TASK-299/301: the goal is the last rotation slot — steerable. Stream its
     // turns live and backfill its durable state (mirrors `:attach goal`), then
     // stop before the worker-index dereference (the goal is not in `workers`).
     if ids[next_idx - 1] == GOAL_ATTACH_ID {
@@ -4749,7 +4769,7 @@ fn cycle_worker(session: &mut Session) -> bool {
             .map(|g| g.condition.clone())
             .unwrap_or_default();
         println!(
-            "\x1b[1;33m⇄ attached to the goal\x1b[0m \x1b[2m({}/{} · watch-only; :goal clear to stop it, Shift-Tab to cycle, :detach to stop){}\x1b[0m",
+            "\x1b[1;33m⇄ attached to the goal\x1b[0m \x1b[2m({}/{} · type to steer it, :goal clear to stop it, Shift-Tab to cycle, :detach to stop){}\x1b[0m",
             next_idx,
             ids.len(),
             attach_task_suffix(&task)
@@ -5520,6 +5540,13 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
         println!(
             "usage: :tell [--any] <worker-id> <message>   — steer an in-flight coordinator (--any: across sessions)"
         );
+        return;
+    }
+    // `:tell goal <msg>` steers the active background goal, not a coordinator:
+    // the goal has no store row or mailbox, it drains its own steer queue at the
+    // top of each turn. Exact-match so a worker-id prefix never collides.
+    if id == GOAL_ATTACH_ID {
+        steer_active_goal(message, session);
         return;
     }
     let Some(store) = session.coordinator_store.clone() else {
