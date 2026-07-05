@@ -50,6 +50,7 @@ mod session;
 mod skill_match;
 mod skill_provider;
 mod skills;
+mod spawn_broker;
 mod stream_cancel;
 mod stream_render;
 mod style;
