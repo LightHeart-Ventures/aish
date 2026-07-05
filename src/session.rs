@@ -490,6 +490,10 @@ pub struct Session {
     /// stopped by `:loop stop` or a Ctrl-C abort. Always `None` for a background
     /// coordinator — loops are an interactive affordance.
     pub loop_state: Option<LoopState>,
+    /// SPR-059 (TASK-264/265): handle to the running webhook broker client
+    /// background service, spawned at REPL startup when `WEBHOOK_BROKER_URL` is
+    /// set. `None` when unconfigured or in a nested background coordinator.
+    pub webhook: Option<crate::webhook::WebhookHandle>,
     /// Auto-resume-on-child-completion state (the parent-wake hook). When a
     /// top-level interactive session fans out background coordinators via
     /// `run_in_background`, this coalesces their completions so that once the
@@ -652,6 +656,7 @@ impl Session {
             restart_requested: false,
             task_anchor: None,
             loop_state: None,
+            webhook: None,
             resume: Arc::new(Mutex::new(ResumeState::default())),
             tool_failures: std::collections::HashMap::new(),
             tool_telemetry_buf: Vec::new(),

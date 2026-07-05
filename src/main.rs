@@ -60,6 +60,7 @@ mod transcript_ring;
 mod turn_audit;
 mod update;
 mod schedule;
+mod webhook;
 mod worker;
 mod worker_store;
 mod workers_modal;
