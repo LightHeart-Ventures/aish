@@ -12,11 +12,22 @@
 
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Skill {
     pub name: String,
     pub description: String,
     pub path: PathBuf,
+    /// TASK-331 semantic metadata — coarse topic buckets a skill belongs to
+    /// (`infrastructure`, `troubleshooting`, `release`, `perf`, `design`,
+    /// `review`, …). Empty when the SKILL.md predates the schema.
+    pub categories: Vec<String>,
+    /// TASK-331 — repo/project scopes this skill is meant for (`aish`,
+    /// `cloudinero`, `all`, …). Empty ⇒ unscoped (treated as broadly applicable).
+    pub applies_to: Vec<String>,
+    /// TASK-331 — intent patterns this skill should be SUPPRESSED on
+    /// (`review`, `design`, `ui`, …), so a match on an unwanted intent can be
+    /// filtered out before the per-turn nudge fires.
+    pub unwanted_for: Vec<String>,
 }
 
 /// Scan a skills directory. Missing dir → no skills; malformed entries are
@@ -32,10 +43,14 @@ pub fn load(dir: &Path) -> Vec<Skill> {
             continue;
         };
         if let Some((name, description)) = parse_frontmatter(&text) {
+            let (categories, applies_to, unwanted_for) = parse_semantic_metadata(&text);
             skills.push(Skill {
                 name,
                 description,
                 path: skill_md,
+                categories,
+                applies_to,
+                unwanted_for,
             });
         }
     }
@@ -84,6 +99,116 @@ pub fn parse_frontmatter(text: &str) -> Option<(String, String)> {
         }
     }
     Some((name?, description?))
+}
+
+/// Return the inner text of a `---`-fenced frontmatter block (between the
+/// opening `---` and the terminating `\n---`), or `None` when absent.
+fn frontmatter_block(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("---")?;
+    let end = rest.find("\n---")?;
+    Some(&rest[..end])
+}
+
+/// TASK-331 — pull the three semantic-metadata list fields out of a SKILL.md
+/// frontmatter block: `(categories, applies-to, unwanted-for)`. Each is a
+/// `Vec<String>` that is empty when the field is absent. Both YAML list shapes
+/// are accepted:
+///   inline  →  `categories: [infrastructure, troubleshooting]`
+///   block   →  `categories:\n  - infrastructure\n  - troubleshooting`
+/// Values are trimmed and surrounding quotes stripped; empty entries dropped.
+pub fn parse_semantic_metadata(text: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let Some(front) = frontmatter_block(text) else {
+        return (Vec::new(), Vec::new(), Vec::new());
+    };
+    (
+        parse_list_field(front, "categories"),
+        parse_list_field(front, "applies-to"),
+        parse_list_field(front, "unwanted-for"),
+    )
+}
+
+/// Trim whitespace then strip a single pair of matching surrounding quotes.
+fn clean_item(s: &str) -> String {
+    let t = s.trim();
+    let t = t
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .or_else(|| t.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))
+        .unwrap_or(t);
+    t.trim().to_string()
+}
+
+/// Extract one YAML list field (`key`) from a frontmatter block, supporting
+/// both the inline `[a, b]` form and the multi-line `- a` block form.
+fn parse_list_field(front: &str, key: &str) -> Vec<String> {
+    let lines: Vec<&str> = front.lines().collect();
+    for (i, raw) in lines.iter().enumerate() {
+        // Match `key:` only at the top level (no leading indentation), so a
+        // nested key never collides with a real field.
+        let Some(rest) = raw.strip_prefix(key) else {
+            continue;
+        };
+        let Some(after) = rest.strip_prefix(':') else {
+            continue;
+        };
+        let value = after.trim();
+        if value.starts_with('[') {
+            // Inline flow sequence: [a, b, c]
+            let inner = value.trim_start_matches('[').trim_end_matches(']');
+            return inner
+                .split(',')
+                .map(clean_item)
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if !value.is_empty() {
+            // Scalar on the same line — treat as a single-item list.
+            let item = clean_item(value);
+            return if item.is_empty() { Vec::new() } else { vec![item] };
+        }
+        // Block form: subsequent `  - item` lines until indentation ends.
+        let mut out = Vec::new();
+        for next in &lines[i + 1..] {
+            let trimmed = next.trim_start();
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                let item = clean_item(item);
+                if !item.is_empty() {
+                    out.push(item);
+                }
+            } else if trimmed.is_empty() {
+                continue;
+            } else {
+                break;
+            }
+        }
+        return out;
+    }
+    Vec::new()
+}
+
+/// TASK-331 — validate the semantic metadata across a loaded catalog and return
+/// human-readable warnings (surfaced as startup notices). A skill missing BOTH
+/// `categories` and `applies-to` is flagged so authors can backfill the schema.
+/// Non-fatal: skills still load and function without the fields.
+pub fn metadata_warnings(skills: &[Skill]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for sk in skills {
+        let mut missing = Vec::new();
+        if sk.categories.is_empty() {
+            missing.push("categories");
+        }
+        if sk.applies_to.is_empty() {
+            missing.push("applies-to");
+        }
+        if !missing.is_empty() {
+            warnings.push(format!(
+                "skill '{}' missing semantic metadata: {} (see SKILL-FORMAT.md)",
+                sk.name,
+                missing.join(", ")
+            ));
+        }
+    }
+    warnings
 }
 
 /// The system-prompt section advertising available skills from both sources.
@@ -174,6 +299,7 @@ mod tests {
             name: "deploy".into(),
             description: "Ship it.".into(),
             path: PathBuf::from("/s/deploy/SKILL.md"),
+            ..Default::default()
         }];
         let mcp = vec![crate::mcp::McpSkill {
             server: "atum".into(),
@@ -257,5 +383,68 @@ mod tests {
         assert_eq!(load(&skills_dir).len(), 1);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- TASK-331: semantic-metadata parser + validation ----
+
+    #[test]
+    fn parse_semantic_metadata_inline_flow_lists() {
+        let md = "---\nname: aish_sre\ndescription: SRE playbook.\n\
+categories: [infrastructure, troubleshooting, release]\n\
+applies-to: [aish]\n\
+unwanted-for: [design, review]\n---\nbody";
+        let (cats, applies, unwanted) = parse_semantic_metadata(md);
+        assert_eq!(cats, vec!["infrastructure", "troubleshooting", "release"]);
+        assert_eq!(applies, vec!["aish"]);
+        assert_eq!(unwanted, vec!["design", "review"]);
+    }
+
+    #[test]
+    fn parse_semantic_metadata_block_lists_and_quotes() {
+        let md = "---\nname: review\ndescription: Reviews.\n\
+categories:\n  - review\n  - \"code-quality\"\n\
+applies-to:\n  - 'all'\n\
+unwanted-for:\n  - infrastructure\n  - perf\n---\nbody";
+        let (cats, applies, unwanted) = parse_semantic_metadata(md);
+        assert_eq!(cats, vec!["review", "code-quality"]);
+        assert_eq!(applies, vec!["all"]);
+        assert_eq!(unwanted, vec!["infrastructure", "perf"]);
+    }
+
+    #[test]
+    fn parse_semantic_metadata_missing_fields_default_empty() {
+        // A pre-schema SKILL.md with no semantic fields yields three empty vecs
+        // and must not panic.
+        let md = "---\nname: rust-pro\ndescription: Rust.\ncategories: []\n---\nbody";
+        let (cats, applies, unwanted) = parse_semantic_metadata(md);
+        assert!(cats.is_empty());
+        assert!(applies.is_empty());
+        assert!(unwanted.is_empty());
+        // No frontmatter at all → still empty, no panic.
+        let (c2, a2, u2) = parse_semantic_metadata("plain body, no frontmatter");
+        assert!(c2.is_empty() && a2.is_empty() && u2.is_empty());
+    }
+
+    #[test]
+    fn metadata_warnings_flags_missing_fields() {
+        let complete = Skill {
+            name: "aish_sre".into(),
+            description: "d".into(),
+            categories: vec!["infrastructure".into()],
+            applies_to: vec!["aish".into()],
+            ..Default::default()
+        };
+        let bare = Skill {
+            name: "legacy".into(),
+            description: "d".into(),
+            ..Default::default()
+        };
+        let warns = metadata_warnings(std::slice::from_ref(&complete));
+        assert!(warns.is_empty(), "complete skill should not warn: {warns:?}");
+        let warns = metadata_warnings(&[complete, bare]);
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("legacy"));
+        assert!(warns[0].contains("categories"));
+        assert!(warns[0].contains("applies-to"));
     }
 }

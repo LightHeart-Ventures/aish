@@ -292,6 +292,7 @@ mod tests {
             name: name.into(),
             description: description.into(),
             path: PathBuf::from(format!("/skills/{name}/SKILL.md")),
+            ..Default::default()
         }
     }
 
