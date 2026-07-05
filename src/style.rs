@@ -201,6 +201,13 @@ pub fn job_activity_emoji(task: &str) -> &'static str {
     if t.contains("operator alert") || t.contains("`:alert` feature") || t.contains("set_alert") {
         return ALERT_GLYPH;
     }
+    // Background `:goal` loop turns are spawned with the GOAL_DIRECTIVE_PREFIX,
+    // whose opening line is "Work toward this goal …". That anchor survives the
+    // task-text truncation the `:workers` rows apply, so a goal reads as a
+    // bullseye/target rather than the generic robot.
+    if t.contains("work toward this goal") {
+        return "🎯";
+    }
     // Ordinary background work — reuse the generic worker glyph so the robot
     // emoji stays single-sourced with `job_type_emoji`.
     job_type_emoji("worker")
@@ -807,6 +814,12 @@ Watch for this condition and call the `set_alert` tool with alert_id=7 …";
         // Any of the anchors alone is enough.
         assert_eq!(job_activity_emoji("call set_alert when the PR merges"), "⏰");
         assert_eq!(job_activity_emoji("watch for an operator alert condition"), "⏰");
+        // Goal-loop turns carry the GOAL_DIRECTIVE_PREFIX opening → bullseye.
+        assert_eq!(
+            job_activity_emoji("Work toward this goal, then report what you did …"),
+            "🎯"
+        );
+        assert_eq!(job_activity_emoji("work toward this goal"), "🎯");
         // Ordinary background work falls back to the generic worker robot.
         assert_eq!(job_activity_emoji("fix the failing CI on branch feat/x"), "🤖");
         assert_eq!(job_activity_emoji("refactor the coordinator store"), "🤖");
