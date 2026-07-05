@@ -1237,6 +1237,16 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
     // the moment the next forwarded line replaces it — exactly like the
     // interactive thinking spinner that animates then vanishes when output begins.
     let mut thinking: Option<ThinkingSpinner> = None;
+    // Whether the LAST forwarded line for this worker was a `💭 thinking…`
+    // notice. Consecutive reasoning rounds emit back-to-back thinking notices
+    // with no activity line between them; without this guard each notice would
+    // start a FRESH spinner — and in printer / off-TTY mode every spinner commits
+    // its OWN static "thinking…" line, waterfalling duplicate rows down the
+    // `:output` pane (the reported bug). We start a spinner only on the
+    // transition activity → thinking and keep it alive across the run, so a
+    // reasoning phase shows ONE animated row (TTY) or ONE static line (printer /
+    // piped) regardless of how many notices it spans.
+    let mut prev_thinking = false;
     // The LIVE read cursor over this worker's shared transcript ring. The live
     // forward stream drains it every forwardable line (advancing it even while
     // the `:worker-output` gate is closed, so it stays caught up and never
@@ -1261,6 +1271,7 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
             if let Some(spin) = thinking.take() {
                 spin.stop();
             }
+            prev_thinking = false;
             // Wrap the always-surfaced console note in blank lines so it is set
             // visually apart from whatever printed immediately before it (a
             // coordinator `·result`, a tool row, or the prompt) AND from whatever
@@ -1343,25 +1354,36 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                     job.stop_backfill_thinking();
                 }
                 if matches!(event, ActivityEvent::Thinking(_)) {
-                    // Model-reasoning phase: replace any prior thinking row, then
-                    // animate THIS one in place (transient) until the worker's
-                    // next forwarded line lands — matching the interactive
-                    // `Spinner` that animates then vanishes when output begins.
-                    // Off a TTY there's no animation: fall back to a one-shot
-                    // static row so piped parents still see the notice.
-                    if let Some(spin) = thinking.take() {
-                        spin.stop();
-                    }
-                    // Hand the spinner the SAME forward-gate handles the stream
-                    // loop reads, so it can self-erase the moment the user
-                    // Shift-Tabs / detaches away mid-think (see ThinkingSpinner).
-                    thinking =
-                        ThinkingSpinner::start(label, show_output.clone(), attached.clone());
-                    if thinking.is_none() {
-                        for (_s, t) in &live_rows {
-                            crate::tools::announce_raw(&render_row(t));
+                    // Model-reasoning phase: show ONE animated "thinking…" row
+                    // that persists until the worker's next forwarded line lands
+                    // — matching the interactive `Spinner` that animates then
+                    // vanishes when output begins. Consecutive notices (multiple
+                    // reasoning rounds with no activity line between) must NOT each
+                    // spawn a fresh spinner: in printer / off-TTY mode every spawn
+                    // commits its OWN static "thinking…" line (the waterfall of
+                    // duplicate rows), and in TTY mode a restart resets the braille
+                    // frame to 0, stuttering the animation. So start a spinner ONLY
+                    // on the transition activity → thinking; a run of back-to-back
+                    // notices keeps the single live spinner turning.
+                    if !prev_thinking && thinking.is_none() {
+                        // Hand the spinner the SAME forward-gate handles the stream
+                        // loop reads, so it can self-erase the moment the user
+                        // Shift-Tabs / detaches away mid-think (see ThinkingSpinner).
+                        thinking = ThinkingSpinner::start(
+                            label,
+                            show_output.clone(),
+                            attached.clone(),
+                        );
+                        if thinking.is_none() {
+                            // Off a TTY there's no animation: emit a single static
+                            // row so piped parents still see the notice (once per
+                            // reasoning run, not per notice).
+                            for (_s, t) in &live_rows {
+                                crate::tools::announce_raw(&render_row(t));
+                            }
                         }
                     }
+                    prev_thinking = true;
                 } else {
                     // Any other forwarded line ENDS the thinking phase: stop +
                     // erase the spinner so this row lands on the cleared line,
@@ -1378,12 +1400,17 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                     for (_s, t) in &live_rows {
                         crate::tools::announce_raw(&render_row(t));
                     }
+                    prev_thinking = false;
                 }
-            } else if let Some(spin) = thinking.take() {
-                // Forwarding just turned off for this worker (e.g. `:detach`
-                // mid-think): stop the animation so it doesn't keep drawing while
-                // suppressed.
-                spin.stop();
+            } else {
+                // Forwarding is off for this worker (e.g. `:detach` mid-think):
+                // stop any animation so it doesn't keep drawing while suppressed,
+                // and reset the thinking-run guard so a fresh spinner starts when
+                // output resumes.
+                if let Some(spin) = thinking.take() {
+                    spin.stop();
+                }
+                prev_thinking = false;
             }
         }
         if tail.len() == STDERR_TAIL_LINES {
