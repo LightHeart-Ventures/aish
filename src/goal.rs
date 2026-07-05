@@ -364,8 +364,9 @@ pub fn spawn(
 /// Because each goal turn runs as a full-tool coordinator subprocess
 /// ([`crate::worker::run_once`]), it has the always-surfaced `message_console`
 /// channel. We instruct it to post a per-turn note so the operator sees live
-/// progress even while the goal loop runs unattended: (1) a turn summary, and
-/// (2) any pull request it opened, with a one-line summary. `message_console`
+/// progress even while the goal loop runs unattended: (1) the work completed
+/// this turn, (2) the work remaining before the goal is met, and (3) any pull
+/// request it opened, with a one-line summary. `message_console`
 /// emits a `📣` sentinel line that is surfaced to the operator regardless of the
 /// `:worker-output` gate, without polluting the stdout result the verifier judges.
 ///
@@ -388,9 +389,10 @@ Then build toward the goal:\n\
 6. Dispatch the independent, file-disjoint sub-tasks in parallel with the run_in_background tool — one worker per bite-size unit, and one worker for all the TODOs that share a file — keeping serial only the work with real dependencies or that touches shared files.\n\
 7. Track the work as a board task: open a task (or reuse the linked one), keep its spec, comments, branch, and pull-request fields up to date as you progress, and move it to completed only once the goal is verified done.\n\
 8. Guard against cascading errors: have an independent agent or verifier fact-check each key result before you build further on it.\n\n\
-Before you finish this turn, call the `message_console` tool once to surface your progress to the operator:\n\
-1. A one- to two-line summary of what you did this turn and the evidence for it (on the first turn, include your 60-character restatement and your success definition).\n\
-2. If you opened a pull request this turn, include its number/URL and a one-line summary of what it changes.\n\n\
+Before you finish this turn, call the `message_console` tool once to summarize the work completed and the work remaining, so the operator sees live progress at each turn:\n\
+1. WORK COMPLETED: a one- to two-line summary of what you did this turn and the evidence for it (on the first turn, include your 60-character restatement and your success definition).\n\
+2. WORK REMAINING: a one- to two-line summary of the outstanding sub-tasks/milestones still to finish before the goal is met — or \"none — goal met\" when nothing is left.\n\
+3. If you opened a pull request this turn, include its number/URL and a one-line summary of what it changes.\n\n\
 Goal:\n";
 /// Marker separating the goal condition from the verifier's last-check guidance
 /// in a re-tried turn's directive.
@@ -2028,10 +2030,15 @@ mod domain_tests {
         );
         assert!(
             d.to_lowercase().contains("summary of what you did this turn"),
-            "directive should ask for a per-turn summary"
+            "directive should ask for a per-turn work-completed summary"
+        );
+        let low = d.to_lowercase();
+        assert!(
+            low.contains("work completed") && low.contains("work remaining"),
+            "directive should ask for both work completed and work remaining each turn"
         );
         assert!(
-            d.to_lowercase().contains("pull request"),
+            low.contains("pull request"),
             "directive should ask for any opened PR with a summary"
         );
         // Instructions live in the prefix, so the condition still round-trips clean.
