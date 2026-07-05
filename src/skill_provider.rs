@@ -850,7 +850,7 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
 }
 
 /// Collapse newlines and cap a string at `max` display chars (ellipsis when cut).
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     let s = s.replace(['\n', '\r'], " ");
     if s.chars().count() <= max {
         return s;
