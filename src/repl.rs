@@ -40,12 +40,23 @@ fn install_mcp_if_ready(
                 // (most-recent wins) instead of printing it to stderr above the
                 // prompt — keeps the startup header clean, matching how worker-done
                 // notices and fired-`:alert` badges are moved onto the footer.
-                let msg = format!(
-                    "\x1b[2mmcp: ready — {n} server{} connected\x1b[0m",
+                let plain = format!(
+                    "mcp: ready — {n} server{} connected",
                     if n == 1 { "" } else { "s" }
                 );
                 if let Ok(mut f) = session.flash.lock() {
-                    *f = Some(msg);
+                    *f = Some(format!("\x1b[2m{plain}\x1b[0m"));
+                }
+                // Also append it to the recoverable `:activity` tray so the notice
+                // is inspectable after the flash slot is overwritten by the next
+                // most-recent message (info tier, source "mcp").
+                if let Some(act) = &session.activity_store {
+                    let _ = act.record(
+                        crate::style::Severity::Info.as_str(),
+                        "mcp: ready",
+                        &plain,
+                        "mcp",
+                    );
                 }
             }
         }
