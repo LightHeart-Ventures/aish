@@ -401,10 +401,8 @@ pub struct Session {
     /// stderr-streaming task (via `WorkerSpec`) and read per line, so toggling
     /// mid-run takes effect on later lines.
     pub show_worker_output: Arc<AtomicBool>,
-    /// Tri-state governing `show_worker_output` (TASK-292): `Auto` (DEFAULT) lets
-    /// aish auto-show a SOLE running coordinator and revert when it finishes;
-    /// `ForcedOn`/`ForcedOff` mean the user pinned the stream with
-    /// `:worker-output on|off` — a pin ALWAYS wins, auto never overrides it.
+    /// Binary mode mirroring `show_worker_output`: `Off` (DEFAULT) keeps
+    /// coordinators quiet; `On` streams their activity. Set by `:output on|off`.
     /// Stored as a `u8` (see [`crate::worker::WorkerOutputMode`]) so it shares
     /// cheaply like `show_worker_output`; session-local, never persisted.
     pub worker_output_mode: Arc<AtomicU8>,
@@ -559,19 +557,16 @@ impl Session {
         crate::worker::WorkerOutputMode::from_u8(self.worker_output_mode.load(Ordering::SeqCst))
     }
 
-    /// Set the `:worker-output` mode (TASK-292). Setting a forced mode also pins
-    /// `show_worker_output` to match; switching back to `Auto` leaves the current
-    /// effective value in place for the next prompt-render auto-reconcile to fix.
+    /// Set the `:worker-output` mode. Pins `show_worker_output` to match.
     pub fn set_worker_output_mode(&self, mode: crate::worker::WorkerOutputMode) {
         self.worker_output_mode.store(mode.as_u8(), Ordering::SeqCst);
         match mode {
-            crate::worker::WorkerOutputMode::ForcedOn => {
+            crate::worker::WorkerOutputMode::On => {
                 self.show_worker_output.store(true, Ordering::SeqCst)
             }
-            crate::worker::WorkerOutputMode::ForcedOff => {
+            crate::worker::WorkerOutputMode::Off => {
                 self.show_worker_output.store(false, Ordering::SeqCst)
             }
-            crate::worker::WorkerOutputMode::Auto => {}
         }
     }
 
