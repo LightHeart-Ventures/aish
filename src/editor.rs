@@ -233,6 +233,10 @@ impl RustylineEditor {
         }
         // Raw mode so poll wakes on the first keystroke, not only on Enter.
         let guard = RawModeGuard::enter()?;
+        // Tell `print_above_prompt` an idle prompt is on screen with no rustyline
+        // edit-state behind it, so a forwarded worker row erases the prompt line
+        // (and flags a repaint) instead of gluing onto it. Cleared at every exit.
+        crate::tools::set_idle_prompt_active(true);
         loop {
             match poll_stdin_readable(200) {
                 Ok(true) => {
@@ -241,6 +245,7 @@ impl RustylineEditor {
                     // rustyline — it reprints the prompt and reads the buffered
                     // input with full line editing. `guard` drops here → cooked.
                     guard.restore();
+                    crate::tools::set_idle_prompt_active(false);
                     erase_prompt_line();
                     let res = self.rl.readline(prompt);
                     return Some(self.outcome(res));
@@ -248,14 +253,24 @@ impl RustylineEditor {
                 Ok(false) => {
                     if take_resume_wake() {
                         guard.restore();
+                        crate::tools::set_idle_prompt_active(false);
                         erase_prompt_line();
                         return Some(ReadOutcome::Line(String::new()));
+                    }
+                    // A worker row printed above us erased the idle prompt line
+                    // (via `print_above_prompt`); repaint it below the new output
+                    // so the cursor never sits glued to forwarded worker text.
+                    if crate::tools::take_idle_prompt_dirty() {
+                        let mut out = std::io::stdout();
+                        let _ = write!(out, "\r\x1b[2K{prompt}");
+                        let _ = out.flush();
                     }
                 }
                 Err(_) => {
                     // Hard poll failure — restore, erase, and let the caller do
                     // a plain blocking read (return None).
                     guard.restore();
+                    crate::tools::set_idle_prompt_active(false);
                     erase_prompt_line();
                     return None;
                 }
