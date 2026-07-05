@@ -32,6 +32,10 @@ use std::io::{self, Write};
 pub struct WorkerRow {
     /// Stable run id — the value handed to `attach_worker` / `close_worker`.
     pub id: String,
+    /// Worker-type glyph: 🤖 coordinator · 🎯 goal · ⏰ alert. Derived from the
+    /// task text (`crate::style::job_activity_emoji`) so the modal shows the
+    /// same type indicator the static `:workers` table stamps.
+    pub type_emoji: String,
     /// Display id (may carry a `↻N` resumed-thread marker).
     pub id_cell: String,
     /// Session label cell (e.g. `abcd *`).
@@ -332,7 +336,8 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
     });
     // Column header.
     let header = format!(
-        "  {}  {}  {}  {}",
+        "  {}  {}  {}  {}  {}",
+        pad("", 2), // type-glyph column (🤖/🎯/⏰ render 2 cells wide)
         pad("Worker", id_w),
         pad("Status", st_w + 2),
         pad("Runtime", rt_w),
@@ -356,9 +361,12 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
             "  "
         };
         let task = clip(&r.task, 60);
+        // Type glyph rides at the front (unpadded — every glyph is 2 cells, so
+        // the data columns stay aligned with the blank 2-wide header cell).
         let body = format!(
-            "{}{}  {}  {}  {}",
+            "{}{}  {}  {}  {}  {}",
             gutter,
+            r.type_emoji,
             pad(&r.id_cell, id_w),
             pad(&crate::style::styled_status(&r.status), st_w + 2),
             pad(&r.runtime_cell, rt_w),
