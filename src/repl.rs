@@ -3618,12 +3618,10 @@ fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
         print_escalation_banner(&short);
         return;
     }
+    // Fire-and-forget: unlike the old behaviour we do NOT auto-attach or turn
+    // `:output` on. The one-line `message` already carries the :attach/:output
+    // guidance (built in dispatch_coordinator), so print it and we're done.
     println!("{message}");
-    // Fire-and-forget: unlike the old behaviour we do NOT auto-attach or
-    // turn `:output` on — surface how to opt into watching/steering instead.
-    println!(
-        "\x1b[1;36m:attach {short}\x1b[0m\x1b[2m to watch + steer it · \x1b[0m\x1b[36m:output on\x1b[0m\x1b[2m to stream coordinator activity\x1b[0m"
-    );
 }
 
 /// Sentinel id `:attach goal` resolves to. Equal to the goal loop's live
