@@ -7780,6 +7780,7 @@ async fn handle_colon(
             return true;
         }
         Some("mcp") => handle_mcp(parts.collect(), session).await,
+        Some("codebase") => handle_codebase(parts.collect(), session).await,
         Some("skill" | "skills") => {
             let rest: Vec<&str> = parts.collect();
             if let Err(e) = handle_skill_command(&rest, session).await {
@@ -7990,6 +7991,100 @@ async fn handle_update(
 
 /// `:mcp` manages MCP servers (like Claude Code's `/mcp`): list, reconnect, add,
 /// remove, and inspect tools. Adds/removes persist to ~/.aish/.mcp.json.
+/// `:codebase <install|status>` — native enrollment for the DeusData
+/// `codebase-memory-mcp` server (TASK-404, SPR-071). `install` idempotently
+/// writes a `codebase-memory` stdio entry into the user-scope `~/.aish/.mcp.json`
+/// and, when the platform binary is present at `~/.aish/bin/`, connects it live
+/// so its code-intelligence tools join the model's tool set. Absence degrades
+/// gracefully: the entry is registered and the server stays dormant until the
+/// binary lands. `status` reports enrolled / binary / connected state.
+async fn handle_codebase(args: Vec<&str>, session: &mut Session) {
+    use crate::codebase_memory as cbm;
+    let home = cbm::aish_home();
+    let cfg = home.join(".mcp.json");
+    let read_root = || -> serde_json::Value {
+        std::fs::read_to_string(&cfg)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_else(|| serde_json::json!({ "mcpServers": {} }))
+    };
+    let bin = cbm::binary_path(&home);
+    let connected =
+        |session: &Session| session.mcp.server_names().iter().any(|n| n == cbm::SERVER_NAME);
+
+    match args.first().copied() {
+        None | Some("status") => {
+            let root = read_root();
+            let enrolled = cbm::is_enrolled(&root, cbm::SERVER_NAME);
+            let present = cbm::binary_present(&bin);
+            println!(
+                "codebase-memory: enrolled={enrolled}, binary={} ({}), connected={}",
+                if present { "present" } else { "missing" },
+                bin.display(),
+                connected(session),
+            );
+            if enrolled && !present {
+                println!(
+                    "  binary absent — tools stay dormant until `:codebase install` provisions it (graceful absence)."
+                );
+            } else if !enrolled {
+                println!("  run `:codebase install` to enroll the {} server.", cbm::LICENSE);
+            }
+        }
+        Some("install") => {
+            let mut root = read_root();
+            let spec = cbm::server_spec(&bin);
+            let outcome = cbm::merge_server_entry(&mut root, cbm::SERVER_NAME, spec);
+            if let Err(e) = std::fs::create_dir_all(&home).and_then(|()| {
+                std::fs::write(
+                    &cfg,
+                    format!(
+                        "{}\n",
+                        serde_json::to_string_pretty(&root).unwrap_or_default()
+                    ),
+                )
+            }) {
+                println!("codebase install: writing {}: {e}", cfg.display());
+                return;
+            }
+            match outcome {
+                cbm::MergeOutcome::Added => {
+                    println!("registered '{}' ({}) in {}", cbm::SERVER_NAME, cbm::LICENSE, cfg.display())
+                }
+                cbm::MergeOutcome::Unchanged => {
+                    println!("'{}' already registered — idempotent no-op", cbm::SERVER_NAME)
+                }
+                cbm::MergeOutcome::Updated => {
+                    println!("updated '{}' entry in {}", cbm::SERVER_NAME, cfg.display())
+                }
+            }
+            match cbm::platform_asset() {
+                None => println!(
+                    "  no prebuilt asset for {}/{} — build codebase-memory-mcp from source and place it at {}",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    bin.display(),
+                ),
+                Some(asset) if !cbm::binary_present(&bin) => println!(
+                    "  binary not yet present. Fetch {} and install it at {} (auto-download lands in a follow-up card).",
+                    cbm::asset_url(cbm::PINNED_VERSION, asset),
+                    bin.display(),
+                ),
+                Some(_) => println!("  binary present: {}", bin.display()),
+            }
+            if cbm::binary_present(&bin) && !connected(session) {
+                let added = session.mcp.reload().await;
+                if added.iter().any(|n| n == cbm::SERVER_NAME) {
+                    println!("  connected — codebase-memory tools now advertised (`:mcp tools {}`)", cbm::SERVER_NAME);
+                }
+            }
+        }
+        Some(other) => {
+            println!("usage: :codebase <install|status> (unknown subcommand '{other}')")
+        }
+    }
+}
+
 async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
     match args.split_first() {
         None | Some((&"list", _)) | Some((&"status", _)) => {
