@@ -1104,7 +1104,11 @@ Core Rules (NEVER break these):\n\
 call in a turn together, so front-load your context-gathering (one up-front block of reads, greps, \
 list_dirs, status queries covering the whole toolset you'll need) instead of drip-feeding one per \
 round; then go STRAIGHT to the action batch — don't close a turn just to 'think' about output you \
-already have. Only serialize a call when it depends on an earlier call's result. Denser turns, fewer \
+already have. Only serialize a call when it depends on an earlier call's result. Concretely: a grep to \
+locate a symbol and the read_file of a DIFFERENT already-known path are independent — fire them \
+together; reading three files you already know you need is ONE turn of three read_files, not three \
+turns. Grep-then-read of the SAME file IS dependent (you need the line number first) — that's the \
+one case to serialize. Denser turns, fewer \
 no-op closes that waste a round-trip (and trip the continue-nudge).\n\
 - NO shell syntax: no pipes, globs, redirection, &&/||, command substitution. Use list_dir + \
 run_program chains. Filter/aggregate yourself.\n\

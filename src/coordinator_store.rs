@@ -20,6 +20,35 @@ use std::sync::{Arc, Mutex};
 /// One persisted coordinator run. Mirrors `BatchRow`, but for a durable,
 /// resumable multi-round background coordinator (the default background path)
 /// rather than a single Anthropic batch.
+/// TASK-325 — aggregate token-spend across all persisted coordinator runs; the
+/// data behind the `:tokens` dashboard. `tokens_in`/`tokens_out` are summed from
+/// every run's stamped metrics (TASK-285); `ratio()` gives input:output, which
+/// climbs when prompts bloat or caching regresses. Pre-metrics / crashed-before-
+/// finish rows contribute zero but are still counted in `runs`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CostSummary {
+    pub runs: i64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub turns: i64,
+    pub tool_calls: i64,
+}
+
+impl CostSummary {
+    pub fn total_tokens(self) -> i64 {
+        self.tokens_in + self.tokens_out
+    }
+    /// Input:output token ratio (0.0 when no output has been recorded).
+    pub fn ratio(self) -> f64 {
+        if self.tokens_out == 0 {
+            0.0
+        } else {
+            self.tokens_in as f64 / self.tokens_out as f64
+        }
+    }
+}
+
+
 pub struct CoordinatorRow {
     pub run_id: String,
     pub task: String,
@@ -477,6 +506,43 @@ impl CoordinatorStore {
         Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
+    /// TASK-325 AC2/AC3 — sum token/turn/tool metrics across every persisted
+    /// run. Backs the `:tokens` dashboard and the in:out ratio. `COALESCE(...,0)`
+    /// keeps the aggregate well-defined on an empty / all-null table.
+    pub fn cost_summary(&self) -> Result<CostSummary> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0), \
+                    COALESCE(SUM(turns),0), COALESCE(SUM(tool_calls),0) \
+             FROM coordinator_runs",
+            [],
+            |r| {
+                Ok(CostSummary {
+                    runs: r.get(0)?,
+                    tokens_in: r.get(1)?,
+                    tokens_out: r.get(2)?,
+                    turns: r.get(3)?,
+                    tool_calls: r.get(4)?,
+                })
+            },
+        )
+        .map_err(Into::into)
+    }
+
+    /// TASK-325 AC3 — the `limit` runs with the highest total (in+out) token
+    /// spend, descending; ties broken by most-recent. Zero-metric runs sort last.
+    pub fn top_expensive_runs(&self, limit: usize) -> Result<Vec<CoordinatorRow>> {
+        let mut rows = self.load_all()?;
+        rows.sort_by(|a, b| {
+            (b.tokens_in + b.tokens_out)
+                .cmp(&(a.tokens_in + a.tokens_out))
+                .then(b.created_at.cmp(&a.created_at))
+        });
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+
     /// Count prior terminal-`failed` runs whose `task` text matches `task`
     /// exactly. This backs the coordinator's pre-dispatch circuit breaker
     /// (`coordinator::drive`): if the same task has already failed N times, a
@@ -868,6 +934,14 @@ mod tests {
         assert_eq!(r.turns, 7);
         assert_eq!(r.tool_calls, 42);
         assert_eq!(r.phase, "done"); // finish_run set phase + metrics as one unit
+        // TASK-325: the aggregate dashboard sees this run's stamped metrics.
+        let cs = store.cost_summary().unwrap();
+        assert_eq!(cs.runs, 1);
+        assert_eq!(cs.tokens_in, 12_345);
+        assert_eq!(cs.tokens_out, 6_789);
+        assert_eq!(cs.total_tokens(), 19_134);
+        assert_eq!(cs.turns, 7);
+        assert_eq!(cs.tool_calls, 42);
         assert_eq!(r.result.as_deref(), Some("done"));
         let _ = std::fs::remove_file(&path);
     }

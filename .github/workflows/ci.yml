@@ -39,3 +39,10 @@ jobs:
       # explicitly opts back in with `--features local`.
       - name: Test
         run: cargo test --no-default-features --locked
+
+      # SPR-059 webhook broker client (TASK-264/265/268). Hermetic tests build
+      # with --no-default-features against the in-crate MockTransport (drops the
+      # tokio-tungstenite `net` transport). Gated explicitly so the crate can't
+      # silently rot outside the root package's test surface.
+      - name: Test webhook client (SPR-059)
+        run: cargo test -p aish-webhook-client --no-default-features --locked
