@@ -2889,12 +2889,22 @@ fn read_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) 
     // line_start/line_end to read a slice, or grep_files to find the region of
     // interest first. Files at or below the cap read whole (back-compat).
     if content.len() > RANGED_READ_MAX_BYTES {
+        // TASK-333: turn the refusal into an ACTIONABLE, context-sensitive hint.
+        // It reports the file's line count and suggests a concrete first slice so
+        // the agent can retry immediately with real bounds instead of guessing.
+        let total = content.lines().count();
+        let suggested_end = total.min(200).max(1);
         return Err(anyhow::anyhow!(
-            "{} is {} bytes (> {} KiB): bulk reads without line bounds are disallowed. \
-Pass line_start/line_end to read a slice, or use grep_files to locate the region first.",
+            "{} is {} bytes / {} lines (> {} KiB): bulk reads without line bounds are disallowed. \
+Read a slice — e.g. line_start=1, line_end={} (first {} of {} lines) — or use grep_files to \
+locate the region first.",
             full.display(),
             content.len(),
+            total,
             RANGED_READ_MAX_BYTES / 1024,
+            suggested_end,
+            suggested_end,
+            total,
         ));
     }
 
@@ -5266,6 +5276,35 @@ mod fileops_tests {
         std::fs::write(dir.join("empty"), b"").unwrap();
         let r = run(&mut s, "read_file", json!({"path": "empty"})).await;
         assert!(!r.is_error, "empty file must read: {}", r.content);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // TASK-333: the oversize refusal must be an ACTIONABLE, context-sensitive
+    // hint — it reports the file's line count and suggests a concrete slice the
+    // agent can retry with, across a range of oversized files.
+    #[tokio::test]
+    async fn read_file_oversize_hint_is_actionable() {
+        let dir = tmp("readhint");
+        let mut s = yolo_session(&dir);
+
+        // ~8 KiB (600 lines) and ~20 KiB (1500 lines): both over the 5 KiB cap.
+        for (name, lines) in [("mid", 600usize), ("big", 1500usize)] {
+            let mut body = String::new();
+            for i in 0..lines {
+                body.push_str(&format!("line {i}\n"));
+            }
+            assert!(body.len() > RANGED_READ_MAX_BYTES);
+            std::fs::write(dir.join(name), body.as_bytes()).unwrap();
+            let r = run(&mut s, "read_file", json!({"path": name})).await;
+            assert!(r.is_error, "oversized {name} must be refused: {}", r.content);
+            // Reports the real line count.
+            assert!(r.content.contains(&format!("{lines} lines")), "hint must state line count: {}", r.content);
+            // Suggests a concrete, retryable slice (capped at 200 lines).
+            assert!(r.content.contains("line_start=1"), "hint must suggest a slice: {}", r.content);
+            assert!(r.content.contains("line_end=200"), "hint must cap the suggested slice: {}", r.content);
+            assert!(r.content.contains("grep_files"), "hint must mention grep_files: {}", r.content);
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
