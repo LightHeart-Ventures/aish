@@ -163,7 +163,7 @@ pub struct ReasoningEvent {
     /// Discriminates event vs. outcome records in the shared file.
     #[serde(default = "event_kind")]
     pub kind: String,
-    /// Short stable id (`rz_<8hex>`), used to link a later outcome update.
+    /// Short stable id (`rz_<16hex>`), used to link a later outcome update.
     pub id: String,
     /// ISO-8601 / RFC-3339 UTC timestamp.
     pub ts: String,
@@ -928,8 +928,9 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
-/// Short random id `rz_<8 hex>` derived from time + a counter — unique enough for
-/// linking outcome updates within a session without pulling in a uuid crate.
+/// Short id `rz_<16 hex>` = monotonic counter (low word, unique per process) +
+/// time-mixed entropy (high word) — collision-free within a session without
+/// pulling in a uuid crate.
 fn gen_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -939,7 +940,15 @@ fn gen_id() -> String {
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let mix = nanos ^ (n.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    format!("rz_{:08x}", (mix & 0xFFFF_FFFF) as u32)
+    // Low word = the monotonic counter, so ids are guaranteed unique within a
+    // process (the 32-bit time-hash alone birthday-collides at ~1% by 10k ids,
+    // which silently drops a count via the id-keyed fold map). High word = time
+    // entropy for cross-process/session distinctness.
+    format!(
+        "rz_{:08x}{:08x}",
+        (n & 0xFFFF_FFFF) as u32,
+        (mix & 0xFFFF_FFFF) as u32
+    )
 }
 
 /// Current UTC time as an ISO-8601 / RFC-3339 string (`YYYY-MM-DDTHH:MM:SSZ`),

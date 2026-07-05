@@ -1533,6 +1533,10 @@ struct CmdCache {
 /// `:` at the start of a line (or TABs a `:` prefix). Keep this in sync with the
 /// arms of `handle_colon` and the `:help` text.
 const COLON_COMMANDS: &[(&str, &str)] = &[
+    (
+        "activity",
+        "recoverable tray of fired :alerts / notable events (last N); clear",
+    ),
     ("allow", "list / revoke always-allowed tools & dir grants"),
     (
         "attach",
@@ -6091,12 +6095,44 @@ fn handle_tokens(session: &Session) {
 }
 
 
-fn handle_telemetry(sub: Option<&str>, session: &mut Session) {
+fn handle_telemetry(args: Vec<&str>, session: &mut Session) {
+    // `:telemetry skill-match <task>` — TASK-335 debug transparency: run the
+    // same semantic scorer used per-turn (crate::skill_match::skill_match) and
+    // print which skills were considered and WHY the top-2 were chosen (keyword
+    // relevance, intent→category boost, applies-to repo multiplier, unwanted-for
+    // suppression). Lets a new agent understand skill ranking without the env
+    // var (AISH_SKILL_MATCH_DEBUG) or reading the code.
+    if matches!(args.first().copied(), Some("skill-match" | "skill-matching")) {
+        let task = args[1..].join(" ");
+        if task.trim().is_empty() {
+            println!("usage: :telemetry skill-match <task text>");
+            return;
+        }
+        let scored = crate::skill_match::skill_match(&task, None, &session.skills);
+        if scored.is_empty() {
+            println!("no installed skill scored above zero for that task");
+            return;
+        }
+        println!("skill-match reasoning for: {task}");
+        for s in &scored {
+            println!(
+                "  {:<28} score={:>3}  {}",
+                s.skill.name,
+                s.score,
+                if s.reasons.is_empty() {
+                    "no signal".to_string()
+                } else {
+                    s.reasons.join("; ")
+                }
+            );
+        }
+        return;
+    }
     if session.db.is_none() {
         println!("telemetry store unavailable");
         return;
     }
-    match sub {
+    match args.first().copied() {
         Some("clear" | "reset" | "wipe") => {
             let db = session.db.as_ref().unwrap();
             match db.clear_tool_telemetry() {
@@ -6381,6 +6417,7 @@ async fn handle_colon(
                  :mcp add <name> <command|url> [args] connect + save an MCP server (~/.aish/.mcp.json)\n\
                  :mcp remove <name>                  disconnect + unsave an MCP server\n\
                  :mcp tools [name]                   list MCP tools\n\
+                 :mcp test [name|all]                live-probe MCP server(s) — tools/list round-trip + latency\n\
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
                  :context                            show context-window usage (tokens, %, memories)\n\
@@ -6389,6 +6426,7 @@ async fn handle_colon(
                  :compact                            offload older history to long-term memory now\n\
                  :memories [organize]                list stored memories, or dedup them\n\
                  :telemetry [clear]                  tool-call failure/retry-recovery stats (or wipe them)\n\
+                 :telemetry skill-match <task>       show why the semantic matcher ranks skills for a task\n\
                  :tokens                             per-run/aggregate token spend, in:out ratio, top spenders\n\
                  :version                            show aish version + backend (also `aish --version`)\n\
                  :update [prod|dev|ci]               check GitHub for a newer release and upgrade;\n\
@@ -7483,7 +7521,7 @@ async fn handle_colon(
         Some("memories" | "memory") => handle_memories(parts.next(), session),
         Some("hooks") => handle_hooks(parts.next(), session),
         Some("plugin" | "plugins") => handle_plugin(parts.collect()),
-        Some("telemetry" | "tool-stats") => handle_telemetry(parts.next(), session),
+        Some("telemetry" | "tool-stats") => handle_telemetry(parts.collect(), session),
         Some("tokens" | "token-spend") => handle_tokens(session),
         Some(other) => println!("unknown command :{other} — try :help"),
         None => {}
@@ -7791,9 +7829,29 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
                 }
             }
         }
+        Some((&"test", rest)) => {
+            let names: Vec<String> = if rest.is_empty() {
+                session.mcp.server_names()
+            } else {
+                rest.iter().map(|s| s.to_string()).collect()
+            };
+            if names.is_empty() {
+                println!("no MCP servers connected");
+            }
+            for n in names {
+                match session.mcp.test(&n).await {
+                    Ok((tools, rtt)) => println!(
+                        "  ✓ {n} — healthy, {tools} tool{} ({} ms)",
+                        if tools == 1 { "" } else { "s" },
+                        rtt.as_millis()
+                    ),
+                    Err(e) => println!("  ✗ {n} — {e:#}"),
+                }
+            }
+        }
         Some((other, _)) => {
             println!(
-                "unknown :mcp subcommand '{other}' — usage: :mcp [list|reconnect|add|remove|tools]"
+                "unknown :mcp subcommand '{other}' — usage: :mcp [list|reconnect|reload|add|remove|tools|test]"
             )
         }
     }
