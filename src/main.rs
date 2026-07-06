@@ -51,6 +51,7 @@ mod script;
 mod session;
 mod skill_match;
 mod skill_provider;
+mod skill_sources;
 mod skills;
 mod spawn_broker;
 mod spawn_broker_host;
