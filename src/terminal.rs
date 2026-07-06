@@ -1049,6 +1049,27 @@ mod tests {
     }
 
     #[test]
+    fn midturn_inline_seq_draws_bare_prompt_then_line() {
+        // Gate #1 (short / non-footer terminals): the inline affordance must
+        // carriage-return to col 0, erase the row, then paint the prompt sigil.
+        let prompt = "\x1b[2m❯\x1b[0m ";
+
+        // Turn start, nothing typed → CR + erase-line + bare prompt.
+        assert_eq!(midturn_inline_seq(prompt, ""), format!("\r\x1b[2K{prompt}"));
+
+        // Operator types → prompt + live line on the same erased row.
+        assert_eq!(
+            midturn_inline_seq(prompt, "ls -la"),
+            format!("\r\x1b[2K{prompt}ls -la")
+        );
+
+        // The inline path never touches the footer's MIDTURN_INPUT slot, so the
+        // cached status message keeps showing through the footer effective view.
+        clear_midturn_input();
+        assert_eq!(effective_status_msg("coordinating…"), "coordinating…");
+    }
+
+    #[test]
     fn spawn_footer_heartbeat_is_idempotent() {
         // Guarded by an atomic swap — only the first call spawns; repeats no-op
         // (and never panic), so a re-init on resize can't leak threads.
