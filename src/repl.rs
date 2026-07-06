@@ -6316,6 +6316,9 @@ enum SkillCmd {
     List,
     /// `:skill remove <name>`
     Remove(String),
+    /// `:skill sources` — list configured skill sources by priority.
+    Sources,
+
     /// Anything else → print usage.
     Usage,
 }
@@ -6327,6 +6330,7 @@ fn parse_skill_command(args: &[&str]) -> SkillCmd {
     match args {
         ["add", reference, ..] => SkillCmd::Add((*reference).to_string()),
         ["search", rest @ ..] if !rest.is_empty() => SkillCmd::Search(rest.join(" ")),
+        ["sources" | "src"] => SkillCmd::Sources,
         ["list" | "ls"] => SkillCmd::List,
         ["remove" | "rm" | "delete", name, ..] => SkillCmd::Remove((*name).to_string()),
         _ => SkillCmd::Usage,
@@ -6365,22 +6369,152 @@ async fn handle_skill_command(args: &[&str], session: &mut Session) -> Result<()
             skill_list(session);
             Ok(())
         }
+        SkillCmd::Sources => {
+            skill_sources_list().await;
+            Ok(())
+        }
         SkillCmd::Remove(name) => skill_remove(&name, session),
         SkillCmd::Usage => {
             println!(
-                "usage: :skill add <owner/name[@version] | github:owner/repo[/path][@ref]> | search <query> | list | remove <name>"
+                "usage: :skill add <owner/name[@version] | github:owner/repo[/path][@ref]> | search <query> | list | sources | remove <name>"
             );
             Ok(())
         }
     }
 }
 
-/// `:skill add <ref>` — fetch a SKILL.md (from skill.fish or GitHub), import it,
-/// and reload the catalog so the model can use it from the next turn. A GitHub
-/// repo spec (`github:owner/repo`) may import several skills at once.
+/// One resolved skill source for the `:skill` fan-out — the in-process builtin
+/// or a plugin script source — carrying its façade handle and routing metadata.
+struct FanoutSource {
+    /// Display / dedup label (`skillfish` for the builtin, else the source id).
+    label: String,
+    /// Merge/precedence rank; higher wins the search-dedup and add-resolution.
+    priority: i64,
+    /// True for the in-process builtin (skipped in add-resolution: it's the
+    /// fall-through, not a claiming source).
+    is_builtin: bool,
+    /// The façade used to actually run search/add.
+    source: crate::skill_sources::SkillSource,
+    /// `handles` globs the source claims for `:skill add` routing.
+    handles: Vec<String>,
+    can_search: bool,
+    can_add: bool,
+}
+
+/// Build the priority-ordered skill-source list: the always-present in-process
+/// builtin (skill.fish + GitHub, id `skillfish`, priority 100) followed by every
+/// plugin that declares `provides.skill_source`, minus pure `@builtin` façade
+/// aliases (already represented by the builtin). Sorted priority desc, label asc
+/// — the deterministic order the search fan-out and add-resolution consume
+/// (design §4). A zero-plugin shell yields exactly one source (the builtin), so
+/// `:skill search` / `:skill add` behave identically to the pre-fan-out shell.
+fn skill_fanout_sources(plugins_dir: &Path) -> Vec<FanoutSource> {
+    let mut out = vec![FanoutSource {
+        label: "skillfish".to_string(),
+        priority: 100,
+        is_builtin: true,
+        source: crate::skill_sources::SkillSource::Builtin,
+        handles: vec!["*".into(), "*/*".into(), "github:*".into()],
+        can_search: true,
+        can_add: true,
+    }];
+    for rs in crate::plugins::discover_skill_sources(plugins_dir) {
+        // A pure `@builtin` façade is just an alias of the in-process builtin;
+        // skip it so search doesn't double-hit the same registry.
+        let search_builtin = rs.search.as_deref() == Some("@builtin");
+        let add_builtin = rs.add.as_deref() == Some("@builtin");
+        let has_script_search = rs.search.as_deref().is_some_and(|s| s != "@builtin");
+        let has_script_add = rs.add.as_deref().is_some_and(|s| s != "@builtin");
+        if !has_script_search && !has_script_add && (search_builtin || add_builtin) {
+            continue;
+        }
+        if rs.search.is_none() && rs.add.is_none() {
+            continue;
+        }
+        out.push(FanoutSource {
+            label: rs.id.clone(),
+            priority: rs.priority,
+            is_builtin: false,
+            source: crate::skill_sources::SkillSource::Script {
+                plugin_dir: rs.dir.clone(),
+            },
+            handles: rs.handles.clone(),
+            can_search: has_script_search,
+            can_add: has_script_add,
+        });
+    }
+    out.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.label.cmp(&b.label)));
+    out
+}
+
+/// Glob match for a `handles` pattern against a `:skill add` reference. Supports
+/// a trailing `*` wildcard (`github:*`, `acme/*`, `*`) and exact match; `*/*`
+/// matches any single-slash `owner/name` ref.
+fn handles_match(pattern: &str, reference: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if pattern == "*/*" {
+        let parts: Vec<&str> = reference.split('/').collect();
+        return parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty();
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return reference.starts_with(prefix);
+    }
+    pattern == reference
+}
+
+/// `:skill add <ref>` — resolve the reference against configured sources in
+/// priority order (design §4.2): the first *script* source whose `handles`
+/// globs claim it fetches + imports the skill; the in-process builtin
+/// (skill.fish / GitHub) is the fall-through when no plugin claims it, preserving
+/// pre-fan-out behavior exactly for a zero-plugin shell. A GitHub repo spec
+/// (`github:owner/repo`) may import several skills at once.
 async fn skill_add(reference: &str, session: &mut Session) -> Result<()> {
     let skills_dir = skills_dir_path();
     let _ = std::fs::create_dir_all(&skills_dir);
+
+    let plugins_dir = crate::plugins::default_plugins_dir();
+    for fs in skill_fanout_sources(&plugins_dir) {
+        if fs.is_builtin || !fs.can_add {
+            continue;
+        }
+        if !fs.handles.iter().any(|h| handles_match(h, reference)) {
+            continue;
+        }
+        println!("\x1b[2mfetching {reference} via {} …\x1b[0m", fs.label);
+        match fs.source.add(reference).await {
+            Ok(metas) if !metas.is_empty() => {
+                let mut names = Vec::new();
+                for m in &metas {
+                    crate::skill_provider::import(&m.content, &skills_dir)?;
+                    let name = crate::skills::parse_frontmatter(&m.content)
+                        .map(|(n, _)| n)
+                        .unwrap_or_else(|| m.path.clone());
+                    names.push(name);
+                }
+                session.reload_skills_from(&skills_dir);
+                for name in &names {
+                    println!(
+                        "\x1b[32m✓\x1b[0m added \x1b[1m{name}\x1b[0m \x1b[2m({})\x1b[0m",
+                        fs.label
+                    );
+                }
+                let n = names.len();
+                println!(
+                    "  catalog reloaded ({n} skill{}).",
+                    if n == 1 { "" } else { "s" }
+                );
+                return Ok(());
+            }
+            Ok(_) => { /* empty result → try the next-priority source */ }
+            Err(e) => {
+                println!("\x1b[2m{} could not resolve {reference}: {e}\x1b[0m", fs.label);
+            }
+        }
+    }
+
+    // Fall-through: in-process builtin (skill.fish + GitHub), unchanged.
     println!("\x1b[2mfetching {reference} …\x1b[0m");
     let imported = crate::skill_provider::add(reference, &skills_dir).await?;
     session.reload_skills_from(&skills_dir);
@@ -6402,14 +6536,126 @@ async fn skill_add(reference: &str, session: &mut Session) -> Result<()> {
     Ok(())
 }
 
-/// `:skill search <query>` — query the skill.fish catalog and print matches.
+/// `:skill search <query>` — fan out across every searchable configured source
+/// in parallel and print merged matches. A zero-plugin / single-source shell
+/// takes the exact pre-fan-out path (no SOURCE column) so its output stays
+/// byte-identical; with ≥2 sources, results are deduped priority-first and
+/// rendered with a SOURCE column.
 async fn skill_search(query: &str) -> Result<()> {
-    let results = crate::skill_provider::search(query).await?;
+    let plugins_dir = crate::plugins::default_plugins_dir();
+    let sources = skill_fanout_sources(&plugins_dir);
+    let searchable = sources.iter().filter(|s| s.can_search).count();
+
+    // Single searchable source (the builtin, zero plugins): identical to before.
+    if searchable <= 1 {
+        let results = crate::skill_provider::search(query).await?;
+        println!(
+            "{}",
+            crate::skill_provider::print_results_table(query, &results)
+        );
+        return Ok(());
+    }
+
+    // Fan out in parallel, each source bounded by a timeout so one slow source
+    // can't wedge the whole search. Failures / timeouts fail soft.
+    let per_source = std::time::Duration::from_secs(15);
+    let mut joins = Vec::new();
+    for fs in &sources {
+        if !fs.can_search {
+            continue;
+        }
+        let src = fs.source.clone();
+        let label = fs.label.clone();
+        let q = query.to_string();
+        joins.push(tokio::spawn(async move {
+            let r = tokio::time::timeout(per_source, src.search(&q)).await;
+            (label, r)
+        }));
+    }
+
+    // Collected in spawn order == priority-desc order, so the first writer wins
+    // the dedup (higher-priority source keeps the row).
+    let mut tagged: Vec<(crate::skill_provider::SearchResult, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for j in joins {
+        let (label, res) = match j.await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let rows = match res {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(e)) => {
+                eprintln!("\x1b[2m{label}: search failed: {e}\x1b[0m");
+                continue;
+            }
+            Err(_) => {
+                eprintln!("\x1b[2m{label}: search timed out\x1b[0m");
+                continue;
+            }
+        };
+        for r in rows {
+            if seen.insert(r.ref_or_synth()) {
+                tagged.push((r, label.clone()));
+            }
+        }
+    }
+
     println!(
         "{}",
-        crate::skill_provider::print_results_table(query, &results)
+        crate::skill_provider::print_results_table_sourced(query, &tagged)
     );
     Ok(())
+}
+
+/// `:skill sources` — list every configured skill source (builtin + plugins) in
+/// priority order: SOURCE | PRIORITY | SEARCH | ADD | HANDLES.
+async fn skill_sources_list() {
+    let plugins_dir = crate::plugins::default_plugins_dir();
+    let sources = skill_fanout_sources(&plugins_dir);
+    let color = crate::style::colors_enabled();
+    let (bold, cyan, reset) = if color {
+        ("\x1b[1m", "\x1b[36m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+    let rows: Vec<(String, String, String, String, String)> = sources
+        .iter()
+        .map(|s| {
+            (
+                s.label.clone(),
+                s.priority.to_string(),
+                if s.can_search { "yes".into() } else { "-".into() },
+                if s.can_add { "yes".into() } else { "-".into() },
+                if s.handles.is_empty() {
+                    "-".into()
+                } else {
+                    s.handles.join(", ")
+                },
+            )
+        })
+        .collect();
+    let id_w = rows
+        .iter()
+        .map(|r| r.0.chars().count())
+        .chain(std::iter::once("SOURCE".len()))
+        .max()
+        .unwrap_or(6);
+    let pr_w = rows
+        .iter()
+        .map(|r| r.1.chars().count())
+        .chain(std::iter::once("PRIORITY".len()))
+        .max()
+        .unwrap_or(8);
+    println!(
+        "{bold}{:<id_w$}  {:>pr_w$}  {:<6}  {:<3}  {}{reset}",
+        "SOURCE", "PRIORITY", "SEARCH", "ADD", "HANDLES"
+    );
+    for r in &rows {
+        println!(
+            "{cyan}{:<id_w$}{reset}  {:>pr_w$}  {:<6}  {:<3}  {}",
+            r.0, r.1, r.2, r.3, r.4
+        );
+    }
 }
 
 /// Classify a skill's on-disk `SKILL.md` path into a `:skill search`-style
