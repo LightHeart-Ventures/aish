@@ -849,6 +849,117 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
     out
 }
 
+/// Like [`print_results_table`] but renders an extra **SOURCE** column naming
+/// which configured skill source produced each row — used by the `:skill search`
+/// fan-out when more than one source answered. Rows are `(result, source_label)`
+/// pairs; ranking (stars desc, stable) keeps each label glued to its row through
+/// the sort. Single-source callers use [`print_results_table`] so their output
+/// stays byte-identical to the pre-fan-out shell.
+pub fn print_results_table_sourced(query: &str, results: &[(SearchResult, String)]) -> String {
+    if results.is_empty() {
+        return format!("No skills found for {query:?}.");
+    }
+    let mut ranked: Vec<&(SearchResult, String)> = results.iter().collect();
+    ranked.sort_by(|a, b| b.0.stars.cmp(&a.0.stars));
+
+    let installed = crate::skills::load(&skills_dir_path());
+    let installed_names: std::collections::HashSet<_> =
+        installed.iter().map(|s| s.name.clone()).collect();
+
+    let names: Vec<String> = ranked.iter().map(|r| r.0.short_name()).collect();
+    let stars: Vec<String> = ranked
+        .iter()
+        .map(|r| {
+            if r.0.stars > 0 {
+                format!("★ {}", r.0.stars)
+            } else {
+                "-".to_string()
+            }
+        })
+        .collect();
+    let statuses: Vec<String> = ranked
+        .iter()
+        .map(|r| {
+            let leaf = r.0.short_name();
+            let leaf = leaf.rsplit('/').next().unwrap_or(&leaf);
+            if installed_names.contains(&leaf.to_string())
+                || (!r.0.name.is_empty() && installed_names.contains(&r.0.name))
+            {
+                "✓ installed".to_string()
+            } else {
+                String::new()
+            }
+        })
+        .collect();
+    let srcs: Vec<String> = ranked.iter().map(|r| r.1.clone()).collect();
+
+    let name_w = names
+        .iter()
+        .map(|s| s.chars().count())
+        .chain(std::iter::once("SKILL".len()))
+        .max()
+        .unwrap_or(5);
+    let star_w = stars
+        .iter()
+        .map(|s| s.chars().count())
+        .chain(std::iter::once("STARS".len()))
+        .max()
+        .unwrap_or(5);
+    let status_w = statuses
+        .iter()
+        .map(|s| s.chars().count())
+        .chain(std::iter::once("STATUS".len()))
+        .max()
+        .unwrap_or(6);
+    let src_w = srcs
+        .iter()
+        .map(|s| s.chars().count())
+        .chain(std::iter::once("SOURCE".len()))
+        .max()
+        .unwrap_or(6);
+
+    let sep = 2usize;
+    let prefix_w = name_w + sep + star_w + sep + status_w + sep + src_w + sep;
+    let tw = crate::md::term_width();
+    let desc_w = if tw == usize::MAX {
+        usize::MAX
+    } else {
+        tw.saturating_sub(prefix_w).max(20)
+    };
+    let descs: Vec<String> = ranked
+        .iter()
+        .map(|r| truncate(&r.0.description, desc_w))
+        .collect();
+
+    let color = crate::style::colors_enabled();
+    let (bold, dim, green, yellow, cyan, reset) = if color {
+        ("\x1b[1m", "\x1b[2m", "\x1b[32m", "\x1b[33m", "\x1b[36m", "\x1b[0m")
+    } else {
+        ("", "", "", "", "", "")
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:<name_w$}  {:>star_w$}  {:<status_w$}  {:<src_w$}  {}\n",
+        "SKILL", "STARS", "STATUS", "SOURCE", "DESCRIPTION"
+    ));
+    for i in 0..ranked.len() {
+        let status_color = if statuses[i].is_empty() { dim } else { green };
+        out.push_str(&format!(
+            "{bold}{:<name_w$}{reset}  {yellow}{:>star_w$}{reset}  {status_color}{:<status_w$}{reset}  {cyan}{:<src_w$}{reset}  {}\n",
+            names[i], stars[i], statuses[i], srcs[i], descs[i]
+        ));
+    }
+    let top = names.first().cloned().unwrap_or_default();
+    out.push_str(&format!(
+        "\n{} result(s) — fetch one by name, e.g. `:skill add {}`",
+        ranked.len(),
+        top
+    ));
+    out
+}
+
+
 /// Collapse newlines and cap a string at `max` display chars (ellipsis when cut).
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     let s = s.replace(['\n', '\r'], " ");
