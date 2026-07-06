@@ -796,7 +796,22 @@ pub async fn run(
                                 .count()
                         })
                         .unwrap_or(0);
-                    crate::editor::set_background_pending(outstanding_workers > 0);
+                    // Gate #2 (worker-resume review): also take the poll path
+                    // whenever this session is ATTACHED to a worker — even a
+                    // FINISHED one under review (outstanding_workers == 0). In
+                    // review mode the presenter still streams rows above the
+                    // prompt; the poll loop's dirty-repaint (take_idle_prompt_dirty)
+                    // keeps the prompt line alive, whereas the plain rustyline read
+                    // gets its prompt clobbered by those writes. `attached` is
+                    // Some(worker_id) exactly in that resume/review window.
+                    let attached_to_worker = session
+                        .attached
+                        .lock()
+                        .map(|a| a.is_some())
+                        .unwrap_or(false);
+                    crate::editor::set_background_pending(
+                        outstanding_workers > 0 || attached_to_worker,
+                    );
                     editor.read_line(&prompt)
                 }
                 },
@@ -1122,12 +1137,21 @@ pub async fn run(
                             .unwrap_or(true);
                     let (mt_line_tx, mut mt_line_rx) =
                         tokio::sync::mpsc::unbounded_channel::<String>();
+                    let midturn_prompt = "\x1b[2m❯\x1b[0m ".to_string();
                     let midturn = midturn_on.then(|| crate::keywatch::MidturnCfg {
                         line_tx: mt_line_tx,
-                        prompt: "\x1b[2m❯\x1b[0m ".to_string(),
+                        prompt: midturn_prompt.clone(),
                     });
                     let mut keywatch =
                         crate::keywatch::TurnKeyWatch::install(Some(on_shift_tab), midturn);
+                    // Prime the footer's message row with the bare prompt sigil the
+                    // moment the turn starts, so the operator can SEE there is a
+                    // prompt to type into (and Shift-Tab to cycle workers) DURING
+                    // thinking / tool-calls — not only after the first keystroke.
+                    // Cleared on turn teardown (keywatch guard → clear_midturn_input).
+                    if midturn_on {
+                        crate::terminal::set_midturn_input(&midturn_prompt, "");
+                    }
                     let turn = engine::run_turn(&backend, &mut session, line, &mut confirm);
                     tokio::pin!(turn);
                     loop {
