@@ -714,8 +714,17 @@ pub(crate) async fn search_core(query: &str) -> Result<Vec<SearchResult>> {
         .await
         .unwrap_or_default();
 
-    // (2) mcpmarket is the dynamic primary source. On any failure we degrade
+    // (2) mcpmarket is disabled by default (offline-first).
+    // Enable it with `AISH_ENABLE_MCPMARKET=1`. On any failure we degrade
     // gracefully to the embedded index rather than surfacing a network error.
+    let mcpmarket_enabled = std::env::var("AISH_ENABLE_MCPMARKET")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    
+    if !mcpmarket_enabled {
+        return Ok(local);
+    }
+    
     match search_mcpmarket(query, MCPMARKET_LIMIT).await {
         Ok(remote) if !remote.is_empty() => Ok(merge_results(remote, local)),
         _ => Ok(local),
