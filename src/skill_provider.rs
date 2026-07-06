@@ -685,7 +685,8 @@ async fn search_with_base(base: &str, query: &str) -> Result<Vec<SearchResult>> 
     parse_search_body(&body)
 }
 
-/// Search for `query` across the available skill sources.
+/// The **built-in** in-process skill source: mcpmarket.com (dynamic primary)
+/// merged over the curated, binary-embedded index (offline fallback).
 ///
 /// Source precedence (mirrors skillfish's `:skill search`):
 ///   1. An explicit `AISH_SKILL_REGISTRY` override always wins — when the user
@@ -697,8 +698,12 @@ async fn search_with_base(base: &str, query: &str) -> Result<Vec<SearchResult>> 
 ///   3. If mcpmarket is unreachable or returns nothing, fall back to the local
 ///      embedded index alone — search keeps working fully offline.
 ///
-/// An empty result list is returned as `Ok(vec![])`, never an error.
-pub async fn search(query: &str) -> Result<Vec<SearchResult>> {
+/// This is the `@builtin` leaf of the skill-source federation. It does NOT fan
+/// out to plugins itself (the public [`search`] and the repl `:skill search`
+/// fan-out do that), so the `SkillSource::Builtin` façade can delegate here
+/// without double-executing plugin handlers. An empty result list is returned
+/// as `Ok(vec![])`, never an error.
+pub(crate) async fn search_core(query: &str) -> Result<Vec<SearchResult>> {
     // (1) An explicit registry override is authoritative.
     if let Some(base) = registry_override() {
         return search_with_base(&base, query).await;
@@ -724,6 +729,79 @@ pub async fn search(query: &str) -> Result<Vec<SearchResult>> {
         Ok(remote) if !remote.is_empty() => Ok(merge_results(remote, local)),
         _ => Ok(local),
     }
+}
+
+/// Fan out `query` to every plugin-provided skill source (`provides.skill_source`
+/// with a real `search.sh` handler), highest-priority first, and collect their
+/// hits. This is the plugin federation layer: each source runs in the plugin's
+/// dir through the [`crate::skill_sources::SkillSource::Script`] façade (env in,
+/// JSON array out — the `AISH_SKILL_QUERY` contract). Fail-soft: a source that
+/// errors, or returns nothing, is skipped rather than propagated, so one bad
+/// plugin can never break search.
+///
+/// A plugin declaring the reserved `@builtin` search handler is deliberately
+/// skipped here — it *is* the in-process built-in source ([`search_core`]) and
+/// executing it as a script would double-hit the registry. Results are deduped
+/// by reference in priority order (first writer wins).
+async fn search_plugins(query: &str) -> Vec<SearchResult> {
+    let plugins_dir = crate::plugins::default_plugins_dir();
+    let mut out: Vec<SearchResult> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    // `discover_skill_sources` yields sources priority-desc, id-asc, so the
+    // highest-priority source that emits a given reference wins the dedup.
+    for rs in crate::plugins::discover_skill_sources(&plugins_dir) {
+        // Only real script search handlers participate. `@builtin` is the
+        // in-process source (already covered by `search_core`); an add-only
+        // source has no `search` handler at all.
+        match rs.search.as_deref() {
+            Some(handler) if handler != "@builtin" => {}
+            _ => continue,
+        }
+        let src = crate::skill_sources::SkillSource::Script {
+            plugin_dir: rs.dir.clone(),
+        };
+        match src.search(query).await {
+            Ok(rows) => {
+                for r in rows {
+                    if seen.insert(r.ref_or_synth()) {
+                        out.push(r);
+                    }
+                }
+            }
+            // Fail-soft: skip a plugin that errored, keep the rest of the
+            // federation (and the built-in fallback) intact.
+            Err(_) => continue,
+        }
+    }
+    out
+}
+
+/// Search for `query` across the full skill-source federation.
+///
+/// Precedence: **plugin skill sources first** (highest priority — a
+/// `provides.skill_source` plugin such as `npx-skills` answers before the
+/// built-in), then the built-in [`search_core`] (mcpmarket primary + embedded
+/// fallback). Plugin hits are deduped ahead of the built-in results by
+/// reference so the same skill never shows twice; plugin failures fail soft.
+///
+/// This is the entry point for the non-interactive CLI path
+/// (`aish --skill-search`) and any direct caller (e.g. add-ref resolution). The
+/// interactive `:skill search` repl path runs its own parallel fan-out and uses
+/// [`search_core`] for its built-in leaf, so plugin handlers are not
+/// double-executed there.
+///
+/// An empty result list is returned as `Ok(vec![])`, never an error.
+pub async fn search(query: &str) -> Result<Vec<SearchResult>> {
+    // (0) Plugin skill sources are the highest-priority tier — fan out first.
+    let plugin_hits = search_plugins(query).await;
+
+    // (1) The built-in core (mcpmarket + embedded). `?` preserves the
+    // registry-override error-propagation contract; the non-override path never
+    // errors — it degrades to the embedded index.
+    let core = search_core(query).await?;
+
+    // Plugins lead; built-in results the plugins didn't already cover follow.
+    Ok(merge_results(plugin_hits, core))
 }
 
 /// Merge two result lists, preferring `primary` order and dropping any
