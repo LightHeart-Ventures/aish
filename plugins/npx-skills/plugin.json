@@ -1,0 +1,15 @@
+{
+  "id": "npx-skills",
+  "name": "npx skills (agentskills.io)",
+  "version": "1.0.0",
+  "description": "Skill source that wraps the `npx skills` CLI (agentskills.io / skill.fish ecosystem) so `:skill search` and `:skill add` can discover and install community skills without a source compiled into aish. This is the reference `provides.skill_source` plugin (design docs/design/plugin-skill-sources.md §4 shape B).",
+  "provides": {
+    "skill_source": {
+      "id": "npx-skills",
+      "priority": 90,
+      "search": "search.sh",
+      "add": "add.sh",
+      "handles": ["npx:*", "skills:*"]
+    }
+  }
+}
