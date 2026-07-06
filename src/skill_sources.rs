@@ -12,6 +12,14 @@
 //! persisted via the existing `skill_provider::import` path; this module handles
 //! *discovery* only.
 
+// The façade lands ahead of its REPL consumer: the `:skill` command wiring that
+// selects a `SkillSource` and calls `search`/`add` is a follow-up task per
+// docs/design/plugin-skill-sources.md §7 (rollout). Until that lands the public
+// surface is exercised only by this module's tests, so scope-suppress the
+// not-yet-wired dead_code lint at the module boundary rather than sprinkling
+// per-item allows.
+#![allow(dead_code)]
+
 use anyhow::{Context, Result, bail};
 use crate::skill_provider::SearchResult;
 use serde::Deserialize;
@@ -54,8 +62,8 @@ impl SkillSource {
     pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
         match self {
             SkillSource::Builtin => {
-                // Delegate to the existing in-process search path.
-                // (This is a placeholder; real impl calls skill_provider::search.)
+                // In-process path (reserved handler "@builtin", design §5): delegate
+                // straight to the existing skill_provider search.
                 crate::skill_provider::search(query).await
             }
             SkillSource::Script { plugin_dir } => {
@@ -84,9 +92,20 @@ impl SkillSource {
     pub async fn add(&self, reference: &str) -> Result<Vec<SkillMetadata>> {
         match self {
             SkillSource::Builtin => {
-                // Placeholder; real impl calls skill_provider::add(reference).
-                // Returns the imported skill metadata.
-                bail!("builtin add not yet implemented")
+                // In-process path (reserved handler "@builtin", design §5): import
+                // directly via skill_provider::add, which detects the source, fetches
+                // and writes the skill under the default skills dir, then map each
+                // imported skill to the uniform SkillMetadata shape (reading the
+                // persisted SKILL.md back so the return type matches the script path).
+                let skills_dir = default_skills_dir();
+                let imported = crate::skill_provider::add(reference, &skills_dir).await?;
+                Ok(imported
+                    .into_iter()
+                    .map(|s| SkillMetadata {
+                        content: std::fs::read_to_string(&s.path).unwrap_or_default(),
+                        path: s.name,
+                    })
+                    .collect())
             }
             SkillSource::Script { plugin_dir } => {
                 let script = plugin_dir.join("add.sh");
@@ -106,6 +125,16 @@ impl SkillSource {
             }
         }
     }
+}
+
+/// Default skills directory (`~/.aish/skills`), mirroring `skill_provider`'s
+/// internal default. Used by the `Builtin` variant when the caller does not
+/// supply an explicit dir. The REPL fall-through (design §4.2) may instead call
+/// `skill_provider::add` directly with its own known skills dir.
+fn default_skills_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".aish")
+        .join("skills")
 }
 
 /// Parse the stdout of a search handler.
@@ -244,5 +273,108 @@ mod tests {
     fn test_parse_add_result_empty() {
         let result = parse_add_result("", "author/skill");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_default_skills_dir_shape() {
+        // Builtin variant resolves the standard ~/.aish/skills location.
+        let dir = default_skills_dir();
+        assert!(dir.ends_with("skills"));
+        assert!(dir.to_string_lossy().contains(".aish"));
+    }
+
+    /// Create a unique temp dir for a script-handler fixture.
+    fn unique_tmp_dir(tag: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{tag}_{}_{}", std::process::id(), nanos))
+    }
+
+    /// Write an executable handler script into `dir`.
+    #[cfg(unix)]
+    fn write_handler(dir: &std::path::Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let script = dir.join(name);
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_script_search_executes_handler() {
+        let dir = unique_tmp_dir("skillsrc_search_ok");
+        write_handler(
+            &dir,
+            "search.sh",
+            "#!/bin/sh\ncat <<'EOF'\n[{\"name\":\"demo\",\"author\":\"acme\",\"description\":\"d\",\"version\":\"1.0.0\",\"reference\":\"acme/demo\",\"stars\":7}]\nEOF\n",
+        );
+        let src = SkillSource::Script {
+            plugin_dir: dir.clone(),
+        };
+        let res = src.search("anything").await.unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].name, "demo");
+        assert_eq!(res[0].stars, 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_script_search_nonzero_exit_errors() {
+        let dir = unique_tmp_dir("skillsrc_search_fail");
+        write_handler(&dir, "search.sh", "#!/bin/sh\necho boom >&2\nexit 3\n");
+        let src = SkillSource::Script {
+            plugin_dir: dir.clone(),
+        };
+        // Non-zero exit from run_plugin_handler propagates as an error.
+        assert!(src.search("q").await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_script_search_missing_handler_is_empty() {
+        // No search.sh present → optional handler → empty results, not an error.
+        let dir = unique_tmp_dir("skillsrc_search_none");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = SkillSource::Script {
+            plugin_dir: dir.clone(),
+        };
+        let res = src.search("q").await.unwrap();
+        assert!(res.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_script_add_executes_handler() {
+        // add.sh emits a raw SKILL.md → synthesized into a single SkillMetadata,
+        // with the path derived from the reference's trailing segment.
+        let dir = unique_tmp_dir("skillsrc_add_ok");
+        write_handler(&dir, "add.sh", "#!/bin/sh\nprintf '# Demo Skill\\n\\nbody\\n'\n");
+        let src = SkillSource::Script {
+            plugin_dir: dir.clone(),
+        };
+        let res = src.add("acme/demo").await.unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].path, "demo");
+        assert!(res[0].content.contains("Demo Skill"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_script_add_missing_handler_errors() {
+        let dir = unique_tmp_dir("skillsrc_add_none");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = SkillSource::Script {
+            plugin_dir: dir.clone(),
+        };
+        assert!(src.add("acme/demo").await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
