@@ -62,9 +62,14 @@ impl SkillSource {
     pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
         match self {
             SkillSource::Builtin => {
-                // In-process path (reserved handler "@builtin", design §5): delegate
-                // straight to the existing skill_provider search.
-                crate::skill_provider::search(query).await
+                // In-process path (reserved handler "@builtin", design §5):
+                // delegate to the built-in *core* source (mcpmarket + embedded).
+                // We call `search_core` rather than `search` so this leaf does
+                // not itself re-fan out to plugins — the federation fan-out lives
+                // one layer up (the repl `:skill search` orchestration and the
+                // public `skill_provider::search`), and double-fanning would
+                // double-execute plugin handlers.
+                crate::skill_provider::search_core(query).await
             }
             SkillSource::Script { plugin_dir } => {
                 let script = plugin_dir.join("search.sh");
