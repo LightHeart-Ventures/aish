@@ -133,6 +133,66 @@ pub fn merge_server_entry(root: &mut Value, name: &str, spec: Value) -> MergeOut
     }
 }
 
+// ---------------------------------------------------------------------------
+// TASK-407 (SPR-071): Repo-open auto-index handoff.
+//
+// When aish enters a repo carrying the `.repospec.json` habit-marker and the
+// `codebase-memory` server is enrolled + connected, warm its structural index
+// ONCE per repo-open so the graph is ready before the first coordinator query.
+// The filesystem / MCP IO lives in `engine::maybe_auto_index_repo`; the pieces
+// below are the pure, offline-testable core (tool id, args, config gate, and the
+// combined fire/no-op predicate).
+// ---------------------------------------------------------------------------
+
+/// The `codebase-memory` tool that (re)builds the structural index for a repo.
+/// The fully-qualified id advertised to the model is
+/// `mcp__codebase-memory__index_repository` (see [`index_tool_qualified`]).
+pub const INDEX_TOOL: &str = "index_repository";
+
+/// Environment variable that opts a session out of repo-open auto-indexing.
+/// Set `AISH_CODEBASE_AUTO_INDEX=0` (or `false`/`off`/`no`) to disable.
+pub const AUTO_INDEX_ENV: &str = "AISH_CODEBASE_AUTO_INDEX";
+
+/// The fully-qualified MCP tool id for the index/refresh call, in the
+/// `mcp__<server>__<tool>` shape [`crate::mcp::McpHost::call`] expects.
+pub fn index_tool_qualified() -> String {
+    format!("mcp__{SERVER_NAME}__{INDEX_TOOL}")
+}
+
+/// The JSON arguments for an index/refresh over `repo_root` — the repo whose
+/// structural graph should be warmed.
+pub fn index_args(repo_root: &Path) -> Value {
+    json!({ "path": repo_root.to_string_lossy() })
+}
+
+/// Whether repo-open auto-indexing is enabled — the AC's `auto_index` config
+/// gate. Priority: an explicit env override wins (`AISH_CODEBASE_AUTO_INDEX`),
+/// otherwise the optional `{"codebaseMemory":{"autoIndex":false}}` key in
+/// `.mcp.json`, otherwise ON by default. An empty env value is treated as unset.
+pub fn auto_index_enabled(root: &Value, env: Option<&str>) -> bool {
+    match env
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+    {
+        Some(v) => !matches!(v.as_str(), "0" | "false" | "off" | "no"),
+        None => root
+            .get("codebaseMemory")
+            .and_then(|c| c.get("autoIndex"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+    }
+}
+
+/// The combined decision: fire a repo-open auto-index only when the server is
+/// enrolled AND connected (binary present + tools live), the `auto_index` gate
+/// is on, and this repo root has not already been indexed this session
+/// (dedup → at most once per repo-open). Pure so the fire/no-op matrix is fully
+/// unit-testable without touching the filesystem or an MCP server.
+pub fn should_auto_index(enrolled: bool, connected: bool, gate_on: bool, already: bool) -> bool {
+    enrolled && connected && gate_on && !already
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +288,74 @@ mod tests {
     fn binary_path_lives_under_bin() {
         let home = PathBuf::from("/home/x/.aish");
         assert!(binary_path(&home).starts_with(home.join("bin")));
+    }
+
+    // --- TASK-407: repo-open auto-index core -------------------------------
+
+    #[test]
+    fn index_tool_is_fully_qualified_mcp_id() {
+        assert_eq!(INDEX_TOOL, "index_repository");
+        assert_eq!(
+            index_tool_qualified(),
+            format!("mcp__{SERVER_NAME}__index_repository")
+        );
+        // Round-trips through the `mcp__<server>__<tool>` shape McpHost::call parses.
+        let q = index_tool_qualified();
+        let rest = q.strip_prefix("mcp__").unwrap();
+        let (server, tool) = rest.split_once("__").unwrap();
+        assert_eq!(server, SERVER_NAME);
+        assert_eq!(tool, INDEX_TOOL);
+    }
+
+    #[test]
+    fn index_args_carry_the_repo_root_path() {
+        let args = index_args(&PathBuf::from("/home/x/proj"));
+        assert_eq!(args["path"], "/home/x/proj");
+    }
+
+    #[test]
+    fn auto_index_env_override_wins_over_config() {
+        // Config says off, but an explicit env "1" forces it on.
+        let cfg_off = json!({ "codebaseMemory": { "autoIndex": false } });
+        assert!(auto_index_enabled(&cfg_off, Some("1")));
+        // Config says on (default), but env off wins.
+        let cfg_empty = json!({});
+        for off in ["0", "false", "off", "no", "FALSE", " Off "] {
+            assert!(!auto_index_enabled(&cfg_empty, Some(off)), "{off:?}");
+        }
+        for on in ["1", "true", "yes", "anything"] {
+            assert!(auto_index_enabled(&cfg_empty, Some(on)), "{on:?}");
+        }
+    }
+
+    #[test]
+    fn auto_index_empty_env_falls_back_to_config() {
+        // An empty/whitespace env value is treated as unset → config decides.
+        let cfg_off = json!({ "codebaseMemory": { "autoIndex": false } });
+        assert!(!auto_index_enabled(&cfg_off, Some("")));
+        assert!(!auto_index_enabled(&cfg_off, Some("   ")));
+        assert!(!auto_index_enabled(&cfg_off, None));
+    }
+
+    #[test]
+    fn auto_index_defaults_on_when_unconfigured() {
+        assert!(auto_index_enabled(&json!({}), None));
+        assert!(auto_index_enabled(&json!({ "mcpServers": {} }), None));
+        // Explicit true in config also enables.
+        assert!(auto_index_enabled(
+            &json!({ "codebaseMemory": { "autoIndex": true } }),
+            None
+        ));
+    }
+
+    #[test]
+    fn should_auto_index_only_when_all_gates_pass() {
+        // The one firing combination: enrolled + connected + gate on + not-yet-done.
+        assert!(should_auto_index(true, true, true, false));
+        // Any single failing precondition suppresses the fire.
+        assert!(!should_auto_index(false, true, true, false), "not enrolled");
+        assert!(!should_auto_index(true, false, true, false), "not connected");
+        assert!(!should_auto_index(true, true, false, false), "gate off");
+        assert!(!should_auto_index(true, true, true, true), "already indexed");
     }
 }
