@@ -4805,12 +4805,14 @@ mod tests {
     }
 
     // A `sh` snippet that exits 0 iff the running shell leads its own process
-    // group. Field 1 of /proc/self/stat is the pid and field 5 is the pgrp; a
-    // foreground child that `run_on_tty` setpgid'd into its own group has
-    // pgrp == pid. `$$` stays the shell's pid inside the command substitution
-    // (POSIX), and `comm` (field 2) is `(sh)`/`(dash)` — no embedded spaces — so
-    // positional splitting keeps the fields aligned.
-    const OWN_PGRP_PROBE: &str = r#"set -- $(cat /proc/$$/stat); [ "$5" = "$1" ]"#;
+    // group. A foreground child that `run_on_tty` setpgid'd into its own group
+    // has pgrp == pid. `ps -o pgid= -p $$` prints the shell's process-group id on
+    // both BSD (macOS) and GNU (Linux) `ps` — portable, unlike `/proc/$$/stat`,
+    // which doesn't exist on macOS and made this probe pass vacuously there
+    // (empty output → `[ "" = "" ]` → exit 0, verifying nothing). `$$` stays the
+    // shell's pid inside the command substitution (POSIX); `tr -d ' '` strips the
+    // leading pad `ps` right-justifies the pgid with.
+    const OWN_PGRP_PROBE: &str = r#"[ "$(ps -o pgid= -p $$ | tr -d ' ')" = "$$" ]"#;
 
     #[tokio::test]
     async fn foreground_child_leads_its_own_process_group() {
