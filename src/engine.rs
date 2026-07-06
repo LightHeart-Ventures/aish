@@ -83,25 +83,19 @@ pub async fn run_turn(
     result
 }
 
-/// TASK-407 (SPR-071): repo-open auto-index handoff, wired to the
-/// `.repospec.json` first-visit habit. When aish is operating inside a repo that
-/// carries the repospec marker and the `codebase-memory` server is enrolled AND
-/// connected, warm its structural index ONCE per repo-open so the graph is ready
-/// before the first coordinator query. Bounded handoff: the index tool kicks a
-/// background build and returns fast, and the call is wrapped in a short timeout
-/// so a large repo can never hang the prompt. Cheap to call every turn — the
-/// dedup set short-circuits after the first fire and the only work on a miss is
-/// one `.mcp.json` read. The `auto_index` config gate (env override ->
+/// TASK-407 (SPR-071): repo-open auto-index handoff. When aish enters any repo
+/// where the `codebase-memory` server is enrolled AND connected, warm its
+/// structural index ONCE per repo-open so the graph is ready before the first
+/// coordinator query. Bounded handoff: the index tool kicks a background build
+/// and returns fast, and the call is wrapped in a short timeout so a large repo
+/// can never hang the prompt. Cheap to call every turn — the dedup set
+/// short-circuits after the first fire and the only work on a miss is one
+/// `.mcp.json` read. The `auto_index` config gate (env override ->
 /// `.mcp.json` -> default-on) honours opt-out.
 async fn maybe_auto_index_repo(session: &mut Session) {
     use crate::codebase_memory as cbm;
-    // Repo-open marker: reuse the repospec first-visit habit. No repospec -> not a
-    // "repo" in the habit sense -> nothing to warm. A `cd` into a new repospec
-    // repo fires naturally (new root not in dedup set), while re-entering an
-    // already-warmed repo is a no-op.
-    if !session.cwd.join(crate::skill_match::REPOSPEC_FILE).exists() {
-        return;
-    }
+    // Repo-open marker: check canonical cwd as the stable dedup key. No need
+    // for external markers — if the server is connected, we warm the index.
     // Stable dedup key: the canonical repo root (falls back to cwd as-is).
     let repo_root = std::fs::canonicalize(&session.cwd).unwrap_or_else(|_| session.cwd.clone());
     let already = session.codebase_indexed.contains(&repo_root);

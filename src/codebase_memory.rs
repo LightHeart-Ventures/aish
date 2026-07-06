@@ -136,12 +136,12 @@ pub fn merge_server_entry(root: &mut Value, name: &str, spec: Value) -> MergeOut
 // ---------------------------------------------------------------------------
 // TASK-407 (SPR-071): Repo-open auto-index handoff.
 //
-// When aish enters a repo carrying the `.repospec.json` habit-marker and the
-// `codebase-memory` server is enrolled + connected, warm its structural index
-// ONCE per repo-open so the graph is ready before the first coordinator query.
-// The filesystem / MCP IO lives in `engine::maybe_auto_index_repo`; the pieces
-// below are the pure, offline-testable core (tool id, args, config gate, and the
-// combined fire/no-op predicate).
+// When aish enters any repo where the `codebase-memory` server is enrolled +
+// connected, warm its structural index ONCE per repo-open so the graph is ready
+// before the first coordinator query. The filesystem / MCP IO lives in
+// `engine::maybe_auto_index_repo`; the pieces below are the pure,
+// offline-testable core (tool id, args, config gate, and the combined fire/no-op
+// predicate).
 // ---------------------------------------------------------------------------
 
 /// The `codebase-memory` tool that (re)builds the structural index for a repo.
