@@ -840,6 +840,17 @@ fn utf8_locale() -> bool {
 mod tests {
     use super::*;
 
+    /// Serializes every test that mutates a process-global footer-state
+    /// singleton — `MIDTURN_INPUT`, `READING_LINE`, `INPUT_DIRTY`. Cargo runs
+    /// unit tests multi-threaded in ONE binary, so these tests otherwise race on
+    /// the shared statics: one test's `clear_midturn_input()` /
+    /// `set_reading_line(false)` can flip the slot/flag between a sibling's set
+    /// and its assertion (observed: `coordinating…` instead of the bare prompt;
+    /// `READING_LINE` load failing right after a `set_reading_line(true)`). Every
+    /// footer-global test locks this first. Poison-tolerant: a panic while held
+    /// must not cascade-fail the siblings.
+    static FOOTER_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn alt_scroll_suppress_saves_once_then_restores() {
         // Deterministic starting point: not yet suppressed.
@@ -989,6 +1000,7 @@ mod tests {
 
     #[test]
     fn set_reading_line_toggles_and_arms_timer() {
+        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Entering a read marks the idle-at-prompt window AND refreshes the
         // timer (so the first heartbeat waits a full interval at a new prompt).
         set_reading_line(true);
@@ -1004,6 +1016,7 @@ mod tests {
 
     #[test]
     fn input_dirty_flag_round_trips_and_read_clears_it() {
+        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A non-empty in-progress line sets the dirty flag; the heartbeat reads
         // it and backs off (verified indirectly — the gate is a plain load).
         set_input_dirty(true);
@@ -1017,6 +1030,8 @@ mod tests {
 
     #[test]
     fn midturn_empty_text_surfaces_bare_prompt_then_clears() {
+        // Serialize against sibling tests that mutate footer-state globals.
+        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Turn-start priming: set_midturn_input with EMPTY text must surface the
         // bare prompt affordance (so the operator SEES a prompt to type into
         // during thinking / tool-calls), overriding the cached status message.
@@ -1050,6 +1065,9 @@ mod tests {
 
     #[test]
     fn midturn_inline_seq_draws_bare_prompt_then_line() {
+        // Serialize against sibling tests that mutate footer-state globals
+        // (this test calls clear_midturn_input at the end).
+        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Gate #1 (short / non-footer terminals): the inline affordance must
         // carriage-return to col 0, erase the row, then paint the prompt sigil.
         let prompt = "\x1b[2m❯\x1b[0m ";
