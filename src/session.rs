@@ -225,6 +225,12 @@ pub struct Session {
     /// offline `crate::skill_match::recommend_install` path). Deduped so the same
     /// "you could install `<ref>`" nudge fires at most once per session.
     pub skill_suggested: HashSet<String>,
+    /// Repo roots already handed to the `codebase-memory` server for a
+    /// structural index THIS session (TASK-407). Dedups the repo-open
+    /// auto-index so warming fires at most once per repo per session, even
+    /// though the check itself runs each turn (it's cheap: a membership test
+    /// plus, on a miss, one `.mcp.json` read).
+    pub codebase_indexed: HashSet<PathBuf>,
     /// Connected MCP servers; their tools join the model's tool set.
     pub mcp: crate::mcp::McpHost,
     /// Persistent store (history + agent memories). None if it failed to open.
@@ -584,6 +590,7 @@ impl Session {
             skills_prompt: String::new(),
             skills: Vec::new(),
             skill_suggested: HashSet::new(),
+            codebase_indexed: HashSet::new(),
             mcp: crate::mcp::McpHost::default(),
             db: None,
             raw_tool_output: false,
