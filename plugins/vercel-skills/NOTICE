@@ -1,0 +1,19 @@
+vercel-skills (aish plugin)
+===========================
+
+This plugin is a fork of vercel-labs/skills:
+
+    https://github.com/vercel-labs/skills
+    Copyright (c) Vercel, Inc.
+    Licensed under the MIT License.
+
+Forked at upstream version 1.5.15. The skill-discovery and SKILL.md
+frontmatter-parsing logic in bin/skills-json.mjs is a clean-room reimplementation
+that follows the algorithms and data model of upstream's src/skills.ts,
+src/frontmatter.ts, and src/types.ts, adapted for JSON-first output with no
+runtime dependencies.
+
+The plugin wrapper (plugin.json, skills-json.sh, README.md, REVIEW.md) is
+authored by LightHeart Ventures and licensed under Apache-2.0.
+
+Upstream MIT license text: https://github.com/vercel-labs/skills/blob/main/README.md

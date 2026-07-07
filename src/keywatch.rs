@@ -59,6 +59,23 @@ pub struct MidturnCfg {
     pub line_tx: mpsc::UnboundedSender<String>,
     /// Styled prompt sigil painted before the typed text in the footer row.
     pub prompt: String,
+    /// Gate #1 (short / non-footer terminals): when true, the reader paints the
+    /// prompt affordance INLINE (`\r\x1b[2K❯ …`) straight to stdout instead of
+    /// into the footer's message row — because there is no footer to paint into.
+    /// Best-effort visual echo behind `AISH_MIDTURN_INLINE`; Shift-Tab + line
+    /// capture work regardless. Set false whenever a footer region exists (the
+    /// footer path is cleaner and race-free).
+    pub inline: bool,
+}
+
+/// Paint the mid-turn prompt + in-progress line, routing to the footer message
+/// row or the inline path per [`MidturnCfg::inline`].
+fn paint_midturn(cfg: &MidturnCfg, text: &str) {
+    if cfg.inline {
+        crate::terminal::set_midturn_inline(&cfg.prompt, text);
+    } else {
+        crate::terminal::set_midturn_input(&cfg.prompt, text);
+    }
 }
 
 /// A callback the reader thread invokes DIRECTLY on a mid-turn Shift-Tab, so the
@@ -284,12 +301,14 @@ fn reader_loop(
             for key in parser.decode(chunk) {
                 match linebuf.apply(key) {
                     Action::None => {
-                        crate::terminal::set_midturn_input(&cfg.prompt, &linebuf.as_string());
+                        paint_midturn(cfg, &linebuf.as_string());
                     }
                     Action::Submit(line) => {
                         let _ = cfg.line_tx.send(line);
-                        // Line consumed → restore the normal status message.
-                        crate::terminal::set_midturn_input(&cfg.prompt, "");
+                        // Line consumed → return to the bare prompt affordance
+                        // (still mid-turn); the cached status message is restored
+                        // only on turn teardown via clear_midturn_input.
+                        paint_midturn(cfg, "");
                     }
                     Action::CycleWorker => {
                         if let Some(cb) = on_shift_tab.as_ref() {
@@ -326,6 +345,9 @@ fn reader_loop(
 /// Pending forever).
 pub struct TurnKeyWatch {
     active: bool,
+    /// Whether this turn's mid-turn capture used the inline (non-footer) paint
+    /// path, so Drop knows to erase the inline affordance row on teardown.
+    midturn_inline: bool,
     rx: mpsc::UnboundedReceiver<TurnKey>,
     /// Kept alive so the channel never closes while inert — `recv()` then stays
     /// Pending rather than resolving `None` and busy-spinning the `select!`.
@@ -353,6 +375,7 @@ impl TurnKeyWatch {
         if !stdin_is_tty() || g.installed.load(Ordering::Acquire) {
             return TurnKeyWatch {
                 active: false,
+                midturn_inline: false,
                 rx,
                 _keepalive: tx,
                 handle: None,
@@ -361,6 +384,7 @@ impl TurnKeyWatch {
         let Some(cooked) = get_termios() else {
             return TurnKeyWatch {
                 active: false,
+                midturn_inline: false,
                 rx,
                 _keepalive: tx,
                 handle: None,
@@ -371,6 +395,7 @@ impl TurnKeyWatch {
         g.stop.store(false, Ordering::Release);
         g.installed.store(true, Ordering::Release);
         set_termios(&cbreak_from(&cooked));
+        let midturn_inline = midturn.as_ref().map(|c| c.inline).unwrap_or(false);
         let reader_tx = tx.clone();
         let handle = std::thread::Builder::new()
             .name("aish-keywatch".into())
@@ -378,6 +403,7 @@ impl TurnKeyWatch {
             .ok();
         TurnKeyWatch {
             active: handle.is_some(),
+            midturn_inline,
             rx,
             _keepalive: tx,
             handle,
@@ -404,8 +430,12 @@ impl Drop for TurnKeyWatch {
         }
         apply_cooked();
         // Drop any mid-turn type-ahead echo so the footer returns to its normal
-        // coordinator status message once the turn's capture ends.
+        // coordinator status message once the turn's capture ends. In inline mode
+        // (no footer) also erase the inline affordance row we painted directly.
         crate::terminal::clear_midturn_input();
+        if self.midturn_inline {
+            crate::terminal::clear_midturn_inline();
+        }
         g.installed.store(false, Ordering::Release);
     }
 }

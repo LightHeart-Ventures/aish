@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/webhook-receiver", "crates/aish-webhook-client"]
+members = [".", "crates/webhook-receiver", "crates/aish-webhook-client", "crates/git-discover"]
 resolver = "2"
 
 [package]
@@ -43,6 +43,10 @@ tracing = "0.1"
 # default `net` feature (tungstenite transport) on regardless of aish's own
 # `--no-default-features` CI gate, which only toggles aish's `local` feature.
 aish-webhook-client = { path = "crates/aish-webhook-client" }
+# git-discover: zero-dep repo detection ("what repo am I in right now?"). Gives
+# aish a single typed entry point (git_discover::discover) for a checkout's
+# identity + state, replacing ad-hoc `git rev-parse` shelling at call sites.
+git-discover = { path = "crates/git-discover" }
 
 [features]
 default = []
