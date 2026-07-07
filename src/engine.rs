@@ -28,6 +28,22 @@ type SpinState = Arc<Mutex<Spin>>;
 // answer before the hard limit is ever reached.
 const MAX_ITERATIONS: usize = 50;
 
+/// Operator override for the serial-chain yield depth, read from
+/// `AISH_SERIAL_CHAIN_YIELD_DEPTH`. Defaults to
+/// [`crate::loopguard::SERIAL_CHAIN_YIELD_DEPTH`]; a parsed value is honoured
+/// only inside `[1, 1000]`, otherwise the default stands (a typo can never
+/// uncap or zero-cap the guard). Lets a genuinely-serial workload — a long
+/// chain of dependent calls that cannot be batched — raise the ceiling instead
+/// of false-tripping the yield and burning the coordinator's auto-recovery
+/// budget. Same forgiving parse/clamp discipline as `AISH_COORDINATOR_MAX_ROUNDS`.
+fn serial_chain_yield_depth() -> usize {
+    std::env::var("AISH_SERIAL_CHAIN_YIELD_DEPTH")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| (1..=1000).contains(&n))
+        .unwrap_or(crate::loopguard::SERIAL_CHAIN_YIELD_DEPTH)
+}
+
 /// One full agentic turn: user input → (model ⇄ tools)* → final text.
 /// Frontend-agnostic: confirmation is a callback, output goes through eprintln
 /// only for transient activity lines.
@@ -324,7 +340,8 @@ async fn run_turn_inner(
     // even when the calls differ (not a loop) and the budget is not yet spent.
     // Past `SERIAL_CHAIN_YIELD_DEPTH` the turn yields with a resumable banner so
     // the durable coordinator loop checkpoints and re-plans toward batching.
-    let mut serial_chain_guard = crate::loopguard::SerialChainGuard::default();
+    let mut serial_chain_guard =
+        crate::loopguard::SerialChainGuard::with_threshold(serial_chain_yield_depth());
     // TASK-357: cumulative per-turn tool-call budget. Counts EVERY tool call
     // executed across the whole turn (a batched round of N advances it by N),
     // orthogonal to the round/iteration budget and the serial-chain SHAPE guard.
