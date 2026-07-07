@@ -126,6 +126,7 @@ rather than letting redundant work run.
 | `AISH_COORDINATOR_MAX_FAILED_ATTEMPTS` | 3 | 0–1000 | Pre-dispatch circuit-breaker threshold; `0` disables. |
 | `AISH_COORDINATOR_FAILED_KEEP` | 50 | 0–100000 | Max retained terminal `failed` rows (keep-recent bound); `0` keeps none. |
 | `AISH_COORDINATOR_FAILED_MAX_AGE_DAYS` | 14 | 0–3650 | Drop retained `failed` rows older than this many days. |
+| `AISH_SERIAL_CHAIN_YIELD_DEPTH` | 8 | 1–1000 | Consecutive single-tool-call rounds allowed before a turn gracefully yields (`serial-chain-yield`). Raise it for genuinely-serial workloads whose dependent calls can't be batched, so they don't false-trip and exhaust the auto-recovery budget. Default behaviour is unchanged. |
 
 ## Tests
 
