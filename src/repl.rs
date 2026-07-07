@@ -1400,6 +1400,80 @@ fn recent_message_row(baseline: String, flash: Option<String>) -> String {
 ///
 /// The returned string is already colorized (ANSI when color is enabled); the
 /// footer renderer clips it to width via `clip_visible`, which is escape-aware.
+/// How long a cached statusline-segment file may go un-refreshed before we stop
+/// surfacing it. A live plugin rewrites its `*.txt` on a cadence (ccquota every
+/// ~600s); once it stops (uninstalled / crashed) we don't want its last badge
+/// pinned to the footer forever. One hour is generous for slow refreshers.
+const STATUSLINE_SEGMENT_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Hard cap on the visible width of the folded segment area, so a verbose plugin
+/// can't crowd the live coordinator/schedule hint off the SecondStatusLine.
+const STATUSLINE_SEGMENT_MAX_COLS: usize = 48;
+
+/// The directory plugins drop cached SecondStatusLine segment files into:
+/// `~/.aish/state/statusline/`. `None` when `$HOME` is unset (segments off).
+fn statusline_segment_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(
+        PathBuf::from(home)
+            .join(".aish")
+            .join("state")
+            .join("statusline"),
+    )
+}
+
+/// Read cached SecondStatusLine segment files from `dir` (`*.txt`), returning
+/// each file's first non-empty line as a ready-to-render segment (the plugin
+/// owns the color codes). Pure + injectable (`now`/`stale_after`) so it unit
+/// tests without touching the real home dir. Skips: non-`.txt` files, files
+/// whose mtime is older than `stale_after` (a plugin that stopped refreshing),
+/// empty/whitespace-only bodies, and anything unreadable. Sorted by file name
+/// for stable, deterministic ordering across plugins.
+fn statusline_segments(
+    dir: &Path,
+    now: std::time::SystemTime,
+    stale_after: std::time::Duration,
+) -> Vec<String> {
+    let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("txt"))
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    entries.sort();
+    let mut out = Vec::new();
+    for path in entries {
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if let Ok(modified) = meta.modified() {
+            if now
+                .duration_since(modified)
+                .map(|age| age > stale_after)
+                .unwrap_or(false)
+            {
+                continue; // stale — plugin stopped refreshing
+            }
+        }
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(line) = body
+            .lines()
+            .map(str::trim_end)
+            .find(|l| !l.trim().is_empty())
+        {
+            out.push(line.to_string());
+        }
+    }
+    out
+}
+
+
 fn coordinator_status_message(session: &Session) -> String {
     let attached = session.attached.lock().unwrap().clone();
     // Same ordering as `cycle_worker`: newest coordinator first (spawn order
@@ -1447,6 +1521,31 @@ fn coordinator_status_message(session: &Session) -> String {
     // it. With no flash pending, the live attach/detach + schedule hint shows
     // through. The flash is dropped on the next attach/detach transition so the
     // fresh hint resurfaces.
+    // Fold cached plugin statusline segments (`~/.aish/state/statusline/*.txt`)
+    // onto the SecondStatusLine — e.g. the ccquota Claude-Code subscription-burn
+    // badge (SPR-073). Any plugin can drop a colorized `*.txt` file here; we read
+    // it cheaply on the idle repaint tick (no keystroke needed). Files gone stale
+    // (a plugin that stopped refreshing) or unreadable are skipped. Placed to the
+    // RIGHT of the live coordinator/schedule hint so operator state stays primary.
+    if let Some(dir) = statusline_segment_dir() {
+        let segs = statusline_segments(
+            &dir,
+            std::time::SystemTime::now(),
+            STATUSLINE_SEGMENT_STALE_AFTER,
+        );
+        if !segs.is_empty() {
+            let joined = segs.join("  \u{b7}  ");
+            // Bound the segment area (escape-aware clip keeps ANSI intact) so a
+            // chatty plugin can't crowd the live hint off the row.
+            let clamped = crate::terminal::clip_visible(&joined, STATUSLINE_SEGMENT_MAX_COLS);
+            left = if left.is_empty() {
+                clamped
+            } else {
+                format!("{left}  \u{b7}  {clamped}")
+            };
+        }
+    }
+
     left = recent_message_row(left, session.flash.lock().ok().and_then(|b| b.clone()));
     // Right-justify the session name (`:rename`) on this row, directly above the
     // clock on the statusline below — in bold magenta. Blank when unnamed.
@@ -8746,6 +8845,60 @@ mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
     use std::collections::HashMap;
+
+    // ---- SPR-073: file-backed statusline segments (TASK-316) ---------------
+
+    #[test]
+    fn statusline_segments_reads_sorted_nonempty_txt() {
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!(
+            "aish_seg_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("20-ccquota.txt"), "\u{2691} wk 88%\n").unwrap();
+        std::fs::write(dir.join("10-first.txt"), "  \nFIRST body\nsecond\n").unwrap();
+        std::fs::write(dir.join("30-empty.txt"), "   \n\n").unwrap(); // skipped: blank
+        std::fs::write(dir.join("40-note.md"), "not a txt").unwrap(); // skipped: ext
+        let segs = statusline_segments(&dir, SystemTime::now(), Duration::from_secs(3600));
+        assert_eq!(
+            segs,
+            vec!["FIRST body".to_string(), "\u{2691} wk 88%".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn statusline_segments_skips_stale_and_missing_dir() {
+        use std::time::{Duration, SystemTime};
+        // Missing dir → empty, no panic.
+        let missing =
+            std::env::temp_dir().join(format!("aish_seg_missing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(statusline_segments(&missing, SystemTime::now(), Duration::from_secs(3600))
+            .is_empty());
+        // Stale file → skipped (now is 5s past mtime, stale_after = 0).
+        let dir = std::env::temp_dir().join(format!(
+            "aish_seg_stale_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("badge.txt"), "STALE\n").unwrap();
+        let future = SystemTime::now() + Duration::from_secs(5);
+        assert!(statusline_segments(&dir, future, Duration::from_secs(0)).is_empty());
+        // A generous fresh window includes it again.
+        let fresh = statusline_segments(&dir, SystemTime::now(), Duration::from_secs(3600));
+        assert_eq!(fresh, vec!["STALE".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // `:goal complete <phrase>` must route to the pursuit loop, not the CRUD
     // `complete` subcommand — only goal-id-shaped (hex/uuid) tails are refs.
