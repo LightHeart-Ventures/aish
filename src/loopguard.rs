@@ -641,9 +641,11 @@ read that exact line).]",
 /// call (not just batchable reads) and drives a turn-yield rather than a mere
 /// prompt nudge: a long serial chain drains the rate-limit window — every round
 /// re-sends the whole context — even when the individual calls differ (so it is
-/// not a loop) and the budget is not yet spent. Set to 8 per the card's ">8
-/// sequential calls" policy, so the 9th consecutive lone call trips the yield.
-pub const SERIAL_CHAIN_YIELD_DEPTH: usize = 8;
+/// not a loop) and the budget is not yet spent. Raised to 12 (from the original
+/// 8) so genuinely-serial dependent chains — which cannot be batched — run
+/// deeper before yielding instead of false-tripping every 8 rounds and draining
+/// the coordinator's auto-recovery budget; the 13th consecutive lone call trips.
+pub const SERIAL_CHAIN_YIELD_DEPTH: usize = 12;
 
 /// Tracks the current run of consecutive single-tool-call rounds within one
 /// `run_turn` and signals when the chain has grown deep enough to yield. Lives
@@ -1129,8 +1131,8 @@ mod tests {
                 "round {i} (≤ threshold) must not yield"
             );
         }
-        // …the very next one (the 9th with the default threshold of 8) trips it,
-        // reporting the streak length reached.
+        // …the very next one (the 13th with the default threshold of 12) trips
+        // it, reporting the streak length reached.
         assert_eq!(
             g.record(1),
             Some(SERIAL_CHAIN_YIELD_DEPTH + 1),
@@ -1142,7 +1144,7 @@ mod tests {
     fn serial_chain_guard_honors_threshold_override() {
         // An operator override (env AISH_SERIAL_CHAIN_YIELD_DEPTH, resolved by
         // the engine) lets a genuinely-serial workload run deeper before the
-        // turn yields — the default of 8 is not a hard ceiling.
+        // turn yields — the default of 12 is not a hard ceiling.
         let raised = SERIAL_CHAIN_YIELD_DEPTH + 4;
         let mut g = SerialChainGuard::with_threshold(raised);
         for i in 1..=raised {
