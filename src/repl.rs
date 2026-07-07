@@ -796,7 +796,22 @@ pub async fn run(
                                 .count()
                         })
                         .unwrap_or(0);
-                    crate::editor::set_background_pending(outstanding_workers > 0);
+                    // Gate #2 (worker-resume review): also take the poll path
+                    // whenever this session is ATTACHED to a worker — even a
+                    // FINISHED one under review (outstanding_workers == 0). In
+                    // review mode the presenter still streams rows above the
+                    // prompt; the poll loop's dirty-repaint (take_idle_prompt_dirty)
+                    // keeps the prompt line alive, whereas the plain rustyline read
+                    // gets its prompt clobbered by those writes. `attached` is
+                    // Some(worker_id) exactly in that resume/review window.
+                    let attached_to_worker = session
+                        .attached
+                        .lock()
+                        .map(|a| a.is_some())
+                        .unwrap_or(false);
+                    crate::editor::set_background_pending(
+                        outstanding_workers > 0 || attached_to_worker,
+                    );
                     editor.read_line(&prompt)
                 }
                 },
@@ -1112,22 +1127,46 @@ pub async fn run(
                                 goal_active,
                             );
                         });
-                    // Mid-turn type-ahead is enabled only when the pinned footer
-                    // is active (so the typed line can be echoed into its message
-                    // row). Escape hatch: set AISH_MIDTURN_INPUT=0 to disable and
-                    // fall back to the legacy Shift-Tab-only reader.
-                    let midturn_on = footer_active
-                        && std::env::var("AISH_MIDTURN_INPUT")
-                            .map(|v| v != "0")
-                            .unwrap_or(true);
+                    // Mid-turn type-ahead is normally enabled only when the pinned
+                    // footer is active (so the typed line can be echoed into its
+                    // message row). Gate #1: on a short / non-footer terminal there
+                    // IS no message row, so opt into an INLINE affordance
+                    // (`\r\x1b[2K❯ …` above the stream) with AISH_MIDTURN_INLINE=1.
+                    // Escape hatch: AISH_MIDTURN_INPUT=0 disables mid-turn capture
+                    // entirely (legacy Shift-Tab-only reader).
+                    let midturn_input_enabled = std::env::var("AISH_MIDTURN_INPUT")
+                        .map(|v| v != "0")
+                        .unwrap_or(true);
+                    let midturn_inline_requested = std::env::var("AISH_MIDTURN_INLINE")
+                        .map(|v| v != "0" && !v.is_empty())
+                        .unwrap_or(false);
+                    // Inline only kicks in when there's no footer to paint into;
+                    // with a footer the (race-free) footer path always wins.
+                    let midturn_inline = midturn_inline_requested && !footer_active;
+                    let midturn_on =
+                        midturn_input_enabled && (footer_active || midturn_inline);
                     let (mt_line_tx, mut mt_line_rx) =
                         tokio::sync::mpsc::unbounded_channel::<String>();
+                    let midturn_prompt = "\x1b[2m❯\x1b[0m ".to_string();
                     let midturn = midturn_on.then(|| crate::keywatch::MidturnCfg {
                         line_tx: mt_line_tx,
-                        prompt: "\x1b[2m❯\x1b[0m ".to_string(),
+                        prompt: midturn_prompt.clone(),
+                        inline: midturn_inline,
                     });
                     let mut keywatch =
                         crate::keywatch::TurnKeyWatch::install(Some(on_shift_tab), midturn);
+                    // Prime the prompt sigil the moment the turn starts, so the
+                    // operator can SEE there is a prompt to type into (and Shift-Tab
+                    // to cycle workers) DURING thinking / tool-calls — not only after
+                    // the first keystroke. Route to the footer message row or the
+                    // inline path per gate. Cleared on turn teardown (keywatch guard).
+                    if midturn_on {
+                        if midturn_inline {
+                            crate::terminal::set_midturn_inline(&midturn_prompt, "");
+                        } else {
+                            crate::terminal::set_midturn_input(&midturn_prompt, "");
+                        }
+                    }
                     let turn = engine::run_turn(&backend, &mut session, line, &mut confirm);
                     tokio::pin!(turn);
                     loop {

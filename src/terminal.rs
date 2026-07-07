@@ -79,20 +79,23 @@ fn effective_status_msg(cached: &str) -> String {
     }
 }
 
-/// Paint the operator's mid-turn type-ahead line into the footer's message row.
-/// `styled_prompt` is emitted verbatim (already colour-styled) before `text`; an
-/// empty `text` clears the override so the normal status message returns. No
-/// visible effect when no footer region is installed (short terminal / non-tty),
-/// but the override slot is still updated. Safe to call from the keywatch reader
-/// thread — it locks stdout + a mutex exactly like the idle heartbeat repaint.
+/// Paint the operator's mid-turn prompt + type-ahead line into the footer's
+/// message row. `styled_prompt` is emitted verbatim (already colour-styled)
+/// before `text`. An empty `text` now means "nothing typed yet" and surfaces the
+/// BARE PROMPT sigil (so the operator can SEE there is a prompt to type into
+/// during thinking / tool-calls) rather than removing the override — the normal
+/// status message is restored only on turn teardown via [`clear_midturn_input`].
+/// No visible effect when no footer region is installed (short terminal /
+/// non-tty), but the override slot is still updated. Safe to call from the
+/// keywatch reader thread — it locks stdout + a mutex exactly like the idle
+/// heartbeat repaint.
 pub fn set_midturn_input(styled_prompt: &str, text: &str) {
     {
         let mut slot = MIDTURN_INPUT.lock().unwrap();
-        *slot = if text.is_empty() {
-            None
-        } else {
-            Some(format!("{styled_prompt}{text}"))
-        };
+        // Always surface at least the bare prompt affordance during a turn; append
+        // the live line as the operator types. `clear_midturn_input` (turn
+        // teardown) is what restores the cached status message.
+        *slot = Some(format!("{styled_prompt}{text}"));
     }
     paint_cached_footer(false);
 }
@@ -109,6 +112,39 @@ pub fn clear_midturn_input() {
         *slot = None;
     }
     paint_cached_footer(false);
+}
+
+/// Build the escape sequence that renders the mid-turn prompt affordance
+/// INLINE, for terminals with no pinned footer message row (height <
+/// [`MIN_FOOTER_ROWS`], or a non-footer tty). Returns
+/// `\r\x1b[2K{styled_prompt}{text}`: carriage-return to column 0, erase the
+/// whole line, then paint the (already colour-styled) bare prompt sigil plus any
+/// typed text. Pure builder so it can be unit-tested without a real terminal.
+pub fn midturn_inline_seq(styled_prompt: &str, text: &str) -> String {
+    format!("\r\x1b[2K{styled_prompt}{text}")
+}
+
+/// Paint the mid-turn prompt affordance INLINE on the current cursor row (for
+/// short / non-footer terminals). Writes straight to stdout from the keywatch
+/// reader thread. This is the Gate #1 path behind `AISH_MIDTURN_INLINE`: it is
+/// best-effort (it can race the engine's output writes on the main thread), so
+/// the footer path ([`set_midturn_input`]) is always preferred when a footer
+/// region exists. No MIDTURN_INPUT slot is touched — the affordance is drawn,
+/// not cached, since there is no footer to repaint it into.
+pub fn set_midturn_inline(styled_prompt: &str, text: &str) {
+    let mut out = std::io::stdout();
+    let _ = write!(out, "{}", midturn_inline_seq(styled_prompt, text));
+    let _ = out.flush();
+    note_footer_activity();
+}
+
+/// Erase an inline mid-turn prompt affordance at turn teardown (carriage-return
+/// + erase-line). Pairs with [`set_midturn_inline`]; a no-op-looking write that
+/// keeps the flag-gated inline path from leaving a stale `❯` on the row.
+pub fn clear_midturn_inline() {
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\r\x1b[2K");
+    let _ = out.flush();
 }
 
 // ---------------------------------------------------------------------------
@@ -804,6 +840,17 @@ fn utf8_locale() -> bool {
 mod tests {
     use super::*;
 
+    /// Serializes every test that mutates a process-global footer-state
+    /// singleton — `MIDTURN_INPUT`, `READING_LINE`, `INPUT_DIRTY`. Cargo runs
+    /// unit tests multi-threaded in ONE binary, so these tests otherwise race on
+    /// the shared statics: one test's `clear_midturn_input()` /
+    /// `set_reading_line(false)` can flip the slot/flag between a sibling's set
+    /// and its assertion (observed: `coordinating…` instead of the bare prompt;
+    /// `READING_LINE` load failing right after a `set_reading_line(true)`). Every
+    /// footer-global test locks this first. Poison-tolerant: a panic while held
+    /// must not cascade-fail the siblings.
+    static FOOTER_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn alt_scroll_suppress_saves_once_then_restores() {
         // Deterministic starting point: not yet suppressed.
@@ -953,6 +1000,7 @@ mod tests {
 
     #[test]
     fn set_reading_line_toggles_and_arms_timer() {
+        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Entering a read marks the idle-at-prompt window AND refreshes the
         // timer (so the first heartbeat waits a full interval at a new prompt).
         set_reading_line(true);
@@ -968,6 +1016,7 @@ mod tests {
 
     #[test]
     fn input_dirty_flag_round_trips_and_read_clears_it() {
+        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A non-empty in-progress line sets the dirty flag; the heartbeat reads
         // it and backs off (verified indirectly — the gate is a plain load).
         set_input_dirty(true);
@@ -977,6 +1026,65 @@ mod tests {
         set_reading_line(true);
         assert!(!INPUT_DIRTY.load(Ordering::Relaxed));
         set_reading_line(false);
+    }
+
+    #[test]
+    fn midturn_empty_text_surfaces_bare_prompt_then_clears() {
+        // Serialize against sibling tests that mutate footer-state globals.
+        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Turn-start priming: set_midturn_input with EMPTY text must surface the
+        // bare prompt affordance (so the operator SEES a prompt to type into
+        // during thinking / tool-calls), overriding the cached status message.
+        // Teardown (clear_midturn_input) must restore the cached status message.
+        // Locks in the ISS fix for "no visible prompt while the turn runs".
+        let prompt = "\x1b[2m❯\x1b[0m ";
+
+        // Baseline: no override → cached status shows through.
+        clear_midturn_input();
+        assert_eq!(effective_status_msg("coordinating…"), "coordinating…");
+
+        // Turn start, nothing typed yet → bare prompt is surfaced.
+        set_midturn_input(prompt, "");
+        assert_eq!(effective_status_msg("coordinating…"), prompt);
+
+        // Operator types → prompt + live line replaces the status row.
+        set_midturn_input(prompt, "ls -la");
+        assert_eq!(
+            effective_status_msg("coordinating…"),
+            format!("{prompt}ls -la")
+        );
+
+        // Turn teardown → cached status message restored.
+        clear_midturn_input();
+        assert_eq!(effective_status_msg("coordinating…"), "coordinating…");
+
+        // Idempotent: a second clear is a no-op (no panic, stays cleared).
+        clear_midturn_input();
+        assert_eq!(effective_status_msg("idle"), "idle");
+    }
+
+    #[test]
+    fn midturn_inline_seq_draws_bare_prompt_then_line() {
+        // Serialize against sibling tests that mutate footer-state globals
+        // (this test calls clear_midturn_input at the end).
+        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Gate #1 (short / non-footer terminals): the inline affordance must
+        // carriage-return to col 0, erase the row, then paint the prompt sigil.
+        let prompt = "\x1b[2m❯\x1b[0m ";
+
+        // Turn start, nothing typed → CR + erase-line + bare prompt.
+        assert_eq!(midturn_inline_seq(prompt, ""), format!("\r\x1b[2K{prompt}"));
+
+        // Operator types → prompt + live line on the same erased row.
+        assert_eq!(
+            midturn_inline_seq(prompt, "ls -la"),
+            format!("\r\x1b[2K{prompt}ls -la")
+        );
+
+        // The inline path never touches the footer's MIDTURN_INPUT slot, so the
+        // cached status message keeps showing through the footer effective view.
+        clear_midturn_input();
+        assert_eq!(effective_status_msg("coordinating…"), "coordinating…");
     }
 
     #[test]
