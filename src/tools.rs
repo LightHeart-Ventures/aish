@@ -3409,21 +3409,50 @@ fn list_dir(call: &ToolCall, session: &Session) -> Result<(String, serde_json::V
         return Ok(("[empty directory]".into(), serde_json::Value::Array(vec![])));
     }
     // TASK-322: cap oversized listings. Truncate BOTH the text and the JSON
-    // payload to the same `max` entries and warn so the agent narrows the path
-    // (or re-lists with a higher `max`) instead of drowning in output.
+    // payload to the SAME rows so the human-facing text (`content`) and the
+    // model-facing payload (`structured`) can never list different files — the
+    // "the text and JSON can never drift" invariant this fn documents, and the
+    // "the human always sees the verbatim tool output" promise in
+    // backend::ToolResult. Two caps fold into one row-count truncation:
+    //   1. the entry cap (`max`, TASK-322), and
+    //   2. the byte cap (`MAX_OUTPUT`) on the rendered text.
+    // Applying `truncate_middle` to the text ALONE (the old tail) dropped file
+    // lines from the middle of the listing while leaving every entry in the JSON
+    // payload — so a long listing showed the operator fewer files than the model
+    // saw. We instead drop whole trailing rows until the text fits, and rebuild
+    // both halves from that identical row set.
     let total = rows.len();
-    let truncated = total > max;
-    if truncated {
+    if rows.len() > max {
         rows.truncate(max);
     }
+    // Byte cap: keep only as many leading rows as fit under MAX_OUTPUT (each row
+    // costs its line length + 1 for the '\n' join). Reserve headroom for the
+    // truncation marker so the final text never exceeds the cap.
+    const MARKER_HEADROOM: usize = 96;
+    let budget = MAX_OUTPUT.saturating_sub(MARKER_HEADROOM);
+    let mut used = 0usize;
+    let mut fit = 0usize;
+    for (line, _) in &rows {
+        let cost = line.len() + 1;
+        if fit > 0 && used + cost > budget {
+            break;
+        }
+        used += cost;
+        fit += 1;
+    }
+    if fit < rows.len() {
+        rows.truncate(fit);
+    }
+    let shown = rows.len();
+    let truncated = shown < total;
     let payload = serde_json::Value::Array(rows.iter().map(|(_, v)| v.clone()).collect());
     let mut text = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
     if truncated {
         text.push_str(&format!(
-            "\n…[showing {max} of {total} entries; narrow the path or pass a higher `max`]"
+            "\n…[showing {shown} of {total} entries; narrow the path or pass a higher `max`]"
         ));
     }
-    Ok((truncate_middle(text, MAX_OUTPUT), payload))
+    Ok((text, payload))
 }
 
 // ---------------------------------------------------------------------------
@@ -5571,6 +5600,55 @@ mod fileops_tests {
         // JSON payload is truncated to the same cap.
         let arr = r.structured.as_ref().unwrap().as_array().unwrap();
         assert_eq!(arr.len(), 3, "payload truncated to max");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Regression: the human-facing text (`content`) and the model-facing JSON
+    // payload (`structured`) must list the SAME files even when the rendered
+    // listing blows past the MAX_OUTPUT byte cap. The old tail middle-truncated
+    // the text ALONE (via `truncate_middle`), so the operator saw fewer files
+    // than the model — "output should match the output (same files)".
+    #[tokio::test]
+    async fn list_dir_text_and_payload_never_drift_under_byte_cap() {
+        let dir = tmp("listdrift");
+        // ~220-char names × 300 files ≈ 66 KB of rendered text — comfortably
+        // over MAX_OUTPUT (50 KB), forcing the byte cap to engage while staying
+        // under the 1000-entry cap so ONLY the byte cap is exercised.
+        let long = "n".repeat(200);
+        for i in 0..300 {
+            std::fs::write(dir.join(format!("{long}{i:03}")), b"x").unwrap();
+        }
+        let mut s = yolo_session(&dir);
+        let r = run(&mut s, "list_dir", json!({})).await;
+        assert!(!r.is_error, "{}", r.content);
+
+        // The byte cap must have engaged: fewer than 300 shown, marker present.
+        assert!(r.content.contains("of 300 entries"), "must warn truncation: head/tail of content missing marker");
+
+        let arr = r.structured.as_ref().unwrap().as_array().unwrap();
+        // Count file-rows in the human text (every non-marker line renders as
+        // "file <name> <size>"). It must equal the payload length exactly — no
+        // entry may exist in one half but not the other.
+        let file_lines = r.content.lines().filter(|l| l.starts_with("file ")).count();
+        assert_eq!(
+            file_lines,
+            arr.len(),
+            "text lists {file_lines} files but payload lists {} — they drifted",
+            arr.len()
+        );
+        assert!(arr.len() < 300, "byte cap must have dropped some entries (got {})", arr.len());
+        assert!(!arr.is_empty(), "at least one entry must survive the byte cap");
+
+        // Every file the model sees must also appear verbatim in the human text.
+        for e in arr {
+            let name = e["name"].as_str().unwrap();
+            assert!(
+                r.content.contains(name),
+                "payload entry {name} missing from human-facing text"
+            );
+        }
+        // And the whole rendered text still honors the byte cap.
+        assert!(r.content.len() <= MAX_OUTPUT, "content {} exceeds MAX_OUTPUT {MAX_OUTPUT}", r.content.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
