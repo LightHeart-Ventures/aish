@@ -1,0 +1,17 @@
+[package]
+name = "git-discover"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Zero-dependency git repository discovery for aish: detect the repo a directory currently belongs to (root, remote, forge host/owner/repo, branch, HEAD, trunk, dirty, linked-worktree) by shelling cheap, read-only `git` probes."
+repository = "https://github.com/LightHeart-Ventures/aish"
+publish = false
+
+[[bin]]
+name = "git-discover"
+path = "src/main.rs"
+
+[dependencies]
+# Intentionally zero external dependencies. The crate only shells the `git`
+# binary via std::process and hand-rolls its (tiny) JSON output, so it compiles
+# in a blink and can be reused anywhere without dragging in a dependency tree.
