@@ -858,13 +858,6 @@ pub fn pane_input_row(label: &str, task: &str) -> String {
     pane_row(label, &format!("\x1b[1m💬 task: {}\x1b[0m", task_headline(task)))
 }
 
-/// Max visible chars of the task shown in an `:attach`/replay INPUT row before
-/// it's clipped with an ellipsis. Bounded so an auto-offloaded or resumed task —
-/// which carries a large machine-facing prompt (embedded conversation digest,
-/// prior-result scaffold) — renders as a readable one-liner instead of a wall of
-/// wrapped pane rows.
-const TASK_HEADLINE_MAX: usize = 200;
-
 /// Reduce a coordinator's (possibly huge, machine-facing) task string to a short
 /// HUMAN-READABLE headline for the replay input row.
 ///
@@ -874,9 +867,10 @@ const TASK_HEADLINE_MAX: usize = 200;
 /// scaffolding. In both cases the LOAD-BEARING instruction is the text AFTER the
 /// last such marker — the operator's actual ask — so we peel that out (checking
 /// the follow-up marker first, since a resumed task's original section may itself
-/// still contain an `End context` marker), then collapse whitespace and clip to
-/// [`TASK_HEADLINE_MAX`]. A plain task with no markers just gets the
-/// collapse-and-clip. Pure — unit-tested.
+/// still contain an `End context` marker), then collapse whitespace so it
+/// renders as one clean block. The full ask is shown — `pane_row` wraps it
+/// across bordered continuation rows, so nothing is clipped. A plain task with
+/// no markers just gets the whitespace collapse. Pure — unit-tested.
 fn task_headline(task: &str) -> String {
     const FOLLOW_UP: &str = "=== OPERATOR'S FOLLOW-UP ===";
     const END_CTX: &str = "=== End context ===";
@@ -895,14 +889,7 @@ fn task_headline(task: &str) -> String {
     } else {
         collapsed
     };
-    if collapsed.chars().count() > TASK_HEADLINE_MAX {
-        format!(
-            "{}…",
-            collapsed.chars().take(TASK_HEADLINE_MAX).collect::<String>()
-        )
-    } else {
-        collapsed
-    }
+    collapsed
 }
 
 /// Frame a coordinator's `message_console` note for the operator's terminal.
@@ -4416,14 +4403,16 @@ mod tests {
     }
 
     #[test]
-    fn task_headline_clips_long_tasks_with_an_ellipsis() {
+    fn task_headline_shows_long_tasks_in_full() {
+        // The full task must be preserved — no clipping/ellipsis. `pane_row`
+        // wraps it across bordered continuation rows downstream.
         let long = "word ".repeat(100); // 500 chars, no markers
         let h = task_headline(&long);
-        assert!(h.ends_with('…'), "clipped with ellipsis: {h:?}");
-        assert!(
-            h.chars().count() == TASK_HEADLINE_MAX + 1,
-            "clipped to the bound (+ellipsis): {}",
-            h.chars().count()
+        assert!(!h.contains('…'), "no ellipsis clip: {h:?}");
+        assert_eq!(
+            h,
+            "word ".repeat(100).trim(),
+            "whole task preserved (whitespace collapsed): {h:?}"
         );
     }
 
