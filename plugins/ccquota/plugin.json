@@ -1,17 +1,14 @@
 {
   "id": "ccquota",
   "name": "Claude Code Quota Badge",
-  "version": "1.0.0",
-  "description": "Surfaces your Claude Code subscription usage (weekly/monthly % used + burn-rate pace) as a SecondStatusLine segment. A throttled TurnEnd hook runs the vendored cclimits.sh (dandaka/ccquota, MIT) at most once every ~10 min and writes a one-line badge to ~/.aish/state/statusline/ccquota.txt, which aish's file-backed statusline reader (TASK-316) folds onto the status line. Pure plugin — zero core change.",
+  "version": "2.0.0",
+  "description": "Surfaces your Claude Code subscription usage (weekly/monthly % used + burn-rate pace) as a first-class SecondStatusLine segment. Declares `provides.statusline.command`; aish core (TASK-318, SPR-073) runs the vendored cclimits.sh (dandaka/ccquota, MIT) on its own ~10-min cadence off the turn loop, caches the one-line badge in memory, and folds it onto the status line. Core owns cadence, cache, timeout, and staleness — the plugin just prints a badge line. Migrated from the Phase 1 TurnEnd-hook + file-convention design.",
   "enabled": true,
-  "config_schema": {
-    "type": "object",
-    "properties": {
-      "throttle_seconds": {
-        "type": "integer",
-        "default": 600,
-        "description": "Minimum seconds between cclimits.sh refreshes. cclimits drives Claude Code via tmux (~seconds), so keep this generous."
-      }
+  "provides": {
+    "statusline": {
+      "command": "statusline.sh",
+      "every": "10m",
+      "timeout_ms": 45000
     }
   }
 }

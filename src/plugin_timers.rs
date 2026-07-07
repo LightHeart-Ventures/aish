@@ -72,7 +72,7 @@ fn resolve_cache(cache: &str) -> PathBuf {
 /// Resolve a timer `command` to an executable path. If it names a file that
 /// exists inside the plugin directory, that file runs; otherwise the value is
 /// used verbatim (PATH lookup by `tokio::process::Command`).
-fn resolve_command(dir: &Path, command: &str) -> PathBuf {
+pub(crate) fn resolve_command(dir: &Path, command: &str) -> PathBuf {
     let candidate = dir.join(command);
     if candidate.exists() {
         candidate

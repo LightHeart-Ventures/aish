@@ -35,6 +35,7 @@ mod pipeline;
 mod plugin_auth;
 mod plugin_dispatcher;
 mod plugin_timers;
+mod plugin_statusline;
 mod plugin_memory;
 #[cfg(test)]
 mod plugin_phase05_consolidation_tests;
@@ -732,6 +733,11 @@ async fn main() -> Result<()> {
     // refresh work off the agent turn loop. Error-isolated; a bad timer never
     // blocks startup or disturbs the others.
     plugin_timers::arm(&aish_dir.join("plugins"));
+
+    // TASK-318 (SPR-073): arm declarative first-class plugin statusline segments.
+    // Core owns the cadence, the in-memory cache, and the render contract — the
+    // plugin declares only `provides.statusline.command`. Also error-isolated.
+    plugin_statusline::arm(&aish_dir.join("plugins"));
 
     repl::run(
         backend,

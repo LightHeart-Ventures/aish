@@ -2,13 +2,13 @@
 """badge.py — turn cclimits.sh --json into a single SecondStatusLine line.
 
 Reads the ccquota JSON on stdin and prints ONE ready-to-render line (the plugin
-owns its ANSI color, per aish's file-backed statusline contract, TASK-316):
+owns its ANSI color; core renders the line verbatim, SPR-073 / TASK-318):
 
     <color>⚡cc 63%w ·142%<reset>
 
 Picks the single most-constraining window: highest pace when any window reports
 pace, else highest percent. Color escalates dim→yellow→red with pressure. Prints
-nothing (empty) on unusable input so refresh.sh leaves the prior badge to age.
+nothing (empty) on unusable input so core leaves the prior badge to age out.
 """
 import json
 import sys

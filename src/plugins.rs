@@ -103,6 +103,46 @@ pub struct Provides {
     /// [`crate::plugin_timers::arm`].
     #[serde(default)]
     pub timers: Vec<PluginTimer>,
+    /// Phase 2b (TASK-318, SPR-073): a first-class **statusline** segment. The
+    /// plugin declares only a `command` (plus optional `args`/`every`/
+    /// `timeout_ms`); **core** owns the refresh cadence, the cache, and the
+    /// render contract — the plugin never touches the raw
+    /// `~/.aish/state/statusline/*.txt` file convention. Core runs the command
+    /// on a cadence and folds its stdout onto the SecondStatusLine. Absent →
+    /// the plugin contributes no first-class statusline segment. Consumed by
+    /// [`crate::plugin_statusline::arm`].
+    #[serde(default)]
+    pub statusline: Option<PluginStatusline>,
+}
+
+/// A `provides.statusline` block (TASK-318, SPR-073): a plugin's declarative,
+/// first-class SecondStatusLine segment. Unlike the Phase 1 file convention
+/// (where a plugin armed a timer, picked the magic cache path, and wrote a
+/// `*.txt` file itself), here the plugin declares ONLY a `command` and core
+/// owns everything else — cadence, an in-memory cache, staleness, and the
+/// render. `command` runs via direct fork/exec (NO shell) with the plugin
+/// directory as CWD; its first non-empty stdout line becomes the segment (the
+/// plugin owns any ANSI color). Unknown keys are dropped by serde for the usual
+/// forward-compat story.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct PluginStatusline {
+    /// Program to exec (`argv[0]`). A value that resolves to a file inside the
+    /// plugin directory runs that file; otherwise it's looked up on `PATH`.
+    pub command: String,
+    /// Extra arguments passed verbatim to `command`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Refresh interval as a compact duration — `"30s"`, `"10m"`, `"1h"`,
+    /// `"1d"` (a bare integer means seconds); same grammar as
+    /// [`crate::plugin_timers::parse_every`]. Absent/unparseable → the loader's
+    /// default cadence (see [`crate::plugin_statusline`]).
+    #[serde(default)]
+    pub every: Option<String>,
+    /// Per-run wall-clock timeout in milliseconds. A run that overruns is killed
+    /// and skipped; the prior segment ages out naturally. Absent → the loader
+    /// default.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// A single `provides.timers[]` entry (TASK-317, SPR-073): run `command` (with
@@ -208,6 +248,13 @@ impl PluginManifest {
             Some(p) => &p.timers,
             None => &[],
         }
+    }
+
+    /// This plugin's first-class statusline segment (`provides.statusline`,
+    /// TASK-318). `None` when the plugin declares no `provides` block or no
+    /// statusline. Consumed by [`crate::plugin_statusline::arm`].
+    pub fn statusline(&self) -> Option<&PluginStatusline> {
+        self.provides.as_ref().and_then(|p| p.statusline.as_ref())
     }
 
 
