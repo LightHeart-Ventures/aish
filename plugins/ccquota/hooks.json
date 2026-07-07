@@ -1,0 +1,15 @@
+{
+  "hooks": [
+    {
+      "name": "ccquota-refresh",
+      "event": "TurnEnd",
+      "matcher": { "agent": "interactive" },
+      "action": {
+        "type": "command",
+        "program": "bash",
+        "args": ["-c", "exec \"$HOME/.aish/plugins/ccquota/refresh.sh\""],
+        "timeout_ms": 45000
+      }
+    }
+  ]
+}
