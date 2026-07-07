@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+ccquota.stamp
+ccquota.lock
