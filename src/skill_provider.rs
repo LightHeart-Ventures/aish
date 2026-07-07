@@ -714,12 +714,12 @@ pub(crate) async fn search_core(query: &str) -> Result<Vec<SearchResult>> {
         .await
         .unwrap_or_default();
 
-    // (2) mcpmarket is disabled by default (offline-first).
-    // Enable it with `AISH_ENABLE_MCPMARKET=1`. On any failure we degrade
-    // gracefully to the embedded index rather than surfacing a network error.
+    // (2) mcpmarket is enabled by default (primary source). Disable it with
+    // `AISH_ENABLE_MCPMARKET=0`. On any failure we degrade gracefully to the
+    // embedded index rather than surfacing a network error.
     let mcpmarket_enabled = std::env::var("AISH_ENABLE_MCPMARKET")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+        .map(|v| v != "0")
+        .unwrap_or(true);
     
     if !mcpmarket_enabled {
         return Ok(local);
