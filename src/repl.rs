@@ -466,7 +466,7 @@ pub async fn run(
                     if let Ok(fired) = store.take_fired() {
                         let mut ring = false;
                         for (_id, detail, short, audible) in fired {
-                            crate::tools::print_above_prompt(format!("{detail}\n"));
+                            crate::tools::print_above_prompt(format!("{detail}\n\n"));
                             // Severity-tiered: infer the tier from the banner +
                             // detail text so the footer badge is colored by
                             // seriousness, and append the event to the
