@@ -13,22 +13,30 @@ The color goes dim → yellow → red as pressure rises.
 
 ## How it works
 
-This is a **pure plugin** — zero changes to aish core. It leans on the
-file-backed statusline primitive (SPR-073 / TASK-316):
+This plugin declares a **first-class statusline segment** (SPR-073 / TASK-318):
+the manifest's `provides.statusline` block names a `command`, and aish **core**
+owns everything else — the refresh cadence, the in-memory cache, the per-run
+timeout, and staleness. The plugin never touches a cache file or picks a path.
 
-1. A **TurnEnd hook** (`hooks.json`, scoped to the interactive agent) runs
-   `refresh.sh` after each turn.
-2. `refresh.sh` is **throttled** (default once per ~10 min via a stamp file) and
-   **never blocks** the REPL: when a refresh is due it detaches the slow capture
-   and returns immediately.
-3. The detached worker runs `cclimits.sh --json` (vendored from
+```json
+"provides": { "statusline": { "command": "statusline.sh", "every": "10m", "timeout_ms": 45000 } }
+```
+
+1. On startup, core arms one cheap detached loop for this statusline.
+2. Every `every` (~10 min), off the agent turn loop, core runs `statusline.sh`
+   with a 45s timeout.
+3. `statusline.sh` runs `cclimits.sh --json` (vendored from
    [dandaka/ccquota](https://github.com/dandaka/ccquota), MIT — see `NOTICE`),
-   which drives `claude` through a headless `tmux` session to read `/usage`.
-4. `badge.py` renders the JSON into one colored line written to
-   `~/.aish/state/statusline/ccquota.txt`.
-5. aish's statusline reader folds that file onto the status line and hides it
-   automatically once its mtime goes stale (> 1h), so a wedged capture
-   self-heals.
+   which drives `claude` through a headless `tmux` session to read `/usage`,
+   then pipes it through `badge.py` to render **one colored line**.
+4. Core caches that line in memory and folds it onto the status line, hiding it
+   automatically once it goes stale (a wedged capture self-heals).
+
+> **Migrated from Phase 1.** Earlier versions used a throttled `TurnEnd` hook
+> (`refresh.sh` + `hooks.json`) that owned the throttle stamp, a single-flight
+> lock, a detached capture, and wrote `~/.aish/state/statusline/ccquota.txt` for
+> the file-backed reader (TASK-316). All of that plumbing now lives in core;
+> `refresh.sh` and `hooks.json` are gone and `statusline.sh` just prints a line.
 
 ## Requirements
 
@@ -44,22 +52,25 @@ error that disrupts your turn.
 
 ## Install
 
-Copy this directory to `~/.aish/plugins/ccquota/` (the hook invokes
-`$HOME/.aish/plugins/ccquota/refresh.sh`) and make the scripts executable:
+Copy this directory to `~/.aish/plugins/ccquota/` and make the scripts
+executable:
 
 ```
 cp -r plugins/ccquota ~/.aish/plugins/
-chmod +x ~/.aish/plugins/ccquota/cclimits.sh ~/.aish/plugins/ccquota/refresh.sh
+chmod +x ~/.aish/plugins/ccquota/cclimits.sh ~/.aish/plugins/ccquota/statusline.sh
 ```
 
-Restart aish (or reload plugins). The badge appears within a few turns of the
-first non-throttled refresh.
+Restart aish (or reload plugins). The badge appears after the first refresh
+(~a couple seconds past the startup settle, then every `every`).
 
 ## Configuration
 
-- `throttle_seconds` (manifest `config_schema`, default `600`) / env
-  `CCQUOTA_THROTTLE_SECONDS` — minimum seconds between `cclimits.sh` refreshes.
-  Keep it generous; each refresh spins up a real Claude Code session.
+Cadence and timeout live in the manifest `provides.statusline` block:
+
+- `every` (default `"10m"`) — how often core runs `statusline.sh`. Keep it
+  generous; each refresh spins up a real Claude Code session through tmux.
+- `timeout_ms` (default `45000`) — per-run wall-clock budget; an overrun is
+  killed and the prior badge ages out.
 
 ## Portability (TASK-319)
 

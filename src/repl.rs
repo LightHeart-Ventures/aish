@@ -1527,12 +1527,19 @@ fn coordinator_status_message(session: &Session) -> String {
     // it cheaply on the idle repaint tick (no keystroke needed). Files gone stale
     // (a plugin that stopped refreshing) or unreadable are skipped. Placed to the
     // RIGHT of the live coordinator/schedule hint so operator state stays primary.
-    if let Some(dir) = statusline_segment_dir() {
-        let segs = statusline_segments(
-            &dir,
-            std::time::SystemTime::now(),
-            STATUSLINE_SEGMENT_STALE_AFTER,
-        );
+    {
+        // TASK-318: first-class, core-owned in-memory segments come first
+        // (`provides.statusline` — cadence/cache/render owned by core), then the
+        // Phase 1 file-convention segments for backward compat with any plugin
+        // (or external process) still dropping a colorized `*.txt` badge.
+        let mut segs = crate::plugin_statusline::segments(STATUSLINE_SEGMENT_STALE_AFTER);
+        if let Some(dir) = statusline_segment_dir() {
+            segs.extend(statusline_segments(
+                &dir,
+                std::time::SystemTime::now(),
+                STATUSLINE_SEGMENT_STALE_AFTER,
+            ));
+        }
         if !segs.is_empty() {
             let joined = segs.join("  \u{b7}  ");
             // Bound the segment area (escape-aware clip keeps ANSI intact) so a
