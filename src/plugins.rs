@@ -95,6 +95,44 @@ pub struct Provides {
     /// and `:skill` verb handlers.
     #[serde(default)]
     pub skill_source: Option<SkillSource>,
+    /// Phase 4 (TASK-317, SPR-073): declarative background **timers**. Each entry
+    /// runs a plain program on a fixed interval and (optionally) caches its
+    /// stdout to a file — a cheap, always-on alternative to throttling work
+    /// inside a `TurnEnd` hook, e.g. keeping a SecondStatusLine segment fresh.
+    /// Absent/empty → the plugin arms no timers. Consumed by
+    /// [`crate::plugin_timers::arm`].
+    #[serde(default)]
+    pub timers: Vec<PluginTimer>,
+}
+
+/// A single `provides.timers[]` entry (TASK-317, SPR-073): run `command` (with
+/// `args`) every `every`, and — when `cache` is set — write its stdout to that
+/// file. The turn-independent primitive that lets a plugin keep a status segment
+/// fresh without hanging refresh work off the agent turn loop. Programs run via
+/// direct fork/exec (NO shell) with the plugin directory as CWD; unknown keys
+/// are dropped by serde for the usual forward-compat story.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct PluginTimer {
+    /// Program to exec (`argv[0]`). A value that resolves to a file inside the
+    /// plugin directory runs that file; otherwise it's looked up on `PATH`.
+    pub command: String,
+    /// Extra arguments passed verbatim to `command`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Interval between runs as a compact duration — `"30s"`, `"10m"`, `"1h"`,
+    /// `"1d"` (a bare integer means seconds). Parsed by
+    /// [`crate::plugin_timers::parse_every`]; an unparseable/zero value disarms
+    /// the timer (logged, never fatal).
+    pub every: String,
+    /// Optional file the command's stdout is written to after each run (relative
+    /// paths resolve under `~/.aish/`). Absent → the command's own side effects
+    /// are the payload and nothing is written by the loader.
+    #[serde(default)]
+    pub cache: Option<String>,
+    /// Per-run wall-clock timeout in milliseconds (default 60000). A run that
+    /// overruns is killed and skipped; the interval cadence is preserved.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// The `provides.skill_source` block (design
@@ -160,6 +198,16 @@ impl PluginManifest {
     #[allow(dead_code)] // consumed by the Phase 2+ SkillSource façade / `:skill` verb handlers
     pub fn skill_source(&self) -> Option<&SkillSource> {
         self.provides.as_ref().and_then(|p| p.skill_source.as_ref())
+    }
+
+    /// This plugin's declared background timers (`provides.timers`, TASK-317).
+    /// Empty slice when the plugin declares no `provides` block or no timers.
+    /// Consumed by [`crate::plugin_timers::arm`].
+    pub fn timers(&self) -> &[PluginTimer] {
+        match &self.provides {
+            Some(p) => &p.timers,
+            None => &[],
+        }
     }
 
 

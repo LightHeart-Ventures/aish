@@ -34,6 +34,7 @@ mod oracle;
 mod pipeline;
 mod plugin_auth;
 mod plugin_dispatcher;
+mod plugin_timers;
 mod plugin_memory;
 #[cfg(test)]
 mod plugin_phase05_consolidation_tests;
@@ -725,6 +726,12 @@ async fn main() -> Result<()> {
     if let Some(d) = plugin_dispatcher::dispatcher() {
         let _ = d.route(plugin_dispatcher::Event::WorkspaceOpen);
     }
+
+    // TASK-317 (SPR-073): arm declarative plugin timers — cheap, always-on
+    // interval loops that keep statusline cache files fresh without hanging
+    // refresh work off the agent turn loop. Error-isolated; a bad timer never
+    // blocks startup or disturbs the others.
+    plugin_timers::arm(&aish_dir.join("plugins"));
 
     repl::run(
         backend,
