@@ -641,12 +641,46 @@ pub fn suspend_footer_region() -> bool {
     true
 }
 
+/// Build the cursor/region choreography that [`resume_footer_region`] writes to
+/// reclaim the bottom [`FOOTER_ROWS`] rows for the footer after a full-screen
+/// foreground child exits: re-assert DECSTBM (which homes the cursor to the
+/// top-left as a side effect) then drop the cursor into the last body row so the
+/// next prompt grows up from just above the footer. Kept pure (no I/O, no shared
+/// state) so the sequence is unit-testable byte-for-byte.
+///
+/// KNOWN LIMITATION — output-clobber on resume (root cause of the "`ls -al`
+/// loses its last few lines" report): while the child ran, the footer region
+/// was suspended to the FULL screen (see [`suspend_footer_region`]), so any
+/// output that scrolled into the bottom `FOOTER_ROWS` rows now lives there. This
+/// resume paints the footer straight over those rows, hiding the command's last
+/// lines from the viewport (they survive in native scrollback — aish never
+/// emits ESC[3J). It is NOT the off-by-one once suspected in `scroll_region_seq`:
+/// that math is correct (24 → `ESC[1;21r`, and 21 body + 3 footer = 24, pinned
+/// by `scroll_region_reserves_three_bottom_rows`).
+///
+/// The correct fix is to scroll the body UP by the overflow
+/// (`cursor_row - body_bottom`, clamped to `0..=FOOTER_ROWS`) BEFORE reclaiming
+/// the rows — but the overflow is only knowable from a DSR (ESC[6n)
+/// cursor-position query, which must run with a bounded, non-blocking read and a
+/// total fallback to this behavior so a non-conforming terminal can never hang
+/// the shell. An UNCONDITIONAL scroll-up is NOT viable: the prompt is
+/// bottom-anchored, so nearly every command (even `echo hi`) leaves the cursor
+/// in the footer zone, and a fixed scroll-up would jerk the screen up on every
+/// command and after every alt-screen app. Deferred until it can be verified
+/// against a real TTY.
+pub fn resume_region_seq(rows: u16) -> String {
+    let body_bottom = rows.saturating_sub(FOOTER_ROWS).max(1);
+    format!("{}\x1b[{body_bottom};1H", scroll_region_seq(rows))
+}
+
 /// Re-establish the footer scroll region and repaint the cached footer after a
 /// foreground child that inherited the full terminal exits. Pairs with
 /// [`suspend_footer_region`]. Homes the cursor into the last body row so the
 /// next prompt grows up from just above the footer (mirrors
 /// [`Terminal::init_scroll_region`]). No-op when the terminal is now too short
-/// to host the footer (e.g. it was resized smaller while the child ran).
+/// to host the footer (e.g. it was resized smaller while the child ran). See
+/// [`resume_region_seq`] for the choreography and the known output-clobber
+/// limitation.
 pub fn resume_footer_region() {
     let Some((rows, _cols)) = term_size() else {
         return;
@@ -654,16 +688,12 @@ pub fn resume_footer_region() {
     if rows < MIN_FOOTER_ROWS {
         return;
     }
-    // Re-assert DECSTBM (homes the cursor to top-left as a side effect), then
-    // drop the cursor into the last body row so subsequent output stays above
-    // the footer instead of stranding at the top of the screen.
-    let body_bottom = rows.saturating_sub(FOOTER_ROWS).max(1);
-    // Re-suppress alternate-scroll alongside re-asserting the region.
-    let seq = format!(
-        "{}{}\x1b[{body_bottom};1H",
-        scroll_region_seq(rows),
-        suppress_alt_scroll_seq(),
-    );
+    // Re-assert the region + home into the last body row, and re-suppress
+    // alternate-scroll alongside it (cursor-neutral: `suppress_alt_scroll_seq`
+    // only toggles private mode 1007, so its position relative to the home move
+    // is immaterial; it also returns "" after the first suppression so the saved
+    // original setting is preserved).
+    let seq = format!("{}{}", resume_region_seq(rows), suppress_alt_scroll_seq());
     let mut out = std::io::stdout();
     let _ = write!(out, "{seq}");
     let _ = out.flush();
@@ -915,6 +945,21 @@ mod tests {
         // Degenerate tiny sizes still emit a valid (row 1) region.
         assert_eq!(scroll_region_seq(3), "\x1b[1;1r");
         assert_eq!(scroll_region_seq(1), "\x1b[1;1r");
+    }
+
+    #[test]
+    fn resume_region_reasserts_then_homes_last_body_row() {
+        // 24-row terminal: re-assert region 1..=21 then home into row 21 (the
+        // last body row) so the next prompt grows up from just above the footer.
+        assert_eq!(resume_region_seq(24), "\x1b[1;21r\x1b[21;1H");
+    }
+
+    #[test]
+    fn resume_region_clamps_tiny_terminals() {
+        // Degenerate heights collapse to a row-1 region AND a row-1 home rather
+        // than emitting an invalid ESC[0;1H.
+        assert_eq!(resume_region_seq(3), "\x1b[1;1r\x1b[1;1H");
+        assert_eq!(resume_region_seq(1), "\x1b[1;1r\x1b[1;1H");
     }
 
     #[test]
