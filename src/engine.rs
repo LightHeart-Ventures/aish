@@ -149,16 +149,35 @@ async fn maybe_auto_index_repo(session: &mut Session) {
     // Bounded handoff: the index tool kicks a background build and returns fast;
     // the timeout guarantees we never block the prompt on a large repo.
     const AUTO_INDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    // Best-effort diagnostics: handoff warnings are appended to
+    // `~/.aish/codebase-memory.log` and only echoed to stderr when
+    // `AISH_CODEBASE_DEBUG` is truthy, so the normal TUI/coordinator stream stays
+    // clean (this is a non-fatal background warm, not an actionable error).
+    let debug_echo = cbm::debug_echo_enabled(
+        session
+            .env
+            .iter()
+            .find(|(k, _)| k == cbm::DEBUG_ENV)
+            .map(|(_, v)| v.as_str()),
+    );
     match tokio::time::timeout(AUTO_INDEX_TIMEOUT, session.mcp.call(&qualified, &args)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
-            eprintln!("[codebase-memory] repo-open auto-index handoff failed: {e}");
+            let msg = format!("repo-open auto-index handoff failed: {e}");
+            cbm::log_handoff_event(&msg);
+            if debug_echo {
+                eprintln!("[codebase-memory] {msg}");
+            }
         }
         Err(_) => {
-            eprintln!(
-                "[codebase-memory] repo-open auto-index handoff timed out after {}s (index continues server-side)",
+            let msg = format!(
+                "repo-open auto-index handoff timed out after {}s (index continues server-side)",
                 AUTO_INDEX_TIMEOUT.as_secs()
             );
+            cbm::log_handoff_event(&msg);
+            if debug_echo {
+                eprintln!("[codebase-memory] {msg}");
+            }
         }
     }
 }
