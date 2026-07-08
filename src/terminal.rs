@@ -653,6 +653,41 @@ pub fn restore_after_clear() {
     paint_cached_footer(true);
 }
 
+/// Re-sync the footer after an OS suspend/resume — the SIGCONT wake path.
+///
+/// A laptop that slept and woke (or a `fg` after the process was stopped) is
+/// continued with SIGCONT, but nothing else tells aish the world moved: the
+/// pinned footer may have scrolled out of view or lost its DECSTBM scroll
+/// region while parked, and the monotonic idle clock ([`heartbeat_now_ms`],
+/// backed by CLOCK_MONOTONIC) does NOT advance across a suspend, so the
+/// heartbeat under-counts the true idle gap and may not self-heal for a while.
+///
+/// On wake we repaint the cached footer immediately — `footer_seq` re-asserts
+/// the scroll region (healing a dropped margin) and its DECSC/DECRC wrapper
+/// preserves the input cursor, so an in-progress prompt line is untouched — and
+/// reset the idle timer so the heartbeat cadence restarts cleanly from now.
+///
+/// No-op-but-still-reset-the-timer when no footer region is installed, a worker
+/// alt-screen view owns the terminal, or the user is mid-editing a non-empty
+/// line: in those cases an immediate repaint would either do nothing useful or
+/// risk clobbering the visible cursor, so the heal is deferred to the heartbeat
+/// / the main loop's next idle pass while the timer is still re-armed.
+pub fn resync_after_wake() {
+    if !ACTIVE.load(Ordering::Relaxed)
+        || ATTACH_ACTIVE.load(Ordering::Relaxed)
+        || INPUT_DIRTY.load(Ordering::Relaxed)
+    {
+        // Re-arm the idle timer so the post-wake heartbeat waits a clean full
+        // interval rather than firing off a frozen (pre-suspend) clock reading.
+        note_footer_activity();
+        return;
+    }
+    // Cursor-safe repaint: re-asserts DECSTBM and restores the input cursor.
+    // paint_cached_footer records footer activity, resetting the idle timer.
+    paint_cached_footer(false);
+}
+
+/// Suspend the bottom-anchored footer scroll region for the duration of a
 /// Suspend the bottom-anchored footer scroll region for the duration of a
 /// foreground child that inherits the terminal (`sudo`, `vim`, `less`, …).
 /// Resets DECSTBM to the full screen and erases the three footer rows so the
@@ -1087,6 +1122,24 @@ mod tests {
         assert!(
             idle < HEARTBEAT_IDLE.as_millis() as u64,
             "just-noted activity must read as well under the idle threshold, got {idle}ms"
+        );
+    }
+
+    #[test]
+    fn resync_after_wake_resets_idle_timer_when_inactive() {
+        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // No footer region installed in the test harness (ACTIVE stays false),
+        // so resync_after_wake takes the no-op-but-rearm branch: it must still
+        // reset the idle timer so a post-suspend heartbeat waits a clean
+        // interval instead of firing off the frozen pre-suspend clock reading.
+        assert!(!ACTIVE.load(Ordering::Relaxed));
+        LAST_FOOTER_ACTIVITY_MS.store(0, Ordering::Relaxed);
+        resync_after_wake();
+        let idle =
+            heartbeat_now_ms().saturating_sub(LAST_FOOTER_ACTIVITY_MS.load(Ordering::Relaxed));
+        assert!(
+            idle < HEARTBEAT_IDLE.as_millis() as u64,
+            "wake re-sync must re-arm the idle timer, got {idle}ms"
         );
     }
 
