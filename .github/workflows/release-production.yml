@@ -1,67 +1,111 @@
 name: Release (Production)
 
-# Triggered via workflow_dispatch to create a production release with a stable semver tag (v0.4.0, v0.4.1, …).
-# This replaces manual tag pushing (which the SRE skill forbids). A maintainer provides the semver version,
-# this workflow creates the tag on the current main commit, builds release binaries for every supported target,
-# generates SHA256 checksums, and publishes a GitHub Release marked as latest.
+# Unified production release workflow supporting both legacy tag-push and modern dispatch triggers.
+#
+# TRIGGER PATHS:
+#
+# 1. TAG PUSH (legacy, still active):
+#    `git tag v0.23.1 && git push origin v0.23.1`
+#    → Fires on `push: tags: v*`, auto-derives version from tag name, verifies match vs Cargo.toml.
+#
+# 2. WORKFLOW DISPATCH (modern, preferred):
+#    GitHub UI: Actions > Release (Production) > Run workflow > enter version + notes
+#    → Creates the tag on origin/main, builds release binaries, publishes with assets.
+#
+# Both paths use identical build + publish logic. Choose dispatch for clarity (single UI entry point)
+# or tag-push for CLI tooling (direct git/tag integration). Both are safe; dispatch is recommended
+# for maintainers (it's self-documenting and prevents tag/Cargo.toml drift).
 #
 # Platform support: aish is a Unix-native shell targeting macOS (x86_64 + arm64) and Linux (x86_64) only.
+
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       version:
-        description: "Semantic version to release (e.g., 0.23.1 — the 'v' prefix is added automatically)"
-        required: true
+        description: "Semantic version to release (e.g., 0.23.1 — the 'v' prefix is added automatically; ignored on tag push)"
+        required: false
         type: string
       notes:
         description: "Optional release notes (hand-written; auto-generated if empty)"
         required: false
         type: string
 
+# Need write access to create the release + upload assets.
 permissions:
   contents: write
 
 concurrency:
-  group: release-prod-${{ github.ref }}
+  group: release-production-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   verify-version:
-    name: verify version match
+    name: verify tag matches Cargo.toml version
     runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: origin/main
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'origin/main' || '' }}
 
-      - name: Verify Cargo.toml version matches input
+      - name: Determine version (tag-push vs dispatch)
         id: version
         run: |
           set -euo pipefail
-          input_version="${{ inputs.version }}"
-          cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
-          tag="v${input_version}"
-          echo "Input version: $input_version"
-          echo "Cargo.toml version: $cargo_version"
-          if [ "$input_version" != "$cargo_version" ]; then
-            echo "::error::Input version $input_version does not match Cargo.toml version $cargo_version. Bump Cargo.toml first."
-            exit 1
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Tag push: extract version from GITHUB_REF_NAME (e.g., "v0.23.1" → "0.23.1")
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+          else
+            # Dispatch: use explicit input (or fall back to "unset" error)
+            version="${{ inputs.version }}"
+            if [ -z "$version" ]; then
+              echo "::error::Dispatch trigger requires the 'version' input (e.g., 0.23.1). Supplied: empty."
+              exit 1
+            fi
+            tag="v${version}"
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $version (tag: $tag)"
         shell: bash
 
-      - name: Assert tag does not already exist
+      - name: Assert tag matches Cargo.toml version
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          version="${{ steps.version.outputs.version }}"
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          echo "tag version:        $version"
+          echo "Cargo.toml version: $cargo_version"
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::Release version $version does not match Cargo.toml version $cargo_version. Bump Cargo.toml (and Cargo.lock) before releasing so the binary reports the right version."
+            exit 1
+          fi
+        shell: bash
+
+      - name: Assert no published release already exists for this tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="${{ steps.version.outputs.tag }}"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::Release $tag already exists. Pick a new version."
-            exit 1
+          json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft 2>/dev/null || true)"
+          if [ -z "$json" ]; then
+            echo "No existing release for $tag — this workflow will create and publish it. OK."
+            exit 0
           fi
+          is_draft="$(echo "$json" | jq -r '.isDraft')"
+          if [ "$is_draft" = "true" ]; then
+            echo "A DRAFT release exists for $tag — drafts are mutable, so the publish job will upload assets and publish it. OK."
+            exit 0
+          fi
+          echo "::error::A PUBLISHED release already exists for $tag. GitHub immutable releases cannot receive assets after publishing, so this workflow cannot attach the binaries that ':update' needs — it would fail with 'target_commitish cannot be changed when release is immutable'. Do NOT pre-publish the release: let this workflow create it, or pre-create it as a DRAFT. To recover this tag: delete the release AND the tag, then re-push the tag so this workflow recreates it with assets (or bump the version)."
+          exit 1
         shell: bash
 
   build:
@@ -84,7 +128,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: origin/main
+          ref: ${{ needs.verify-version.outputs.tag }}
 
       - name: Install Rust toolchain
         run: |
@@ -123,7 +167,7 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.asset }}
+          name: ${{ matrix.asset }}-prod
           path: |
             dist/${{ matrix.asset }}
             dist/${{ matrix.asset }}.sha256
@@ -145,7 +189,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          find artifacts -type f \( -name 'aish-*' \) -exec cp {} dist/ \;
+          find artifacts -type f \( -name 'aish-*' ! -name '*-prod' \) -exec cp {} dist/ \;
           echo "Release assets:"
           ls -l dist
           echo
@@ -167,12 +211,11 @@ jobs:
           tag="${{ needs.verify-version.outputs.tag }}"
           notes="${{ inputs.notes }}"
           if [ -z "$notes" ]; then
-            # Auto-generate notes from commits since last tag
-            notes="$(gh release view --repo "$GITHUB_REPOSITORY" 2>/dev/null | head -20 || echo 'Production release')"
+            notes="Production release"
           fi
           gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
-            --target origin/main \
+            --target "$tag" \
             --latest \
             --title "aish $tag" \
             --notes "$notes" \

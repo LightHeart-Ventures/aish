@@ -1,0 +1,92 @@
+# Reusable workflow: build a release binary for a single Rust target.
+#
+# This workflow is called by the multi-target release workflows (release-production.yml,
+# release-dev.yml, release-ci-cd.yml) to eliminate duplicated Rust toolchain setup, caching,
+# and build command logic. All release workflows now share one source of truth for:
+#   - toolchain update
+#   - cargo cache key & paths
+#   - build command (--release --features local)
+#   - packaging & checksum generation
+#
+# Usage:
+#   - ${{ workflow.calling.jobs.<job>.outputs.tag }} from the caller to get the tag name
+#   - ${{ needs.<job>.outputs.artifact-path }} to reference the uploaded artifact
+
+name: Build Release Binary
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: "Rust compilation target (e.g., x86_64-apple-darwin)"
+        required: true
+        type: string
+      asset-name:
+        description: "Output binary name (e.g., aish-x86_64-apple-darwin)"
+        required: true
+        type: string
+      features:
+        description: "Cargo features to enable (e.g., 'local' for full build, '' for Claude-only)"
+        required: false
+        type: string
+        default: "local"
+      artifact-suffix:
+        description: "Suffix for artifact name to avoid collisions (e.g., '-prod', '-dev', '-ci')"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build:
+    name: build ${{ inputs.target }}
+    runs-on: ${{ fromJson('{"x86_64-apple-darwin":"macos-latest","aarch64-apple-darwin":"macos-latest","x86_64-unknown-linux-gnu":"blacksmith-4vcpu-ubuntu-2404"}')[inputs.target] }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup target add ${{ inputs.target }}
+        shell: bash
+
+      - name: Cache cargo + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ inputs.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: |
+          if [ -z "${{ inputs.features }}" ]; then
+            cargo build --release --target ${{ inputs.target }}
+          else
+            cargo build --release --features ${{ inputs.features }} --target ${{ inputs.target }}
+          fi
+        shell: bash
+
+      - name: Package binary + checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ inputs.target }}/release/aish" "dist/${{ inputs.asset-name }}"
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ inputs.asset-name }}" > "${{ inputs.asset-name }}.sha256"
+          else
+            shasum -a 256 "${{ inputs.asset-name }}" > "${{ inputs.asset-name }}.sha256"
+          fi
+          cat "${{ inputs.asset-name }}.sha256"
+        shell: bash
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.asset-name }}${{ inputs.artifact-suffix }}
+          path: |
+            dist/${{ inputs.asset-name }}
+            dist/${{ inputs.asset-name }}.sha256
+          if-no-files-found: error
