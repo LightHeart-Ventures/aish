@@ -346,9 +346,67 @@ pub(crate) fn repo_key(src: &Path) -> String {
         .unwrap_or_else(|| fallback_repo_key(src))
 }
 
+/// Parse a GitHub remote URL into a human-readable `owner/repo` name (the slash
+/// KEPT, unlike [`repo_key_from_remote`] which sanitizes it to `--`). `None`
+/// when the URL isn't a parseable GitHub remote. Pure.
+pub(crate) fn repo_name_from_remote(url: &str) -> Option<String> {
+    let url = url.trim();
+    let rest = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| url.strip_prefix("https://github.com/"))
+        .or_else(|| url.strip_prefix("http://github.com/"))?;
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let mut parts = rest.splitn(2, '/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    Some(format!("{owner}/{repo}"))
+}
+
+/// A human-readable name for the repo containing `dir`: `owner/repo` from the
+/// GitHub `origin` remote when parseable, else the worktree-root basename. IO —
+/// shells `git`. `None` when `dir` isn't inside a git repo.
+pub(crate) fn repo_name(dir: &Path) -> Option<String> {
+    if !is_git_repo(dir) {
+        return None;
+    }
+    if let Some(name) = origin_url(dir).and_then(|url| repo_name_from_remote(&url)) {
+        return Some(name);
+    }
+    toplevel(dir).and_then(|t| {
+        Path::new(&t)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_name_from_remote_keeps_owner_slash_repo() {
+        assert_eq!(
+            repo_name_from_remote("https://github.com/LightHeart-Ventures/aish.git").as_deref(),
+            Some("LightHeart-Ventures/aish")
+        );
+        assert_eq!(
+            repo_name_from_remote("git@github.com:owner/repo.git").as_deref(),
+            Some("owner/repo")
+        );
+        assert_eq!(
+            repo_name_from_remote("ssh://git@github.com/owner/repo").as_deref(),
+            Some("owner/repo")
+        );
+        assert_eq!(
+            repo_name_from_remote("https://github.com/owner/repo/").as_deref(),
+            Some("owner/repo")
+        );
+        assert_eq!(repo_name_from_remote("https://gitlab.com/a/b.git"), None);
+        assert_eq!(repo_name_from_remote("git@github.com:owner"), None);
+    }
 
     #[test]
     fn repo_key_from_remote_parses_https_and_ssh() {
