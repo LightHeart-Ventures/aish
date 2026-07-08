@@ -178,6 +178,32 @@ static LAST_FOOTER_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
 /// Ensures the heartbeat thread is spawned at most once per process.
 static HEARTBEAT_SPAWNED: AtomicBool = AtomicBool::new(false);
 
+/// Terminal size `(rows, cols)` at the last footer paint, packed as
+/// `(rows << 16) | cols`. The heartbeat compares the LIVE size against this and
+/// repaints IMMEDIATELY on a change — bypassing the [`HEARTBEAT_IDLE`] gate — so
+/// a window resize refreshes the footer within one heartbeat tick (~500ms)
+/// instead of waiting out the full idle interval or the next REPL idle pass.
+/// `0` = never painted. Updated inside [`paint_cached_footer`] so every paint
+/// path (idle self-heal, mid-turn override, resize) keeps it current.
+static LAST_PAINTED_SIZE: AtomicU64 = AtomicU64::new(0);
+
+/// Pack `(rows, cols)` into a single u64 for atomic storage/compare.
+fn pack_size(rows: u16, cols: u16) -> u64 {
+    ((rows as u64) << 16) | cols as u64
+}
+
+/// True when the live terminal size differs from the last painted size (i.e. the
+/// window was resized since the last footer paint). Off-tty / unknown size ⇒
+/// `false` (nothing to refresh). Cheap: one TIOCGWINSZ ioctl + an atomic load.
+fn size_changed_since_paint() -> bool {
+    match term_size() {
+        Some((rows, cols)) => {
+            pack_size(rows, cols) != LAST_PAINTED_SIZE.load(Ordering::Relaxed)
+        }
+        None => false,
+    }
+}
+
 /// True while the in-progress input line is non-empty. The heartbeat NEVER
 /// repaints while this is set, so a partially-typed command can never be
 /// clobbered by a footer repaint racing rustyline's own line render (the
@@ -251,7 +277,11 @@ pub fn spawn_footer_heartbeat() {
                 }
                 let idle =
                     heartbeat_now_ms().saturating_sub(LAST_FOOTER_ACTIVITY_MS.load(Ordering::Relaxed));
-                if idle >= idle_ms {
+                // Repaint when idle-timed-out OR the terminal was resized since
+                // the last paint. The resize case bypasses the idle gate so the
+                // footer tracks the new canvas size within one tick rather than
+                // waiting out HEARTBEAT_IDLE — "update accordingly on resize".
+                if idle >= idle_ms || size_changed_since_paint() {
                     // Cursor-safe repaint (no body-home): DECSC/DECRC restores
                     // the input cursor exactly where the user left it.
                     paint_cached_footer(false);
@@ -277,6 +307,9 @@ fn paint_cached_footer(home_body: bool) {
     if rows < MIN_FOOTER_ROWS {
         return;
     }
+    // Record the size we're painting at so the heartbeat can detect a later
+    // resize and refresh the footer to the new canvas dimensions on sight.
+    LAST_PAINTED_SIZE.store(pack_size(rows, cols), Ordering::Relaxed);
     let (msg, bar) = LAST_FOOTER.lock().map(|l| l.clone()).unwrap_or_default();
     // Mid-turn type-ahead, when active, takes over the message row.
     let msg = effective_status_msg(&msg);
@@ -544,6 +577,20 @@ impl Terminal {
         }
         if let Ok(mut last) = LAST_FOOTER.lock() {
             *last = (status_msg.to_string(), statusline.to_string());
+        }
+        // Re-sync cached dimensions from the LIVE terminal size before painting
+        // so a resize that lands DURING a turn (when the main loop hasn't yet
+        // drained the SIGWINCH flag) is reflected on the very next footer draw:
+        // footer_seq re-asserts the scroll region at these dims, so the bottom
+        // margin tracks the new height without waiting for the idle pass.
+        if let Some((rows, cols)) = term_size() {
+            self.rows = rows;
+            self.cols = cols;
+        }
+        // A resize below the footer threshold mid-turn: skip the paint (a footer
+        // no longer fits) and let the idle handle_resize tear the region down.
+        if self.rows < MIN_FOOTER_ROWS {
+            return;
         }
         let sep = separator_line(self.cols, self.utf8, crate::style::colors_enabled());
         let mut buf = String::new();
@@ -1156,5 +1203,25 @@ mod tests {
             utf8: true,
         };
         assert!(!short.footer_enabled());
+    }
+
+    #[test]
+    fn pack_size_round_trips_and_discriminates() {
+        // Packing is injective over (rows, cols): distinct sizes → distinct keys.
+        assert_eq!(pack_size(24, 80), pack_size(24, 80));
+        assert_ne!(pack_size(24, 80), pack_size(50, 80)); // height changed
+        assert_ne!(pack_size(24, 80), pack_size(24, 120)); // width changed
+        assert_ne!(pack_size(24, 80), pack_size(80, 24)); // swapped ≠ same
+        // cols occupy the low 16 bits, rows the next 16 — no cross-talk.
+        assert_eq!(pack_size(1, 1), (1u64 << 16) | 1);
+        assert_eq!(pack_size(0, 0), 0); // matches "never painted" sentinel
+    }
+
+    #[test]
+    fn size_change_detection_flips_on_new_dims() {
+        // A stored size equal to the probe ⇒ unchanged; a different one ⇒ changed.
+        LAST_PAINTED_SIZE.store(pack_size(24, 80), Ordering::Relaxed);
+        assert_eq!(pack_size(24, 80), LAST_PAINTED_SIZE.load(Ordering::Relaxed));
+        assert_ne!(pack_size(30, 100), LAST_PAINTED_SIZE.load(Ordering::Relaxed));
     }
 }

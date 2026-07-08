@@ -183,6 +183,14 @@ pub async fn run(
             .fire_observe(crate::hooks::HookEvent::SessionStart, p);
     }
 
+    // First-run repo notice: if we launched inside a git checkout, surface
+    // "Working with repository: <name>" on the SecondStatusLine. Deduped by
+    // repo_key so a later change_dir into the same repo won't re-announce.
+    // Skipped for nested background coordinators (no interactive footer).
+    if !session.nested {
+        session.announce_repo_if_new();
+    }
+
     // SPR-059 (TASK-264/265): connect to the webhook broker when
     // WEBHOOK_BROKER_URL is set. Skipped in nested background coordinators — the
     // broker client is an interactive-session affordance. Soft no-op (returns

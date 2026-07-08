@@ -369,6 +369,12 @@ pub struct Session {
     /// pending flash → the row falls back to the live coordinator/attach hint
     /// instead of stacking messages on top of each other.
     pub flash: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// `repo_key` of the git checkout most recently ANNOUNCED on the
+    /// SecondStatusLine ("Working with repository: …"). Set the first time the
+    /// session lands in a repo (at launch or after a `change_dir`), so the
+    /// notice fires once per distinct checkout and re-fires only when the cwd
+    /// moves into a *different* repo. Session-local; never persisted.
+    pub announced_repo: Option<String>,
     /// Id of the goal `:goal` subcommands target by default (set by `:goal
     /// new` / `:goal show <id>`). Session-local (not persisted); falls back to
     /// the active goal when unset or stale. (TASK-278)
@@ -629,6 +635,7 @@ impl Session {
             alert_store: None,
             activity_store: None,
             flash: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            announced_repo: None,
             current_goal_id: None,
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
             tool_allowlist: std::env::var("AISH_TOOL_ALLOWLIST").ok().and_then(|v| {
@@ -854,6 +861,44 @@ impl Session {
     /// the cache holds more than one (see `reconcile_active_goal`, which keeps
     /// that from happening in practice). Borrows the cached record so callers
     /// can read progress/badge without a DB round-trip.
+    /// The first time the session lands in a given git repo — at launch, or
+    /// after a `change_dir` into a *different* checkout — surface
+    /// "Working with repository: <name>" on the SecondStatusLine flash slot
+    /// (most-recent wins). No-op outside a git repo, and deduped by `repo_key`
+    /// so re-entering the same checkout (or a sibling worktree sharing its
+    /// origin) doesn't re-announce. Session-local; never persisted.
+    pub fn announce_repo_if_new(&mut self) {
+        if !crate::git::is_git_repo(&self.cwd) {
+            return;
+        }
+        let key = crate::git::repo_key(&self.cwd);
+        if self.announced_repo.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        let name = crate::git::repo_name(&self.cwd).unwrap_or_else(|| key.clone());
+        self.announced_repo = Some(key);
+        let plain = format!("Working with repository: {name}");
+        let msg = if crate::style::colors_enabled() {
+            format!("\x1b[36m{plain}\x1b[0m")
+        } else {
+            plain.clone()
+        };
+        if let Ok(mut f) = self.flash.lock() {
+            *f = Some(msg);
+        }
+        // Also drop a recoverable `:activity` entry so the notice survives the
+        // next most-recent flash overwriting the single footer slot.
+        if let Some(act) = &self.activity_store {
+            let _ = act.record(
+                crate::style::Severity::Info.as_str(),
+                "repo",
+                &plain,
+                "repo",
+            );
+        }
+    }
+
+
     pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
         // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
         // updated_at DESC), so the first match is the freshest active goal.
