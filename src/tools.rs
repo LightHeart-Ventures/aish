@@ -4279,6 +4279,8 @@ fn change_dir(call: &ToolCall, session: &mut Session) -> Result<String> {
         anyhow::bail!("{} is not a directory", canonical.display());
     }
     session.cwd = canonical;
+    // First entry into a new repo → announce it on the SecondStatusLine.
+    session.announce_repo_if_new();
     Ok(format!(
         "working directory is now {}",
         session.cwd.display()
