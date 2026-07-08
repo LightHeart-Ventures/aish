@@ -326,6 +326,30 @@ pub async fn run(
                 }
             }
         });
+        // SIGCONT → the process was just resumed after being stopped (OS
+        // suspend/resume — laptop sleep, lid-close, hibernate — or a `fg` after
+        // Ctrl-Z / kill -STOP). Nothing else tells aish the world moved: the
+        // pinned footer may have scrolled away or lost its scroll region while
+        // parked, the terminal may have been resized during the sleep window,
+        // and the monotonic idle clock froze across the suspend so the heartbeat
+        // under-counts the gap and won't self-heal promptly. On wake we (a) flag
+        // a resize so the loop re-establishes the region + prompt at the live
+        // size on its next idle pass, and (b) re-sync the footer immediately so
+        // the heal is live rather than deferred until the next keystroke.
+        let resized_cont = resized.clone();
+        tokio::spawn(async move {
+            if let Ok(mut sig) = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::from_raw(libc::SIGCONT),
+            ) {
+                loop {
+                    if sig.recv().await.is_none() {
+                        break;
+                    }
+                    resized_cont.store(true, Ordering::SeqCst);
+                    crate::terminal::resync_after_wake();
+                }
+            }
+        });
     }
 
     // Live statusline (version + model on the left, date/time on the right),
