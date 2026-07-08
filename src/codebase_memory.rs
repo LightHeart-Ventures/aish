@@ -192,6 +192,56 @@ pub fn should_auto_index(enrolled: bool, connected: bool, gate_on: bool, already
     enrolled && connected && gate_on && !already
 }
 
+/// Environment variable that echoes best-effort auto-index handoff diagnostics
+/// to stderr. Off by default — the handoff is a non-fatal background warm, so
+/// its warnings would only be noise in the interactive/coordinator stream.
+/// Set `AISH_CODEBASE_DEBUG=1` (or `true`/`on`/`yes`) to surface them live.
+pub const DEBUG_ENV: &str = "AISH_CODEBASE_DEBUG";
+
+/// Whether handoff diagnostics should ALSO be echoed to stderr (they are always
+/// appended to the log file regardless). Pure so the truth-table is unit-testable
+/// without touching the process environment. An empty/unset value is OFF.
+pub fn debug_echo_enabled(env: Option<&str>) -> bool {
+    matches!(
+        env.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
+/// Path of the codebase-memory diagnostics log. Best-effort auto-index handoff
+/// warnings are appended here instead of polluting stderr. Honours
+/// `$AISH_CODEBASE_LOG` (used by tests), else `~/.aish/codebase-memory.log`.
+pub fn handoff_log_path() -> PathBuf {
+    if let Ok(p) = std::env::var("AISH_CODEBASE_LOG") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    aish_home().join("codebase-memory.log")
+}
+
+/// Append a unix-timestamped diagnostic line to [`handoff_log_path`]. Best-effort:
+/// this IS the diagnostics path, so any IO error is swallowed — it must never
+/// panic or surface a new error of its own.
+pub fn log_handoff_event(msg: &str) {
+    let path = handoff_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{ts} [codebase-memory] {msg}");
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -200,6 +250,19 @@ mod tests {
 
     fn spec_for(cmd: &str) -> Value {
         server_spec(&PathBuf::from(cmd))
+    }
+
+    #[test]
+    fn debug_echo_enabled_truth_table() {
+        // Truthy values enable the stderr echo.
+        for v in ["1", "true", "on", "yes", "TRUE", " On ", "Yes"] {
+            assert!(debug_echo_enabled(Some(v)), "expected {v:?} to enable echo");
+        }
+        // Everything else (incl. unset, empty, and explicit off values) stays quiet.
+        for v in ["0", "false", "off", "no", "", "  ", "nope"] {
+            assert!(!debug_echo_enabled(Some(v)), "expected {v:?} to stay quiet");
+        }
+        assert!(!debug_echo_enabled(None), "unset must stay quiet");
     }
 
     #[test]
