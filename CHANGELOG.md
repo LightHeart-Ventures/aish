@@ -2,6 +2,18 @@
 
 All notable changes to aish are documented here. Dates are the GitHub release published dates (UTC). Burned/failed release tags that never shipped valid assets (v0.18.1, v0.18.3, v0.19.0) are intentionally omitted.
 
+## [0.36.2] - 2026-07-08
+
+### Added
+- **Terminal footer resync on SIGCONT wake (PR #651)**: terminal footer + idle timer re-sync when the process wakes from `SIGCONT` (e.g., fg after Ctrl-Z + bg). Prevents stale footer state on resume.
+- **Repository entry announcement (PR #654)**: aish now prints "Working with repository: <name>" on first repo entry in a session, clarifying context in multi-repo workflows.
+- **Terminal footer dynamic resize (PR #654)**: terminal footer redraws on window resize within one heartbeat tick instead of waiting for the next turn, improving responsiveness.
+
+### Changed
+- **Release workflow consolidation (PR #653)**: merged `release.yml` + `release-prod.yml` → `release-production.yml`. Added `workflow_dispatch` trigger, reusable `build-release-binary.yml` to eliminate duplication, and clearer workflow naming (`release-ci.yml` → `release-ci-cd.yml`). Documented in `workflows/README.md`.
+- **Codebase-memory auto-index warnings quieted (PR #652)**: moved auto-index handoff warnings from interactive output to a durable log, reducing noise in typical workflows.
+- **Documentation reorganized (PR #654)**: restructured docs into a tiered hierarchy with `INDEX.md` navigation hub, consolidated release docs into `RELEASE.md`, archived completed work, organized reference/internals/formats into subdirectories, and created `archive/MANIFEST.md` for historical context.
+
 ## [0.36.0] - 2026-07-07
 
 ### Added
