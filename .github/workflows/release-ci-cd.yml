@@ -1,5 +1,9 @@
 name: Release (CI/CD)
 
+# Auto-publish bleeding-edge builds from every main commit. This is the **continuous delivery**
+# half of the release channels (not an on-demand CI test gate — that's ci.yml). Tags these with
+# `ci-{run_number}-{short_sha}` and marks them prerelease so they don't override production.
+
 # Auto-publish on every main commit: bleeding-edge internal testing channel.
 # Tags: ci-{run_number}-{short_sha} (e.g., ci-12345-a1b2c3d4)
 # Marked as prerelease so these never override the latest production release.
