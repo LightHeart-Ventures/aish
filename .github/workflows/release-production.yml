@@ -51,6 +51,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && 'origin/main' || '' }}
+          fetch-depth: 0
 
       - name: Determine version (tag-push vs dispatch)
         id: version
@@ -86,6 +87,18 @@ jobs:
             echo "::error::Release version $version does not match Cargo.toml version $cargo_version. Bump Cargo.toml (and Cargo.lock) before releasing so the binary reports the right version."
             exit 1
           fi
+        shell: bash
+
+      - name: Create tag (dispatch mode only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          git tag "$tag"
+          git push origin "$tag"
+          echo "Created and pushed tag: $tag"
         shell: bash
 
       - name: Assert no published release already exists for this tag
