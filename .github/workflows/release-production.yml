@@ -140,7 +140,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.verify-version.outputs.tag }}
+          # On tag push: checkout the tag. On dispatch: checkout main (tag doesn't exist yet).
+          ref: ${{ github.event_name == 'push' && needs.verify-version.outputs.tag || 'main' }}
 
       - name: Install Rust toolchain
         run: |
