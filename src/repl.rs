@@ -5209,6 +5209,17 @@ fn close_worker(id: Option<&str>, session: &mut Session) {
         .unwrap()
         .retain(|w| w.id != run_id);
 
+    // Cancel any armed/pending auto-resume for the worker we just closed.
+    // `:close` is an explicit dismissal, so the operator should NOT be dragged
+    // into an "⤵ auto-resume — reading finished background workers" model turn
+    // for a worker they just closed — that unsolicited turn blocks typing and
+    // Shift-Tab until it finishes (the reported hang). `forget` drops the id
+    // from the resume's pending/seen sets and disarms it when nothing else is
+    // pending. No-op when auto-resume never armed for this id.
+    if let Ok(mut r) = session.resume.lock() {
+        r.forget(&run_id);
+    }
+
     // Detach if we just closed the worker we were attached to.
     if attached.as_deref() == Some(run_id.as_str()) {
         *session.attached.lock().unwrap() = None;
