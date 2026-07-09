@@ -128,7 +128,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.verify-version.outputs.tag }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'origin/main' || needs.verify-version.outputs.tag }}
 
       - name: Install Rust toolchain
         run: |
