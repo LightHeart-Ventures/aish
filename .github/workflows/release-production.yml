@@ -50,7 +50,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && 'origin/main' || '' }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || '' }}
 
       - name: Determine version (tag-push vs dispatch)
         id: version
