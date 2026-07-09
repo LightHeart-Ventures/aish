@@ -74,6 +74,18 @@ jobs:
           echo "Resolved version: $version (tag: $tag)"
         shell: bash
 
+      - name: Verify tag exists or prepare to create it
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          if ! git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "::notice::Tag $tag does not exist yet. Will create during release if permitted."
+          else
+            echo "::notice::Tag $tag already exists."
+          fi
+        shell: bash
+
       - name: Assert tag matches Cargo.toml version
         run: |
           set -euo pipefail
@@ -213,9 +225,13 @@ jobs:
           if [ -z "$notes" ]; then
             notes="Production release"
           fi
+          
+          # Use commit SHA as target to allow GitHub to create the tag
+          target_ref="${{ github.sha }}"
+          
           gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$tag" \
+            --target "$target_ref" \
             --latest \
             --title "aish $tag" \
             --notes "$notes" \
