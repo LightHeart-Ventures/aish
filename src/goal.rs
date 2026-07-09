@@ -741,15 +741,32 @@ fn announce(line: &str) {
     crate::tools::announce("[goal]", line);
 }
 
+/// Build the goal-delivery blob: the dim `── goal achieved (N turn(s)) ──`
+/// banner, the verifier's one-line verdict, then the achieved output rendered as
+/// terminal markdown — each logical line `\n`-terminated so the whole thing can
+/// be handed to the prompt-preserving printer atomically. Pure — unit-tested.
+fn delivery_blob(turns: usize, reason: &str, rendered_output: &str) -> String {
+    format!(
+        "\x1b[2m── goal achieved ({turns} turn(s)) ──\x1b[0m\n\x1b[2m{reason}\x1b[0m\n{rendered_output}\n"
+    )
+}
+
 /// Deliver the achieved outcome over the prompt (rendered markdown), like a
-/// finished batch result.
+/// finished batch result. Routes through the serialized, prompt-preserving
+/// [`crate::tools::print_above_prompt`] (CRLF-normalized, coordinated with the
+/// live prompt + `:output` pane) so the delivery lands as clean, left-aligned
+/// lines instead of gluing onto the last transient `[goal]` activity row and
+/// stair-stepping off the border — the reported malformatted-goal-output bug.
+/// Falls back to a raw stdout write (erasing the transient line first) when no
+/// printer is installed (piped / headless / non-interactive).
 fn deliver(goal: &Handle, turns: usize, reason: &str, output: &str) {
     use std::io::Write;
-    print!("\r\x1b[2K");
-    println!("\x1b[2m── goal achieved ({turns} turn(s)) ──\x1b[0m");
-    println!("\x1b[2m{reason}\x1b[0m");
-    println!("{}", crate::md::render_stdout(output.trim()));
+    let blob = delivery_blob(turns, reason, &crate::md::render_stdout(output.trim()));
     let _ = goal; // handle kept for symmetry / future status integration
+    if crate::tools::print_above_prompt(blob.clone()) {
+        return;
+    }
+    print!("\r\x1b[2K{blob}");
     std::io::stdout().flush().ok();
 }
 
@@ -1270,6 +1287,16 @@ pub fn route_next(goals: &[Goal]) -> Option<&Goal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_blob_is_left_aligned_and_line_terminated() {
+        let blob = delivery_blob(4, "goal met", "line one\nline two");
+        assert_eq!(
+            blob,
+            "\x1b[2m── goal achieved (4 turn(s)) ──\x1b[0m\n\x1b[2mgoal met\x1b[0m\nline one\nline two\n"
+        );
+        assert!(blob.ends_with('\n'));
+    }
 
     #[test]
     fn fmt_duration_buckets() {
