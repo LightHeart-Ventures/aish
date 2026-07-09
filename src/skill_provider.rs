@@ -685,18 +685,15 @@ async fn search_with_base(base: &str, query: &str) -> Result<Vec<SearchResult>> 
     parse_search_body(&body)
 }
 
-/// The **built-in** in-process skill source: mcpmarket.com (dynamic primary)
-/// merged over the curated, binary-embedded index (offline fallback).
+/// The **built-in** in-process skill source: the curated, binary-embedded index
+/// (offline fallback), or an explicit `AISH_SKILL_REGISTRY` mirror when set.
 ///
-/// Source precedence (mirrors skillfish's `:skill search`):
+/// Source precedence:
 ///   1. An explicit `AISH_SKILL_REGISTRY` override always wins — when the user
-///      points aish at a specific mirror we honor it exactly and do not
-///      second-guess it with mcpmarket.
-///   2. Otherwise, query mcpmarket.com's live skills API (the dynamic, primary
-///      source). Non-empty results are merged with the curated, binary-embedded
-///      index so the built-in catalog is always discoverable too.
-///   3. If mcpmarket is unreachable or returns nothing, fall back to the local
-///      embedded index alone — search keeps working fully offline.
+///      points aish at a specific mirror we honor it exactly.
+///   2. Otherwise, the curated, binary-embedded index — search works fully
+///      offline. Live/community search comes from the npx-skillfish plugin
+///      source, not this built-in leaf.
 ///
 /// This is the `@builtin` leaf of the skill-source federation. It does NOT fan
 /// out to plugins itself (the public [`search`] and the repl `:skill search`
@@ -709,26 +706,12 @@ pub(crate) async fn search_core(query: &str) -> Result<Vec<SearchResult>> {
         return search_with_base(&base, query).await;
     }
 
-    // (3, prepared) The offline fallback: the curated, binary-embedded index.
-    let local = search_with_base(&default_registry(), query)
+    // (2) The offline, curated, binary-embedded index. Live/community search is
+    // served by the npx-skillfish plugin (a `provides.skill_source`), not by the
+    // built-in core — see `search` / `search_plugins` for the federation.
+    Ok(search_with_base(&default_registry(), query)
         .await
-        .unwrap_or_default();
-
-    // (2) mcpmarket is DISABLED by default. Enable it with
-    // `AISH_ENABLE_MCPMARKET=1`. On any failure we degrade gracefully to the
-    // embedded index rather than surfacing a network error.
-    let mcpmarket_enabled = std::env::var("AISH_ENABLE_MCPMARKET")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    
-    if !mcpmarket_enabled {
-        return Ok(local);
-    }
-    
-    match search_mcpmarket(query, MCPMARKET_LIMIT).await {
-        Ok(remote) if !remote.is_empty() => Ok(merge_results(remote, local)),
-        _ => Ok(local),
-    }
+        .unwrap_or_default())
 }
 
 /// Fan out `query` to every plugin-provided skill source (`provides.skill_source`
@@ -780,8 +763,8 @@ async fn search_plugins(query: &str) -> Vec<SearchResult> {
 ///
 /// Precedence: **plugin skill sources first** (highest priority — a
 /// `provides.skill_source` plugin such as `npx-skills` answers before the
-/// built-in), then the built-in [`search_core`] (mcpmarket primary + embedded
-/// fallback). Plugin hits are deduped ahead of the built-in results by
+/// built-in), then the built-in [`search_core`] (the offline, embedded
+/// index). Plugin hits are deduped ahead of the built-in results by
 /// reference so the same skill never shows twice; plugin failures fail soft.
 ///
 /// This is the entry point for the non-interactive CLI path
@@ -795,7 +778,7 @@ pub async fn search(query: &str) -> Result<Vec<SearchResult>> {
     // (0) Plugin skill sources are the highest-priority tier — fan out first.
     let plugin_hits = search_plugins(query).await;
 
-    // (1) The built-in core (mcpmarket + embedded). `?` preserves the
+    // (1) The built-in core (the offline, embedded index). `?` preserves the
     // registry-override error-propagation contract; the non-override path never
     // errors — it degrades to the embedded index.
     let core = search_core(query).await?;
@@ -806,8 +789,8 @@ pub async fn search(query: &str) -> Result<Vec<SearchResult>> {
 
 /// Merge two result lists, preferring `primary` order and dropping any
 /// `fallback` entry whose `owner/name` reference already appeared in `primary`.
-/// Keeps the dynamic mcpmarket hits first, then appends embedded-index entries
-/// the live search didn't already cover.
+/// Keeps the primary (plugin) hits first, then appends the embedded-index
+/// entries the primary didn't already cover.
 fn merge_results(primary: Vec<SearchResult>, fallback: Vec<SearchResult>) -> Vec<SearchResult> {
     let mut seen: HashSet<String> = primary.iter().map(|r| r.ref_or_synth()).collect();
     let mut out = primary;
@@ -1069,270 +1052,6 @@ pub async fn run_search(query: &str) -> Result<()> {
     let results = search(query).await?;
     println!("{}", print_results_table(query, &results));
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// mcpmarket.com — the dynamic, primary search source (Phase 3)
-// ---------------------------------------------------------------------------
-//
-// mcpmarket.com publishes a live, growing catalog of skills. We query it as the
-// PRIMARY source for `:skill search` / `--skill-search`, merging its hits over
-// the curated, binary-embedded index so the built-in catalog is still
-// discoverable and search keeps working offline (see `search`).
-
-/// The mcpmarket origin. Override with `AISH_MCPMARKET_BASE` (used by the tests
-/// to point at a loopback server, and available as an escape hatch for a mirror).
-const MCPMARKET_BASE: &str = "https://mcpmarket.com";
-
-/// Whether to emit the verbose `[mcpmarket]` retry/transport trace to stderr.
-/// Off by default — those lines were polluting a normal `--skill-search` run.
-/// Set `AISH_SKILL_DEBUG=1` to turn the trace back on for troubleshooting.
-fn skill_debug() -> bool {
-    std::env::var("AISH_SKILL_DEBUG")
-        .map(|v| v != "0" && !v.trim().is_empty())
-        .unwrap_or(false)
-}
-
-/// How many skills to ask mcpmarket for. Matches the registry's own `limit=50`.
-const MCPMARKET_LIMIT: usize = 50;
-
-/// The minimum GitHub-star count an mcpmarket result must have to be surfaced by
-/// `:skill search` / `--skill-search`. mcpmarket carries a long tail of 0-star
-/// skills (placeholders, unstarred forks, low-signal entries); requiring at
-/// least one star keeps the results list to skills with at least minimal
-/// community validation. Only the mcpmarket source is filtered — the curated,
-/// binary-embedded index and any explicit `AISH_SKILL_REGISTRY` mirror are
-/// surfaced unfiltered.
-const MCPMARKET_MIN_STARS: u64 = 1;
-
-/// The active mcpmarket base: the `AISH_MCPMARKET_BASE` override when set and
-/// non-empty (trailing slash trimmed), else the public origin.
-fn mcpmarket_base() -> String {
-    std::env::var("AISH_MCPMARKET_BASE")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| MCPMARKET_BASE.to_string())
-}
-
-/// The mcpmarket skills-search endpoint URL on `base` for `query`:
-/// `GET {base}/api/search?q=<query>&type=skills&limit=<limit>`.
-fn mcpmarket_search_url(base: &str, query: &str, limit: usize) -> String {
-    format!(
-        "{}/api/search?q={}&type=skills&limit={}",
-        base.trim_end_matches('/'),
-        encode_query(query),
-        limit
-    )
-}
-
-/// Retry delays in milliseconds, matching skillfish's exponential backoff.
-const MCPMARKET_RETRY_DELAYS_MS: &[u64] = &[1000, 2000, 4000];
-
-/// Query a specific mcpmarket `base` (no env lookup), so tests can point it at a
-/// loopback server. Reuses [`parse_search_body`] — mcpmarket's per-skill fields
-/// (`name`, `publisher`/`namespace`, `summary`, `full_name`/`slug`, …) are folded
-/// onto [`SearchResult`] via the serde aliases on that struct.
-///
-/// Retries with exponential backoff on 429 responses (matching skillfish's behavior).
-async fn search_mcpmarket_with_base(
-    base: &str,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<SearchResult>> {
-    let url = mcpmarket_search_url(base, query, limit);
-    check_url(&url)?;
-    
-    let client = http_client()?;
-    let mut last_error: Option<anyhow::Error> = None;
-    
-    let debug = skill_debug();
-    // Retry up to 3 times with exponential backoff (matching skillfish)
-    for attempt in 0..3 {
-        if debug {
-            eprintln!("[mcpmarket] attempt {} of 3...", attempt + 1);
-        }
-        let resp = match client
-            .get(&url)
-            .header("Referer", "https://mcpmarket.com/")
-            .header("Accept", "application/json")
-            .header("User-Agent", "skillfish-cli")
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                if debug {
-                    eprintln!("[mcpmarket] request failed: {e}");
-                }
-                last_error = Some(e.into());
-                if attempt < 2 {
-                    if debug {
-                        eprintln!("[mcpmarket] sleeping {}ms before retry...", MCPMARKET_RETRY_DELAYS_MS[attempt]);
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(
-                        MCPMARKET_RETRY_DELAYS_MS[attempt],
-                    ))
-                    .await;
-                    continue;
-                }
-                return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("request failed")));
-            }
-        };
-
-        if debug {
-            eprintln!("[mcpmarket] got response: {}", resp.status());
-        }
-        // 429 (Vercel challenge) → retry with backoff
-        if resp.status().as_u16() == 429 {
-            if attempt < 2 {
-                if debug {
-                    eprintln!("[mcpmarket] 429 on attempt {}, retrying in {}ms...", attempt + 1, MCPMARKET_RETRY_DELAYS_MS[attempt]);
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(
-                    MCPMARKET_RETRY_DELAYS_MS[attempt],
-                ))
-                .await;
-                continue;
-            }
-            // Last attempt failed with 429
-            if debug {
-                eprintln!("[mcpmarket] 429 on final attempt {}", attempt + 1);
-            }
-            last_error = Some(anyhow::anyhow!("HTTP 429 after retries"));
-            continue;
-        }
-        
-        // Other success or client error → return immediately
-        if !resp.status().is_success() {
-            bail!("mcpmarket returned HTTP {} for {url}", resp.status().as_u16());
-        }
-        
-        let body = resp
-            .text()
-            .await
-            .context("reading the mcpmarket search response")?;
-        return parse_mcpmarket_body(&body);
-    }
-    
-    // All retries exhausted
-    if let Some(e) = last_error {
-        return Err(e);
-    }
-    bail!("mcpmarket search failed after retries")
-}
-
-/// Query mcpmarket's public skills API for `query`.
-async fn search_mcpmarket(query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-    search_mcpmarket_with_base(&mcpmarket_base(), query, limit).await
-}
-
-/// Parse an mcpmarket search response into [`SearchResult`]s.
-///
-/// mcpmarket's per-skill JSON shape differs from the generic registry shape that
-/// [`parse_search_body`] handles, so it needs its own mapping:
-///   * `owner` is a **nested object** `{name,url,avatar}` — not a bare string —
-///     so the generic serde `alias = "owner"` on `author` fails to deserialize
-///     and silently drops EVERY row (the bug this function fixes). We read
-///     `owner.name` explicitly.
-///   * the skill identifier lives in `skill_name`/`raw_name`/`slug`, not `name`
-///     (which is a human display title like "Discord Doctor").
-///   * the canonical, fetchable location is the `website` GitHub URL, which
-///     `:skill add` / `--skill-fetch` resolve via the GitHub path. We surface
-///     that as the `reference` so the value shown in the table actually fetches.
-///
-/// Hits are wrapped under `skills` (mcpmarket's key); we also accept the generic
-/// wrappers for forward-compatibility. Duplicates (by reference) are dropped.
-fn parse_mcpmarket_body(body: &str) -> Result<Vec<SearchResult>> {
-    let v: serde_json::Value =
-        serde_json::from_str(body).context("mcpmarket search response was not valid JSON")?;
-    let arr = v
-        .get("skills")
-        .or_else(|| v.get("results"))
-        .or_else(|| v.get("items"))
-        .or_else(|| v.get("data"))
-        .or_else(|| v.get("hits"))
-        .and_then(|x| x.as_array())
-        .cloned()
-        .or_else(|| v.as_array().cloned())
-        .unwrap_or_default();
-
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for item in arr {
-        // First non-empty string among the given keys.
-        let pick = |keys: &[&str]| -> String {
-            for k in keys {
-                if let Some(s) = item.get(*k).and_then(|x| x.as_str()) {
-                    let s = s.trim();
-                    if !s.is_empty() {
-                        return s.to_string();
-                    }
-                }
-            }
-            String::new()
-        };
-
-        // owner is usually a nested object {name,url,...}; tolerate a bare
-        // string too, then fall back to the flat publisher/namespace fields.
-        let author = item
-            .get("owner")
-            .and_then(|o| {
-                o.get("name")
-                    .and_then(|n| n.as_str())
-                    .or_else(|| o.as_str())
-            })
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| pick(&["publisher", "namespace", "author"]));
-
-        let name = pick(&["skill_name", "raw_name", "slug", "name"]);
-        let description = pick(&["description", "summary", "tagline"]);
-        let version = pick(&["version"]);
-        // Popularity: mcpmarket reports `github_stars` as a number.
-        let stars = ["github_stars", "stars", "stars_count"]
-            .iter()
-            .find_map(|k| item.get(*k).and_then(|x| x.as_u64()))
-            .unwrap_or(0);
-
-        // Canonical fetchable location: the GitHub website URL. Fall back to the
-        // `github` short path, then a synthesized owner/name.
-        let website = pick(&["website"]);
-        let reference = if !website.is_empty() {
-            website
-        } else {
-            let gh = pick(&["github"]);
-            if !gh.is_empty() {
-                gh
-            } else if !author.is_empty() && !name.is_empty() {
-                format!("{author}/{name}")
-            } else {
-                name.clone()
-            }
-        };
-
-        if name.is_empty() && reference.is_empty() {
-            continue;
-        }
-        // mvpmarket.com / mcpmarket.com only: drop low-signal 0-star skills so
-        // search surfaces only skills with at least one star (see
-        // MCPMARKET_MIN_STARS).
-        if stars < MCPMARKET_MIN_STARS {
-            continue;
-        }
-        let r = SearchResult {
-            name,
-            author,
-            description,
-            version,
-            reference,
-            stars,
-        };
-        if seen.insert(r.ref_or_synth()) {
-            out.push(r);
-        }
-    }
-    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -2281,121 +2000,6 @@ mod tests {
         // Short strings pass through unchanged; newlines collapse to spaces.
         assert_eq!(truncate("short", 60), "short");
         assert_eq!(truncate("a\nb", 60), "a b");
-    }
-
-    // ---- Phase 3: mcpmarket search --------------------------------------
-
-    #[test]
-    fn mcpmarket_search_url_is_well_formed() {
-        let u = mcpmarket_search_url("https://mcpmarket.com", "git helper", 25);
-        assert_eq!(
-            u,
-            "https://mcpmarket.com/api/search?q=git%20helper&type=skills&limit=25"
-        );
-        // A trailing slash on the base is normalized away (no `//api`).
-        assert_eq!(
-            mcpmarket_search_url("http://localhost:9/", "x", 50),
-            "http://localhost:9/api/search?q=x&type=skills&limit=50"
-        );
-    }
-
-    #[tokio::test]
-    async fn mcpmarket_parses_real_skills_shape() {
-        // The REAL mcpmarket shape: hits under `skills`, a NESTED `owner` object
-        // (not a bare string), the identifier in `skill_name`/`slug`, and the
-        // fetchable location in the `website` GitHub URL. The generic
-        // parse_search_body silently dropped every such row because the nested
-        // owner object failed to deserialize into the String `author` field —
-        // this is the regression parse_mcpmarket_body fixes.
-        let body = r#"{"skills":[
-            {"id":29062,"name":"Discord Doctor","slug":"discord-doctor",
-             "owner":{"url":"https://github.com/lycfyi","name":"lycfyi"},
-             "github":"lycfyi/community-agent-plugin/discord-connector/discord-doctor",
-             "website":"https://github.com/lycfyi/community-agent-plugin/tree/abc123/plugins/discord-connector/skills/discord-doctor",
-             "raw_name":"discord-doctor","skill_name":"discord-doctor",
-             "description":"Diagnoses Discord configuration issues.","github_stars":7}
-        ]}"#;
-        let port = serve_once("200 OK", body.to_string()).await;
-        let base = format!("http://127.0.0.1:{port}");
-        let got = search_mcpmarket_with_base(&base, "discord", 50)
-            .await
-            .unwrap();
-        assert_eq!(got.len(), 1, "nested-owner row was dropped");
-        assert_eq!(got[0].name, "discord-doctor");
-        assert_eq!(got[0].author, "lycfyi");
-        assert_eq!(got[0].description, "Diagnoses Discord configuration issues.");
-        // The fetchable GitHub website URL becomes the reference.
-        assert_eq!(
-            got[0].ref_or_synth(),
-            "https://github.com/lycfyi/community-agent-plugin/tree/abc123/plugins/discord-connector/skills/discord-doctor"
-        );
-    }
-
-    #[tokio::test]
-    async fn mcpmarket_parses_github_stars() {
-        // The popularity signal `github_stars` is read onto SearchResult.stars.
-        let body = r#"{"skills":[
-            {"skill_name":"github","owner":{"name":"clawdbot"},
-             "website":"https://github.com/clawdbot/clawdbot/tree/abc/skills/github",
-             "description":"GitHub ops.","github_stars":123}
-        ]}"#;
-        let port = serve_once("200 OK", body.to_string()).await;
-        let base = format!("http://127.0.0.1:{port}");
-        let got = search_mcpmarket_with_base(&base, "github", 50).await.unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].stars, 123);
-        assert_eq!(got[0].short_name(), "clawdbot/github");
-    }
-
-    #[tokio::test]
-    async fn mcpmarket_drops_zero_star_skills() {
-        // mvpmarket.com / mcpmarket.com only surface skills with >= 1 star
-        // (MCPMARKET_MIN_STARS). A 0-star row (or one with no star field at all)
-        // is dropped; a 1-star row survives.
-        let body = r#"{"skills":[
-            {"skill_name":"zero","owner":{"name":"acme"},
-             "website":"https://github.com/acme/acme/tree/abc/skills/zero",
-             "description":"No stars.","github_stars":0},
-            {"skill_name":"missing","owner":{"name":"acme"},
-             "website":"https://github.com/acme/acme/tree/abc/skills/missing",
-             "description":"No star field."},
-            {"skill_name":"one","owner":{"name":"acme"},
-             "website":"https://github.com/acme/acme/tree/abc/skills/one",
-             "description":"One star.","github_stars":1}
-        ]}"#;
-        let port = serve_once("200 OK", body.to_string()).await;
-        let base = format!("http://127.0.0.1:{port}");
-        let got = search_mcpmarket_with_base(&base, "x", 50).await.unwrap();
-        assert_eq!(got.len(), 1, "0-star and star-less rows must be dropped");
-        assert_eq!(got[0].name, "one");
-        assert_eq!(got[0].stars, 1);
-    }
-
-    #[tokio::test]
-    async fn mcpmarket_falls_back_to_flat_fields() {
-        // Forward-compat: a flat shape (publisher/summary, no owner object, no
-        // website) still maps, synthesizing the reference from author/name.
-        let body = r#"{"results":[
-            {"skill_name":"git-helper","publisher":"acme","summary":"Helps with git.","version":"2.0.0","stars":1}
-        ]}"#;
-        let port = serve_once("200 OK", body.to_string()).await;
-        let base = format!("http://127.0.0.1:{port}");
-        let got = search_mcpmarket_with_base(&base, "git", 50).await.unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].author, "acme");
-        assert_eq!(got[0].description, "Helps with git.");
-        assert_eq!(got[0].ref_or_synth(), "acme/git-helper");
-        assert_eq!(got[0].version, "2.0.0");
-    }
-
-    #[tokio::test]
-    async fn mcpmarket_http_error_propagates() {
-        let port = serve_once("503 Service Unavailable", "down".to_string()).await;
-        let base = format!("http://127.0.0.1:{port}");
-        let err = search_mcpmarket_with_base(&base, "x", 50)
-            .await
-            .unwrap_err();
-        assert!(format!("{err}").contains("mcpmarket"), "{err}");
     }
 
     #[test]

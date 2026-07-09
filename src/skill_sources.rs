@@ -63,7 +63,7 @@ impl SkillSource {
         match self {
             SkillSource::Builtin => {
                 // In-process path (reserved handler "@builtin", design §5):
-                // delegate to the built-in *core* source (mcpmarket + embedded).
+                // delegate to the built-in *core* source (offline embedded index).
                 // We call `search_core` rather than `search` so this leaf does
                 // not itself re-fan out to plugins — the federation fan-out lives
                 // one layer up (the repl `:skill search` orchestration and the
