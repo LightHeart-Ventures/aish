@@ -4844,6 +4844,19 @@ OWN prior work, not a fresh task, and build on it.\n\n\
 /// `1..=running.len()` means `running[k - 1]`. An unknown `current` (e.g. it was
 /// `:close`d and removed from `running`) restarts the cycle from interactive.
 /// Returns 0 when there is nothing to cycle through.
+/// Whether a Shift-Tab cycle should be a silent no-op. It is a no-op ONLY when
+/// there is genuinely nothing to do: no live/terminal workers, no active `:goal`,
+/// AND the session is not currently attached to anything. The last clause is the
+/// fix for the "goal completes while attached → stuck" bug: when the operator is
+/// attached to the goal and it finishes (so `goal_active` flips false) with no
+/// workers, the cycle must STILL run so it can fall through to the index-0
+/// (interactive) branch and release the now-stale attach — otherwise Shift-Tab
+/// (and the mid-turn variant) dead-ends and the operator can never get back to
+/// the interactive prompt. Pure so it's unit-testable without a live Session.
+fn cycle_is_noop(worker_count: usize, goal_active: bool, attached: bool) -> bool {
+    worker_count == 0 && !goal_active && !attached
+}
+
 fn next_attach_index(running: &[String], current: Option<&str>) -> usize {
     if running.is_empty() {
         return 0;
@@ -4897,8 +4910,18 @@ fn cycle_worker(session: &mut Session) -> bool {
     // screen clear below (otherwise an empty cycle still wipes the screen).
     // TASK-299: the active background `:goal` joins the Shift-Tab rotation as a
     // final watch-only slot, so a goal-only session (no workers) still cycles.
+    // Stale-attach escape: if we're currently attached to something (e.g. the
+    // goal, which just COMPLETED so `goal_active` is now false) with no workers
+    // left, DON'T no-op — fall through so the cycle lands on the index-0
+    // (interactive) branch and releases the stuck attach. Without this the
+    // operator can't Shift-Tab back to interactive after a goal-only run ends.
     let goal_active = session.goal.as_ref().is_some_and(|g| g.is_active());
-    if session.worker_jobs.lock().unwrap().is_empty() && !goal_active {
+    let attached_now = session.attached.lock().unwrap().is_some();
+    if cycle_is_noop(
+        session.worker_jobs.lock().unwrap().len(),
+        goal_active,
+        attached_now,
+    ) {
         return false;
     }
     // Synchronously tear down any live worker "thinking…" spinner BEFORE we
@@ -4930,8 +4953,10 @@ fn cycle_worker(session: &mut Session) -> bool {
             )
         })
         .collect();
-    // `worker_jobs` was non-empty at the top guard, so `workers` is non-empty
-    // here too — there is always at least one slot to cycle to.
+    // `workers` MAY be empty here (goal-only session, or a stale attach with no
+    // live workers): in that case `ids` is empty and `next_attach_index` returns
+    // 0, so we take the index-0 branch below and drop back to interactive — the
+    // stale-attach escape. Otherwise there's at least one slot to cycle to.
 
     // The cycle is [interactive, workers[0], workers[1], …]; index 0 is the
     // detached interactive prompt. The index math is factored into the pure,
@@ -5061,8 +5086,12 @@ fn cycle_worker_live(
             )
         })
         .collect();
-    if workers_v.is_empty() && !goal_active {
-        // No coordinators AND no active goal to attach to — take no action (no
+    // Stale-attach escape (mirrors `cycle_worker`): only no-op when there's
+    // nothing to attach to AND we're not currently attached. If the goal
+    // completed mid-turn while attached (goal_active now false, no workers), fall
+    // through so the index-0 branch releases the stuck attach.
+    if cycle_is_noop(workers_v.len(), goal_active, attached.lock().unwrap().is_some()) {
+        // No coordinators, no active goal, and not attached — take no action (no
         // hint, no redraw), matching the idle-prompt `cycle_worker` no-op.
         return;
     }
@@ -10169,6 +10198,22 @@ mod tests {
         // Nothing to cycle into — stays at interactive regardless of state.
         assert_eq!(next_attach_index(&running, None), 0);
         assert_eq!(next_attach_index(&running, Some("w_a")), 0);
+    }
+
+    #[test]
+    fn cycle_noop_only_when_idle_and_unattached() {
+        // Truly idle interactive prompt: nothing to attach to, not attached → no-op.
+        assert!(cycle_is_noop(0, false, false));
+        // A live worker exists → cycle runs.
+        assert!(!cycle_is_noop(1, false, false));
+        // An active goal exists → cycle runs (goal is a rotation slot).
+        assert!(!cycle_is_noop(0, true, false));
+        // THE BUG FIX: goal completed (goal_active=false) with no workers, but the
+        // operator is still attached to the now-finished goal → must NOT no-op, so
+        // Shift-Tab can fall through to the index-0 branch and return to interactive.
+        assert!(!cycle_is_noop(0, false, true));
+        // Pairs with `next_attach_index`: escaping a stale attach lands on interactive.
+        assert_eq!(next_attach_index(&[], Some(GOAL_ATTACH_ID)), 0);
     }
 
     #[test]
