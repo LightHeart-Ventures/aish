@@ -19,10 +19,6 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 # (backend streaming completions, S8.1). Already in the tree via reqwest, so
 # adding it as a direct dep is essentially free.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-# Browser-impersonating HTTP client (wreq) for bypassing bot protection
-# Used selectively for mcpmarket searches; standard reqwest for everything else
-wreq = { version = "6.0.0-rc", features = ["json"] }
-wreq-util = "3.0.0-rc"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # gzip archives for reasoning-telemetry log rotation (pure-Rust miniz_oxide
 # backend — no C/zlib, already vendored transitively so this edge is free).
