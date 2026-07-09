@@ -180,6 +180,25 @@ impl ResumeState {
         Some(std::mem::take(&mut self.pending))
     }
 
+    /// Forget a worker that the operator explicitly dismissed with `:close`.
+    /// Drops `id` from both `pending` and `seen`, and — when that empties the
+    /// pending set — DISARMS any armed resume. Closing a finished worker is an
+    /// explicit "I've handled this" gesture, so it must cancel the pending
+    /// auto-synthesis for that id rather than dragging the operator into an
+    /// unsolicited resume turn that blocks the prompt (the reported hang).
+    /// Removing it from `seen` too means the id is fully forgotten; the presenter
+    /// won't re-observe it anyway (it's gone from `worker_jobs`). Returns true
+    /// when this call disarmed an armed resume, so callers can note the cancel.
+    pub fn forget(&mut self, id: &str) -> bool {
+        self.pending.retain(|p| p != id);
+        self.seen.remove(id);
+        if self.pending.is_empty() && self.armed {
+            self.armed = false;
+            return true;
+        }
+        false
+    }
+
     /// Test-only peek at the pending count.
     #[cfg(test)]
     fn pending_len(&self) -> usize {
@@ -2004,6 +2023,43 @@ mod tests {
         assert!(r.take().is_none());
         assert!(r.observe(&["w_c".into()], 0));
         assert_eq!(r.take().unwrap(), vec!["w_c".to_string()]);
+    }
+
+    #[test]
+    fn resume_state_forget_disarms_when_last_pending_closed() {
+        if !auto_resume_enabled() {
+            return;
+        }
+        // Single finished worker armed the resume; closing it cancels the turn.
+        let mut r = ResumeState::default();
+        assert!(r.observe(&["w_a".into()], 0));
+        assert!(r.forget("w_a"), "forgetting the sole pending id disarms");
+        assert_eq!(r.pending_len(), 0);
+        assert!(r.take().is_none(), "no resume fires after close");
+    }
+
+    #[test]
+    fn resume_state_forget_keeps_arm_when_others_pending() {
+        if !auto_resume_enabled() {
+            return;
+        }
+        // Two finished workers armed the resume; closing one leaves the other.
+        let mut r = ResumeState::default();
+        assert!(!r.observe(&["w_a".into()], 1));
+        assert!(r.observe(&["w_b".into()], 0));
+        assert!(!r.forget("w_a"), "still one pending id → resume stays armed");
+        assert_eq!(r.take().unwrap(), vec!["w_b".to_string()]);
+    }
+
+    #[test]
+    fn resume_state_forget_unknown_id_is_noop() {
+        if !auto_resume_enabled() {
+            return;
+        }
+        let mut r = ResumeState::default();
+        assert!(r.observe(&["w_a".into()], 0));
+        assert!(!r.forget("w_zzz"), "forgetting an unknown id changes nothing");
+        assert_eq!(r.take().unwrap(), vec!["w_a".to_string()]);
     }
 
     #[test]
