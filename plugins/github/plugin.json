@@ -1,0 +1,41 @@
+{
+  "id": "github",
+  "name": "GitHub Webhook Handlers",
+  "version": "0.1.0",
+  "description": "Reference webhook plugin (SPR-069, TASK-386/387). Declares canonical `webhooks[]` handlers that the aish-webhook-client dispatcher fork/exec's — NO shell is ever involved. Each handler receives the GitHub event payload as JSON on stdin plus WEBHOOK_* env vars, and emits a concise one-line summary on stdout. Covers pull_request (review triage), workflow_run (CI failure alert), and release (publish notice). Filters are AND-combined equality checks over dotted payload paths so a handler only runs on the exact actions it cares about.",
+  "author": "LightHeart Ventures",
+  "license": "Apache-2.0",
+  "enabled": true,
+  "webhooks": [
+    {
+      "event_type": "pull_request",
+      "command": ["handlers/pr-review.sh"],
+      "filters": { "action": "opened" },
+      "timeout_secs": 30
+    },
+    {
+      "event_type": "pull_request",
+      "command": ["handlers/pr-review.sh"],
+      "filters": { "action": "reopened" },
+      "timeout_secs": 30
+    },
+    {
+      "event_type": "pull_request",
+      "command": ["handlers/pr-review.sh"],
+      "filters": { "action": "ready_for_review" },
+      "timeout_secs": 30
+    },
+    {
+      "event_type": "workflow_run",
+      "command": ["handlers/workflow-run.sh"],
+      "filters": { "action": "completed" },
+      "timeout_secs": 20
+    },
+    {
+      "event_type": "release",
+      "command": ["handlers/release.sh"],
+      "filters": { "action": "published" },
+      "timeout_secs": 20
+    }
+  ]
+}
