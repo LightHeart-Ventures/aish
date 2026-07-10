@@ -43,8 +43,23 @@ pub struct PluginManifest {
     #[serde(default)]
     pub version: String,
     /// Declared webhook handlers.
-    #[serde(default, alias = "handlers")]
+    ///
+    /// TASK-447: the legacy `handlers` key is no longer honored — the schema
+    /// fork is removed. Manifests MUST use `webhooks`; a manifest still using
+    /// `handlers` is rejected fail-fast by [`PluginRegistry::load_dir`].
+    #[serde(default)]
     pub webhooks: Vec<WebhookHandler>,
+}
+
+/// TASK-447: detect the removed legacy `handlers` top-level array so
+/// [`PluginRegistry::load_dir`] can reject manifests still using the forked
+/// schema instead of silently loading them with an empty handler set.
+fn raw_has_legacy_handlers(raw: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| v.get("handlers").and_then(|h| h.as_array().cloned()))
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
 }
 
 /// In-memory registry of loaded plugin manifests.
@@ -77,12 +92,34 @@ impl PluginRegistry {
             if !manifest_path.is_file() {
                 continue;
             }
-            match std::fs::read_to_string(&manifest_path)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<PluginManifest>(&raw).ok())
-            {
-                Some(m) => plugins.push(m),
-                None => tracing::warn!(path = %manifest_path.display(), "skipping malformed plugin.json"),
+            let raw = match std::fs::read_to_string(&manifest_path) {
+                Ok(r) => r,
+                Err(_) => {
+                    tracing::warn!(path = %manifest_path.display(), "skipping unreadable plugin.json");
+                    continue;
+                }
+            };
+            match serde_json::from_str::<PluginManifest>(&raw) {
+                Ok(m) => {
+                    // TASK-447: fail-fast on the removed `handlers` schema fork.
+                    // A manifest that parses to zero webhooks but still carries a
+                    // non-empty top-level `handlers` array is using the legacy
+                    // key — skip it with an actionable migration warning rather
+                    // than silently loading an empty (dead) handler set.
+                    if m.webhooks.is_empty() && raw_has_legacy_handlers(&raw) {
+                        tracing::warn!(
+                            path = %manifest_path.display(),
+                            "plugin.json uses the removed `handlers` key; rename it to `webhooks` — skipping"
+                        );
+                        continue;
+                    }
+                    plugins.push(m);
+                }
+                Err(e) => tracing::warn!(
+                    path = %manifest_path.display(),
+                    error = %e,
+                    "skipping malformed plugin.json"
+                ),
             }
         }
         Ok(Self { plugins })
@@ -539,6 +576,28 @@ mod tests {
         let reg = PluginRegistry::load_dir(&base).unwrap();
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.matching("pull_request").len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// TASK-447 — the removed `handlers` schema fork is rejected fail-fast.
+    ///
+    /// A manifest that still uses the legacy top-level `handlers` key (instead
+    /// of `webhooks`) must NOT be silently loaded with an empty handler set —
+    /// `load_dir` skips it, so the registry ends up empty and the operator gets
+    /// an actionable migration warning in the logs.
+    #[test]
+    fn load_dir_skips_legacy_handlers_key() {
+        let base = std::env::temp_dir().join(format!("aish-wh-legacy-{}", std::process::id()));
+        let pdir = base.join("plug-legacy");
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(
+            pdir.join("plugin.json"),
+            r#"{"id":"plug-legacy","handlers":[{"event_type":"pull_request","command":["true"]}]}"#,
+        )
+        .unwrap();
+        let reg = PluginRegistry::load_dir(&base).unwrap();
+        assert_eq!(reg.len(), 0, "legacy `handlers` manifest must be skipped, not loaded empty");
+        assert_eq!(reg.matching("pull_request").len(), 0);
         let _ = std::fs::remove_dir_all(&base);
     }
 
