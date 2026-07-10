@@ -1,0 +1,16 @@
+{
+  "schema": "signoz-observability/registry/v1",
+  "repos": {},
+  "_note": "Keyed by canonical repo root. Each entry is written by bin/scan-repo.sh and read by bin/poll-exceptions.sh. Example entry shape below (do not remove the _example key — it is ignored by the scanner's jq merge):",
+  "_example": {
+    "/home/grhohertz/projects/cost-mvp-api": {
+      "detected_at": "2025-01-01T00:00:00Z",
+      "last_scanned": "2025-01-01T00:00:00Z",
+      "languages": ["node"],
+      "services": ["cost-mvp-api"],
+      "instrumented": true,
+      "endpoints": ["http://localhost:4317"],
+      "markers": ["package.json:@opentelemetry/sdk-node", "OTEL_SERVICE_NAME"]
+    }
+  }
+}

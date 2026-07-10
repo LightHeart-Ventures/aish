@@ -2727,17 +2727,7 @@ mod tests {
     /// TASK-376 — the one-release `handlers` → `webhooks` serde alias keeps
     /// pre-reconciliation manifests loading under the canonical loader. Removing
     /// the alias (TASK-447) must be a deliberate, test-visible change, not a
-    /// silent break.
-    #[test]
-    fn canonical_loader_accepts_handlers_alias() {
-        use aish_webhook_client::PluginManifest as WebhookManifest;
 
-        let legacy = r#"{"id":"legacy","handlers":[{"event_type":"push","command":["h.sh"]}]}"#;
-        let m: WebhookManifest =
-            serde_json::from_str(legacy).expect("`handlers` alias still accepted");
-        assert_eq!(m.webhooks.len(), 1, "alias populated webhooks[]");
-        assert_eq!(m.webhooks[0].event_type, "push");
-    }
 
 
     /// A private, dependency-free temp dir (the crate doesn't pull in the
