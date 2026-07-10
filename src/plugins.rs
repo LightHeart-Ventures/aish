@@ -2677,6 +2677,68 @@ mod tests {
         assert!(format_plugin_schemas(&tmp, "ghost").is_none());
     }
 
+    /// TASK-376 (SPR-069) — schema-reconciliation guard.
+    ///
+    /// The ADR (`docs/design/webhook-plugin-routing.md`, Decision 1) pins the
+    /// canonical webhook-handler schema to the `webhooks[]` array parsed by
+    /// `aish_webhook_client::PluginManifest`, and asserts that a single
+    /// `plugin.json` "satisfies both" the aish-core loader
+    /// (`super::PluginManifest`) and the webhook-client loader. This test turns
+    /// that prose claim into a CI-enforced invariant: the shipped GitHub
+    /// reference plugin (`plugins/github/plugin.json`) must parse cleanly under
+    /// BOTH loaders, and the canonical loader must surface the declared
+    /// handlers. If a future change forks the schema (adds a competing field,
+    /// or tightens either struct to reject the other's keys), this test fails.
+    #[test]
+    fn github_plugin_manifest_satisfies_both_loaders() {
+        use aish_webhook_client::PluginManifest as WebhookManifest;
+
+        let text = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("plugins")
+                .join("github")
+                .join("plugin.json"),
+        )
+        .expect("plugins/github/plugin.json present");
+
+        // (1) aish-core loader accepts the manifest — the unknown
+        //     `webhooks`/`author`/`license` keys are dropped by serde, never a
+        //     hard error. One manifest, both loaders.
+        let core: PluginManifest =
+            serde_json::from_str(&text).expect("core PluginManifest parses github plugin");
+        assert_eq!(core.id, "github");
+
+        // (2) The canonical webhook-client loader parses the same bytes and
+        //     surfaces the declared handlers — the single source of truth.
+        let hooks: WebhookManifest =
+            serde_json::from_str(&text).expect("canonical PluginManifest parses github plugin");
+        assert_eq!(hooks.id, "github");
+        assert_eq!(hooks.webhooks.len(), 5, "all five handlers parsed");
+        let first = &hooks.webhooks[0];
+        assert_eq!(first.event_type, "pull_request");
+        assert_eq!(first.command, vec!["handlers/pr-review.sh".to_string()]);
+        assert_eq!(
+            first.filters.get("action").and_then(|v| v.as_str()),
+            Some("opened"),
+        );
+    }
+
+    /// TASK-376 — the one-release `handlers` → `webhooks` serde alias keeps
+    /// pre-reconciliation manifests loading under the canonical loader. Removing
+    /// the alias (TASK-447) must be a deliberate, test-visible change, not a
+    /// silent break.
+    #[test]
+    fn canonical_loader_accepts_handlers_alias() {
+        use aish_webhook_client::PluginManifest as WebhookManifest;
+
+        let legacy = r#"{"id":"legacy","handlers":[{"event_type":"push","command":["h.sh"]}]}"#;
+        let m: WebhookManifest =
+            serde_json::from_str(legacy).expect("`handlers` alias still accepted");
+        assert_eq!(m.webhooks.len(), 1, "alias populated webhooks[]");
+        assert_eq!(m.webhooks[0].event_type, "push");
+    }
+
+
     /// A private, dependency-free temp dir (the crate doesn't pull in the
     /// `tempfile` crate for this module — mirror skills.rs's test helper).
     fn tempdir() -> PathBuf {
