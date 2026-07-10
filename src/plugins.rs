@@ -43,8 +43,9 @@ pub struct PluginManifest {
     /// part of the canonical manifest surface (not silently dropped).
     #[serde(default)]
     pub webhook_url: Option<String>,
-    /// Phase 1.6 webhook opt-in: a shell command run on each lifecycle event
-    /// (event JSON on stdin). Consumed by [`crate::plugin_dispatcher`].
+    /// Phase 1.6 webhook opt-in: a command run (fork/exec as argv, NO shell —
+    /// SPR-069 TASK-379) on each lifecycle event, event JSON on stdin. Consumed
+    /// by [`crate::plugin_dispatcher`].
     #[serde(default)]
     pub webhook_command: Option<String>,
     /// Optional JSON-Schema-shaped description of the plugin's configuration

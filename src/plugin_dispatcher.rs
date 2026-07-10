@@ -258,16 +258,27 @@ impl PluginDispatcher {
         }
     }
 
-    /// Run a `webhook_command` via `sh -c`, piping the event JSON on stdin and
-    /// exposing `AISH_EVENT_TYPE` / `AISH_PLUGIN_ID` in the environment. The
-    /// captured `{exit_code, stdout, stderr, event}` is persisted to plugin state
-    /// under `<plugin_id>:last_webhook_output`.
+    /// Fork/exec a `webhook_command` as **argv (no shell)** — piping the event
+    /// JSON on stdin and exposing `AISH_EVENT_TYPE` / `AISH_PLUGIN_ID` in the
+    /// environment. The command string is tokenized by [`split_argv`] and run
+    /// via `tokio::process::Command` directly; there is deliberately NO `sh -c`
+    /// (SPR-069 TASK-379) so shell metacharacters in a manifest or payload are
+    /// inert. The captured `{exit_code, stdout, stderr, event}` is persisted to
+    /// plugin state under `<plugin_id>:last_webhook_output`.
     async fn run_command(&self, plugin_id: &str, cmd: &str, ev: &PluginEvent) {
         use tokio::io::AsyncWriteExt;
         let payload = serde_json::to_string(ev).unwrap_or_else(|_| "{}".into());
-        let mut child = match tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
+        // NO SHELL (SPR-069 TASK-379/446): the command is fork/exec'd as argv,
+        // never `sh -c`. Tokens are passed verbatim, so `$(...)`, `;`, `|`,
+        // backticks in a manifest or payload are literal argv bytes — never
+        // interpreted. Payload data reaches the handler on stdin only.
+        let argv = split_argv(cmd);
+        let Some((program, args)) = argv.split_first() else {
+            log_channel(&format!("{plugin_id} empty webhook_command; skipped"));
+            return;
+        };
+        let mut child = match tokio::process::Command::new(program)
+            .args(args)
             .env("AISH_EVENT_TYPE", &ev.event_type)
             .env("AISH_PLUGIN_ID", plugin_id)
             .stdin(std::process::Stdio::piped())
@@ -319,6 +330,80 @@ impl PluginDispatcher {
                 }
             }
         }
+    }
+}
+
+/// Split a legacy `webhook_command` string into an argv vector for **no-shell**
+/// fork/exec (SPR-069 TASK-379). Whitespace separates tokens; single and double
+/// quotes group a token that contains spaces. Crucially, NO shell evaluation
+/// happens: `$VAR`, `$(...)`, backticks, `;`, `|`, `&&`, and redirections are
+/// copied verbatim into the token they appear in — inert argv bytes, never
+/// interpreted. A trailing unbalanced quote simply closes at end-of-string.
+pub fn split_argv(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut quote: Option<char> = None;
+    for c in cmd.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else {
+                    cur.push(c);
+                }
+            }
+            None => {
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                    in_token = true;
+                } else if c.is_whitespace() {
+                    if in_token {
+                        out.push(std::mem::take(&mut cur));
+                        in_token = false;
+                    }
+                } else {
+                    cur.push(c);
+                    in_token = true;
+                }
+            }
+        }
+    }
+    if in_token {
+        out.push(cur);
+    }
+    out
+}
+
+#[cfg(test)]
+mod argv_tests {
+    use super::split_argv;
+
+    #[test]
+    fn splits_on_whitespace() {
+        assert_eq!(split_argv("sleep 0.3"), vec!["sleep", "0.3"]);
+        assert_eq!(split_argv("  echo   hi  "), vec!["echo", "hi"]);
+        assert!(split_argv("   ").is_empty());
+    }
+
+    #[test]
+    fn quotes_group_a_token_with_spaces() {
+        assert_eq!(split_argv(r#"printf "a b""#), vec!["printf", "a b"]);
+        assert_eq!(split_argv("printf 'a b'"), vec!["printf", "a b"]);
+        assert_eq!(split_argv(r#"a"b c"d"#), vec!["ab cd"]);
+    }
+
+    #[test]
+    fn shell_metacharacters_are_literal_never_evaluated() {
+        // The load-bearing security property (TASK-379/446): metacharacters are
+        // ordinary token bytes, so nothing is ever shell-interpreted.
+        assert_eq!(split_argv("echo $(whoami)"), vec!["echo", "$(whoami)"]);
+        assert_eq!(
+            split_argv("rm -rf / ; echo hi"),
+            vec!["rm", "-rf", "/", ";", "echo", "hi"],
+        );
+        assert_eq!(split_argv("echo `id`"), vec!["echo", "`id`"]);
+        assert_eq!(split_argv("cat a|b"), vec!["cat", "a|b"]);
     }
 }
 
