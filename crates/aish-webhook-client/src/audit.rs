@@ -15,6 +15,7 @@
 //! * [`MemoryAuditSink`] — in-memory buffer, primarily for tests and
 //!   integration harnesses.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -150,39 +151,117 @@ impl AuditSink for JsonlAuditSink {
     }
 }
 
-/// In-memory buffer of records. Useful for tests and for callers that want to
-/// observe dispatch activity without touching disk.
+/// Default ring cap for [`MemoryAuditSink`]: retain at most this many records.
+pub const DEFAULT_MEMORY_MAX_ENTRIES: usize = 100;
+/// Default ring cap for [`MemoryAuditSink`]: retain at most ~1 MiB of records
+/// (measured as the summed serialized-JSON byte size of retained records).
+pub const DEFAULT_MEMORY_MAX_BYTES: usize = 1024 * 1024;
+
+/// One retained record plus its cached serialized size (so eviction can
+/// decrement the running byte total without re-serializing).
+#[derive(Debug)]
+struct MemEntry {
+    rec: AuditRecord,
+    size: usize,
+}
+
+/// Ring-buffer contents guarded by the sink's mutex.
 #[derive(Debug, Default)]
+struct MemRing {
+    entries: VecDeque<MemEntry>,
+    /// Running sum of retained `MemEntry::size`.
+    bytes: usize,
+    /// Count of records evicted (oldest-first) to stay under the caps.
+    dropped: u64,
+}
+
+/// In-memory, bounded ring buffer of audit records (TASK-380). Retains the most
+/// recent records up to BOTH a count cap and an approximate byte cap, evicting
+/// oldest-first when either is exceeded; the newest record is never evicted.
+/// Backs the plugin-memory `:webhook logs` trail and test/integration harnesses
+/// without growing without bound.
+#[derive(Debug)]
 pub struct MemoryAuditSink {
-    records: Mutex<Vec<AuditRecord>>,
+    ring: Mutex<MemRing>,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+impl Default for MemoryAuditSink {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemoryAuditSink {
+    /// Sink with the default caps ([`DEFAULT_MEMORY_MAX_ENTRIES`] /
+    /// [`DEFAULT_MEMORY_MAX_BYTES`]).
     pub fn new() -> Self {
-        Self::default()
+        Self::with_caps(DEFAULT_MEMORY_MAX_ENTRIES, DEFAULT_MEMORY_MAX_BYTES)
     }
 
-    /// Snapshot of everything recorded so far.
+    /// Sink with explicit caps. Each cap is clamped to a minimum of 1 so the
+    /// buffer always retains at least the newest record.
+    pub fn with_caps(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            ring: Mutex::new(MemRing::default()),
+            max_entries: max_entries.max(1),
+            max_bytes: max_bytes.max(1),
+        }
+    }
+
+    /// Snapshot of everything currently retained (oldest → newest).
     pub fn records(&self) -> Vec<AuditRecord> {
-        self.records.lock().expect("audit mutex poisoned").clone()
+        self.ring
+            .lock()
+            .expect("audit mutex poisoned")
+            .entries
+            .iter()
+            .map(|e| e.rec.clone())
+            .collect()
     }
 
     pub fn len(&self) -> usize {
-        self.records.lock().expect("audit mutex poisoned").len()
+        self.ring.lock().expect("audit mutex poisoned").entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// How many records have been evicted (oldest-first) to honor the caps.
+    pub fn dropped(&self) -> u64 {
+        self.ring.lock().expect("audit mutex poisoned").dropped
+    }
+
+    /// Approximate retained byte size (summed serialized-JSON lengths).
+    pub fn byte_len(&self) -> usize {
+        self.ring.lock().expect("audit mutex poisoned").bytes
     }
 }
 
 #[async_trait::async_trait]
 impl AuditSink for MemoryAuditSink {
     async fn record(&self, rec: &AuditRecord) -> Result<()> {
-        self.records
-            .lock()
-            .expect("audit mutex poisoned")
-            .push(rec.clone());
+        // Approximate footprint = serialized JSON length. Cheap and stable, and
+        // it is exactly what an on-disk/JSONL realization of this trail costs.
+        let size = serde_json::to_string(rec).map(|s| s.len()).unwrap_or(0);
+        let mut ring = self.ring.lock().expect("audit mutex poisoned");
+        ring.entries.push_back(MemEntry { rec: rec.clone(), size });
+        ring.bytes = ring.bytes.saturating_add(size);
+        // Evict oldest-first while over either cap, but always keep the record
+        // we just pushed (len > 1 guard on the byte cap).
+        while ring.entries.len() > self.max_entries
+            || (ring.bytes > self.max_bytes && ring.entries.len() > 1)
+        {
+            match ring.entries.pop_front() {
+                Some(old) => {
+                    ring.bytes = ring.bytes.saturating_sub(old.size);
+                    ring.dropped += 1;
+                }
+                None => break,
+            }
+        }
         Ok(())
     }
 }
@@ -240,6 +319,51 @@ mod tests {
         assert_eq!(recs[0].plugin_id, "a");
         assert_eq!(recs[1].plugin_id, "b");
         assert!(!recs[1].success);
+    }
+
+    #[tokio::test]
+    async fn memory_sink_ring_caps_entry_count() {
+        // Cap at 3 entries; feed 5. Oldest two evicted, newest three retained.
+        let sink = MemoryAuditSink::with_caps(3, DEFAULT_MEMORY_MAX_BYTES);
+        for i in 0..5 {
+            let o = outcome(&format!("p{i}"), true, true);
+            sink.record(&AuditRecord::from_outcome("d", "t", &o))
+                .await
+                .unwrap();
+        }
+        let recs = sink.records();
+        assert_eq!(recs.len(), 3, "retains only the cap");
+        assert_eq!(sink.dropped(), 2, "two oldest evicted");
+        // Oldest→newest: the surviving window is p2, p3, p4.
+        assert_eq!(recs[0].plugin_id, "p2");
+        assert_eq!(recs[2].plugin_id, "p4");
+    }
+
+    #[tokio::test]
+    async fn memory_sink_ring_caps_bytes_and_keeps_newest() {
+        // A single record serializes to well over 40 bytes, so a 40-byte cap
+        // forces eviction down to the newest record every push.
+        let sink = MemoryAuditSink::with_caps(DEFAULT_MEMORY_MAX_ENTRIES, 40);
+        for i in 0..4 {
+            let o = outcome(&format!("p{i}"), true, true);
+            sink.record(&AuditRecord::from_outcome("d", "t", &o))
+                .await
+                .unwrap();
+        }
+        let recs = sink.records();
+        assert_eq!(recs.len(), 1, "byte cap collapses to the newest record");
+        assert_eq!(recs[0].plugin_id, "p3", "newest is never evicted");
+        assert_eq!(sink.dropped(), 3);
+        assert!(sink.byte_len() > 0);
+    }
+
+    #[test]
+    fn memory_default_caps_are_bounded() {
+        assert_eq!(DEFAULT_MEMORY_MAX_ENTRIES, 100);
+        assert_eq!(DEFAULT_MEMORY_MAX_BYTES, 1024 * 1024);
+        // Zero caps are clamped up to 1 so the newest record always survives.
+        let sink = MemoryAuditSink::with_caps(0, 0);
+        assert_eq!(sink.len(), 0);
     }
 
     #[tokio::test]
