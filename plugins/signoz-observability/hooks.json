@@ -1,0 +1,34 @@
+{
+  "hooks": [
+    {
+      "name": "signoz-repo-scan-on-cwd",
+      "event": "CwdChanged",
+      "action": {
+        "program": "bin/scan-repo.sh",
+        "args": ["--from=CwdChanged"],
+        "timeout_ms": 6000,
+        "required": false
+      }
+    },
+    {
+      "name": "signoz-repo-scan-on-session",
+      "event": "SessionStart",
+      "action": {
+        "program": "bin/scan-repo.sh",
+        "args": ["--from=SessionStart"],
+        "timeout_ms": 6000,
+        "required": false
+      }
+    },
+    {
+      "name": "signoz-poll-on-turn-end",
+      "event": "TurnEnd",
+      "action": {
+        "program": "bin/poll-exceptions.sh",
+        "args": ["--source=TurnEnd"],
+        "timeout_ms": 8000,
+        "required": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+# SigNoz Observability plugin — example config
+# Copy/merge into ~/.aish/plugins/signoz-observability/config/ or override via
+# `:plugin config signoz-observability` once the config-set surface lands.
+#
+# NOTE: the SigNoz API key is NOT stored here. Session-env injection rejects
+# credential-like keys (token/key/secret/auth/...). Put the key in
+#   ~/.aish/credentials   under   [profile:signoz]   as   SIGNOZ_API_KEY=...
+# and reference it at spawn time as ${profile:signoz}.
+
+signoz_endpoint    = "http://localhost:3301"   # SigNoz query-service base URL
+credential_profile = "signoz"                   # [profile:signoz] in ~/.aish/credentials
+poll_window_secs   = 30                          # look-back window per poll
+poll_every         = "30s"                       # timer cadence (turn-independent)
+min_severity       = "ERROR"                     # WARN | ERROR | FATAL
+dedup_ttl_secs     = 300                          # suppress duplicate (service,fingerprint)
+scan_on_detect     = true                         # scan instrumentation on repo detect
+surface            = "both"                        # statusline | memory | both
+
+# Optional: pin the services to watch. When empty, the plugin uses the
+# service names discovered by the instrumentation scanner for the active repo.
+# watch_services = ["cost-mvp-api", "dashboard"]
+
+[scanner]
+# File-system markers the instrumentation scanner looks for, by language.
+# These are defaults; extend per-project as needed.
+max_depth      = 4
+ignore_dirs    = ["node_modules", "target", ".git", "dist", "build", ".venv", "__pycache__"]

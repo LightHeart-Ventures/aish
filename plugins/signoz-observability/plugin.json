@@ -1,0 +1,71 @@
+{
+  "id": "signoz-observability",
+  "name": "SigNoz Observability",
+  "version": "0.1.0",
+  "description": "Auto-detects repos on open, scans them for OpenTelemetry instrumentation, and polls SigNoz for fresh exceptions after every turn — surfacing a service/error summary on the SecondStatusLine and in memory.",
+  "enabled": true,
+  "webhook_command": "printf '📡 SigNoz Observability loaded: %s\\n' \"$AISH_EVENT_TYPE\"",
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "signoz_endpoint": {
+        "type": "string",
+        "description": "Base URL of the SigNoz query API (e.g. https://signoz.example.com or http://localhost:3301).",
+        "default": "http://localhost:3301"
+      },
+      "credential_profile": {
+        "type": "string",
+        "description": "Name of the ~/.aish/credentials [profile:*] section holding SIGNOZ_API_KEY. Secrets NEVER go in session env.",
+        "default": "signoz"
+      },
+      "poll_window_secs": {
+        "type": "integer",
+        "description": "How far back to search for exceptions on each poll.",
+        "default": 30
+      },
+      "poll_every": {
+        "type": "string",
+        "description": "Timer cadence for the turn-independent poller (compact duration).",
+        "default": "30s"
+      },
+      "min_severity": {
+        "type": "string",
+        "enum": ["WARN", "ERROR", "FATAL"],
+        "default": "ERROR"
+      },
+      "dedup_ttl_secs": {
+        "type": "integer",
+        "description": "Suppress re-alerting the same (service,fingerprint) within this window.",
+        "default": 300
+      },
+      "scan_on_detect": {
+        "type": "boolean",
+        "description": "Run the instrumentation scanner when a new repo is detected.",
+        "default": true
+      },
+      "surface": {
+        "type": "string",
+        "enum": ["statusline", "memory", "both"],
+        "default": "both"
+      }
+    },
+    "required": ["signoz_endpoint", "credential_profile"]
+  },
+  "provides": {
+    "lifecycle_hooks": ["on_init", "on_shell_ready"],
+    "timers": [
+      {
+        "command": "bin/poll-exceptions.sh",
+        "args": ["--source=timer"],
+        "every": "30s",
+        "cache": "state/signoz/exceptions.txt",
+        "timeout_ms": 8000
+      }
+    ],
+    "statusline": {
+      "command": "bin/statusline.sh",
+      "every": "15s",
+      "timeout_ms": 1500
+    }
+  }
+}

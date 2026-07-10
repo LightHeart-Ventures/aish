@@ -1,0 +1,3 @@
+# Runtime state — never committed. Populated at runtime by the poller/scanner.
+*
+!.gitignore
