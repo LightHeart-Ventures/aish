@@ -541,4 +541,80 @@ mod tests {
         assert_eq!(reg.matching("pull_request").len(), 1);
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// TASK-446 — shell-injection regression guard.
+    ///
+    /// Handlers are fork/exec'd (`Command::new(&command[0]).args(..)`) with NO
+    /// shell, so metacharacters in a command argument or in the JSON payload
+    /// MUST be passed through literally and never interpreted. If a shell were
+    /// ever (re)introduced into the dispatch path, the `;`/`&&`/`$()` payloads
+    /// below would create sentinel files and this test would fail — locking in
+    /// the no-shell guarantee.
+    #[tokio::test]
+    async fn command_args_and_payload_are_not_shell_interpreted() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("aish-wh-inject-{}-{uniq}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1) Metacharacters in a COMMAND ARGUMENT must stay literal.
+        let sentinel = dir.join("PWNED_ARG");
+        assert!(!sentinel.exists());
+        let injection = format!(
+            "hi; touch {s} && echo x $(touch {s})",
+            s = sentinel.display()
+        );
+        let reg = PluginRegistry::from_plugins(vec![PluginManifest {
+            id: "inject".into(),
+            name: "".into(),
+            version: "".into(),
+            webhooks: vec![WebhookHandler {
+                event_type: "push".into(),
+                command: vec!["echo".into(), injection.clone()],
+                filters: Default::default(),
+                timeout_secs: None,
+            }],
+        }]);
+        let d = WebhookDispatcher::new(Arc::new(reg));
+        let outs = d.dispatch(&wh("push", json!({}))).await;
+        assert_eq!(outs.len(), 1);
+        assert!(outs[0].executed && outs[0].success);
+        // The metacharacters were echoed back verbatim (proving `echo` saw them
+        // as a single literal arg)...
+        assert!(outs[0].stdout.contains("; touch"));
+        assert!(outs[0].stdout.contains("$(touch"));
+        // ...and NO shell side effect fired.
+        assert!(
+            !sentinel.exists(),
+            "shell injection executed via command arg — sentinel was created"
+        );
+
+        // 2) Metacharacters in the JSON PAYLOAD (delivered on stdin, never to a
+        // shell) must also be inert.
+        let sentinel2 = dir.join("PWNED_STDIN");
+        let reg2 = PluginRegistry::from_plugins(vec![PluginManifest {
+            id: "inject2".into(),
+            name: "".into(),
+            version: "".into(),
+            webhooks: vec![WebhookHandler {
+                event_type: "push".into(),
+                command: vec!["cat".into()],
+                filters: Default::default(),
+                timeout_secs: None,
+            }],
+        }]);
+        let d2 = WebhookDispatcher::new(Arc::new(reg2));
+        let evil = json!({"x": format!("$(touch {s}); touch {s}", s = sentinel2.display())});
+        let outs2 = d2.dispatch(&wh("push", evil)).await;
+        assert_eq!(outs2.len(), 1);
+        assert!(outs2[0].success);
+        assert!(
+            !sentinel2.exists(),
+            "shell injection executed via stdin payload — sentinel was created"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
