@@ -382,9 +382,91 @@ pub(crate) fn repo_name(dir: &Path) -> Option<String> {
     })
 }
 
+/// The static `Repo:` line baked into the system prompt at session start.
+/// `"Repo: owner/repo (branch main)\n"` when in a repo, else an empty string so
+/// the placeholder collapses cleanly. Pure — the caller supplies `name`/`branch`.
+pub(crate) fn repo_prompt_line(name: Option<&str>, branch: Option<&str>) -> String {
+    match name {
+        Some(n) => match branch {
+            Some(b) => format!("Repo: {n} (branch {b})\n"),
+            None => format!("Repo: {n}\n"),
+        },
+        None => String::new(),
+    }
+}
+
+/// The suffix appended to a `change_dir` result describing the repo-context
+/// transition, so the MODEL (which only sees tool results) notices a switch
+/// between checkouts instead of silently operating on the wrong repo. `old`/`new`
+/// are `owner/repo` names (`None` = not in a git repo); `branch` is the new
+/// location's branch when known. Pure — no IO — so it's directly unit-tested.
+pub(crate) fn repo_transition_note(
+    old: Option<&str>,
+    new: Option<&str>,
+    branch: Option<&str>,
+) -> String {
+    let brs = branch.map(|b| format!(" on branch {b}")).unwrap_or_default();
+    match (old, new) {
+        (None, None) => String::new(),
+        (Some(o), None) => {
+            format!("\nNote: left repo {o}; no git repo at this location")
+        }
+        (None, Some(n)) => format!("\nNote: now working in repo {n}{brs}"),
+        (Some(o), Some(n)) if o != n => {
+            format!("\nNote: repo context changed: {o} -> {n}{brs}")
+        }
+        (Some(_), Some(n)) => format!(" (repo: {n})"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_prompt_line_formats_or_collapses() {
+        assert_eq!(
+            repo_prompt_line(Some("owner/repo"), Some("main")),
+            "Repo: owner/repo (branch main)\n"
+        );
+        assert_eq!(
+            repo_prompt_line(Some("owner/repo"), None),
+            "Repo: owner/repo\n"
+        );
+        assert_eq!(repo_prompt_line(None, Some("main")), "");
+        assert_eq!(repo_prompt_line(None, None), "");
+    }
+
+    #[test]
+    fn repo_transition_note_covers_every_transition() {
+        // Stayed outside any repo → silent.
+        assert_eq!(repo_transition_note(None, None, None), "");
+        // Entered a repo from a non-repo dir.
+        assert_eq!(
+            repo_transition_note(None, Some("o/r"), Some("main")),
+            "\nNote: now working in repo o/r on branch main"
+        );
+        // Switched between two different repos.
+        assert_eq!(
+            repo_transition_note(Some("a/b"), Some("c/d"), Some("dev")),
+            "\nNote: repo context changed: a/b -> c/d on branch dev"
+        );
+        // Same repo (e.g. cd into a subdir) → quiet inline tag, no warning.
+        assert_eq!(
+            repo_transition_note(Some("a/b"), Some("a/b"), Some("main")),
+            " (repo: a/b)"
+        );
+        // Left a repo for a non-repo dir.
+        assert_eq!(
+            repo_transition_note(Some("a/b"), None, None),
+            "\nNote: left repo a/b; no git repo at this location"
+        );
+        // Branch unknown but repo entered.
+        assert_eq!(
+            repo_transition_note(None, Some("o/r"), None),
+            "\nNote: now working in repo o/r"
+        );
+    }
 
     #[test]
     fn repo_name_from_remote_keeps_owner_slash_repo() {

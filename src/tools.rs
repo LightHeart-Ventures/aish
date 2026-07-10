@@ -4278,11 +4278,22 @@ fn change_dir(call: &ToolCall, session: &mut Session) -> Result<String> {
     if !canonical.is_dir() {
         anyhow::bail!("{} is not a directory", canonical.display());
     }
+    // Capture the repo we're leaving BEFORE switching, so we can tell the model
+    // when a `cd` crosses into a different checkout (the failure mode where an
+    // agent silently keeps operating on the old repo).
+    let old_repo = crate::git::repo_name(&session.cwd);
     session.cwd = canonical;
     // First entry into a new repo → announce it on the SecondStatusLine.
     session.announce_repo_if_new();
+    let new_repo = crate::git::repo_name(&session.cwd);
+    let branch = crate::git::current_branch(&session.cwd);
+    let note = crate::git::repo_transition_note(
+        old_repo.as_deref(),
+        new_repo.as_deref(),
+        branch.as_deref(),
+    );
     Ok(format!(
-        "working directory is now {}",
+        "working directory is now {}{note}",
         session.cwd.display()
     ))
 }

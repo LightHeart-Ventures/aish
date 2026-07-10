@@ -230,6 +230,10 @@ pub struct Session {
     pub session_id: String,
     /// Static host info baked into the system prompt once.
     pub host_info: String,
+    /// Static `Repo: owner/repo (branch …)\n` line for the repo at the starting
+    /// cwd, baked into the system prompt once (empty outside a git repo). Live
+    /// repo switches are surfaced to the model via `change_dir` tool results.
+    pub repo_info: String,
     /// `export` lines from ~/.aishrc, applied to every program aish spawns.
     pub env: Vec<(String, String)>,
     /// Pre-rendered system-prompt section listing ~/.aish/skills (may be empty).
@@ -603,6 +607,10 @@ impl Session {
 
     pub fn new() -> Result<Self> {
         let cwd = std::env::current_dir()?;
+        let repo_info = crate::git::repo_prompt_line(
+            crate::git::repo_name(&cwd).as_deref(),
+            crate::git::current_branch(&cwd).as_deref(),
+        );
         Ok(Self {
             cwd,
             history: Vec::new(),
@@ -611,6 +619,7 @@ impl Session {
             name: None,
             session_id: uuid::Uuid::new_v4().to_string(),
             host_info: host_info(),
+            repo_info,
             env: Vec::new(),
             skills_prompt: String::new(),
             skills: Vec::new(),
@@ -1225,6 +1234,7 @@ efficiency, builder mindset, zero lectures, maximum signal.\n\
 \n\
 {host}\n\
 Starting cwd: {cwd}\n\
+{repo}\
 \n\
 Core Rules (NEVER break these):\n\
 - Intent in, results out. Parse natural language and execute via tools. Chain steps aggressively.\n\
@@ -1290,6 +1300,7 @@ Final reply style: one line when possible. Table when useful. End turn cleanly. 
 fluff.{skills}{batch}{escalate}{console}{goal}{task}",
             host = self.host_info,
             cwd = self.cwd.display(),
+            repo = self.repo_info,
             skills = self.skills_prompt,
             batch = if self.batch_mode { BATCH_NUDGE } else { "" },
             escalate = if escalate_available {
