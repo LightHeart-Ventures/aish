@@ -2724,12 +2724,6 @@ mod tests {
         );
     }
 
-    /// TASK-376 — the one-release `handlers` → `webhooks` serde alias keeps
-    /// pre-reconciliation manifests loading under the canonical loader. Removing
-    /// the alias (TASK-447) must be a deliberate, test-visible change, not a
-
-
-
     /// A private, dependency-free temp dir (the crate doesn't pull in the
     /// `tempfile` crate for this module — mirror skills.rs's test helper).
     fn tempdir() -> PathBuf {
