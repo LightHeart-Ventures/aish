@@ -81,7 +81,22 @@ impl PluginRegistry {
                 .ok()
                 .and_then(|raw| serde_json::from_str::<PluginManifest>(&raw).ok())
             {
-                Some(m) => plugins.push(m),
+                Some(mut m) => {
+                    // Resolve relative handler commands (e.g. "handlers/greet.sh")
+                    // against the plugin's own directory so dispatch is independent
+                    // of aish's cwd. Bare program names (no '/') are left alone for
+                    // PATH lookup; absolute paths are unchanged.
+                    let plugin_dir = entry.path();
+                    for h in &mut m.webhooks {
+                        if let Some(prog) = h.command.first_mut() {
+                            let p = Path::new(prog.as_str());
+                            if p.is_relative() && prog.contains('/') {
+                                *prog = plugin_dir.join(p).to_string_lossy().into_owned();
+                            }
+                        }
+                    }
+                    plugins.push(m);
+                }
                 None => tracing::warn!(path = %manifest_path.display(), "skipping malformed plugin.json"),
             }
         }

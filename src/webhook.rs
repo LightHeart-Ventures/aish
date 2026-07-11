@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aish_webhook_client::{
-    AuditRecord, BrokerClient, BrokerConfig, ConnState, MemoryAuditSink, PluginRegistry, StopReason,
-    WebhookDispatcher, WebhookService, transport::TungsteniteTransport,
+    AuditRecord, BrokerClient, BrokerConfig, ConnState, FlashSink, MemoryAuditSink, PluginRegistry,
+    StopReason, WebhookDispatcher, WebhookService, transport::TungsteniteTransport,
 };
 use tokio::sync::watch;
 
@@ -61,6 +61,21 @@ impl Default for WebhookStatus {
     }
 }
 
+/// Adapt the SecondStatusLine flash slot (`session.flash`) into a webhook-client
+/// [`FlashSink`]. Each broker-delivered handler's stdout is distilled to a
+/// one-line, ≤60-char message (via [`crate::plugin_dispatcher::nline_message`])
+/// and written into the single most-recent-wins slot the footer renders — the
+/// last hop of "hello-world plugin received a broker webhook → SecondStatusLine".
+pub fn flash_sink_from_slot(slot: Arc<Mutex<Option<String>>>) -> FlashSink {
+    Arc::new(move |stdout: String| {
+        if let Some(msg) = crate::plugin_dispatcher::nline_message(&stdout) {
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(msg);
+            }
+        }
+    })
+}
+
 /// Handle to a running webhook background service. Dropping it detaches the task
 /// (it also dies with the process); call [`WebhookHandle::shutdown`] to stop it
 /// gracefully first.
@@ -81,18 +96,18 @@ impl WebhookHandle {
     /// broker URL is present, spawn the background service. Returns `None` when
     /// unconfigured — the common case — so callers treat "no broker" as a
     /// soft no-op.
-    pub fn spawn_from_env() -> Option<Self> {
+    pub fn spawn_from_env(flash: Option<FlashSink>) -> Option<Self> {
         let broker_url = std::env::var("WEBHOOK_BROKER_URL").ok()?;
         if broker_url.trim().is_empty() {
             return None;
         }
         let config = config_from_env(broker_url);
         let dir = plugins_dir();
-        Some(Self::spawn(config, dir))
+        Some(Self::spawn(config, dir, flash))
     }
 
     /// Spawn the background service for an explicit config + plugin directory.
-    pub fn spawn(config: BrokerConfig, plugins_dir: PathBuf) -> Self {
+    pub fn spawn(config: BrokerConfig, plugins_dir: PathBuf, flash: Option<FlashSink>) -> Self {
         // Load plugin webhook handlers; soft-fail to an empty registry so a
         // missing/!readable plugin dir never blocks broker connectivity.
         let registry = match PluginRegistry::load_dir(&plugins_dir) {
@@ -116,8 +131,17 @@ impl WebhookHandle {
         let task_registry = registry.clone();
         let task_audit = audit.clone();
         let task_status = status.clone();
+        let task_flash = flash;
         let join = tokio::spawn(async move {
-            service_loop(task_config, task_registry, task_audit, task_status, shutdown_rx).await;
+            service_loop(
+                task_config,
+                task_registry,
+                task_audit,
+                task_status,
+                shutdown_rx,
+                task_flash,
+            )
+            .await;
         });
 
         Self {
@@ -189,7 +213,10 @@ impl WebhookHandle {
 /// Rebuild the webhook service from the environment, reloading plugin handlers
 /// from disk. Used by `:webhook reload`. Returns the reloaded handler count on
 /// success. Errors (returned as a message) when no broker URL is configured.
-pub fn reload(slot: &mut Option<WebhookHandle>) -> Result<usize, String> {
+pub fn reload(
+    slot: &mut Option<WebhookHandle>,
+    flash: Option<FlashSink>,
+) -> Result<usize, String> {
     let configured = std::env::var("WEBHOOK_BROKER_URL")
         .ok()
         .is_some_and(|u| !u.trim().is_empty());
@@ -200,7 +227,7 @@ pub fn reload(slot: &mut Option<WebhookHandle>) -> Result<usize, String> {
     if let Some(h) = slot.take() {
         h.shutdown();
     }
-    match WebhookHandle::spawn_from_env() {
+    match WebhookHandle::spawn_from_env(flash) {
         Some(h) => {
             let n = h.handler_count;
             *slot = Some(h);
@@ -303,8 +330,15 @@ async fn service_loop(
     audit: Arc<MemoryAuditSink>,
     status: Arc<Mutex<WebhookStatus>>,
     shutdown_rx: watch::Receiver<bool>,
+    flash: Option<FlashSink>,
 ) {
-    let dispatcher = Arc::new(WebhookDispatcher::new(registry).with_audit_sink(audit));
+    let mut dispatcher = WebhookDispatcher::new(registry).with_audit_sink(audit);
+    if let Some(f) = flash {
+        // Wire the broker dispatcher to the SecondStatusLine: a handler's stdout
+        // now surfaces on the footer. This is the seam that completes the goal.
+        dispatcher = dispatcher.with_flash_sink(f);
+    }
+    let dispatcher = Arc::new(dispatcher);
 
     loop {
         if *shutdown_rx.borrow() {
@@ -392,6 +426,27 @@ mod tests {
     }
 
     #[test]
+    fn flash_sink_writes_capped_line_to_slot() {
+        // The adapter is the new hop: broker handler stdout → SecondStatusLine slot.
+        let slot = Arc::new(Mutex::new(None));
+        let sink = flash_sink_from_slot(slot.clone());
+        sink("\n  \n👋 hello-world: ping webhook received\nsecond line\n".to_string());
+        assert_eq!(
+            slot.lock().unwrap().as_deref(),
+            Some("👋 hello-world: ping webhook received")
+        );
+    }
+
+    #[test]
+    fn flash_sink_ignores_blank_stdout() {
+        // Nothing surfaceable → the prior most-recent-wins value is preserved.
+        let slot = Arc::new(Mutex::new(Some("prior".to_string())));
+        let sink = flash_sink_from_slot(slot.clone());
+        sink("   \n\n".to_string());
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("prior"));
+    }
+
+    #[test]
     fn config_from_env_maps_optional_fields() {
         let _g = ENV_LOCK.lock().unwrap();
         // SAFETY: guarded by ENV_LOCK; single-threaded within this test.
@@ -420,7 +475,7 @@ mod tests {
         unsafe {
             std::env::remove_var("WEBHOOK_BROKER_URL");
         }
-        assert!(WebhookHandle::spawn_from_env().is_none());
+        assert!(WebhookHandle::spawn_from_env(None).is_none());
     }
 
     #[test]
