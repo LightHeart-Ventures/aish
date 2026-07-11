@@ -2,6 +2,7 @@ mod alert;
 mod autosuggest;
 mod backend;
 mod batch;
+mod config;
 mod container;
 mod context;
 mod control;

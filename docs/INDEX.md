@@ -24,6 +24,9 @@ Welcome to the aish codebase documentation. This index guides you to the right r
 
 Implementation details, schemas, and how things work.
 
+### Configuration & Operations
+- [reference/runtime-config.md](./reference/runtime-config.md) — Environment variables, config file, and tuning knobs
+
 ### Coordinator & Orchestration
 - [reference/coordinator/patterns.md](./reference/coordinator/patterns.md) — Coordinator loop patterns and best practices
 - [reference/coordinator/loop-guards.md](./reference/coordinator/loop-guards.md) — Detecting and preventing infinite loops
