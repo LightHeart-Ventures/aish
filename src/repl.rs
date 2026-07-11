@@ -196,7 +196,8 @@ pub async fn run(
     // broker client is an interactive-session affordance. Soft no-op (returns
     // None) when the env var is unset, which is the common case.
     if !session.nested {
-        if let Some(h) = crate::webhook::WebhookHandle::spawn_from_env() {
+        let flash = crate::webhook::flash_sink_from_slot(session.flash.clone());
+        if let Some(h) = crate::webhook::WebhookHandle::spawn_from_env(Some(flash)) {
             println!(
                 "\x1b[2m🪝 webhook: connecting to {} (tenant {}, {} handler(s))\x1b[0m",
                 h.broker_url, h.tenant_id, h.handler_count
@@ -7060,10 +7061,15 @@ async fn handle_colon(
                     "\x1b[2m🪝 webhook: not configured — set WEBHOOK_BROKER_URL and restart to enable\x1b[0m"
                 ),
             },
-            Some("reload") => match crate::webhook::reload(&mut session.webhook) {
-                Ok(n) => println!("\x1b[32m🪝\x1b[0m webhook reloaded — {n} handler(s) from plugins"),
-                Err(e) => println!("\x1b[33m🪝\x1b[0m {e}"),
-            },
+            Some("reload") => {
+                let flash = crate::webhook::flash_sink_from_slot(session.flash.clone());
+                match crate::webhook::reload(&mut session.webhook, Some(flash)) {
+                    Ok(n) => {
+                        println!("\x1b[32m🪝\x1b[0m webhook reloaded — {n} handler(s) from plugins")
+                    }
+                    Err(e) => println!("\x1b[33m🪝\x1b[0m {e}"),
+                }
+            }
             Some("logs") => {
                 let n = parts
                     .next()

@@ -55,7 +55,7 @@ pub use audit::{AuditRecord, AuditSink, JsonlAuditSink, MemoryAuditSink, NoopAud
 pub use backoff::ExponentialBackoff;
 pub use client::{BrokerClient, ConnState};
 pub use dispatcher::{
-    HandlerOutcome, PluginManifest, PluginRegistry, WebhookDispatcher, WebhookHandler,
+    FlashSink, HandlerOutcome, PluginManifest, PluginRegistry, WebhookDispatcher, WebhookHandler,
     DEFAULT_HANDLER_TIMEOUT,
 };
 pub use envelope::{BrokerConfig, ClientFrame, ServerFrame, Webhook};
