@@ -43,7 +43,7 @@ pub struct PluginManifest {
     #[serde(default)]
     pub version: String,
     /// Declared webhook handlers.
-    #[serde(default, alias = "handlers")]
+    #[serde(default)]
     pub webhooks: Vec<WebhookHandler>,
 }
 
