@@ -165,11 +165,18 @@ pub fn passes_filters(
         .all(|(k, expected)| get_path(payload, k).map(|got| got == expected).unwrap_or(false))
 }
 
+/// Sink for surfacing a handler's stdout live (e.g. the SecondStatusLine
+/// "flash" slot). Called once per successfully-executed handler with non-empty
+/// stdout. Kept as a plain `Fn(String)` so the crate stays decoupled from
+/// aish's `session.flash` type — the caller adapts it (cap/format) to the slot.
+pub type FlashSink = Arc<dyn Fn(String) + Send + Sync>;
+
 /// Dispatches webhooks to plugin handlers (Phase 5 seam realized).
 pub struct WebhookDispatcher {
     registry: Arc<PluginRegistry>,
     default_timeout: Duration,
     audit: Arc<dyn AuditSink>,
+    flash: Option<FlashSink>,
 }
 
 impl WebhookDispatcher {
@@ -178,7 +185,17 @@ impl WebhookDispatcher {
             registry,
             default_timeout: DEFAULT_HANDLER_TIMEOUT,
             audit: Arc::new(NoopAuditSink),
+            flash: None,
         }
+    }
+
+    /// Attach a [`FlashSink`]. Every executed handler that exits with a non-empty
+    /// stdout has that stdout handed to the sink — this is the seam that carries
+    /// a received webhook's handler output to the SecondStatusLine. Defaults to
+    /// no sink (a soft no-op), so tests and headless callers need not set one.
+    pub fn with_flash_sink(mut self, sink: FlashSink) -> Self {
+        self.flash = Some(sink);
+        self
     }
 
     pub fn with_default_timeout(mut self, d: Duration) -> Self {
@@ -258,6 +275,18 @@ impl WebhookDispatcher {
             } else if o.executed {
                 tracing::info!(plugin_id = %o.plugin_id, event_type = %o.event_type,
                     duration_ms = o.duration_ms, "handler ok");
+            }
+        }
+
+        // Surface each executed handler's stdout to the flash sink (the
+        // SecondStatusLine). This is the seam that carries a broker-delivered
+        // webhook's handler output all the way to the statusline. Only
+        // non-empty stdout from a handler that actually ran is flashed.
+        if let Some(flash) = &self.flash {
+            for o in &outcomes {
+                if o.executed && !o.stdout.trim().is_empty() {
+                    flash(o.stdout.clone());
+                }
             }
         }
 
@@ -479,6 +508,51 @@ mod tests {
         assert!(outs[0].success);
         assert!(outs[0].stdout.contains("hello"));
         assert!(outs[0].stdout.contains("world"));
+    }
+
+    #[tokio::test]
+    async fn handler_stdout_reaches_flash_sink() {
+        use std::sync::Mutex;
+        let reg = PluginRegistry::from_plugins(vec![PluginManifest {
+            id: "hello-world".into(),
+            name: "".into(),
+            version: "".into(),
+            webhooks: vec![WebhookHandler {
+                event_type: "issues".into(),
+                command: vec!["printf".into(), "Hello, World!".into()],
+                filters: Default::default(),
+                timeout_secs: None,
+            }],
+        }]);
+        let flashed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_store = flashed.clone();
+        let d = WebhookDispatcher::new(Arc::new(reg)).with_flash_sink(Arc::new(
+            move |msg: String| sink_store.lock().unwrap().push(msg),
+        ));
+        let outs = d.dispatch(&wh("issues", json!({"action":"opened"}))).await;
+        assert!(outs[0].success);
+        let got = flashed.lock().unwrap();
+        assert_eq!(got.len(), 1, "exactly one flash for one executed handler");
+        assert!(got[0].contains("Hello, World!"), "stdout reached statusline sink");
+    }
+
+    #[tokio::test]
+    async fn no_flash_sink_is_soft_noop() {
+        // Absence of a sink must not break dispatch.
+        let reg = PluginRegistry::from_plugins(vec![PluginManifest {
+            id: "hello-world".into(),
+            name: "".into(),
+            version: "".into(),
+            webhooks: vec![WebhookHandler {
+                event_type: "issues".into(),
+                command: vec!["printf".into(), "hi".into()],
+                filters: Default::default(),
+                timeout_secs: None,
+            }],
+        }]);
+        let d = WebhookDispatcher::new(Arc::new(reg));
+        let outs = d.dispatch(&wh("issues", json!({}))).await;
+        assert!(outs[0].success);
     }
 
     #[tokio::test]
