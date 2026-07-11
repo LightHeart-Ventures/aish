@@ -31,27 +31,40 @@ use std::time::Duration;
 // Removed Emulation import - using skillfish-cli UA instead
 
 /// The curated skill-registry index, embedded in the binary at compile time.
-/// [`initialize_registry`] writes this to `~/.aish/registry/index.json` on
+/// [`initialize_registry`] writes this to `~/.aish/registry/skills.json` on
 /// startup so the default `file://` registry always has a catalog to search,
 /// even fully offline.
-const EMBEDDED_INDEX: &str = include_str!("../registry/index.json");
+const EMBEDDED_SKILLS_INDEX: &str = include_str!("../registry/skills.json");
 
-/// The on-disk path of the local registry index: `~/.aish/registry/index.json`.
-fn local_registry_path() -> PathBuf {
+/// The curated plugin-registry index, embedded in the binary at compile time.
+/// [`initialize_registry`] writes this to `~/.aish/registry/plugins.json` on
+/// startup so plugins can be discovered offline.
+const EMBEDDED_PLUGINS_INDEX: &str = include_str!("../registry/plugins.json");
+
+/// The on-disk path of the local skills registry index: `~/.aish/registry/skills.json`.
+fn local_skills_registry_path() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
         .join(".aish")
         .join("registry")
-        .join("index.json")
+        .join("skills.json")
 }
 
-/// The default registry: a `file://` URI pointing at the local, binary-shipped
+/// The on-disk path of the local plugins registry index: `~/.aish/registry/plugins.json`.
+fn local_plugins_registry_path() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".aish")
+        .join("registry")
+        .join("plugins.json")
+}
+
+/// The default skills registry: a `file://` URI pointing at the local, binary-shipped
 /// index written by [`initialize_registry`]. This makes skill *search* work
 /// offline out of the box. Override with `AISH_SKILL_REGISTRY=scheme://host`
 /// (e.g. `https://skill.fish`, a self-hosted mirror, or another `file://`
 /// index) to use an alternate source — overriding is also what enables
 /// *fetching* individual skills from their upstream origin.
-fn default_registry() -> String {
-    format!("file://{}", local_registry_path().display())
+fn default_skills_registry() -> String {
+    format!("file://{}", local_skills_registry_path().display())
 }
 
 /// The `AISH_SKILL_REGISTRY` override, when set and non-empty (trailing slash
@@ -65,34 +78,46 @@ fn registry_override() -> Option<String> {
         .map(|s| s.trim_end_matches('/').to_string())
 }
 
-/// Resolve the active registry: the `AISH_SKILL_REGISTRY` override when set and
+/// Resolve the active skills registry: the `AISH_SKILL_REGISTRY` override when set and
 /// non-empty, else the local `file://` index default.
-fn registry() -> String {
-    registry_override().unwrap_or_else(default_registry)
+fn skills_registry() -> String {
+    registry_override().unwrap_or_else(default_skills_registry)
 }
 
-/// Write the curated, binary-embedded registry index to
-/// `<aish_dir>/registry/index.json` so the default `file://` registry has a
-/// catalog to search. Called once on startup; overwrites any prior copy so the
-/// shipped index always matches this binary. Best-effort: the caller ignores
+/// Write the curated, binary-embedded registry indices to
+/// `<aish_dir>/registry/{skills,plugins}.json` so the default `file://` registries have
+/// catalogs to search. Called once on startup; overwrites any prior copies so the
+/// shipped indices always match this binary. Best-effort: the caller ignores
 /// the error rather than aborting startup.
 pub fn initialize_registry(aish_dir: &Path) -> std::io::Result<()> {
     let dir = aish_dir.join("registry");
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("index.json"), EMBEDDED_INDEX)
+    std::fs::write(dir.join("skills.json"), EMBEDDED_SKILLS_INDEX)?;
+    std::fs::write(dir.join("plugins.json"), EMBEDDED_PLUGINS_INDEX)
 }
 
-/// Read + parse the binary-shipped registry index (`~/.aish/registry/index.json`,
+/// Read + parse the binary-shipped skills registry index (`~/.aish/registry/skills.json`,
 /// written by [`initialize_registry`] on startup) WITHOUT any network — the
 /// source for the per-turn, offline skill-install recommendation
 /// (`crate::skill_match::recommend_install`). Returns the full curated catalog
 /// for the caller to rank in-process. Best-effort: a missing/unreadable/invalid
 /// index yields an empty list, never an error, so the hot path can't fail on it.
-pub fn local_index_catalog() -> Vec<SearchResult> {
-    let Ok(body) = std::fs::read_to_string(local_registry_path()) else {
+pub fn local_skills_catalog() -> Vec<SearchResult> {
+    let Ok(body) = std::fs::read_to_string(local_skills_registry_path()) else {
         return Vec::new();
     };
     parse_search_body(&body).unwrap_or_default()
+}
+
+/// Read + parse the binary-shipped plugins registry index (`~/.aish/registry/plugins.json`,
+/// written by [`initialize_registry`] on startup) WITHOUT any network. Returns the full
+/// curated catalog for the caller to rank in-process. Best-effort: a missing/unreadable/
+/// invalid index yields an empty list, never an error, so the hot path can't fail on it.
+pub fn local_plugins_catalog() -> Vec<PluginInfo> {
+    let Ok(body) = std::fs::read_to_string(local_plugins_registry_path()) else {
+        return Vec::new();
+    };
+    parse_plugins_body(&body).unwrap_or_default()
 }
 
 /// A parsed reference to a skill on the registry.
@@ -573,6 +598,138 @@ fn encode_query(s: &str) -> String {
     out
 }
 
+/// Plugin metadata from the registry.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PluginInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub author: String,
+    pub repository: String,
+    pub reference: String,
+    pub branch: String,
+    pub version: String,
+    pub enabled: bool,
+    pub provides: std::collections::HashMap<String, bool>,
+}
+
+/// Plugin registry wrapper.
+#[derive(Debug, serde::Deserialize)]
+struct PluginRegistry {
+    version: String,
+    plugins: Vec<PluginInfo>,
+}
+
+/// Parse the plugins registry JSON body.
+fn parse_plugins_body(body: &str) -> Result<Vec<PluginInfo>, serde_json::Error> {
+    serde_json::from_str::<PluginRegistry>(body).map(|r| r.plugins)
+}
+
+/// Download a plugin from GitHub's main branch and extract it to ~/.aish/plugins.
+/// Supports references like `owner/repo/plugins/plugin-id` (path within repo).
+pub async fn install_plugin(plugin_id: &str, plugins_dir: &Path) -> Result<()> {
+    // Parse the plugin ID — for now, assume it's in the aish repo
+    // in the format: plugins/<plugin-id>
+    let catalog = local_plugins_catalog();
+    let plugin = catalog
+        .iter()
+        .find(|p| p.id == plugin_id)
+        .ok_or_else(|| anyhow::anyhow!("plugin `{plugin_id}` not found in registry"))?;
+
+    // Extract owner, repo, and path from reference (e.g., "LightHeart-Ventures/aish/plugins/hello-world")
+    let parts: Vec<&str> = plugin.reference.split('/').collect();
+    if parts.len() < 3 {
+        return Err(anyhow::anyhow!("invalid plugin reference: {}", plugin.reference));
+    }
+
+    let owner = parts[0];
+    let repo = parts[1];
+
+    // Use GitHub raw content URL to fetch the plugin directory
+    // We'll download as a tar.gz and extract it
+    let url = format!(
+        "https://github.com/{}/{}/archive/refs/heads/{}.tar.gz",
+        owner, repo, &plugin.branch
+    );
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "aish/0.37.0")
+        .send()
+        .await
+        .context("downloading plugin archive")?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "failed to download plugin: HTTP {} from {}",
+            resp.status().as_u16(),
+            url
+        ));
+    }
+
+    let bytes = resp.bytes().await.context("reading plugin archive")?;
+    let tar = flate2::read::GzDecoder::new(&bytes[..]);
+    let mut archive = tar::Archive::new(tar);
+
+    // Extract the plugin directory from the archive
+    let plugin_dir = plugins_dir.join(plugin_id);
+    std::fs::create_dir_all(&plugin_dir)?;
+
+    for entry in archive.entries().context("reading archive entries")? {
+        let mut entry = entry.context("reading archive entry")?;
+        let path_in_archive = entry.path()?.to_path_buf();
+
+        // Look for the plugin directory in the archive
+        // Format: {repo}-{branch}/plugins/{plugin-id}/...
+        if let Some(rel_path) = path_in_archive.to_str() {
+            if rel_path.contains(&format!("plugins/{plugin_id}")) {
+                // Extract files relative to the plugin directory
+                let remaining = rel_path
+                    .split(&format!("plugins/{plugin_id}"))
+                    .nth(1)
+                    .unwrap_or("");
+                if !remaining.is_empty() && remaining != "/" {
+                    let target = plugin_dir.join(remaining.trim_start_matches('/'));
+                    std::fs::create_dir_all(target.parent().unwrap_or(&plugin_dir))?;
+                    entry.unpack(&target)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Remove a plugin from ~/.aish/plugins.
+pub fn remove_plugin(plugin_id: &str, plugins_dir: &Path) -> Result<()> {
+    let plugin_dir = plugins_dir.join(plugin_id);
+    if !plugin_dir.exists() {
+        return Err(anyhow::anyhow!("plugin `{plugin_id}` not found"));
+    }
+    std::fs::remove_dir_all(&plugin_dir)
+        .context("removing plugin directory")?;
+    Ok(())
+}
+
+/// List all available plugins from the local registry.
+pub fn list_available_plugins() -> Vec<PluginInfo> {
+    local_plugins_catalog()
+}
+
+/// Get plugin info from the registry.
+pub fn get_plugin_info(plugin_id: &str) -> Option<PluginInfo> {
+    local_plugins_catalog()
+        .into_iter()
+        .find(|p| p.id == plugin_id)
+}
+
+/// Combined catalog for skill/plugin discovery — returns searchable catalog entries.
+/// This is used by the skill recommendation system and `maybe_recommend_skill`.
+pub fn local_index_catalog() -> Vec<SearchResult> {
+    local_skills_catalog()
+}
+
 /// The search endpoint URL on `base` for `query`.
 fn search_url_with_base(base: &str, query: &str) -> String {
     format!(
@@ -709,7 +866,7 @@ pub(crate) async fn search_core(query: &str) -> Result<Vec<SearchResult>> {
     // (2) The offline, curated, binary-embedded index. Live/community search is
     // served by the npx-skillfish plugin (a `provides.skill_source`), not by the
     // built-in core — see `search` / `search_plugins` for the federation.
-    Ok(search_with_base(&default_registry(), query)
+    Ok(search_with_base(&default_skills_registry(), query)
         .await
         .unwrap_or_default())
 }
@@ -1047,7 +1204,7 @@ pub async fn run_search(query: &str) -> Result<()> {
     if query.is_empty() {
         bail!("empty search query — try `aish --skill-search <query>`");
     }
-    let line = format!("searching {} for {query:?} …", registry());
+    let line = format!("searching {} for {query:?} …", skills_registry());
     println!("{}", crate::style::dim(&line));
     let results = search(query).await?;
     println!("{}", print_results_table(query, &results));
@@ -1605,10 +1762,10 @@ mod tests {
     #[test]
     fn default_registry_is_local_file_index() {
         // The default (no override) is a file:// URI pointing at the local
-        // index.json under ~/.aish/registry. Pure function — no env mutation.
-        let reg = default_registry();
+        // skills.json under ~/.aish/registry. Pure function — no env mutation.
+        let reg = default_skills_registry();
         assert!(reg.starts_with("file://"), "got: {reg}");
-        assert!(reg.ends_with("/registry/index.json"), "got: {reg}");
+        assert!(reg.ends_with("/registry/skills.json"), "got: {reg}");
     }
 
     #[test]
