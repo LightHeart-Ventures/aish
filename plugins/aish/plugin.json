@@ -1,0 +1,7 @@
+{
+  "id": "aish",
+  "name": "aish Platform",
+  "version": "1.0.0",
+  "description": "Official aish platform skills and utilities — configuration guide, SRE playbook, and operational troubleshooting.",
+  "enabled": true
+}
