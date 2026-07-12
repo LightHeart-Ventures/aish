@@ -6235,6 +6235,52 @@ fn handle_plugin(args: Vec<&str>) {
     let id = args.get(1).copied();
     let flag = args.get(2).copied();
     match sub {
+        Some("add") => {
+            let Some(plugin_id) = id else {
+                println!("usage: :plugin add <plugin-id>");
+                println!("\navailable plugins:");
+                for p in crate::skill_provider::list_available_plugins() {
+                    println!("  {:<20} {}", p.id, p.description);
+                }
+                return;
+            };
+            // Spawn async task to download and install plugin
+            let plugins_dir = dir.clone();
+            let plugin_id = plugin_id.to_string();
+            std::thread::spawn(move || {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Use a blocking runtime since we're in a spawned thread
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        crate::skill_provider::install_plugin(&plugin_id, &plugins_dir).await
+                    })
+                })) {
+                    Ok(Ok(())) => {
+                        println!("\x1b[32m✓\x1b[0m plugin `{plugin_id}` installed successfully");
+                        println!("  reload with `:restart` to activate");
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("\x1b[31m✗\x1b[0m failed to install plugin: {e:#}");
+                    }
+                    Err(_) => {
+                        eprintln!("\x1b[31m✗\x1b[0m plugin installation panicked");
+                    }
+                }
+            });
+        }
+        Some("remove" | "rm") => {
+            let Some(plugin_id) = id else {
+                println!("usage: :plugin remove <plugin-id>");
+                return;
+            };
+            match crate::skill_provider::remove_plugin(plugin_id, &dir) {
+                Ok(()) => {
+                    println!("\x1b[32m✓\x1b[0m plugin `{plugin_id}` removed");
+                    println!("  reload with `:restart` to apply");
+                }
+                Err(e) => eprintln!("\x1b[31m✗\x1b[0m {e:#}"),
+            }
+        }
         Some("info") => {
             let Some(id) = id else {
                 println!("usage: :plugin info <id> [--schema]");
@@ -6268,6 +6314,7 @@ fn handle_plugin(args: Vec<&str>) {
                 println!("  {:<20} {name} v{ver}{state}", m.id);
             }
             println!("\n:plugin info <id> for full provenance");
+            println!(":plugin add <id> to install a plugin from the registry");
         }
         Some(other) => println!("unknown :plugin subcommand `{other}` — try :plugin list"),
     }
