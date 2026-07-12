@@ -77,28 +77,48 @@ impl PluginRegistry {
             if !manifest_path.is_file() {
                 continue;
             }
-            match std::fs::read_to_string(&manifest_path)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<PluginManifest>(&raw).ok())
-            {
-                Some(mut m) => {
-                    // Resolve relative handler commands (e.g. "handlers/greet.sh")
-                    // against the plugin's own directory so dispatch is independent
-                    // of aish's cwd. Bare program names (no '/') are left alone for
-                    // PATH lookup; absolute paths are unchanged.
-                    let plugin_dir = entry.path();
-                    for h in &mut m.webhooks {
-                        if let Some(prog) = h.command.first_mut() {
-                            let p = Path::new(prog.as_str());
-                            if p.is_relative() && prog.contains('/') {
-                                *prog = plugin_dir.join(p).to_string_lossy().into_owned();
-                            }
-                        }
-                    }
-                    plugins.push(m);
+            let raw = match std::fs::read_to_string(&manifest_path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let mut m = match serde_json::from_str::<PluginManifest>(&raw) {
+                Ok(m) => m,
+                Err(_) => {
+                    tracing::warn!(path = %manifest_path.display(), "skipping malformed plugin.json");
+                    continue;
                 }
-                None => tracing::warn!(path = %manifest_path.display(), "skipping malformed plugin.json"),
+            };
+
+            // TASK-447 — fail-fast on the removed `handlers` schema fork.
+            // The one-release `handlers` -> `webhooks` serde alias was retired,
+            // so a manifest still using the legacy top-level `handlers` key now
+            // parses to ZERO webhooks. Rather than silently registering a plugin
+            // with no handlers (the old silent-break), detect the legacy key and
+            // skip the plugin with an actionable migration warning.
+            if m.webhooks.is_empty() && raw_has_legacy_handlers(&raw) {
+                tracing::warn!(
+                    path = %manifest_path.display(),
+                    "plugin.json uses the removed `handlers` key — rename it to `webhooks` \
+                     (the `handlers`->`webhooks` alias was removed in TASK-447); \
+                     no webhook handlers were loaded for this plugin"
+                );
+                continue;
             }
+
+            // Resolve relative handler commands (e.g. "handlers/greet.sh")
+            // against the plugin's own directory so dispatch is independent
+            // of aish's cwd. Bare program names (no '/') are left alone for
+            // PATH lookup; absolute paths are unchanged.
+            let plugin_dir = entry.path();
+            for h in &mut m.webhooks {
+                if let Some(prog) = h.command.first_mut() {
+                    let p = Path::new(prog.as_str());
+                    if p.is_relative() && prog.contains('/') {
+                        *prog = plugin_dir.join(p).to_string_lossy().into_owned();
+                    }
+                }
+            }
+            plugins.push(m);
         }
         Ok(Self { plugins })
     }
@@ -159,6 +179,20 @@ impl HandlerOutcome {
             duration_ms: 0,
         }
     }
+}
+
+/// TASK-447 — true when the raw manifest JSON carries a non-empty top-level
+/// `handlers` array: the retired legacy key that the `webhooks` field no longer
+/// aliases. [`PluginRegistry::load_dir`] uses this to turn a silent empty-load
+/// into an actionable migration warning.
+fn raw_has_legacy_handlers(raw: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("handlers"))
+        .and_then(|h| h.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
 }
 
 /// Look up a dotted path (`"a.b.c"`) in a JSON value.
@@ -629,6 +663,74 @@ mod tests {
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.matching("pull_request").len(), 1);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// TASK-447 — the retired `handlers` key must fail fast, not silently load.
+    ///
+    /// The one-release `handlers` -> `webhooks` serde alias was removed. A
+    /// manifest still using the legacy top-level `handlers` key now parses to
+    /// zero webhooks; `load_dir` MUST skip such a plugin (with a warning) rather
+    /// than register a silent no-op plugin. This locks in the fail-fast contract.
+    #[test]
+    fn load_dir_skips_legacy_handlers_key() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("aish-wh-legacy-{}-{uniq}", std::process::id()));
+        let pdir = base.join("legacy");
+        std::fs::create_dir_all(&pdir).unwrap();
+        // Legacy schema: top-level `handlers` (no `webhooks`).
+        std::fs::write(
+            pdir.join("plugin.json"),
+            r#"{"id":"legacy","handlers":[{"event_type":"push","command":["true"]}]}"#,
+        )
+        .unwrap();
+        let reg = PluginRegistry::load_dir(&base).unwrap();
+        assert_eq!(reg.len(), 0, "legacy handlers-only manifest must be skipped, not silently loaded");
+        assert_eq!(reg.matching("push").len(), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// TASK-447 — a valid `webhooks` manifest sitting next to a legacy one is
+    /// still loaded (the fail-fast skip is per-plugin, never fleet-wide).
+    #[test]
+    fn load_dir_loads_webhooks_next_to_legacy() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("aish-wh-mixed-{}-{uniq}", std::process::id()));
+        std::fs::create_dir_all(base.join("legacy")).unwrap();
+        std::fs::create_dir_all(base.join("modern")).unwrap();
+        std::fs::write(
+            base.join("legacy").join("plugin.json"),
+            r#"{"id":"legacy","handlers":[{"event_type":"push","command":["true"]}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("modern").join("plugin.json"),
+            r#"{"id":"modern","webhooks":[{"event_type":"push","command":["true"]}]}"#,
+        )
+        .unwrap();
+        let reg = PluginRegistry::load_dir(&base).unwrap();
+        assert_eq!(reg.len(), 1, "only the modern `webhooks` plugin is registered");
+        assert_eq!(reg.matching("push").len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn raw_has_legacy_handlers_detects_key() {
+        assert!(raw_has_legacy_handlers(
+            r#"{"handlers":[{"event_type":"push","command":["h.sh"]}]}"#
+        ));
+        // `webhooks` is the canonical key — not the legacy fork.
+        assert!(!raw_has_legacy_handlers(
+            r#"{"webhooks":[{"event_type":"push","command":["h.sh"]}]}"#
+        ));
+        // An empty `handlers` array is not an actionable migration signal.
+        assert!(!raw_has_legacy_handlers(r#"{"handlers":[]}"#));
+        assert!(!raw_has_legacy_handlers(r#"{"id":"x"}"#));
     }
 
     /// TASK-446 — shell-injection regression guard.
