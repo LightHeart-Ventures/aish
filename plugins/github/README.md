@@ -10,12 +10,35 @@ scripts that turn GitHub events into concise, auditable one-line summaries.
 | GitHub event   | Filter(s)                                         | Handler                    | Emits |
 |----------------|---------------------------------------------------|----------------------------|-------|
 | `pull_request` | `action ∈ {opened, reopened, ready_for_review}`   | `handlers/pr-review.sh`    | PR triage line (repo#num, author, head→base, title, url) |
-| `workflow_run` | `action = completed`                              | `handlers/workflow-run.sh` | CI outcome line (✓/✗, name, branch, status/conclusion); non-zero exit on a bad conclusion |
+| `workflow_run` | `action = completed`                              | `handlers/workflow-run.sh` | CI outcome line (✓/✗, name, branch, status/conclusion); non-zero exit on a bad conclusion; **auto-dispatches a `fix-ci` worker on failure** (see below) |
 | `release`      | `action = published`                              | `handlers/release.sh`      | Release notice (tag, name, author, pre-release flag) |
 
 Each `action` value is registered as its own handler entry because filters are
 **AND-combined equality** checks — there is no `in` operator, so one entry per
 accepted value keeps the match explicit.
+
+## CI auto-fix worker
+
+When a `workflow_run` concludes in a bad state (`failure`, `timed_out`,
+`cancelled`, `startup_failure`) **and** the event carries an associated PR (or a
+usable head branch), `workflow-run.sh` detaches a background aish coordinator
+that runs the [`fix-ci`](../../skills/fix-ci/SKILL.md) skill against the failed
+run — it checks out the branch, inspects `gh run view <id> --log-failed`, applies
+the smallest correct fix, reconfirms the test/lint gate is green, and pushes to
+the **PR branch** (never the default branch).
+
+Properties:
+
+| Property      | Behavior |
+|---------------|----------|
+| **Opt-out**   | set `GITHUB_CI_AUTOFIX=0` in the handler env to disable (default: enabled) |
+| **PR-scoped** | only fires when the payload has `workflow_run.pull_requests[]` or a real `head_branch` |
+| **Non-blocking** | worker is `setsid`-detached with closed stdin, so the handler returns well inside its dispatcher timeout |
+| **Idempotent** | a per-run marker (`$TMPDIR/aish-ci-autofix-<run_id>.marker`) dedupes webhook redeliveries — one failed run spawns at most one worker |
+| **Best-effort** | dispatch failures never change the handler's exit code, which keeps signalling the raw CI conclusion to the audit sink |
+
+The worker's stdout/stderr is captured to `$TMPDIR/ci-autofix-<run_id>-<ts>.log`.
+Requires `aish` on `PATH`; if absent, auto-fix is skipped with a logged notice.
 
 ## Handler contract
 
