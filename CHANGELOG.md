@@ -6,6 +6,7 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ### Changed
 - **Embedded mcpmarket skill search removed — live search now comes from the plugin**: dropped the in-process mcpmarket network search path from `skill_provider` (the `wreq`/`wreq-util` browser-impersonating HTTP client is gone from `Cargo.toml`). `:skill search` now reads the offline embedded curated index for the builtin source, while live/community search is served exclusively by the `npx-skillfish` plugin (a `provides.skill_source`). The offline index, `:skill add` (GitHub + skill.fish), and the plugin skill-source fan-out are unchanged.
+- **`npx-skills` plugin removed**: npx-skills (npm registry skill search + install) is archived. Live skill import and search is now unified under `npx-skillfish` (agentskills.io/skillfish), which is more performant and upstream-maintained. Removed `plugins/npx-skills/` from the tree; documentation updated to remove references to npm-sourced skills.
 
 
 ## [0.36.2] - 2026-07-08

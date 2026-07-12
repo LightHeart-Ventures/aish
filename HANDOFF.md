@@ -37,7 +37,7 @@
 | `plugins/github/INSTALL.md` | 12 KB | GitHub webhooks |
 | `plugins/hello-world/INSTALL.md` | 4 KB | Reference plugin |
 | `plugins/npx-skillfish/INSTALL.md` | 4 KB | Agentskills.io integration |
-| `plugins/npx-skills/INSTALL.md` | 8 KB | npm skill search & install |
+
 | `plugins/signoz-observability/INSTALL.md` | 8 KB | Observability stack |
 | `PLUGIN_REGISTRY_COMPLETION.md` | 12 KB | Full technical summary |
 | `PLUGIN_REGISTRY_QUICK_REF.md` | 8 KB | Quick reference for reviewers |

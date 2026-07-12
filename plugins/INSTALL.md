@@ -25,7 +25,7 @@ For each plugin, read its **`INSTALL.md`** file. All guides follow the same stru
 | **codebase-memory** | MCP Server | DeusData/codebase-memory-mcp binary | Graph-based code search instead of grep |
 | **github** | Webhook Handlers | GitHub webhooks, (optional) gh CLI | Ingesting GitHub PR/workflow/release events |
 | **hello-world** | Local (Reference) | None | Testing plugin discovery, reference implementation |
-| **npx-skills** | Local (Shell) | Node.js/npx | Searching npm registry for skills |
+
 | **npx-skillfish** | Local (Shell) | Node.js/npx | Importing skills from agentskills.io/skillfish |
 | **signoz-observability** | MCP Server | SigNoz instance, API key | Querying logs, traces, metrics, alerts |
 
@@ -48,7 +48,6 @@ For each plugin, read its **`INSTALL.md`** file. All guides follow the same stru
 - **[github/INSTALL.md](./github/INSTALL.md)** — Webhook handlers for GitHub events
 
 #### Skill Management
-- **[npx-skills/INSTALL.md](./npx-skills/INSTALL.md)** — Search and install skills from npm
 - **[npx-skillfish/INSTALL.md](./npx-skillfish/INSTALL.md)** — Import skills from agentskills.io/skillfish
 
 #### Observability
@@ -92,10 +91,10 @@ These plugins run **shell scripts** with no binary dependencies:
    - Needs: Webhook broker (Fly.io recommended)
    - [Install guide](./github/INSTALL.md)
 
-4. **npx-skills** & **npx-skillfish**
-   - Skill search and management via npm/GitHub
+4. **npx-skillfish**
+   - Skill import and management via GitHub
    - Needs: Node.js / npx (install from https://nodejs.org/)
-   - [npx-skills guide](./npx-skills/INSTALL.md) | [npx-skillfish guide](./npx-skillfish/INSTALL.md)
+   - [npx-skillfish guide](./npx-skillfish/INSTALL.md)
 
 5. **hello-world**
    - Reference plugin (bundled, no installation)
@@ -150,7 +149,7 @@ Prerequisites: None (uses existing `ANTHROPIC_API_KEY`)
 
 ### I want to search for and import skills
 
-**→ Install [npx-skills](./npx-skills/INSTALL.md) and/or [npx-skillfish](./npx-skillfish/INSTALL.md)**
+**→ Install [npx-skillfish](./npx-skillfish/INSTALL.md)**
 
 Prerequisites: Node.js / npm
 
