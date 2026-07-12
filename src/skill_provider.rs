@@ -1795,11 +1795,15 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("aish-reg-init-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         initialize_registry(&tmp).unwrap();
-        let written = std::fs::read_to_string(tmp.join("registry").join("index.json")).unwrap();
-        assert_eq!(written, EMBEDDED_INDEX);
-        // The embedded index parses as a non-empty catalog.
-        let parsed = parse_search_body(&written).unwrap();
-        assert!(!parsed.is_empty(), "embedded index parsed empty");
+        // The JSONL registry refactor writes split skills.json + plugins.json
+        // (index.json was dropped). Both must match their embedded constants.
+        let skills = std::fs::read_to_string(tmp.join("registry").join("skills.json")).unwrap();
+        assert_eq!(skills, EMBEDDED_SKILLS_INDEX);
+        let plugins = std::fs::read_to_string(tmp.join("registry").join("plugins.json")).unwrap();
+        assert_eq!(plugins, EMBEDDED_PLUGINS_INDEX);
+        // The embedded skills index parses as a non-empty catalog.
+        let parsed = parse_search_body(&skills).unwrap();
+        assert!(!parsed.is_empty(), "embedded skills index parsed empty");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
