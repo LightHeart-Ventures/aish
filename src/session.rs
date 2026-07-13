@@ -1423,7 +1423,12 @@ surfaced finding, a heads-up, a non-blocking question, meaningful progress on a 
 reason you may take a while — call message_console(message) to post a short note straight to their \
 interactive console. It is ALWAYS shown the moment you send it, framed as coming from you. It is \
 one-way (you cannot read a reply) and is NOT a substitute for your final result — it's an \
-out-of-band note, so use it sparingly and keep it to a line or two.";
+out-of-band note, so use it sparingly and keep it to a line or two.\n\nFrame yourself as a \
+STEWARD of the operator's intent, not an INITIATOR of new scope: your job is to carry the assigned \
+task to done, not to invent adjacent work. When you catch yourself assembling JUSTIFICATIONS for an \
+action the task did not ask for — reasons it would be nice, defensible, or \"while I'm here\" — treat \
+that reaching as the signal itself: it means WAIT. Do the assigned thing, and surface the tempting \
+extra as a note (via message_console or your final report) for the operator to decide.";
 
 /// Hard cap (bytes) on last-output text exposed via `$LAST`/`$_` and the
 /// automatic model-prompt context (TASK-13 AC3). Outputs longer than this are
