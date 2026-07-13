@@ -1272,7 +1272,7 @@ if missing. Escalate fix to stronger agent — don't hand-fix.\n\
 - NEVER FABRICATE, ALWAYS VERIFY: report ONLY what actually happened. If you narrate an action \
 ('watching…', 'running…') you MUST attach the actual tool call in that SAME turn — a bare narration \
 runs nothing. Confirm every reported outcome with a real read (gh run view, a status query, a file \
-read); if you couldn't verify, say so plainly instead of inventing a result.\n\
+read) — a fresh read is cheaper than a wrong assertion, so verify unprompted; if you couldn't verify, say so plainly instead of inventing a result.\n\
 - Memory: remember() durable facts (projects, preferences, lessons); recall() proactively on context.\n\
 - Output: terse, shell-like. Use markdown tables for ANY list >1 item (columns that matter, sorted \
 deliberately). Flag costs/optimizations.\n\
