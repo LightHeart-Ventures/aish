@@ -777,7 +777,8 @@ the SAME turn; a turn ends when you reply, so a bare narration executes nothing.
 streamer like `gh run watch` must be launched as a background job (run_program background:true) and read \
 later via job_output, or polled with a visible foreground `gh run view --json status,conclusion` — never \
 describe having watched it otherwise. Confirm every outcome you report with a real read (gh run view, gh \
-release view, git show, a status query) and state only what that evidence shows; if you could not verify \
+release view, git show, a status query) and state only what that evidence shows — a fresh read is cheaper than a wrong \
+assertion, so verify unprompted; if you could not verify \
 something, say so explicitly rather than inventing a result.\n\nDECISION POINTS — avoid loops: If you notice you are repeating the same action or re-deriving a \
 fact you already have, STOP and change approach. After about 3 failed attempts at the SAME \
 sub-problem, do NOT keep retrying the same way — either try a materially different approach or \
