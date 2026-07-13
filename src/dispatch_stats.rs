@@ -305,6 +305,7 @@ mod tests {
             error: None,
             session_id: None,
             session_name: None,
+            parent_run_id: None,
             created_at: created.map(String::from),
             heartbeat_at: beat.map(String::from),
             tokens_in: 0,

@@ -3955,7 +3955,7 @@ fn collect_worker_rows(session: &Session) -> Vec<crate::workers_modal::WorkerRow
     };
     let mut in_mem: Vec<_> = session.worker_jobs.lock().unwrap().iter().cloned().collect();
     in_mem.sort_by(|a, b| b.started_epoch().cmp(&a.started_epoch())); // newest-first
-    in_mem
+    let mut rows: Vec<crate::workers_modal::WorkerRow> = in_mem
         .iter()
         .map(|w| {
             let (started_cell, runtime_cell) =
@@ -3975,9 +3975,104 @@ fn collect_worker_rows(session: &Session) -> Vec<crate::workers_modal::WorkerRow
                 runtime_cell,
                 task: one_line(&w.task),
                 result_cell: w.result_cell(),
+                parent_id: None,
+                depth: 0,
             }
         })
-        .collect()
+        .collect();
+    // TASK-315: fold in durable SUBWORKERS — coordinator_runs rows whose parent
+    // chain reaches one of this session's in-mem coordinators. A coordinator's
+    // spawned children live in their own session/process (not this session's
+    // `worker_jobs`), so we pull them from the shared store and stamp `parent_id`
+    // from `parent_run_id`; `build_worker_forest` then indents each beneath its
+    // parent. Display-only — attach still resolves ids on its own.
+    if let Some(store) = &session.coordinator_store {
+        if let Ok(all) = store.load_all() {
+            let mut visible: std::collections::HashSet<String> =
+                rows.iter().map(|r| r.id.clone()).collect();
+            loop {
+                let mut added = false;
+                for r in &all {
+                    let Some(parent) = r.parent_run_id.as_deref() else {
+                        continue;
+                    };
+                    if visible.contains(parent) && !visible.contains(&r.run_id) {
+                        rows.push(durable_worker_row(r, session.session_id.as_str(), now_epoch));
+                        visible.insert(r.run_id.clone());
+                        added = true;
+                    }
+                }
+                if !added {
+                    break;
+                }
+            }
+        }
+    }
+    crate::workers_modal::build_worker_forest(rows)
+}
+
+/// Convert a durable `coordinator_runs` row into a display [`WorkerRow`] for the
+/// `:workers` forest. Mirrors the static table's durable-row cell logic (status
+/// = phase, result derived from result/error, time cells frozen at heartbeat
+/// once terminal). `parent_id` carries `parent_run_id` so the row indents
+/// beneath its parent. Used only for SUBWORKERS not present in `worker_jobs`.
+fn durable_worker_row(
+    r: &crate::coordinator_store::CoordinatorRow,
+    me_session_id: &str,
+    now_epoch: i64,
+) -> crate::workers_modal::WorkerRow {
+    let one_line = |t: &str| {
+        let s = t.split_whitespace().collect::<Vec<_>>().join(" ");
+        if s.chars().count() > 70 {
+            format!("{}…", s.chars().take(70).collect::<String>())
+        } else {
+            s
+        }
+    };
+    let is_me = r.session_id.as_deref() == Some(me_session_id);
+    let label = r
+        .session_name
+        .clone()
+        .or_else(|| r.session_id.as_deref().map(|s| crate::batch::short_id(s).to_string()))
+        .unwrap_or_else(|| "—".into());
+    let session_label = if is_me { format!("{label} *") } else { label };
+    let result_cell = match (r.result.as_deref(), r.error.as_deref()) {
+        (Some(res), None) => res
+            .split_whitespace()
+            .find(|s| s.starts_with('#'))
+            .map(|pr| format!("✓ {pr}"))
+            .unwrap_or_else(|| "✓ success".to_string()),
+        (None, Some(e)) => {
+            let t = if e.chars().count() > 40 {
+                format!("{}…", e.chars().take(40).collect::<String>())
+            } else {
+                e.to_string()
+            };
+            format!("✗ {t}")
+        }
+        _ => "—".to_string(),
+    };
+    let started = r.created_at.as_deref().and_then(crate::style::parse_sqlite_utc);
+    let terminal = matches!(r.phase.as_str(), "done" | "failed" | "checkpoint");
+    let finished = if terminal {
+        r.heartbeat_at.as_deref().and_then(crate::style::parse_sqlite_utc)
+    } else {
+        None
+    };
+    let (started_cell, runtime_cell) = crate::style::time_cells(started, finished, now_epoch);
+    crate::workers_modal::WorkerRow {
+        id: r.run_id.clone(),
+        type_emoji: crate::style::job_activity_emoji(&r.task).to_string(),
+        id_cell: crate::batch::short_id(&r.run_id).to_string(),
+        session_label,
+        status: r.phase.clone(),
+        started_cell,
+        runtime_cell,
+        task: one_line(&r.task),
+        result_cell,
+        parent_id: r.parent_run_id.clone(),
+        depth: 0,
+    }
 }
 
 /// `:attach <id>` — attach the interactive session to a LIVE coordinator this
@@ -4027,6 +4122,23 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
                 w.id.clone(),
                 matches!(w.status().as_str(), "done" | "failed"),
             ));
+        }
+    }
+    // Subworker / cross-session fallback: an id absent from this session's
+    // `worker_jobs` may be a durable SUBWORKER (spawned by one of our
+    // coordinators) or a run owned by another session. Resolve it from the
+    // shared coordinator store and attach in REVIEW mode (replay its durable
+    // task + result). Only consulted when the in-mem lookup found nothing, so
+    // this session's own workers are never double-listed.
+    if matches.is_empty() {
+        if let Some(store) = &session.coordinator_store {
+            if let Ok(rows) = store.load_all() {
+                for r in &rows {
+                    if hit(&r.run_id) {
+                        matches.push((r.run_id.clone(), true));
+                    }
+                }
+            }
         }
     }
     match matches.as_slice() {
@@ -4082,7 +4194,14 @@ fn backfill_attached(run_id: &str, session: &Session) {
         .iter()
         .find(|w| w.id == *run_id)
         .cloned();
-    let Some(job) = job else { return };
+    let Some(job) = job else {
+        // Subworker / cross-session review: not one of THIS session's in-mem
+        // workers, so there's no live transcript to replay — surface the durable
+        // header + task from the coordinator store so an attach still shows what
+        // the worker is/was doing (its result follows via print_attached_result).
+        backfill_attached_durable(run_id, session);
+        return;
+    };
     let short = crate::batch::short_id(run_id);
     println!("{}", crate::worker::pane_replay_header(&short));
     // The task is the coordinator's "input" — the START of the conversation. It's
@@ -4372,7 +4491,61 @@ fn print_attached_result(run_id: &str, session: &Session) {
                 crate::worker::pane_row(run_id, "·result (empty result)")
             ),
         }
+    } else {
+        // Subworker / cross-session: no in-mem job, so read the final result
+        // (or failure) straight from the durable coordinator store.
+        if let Some(store) = &session.coordinator_store {
+            if let Ok(rows) = store.load_all() {
+                if let Some(r) = rows.iter().find(|r| r.run_id == *run_id) {
+                    let msg = match (r.result.as_deref(), r.error.as_deref()) {
+                        (Some(res), _) if !res.trim().is_empty() => res.trim().to_string(),
+                        (_, Some(e)) if !e.trim().is_empty() => format!("failed: {}", e.trim()),
+                        _ => format!("({} — no result captured yet)", r.phase),
+                    };
+                    let rendered = crate::md::render_stdout_within(
+                        &msg,
+                        crate::worker::pane_content_cols(run_id),
+                    );
+                    let mut lines = rendered.split('\n');
+                    match lines.next() {
+                        Some(first) => {
+                            println!(
+                                "{}",
+                                crate::worker::pane_row(run_id, &format!("·result {first}"))
+                            );
+                            for line in lines {
+                                println!("{}", crate::worker::pane_row(run_id, line));
+                            }
+                        }
+                        None => println!(
+                            "{}",
+                            crate::worker::pane_row(run_id, "·result (empty result)")
+                        ),
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Durable-only backfill for a SUBWORKER (or another session's run) not present
+/// in this session's `worker_jobs`: print the replay header + the coordinator's
+/// task (its "input") from the shared store. No transcript rows are available
+/// off-process, so this is header + prompt only; the final result is appended by
+/// `print_attached_result`'s own durable fallback.
+fn backfill_attached_durable(run_id: &str, session: &Session) {
+    let Some(store) = &session.coordinator_store else {
+        return;
+    };
+    let Ok(rows) = store.load_all() else {
+        return;
+    };
+    let Some(r) = rows.iter().find(|r| r.run_id == *run_id) else {
+        return;
+    };
+    let short = crate::batch::short_id(run_id);
+    println!("{}", crate::worker::pane_replay_header(&short));
+    println!("{}", crate::worker::pane_input_row(run_id, &r.task));
 }
 
 /// `:detach` — stop watching the attached coordinator. It keeps running in the
@@ -4940,17 +5113,18 @@ fn cycle_worker(session: &mut Session) -> bool {
     // so `.rev()` puts the most recently spawned coordinator at slot 1 — the
     // first Shift-Tab from the interactive prompt lands on the newest worker and
     // each further press walks back toward the oldest, then wraps to interactive.
-    let workers: Vec<(String, bool, String)> = session
-        .worker_jobs
-        .lock()
-        .unwrap()
-        .iter()
-        .rev()
-        .map(|w| {
+    // TASK-315: the rotation walks the full forest — this session's in-mem
+    // coordinators (newest-first) AND their durable subworkers (each right after
+    // its parent, pre-order) — so Shift-Tab cycles into subworkers too. Attach
+    // resolves a subworker id via the store fallback in `attach_worker` and
+    // reviews it durably (`backfill_attached_durable` + `print_attached_result`).
+    let workers: Vec<(String, bool, String)> = collect_worker_rows(session)
+        .into_iter()
+        .map(|r| {
             (
-                w.id.clone(),
-                matches!(w.status().as_str(), "done" | "failed"),
-                w.task.clone(),
+                r.id.clone(),
+                matches!(r.status.as_str(), "done" | "failed"),
+                r.task,
             )
         })
         .collect();
