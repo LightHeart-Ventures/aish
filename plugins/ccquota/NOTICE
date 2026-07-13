@@ -1,0 +1,21 @@
+ccquota — Claude Code quota badge, vendored bits
+================================================
+
+The file `cclimits.sh` in this directory is derived from:
+
+  dandaka/ccquota — https://github.com/dandaka/ccquota
+  Copyright (c) dandaka and ccquota contributors
+  Licensed under the MIT License.
+
+It is vendored (not fetched at runtime) so the aish plugin is self-contained
+and reproducible. Local modifications made for the aish integration (SPR-073)
+are marked inline in `cclimits.sh` with `TASK-319` / "Local modifications"
+comments, chiefly:
+
+  * compute_pace() made portable across GNU coreutils `date` (Linux) and BSD
+    `date` (macOS); upstream used BSD-only `date -j` flags.
+  * Graceful degradation: pace is omitted rather than aborting when a reset
+    timestamp cannot be parsed.
+
+The MIT license permits this use with attribution. This NOTICE preserves that
+attribution. No warranty is expressed or implied.

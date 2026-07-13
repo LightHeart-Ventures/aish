@@ -79,20 +79,23 @@ fn effective_status_msg(cached: &str) -> String {
     }
 }
 
-/// Paint the operator's mid-turn type-ahead line into the footer's message row.
-/// `styled_prompt` is emitted verbatim (already colour-styled) before `text`; an
-/// empty `text` clears the override so the normal status message returns. No
-/// visible effect when no footer region is installed (short terminal / non-tty),
-/// but the override slot is still updated. Safe to call from the keywatch reader
-/// thread — it locks stdout + a mutex exactly like the idle heartbeat repaint.
+/// Paint the operator's mid-turn prompt + type-ahead line into the footer's
+/// message row. `styled_prompt` is emitted verbatim (already colour-styled)
+/// before `text`. An empty `text` now means "nothing typed yet" and surfaces the
+/// BARE PROMPT sigil (so the operator can SEE there is a prompt to type into
+/// during thinking / tool-calls) rather than removing the override — the normal
+/// status message is restored only on turn teardown via [`clear_midturn_input`].
+/// No visible effect when no footer region is installed (short terminal /
+/// non-tty), but the override slot is still updated. Safe to call from the
+/// keywatch reader thread — it locks stdout + a mutex exactly like the idle
+/// heartbeat repaint.
 pub fn set_midturn_input(styled_prompt: &str, text: &str) {
     {
         let mut slot = MIDTURN_INPUT.lock().unwrap();
-        *slot = if text.is_empty() {
-            None
-        } else {
-            Some(format!("{styled_prompt}{text}"))
-        };
+        // Always surface at least the bare prompt affordance during a turn; append
+        // the live line as the operator types. `clear_midturn_input` (turn
+        // teardown) is what restores the cached status message.
+        *slot = Some(format!("{styled_prompt}{text}"));
     }
     paint_cached_footer(false);
 }
@@ -109,6 +112,39 @@ pub fn clear_midturn_input() {
         *slot = None;
     }
     paint_cached_footer(false);
+}
+
+/// Build the escape sequence that renders the mid-turn prompt affordance
+/// INLINE, for terminals with no pinned footer message row (height <
+/// [`MIN_FOOTER_ROWS`], or a non-footer tty). Returns
+/// `\r\x1b[2K{styled_prompt}{text}`: carriage-return to column 0, erase the
+/// whole line, then paint the (already colour-styled) bare prompt sigil plus any
+/// typed text. Pure builder so it can be unit-tested without a real terminal.
+pub fn midturn_inline_seq(styled_prompt: &str, text: &str) -> String {
+    format!("\r\x1b[2K{styled_prompt}{text}")
+}
+
+/// Paint the mid-turn prompt affordance INLINE on the current cursor row (for
+/// short / non-footer terminals). Writes straight to stdout from the keywatch
+/// reader thread. This is the Gate #1 path behind `AISH_MIDTURN_INLINE`: it is
+/// best-effort (it can race the engine's output writes on the main thread), so
+/// the footer path ([`set_midturn_input`]) is always preferred when a footer
+/// region exists. No MIDTURN_INPUT slot is touched — the affordance is drawn,
+/// not cached, since there is no footer to repaint it into.
+pub fn set_midturn_inline(styled_prompt: &str, text: &str) {
+    let mut out = std::io::stdout();
+    let _ = write!(out, "{}", midturn_inline_seq(styled_prompt, text));
+    let _ = out.flush();
+    note_footer_activity();
+}
+
+/// Erase an inline mid-turn prompt affordance at turn teardown (carriage-return
+/// + erase-line). Pairs with [`set_midturn_inline`]; a no-op-looking write that
+/// keeps the flag-gated inline path from leaving a stale `❯` on the row.
+pub fn clear_midturn_inline() {
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\r\x1b[2K");
+    let _ = out.flush();
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +177,32 @@ static LAST_FOOTER_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Ensures the heartbeat thread is spawned at most once per process.
 static HEARTBEAT_SPAWNED: AtomicBool = AtomicBool::new(false);
+
+/// Terminal size `(rows, cols)` at the last footer paint, packed as
+/// `(rows << 16) | cols`. The heartbeat compares the LIVE size against this and
+/// repaints IMMEDIATELY on a change — bypassing the [`HEARTBEAT_IDLE`] gate — so
+/// a window resize refreshes the footer within one heartbeat tick (~500ms)
+/// instead of waiting out the full idle interval or the next REPL idle pass.
+/// `0` = never painted. Updated inside [`paint_cached_footer`] so every paint
+/// path (idle self-heal, mid-turn override, resize) keeps it current.
+static LAST_PAINTED_SIZE: AtomicU64 = AtomicU64::new(0);
+
+/// Pack `(rows, cols)` into a single u64 for atomic storage/compare.
+fn pack_size(rows: u16, cols: u16) -> u64 {
+    ((rows as u64) << 16) | cols as u64
+}
+
+/// True when the live terminal size differs from the last painted size (i.e. the
+/// window was resized since the last footer paint). Off-tty / unknown size ⇒
+/// `false` (nothing to refresh). Cheap: one TIOCGWINSZ ioctl + an atomic load.
+fn size_changed_since_paint() -> bool {
+    match term_size() {
+        Some((rows, cols)) => {
+            pack_size(rows, cols) != LAST_PAINTED_SIZE.load(Ordering::Relaxed)
+        }
+        None => false,
+    }
+}
 
 /// True while the in-progress input line is non-empty. The heartbeat NEVER
 /// repaints while this is set, so a partially-typed command can never be
@@ -215,7 +277,11 @@ pub fn spawn_footer_heartbeat() {
                 }
                 let idle =
                     heartbeat_now_ms().saturating_sub(LAST_FOOTER_ACTIVITY_MS.load(Ordering::Relaxed));
-                if idle >= idle_ms {
+                // Repaint when idle-timed-out OR the terminal was resized since
+                // the last paint. The resize case bypasses the idle gate so the
+                // footer tracks the new canvas size within one tick rather than
+                // waiting out HEARTBEAT_IDLE — "update accordingly on resize".
+                if idle >= idle_ms || size_changed_since_paint() {
                     // Cursor-safe repaint (no body-home): DECSC/DECRC restores
                     // the input cursor exactly where the user left it.
                     paint_cached_footer(false);
@@ -241,6 +307,9 @@ fn paint_cached_footer(home_body: bool) {
     if rows < MIN_FOOTER_ROWS {
         return;
     }
+    // Record the size we're painting at so the heartbeat can detect a later
+    // resize and refresh the footer to the new canvas dimensions on sight.
+    LAST_PAINTED_SIZE.store(pack_size(rows, cols), Ordering::Relaxed);
     let (msg, bar) = LAST_FOOTER.lock().map(|l| l.clone()).unwrap_or_default();
     // Mid-turn type-ahead, when active, takes over the message row.
     let msg = effective_status_msg(&msg);
@@ -509,6 +578,20 @@ impl Terminal {
         if let Ok(mut last) = LAST_FOOTER.lock() {
             *last = (status_msg.to_string(), statusline.to_string());
         }
+        // Re-sync cached dimensions from the LIVE terminal size before painting
+        // so a resize that lands DURING a turn (when the main loop hasn't yet
+        // drained the SIGWINCH flag) is reflected on the very next footer draw:
+        // footer_seq re-asserts the scroll region at these dims, so the bottom
+        // margin tracks the new height without waiting for the idle pass.
+        if let Some((rows, cols)) = term_size() {
+            self.rows = rows;
+            self.cols = cols;
+        }
+        // A resize below the footer threshold mid-turn: skip the paint (a footer
+        // no longer fits) and let the idle handle_resize tear the region down.
+        if self.rows < MIN_FOOTER_ROWS {
+            return;
+        }
         let sep = separator_line(self.cols, self.utf8, crate::style::colors_enabled());
         let mut buf = String::new();
         // footer_seq re-asserts the scroll region internally, INSIDE its
@@ -570,6 +653,41 @@ pub fn restore_after_clear() {
     paint_cached_footer(true);
 }
 
+/// Re-sync the footer after an OS suspend/resume — the SIGCONT wake path.
+///
+/// A laptop that slept and woke (or a `fg` after the process was stopped) is
+/// continued with SIGCONT, but nothing else tells aish the world moved: the
+/// pinned footer may have scrolled out of view or lost its DECSTBM scroll
+/// region while parked, and the monotonic idle clock ([`heartbeat_now_ms`],
+/// backed by CLOCK_MONOTONIC) does NOT advance across a suspend, so the
+/// heartbeat under-counts the true idle gap and may not self-heal for a while.
+///
+/// On wake we repaint the cached footer immediately — `footer_seq` re-asserts
+/// the scroll region (healing a dropped margin) and its DECSC/DECRC wrapper
+/// preserves the input cursor, so an in-progress prompt line is untouched — and
+/// reset the idle timer so the heartbeat cadence restarts cleanly from now.
+///
+/// No-op-but-still-reset-the-timer when no footer region is installed, a worker
+/// alt-screen view owns the terminal, or the user is mid-editing a non-empty
+/// line: in those cases an immediate repaint would either do nothing useful or
+/// risk clobbering the visible cursor, so the heal is deferred to the heartbeat
+/// / the main loop's next idle pass while the timer is still re-armed.
+pub fn resync_after_wake() {
+    if !ACTIVE.load(Ordering::Relaxed)
+        || ATTACH_ACTIVE.load(Ordering::Relaxed)
+        || INPUT_DIRTY.load(Ordering::Relaxed)
+    {
+        // Re-arm the idle timer so the post-wake heartbeat waits a clean full
+        // interval rather than firing off a frozen (pre-suspend) clock reading.
+        note_footer_activity();
+        return;
+    }
+    // Cursor-safe repaint: re-asserts DECSTBM and restores the input cursor.
+    // paint_cached_footer records footer activity, resetting the idle timer.
+    paint_cached_footer(false);
+}
+
+/// Suspend the bottom-anchored footer scroll region for the duration of a
 /// Suspend the bottom-anchored footer scroll region for the duration of a
 /// foreground child that inherits the terminal (`sudo`, `vim`, `less`, …).
 /// Resets DECSTBM to the full screen and erases the three footer rows so the
@@ -605,12 +723,46 @@ pub fn suspend_footer_region() -> bool {
     true
 }
 
+/// Build the cursor/region choreography that [`resume_footer_region`] writes to
+/// reclaim the bottom [`FOOTER_ROWS`] rows for the footer after a full-screen
+/// foreground child exits: re-assert DECSTBM (which homes the cursor to the
+/// top-left as a side effect) then drop the cursor into the last body row so the
+/// next prompt grows up from just above the footer. Kept pure (no I/O, no shared
+/// state) so the sequence is unit-testable byte-for-byte.
+///
+/// KNOWN LIMITATION — output-clobber on resume (root cause of the "`ls -al`
+/// loses its last few lines" report): while the child ran, the footer region
+/// was suspended to the FULL screen (see [`suspend_footer_region`]), so any
+/// output that scrolled into the bottom `FOOTER_ROWS` rows now lives there. This
+/// resume paints the footer straight over those rows, hiding the command's last
+/// lines from the viewport (they survive in native scrollback — aish never
+/// emits ESC[3J). It is NOT the off-by-one once suspected in `scroll_region_seq`:
+/// that math is correct (24 → `ESC[1;21r`, and 21 body + 3 footer = 24, pinned
+/// by `scroll_region_reserves_three_bottom_rows`).
+///
+/// The correct fix is to scroll the body UP by the overflow
+/// (`cursor_row - body_bottom`, clamped to `0..=FOOTER_ROWS`) BEFORE reclaiming
+/// the rows — but the overflow is only knowable from a DSR (ESC[6n)
+/// cursor-position query, which must run with a bounded, non-blocking read and a
+/// total fallback to this behavior so a non-conforming terminal can never hang
+/// the shell. An UNCONDITIONAL scroll-up is NOT viable: the prompt is
+/// bottom-anchored, so nearly every command (even `echo hi`) leaves the cursor
+/// in the footer zone, and a fixed scroll-up would jerk the screen up on every
+/// command and after every alt-screen app. Deferred until it can be verified
+/// against a real TTY.
+pub fn resume_region_seq(rows: u16) -> String {
+    let body_bottom = rows.saturating_sub(FOOTER_ROWS).max(1);
+    format!("{}\x1b[{body_bottom};1H", scroll_region_seq(rows))
+}
+
 /// Re-establish the footer scroll region and repaint the cached footer after a
 /// foreground child that inherited the full terminal exits. Pairs with
 /// [`suspend_footer_region`]. Homes the cursor into the last body row so the
 /// next prompt grows up from just above the footer (mirrors
 /// [`Terminal::init_scroll_region`]). No-op when the terminal is now too short
-/// to host the footer (e.g. it was resized smaller while the child ran).
+/// to host the footer (e.g. it was resized smaller while the child ran). See
+/// [`resume_region_seq`] for the choreography and the known output-clobber
+/// limitation.
 pub fn resume_footer_region() {
     let Some((rows, _cols)) = term_size() else {
         return;
@@ -618,16 +770,12 @@ pub fn resume_footer_region() {
     if rows < MIN_FOOTER_ROWS {
         return;
     }
-    // Re-assert DECSTBM (homes the cursor to top-left as a side effect), then
-    // drop the cursor into the last body row so subsequent output stays above
-    // the footer instead of stranding at the top of the screen.
-    let body_bottom = rows.saturating_sub(FOOTER_ROWS).max(1);
-    // Re-suppress alternate-scroll alongside re-asserting the region.
-    let seq = format!(
-        "{}{}\x1b[{body_bottom};1H",
-        scroll_region_seq(rows),
-        suppress_alt_scroll_seq(),
-    );
+    // Re-assert the region + home into the last body row, and re-suppress
+    // alternate-scroll alongside it (cursor-neutral: `suppress_alt_scroll_seq`
+    // only toggles private mode 1007, so its position relative to the home move
+    // is immaterial; it also returns "" after the first suppression so the saved
+    // original setting is preserved).
+    let seq = format!("{}{}", resume_region_seq(rows), suppress_alt_scroll_seq());
     let mut out = std::io::stdout();
     let _ = write!(out, "{seq}");
     let _ = out.flush();
@@ -804,6 +952,17 @@ fn utf8_locale() -> bool {
 mod tests {
     use super::*;
 
+    /// Serializes every test that mutates a process-global footer-state
+    /// singleton — `MIDTURN_INPUT`, `READING_LINE`, `INPUT_DIRTY`. Cargo runs
+    /// unit tests multi-threaded in ONE binary, so these tests otherwise race on
+    /// the shared statics: one test's `clear_midturn_input()` /
+    /// `set_reading_line(false)` can flip the slot/flag between a sibling's set
+    /// and its assertion (observed: `coordinating…` instead of the bare prompt;
+    /// `READING_LINE` load failing right after a `set_reading_line(true)`). Every
+    /// footer-global test locks this first. Poison-tolerant: a panic while held
+    /// must not cascade-fail the siblings.
+    static FOOTER_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn alt_scroll_suppress_saves_once_then_restores() {
         // Deterministic starting point: not yet suppressed.
@@ -868,6 +1027,21 @@ mod tests {
         // Degenerate tiny sizes still emit a valid (row 1) region.
         assert_eq!(scroll_region_seq(3), "\x1b[1;1r");
         assert_eq!(scroll_region_seq(1), "\x1b[1;1r");
+    }
+
+    #[test]
+    fn resume_region_reasserts_then_homes_last_body_row() {
+        // 24-row terminal: re-assert region 1..=21 then home into row 21 (the
+        // last body row) so the next prompt grows up from just above the footer.
+        assert_eq!(resume_region_seq(24), "\x1b[1;21r\x1b[21;1H");
+    }
+
+    #[test]
+    fn resume_region_clamps_tiny_terminals() {
+        // Degenerate heights collapse to a row-1 region AND a row-1 home rather
+        // than emitting an invalid ESC[0;1H.
+        assert_eq!(resume_region_seq(3), "\x1b[1;1r\x1b[1;1H");
+        assert_eq!(resume_region_seq(1), "\x1b[1;1r\x1b[1;1H");
     }
 
     #[test]
@@ -952,7 +1126,26 @@ mod tests {
     }
 
     #[test]
+    fn resync_after_wake_resets_idle_timer_when_inactive() {
+        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // No footer region installed in the test harness (ACTIVE stays false),
+        // so resync_after_wake takes the no-op-but-rearm branch: it must still
+        // reset the idle timer so a post-suspend heartbeat waits a clean
+        // interval instead of firing off the frozen pre-suspend clock reading.
+        assert!(!ACTIVE.load(Ordering::Relaxed));
+        LAST_FOOTER_ACTIVITY_MS.store(0, Ordering::Relaxed);
+        resync_after_wake();
+        let idle =
+            heartbeat_now_ms().saturating_sub(LAST_FOOTER_ACTIVITY_MS.load(Ordering::Relaxed));
+        assert!(
+            idle < HEARTBEAT_IDLE.as_millis() as u64,
+            "wake re-sync must re-arm the idle timer, got {idle}ms"
+        );
+    }
+
+    #[test]
     fn set_reading_line_toggles_and_arms_timer() {
+        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Entering a read marks the idle-at-prompt window AND refreshes the
         // timer (so the first heartbeat waits a full interval at a new prompt).
         set_reading_line(true);
@@ -968,6 +1161,7 @@ mod tests {
 
     #[test]
     fn input_dirty_flag_round_trips_and_read_clears_it() {
+        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A non-empty in-progress line sets the dirty flag; the heartbeat reads
         // it and backs off (verified indirectly — the gate is a plain load).
         set_input_dirty(true);
@@ -977,6 +1171,65 @@ mod tests {
         set_reading_line(true);
         assert!(!INPUT_DIRTY.load(Ordering::Relaxed));
         set_reading_line(false);
+    }
+
+    #[test]
+    fn midturn_empty_text_surfaces_bare_prompt_then_clears() {
+        // Serialize against sibling tests that mutate footer-state globals.
+        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Turn-start priming: set_midturn_input with EMPTY text must surface the
+        // bare prompt affordance (so the operator SEES a prompt to type into
+        // during thinking / tool-calls), overriding the cached status message.
+        // Teardown (clear_midturn_input) must restore the cached status message.
+        // Locks in the ISS fix for "no visible prompt while the turn runs".
+        let prompt = "\x1b[2m❯\x1b[0m ";
+
+        // Baseline: no override → cached status shows through.
+        clear_midturn_input();
+        assert_eq!(effective_status_msg("coordinating…"), "coordinating…");
+
+        // Turn start, nothing typed yet → bare prompt is surfaced.
+        set_midturn_input(prompt, "");
+        assert_eq!(effective_status_msg("coordinating…"), prompt);
+
+        // Operator types → prompt + live line replaces the status row.
+        set_midturn_input(prompt, "ls -la");
+        assert_eq!(
+            effective_status_msg("coordinating…"),
+            format!("{prompt}ls -la")
+        );
+
+        // Turn teardown → cached status message restored.
+        clear_midturn_input();
+        assert_eq!(effective_status_msg("coordinating…"), "coordinating…");
+
+        // Idempotent: a second clear is a no-op (no panic, stays cleared).
+        clear_midturn_input();
+        assert_eq!(effective_status_msg("idle"), "idle");
+    }
+
+    #[test]
+    fn midturn_inline_seq_draws_bare_prompt_then_line() {
+        // Serialize against sibling tests that mutate footer-state globals
+        // (this test calls clear_midturn_input at the end).
+        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Gate #1 (short / non-footer terminals): the inline affordance must
+        // carriage-return to col 0, erase the row, then paint the prompt sigil.
+        let prompt = "\x1b[2m❯\x1b[0m ";
+
+        // Turn start, nothing typed → CR + erase-line + bare prompt.
+        assert_eq!(midturn_inline_seq(prompt, ""), format!("\r\x1b[2K{prompt}"));
+
+        // Operator types → prompt + live line on the same erased row.
+        assert_eq!(
+            midturn_inline_seq(prompt, "ls -la"),
+            format!("\r\x1b[2K{prompt}ls -la")
+        );
+
+        // The inline path never touches the footer's MIDTURN_INPUT slot, so the
+        // cached status message keeps showing through the footer effective view.
+        clear_midturn_input();
+        assert_eq!(effective_status_msg("coordinating…"), "coordinating…");
     }
 
     #[test]
@@ -1003,5 +1256,25 @@ mod tests {
             utf8: true,
         };
         assert!(!short.footer_enabled());
+    }
+
+    #[test]
+    fn pack_size_round_trips_and_discriminates() {
+        // Packing is injective over (rows, cols): distinct sizes → distinct keys.
+        assert_eq!(pack_size(24, 80), pack_size(24, 80));
+        assert_ne!(pack_size(24, 80), pack_size(50, 80)); // height changed
+        assert_ne!(pack_size(24, 80), pack_size(24, 120)); // width changed
+        assert_ne!(pack_size(24, 80), pack_size(80, 24)); // swapped ≠ same
+        // cols occupy the low 16 bits, rows the next 16 — no cross-talk.
+        assert_eq!(pack_size(1, 1), (1u64 << 16) | 1);
+        assert_eq!(pack_size(0, 0), 0); // matches "never painted" sentinel
+    }
+
+    #[test]
+    fn size_change_detection_flips_on_new_dims() {
+        // A stored size equal to the probe ⇒ unchanged; a different one ⇒ changed.
+        LAST_PAINTED_SIZE.store(pack_size(24, 80), Ordering::Relaxed);
+        assert_eq!(pack_size(24, 80), LAST_PAINTED_SIZE.load(Ordering::Relaxed));
+        assert_ne!(pack_size(30, 100), LAST_PAINTED_SIZE.load(Ordering::Relaxed));
     }
 }

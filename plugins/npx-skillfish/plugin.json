@@ -1,0 +1,15 @@
+{
+  "id": "npx-skillfish",
+  "name": "npx skillfish (skill.fish)",
+  "version": "1.0.0",
+  "description": "Skill source that wraps the `npx skillfish` CLI (skill.fish ecosystem) so `:skill search` can discover community skills. This provides semantic search over the skillfish catalog.",
+  "provides": {
+    "skill_source": {
+      "id": "npx-skillfish",
+      "priority": 85,
+      "search": "search.sh",
+      "executable": true,
+      "handles": ["skillfish:*"]
+    }
+  }
+}

@@ -1,0 +1,38 @@
+# fly.toml — aish-webhook-broker (SPR-059 Phase 4.7)
+# Build context is this crate dir; the Dockerfile here is self-contained
+# (standalone workspace, own Cargo.lock) so the remote builder never pulls the
+# parent aish build graph. Deploy:  flyctl deploy --config fly.toml
+app = "aish-webhook-broker"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  BROKER_LISTEN = "0.0.0.0:8080"
+  BROKER_DB = "/var/lib/aish-broker.db"
+  BROKER_LOG_LEVEL = "info"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Keep one machine warm so persistent client WS connections are not culled.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 200
+    soft_limit = 150
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
+    method = "get"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

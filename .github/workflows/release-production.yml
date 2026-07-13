@@ -1,0 +1,240 @@
+name: Release (Production)
+
+# Unified production release workflow supporting both legacy tag-push and modern dispatch triggers.
+#
+# TRIGGER PATHS:
+#
+# 1. TAG PUSH (legacy, still active):
+#    `git tag v0.23.1 && git push origin v0.23.1`
+#    → Fires on `push: tags: v*`, auto-derives version from tag name, verifies match vs Cargo.toml.
+#
+# 2. WORKFLOW DISPATCH (modern, preferred):
+#    GitHub UI: Actions > Release (Production) > Run workflow > enter version + notes
+#    → Creates the tag on origin/main, builds release binaries, publishes with assets.
+#
+# Both paths use identical build + publish logic. Choose dispatch for clarity (single UI entry point)
+# or tag-push for CLI tooling (direct git/tag integration). Both are safe; dispatch is recommended
+# for maintainers (it's self-documenting and prevents tag/Cargo.toml drift).
+#
+# Platform support: aish is a Unix-native shell targeting macOS (x86_64 + arm64) and Linux (x86_64) only.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semantic version to release (e.g., 0.23.1 — the 'v' prefix is added automatically; ignored on tag push)"
+        required: false
+        type: string
+      notes:
+        description: "Optional release notes (hand-written; auto-generated if empty)"
+        required: false
+        type: string
+
+# Need write access to create the release + upload assets.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-production-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-version:
+    name: verify tag matches Cargo.toml version
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || '' }}
+
+      - name: Determine version (tag-push vs dispatch)
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Tag push: extract version from GITHUB_REF_NAME (e.g., "v0.23.1" → "0.23.1")
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+          else
+            # Dispatch: use explicit input (or fall back to "unset" error)
+            version="${{ inputs.version }}"
+            if [ -z "$version" ]; then
+              echo "::error::Dispatch trigger requires the 'version' input (e.g., 0.23.1). Supplied: empty."
+              exit 1
+            fi
+            tag="v${version}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $version (tag: $tag)"
+        shell: bash
+
+      - name: Verify tag exists or prepare to create it
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          if ! git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "::notice::Tag $tag does not exist yet. Will create during release if permitted."
+          else
+            echo "::notice::Tag $tag already exists."
+          fi
+        shell: bash
+
+      - name: Assert tag matches Cargo.toml version
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          version="${{ steps.version.outputs.version }}"
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          echo "tag version:        $version"
+          echo "Cargo.toml version: $cargo_version"
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::Release version $version does not match Cargo.toml version $cargo_version. Bump Cargo.toml (and Cargo.lock) before releasing so the binary reports the right version."
+            exit 1
+          fi
+        shell: bash
+
+      - name: Assert no published release already exists for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft 2>/dev/null || true)"
+          if [ -z "$json" ]; then
+            echo "No existing release for $tag — this workflow will create and publish it. OK."
+            exit 0
+          fi
+          is_draft="$(echo "$json" | jq -r '.isDraft')"
+          if [ "$is_draft" = "true" ]; then
+            echo "A DRAFT release exists for $tag — drafts are mutable, so the publish job will upload assets and publish it. OK."
+            exit 0
+          fi
+          echo "::error::A PUBLISHED release already exists for $tag. GitHub immutable releases cannot receive assets after publishing, so this workflow cannot attach the binaries that ':update' needs — it would fail with 'target_commitish cannot be changed when release is immutable'. Do NOT pre-publish the release: let this workflow create it, or pre-create it as a DRAFT. To recover this tag: delete the release AND the tag, then re-push the tag so this workflow recreates it with assets (or bump the version)."
+          exit 1
+        shell: bash
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: verify-version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: aish-x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: aish-aarch64-apple-darwin
+          - os: blacksmith-4vcpu-ubuntu-2404
+            target: x86_64-unknown-linux-gnu
+            asset: aish-x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # On tag push: checkout the tag. On dispatch: checkout main (tag doesn't exist yet).
+          ref: ${{ github.event_name == 'push' && needs.verify-version.outputs.tag || 'main' }}
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+        shell: bash
+
+      - name: Cache cargo + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --features local --target ${{ matrix.target }}
+        shell: bash
+
+      - name: Package binary + checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/aish" "dist/${{ matrix.asset }}"
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+          cat "${{ matrix.asset }}.sha256"
+        shell: bash
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}-prod
+          path: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [verify-version, build]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name 'aish-*' ! -name '*-prod' \) -exec cp {} dist/ \;
+          echo "Release assets:"
+          ls -l dist
+          echo
+          echo "Aggregated checksums:"
+          cat dist/*.sha256
+
+      - name: Aggregate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.verify-version.outputs.tag }}"
+          notes="${{ inputs.notes }}"
+          if [ -z "$notes" ]; then
+            notes="Production release"
+          fi
+          
+          # Use commit SHA as target to allow GitHub to create the tag
+          target_ref="${{ github.sha }}"
+          
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$target_ref" \
+            --latest \
+            --title "aish $tag" \
+            --notes "$notes" \
+            dist/aish-* dist/SHA256SUMS
+        shell: bash

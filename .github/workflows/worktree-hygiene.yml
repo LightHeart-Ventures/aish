@@ -1,0 +1,51 @@
+name: Worktree Hygiene
+
+# SPR-064 — Collision Prevention & Auto-Cleanup.
+#  - fresh-branch-gate (TASK-326): fail PRs/pushes on stale release/* branches.
+#  - audit (TASK-328/329): scheduled read-only audit + dry-run cleanup, uploads
+#    the .worktree-audit.csv observability artifact. (Real disk reclamation runs
+#    on the dev host via cron/systemd — see DEVELOPMENT.md — since GitHub runners
+#    have no access to the developer's worktree pool.)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * *'   # nightly, matches worktreeRetention.autoCleanupSchedule
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fresh-branch-gate:
+    name: fresh-branch gate
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Validate branch freshness
+        run: bash scripts/check-branch-freshness.sh "${{ github.head_ref || github.ref_name }}"
+
+  audit:
+    name: worktree audit (observability)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Audit worktrees
+        run: bash scripts/audit-worktrees.sh
+      - name: Cleanup dry-run
+        run: bash scripts/cleanup-worktrees.sh
+      - name: Upload audit CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: worktree-audit
+          path: .worktree-audit.csv
+          if-no-files-found: warn

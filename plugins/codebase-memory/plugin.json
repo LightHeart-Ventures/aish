@@ -1,0 +1,28 @@
+{
+  "id": "codebase-memory",
+  "name": "Codebase Memory — code intelligence",
+  "version": "1.0.0",
+  "description": "Enrolls DeusData/codebase-memory-mcp (MIT) as an aish MCP server, exposing 14 structural code-intelligence tools (get_architecture, search_graph, query_graph, trace_path, get_code_snippet, detect_changes, manage_adr, index_repository, …). aish auto-merges this plugin's .mcp.json into the MCP client set, so the server connects with no manual edit to ~/.aish/.mcp.json. Ships a code-intelligence skill and an auto-index-on-repo-open gate.",
+  "author": "LightHeart Ventures",
+  "license": "MIT (bundled server: DeusData/codebase-memory-mcp) / Apache-2.0 (plugin wrapper)",
+  "homepage": "https://github.com/DeusData/codebase-memory-mcp",
+  "mcp": {
+    "server": "codebase-memory",
+    "binary": "codebase-memory-mcp",
+    "transport": "stdio",
+    "source": ".mcp.json",
+    "note": "aish merges every plugin's <plugin>/.mcp.json into the MCP client set (first-one-wins precedence: project config > user config > plugin, plugins in id order). No mcpServers entry in ~/.aish/.mcp.json is required for the server to connect once this plugin is installed."
+  },
+  "config": {
+    "autoIndex": {
+      "default": true,
+      "description": "Warm the repo's structural graph once per repo-open (bounded, backgrounded) so code-intelligence queries are ready before the first coordinator turn.",
+      "envVar": "AISH_CODEBASE_AUTO_INDEX",
+      "envDisables": ["0", "false", "off", "no"],
+      "configKey": "codebaseMemory.autoIndex",
+      "configFile": "~/.aish/.mcp.json",
+      "resolutionOrder": "env override (AISH_CODEBASE_AUTO_INDEX) -> codebaseMemory.autoIndex bool in ~/.aish/.mcp.json -> ON by default",
+      "enrollmentCaveat": "The repo-open auto-index handoff also checks is_enrolled() against ~/.aish/.mcp.json (mcpServers.codebase-memory). Serving the tools via this plugin makes them AVAILABLE, but auto-index stays dormant unless that enrollment entry is present in ~/.aish/.mcp.json (e.g. via ':codebase install') OR a newer aish teaches the probe to consult plugin .mcp.json. Manual `index_repository` calls work either way. See docs/plugins/codebase-memory-plugin.md."
+    }
+  }
+}

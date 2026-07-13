@@ -28,6 +28,22 @@ type SpinState = Arc<Mutex<Spin>>;
 // answer before the hard limit is ever reached.
 const MAX_ITERATIONS: usize = 50;
 
+/// Operator override for the serial-chain yield depth, read from
+/// `AISH_SERIAL_CHAIN_YIELD_DEPTH`. Defaults to
+/// [`crate::loopguard::SERIAL_CHAIN_YIELD_DEPTH`]; a parsed value is honoured
+/// only inside `[1, 1000]`, otherwise the default stands (a typo can never
+/// uncap or zero-cap the guard). Lets a genuinely-serial workload — a long
+/// chain of dependent calls that cannot be batched — raise the ceiling instead
+/// of false-tripping the yield and burning the coordinator's auto-recovery
+/// budget. Same forgiving parse/clamp discipline as `AISH_COORDINATOR_MAX_ROUNDS`.
+fn serial_chain_yield_depth() -> usize {
+    std::env::var("AISH_SERIAL_CHAIN_YIELD_DEPTH")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| (1..=1000).contains(&n))
+        .unwrap_or(crate::loopguard::SERIAL_CHAIN_YIELD_DEPTH)
+}
+
 /// One full agentic turn: user input → (model ⇄ tools)* → final text.
 /// Frontend-agnostic: confirmation is a callback, output goes through eprintln
 /// only for transient activity lines.
@@ -83,6 +99,89 @@ pub async fn run_turn(
     result
 }
 
+/// TASK-407 (SPR-071): repo-open auto-index handoff. When aish enters any repo
+/// where the `codebase-memory` server is enrolled AND connected, warm its
+/// structural index ONCE per repo-open so the graph is ready before the first
+/// coordinator query. Bounded handoff: the index tool kicks a background build
+/// and returns fast, and the call is wrapped in a short timeout so a large repo
+/// can never hang the prompt. Cheap to call every turn — the dedup set
+/// short-circuits after the first fire and the only work on a miss is one
+/// `.mcp.json` read. The `auto_index` config gate (env override ->
+/// `.mcp.json` -> default-on) honours opt-out.
+async fn maybe_auto_index_repo(session: &mut Session) {
+    use crate::codebase_memory as cbm;
+    // Repo-open marker: check canonical cwd as the stable dedup key. No need
+    // for external markers — if the server is connected, we warm the index.
+    // Stable dedup key: the canonical repo root (falls back to cwd as-is).
+    let repo_root = std::fs::canonicalize(&session.cwd).unwrap_or_else(|_| session.cwd.clone());
+    let already = session.codebase_indexed.contains(&repo_root);
+
+    // Enrolled? (registered in `~/.aish/.mcp.json`). On absence/parse-failure,
+    // treat the config as an empty object -> `is_enrolled` returns false.
+    let root = std::fs::read_to_string(cbm::aish_home().join(".mcp.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let enrolled = cbm::is_enrolled(&root, cbm::SERVER_NAME);
+    // Connected? The server actually handshook this session (binary present +
+    // tools live) -- not merely declared on disk.
+    let connected = session
+        .mcp
+        .server_names()
+        .iter()
+        .any(|n| n == cbm::SERVER_NAME);
+    // Config gate: env override (`AISH_CODEBASE_AUTO_INDEX`) -> `.mcp.json` -> on.
+    let env = session
+        .env
+        .iter()
+        .find(|(k, _)| k == cbm::AUTO_INDEX_ENV)
+        .map(|(_, v)| v.clone());
+    let gate_on = cbm::auto_index_enabled(&root, env.as_deref());
+    if !cbm::should_auto_index(enrolled, connected, gate_on, already) {
+        return;
+    }
+    // Dedup: mark this repo root warmed BEFORE the (bounded) handoff so a slow or
+    // timing-out index can't double-fire on the next turn.
+    session.codebase_indexed.insert(repo_root.clone());
+
+    let qualified = cbm::index_tool_qualified();
+    let args = cbm::index_args(&repo_root);
+    // Bounded handoff: the index tool kicks a background build and returns fast;
+    // the timeout guarantees we never block the prompt on a large repo.
+    const AUTO_INDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    // Best-effort diagnostics: handoff warnings are appended to
+    // `~/.aish/codebase-memory.log` and only echoed to stderr when
+    // `AISH_CODEBASE_DEBUG` is truthy, so the normal TUI/coordinator stream stays
+    // clean (this is a non-fatal background warm, not an actionable error).
+    let debug_echo = cbm::debug_echo_enabled(
+        session
+            .env
+            .iter()
+            .find(|(k, _)| k == cbm::DEBUG_ENV)
+            .map(|(_, v)| v.as_str()),
+    );
+    match tokio::time::timeout(AUTO_INDEX_TIMEOUT, session.mcp.call(&qualified, &args)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            let msg = format!("repo-open auto-index handoff failed: {e}");
+            cbm::log_handoff_event(&msg);
+            if debug_echo {
+                eprintln!("[codebase-memory] {msg}");
+            }
+        }
+        Err(_) => {
+            let msg = format!(
+                "repo-open auto-index handoff timed out after {}s (index continues server-side)",
+                AUTO_INDEX_TIMEOUT.as_secs()
+            );
+            cbm::log_handoff_event(&msg);
+            if debug_echo {
+                eprintln!("[codebase-memory] {msg}");
+            }
+        }
+    }
+}
+
 /// The agentic turn body. Wrapped by [`run_turn`], which fires the
 /// `TurnEnd`/`TurnEndFailure` observe hooks around it.
 async fn run_turn_inner(
@@ -131,6 +230,8 @@ async fn run_turn_inner(
     // has grown past the window threshold — offloading the oldest slice to the
     // SQLite memories table and replacing it with a short in-context summary.
     maybe_compact(backend, session);
+    // TASK-407: repo-open auto-index handoff (dedup'd, bounded, opt-out-aware).
+    maybe_auto_index_repo(session).await;
     // Skill-awareness (crate::skill_match): score THIS turn's request against the
     // installed local skill catalog and, when one clearly fits, fold a short note
     // pointing at its SKILL.md into the turn input. Matched on the raw request
@@ -258,7 +359,8 @@ async fn run_turn_inner(
     // even when the calls differ (not a loop) and the budget is not yet spent.
     // Past `SERIAL_CHAIN_YIELD_DEPTH` the turn yields with a resumable banner so
     // the durable coordinator loop checkpoints and re-plans toward batching.
-    let mut serial_chain_guard = crate::loopguard::SerialChainGuard::default();
+    let mut serial_chain_guard =
+        crate::loopguard::SerialChainGuard::with_threshold(serial_chain_yield_depth());
     // TASK-357: cumulative per-turn tool-call budget. Counts EVERY tool call
     // executed across the whole turn (a batched round of N advances it by N),
     // orthogonal to the round/iteration budget and the serial-chain SHAPE guard.
@@ -301,6 +403,7 @@ async fn run_turn_inner(
         // and keeps the recent tail, so this is belt-and-suspenders).
         if !continuing {
             maybe_compact(backend, session);
+            maybe_auto_index_repo(session).await;
         }
         // Budget phase for THIS round: Normal → run freely; SoftWarn → fold a
         // "converge now" notice into the prompt; ForceSummarize → hand the model

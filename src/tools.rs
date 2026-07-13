@@ -1881,11 +1881,127 @@ event_id={id} + outcome=correct|wrong_turn.",
     }
 }
 
+/// Do two task strings describe "the same work" for the duplicate-offload guard?
+/// Pure / side-effect-free so it is directly unit-testable. A match on ANY of:
+///   * case- and whitespace-normalized exact equality;
+///   * long-substring containment (the shorter, ≥20 normalized chars, sits
+///     inside the longer — a re-offload that pasted extra context around the
+///     same ask);
+///   * Jaccard token-overlap ≥ 0.8.
+/// An empty (post-normalization) string never matches — nothing can duplicate
+/// "no task".
+fn tasks_are_duplicate(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    }
+    let (na, nb) = (norm(a), norm(b));
+    if na.is_empty() || nb.is_empty() {
+        return false;
+    }
+    if na == nb {
+        return true;
+    }
+    // Containment.
+    let (short, long) = if na.len() <= nb.len() { (&na, &nb) } else { (&nb, &na) };
+    if short.len() >= 20 && long.contains(short.as_str()) {
+        return true;
+    }
+    // Jaccard token overlap.
+    use std::collections::HashSet;
+    let ta: HashSet<&str> = na.split(' ').collect();
+    let tb: HashSet<&str> = nb.split(' ').collect();
+    let union = ta.union(&tb).count();
+    if union == 0 {
+        return false;
+    }
+    let inter = ta.intersection(&tb).count();
+    (inter as f64) / (union as f64) >= 0.8
+}
+
+/// Truncate a task string for a one-line duplicate-guard message.
+fn truncate_task(t: &str) -> String {
+    let one_line = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= 80 {
+        one_line
+    } else {
+        let head: String = one_line.chars().take(77).collect();
+        format!("{head}…")
+    }
+}
+
+/// Pre-flight for `run_in_background`: is there ALREADY in-flight background work
+/// whose task matches `task`? Scans (a) this session's live worker-job table and
+/// (b) the durable coordinator store across ALL sessions (a sibling process's
+/// in-flight run counts too). Non-terminal == still running. Returns a human
+/// describing string on the first hit, else None. Read-only.
+fn find_duplicate_running_work(session: &Session, task: &str) -> Option<String> {
+    // (a) Live worker jobs in THIS session — anything not terminal is in flight.
+    for w in session.worker_jobs.lock().unwrap().iter() {
+        let st = w.status();
+        if matches!(st.as_str(), "done" | "failed") {
+            continue;
+        }
+        if tasks_are_duplicate(&w.task, task) {
+            return Some(format!(
+                "a background coordinator (`{}`, {}) is already running matching work: \"{}\"",
+                crate::batch::short_id(&w.id),
+                st,
+                truncate_task(&w.task),
+            ));
+        }
+    }
+    // (b) Durable coordinator rows — every session's, deduped on run_id against
+    // the in-memory workers already checked above.
+    if let Some(store) = &session.coordinator_store {
+        if let Ok(rows) = store.load_all() {
+            let live: std::collections::HashSet<String> =
+                session.worker_jobs.lock().unwrap().iter().map(|w| w.id.clone()).collect();
+            for r in rows {
+                if live.contains(&r.run_id) {
+                    continue;
+                }
+                if matches!(r.phase.as_str(), "done" | "failed") {
+                    continue;
+                }
+                if tasks_are_duplicate(&r.task, task) {
+                    return Some(format!(
+                        "a durable coordinator run (`{}`, phase {}) is already running matching work: \"{}\"",
+                        crate::batch::short_id(&r.run_id),
+                        r.phase,
+                        truncate_task(&r.task),
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
     let task = call.args["task"].as_str().map(str::trim).unwrap_or("");
     if task.is_empty() {
         anyhow::bail!("`task` is required");
     }
+
+    // ── Duplicate-work guard (the :goal / offload dedupe ask) ─────────────────
+    // Before spending a credential or a host fork, check whether this exact work
+    // is ALREADY in flight — a live worker job in this session, or a non-terminal
+    // durable coordinator row in ANY session. On a hit, refuse and point at the
+    // existing run so the model steers it instead of spawning a twin. Bypass with
+    // `force: true` or AISH_BG_ALLOW_DUP=1 for a deliberate re-run.
+    let allow_dup = call.args["force"].as_bool().unwrap_or(false)
+        || std::env::var("AISH_BG_ALLOW_DUP")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    if !allow_dup {
+        if let Some(dup) = find_duplicate_running_work(session, task) {
+            anyhow::bail!(
+                "not offloading — {dup}. Check `background_status` for progress, `tell` it to \
+steer, or pass `force: true` (or set AISH_BG_ALLOW_DUP=1) to spawn a duplicate anyway."
+            );
+        }
+    }
+
     // A background coordinator (a re-exec'd headless aish) runs on the SAME
     // backend as this session (full parity), so it needs a credential for THAT
     // backend — both inherited by the child (env + ~/.aishrc exports, and for
@@ -1972,6 +2088,40 @@ short, natural sentence that you're working on it and the answer will appear her
     // process's spawn budget is exhausted. Only the worker-spawn path is gated —
     // the tool-less batch tier above returns before here, and a batch offload is
     // an API call, not a host fork, so it carries no fork-bomb risk.
+    // ── Host-brokered sibling spawn (PR #597 follow-up: the EMIT SITE) ────────
+    // When we ARE a nested coordinator AND the spawn broker is enabled, do NOT
+    // fork / docker-run the sibling ourselves. Emit a non-secret `SpawnRequest`
+    // into the mounted state spool for the HOST `aish` to service as a FLAT
+    // sibling — no docker-in-docker, and host cleanup + observability see every
+    // coordinator. On ANY emit failure we fall through to the legacy in-process
+    // path so a broker hiccup never silently drops the user's work.
+    if session.nested && crate::spawn_broker::broker_enabled() {
+        let isolate = call.args["isolate"].as_bool().unwrap_or(true);
+        let base = match call.args["base"].as_str() {
+            Some(b) if b.eq_ignore_ascii_case("head") => "head",
+            _ => "main",
+        };
+        match crate::worker::emit_spawn_request(session, task, isolate, base) {
+            Ok(path) => {
+                let fname = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                return Ok(format!(
+                    "Queued a background coordinator via the host spawn-broker (flat sibling; full \
+toolset + MCP in this directory). The host launches it and its result auto-delivers here when it's \
+done — do NOT poll for it. Spool request: {fname}. Now reply to the user with one short, natural \
+sentence that you're on it and the answer will appear when ready."
+                ));
+            }
+            Err(e) => {
+                eprintln!(
+                    "aish: spawn-broker emit failed ({e}); falling back to in-process coordinator"
+                );
+            }
+        }
+    }
+
     crate::worker::spawn_budget_gate().map_err(|e| anyhow::anyhow!(e))?;
 
     let exe = std::env::current_exe()
@@ -2218,13 +2368,18 @@ fn message_console(call: &ToolCall, session: &Session) -> Result<String> {
         return Ok("message_console is only available to a background coordinator — an \
 interactive session has no parent console to message".into());
     }
-    // One sentinel line per physical line so a multi-line note is forwarded
-    // intact and the operator sees the coordinator's intended line breaks. The
-    // parent re-frames each line as a console row. Mirrors how the coordinator's
-    // narration/thinking sentinels are emitted on stderr.
-    for line in message.lines() {
-        eprintln!("📣 {line}");
-    }
+    // Emit the note as ONE 📣 sentinel line so the parent frames the 📣 [label]
+    // prefix exactly ONCE for the whole note. A multi-line note's physical
+    // newlines are encoded as CONSOLE_LINE_SEP (a non-`\n` separator) so the note
+    // survives the newline-delimited stderr transport on a single line; the
+    // parent's `worker::console_row` decodes them back into aligned continuation
+    // lines. (Previously we emitted one sentinel per physical line, which
+    // repeated the 📣 [label] prefix on every line of a multi-line note.)
+    let encoded = message
+        .lines()
+        .collect::<Vec<_>>()
+        .join(&crate::worker::CONSOLE_LINE_SEP.to_string());
+    eprintln!("📣 {encoded}");
     Ok("delivered to the operator's console".into())
 }
 
@@ -3254,21 +3409,50 @@ fn list_dir(call: &ToolCall, session: &Session) -> Result<(String, serde_json::V
         return Ok(("[empty directory]".into(), serde_json::Value::Array(vec![])));
     }
     // TASK-322: cap oversized listings. Truncate BOTH the text and the JSON
-    // payload to the same `max` entries and warn so the agent narrows the path
-    // (or re-lists with a higher `max`) instead of drowning in output.
+    // payload to the SAME rows so the human-facing text (`content`) and the
+    // model-facing payload (`structured`) can never list different files — the
+    // "the text and JSON can never drift" invariant this fn documents, and the
+    // "the human always sees the verbatim tool output" promise in
+    // backend::ToolResult. Two caps fold into one row-count truncation:
+    //   1. the entry cap (`max`, TASK-322), and
+    //   2. the byte cap (`MAX_OUTPUT`) on the rendered text.
+    // Applying `truncate_middle` to the text ALONE (the old tail) dropped file
+    // lines from the middle of the listing while leaving every entry in the JSON
+    // payload — so a long listing showed the operator fewer files than the model
+    // saw. We instead drop whole trailing rows until the text fits, and rebuild
+    // both halves from that identical row set.
     let total = rows.len();
-    let truncated = total > max;
-    if truncated {
+    if rows.len() > max {
         rows.truncate(max);
     }
+    // Byte cap: keep only as many leading rows as fit under MAX_OUTPUT (each row
+    // costs its line length + 1 for the '\n' join). Reserve headroom for the
+    // truncation marker so the final text never exceeds the cap.
+    const MARKER_HEADROOM: usize = 96;
+    let budget = MAX_OUTPUT.saturating_sub(MARKER_HEADROOM);
+    let mut used = 0usize;
+    let mut fit = 0usize;
+    for (line, _) in &rows {
+        let cost = line.len() + 1;
+        if fit > 0 && used + cost > budget {
+            break;
+        }
+        used += cost;
+        fit += 1;
+    }
+    if fit < rows.len() {
+        rows.truncate(fit);
+    }
+    let shown = rows.len();
+    let truncated = shown < total;
     let payload = serde_json::Value::Array(rows.iter().map(|(_, v)| v.clone()).collect());
     let mut text = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
     if truncated {
         text.push_str(&format!(
-            "\n…[showing {max} of {total} entries; narrow the path or pass a higher `max`]"
+            "\n…[showing {shown} of {total} entries; narrow the path or pass a higher `max`]"
         ));
     }
-    Ok((truncate_middle(text, MAX_OUTPUT), payload))
+    Ok((text, payload))
 }
 
 // ---------------------------------------------------------------------------
@@ -4094,9 +4278,22 @@ fn change_dir(call: &ToolCall, session: &mut Session) -> Result<String> {
     if !canonical.is_dir() {
         anyhow::bail!("{} is not a directory", canonical.display());
     }
+    // Capture the repo we're leaving BEFORE switching, so we can tell the model
+    // when a `cd` crosses into a different checkout (the failure mode where an
+    // agent silently keeps operating on the old repo).
+    let old_repo = crate::git::repo_name(&session.cwd);
     session.cwd = canonical;
+    // First entry into a new repo → announce it on the SecondStatusLine.
+    session.announce_repo_if_new();
+    let new_repo = crate::git::repo_name(&session.cwd);
+    let branch = crate::git::current_branch(&session.cwd);
+    let note = crate::git::repo_transition_note(
+        old_repo.as_deref(),
+        new_repo.as_deref(),
+        branch.as_deref(),
+    );
     Ok(format!(
-        "working directory is now {}",
+        "working directory is now {}{note}",
         session.cwd.display()
     ))
 }
@@ -4133,6 +4330,35 @@ fn char_ceil(s: &str, mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dup_guard_exact_and_normalized_match() {
+        assert!(tasks_are_duplicate("Build the report", "build   the\nreport"));
+        assert!(tasks_are_duplicate("Fix CI on main", "fix ci on main"));
+        assert!(!tasks_are_duplicate("", "anything"));
+        assert!(!tasks_are_duplicate("anything", "   "));
+        assert!(!tasks_are_duplicate("build the report", "delete the database"));
+    }
+
+    #[test]
+    fn dup_guard_containment_and_jaccard() {
+        // Long-substring containment: same ask with extra context wrapped around it.
+        let core = "generate the quarterly revenue summary spreadsheet";
+        let wrapped = format!("please {core} and email it to finance");
+        assert!(tasks_are_duplicate(core, &wrapped));
+        // Short overlaps must NOT trip containment.
+        assert!(!tasks_are_duplicate("ci", "run ci on the pr branch now please thanks"));
+        // Jaccard ≥ 0.8: near-identical token sets.
+        assert!(tasks_are_duplicate(
+            "audit the aws cost report for october",
+            "audit the aws cost report for october now",
+        ));
+        // Low token overlap stays distinct.
+        assert!(!tasks_are_duplicate(
+            "audit the aws cost report for october",
+            "refactor the postgres connection pool logic",
+        ));
+    }
 
     #[test]
     fn to_crlf_rewrites_bare_lf_and_is_idempotent() {
@@ -4621,12 +4847,14 @@ mod tests {
     }
 
     // A `sh` snippet that exits 0 iff the running shell leads its own process
-    // group. Field 1 of /proc/self/stat is the pid and field 5 is the pgrp; a
-    // foreground child that `run_on_tty` setpgid'd into its own group has
-    // pgrp == pid. `$$` stays the shell's pid inside the command substitution
-    // (POSIX), and `comm` (field 2) is `(sh)`/`(dash)` — no embedded spaces — so
-    // positional splitting keeps the fields aligned.
-    const OWN_PGRP_PROBE: &str = r#"set -- $(cat /proc/$$/stat); [ "$5" = "$1" ]"#;
+    // group. A foreground child that `run_on_tty` setpgid'd into its own group
+    // has pgrp == pid. `ps -o pgid= -p $$` prints the shell's process-group id on
+    // both BSD (macOS) and GNU (Linux) `ps` — portable, unlike `/proc/$$/stat`,
+    // which doesn't exist on macOS and made this probe pass vacuously there
+    // (empty output → `[ "" = "" ]` → exit 0, verifying nothing). `$$` stays the
+    // shell's pid inside the command substitution (POSIX); `tr -d ' '` strips the
+    // leading pad `ps` right-justifies the pgid with.
+    const OWN_PGRP_PROBE: &str = r#"[ "$(ps -o pgid= -p $$ | tr -d ' ')" = "$$" ]"#;
 
     #[tokio::test]
     async fn foreground_child_leads_its_own_process_group() {
@@ -5385,6 +5613,55 @@ mod fileops_tests {
         // JSON payload is truncated to the same cap.
         let arr = r.structured.as_ref().unwrap().as_array().unwrap();
         assert_eq!(arr.len(), 3, "payload truncated to max");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Regression: the human-facing text (`content`) and the model-facing JSON
+    // payload (`structured`) must list the SAME files even when the rendered
+    // listing blows past the MAX_OUTPUT byte cap. The old tail middle-truncated
+    // the text ALONE (via `truncate_middle`), so the operator saw fewer files
+    // than the model — "output should match the output (same files)".
+    #[tokio::test]
+    async fn list_dir_text_and_payload_never_drift_under_byte_cap() {
+        let dir = tmp("listdrift");
+        // ~220-char names × 300 files ≈ 66 KB of rendered text — comfortably
+        // over MAX_OUTPUT (50 KB), forcing the byte cap to engage while staying
+        // under the 1000-entry cap so ONLY the byte cap is exercised.
+        let long = "n".repeat(200);
+        for i in 0..300 {
+            std::fs::write(dir.join(format!("{long}{i:03}")), b"x").unwrap();
+        }
+        let mut s = yolo_session(&dir);
+        let r = run(&mut s, "list_dir", json!({})).await;
+        assert!(!r.is_error, "{}", r.content);
+
+        // The byte cap must have engaged: fewer than 300 shown, marker present.
+        assert!(r.content.contains("of 300 entries"), "must warn truncation: head/tail of content missing marker");
+
+        let arr = r.structured.as_ref().unwrap().as_array().unwrap();
+        // Count file-rows in the human text (every non-marker line renders as
+        // "file <name> <size>"). It must equal the payload length exactly — no
+        // entry may exist in one half but not the other.
+        let file_lines = r.content.lines().filter(|l| l.starts_with("file ")).count();
+        assert_eq!(
+            file_lines,
+            arr.len(),
+            "text lists {file_lines} files but payload lists {} — they drifted",
+            arr.len()
+        );
+        assert!(arr.len() < 300, "byte cap must have dropped some entries (got {})", arr.len());
+        assert!(!arr.is_empty(), "at least one entry must survive the byte cap");
+
+        // Every file the model sees must also appear verbatim in the human text.
+        for e in arr {
+            let name = e["name"].as_str().unwrap();
+            assert!(
+                r.content.contains(name),
+                "payload entry {name} missing from human-facing text"
+            );
+        }
+        // And the whole rendered text still honors the byte cap.
+        assert!(r.content.len() <= MAX_OUTPUT, "content {} exceeds MAX_OUTPUT {MAX_OUTPUT}", r.content.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

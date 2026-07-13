@@ -180,6 +180,25 @@ impl ResumeState {
         Some(std::mem::take(&mut self.pending))
     }
 
+    /// Forget a worker that the operator explicitly dismissed with `:close`.
+    /// Drops `id` from both `pending` and `seen`, and — when that empties the
+    /// pending set — DISARMS any armed resume. Closing a finished worker is an
+    /// explicit "I've handled this" gesture, so it must cancel the pending
+    /// auto-synthesis for that id rather than dragging the operator into an
+    /// unsolicited resume turn that blocks the prompt (the reported hang).
+    /// Removing it from `seen` too means the id is fully forgotten; the presenter
+    /// won't re-observe it anyway (it's gone from `worker_jobs`). Returns true
+    /// when this call disarmed an armed resume, so callers can note the cancel.
+    pub fn forget(&mut self, id: &str) -> bool {
+        self.pending.retain(|p| p != id);
+        self.seen.remove(id);
+        if self.pending.is_empty() && self.armed {
+            self.armed = false;
+            return true;
+        }
+        false
+    }
+
     /// Test-only peek at the pending count.
     #[cfg(test)]
     fn pending_len(&self) -> usize {
@@ -211,6 +230,10 @@ pub struct Session {
     pub session_id: String,
     /// Static host info baked into the system prompt once.
     pub host_info: String,
+    /// Static `Repo: owner/repo (branch …)\n` line for the repo at the starting
+    /// cwd, baked into the system prompt once (empty outside a git repo). Live
+    /// repo switches are surfaced to the model via `change_dir` tool results.
+    pub repo_info: String,
     /// `export` lines from ~/.aishrc, applied to every program aish spawns.
     pub env: Vec<(String, String)>,
     /// Pre-rendered system-prompt section listing ~/.aish/skills (may be empty).
@@ -225,6 +248,12 @@ pub struct Session {
     /// offline `crate::skill_match::recommend_install` path). Deduped so the same
     /// "you could install `<ref>`" nudge fires at most once per session.
     pub skill_suggested: HashSet<String>,
+    /// Repo roots already handed to the `codebase-memory` server for a
+    /// structural index THIS session (TASK-407). Dedups the repo-open
+    /// auto-index so warming fires at most once per repo per session, even
+    /// though the check itself runs each turn (it's cheap: a membership test
+    /// plus, on a miss, one `.mcp.json` read).
+    pub codebase_indexed: HashSet<PathBuf>,
     /// Connected MCP servers; their tools join the model's tool set.
     pub mcp: crate::mcp::McpHost,
     /// Persistent store (history + agent memories). None if it failed to open.
@@ -363,6 +392,12 @@ pub struct Session {
     /// pending flash → the row falls back to the live coordinator/attach hint
     /// instead of stacking messages on top of each other.
     pub flash: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// `repo_key` of the git checkout most recently ANNOUNCED on the
+    /// SecondStatusLine ("Working with repository: …"). Set the first time the
+    /// session lands in a repo (at launch or after a `change_dir`), so the
+    /// notice fires once per distinct checkout and re-fires only when the cwd
+    /// moves into a *different* repo. Session-local; never persisted.
+    pub announced_repo: Option<String>,
     /// Id of the goal `:goal` subcommands target by default (set by `:goal
     /// new` / `:goal show <id>`). Session-local (not persisted); falls back to
     /// the active goal when unset or stale. (TASK-278)
@@ -572,6 +607,10 @@ impl Session {
 
     pub fn new() -> Result<Self> {
         let cwd = std::env::current_dir()?;
+        let repo_info = crate::git::repo_prompt_line(
+            crate::git::repo_name(&cwd).as_deref(),
+            crate::git::current_branch(&cwd).as_deref(),
+        );
         Ok(Self {
             cwd,
             history: Vec::new(),
@@ -580,10 +619,12 @@ impl Session {
             name: None,
             session_id: uuid::Uuid::new_v4().to_string(),
             host_info: host_info(),
+            repo_info,
             env: Vec::new(),
             skills_prompt: String::new(),
             skills: Vec::new(),
             skill_suggested: HashSet::new(),
+            codebase_indexed: HashSet::new(),
             mcp: crate::mcp::McpHost::default(),
             db: None,
             raw_tool_output: false,
@@ -622,6 +663,7 @@ impl Session {
             alert_store: None,
             activity_store: None,
             flash: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            announced_repo: None,
             current_goal_id: None,
             nested: std::env::var("AISH_COORDINATOR").is_ok(),
             tool_allowlist: std::env::var("AISH_TOOL_ALLOWLIST").ok().and_then(|v| {
@@ -847,6 +889,44 @@ impl Session {
     /// the cache holds more than one (see `reconcile_active_goal`, which keeps
     /// that from happening in practice). Borrows the cached record so callers
     /// can read progress/badge without a DB round-trip.
+    /// The first time the session lands in a given git repo — at launch, or
+    /// after a `change_dir` into a *different* checkout — surface
+    /// "Working with repository: <name>" on the SecondStatusLine flash slot
+    /// (most-recent wins). No-op outside a git repo, and deduped by `repo_key`
+    /// so re-entering the same checkout (or a sibling worktree sharing its
+    /// origin) doesn't re-announce. Session-local; never persisted.
+    pub fn announce_repo_if_new(&mut self) {
+        if !crate::git::is_git_repo(&self.cwd) {
+            return;
+        }
+        let key = crate::git::repo_key(&self.cwd);
+        if self.announced_repo.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        let name = crate::git::repo_name(&self.cwd).unwrap_or_else(|| key.clone());
+        self.announced_repo = Some(key);
+        let plain = format!("Working with repository: {name}");
+        let msg = if crate::style::colors_enabled() {
+            format!("\x1b[36m{plain}\x1b[0m")
+        } else {
+            plain.clone()
+        };
+        if let Ok(mut f) = self.flash.lock() {
+            *f = Some(msg);
+        }
+        // Also drop a recoverable `:activity` entry so the notice survives the
+        // next most-recent flash overwriting the single footer slot.
+        if let Some(act) = &self.activity_store {
+            let _ = act.record(
+                crate::style::Severity::Info.as_str(),
+                "repo",
+                &plain,
+                "repo",
+            );
+        }
+    }
+
+
     pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
         // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
         // updated_at DESC), so the first match is the freshest active goal.
@@ -1154,6 +1234,7 @@ efficiency, builder mindset, zero lectures, maximum signal.\n\
 \n\
 {host}\n\
 Starting cwd: {cwd}\n\
+{repo}\
 \n\
 Core Rules (NEVER break these):\n\
 - Intent in, results out. Parse natural language and execute via tools. Chain steps aggressively.\n\
@@ -1191,9 +1272,9 @@ if missing. Escalate fix to stronger agent — don't hand-fix.\n\
 - NEVER FABRICATE, ALWAYS VERIFY: report ONLY what actually happened. If you narrate an action \
 ('watching…', 'running…') you MUST attach the actual tool call in that SAME turn — a bare narration \
 runs nothing. Confirm every reported outcome with a real read (gh run view, a status query, a file \
-read); if you couldn't verify, say so plainly instead of inventing a result.\n\
+read) — a fresh read is cheaper than a wrong assertion, so verify unprompted; if you couldn't verify, say so plainly instead of inventing a result.\n\
 - Memory: remember() durable facts (projects, preferences, lessons); recall() proactively on context.\n\
-- Output: terse, shell-like. Use markdown tables for ANY list >1 item (columns that matter, sorted \
+- Match the ask (correctness, not style): short question → short answer; they'll follow up if they want more. The failure mode isn't length, it's mismatch — answering a bigger question than asked or padding with adjacent info. Gut check: if they could reasonably follow up to get this, don't preempt it.\n- Output: shell-like. Use markdown tables for ANY list >1 item (columns that matter, sorted \
 deliberately). Flag costs/optimizations.\n\
 \n\
 Advanced Directives:\n\
@@ -1219,6 +1300,7 @@ Final reply style: one line when possible. Table when useful. End turn cleanly. 
 fluff.{skills}{batch}{escalate}{console}{goal}{task}",
             host = self.host_info,
             cwd = self.cwd.display(),
+            repo = self.repo_info,
             skills = self.skills_prompt,
             batch = if self.batch_mode { BATCH_NUDGE } else { "" },
             escalate = if escalate_available {
@@ -1309,7 +1391,7 @@ background_status (never invent your own tracking). Steer a coordinator that is 
 preamble, then reply with ONE short, natural sentence — tailored to what they asked — saying you're \
 handling it in the background and the answer will appear here when it's ready (e.g. \"On it — I'll work \
 that out in the background and post the answer here.\"). Do NOT predict or mention the job id, restate \
-the task, or explain cost/timing; the result auto-delivers.";
+the task, or explain cost/timing; the result auto-delivers.\n\nROUTING DECISION TABLE — match the tool to the intent: a NEW logical task to DO → run_in_background · a follow-up or course-correction for an already-running job → tell · a check of progress, outcome, or history → background_status · a QUESTION of any kind (even asking whether a worker was already dispatched) → answer INLINE. Spawning a coordinator to answer a question about coordinators is the exact error class this table prevents.";
 
 /// Appended when the frontend is a smaller/faster model than the strongest one
 /// available (haiku/sonnet, or a local model with a Claude credential). It tells
@@ -1957,6 +2039,43 @@ mod tests {
         assert!(r.take().is_none());
         assert!(r.observe(&["w_c".into()], 0));
         assert_eq!(r.take().unwrap(), vec!["w_c".to_string()]);
+    }
+
+    #[test]
+    fn resume_state_forget_disarms_when_last_pending_closed() {
+        if !auto_resume_enabled() {
+            return;
+        }
+        // Single finished worker armed the resume; closing it cancels the turn.
+        let mut r = ResumeState::default();
+        assert!(r.observe(&["w_a".into()], 0));
+        assert!(r.forget("w_a"), "forgetting the sole pending id disarms");
+        assert_eq!(r.pending_len(), 0);
+        assert!(r.take().is_none(), "no resume fires after close");
+    }
+
+    #[test]
+    fn resume_state_forget_keeps_arm_when_others_pending() {
+        if !auto_resume_enabled() {
+            return;
+        }
+        // Two finished workers armed the resume; closing one leaves the other.
+        let mut r = ResumeState::default();
+        assert!(!r.observe(&["w_a".into()], 1));
+        assert!(r.observe(&["w_b".into()], 0));
+        assert!(!r.forget("w_a"), "still one pending id → resume stays armed");
+        assert_eq!(r.take().unwrap(), vec!["w_b".to_string()]);
+    }
+
+    #[test]
+    fn resume_state_forget_unknown_id_is_noop() {
+        if !auto_resume_enabled() {
+            return;
+        }
+        let mut r = ResumeState::default();
+        assert!(r.observe(&["w_a".into()], 0));
+        assert!(!r.forget("w_zzz"), "forgetting an unknown id changes nothing");
+        assert_eq!(r.take().unwrap(), vec!["w_a".to_string()]);
     }
 
     #[test]

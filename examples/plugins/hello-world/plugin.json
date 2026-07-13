@@ -8,6 +8,18 @@
     "login": "hello-world"
   },
   "webhook_command": "echo '👋 hello-world: webhook received' && cat > /tmp/hello-world-event.json",
+  "webhooks": [
+    {
+      "event_type": "ping",
+      "command": ["handlers/greet.sh"],
+      "timeout_secs": 10
+    },
+    {
+      "event_type": "issues",
+      "command": ["handlers/greet.sh"],
+      "timeout_secs": 10
+    }
+  ],
   "config_schema": {
     "type": "object",
     "properties": {

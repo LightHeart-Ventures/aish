@@ -1,10 +1,10 @@
 [workspace]
-members = [".", "crates/webhook-receiver", "crates/aish-webhook-client"]
+members = [".", "crates/webhook-receiver", "crates/aish-webhook-client", "crates/git-discover"]
 resolver = "2"
 
 [package]
 name = "aish"
-version = "0.33.1"
+version = "0.37.2"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -19,14 +19,11 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 # (backend streaming completions, S8.1). Already in the tree via reqwest, so
 # adding it as a direct dep is essentially free.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-# Browser-impersonating HTTP client (wreq) for bypassing bot protection
-# Used selectively for mcpmarket searches; standard reqwest for everything else
-wreq = { version = "6.0.0-rc", features = ["json"] }
-wreq-util = "3.0.0-rc"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # gzip archives for reasoning-telemetry log rotation (pure-Rust miniz_oxide
 # backend — no C/zlib, already vendored transitively so this edge is free).
 flate2 = "1"
+tar = "0.4"
 rustyline = "18.0.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -43,6 +40,10 @@ tracing = "0.1"
 # default `net` feature (tungstenite transport) on regardless of aish's own
 # `--no-default-features` CI gate, which only toggles aish's `local` feature.
 aish-webhook-client = { path = "crates/aish-webhook-client" }
+# git-discover: zero-dep repo detection ("what repo am I in right now?"). Gives
+# aish a single typed entry point (git_discover::discover) for a checkout's
+# identity + state, replacing ad-hoc `git rev-parse` shelling at call sites.
+git-discover = { path = "crates/git-discover" }
 
 [features]
 default = []

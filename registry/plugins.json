@@ -1,0 +1,122 @@
+{
+  "version": "1.0.0",
+  "plugins": [
+    {
+      "id": "aish",
+      "name": "aish core skills",
+      "description": "Core skills for the aish shell — troubleshooting, SRE, CI/CD, and release management.",
+      "author": "LightHeart Ventures",
+      "repository": "LightHeart-Ventures/aish",
+      "reference": "LightHeart-Ventures/aish/plugins/aish",
+      "branch": "main",
+      "version": "0.25.0",
+      "enabled": true,
+      "provides": {
+        "skills": true
+      }
+    },
+    {
+      "id": "github",
+      "name": "GitHub webhooks",
+      "description": "GitHub webhook handlers for PR review, issue automation, and CI/CD integration.",
+      "author": "LightHeart Ventures",
+      "repository": "LightHeart-Ventures/aish",
+      "reference": "LightHeart-Ventures/aish/plugins/github",
+      "branch": "main",
+      "version": "0.25.0",
+      "enabled": true,
+      "provides": {
+        "webhooks": true,
+        "skills": true
+      }
+    },
+    {
+      "id": "hello-world",
+      "name": "Hello World plugin",
+      "description": "Canonical smoke-test plugin that proves a plugin's skill reaches the agent's catalog.",
+      "author": "LightHeart Ventures",
+      "repository": "LightHeart-Ventures/aish",
+      "reference": "LightHeart-Ventures/aish/plugins/hello-world",
+      "branch": "main",
+      "version": "0.25.0",
+      "enabled": true,
+      "provides": {
+        "skills": true
+      }
+    },
+    {
+      "id": "codebase-memory",
+      "name": "Codebase Memory MCP",
+      "description": "Graph-first code discovery via codebase-memory MCP server integration.",
+      "author": "LightHeart Ventures",
+      "repository": "LightHeart-Ventures/aish",
+      "reference": "LightHeart-Ventures/aish/plugins/codebase-memory",
+      "branch": "main",
+      "version": "0.25.0",
+      "enabled": true,
+      "provides": {
+        "skills": true,
+        "mcp": true
+      }
+    },
+    {
+      "id": "signoz-observability",
+      "name": "SigNoz Observability",
+      "description": "SigNoz observability integration — alerts, dashboards, traces, logs.",
+      "author": "LightHeart Ventures",
+      "repository": "LightHeart-Ventures/aish",
+      "reference": "LightHeart-Ventures/aish/plugins/signoz-observability",
+      "branch": "main",
+      "version": "0.25.0",
+      "enabled": true,
+      "provides": {
+        "skills": true,
+        "mcp": true
+      }
+    },
+    {
+      "id": "ccquota",
+      "name": "Cloud Cost Quota",
+      "description": "Cloud cost quota monitoring and alerting plugin.",
+      "author": "LightHeart Ventures",
+      "repository": "LightHeart-Ventures/aish",
+      "reference": "LightHeart-Ventures/aish/plugins/ccquota",
+      "branch": "main",
+      "version": "0.25.0",
+      "enabled": true,
+      "provides": {
+        "skills": true
+      }
+    },
+    {
+      "id": "npx-skills",
+      "name": "NPX Skills Integration",
+      "description": "Integration with npx-skills for community skill management.",
+      "author": "LightHeart Ventures",
+      "repository": "LightHeart-Ventures/aish",
+      "reference": "LightHeart-Ventures/aish/plugins/npx-skills",
+      "branch": "main",
+      "version": "0.25.0",
+      "enabled": true,
+      "provides": {
+        "skills": true,
+        "skill_source": true
+      }
+    },
+    {
+      "id": "npx-skillfish",
+      "name": "NPX Skillfish Integration",
+      "description": "Integration with npx-skillfish for skill.fish registry access.",
+      "author": "LightHeart Ventures",
+      "repository": "LightHeart-Ventures/aish",
+      "reference": "LightHeart-Ventures/aish/plugins/npx-skillfish",
+      "branch": "main",
+      "version": "0.25.0",
+      "enabled": true,
+      "provides": {
+        "skills": true,
+        "skill_source": true
+      }
+    }
+  ]
+}

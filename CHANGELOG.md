@@ -4,6 +4,25 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Changed
+- **Embedded mcpmarket skill search removed — live search now comes from the plugin**: dropped the in-process mcpmarket network search path from `skill_provider` (the `wreq`/`wreq-util` browser-impersonating HTTP client is gone from `Cargo.toml`). `:skill search` now reads the offline embedded curated index for the builtin source, while live/community search is served exclusively by the `npx-skillfish` plugin (a `provides.skill_source`). The offline index, `:skill add` (GitHub + skill.fish), and the plugin skill-source fan-out are unchanged.
+- **`npx-skills` plugin removed**: npx-skills (npm registry skill search + install) is archived. Live skill import and search is now unified under `npx-skillfish` (agentskills.io/skillfish), which is more performant and upstream-maintained. Removed `plugins/npx-skills/` from the tree; documentation updated to remove references to npm-sourced skills.
+
+
+## [0.36.2] - 2026-07-08
+
+### Added
+- **Terminal footer resync on SIGCONT wake (PR #651)**: terminal footer + idle timer re-sync when the process wakes from `SIGCONT` (e.g., fg after Ctrl-Z + bg). Prevents stale footer state on resume.
+- **Repository entry announcement (PR #654)**: aish now prints "Working with repository: <name>" on first repo entry in a session, clarifying context in multi-repo workflows.
+- **Terminal footer dynamic resize (PR #654)**: terminal footer redraws on window resize within one heartbeat tick instead of waiting for the next turn, improving responsiveness.
+
+### Changed
+- **Release workflow consolidation (PR #653)**: merged `release.yml` + `release-prod.yml` → `release-production.yml`. Added `workflow_dispatch` trigger, reusable `build-release-binary.yml` to eliminate duplication, and clearer workflow naming (`release-ci.yml` → `release-ci-cd.yml`). Documented in `workflows/README.md`.
+- **Codebase-memory auto-index warnings quieted (PR #652)**: moved auto-index handoff warnings from interactive output to a durable log, reducing noise in typical workflows.
+- **Documentation reorganized (PR #654)**: restructured docs into a tiered hierarchy with `INDEX.md` navigation hub, consolidated release docs into `RELEASE.md`, archived completed work, organized reference/internals/formats into subdirectories, and created `archive/MANIFEST.md` for historical context.
+
+## [0.36.0] - 2026-07-07
+
 ### Added
 - **`aish-webhook-broker` — self-hosted webhook broker for the plugin system (PR #515, SPR-059 Phase 4)**: a new standalone crate (`crates/aish-webhook-broker`) shipping the `aish-webhook-broker` binary — a single self-contained server (embedded SQLite, no external services) that ingests webhooks from external producers (GitHub, Slack, GitLab, …) and fans them out to connected aish clients. Webhooks are routed by `(tenant_id, plugin_id)`, verified with constant-time **HMAC-SHA256** (GitHub-compatible `sha256=` prefix, `X-Signature`/`X-Hub-Signature-256`), persisted to a WAL-mode SQLite queue (durable source of truth — survives client disconnects and broker restarts), and delivered in real time over **WebSocket** (`GET /ws`) with an HTTP **long-poll** fallback (`GET /webhooks/:tenant/:plugin/pending?wait_secs=N`). Delivery is at-least-once (messages held until explicitly ACKed via `DELETE …/messages/:id` or a WS `ack` frame), the per-route queue is bounded (`--max-queue-size`, oldest-drops-first overflow), and undelivered messages expire on a configurable TTL (`--msg-ttl-secs`, default 7 days) purged by an hourly sweep. Endpoints: `GET /health`, `POST /clients/register`, `POST /webhooks/:tenant/:plugin`, `GET /webhooks/:tenant/:plugin/pending`, `DELETE /webhooks/:tenant/:plugin/messages/:id`, `GET /ws`. Fully configurable via CLI flags or `BROKER_*` env vars (`BROKER_LISTEN`, `BROKER_DB`, `BROKER_MAX_QUEUE_SIZE`, `BROKER_WS_HEARTBEAT_SECS`, `BROKER_POLL_TIMEOUT_SECS`, `BROKER_MSG_TTL_SECS`, `BROKER_LOG_LEVEL`), with graceful `SIGINT`/`SIGTERM` shutdown. Ships with a README plus `docs/API.md`, `docs/CONFIGURATION.md`, and `docs/DEPLOYMENT.md` (Docker, systemd, AWS EC2/ECS), and unit + in-process HTTP integration tests.
 - **Broker deploy assets — first-class, shipped in-crate (PR #516, SPR-059 Phase 4)**: the `aish-webhook-broker` crate now carries ready-to-run deployment tooling instead of doc-only templates — a multi-stage `Dockerfile` (builds the binary against the runtime libc) with a `.dockerignore`, plus `deploy/docker-compose.yml`, a hardened `deploy/aish-webhook-broker.service` systemd unit, a `deploy/broker.env.example` env template, and `deploy/README.md`. `docs/DEPLOYMENT.md` now points operators at these shipped files (build/install one-liners) and keeps only the AWS ECS/EC2 task definitions as fill-in templates.

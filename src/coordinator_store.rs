@@ -65,6 +65,12 @@ pub struct CoordinatorRow {
     pub session_id: Option<String>,
     /// The launching session's friendly name (`:rename`), for display.
     pub session_name: Option<String>,
+    /// Parent coordinator's run id when this run was spawned BY another
+    /// coordinator (via `run_in_background`), else `None` for a run launched
+    /// directly from an interactive REPL. Stamped from `AISH_PARENT_RUN_ID`
+    /// (see `worker::worker_command`). Drives the hierarchical `:workers`
+    /// forest — a child indents beneath its parent.
+    pub parent_run_id: Option<String>,
     pub created_at: Option<String>,
     /// Last liveness beat (SQLite `current_timestamp` string). A run whose owner
     /// is gone and whose heartbeat is stale is treated as orphaned on reattach.
@@ -338,14 +344,23 @@ impl CoordinatorStore {
             )
             .context("coordinator_runs checkpoint-phase migration failed")?;
         }
+        // Parentage link (hierarchical `:workers`): the parent coordinator's
+        // run id, stamped when a coordinator spawns a sub-coordinator. Additive
+        // `ADD COLUMN` — swallowed once present, so idempotent; existing rows
+        // read back NULL (a root). Placed AFTER the checkpoint rebuild so the
+        // rebuild (whose fixed column list omits this) can't drop it.
+        let _ = conn.execute(
+            "ALTER TABLE coordinator_runs ADD COLUMN parent_run_id TEXT",
+            [],
+        );
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
 
-    /// Register a freshly-started run in the `coordinating` phase. Idempotent —
-    /// re-inserting the same `run_id` (e.g. a resumed run) leaves the existing
-    /// row untouched so its persisted phase/result survives.
+    /// Back-compat 4-arg insert for a run with NO parent (a root coordinator
+    /// launched from an interactive REPL, and every test call site). Delegates
+    /// to `insert_with_parent` with `parent_run_id = None`.
     pub fn insert(
         &self,
         run_id: &str,
@@ -353,11 +368,25 @@ impl CoordinatorStore {
         session_id: &str,
         session_name: Option<&str>,
     ) -> Result<()> {
+        self.insert_with_parent(run_id, task, session_id, session_name, None)
+    }
+
+    /// Register a freshly-started run, optionally linked to the parent
+    /// coordinator that spawned it (`parent_run_id`, from `AISH_PARENT_RUN_ID`).
+    /// Idempotent on `run_id`.
+    pub fn insert_with_parent(
+        &self,
+        run_id: &str,
+        task: &str,
+        session_id: &str,
+        session_name: Option<&str>,
+        parent_run_id: Option<&str>,
+    ) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO coordinator_runs (run_id, task, phase, session_id, session_name)
-             VALUES (?1, ?2, 'coordinating', ?3, ?4)
+            "INSERT INTO coordinator_runs (run_id, task, phase, session_id, session_name, parent_run_id)
+             VALUES (?1, ?2, 'coordinating', ?3, ?4, ?5)
              ON CONFLICT(run_id) DO NOTHING",
-            (run_id, task, session_id, session_name),
+            (run_id, task, session_id, session_name, parent_run_id),
         )?;
         Ok(())
     }
@@ -483,7 +512,7 @@ impl CoordinatorStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT run_id, task, phase, result, error, session_id, session_name, created_at, heartbeat_at, \
-                    tokens_in, tokens_out, turns, tool_calls
+                    tokens_in, tokens_out, turns, tool_calls, parent_run_id
              FROM coordinator_runs ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -501,6 +530,7 @@ impl CoordinatorStore {
                 tokens_out: r.get(10)?,
                 turns: r.get(11)?,
                 tool_calls: r.get(12)?,
+                parent_run_id: r.get(13)?,
             })
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect())

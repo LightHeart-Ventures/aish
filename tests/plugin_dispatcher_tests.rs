@@ -129,17 +129,19 @@ async fn test_route_workspace_open_http() {
     assert!(v["payload_json"].get("cwd").is_some(), "workspace_open carries cwd");
 }
 
-/// Command dispatch: a plugin with `webhook_command` runs a shell script; its
-/// stdout is captured into plugin state under `<id>:last_webhook_output`, and
-/// the event type is exposed on stdin + `$AISH_EVENT_TYPE`.
+/// Command dispatch (NO SHELL — SPR-069 TASK-379/446): a plugin's
+/// `webhook_command` is fork/exec'd as argv; stdout is captured into plugin
+/// state under `<id>:last_webhook_output`. Shell metacharacters are passed
+/// VERBATIM, never evaluated — the regression guard for the old `sh -c` path.
 #[tokio::test]
 async fn test_route_skill_loaded_command() {
     let dir = tempdir("cmd");
-    // Echo the event type (from env) so we can assert it flowed through.
+    // `$(whoami)` must reach the handler as a literal string: a shell would
+    // expand it to the username. No-shell argv exec keeps it literal.
     write_plugin(
         &dir,
         "scripty",
-        r#"{"id":"scripty","webhook_command":"printf handled:$AISH_EVENT_TYPE"}"#,
+        r#"{"id":"scripty","webhook_command":"echo handled:$(whoami)"}"#,
     );
     let state = PluginStateStore::open_in_memory().unwrap();
     let d = PluginDispatcher::new(dir, state.clone());
@@ -152,7 +154,11 @@ async fn test_route_skill_loaded_command() {
         .expect("command output persisted");
     assert_eq!(out["exit_code"], 0);
     assert_eq!(out["event"], "skill_loaded");
-    assert_eq!(out["stdout"], "handled:skill_loaded");
+    assert_eq!(
+        out["stdout"].as_str().unwrap().trim_end(),
+        "handled:$(whoami)",
+        "shell command-substitution must NOT occur",
+    );
 }
 
 /// The same event fans out to every subscribing plugin.
@@ -185,11 +191,11 @@ async fn test_route_multiple_plugins() {
 #[tokio::test]
 async fn test_non_blocking() {
     let dir = tempdir("nonblock");
-    // A command that sleeps before producing output — delivery takes ~300ms.
+    // A command that sleeps ~300ms (no shell) — delivery is bounded by it.
     write_plugin(
         &dir,
         "slow",
-        r#"{"id":"slow","webhook_command":"sleep 0.3; printf done"}"#,
+        r#"{"id":"slow","webhook_command":"sleep 0.3"}"#,
     );
     let state = PluginStateStore::open_in_memory().unwrap();
     let d = PluginDispatcher::new(dir, state.clone());
@@ -212,7 +218,7 @@ async fn test_non_blocking() {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         if let Some(out) = state.get("slow", "last_webhook_output").unwrap() {
-            assert_eq!(out["stdout"], "done");
+            assert_eq!(out["exit_code"], 0);
             break;
         }
         assert!(Instant::now() < deadline, "async delivery never completed");

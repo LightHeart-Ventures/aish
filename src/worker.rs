@@ -858,13 +858,6 @@ pub fn pane_input_row(label: &str, task: &str) -> String {
     pane_row(label, &format!("\x1b[1m💬 task: {}\x1b[0m", task_headline(task)))
 }
 
-/// Max visible chars of the task shown in an `:attach`/replay INPUT row before
-/// it's clipped with an ellipsis. Bounded so an auto-offloaded or resumed task —
-/// which carries a large machine-facing prompt (embedded conversation digest,
-/// prior-result scaffold) — renders as a readable one-liner instead of a wall of
-/// wrapped pane rows.
-const TASK_HEADLINE_MAX: usize = 200;
-
 /// Reduce a coordinator's (possibly huge, machine-facing) task string to a short
 /// HUMAN-READABLE headline for the replay input row.
 ///
@@ -874,9 +867,10 @@ const TASK_HEADLINE_MAX: usize = 200;
 /// scaffolding. In both cases the LOAD-BEARING instruction is the text AFTER the
 /// last such marker — the operator's actual ask — so we peel that out (checking
 /// the follow-up marker first, since a resumed task's original section may itself
-/// still contain an `End context` marker), then collapse whitespace and clip to
-/// [`TASK_HEADLINE_MAX`]. A plain task with no markers just gets the
-/// collapse-and-clip. Pure — unit-tested.
+/// still contain an `End context` marker), then collapse whitespace so it
+/// renders as one clean block. The full ask is shown — `pane_row` wraps it
+/// across bordered continuation rows, so nothing is clipped. A plain task with
+/// no markers just gets the whitespace collapse. Pure — unit-tested.
 fn task_headline(task: &str) -> String {
     const FOLLOW_UP: &str = "=== OPERATOR'S FOLLOW-UP ===";
     const END_CTX: &str = "=== End context ===";
@@ -895,14 +889,7 @@ fn task_headline(task: &str) -> String {
     } else {
         collapsed
     };
-    if collapsed.chars().count() > TASK_HEADLINE_MAX {
-        format!(
-            "{}…",
-            collapsed.chars().take(TASK_HEADLINE_MAX).collect::<String>()
-        )
-    } else {
-        collapsed
-    }
+    collapsed
 }
 
 /// Frame a coordinator's `message_console` note for the operator's terminal.
@@ -914,8 +901,35 @@ fn task_headline(task: &str) -> String {
 /// the contained activity stream — it's an out-of-band interjection). Pure —
 /// unit-tested.
 pub fn console_row(label: &str, text: &str) -> String {
-    format!("\x1b[1;36m📣 [{label}]\x1b[0m {text}")
+    // A note may be multi-line. Over the line-oriented stderr transport the
+    // coordinator encodes its physical newlines as `CONSOLE_LINE_SEP` (a
+    // non-`\n` separator) so the whole note arrives as ONE sentinel line and the
+    // 📣 megaphone + `[label]` prefix is framed exactly ONCE — not repeated on
+    // every physical line (the old bug). Continuation lines are indented to align
+    // under the first line's text so the note reads as one tidy block.
+    let prefix = format!("\x1b[1;36m📣 [{label}]\x1b[0m ");
+    let mut lines = text.split(CONSOLE_LINE_SEP);
+    let first = lines.next().unwrap_or("");
+    let mut out = format!("{prefix}{first}");
+    // Indent = visible width of "📣 [label] ": the megaphone renders 2 cols, plus
+    // " [" (2) + label + "] " (2) → label width + 6. Worker labels are ASCII ids
+    // so char count == display width. ANSI codes in `prefix` have zero width.
+    let indent = " ".repeat(label.chars().count() + 6);
+    for line in lines {
+        out.push('\n');
+        out.push_str(&indent);
+        out.push_str(line);
+    }
+    out
 }
+
+/// Separator the coordinator's `message_console` uses to encode a multi-line
+/// note's physical newlines into a SINGLE `📣` sentinel line, so the note
+/// survives the newline-delimited stderr transport intact and the parent frames
+/// its 📣 `[label]` prefix exactly once. U+2028 (LINE SEPARATOR) is not `\n`, so
+/// `AsyncBufRead::next_line` keeps the encoded note on one line; `console_row`
+/// decodes it back into aligned continuation lines.
+pub const CONSOLE_LINE_SEP: char = '\u{2028}';
 
 /// Stream a child's stderr line by line, forwarding the interesting lines to the
 /// user's terminal live via `announce`, and retaining only the last
@@ -1237,6 +1251,16 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
     // the moment the next forwarded line replaces it — exactly like the
     // interactive thinking spinner that animates then vanishes when output begins.
     let mut thinking: Option<ThinkingSpinner> = None;
+    // Whether the LAST forwarded line for this worker was a `💭 thinking…`
+    // notice. Consecutive reasoning rounds emit back-to-back thinking notices
+    // with no activity line between them; without this guard each notice would
+    // start a FRESH spinner — and in printer / off-TTY mode every spinner commits
+    // its OWN static "thinking…" line, waterfalling duplicate rows down the
+    // `:output` pane (the reported bug). We start a spinner only on the
+    // transition activity → thinking and keep it alive across the run, so a
+    // reasoning phase shows ONE animated row (TTY) or ONE static line (printer /
+    // piped) regardless of how many notices it spans.
+    let mut prev_thinking = false;
     // The LIVE read cursor over this worker's shared transcript ring. The live
     // forward stream drains it every forwardable line (advancing it even while
     // the `:worker-output` gate is closed, so it stays caught up and never
@@ -1261,6 +1285,7 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
             if let Some(spin) = thinking.take() {
                 spin.stop();
             }
+            prev_thinking = false;
             // Wrap the always-surfaced console note in blank lines so it is set
             // visually apart from whatever printed immediately before it (a
             // coordinator `·result`, a tool row, or the prompt) AND from whatever
@@ -1343,25 +1368,36 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                     job.stop_backfill_thinking();
                 }
                 if matches!(event, ActivityEvent::Thinking(_)) {
-                    // Model-reasoning phase: replace any prior thinking row, then
-                    // animate THIS one in place (transient) until the worker's
-                    // next forwarded line lands — matching the interactive
-                    // `Spinner` that animates then vanishes when output begins.
-                    // Off a TTY there's no animation: fall back to a one-shot
-                    // static row so piped parents still see the notice.
-                    if let Some(spin) = thinking.take() {
-                        spin.stop();
-                    }
-                    // Hand the spinner the SAME forward-gate handles the stream
-                    // loop reads, so it can self-erase the moment the user
-                    // Shift-Tabs / detaches away mid-think (see ThinkingSpinner).
-                    thinking =
-                        ThinkingSpinner::start(label, show_output.clone(), attached.clone());
-                    if thinking.is_none() {
-                        for (_s, t) in &live_rows {
-                            crate::tools::announce_raw(&render_row(t));
+                    // Model-reasoning phase: show ONE animated "thinking…" row
+                    // that persists until the worker's next forwarded line lands
+                    // — matching the interactive `Spinner` that animates then
+                    // vanishes when output begins. Consecutive notices (multiple
+                    // reasoning rounds with no activity line between) must NOT each
+                    // spawn a fresh spinner: in printer / off-TTY mode every spawn
+                    // commits its OWN static "thinking…" line (the waterfall of
+                    // duplicate rows), and in TTY mode a restart resets the braille
+                    // frame to 0, stuttering the animation. So start a spinner ONLY
+                    // on the transition activity → thinking; a run of back-to-back
+                    // notices keeps the single live spinner turning.
+                    if !prev_thinking && thinking.is_none() {
+                        // Hand the spinner the SAME forward-gate handles the stream
+                        // loop reads, so it can self-erase the moment the user
+                        // Shift-Tabs / detaches away mid-think (see ThinkingSpinner).
+                        thinking = ThinkingSpinner::start(
+                            label,
+                            show_output.clone(),
+                            attached.clone(),
+                        );
+                        if thinking.is_none() {
+                            // Off a TTY there's no animation: emit a single static
+                            // row so piped parents still see the notice (once per
+                            // reasoning run, not per notice).
+                            for (_s, t) in &live_rows {
+                                crate::tools::announce_raw(&render_row(t));
+                            }
                         }
                     }
+                    prev_thinking = true;
                 } else {
                     // Any other forwarded line ENDS the thinking phase: stop +
                     // erase the spinner so this row lands on the cleared line,
@@ -1378,12 +1414,17 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                     for (_s, t) in &live_rows {
                         crate::tools::announce_raw(&render_row(t));
                     }
+                    prev_thinking = false;
                 }
-            } else if let Some(spin) = thinking.take() {
-                // Forwarding just turned off for this worker (e.g. `:detach`
-                // mid-think): stop the animation so it doesn't keep drawing while
-                // suppressed.
-                spin.stop();
+            } else {
+                // Forwarding is off for this worker (e.g. `:detach` mid-think):
+                // stop any animation so it doesn't keep drawing while suppressed,
+                // and reset the thinking-run guard so a fresh spinner starts when
+                // output resumes.
+                if let Some(spin) = thinking.take() {
+                    spin.stop();
+                }
+                prev_thinking = false;
             }
         }
         if tail.len() == STDERR_TAIL_LINES {
@@ -1578,6 +1619,15 @@ fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str, cwd: &std::path::
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Hierarchy link (`:workers` run tree): stamp OUR run id as the child's
+    // parent so the child's coordinator_store row records `parent_run_id`.
+    // `AISH_RUN_ID` is set by our own `coordinator::run` at startup; unset only
+    // in odd test paths, in which case the child is simply treated as a root.
+    if let Ok(rid) = std::env::var("AISH_RUN_ID") {
+        if !rid.is_empty() {
+            cmd.env("AISH_PARENT_RUN_ID", rid);
+        }
+    }
     if let Some(name) = &spec.launch_session_name {
         cmd.env("AISH_LAUNCH_SESSION_NAME", name);
     }
@@ -2373,6 +2423,52 @@ pub fn coordinator_model(backend_kind: &str, batch_model: &str) -> String {
     }
 }
 
+/// Resolve the state-root spool a NESTED coordinator writes spawn requests into.
+/// Inside a container the host mounts the per-worker state volume at
+/// [`crate::container::STATE_MOUNT`] (`/aish/state`); a host-subprocess coordinator has no such
+/// mount and falls back to its own worker state dir. The HOST accept loop polls
+/// the matching path (see `spawn_broker_host::serve_pending`).
+fn in_worker_spool_root() -> PathBuf {
+    let mount = std::path::Path::new(crate::container::STATE_MOUNT);
+    if mount.is_dir() {
+        return mount.to_path_buf();
+    }
+    worker_state_root()
+}
+
+/// Emit a host-brokered sibling-spawn request — the EMIT SITE for the PR #597
+/// follow-up. Builds a non-secret [`crate::spawn_broker::SpawnRequest`] from the
+/// nested session and writes it atomically into the mounted state spool for the
+/// host `aish` to service as a flat sibling coordinator. Returns the spool path
+/// on success. Credentials are NEVER included — the host injects those from its
+/// own env when it rebuilds the argv via `coordinator_argv`.
+pub fn emit_spawn_request(
+    session: &crate::session::Session,
+    task: &str,
+    isolate: bool,
+    base: &str,
+) -> std::io::Result<PathBuf> {
+    let launch_session_id = std::env::var("AISH_LAUNCH_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| session.session_id.clone());
+    let requested_by_worker = std::env::var("AISH_RUN_ID").ok().filter(|s| !s.is_empty());
+    let req = crate::spawn_broker::SpawnRequest::new(
+        Uuid::new_v4().to_string(),
+        task,
+        session.cwd.display().to_string(),
+        session.backend_kind.clone(),
+        coordinator_model(&session.backend_kind, &session.batch_model),
+        isolate,
+        base,
+        crate::spawn_broker::current_budget(),
+        launch_session_id,
+        requested_by_worker,
+    );
+    let root = in_worker_spool_root();
+    crate::spawn_broker::write_request(&root, &req)
+}
+
 /// A background worker subprocess, tracked for the life of the session. Shared
 /// between the REPL (which lists/surfaces it) and the run task (which mutates it).
 pub struct WorkerJob {
@@ -3027,10 +3123,6 @@ fn build_container_command(
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| c::default_network(rt, std::env::consts::OS).to_string()),
         workdir: "/aish/work".to_string(),
-        // Nested-capable OCI runtime (Sysbox) when configured + registered with
-        // dockerd — lets this container's inner aish spawn grandchild containers
-        // with correct path semantics. `None` keeps the stock runc/crun path.
-        runtime_override: c::resolve_runtime_override(rt),
     };
 
     let mut cmd = Command::new(rt.bin());
@@ -3971,6 +4063,24 @@ mod tests {
     }
 
     #[test]
+    fn console_row_frames_prefix_once_for_multiline_notes() {
+        assert_eq!(
+            console_row("goal", "build is taking a while"),
+            "\x1b[1;36m📣 [goal]\x1b[0m build is taking a while"
+        );
+        let encoded = format!("update:{0}• one{0}• two", CONSOLE_LINE_SEP);
+        let rendered = console_row("goal", &encoded);
+        assert_eq!(rendered.matches('📣').count(), 1);
+        assert_eq!(rendered.matches("[goal]").count(), 1);
+        let indent = " ".repeat("goal".len() + 6);
+        assert_eq!(
+            rendered,
+            format!("\x1b[1;36m📣 [goal]\x1b[0m update:\n{indent}• one\n{indent}• two")
+        );
+        assert!(!rendered.contains(CONSOLE_LINE_SEP));
+    }
+
+    #[test]
     fn worker_output_logs_each_tool_call_exactly_once() {
         // Regression: the duplicate tool-call logging bug. A single tool call
         // produces a START line then a RESULT line on the coordinator's stderr;
@@ -4302,14 +4412,16 @@ mod tests {
     }
 
     #[test]
-    fn task_headline_clips_long_tasks_with_an_ellipsis() {
+    fn task_headline_shows_long_tasks_in_full() {
+        // The full task must be preserved — no clipping/ellipsis. `pane_row`
+        // wraps it across bordered continuation rows downstream.
         let long = "word ".repeat(100); // 500 chars, no markers
         let h = task_headline(&long);
-        assert!(h.ends_with('…'), "clipped with ellipsis: {h:?}");
-        assert!(
-            h.chars().count() == TASK_HEADLINE_MAX + 1,
-            "clipped to the bound (+ellipsis): {}",
-            h.chars().count()
+        assert!(!h.contains('…'), "no ellipsis clip: {h:?}");
+        assert_eq!(
+            h,
+            "word ".repeat(100).trim(),
+            "whole task preserved (whitespace collapsed): {h:?}"
         );
     }
 

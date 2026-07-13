@@ -43,7 +43,7 @@ pub struct PluginManifest {
     #[serde(default)]
     pub version: String,
     /// Declared webhook handlers.
-    #[serde(default, alias = "handlers")]
+    #[serde(default)]
     pub webhooks: Vec<WebhookHandler>,
 }
 
@@ -77,13 +77,48 @@ impl PluginRegistry {
             if !manifest_path.is_file() {
                 continue;
             }
-            match std::fs::read_to_string(&manifest_path)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<PluginManifest>(&raw).ok())
-            {
-                Some(m) => plugins.push(m),
-                None => tracing::warn!(path = %manifest_path.display(), "skipping malformed plugin.json"),
+            let raw = match std::fs::read_to_string(&manifest_path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let mut m = match serde_json::from_str::<PluginManifest>(&raw) {
+                Ok(m) => m,
+                Err(_) => {
+                    tracing::warn!(path = %manifest_path.display(), "skipping malformed plugin.json");
+                    continue;
+                }
+            };
+
+            // TASK-447 — fail-fast on the removed `handlers` schema fork.
+            // The one-release `handlers` -> `webhooks` serde alias was retired,
+            // so a manifest still using the legacy top-level `handlers` key now
+            // parses to ZERO webhooks. Rather than silently registering a plugin
+            // with no handlers (the old silent-break), detect the legacy key and
+            // skip the plugin with an actionable migration warning.
+            if m.webhooks.is_empty() && raw_has_legacy_handlers(&raw) {
+                tracing::warn!(
+                    path = %manifest_path.display(),
+                    "plugin.json uses the removed `handlers` key — rename it to `webhooks` \
+                     (the `handlers`->`webhooks` alias was removed in TASK-447); \
+                     no webhook handlers were loaded for this plugin"
+                );
+                continue;
             }
+
+            // Resolve relative handler commands (e.g. "handlers/greet.sh")
+            // against the plugin's own directory so dispatch is independent
+            // of aish's cwd. Bare program names (no '/') are left alone for
+            // PATH lookup; absolute paths are unchanged.
+            let plugin_dir = entry.path();
+            for h in &mut m.webhooks {
+                if let Some(prog) = h.command.first_mut() {
+                    let p = Path::new(prog.as_str());
+                    if p.is_relative() && prog.contains('/') {
+                        *prog = plugin_dir.join(p).to_string_lossy().into_owned();
+                    }
+                }
+            }
+            plugins.push(m);
         }
         Ok(Self { plugins })
     }
@@ -146,6 +181,20 @@ impl HandlerOutcome {
     }
 }
 
+/// TASK-447 — true when the raw manifest JSON carries a non-empty top-level
+/// `handlers` array: the retired legacy key that the `webhooks` field no longer
+/// aliases. [`PluginRegistry::load_dir`] uses this to turn a silent empty-load
+/// into an actionable migration warning.
+fn raw_has_legacy_handlers(raw: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("handlers"))
+        .and_then(|h| h.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+}
+
 /// Look up a dotted path (`"a.b.c"`) in a JSON value.
 fn get_path<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     let mut cur = v;
@@ -165,11 +214,18 @@ pub fn passes_filters(
         .all(|(k, expected)| get_path(payload, k).map(|got| got == expected).unwrap_or(false))
 }
 
+/// Sink for surfacing a handler's stdout live (e.g. the SecondStatusLine
+/// "flash" slot). Called once per successfully-executed handler with non-empty
+/// stdout. Kept as a plain `Fn(String)` so the crate stays decoupled from
+/// aish's `session.flash` type — the caller adapts it (cap/format) to the slot.
+pub type FlashSink = Arc<dyn Fn(String) + Send + Sync>;
+
 /// Dispatches webhooks to plugin handlers (Phase 5 seam realized).
 pub struct WebhookDispatcher {
     registry: Arc<PluginRegistry>,
     default_timeout: Duration,
     audit: Arc<dyn AuditSink>,
+    flash: Option<FlashSink>,
 }
 
 impl WebhookDispatcher {
@@ -178,7 +234,17 @@ impl WebhookDispatcher {
             registry,
             default_timeout: DEFAULT_HANDLER_TIMEOUT,
             audit: Arc::new(NoopAuditSink),
+            flash: None,
         }
+    }
+
+    /// Attach a [`FlashSink`]. Every executed handler that exits with a non-empty
+    /// stdout has that stdout handed to the sink — this is the seam that carries
+    /// a received webhook's handler output to the SecondStatusLine. Defaults to
+    /// no sink (a soft no-op), so tests and headless callers need not set one.
+    pub fn with_flash_sink(mut self, sink: FlashSink) -> Self {
+        self.flash = Some(sink);
+        self
     }
 
     pub fn with_default_timeout(mut self, d: Duration) -> Self {
@@ -258,6 +324,18 @@ impl WebhookDispatcher {
             } else if o.executed {
                 tracing::info!(plugin_id = %o.plugin_id, event_type = %o.event_type,
                     duration_ms = o.duration_ms, "handler ok");
+            }
+        }
+
+        // Surface each executed handler's stdout to the flash sink (the
+        // SecondStatusLine). This is the seam that carries a broker-delivered
+        // webhook's handler output all the way to the statusline. Only
+        // non-empty stdout from a handler that actually ran is flashed.
+        if let Some(flash) = &self.flash {
+            for o in &outcomes {
+                if o.executed && !o.stdout.trim().is_empty() {
+                    flash(o.stdout.clone());
+                }
             }
         }
 
@@ -482,6 +560,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handler_stdout_reaches_flash_sink() {
+        use std::sync::Mutex;
+        let reg = PluginRegistry::from_plugins(vec![PluginManifest {
+            id: "hello-world".into(),
+            name: "".into(),
+            version: "".into(),
+            webhooks: vec![WebhookHandler {
+                event_type: "issues".into(),
+                command: vec!["printf".into(), "Hello, World!".into()],
+                filters: Default::default(),
+                timeout_secs: None,
+            }],
+        }]);
+        let flashed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_store = flashed.clone();
+        let d = WebhookDispatcher::new(Arc::new(reg)).with_flash_sink(Arc::new(
+            move |msg: String| sink_store.lock().unwrap().push(msg),
+        ));
+        let outs = d.dispatch(&wh("issues", json!({"action":"opened"}))).await;
+        assert!(outs[0].success);
+        let got = flashed.lock().unwrap();
+        assert_eq!(got.len(), 1, "exactly one flash for one executed handler");
+        assert!(got[0].contains("Hello, World!"), "stdout reached statusline sink");
+    }
+
+    #[tokio::test]
+    async fn no_flash_sink_is_soft_noop() {
+        // Absence of a sink must not break dispatch.
+        let reg = PluginRegistry::from_plugins(vec![PluginManifest {
+            id: "hello-world".into(),
+            name: "".into(),
+            version: "".into(),
+            webhooks: vec![WebhookHandler {
+                event_type: "issues".into(),
+                command: vec!["printf".into(), "hi".into()],
+                filters: Default::default(),
+                timeout_secs: None,
+            }],
+        }]);
+        let d = WebhookDispatcher::new(Arc::new(reg));
+        let outs = d.dispatch(&wh("issues", json!({}))).await;
+        assert!(outs[0].success);
+    }
+
+    #[tokio::test]
     async fn handler_timeout_is_bounded() {
         let reg = PluginRegistry::from_plugins(vec![PluginManifest {
             id: "slow".into(),
@@ -540,5 +663,149 @@ mod tests {
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.matching("pull_request").len(), 1);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// TASK-447 — the retired `handlers` key must fail fast, not silently load.
+    ///
+    /// The one-release `handlers` -> `webhooks` serde alias was removed. A
+    /// manifest still using the legacy top-level `handlers` key now parses to
+    /// zero webhooks; `load_dir` MUST skip such a plugin (with a warning) rather
+    /// than register a silent no-op plugin. This locks in the fail-fast contract.
+    #[test]
+    fn load_dir_skips_legacy_handlers_key() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("aish-wh-legacy-{}-{uniq}", std::process::id()));
+        let pdir = base.join("legacy");
+        std::fs::create_dir_all(&pdir).unwrap();
+        // Legacy schema: top-level `handlers` (no `webhooks`).
+        std::fs::write(
+            pdir.join("plugin.json"),
+            r#"{"id":"legacy","handlers":[{"event_type":"push","command":["true"]}]}"#,
+        )
+        .unwrap();
+        let reg = PluginRegistry::load_dir(&base).unwrap();
+        assert_eq!(reg.len(), 0, "legacy handlers-only manifest must be skipped, not silently loaded");
+        assert_eq!(reg.matching("push").len(), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// TASK-447 — a valid `webhooks` manifest sitting next to a legacy one is
+    /// still loaded (the fail-fast skip is per-plugin, never fleet-wide).
+    #[test]
+    fn load_dir_loads_webhooks_next_to_legacy() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("aish-wh-mixed-{}-{uniq}", std::process::id()));
+        std::fs::create_dir_all(base.join("legacy")).unwrap();
+        std::fs::create_dir_all(base.join("modern")).unwrap();
+        std::fs::write(
+            base.join("legacy").join("plugin.json"),
+            r#"{"id":"legacy","handlers":[{"event_type":"push","command":["true"]}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("modern").join("plugin.json"),
+            r#"{"id":"modern","webhooks":[{"event_type":"push","command":["true"]}]}"#,
+        )
+        .unwrap();
+        let reg = PluginRegistry::load_dir(&base).unwrap();
+        assert_eq!(reg.len(), 1, "only the modern `webhooks` plugin is registered");
+        assert_eq!(reg.matching("push").len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn raw_has_legacy_handlers_detects_key() {
+        assert!(raw_has_legacy_handlers(
+            r#"{"handlers":[{"event_type":"push","command":["h.sh"]}]}"#
+        ));
+        // `webhooks` is the canonical key — not the legacy fork.
+        assert!(!raw_has_legacy_handlers(
+            r#"{"webhooks":[{"event_type":"push","command":["h.sh"]}]}"#
+        ));
+        // An empty `handlers` array is not an actionable migration signal.
+        assert!(!raw_has_legacy_handlers(r#"{"handlers":[]}"#));
+        assert!(!raw_has_legacy_handlers(r#"{"id":"x"}"#));
+    }
+
+    /// TASK-446 — shell-injection regression guard.
+    ///
+    /// Handlers are fork/exec'd (`Command::new(&command[0]).args(..)`) with NO
+    /// shell, so metacharacters in a command argument or in the JSON payload
+    /// MUST be passed through literally and never interpreted. If a shell were
+    /// ever (re)introduced into the dispatch path, the `;`/`&&`/`$()` payloads
+    /// below would create sentinel files and this test would fail — locking in
+    /// the no-shell guarantee.
+    #[tokio::test]
+    async fn command_args_and_payload_are_not_shell_interpreted() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("aish-wh-inject-{}-{uniq}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1) Metacharacters in a COMMAND ARGUMENT must stay literal.
+        let sentinel = dir.join("PWNED_ARG");
+        assert!(!sentinel.exists());
+        let injection = format!(
+            "hi; touch {s} && echo x $(touch {s})",
+            s = sentinel.display()
+        );
+        let reg = PluginRegistry::from_plugins(vec![PluginManifest {
+            id: "inject".into(),
+            name: "".into(),
+            version: "".into(),
+            webhooks: vec![WebhookHandler {
+                event_type: "push".into(),
+                command: vec!["echo".into(), injection.clone()],
+                filters: Default::default(),
+                timeout_secs: None,
+            }],
+        }]);
+        let d = WebhookDispatcher::new(Arc::new(reg));
+        let outs = d.dispatch(&wh("push", json!({}))).await;
+        assert_eq!(outs.len(), 1);
+        assert!(outs[0].executed && outs[0].success);
+        // The metacharacters were echoed back verbatim (proving `echo` saw them
+        // as a single literal arg)...
+        assert!(outs[0].stdout.contains("; touch"));
+        assert!(outs[0].stdout.contains("$(touch"));
+        // ...and NO shell side effect fired.
+        assert!(
+            !sentinel.exists(),
+            "shell injection executed via command arg — sentinel was created"
+        );
+
+        // 2) Metacharacters in the JSON PAYLOAD (delivered on stdin, never to a
+        // shell) must also be inert.
+        let sentinel2 = dir.join("PWNED_STDIN");
+        let reg2 = PluginRegistry::from_plugins(vec![PluginManifest {
+            id: "inject2".into(),
+            name: "".into(),
+            version: "".into(),
+            webhooks: vec![WebhookHandler {
+                event_type: "push".into(),
+                command: vec!["cat".into()],
+                filters: Default::default(),
+                timeout_secs: None,
+            }],
+        }]);
+        let d2 = WebhookDispatcher::new(Arc::new(reg2));
+        let evil = json!({"x": format!("$(touch {s}); touch {s}", s = sentinel2.display())});
+        let outs2 = d2.dispatch(&wh("push", evil)).await;
+        assert_eq!(outs2.len(), 1);
+        assert!(outs2[0].success);
+        assert!(
+            !sentinel2.exists(),
+            "shell injection executed via stdin payload — sentinel was created"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

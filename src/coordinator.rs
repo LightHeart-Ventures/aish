@@ -111,7 +111,11 @@ and `git worktree list` to see whether a PEER coordinator or existing branch/wor
 doing THIS task. IF the feature already exists — STOP and report \"Feature already shipped via \
 <PR/commit/branch>\" with the evidence, rather than rebuilding it. IF a peer is already on it — \
 defer or `tell`-coordinate instead of duplicating. ONLY when the existence check comes back empty \
-do you proceed to build. This is cheap insurance on every build task — a 2–3 call guard that \
+do you proceed to build. (4) Before your FIRST edit, if the codebase-memory MCP server is \
+connected, call `detect_changes` to map your working-tree changes → affected symbols + a risk \
+classification, and fold that affected-symbol/risk summary into this guard's reasoning AND the \
+draft-PR body; when the server is absent, skip this step silently and continue as today. This is \
+cheap insurance on every build task — a 2–3 call guard that \
 prevents an 87-call runaway.";
 
 /// The 5-PHASE PIPELINE directive (TASK-356). Complements `PHASE0_GUARD` by
@@ -148,6 +152,44 @@ write whose content depends on a value you have not yet read.\n\
 --- PHASE 4: VALIDATION --- (1–2 calls, SERIAL) Run the canonical gate once (for aish: \
 `cargo test --no-default-features --locked`) and confirm green, then open/finish the PR. One check, \
 not a re-inspection of every file you just wrote.";
+
+/// TASK-406 + TASK-410: advertise the codebase-memory MCP code-intelligence
+/// tools to the coordinator as FIRST-CLASS discovery, so a single structural
+/// graph query is preferred over a grep→read loop. The token-efficiency
+/// headline (~3.4k tokens for five structural queries vs ~412k for the
+/// equivalent grep/read scan) is stated inline so the model has a concrete
+/// reason to reach for the graph first. This is purely a prompt-surface
+/// advertisement — the tools arrive free via MCP once the `:codebase` server is
+/// enrolled; when the server is ABSENT the model simply won't have them and the
+/// guidance is a no-op (graceful degradation, TASK-411). It also delineates
+/// `manage_adr` (code-architecture decisions, graph-tied) from aish's durable
+/// `remember()`/memory.rs facts so the two stores aren't conflated (TASK-410).
+/// Held as a `const` so the advertisement is unit-testable without a live MCP
+/// connection.
+const CODE_INTEL_DISCOVERY: &str = "CODE-INTELLIGENCE DISCOVERY — prefer a structural graph query \
+over a grep→read loop. When the codebase-memory MCP server is connected, these tools answer \
+architecture questions in ONE call instead of dozens of file reads (~3.4k tokens for five \
+structural queries vs ~412k for the equivalent grep/read scan) — reach for them FIRST during \
+Phase-1 discovery, and fall back to grep/read only when they are unavailable:\n\
+- `get_architecture` — high-level module/layer map of the repo; start here instead of listing and \
+reading directories one by one.\n\
+- `search_graph` — locate a symbol with its definition and usages structurally (replaces a grep \
+sweep plus several read_files).\n\
+- `trace_path` — trace the call/dependency path between two symbols (who calls what) without \
+manually walking files.\n\
+- `semantic_query` — ask a natural-language question over the indexed graph when you don't yet \
+know the symbol name.\n\
+- dead-code detection — find unreferenced/unreachable symbols before you add, move, or delete \
+code.\n\
+- `detect_changes` — map uncommitted changes → affected symbols + risk (used by the Phase-0 guard \
+and folded into the draft-PR body).\n\
+- `manage_adr` — record and recall Architectural Decision Records so design decisions persist \
+structurally across sessions. This is DISTINCT from aish's durable-facts memory (memory.rs / the \
+`remember()` tool): memory.rs holds free-form project facts and preferences, while `manage_adr` \
+holds code-architecture decisions tied to the graph. Use ADRs for \"why this design\", `remember()` \
+for \"this project fact\" — do not duplicate one store in the other.\n\
+GRACEFUL ABSENCE: if the codebase-memory server is not connected these tools are simply \
+unavailable — fall back to grep/read as today and NEVER fail a run over their absence.";
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -578,10 +620,30 @@ pub async fn drive(
         });
     }
 
+    // Stamp our own run id into the process env so any sub-coordinator we spawn
+    // (via `run_in_background` → `worker_command` / container `env_inline`) can
+    // read it as `AISH_PARENT_RUN_ID` and record us as its parent — this is what
+    // lets `:workers` render the run tree. Root (REPL-launched) runs leave the
+    // var set for their own children; they themselves have no parent.
+    // SAFETY: single-threaded startup, before any worker is spawned.
+    unsafe {
+        std::env::set_var("AISH_RUN_ID", run_id);
+    }
+    // Our parent, if we were spawned by another coordinator (unset ⇒ root run).
+    let parent_run_id = std::env::var("AISH_PARENT_RUN_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+
     if let Some(s) = store {
         // session.session_id/name were adopted from the LAUNCHING session at
         // startup (see main.rs), so the row attributes to who asked for the work.
-        let _ = s.insert(run_id, &input, &session.session_id, session.name.as_deref());
+        let _ = s.insert_with_parent(
+            run_id,
+            &input,
+            &session.session_id,
+            session.name.as_deref(),
+            parent_run_id.as_deref(),
+        );
         // TASK-289: record this live coordinator PROCESS in the durable registry
         // so a parent-death restart can reap our pid (and, once TASK-291 lands,
         // resume an in-flight Batches job). `coord_id` == `run_id`; generation 0
@@ -715,7 +777,8 @@ the SAME turn; a turn ends when you reply, so a bare narration executes nothing.
 streamer like `gh run watch` must be launched as a background job (run_program background:true) and read \
 later via job_output, or polled with a visible foreground `gh run view --json status,conclusion` — never \
 describe having watched it otherwise. Confirm every outcome you report with a real read (gh run view, gh \
-release view, git show, a status query) and state only what that evidence shows; if you could not verify \
+release view, git show, a status query) and state only what that evidence shows — a fresh read is cheaper than a wrong \
+assertion, so verify unprompted; if you could not verify \
 something, say so explicitly rather than inventing a result.\n\nDECISION POINTS — avoid loops: If you notice you are repeating the same action or re-deriving a \
 fact you already have, STOP and change approach. After about 3 failed attempts at the SAME \
 sub-problem, do NOT keep retrying the same way — either try a materially different approach or \
@@ -737,7 +800,7 @@ feature branch (you are typically already on a dedicated work branch — commit 
 or push the default branch), push it, and open a DRAFT pull request with `gh pr create --draft --fill` \
 (pass `--title`/`--body` when `--fill` cannot infer them). Put the PR URL in your final answer. If there \
 are no committable changes, or `gh`/the remote is unavailable, skip the PR and report the branch name \
-plus `git status` instead — do not fail the run over it.\n\n{PHASE0_GUARD}\n\n{PHASE_PIPELINE}\n\nTASK:\n{input}",
+plus `git status` instead — do not fail the run over it.\n\n{PHASE0_GUARD}\n\n{PHASE_PIPELINE}\n\n{CODE_INTEL_DISCOVERY}\n\nTASK:\n{input}",
         cwd = session.cwd.display(),
     );
 
@@ -1660,6 +1723,16 @@ mod tests {
             g.contains("already shipped"),
             "reports the already-shipped conclusion with evidence"
         );
+        // TASK-408: the guard advertises the codebase-memory `detect_changes`
+        // pre-edit call, and is explicit that its absence is a silent no-op.
+        assert!(
+            g.contains("detect_changes"),
+            "guard calls detect_changes before the first edit when available"
+        );
+        assert!(
+            g.contains("skip this step silently"),
+            "guard degrades gracefully when codebase-memory is absent"
+        );
     }
 
     #[test]
@@ -2015,6 +2088,7 @@ mod tests {
             error: None,
             session_id: session_id.map(str::to_string),
             session_name: None,
+            parent_run_id: None,
             created_at: None,
             heartbeat_at,
             tokens_in: 0,

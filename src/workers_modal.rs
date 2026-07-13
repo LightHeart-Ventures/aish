@@ -32,6 +32,10 @@ use std::io::{self, Write};
 pub struct WorkerRow {
     /// Stable run id — the value handed to `attach_worker` / `close_worker`.
     pub id: String,
+    /// Worker-type glyph: 🤖 coordinator · 🎯 goal · ⏰ alert. Derived from the
+    /// task text (`crate::style::job_activity_emoji`) so the modal shows the
+    /// same type indicator the static `:workers` table stamps.
+    pub type_emoji: String,
     /// Display id (may carry a `↻N` resumed-thread marker).
     pub id_cell: String,
     /// Session label cell (e.g. `abcd *`).
@@ -46,6 +50,12 @@ pub struct WorkerRow {
     pub task: String,
     /// Raw result cell (`✓ #42`, `✗ …`, `—`) for `styled_result`.
     pub result_cell: String,
+    /// Display-only parent linkage (durable `parent_run_id`). `None` at a root.
+    /// Used only to order/indent the forest — never for dispatch.
+    pub parent_id: Option<String>,
+    /// Depth in the forest (0 = root). Set by [`build_worker_forest`]; the
+    /// table/modal indent the `task` cell by this many levels.
+    pub depth: usize,
 }
 
 /// What the operator chose when the modal returned.
@@ -80,6 +90,69 @@ pub fn move_selection(sel: usize, len: usize, key: Key) -> usize {
         Key::Down => (sel + 1).min(len - 1),
         _ => sel.min(len - 1),
     }
+}
+
+/// Order a flat set of [`WorkerRow`]s into a stable pre-order **forest** and
+/// stamp each row's `depth`.
+///
+/// - **Roots** are rows whose `parent_id` is `None` *or* whose parent is not
+///   present in the input set (a transitive descendant whose coordinator this
+///   session can't see degrades gracefully to a root). Root order is preserved
+///   from the input (callers pass newest-first).
+/// - Each root is immediately followed by its children (input order preserved),
+///   recursively, each indented one `depth` level deeper.
+/// - **Cycles** and repeated visits are guarded: every id is emitted at most
+///   once, so a `parent_id` chain that loops can't spin or duplicate rows.
+///
+/// Pure and allocation-simple so it can be unit-tested without a live session.
+pub fn build_worker_forest(rows: Vec<WorkerRow>) -> Vec<WorkerRow> {
+    use std::collections::{HashMap, HashSet};
+
+    let present: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
+    // parent id -> child indices, preserving input order.
+    let mut children: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        match &r.parent_id {
+            Some(p) if present.contains(p) && p != &r.id => {
+                children.entry(p.clone()).or_default().push(i);
+            }
+            // None, unknown parent, or self-parent → root.
+            _ => roots.push(i),
+        }
+    }
+
+    let mut out: Vec<WorkerRow> = Vec::with_capacity(rows.len());
+    let mut emitted: HashSet<usize> = HashSet::new();
+    // Explicit stack of (row index, depth) for pre-order DFS without recursion.
+    // Push roots in reverse so the stack pops them in input (newest-first) order.
+    let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|&i| (i, 0usize)).collect();
+    while let Some((i, depth)) = stack.pop() {
+        if !emitted.insert(i) {
+            continue; // cycle / already emitted — skip.
+        }
+        let mut row = rows[i].clone();
+        row.depth = depth;
+        let id = row.id.clone();
+        out.push(row);
+        if let Some(kids) = children.get(&id) {
+            for &c in kids.iter().rev() {
+                if !emitted.contains(&c) {
+                    stack.push((c, depth + 1));
+                }
+            }
+        }
+    }
+    // Any row never reached (part of a pure cycle with no root entry) is
+    // appended as a depth-0 root so nothing silently vanishes.
+    for (i, r) in rows.into_iter().enumerate() {
+        if !emitted.contains(&i) {
+            let mut row = r;
+            row.depth = 0;
+            out.push(row);
+        }
+    }
+    out
 }
 
 /// Feed one read-chunk of raw tty bytes through the CSI state machine, returning
@@ -332,7 +405,8 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
     });
     // Column header.
     let header = format!(
-        "  {}  {}  {}  {}",
+        "  {}  {}  {}  {}  {}",
+        pad("", 2), // type-glyph column (🤖/🎯/⏰ render 2 cells wide)
         pad("Worker", id_w),
         pad("Status", st_w + 2),
         pad("Runtime", rt_w),
@@ -355,10 +429,21 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
         } else {
             "  "
         };
-        let task = clip(&r.task, 60);
+        // Indent nested subworkers under their parent so the forest reads as a
+        // tree; roots (depth 0) are flush. A `└ ` elbow marks each child.
+        let task = if r.depth > 0 {
+            let indent = "  ".repeat(r.depth);
+            let budget = 60usize.saturating_sub(indent.chars().count() + 2);
+            format!("{indent}└ {}", clip(&r.task, budget))
+        } else {
+            clip(&r.task, 60)
+        };
+        // Type glyph rides at the front (unpadded — every glyph is 2 cells, so
+        // the data columns stay aligned with the blank 2-wide header cell).
         let body = format!(
-            "{}{}  {}  {}  {}",
+            "{}{}  {}  {}  {}  {}",
             gutter,
+            r.type_emoji,
             pad(&r.id_cell, id_w),
             pad(&crate::style::styled_status(&r.status), st_w + 2),
             pad(&r.runtime_cell, rt_w),
@@ -607,5 +692,84 @@ mod tests {
     fn clip_adds_ellipsis() {
         assert_eq!(clip("short", 10), "short");
         assert_eq!(clip("abcdefghij", 5), "abcd…");
+    }
+
+    /// Minimal [`WorkerRow`] for forest tests — only `id`/`parent_id` matter to
+    /// [`build_worker_forest`]; every other cell is a placeholder.
+    fn wr(id: &str, parent: Option<&str>) -> WorkerRow {
+        WorkerRow {
+            id: id.into(),
+            type_emoji: "🤖".into(),
+            id_cell: id.into(),
+            session_label: "—".into(),
+            status: "running".into(),
+            started_cell: "—".into(),
+            runtime_cell: "—".into(),
+            task: id.into(),
+            result_cell: "—".into(),
+            parent_id: parent.map(|p| p.into()),
+            depth: 0,
+        }
+    }
+
+    fn ids_depths(rows: &[WorkerRow]) -> Vec<(String, usize)> {
+        rows.iter().map(|r| (r.id.clone(), r.depth)).collect()
+    }
+
+    #[test]
+    fn forest_roots_only_preserve_input_order() {
+        // No parents → every row is a depth-0 root, order preserved.
+        let out = build_worker_forest(vec![wr("a", None), wr("b", None), wr("c", None)]);
+        assert_eq!(
+            ids_depths(&out),
+            vec![("a".into(), 0), ("b".into(), 0), ("c".into(), 0)]
+        );
+    }
+
+    #[test]
+    fn forest_nests_children_under_parent_preorder() {
+        // a ← b ← c (grandchild) and a ← d; root e. Pre-order with depth.
+        let out = build_worker_forest(vec![
+            wr("a", None),
+            wr("e", None),
+            wr("b", Some("a")),
+            wr("c", Some("b")),
+            wr("d", Some("a")),
+        ]);
+        assert_eq!(
+            ids_depths(&out),
+            vec![
+                ("a".into(), 0),
+                ("b".into(), 1),
+                ("c".into(), 2),
+                ("d".into(), 1),
+                ("e".into(), 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn forest_unknown_parent_degrades_to_root() {
+        // Parent id not present in the set → the child renders as a root.
+        let out = build_worker_forest(vec![wr("x", Some("ghost"))]);
+        assert_eq!(ids_depths(&out), vec![("x".into(), 0)]);
+    }
+
+    #[test]
+    fn forest_cycle_is_guarded_no_spin_no_dup() {
+        // a↔b mutual parents (pure cycle, no root entry): each emitted once,
+        // appended as depth-0 roots rather than spinning or duplicating.
+        let out = build_worker_forest(vec![wr("a", Some("b")), wr("b", Some("a"))]);
+        assert_eq!(out.len(), 2);
+        let mut ids: Vec<_> = out.iter().map(|r| r.id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn forest_self_parent_is_root() {
+        // A row that lists itself as parent must not nest under itself.
+        let out = build_worker_forest(vec![wr("s", Some("s"))]);
+        assert_eq!(ids_depths(&out), vec![("s".into(), 0)]);
     }
 }

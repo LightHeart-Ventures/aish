@@ -183,12 +183,21 @@ pub async fn run(
             .fire_observe(crate::hooks::HookEvent::SessionStart, p);
     }
 
+    // First-run repo notice: if we launched inside a git checkout, surface
+    // "Working with repository: <name>" on the SecondStatusLine. Deduped by
+    // repo_key so a later change_dir into the same repo won't re-announce.
+    // Skipped for nested background coordinators (no interactive footer).
+    if !session.nested {
+        session.announce_repo_if_new();
+    }
+
     // SPR-059 (TASK-264/265): connect to the webhook broker when
     // WEBHOOK_BROKER_URL is set. Skipped in nested background coordinators — the
     // broker client is an interactive-session affordance. Soft no-op (returns
     // None) when the env var is unset, which is the common case.
     if !session.nested {
-        if let Some(h) = crate::webhook::WebhookHandle::spawn_from_env() {
+        let flash = crate::webhook::flash_sink_from_slot(session.flash.clone());
+        if let Some(h) = crate::webhook::WebhookHandle::spawn_from_env(Some(flash)) {
             println!(
                 "\x1b[2m🪝 webhook: connecting to {} (tenant {}, {} handler(s))\x1b[0m",
                 h.broker_url, h.tenant_id, h.handler_count
@@ -315,6 +324,30 @@ pub async fn run(
                         break;
                     }
                     resized_sig.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+        // SIGCONT → the process was just resumed after being stopped (OS
+        // suspend/resume — laptop sleep, lid-close, hibernate — or a `fg` after
+        // Ctrl-Z / kill -STOP). Nothing else tells aish the world moved: the
+        // pinned footer may have scrolled away or lost its scroll region while
+        // parked, the terminal may have been resized during the sleep window,
+        // and the monotonic idle clock froze across the suspend so the heartbeat
+        // under-counts the gap and won't self-heal promptly. On wake we (a) flag
+        // a resize so the loop re-establishes the region + prompt at the live
+        // size on its next idle pass, and (b) re-sync the footer immediately so
+        // the heal is live rather than deferred until the next keystroke.
+        let resized_cont = resized.clone();
+        tokio::spawn(async move {
+            if let Ok(mut sig) = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::from_raw(libc::SIGCONT),
+            ) {
+                loop {
+                    if sig.recv().await.is_none() {
+                        break;
+                    }
+                    resized_cont.store(true, Ordering::SeqCst);
+                    crate::terminal::resync_after_wake();
                 }
             }
         });
@@ -466,7 +499,7 @@ pub async fn run(
                     if let Ok(fired) = store.take_fired() {
                         let mut ring = false;
                         for (_id, detail, short, audible) in fired {
-                            crate::tools::print_above_prompt(format!("{detail}\n"));
+                            crate::tools::print_above_prompt(format!("{detail}\n\n"));
                             // Severity-tiered: infer the tier from the banner +
                             // detail text so the footer badge is colored by
                             // seriousness, and append the event to the
@@ -796,7 +829,22 @@ pub async fn run(
                                 .count()
                         })
                         .unwrap_or(0);
-                    crate::editor::set_background_pending(outstanding_workers > 0);
+                    // Gate #2 (worker-resume review): also take the poll path
+                    // whenever this session is ATTACHED to a worker — even a
+                    // FINISHED one under review (outstanding_workers == 0). In
+                    // review mode the presenter still streams rows above the
+                    // prompt; the poll loop's dirty-repaint (take_idle_prompt_dirty)
+                    // keeps the prompt line alive, whereas the plain rustyline read
+                    // gets its prompt clobbered by those writes. `attached` is
+                    // Some(worker_id) exactly in that resume/review window.
+                    let attached_to_worker = session
+                        .attached
+                        .lock()
+                        .map(|a| a.is_some())
+                        .unwrap_or(false);
+                    crate::editor::set_background_pending(
+                        outstanding_workers > 0 || attached_to_worker,
+                    );
                     editor.read_line(&prompt)
                 }
                 },
@@ -1112,22 +1160,46 @@ pub async fn run(
                                 goal_active,
                             );
                         });
-                    // Mid-turn type-ahead is enabled only when the pinned footer
-                    // is active (so the typed line can be echoed into its message
-                    // row). Escape hatch: set AISH_MIDTURN_INPUT=0 to disable and
-                    // fall back to the legacy Shift-Tab-only reader.
-                    let midturn_on = footer_active
-                        && std::env::var("AISH_MIDTURN_INPUT")
-                            .map(|v| v != "0")
-                            .unwrap_or(true);
+                    // Mid-turn type-ahead is normally enabled only when the pinned
+                    // footer is active (so the typed line can be echoed into its
+                    // message row). Gate #1: on a short / non-footer terminal there
+                    // IS no message row, so opt into an INLINE affordance
+                    // (`\r\x1b[2K❯ …` above the stream) with AISH_MIDTURN_INLINE=1.
+                    // Escape hatch: AISH_MIDTURN_INPUT=0 disables mid-turn capture
+                    // entirely (legacy Shift-Tab-only reader).
+                    let midturn_input_enabled = std::env::var("AISH_MIDTURN_INPUT")
+                        .map(|v| v != "0")
+                        .unwrap_or(true);
+                    let midturn_inline_requested = std::env::var("AISH_MIDTURN_INLINE")
+                        .map(|v| v != "0" && !v.is_empty())
+                        .unwrap_or(false);
+                    // Inline only kicks in when there's no footer to paint into;
+                    // with a footer the (race-free) footer path always wins.
+                    let midturn_inline = midturn_inline_requested && !footer_active;
+                    let midturn_on =
+                        midturn_input_enabled && (footer_active || midturn_inline);
                     let (mt_line_tx, mut mt_line_rx) =
                         tokio::sync::mpsc::unbounded_channel::<String>();
+                    let midturn_prompt = "\x1b[2m❯\x1b[0m ".to_string();
                     let midturn = midturn_on.then(|| crate::keywatch::MidturnCfg {
                         line_tx: mt_line_tx,
-                        prompt: "\x1b[2m❯\x1b[0m ".to_string(),
+                        prompt: midturn_prompt.clone(),
+                        inline: midturn_inline,
                     });
                     let mut keywatch =
                         crate::keywatch::TurnKeyWatch::install(Some(on_shift_tab), midturn);
+                    // Prime the prompt sigil the moment the turn starts, so the
+                    // operator can SEE there is a prompt to type into (and Shift-Tab
+                    // to cycle workers) DURING thinking / tool-calls — not only after
+                    // the first keystroke. Route to the footer message row or the
+                    // inline path per gate. Cleared on turn teardown (keywatch guard).
+                    if midturn_on {
+                        if midturn_inline {
+                            crate::terminal::set_midturn_inline(&midturn_prompt, "");
+                        } else {
+                            crate::terminal::set_midturn_input(&midturn_prompt, "");
+                        }
+                    }
                     let turn = engine::run_turn(&backend, &mut session, line, &mut confirm);
                     tokio::pin!(turn);
                     loop {
@@ -1361,6 +1433,80 @@ fn recent_message_row(baseline: String, flash: Option<String>) -> String {
 ///
 /// The returned string is already colorized (ANSI when color is enabled); the
 /// footer renderer clips it to width via `clip_visible`, which is escape-aware.
+/// How long a cached statusline-segment file may go un-refreshed before we stop
+/// surfacing it. A live plugin rewrites its `*.txt` on a cadence (ccquota every
+/// ~600s); once it stops (uninstalled / crashed) we don't want its last badge
+/// pinned to the footer forever. One hour is generous for slow refreshers.
+const STATUSLINE_SEGMENT_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Hard cap on the visible width of the folded segment area, so a verbose plugin
+/// can't crowd the live coordinator/schedule hint off the SecondStatusLine.
+const STATUSLINE_SEGMENT_MAX_COLS: usize = 48;
+
+/// The directory plugins drop cached SecondStatusLine segment files into:
+/// `~/.aish/state/statusline/`. `None` when `$HOME` is unset (segments off).
+fn statusline_segment_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(
+        PathBuf::from(home)
+            .join(".aish")
+            .join("state")
+            .join("statusline"),
+    )
+}
+
+/// Read cached SecondStatusLine segment files from `dir` (`*.txt`), returning
+/// each file's first non-empty line as a ready-to-render segment (the plugin
+/// owns the color codes). Pure + injectable (`now`/`stale_after`) so it unit
+/// tests without touching the real home dir. Skips: non-`.txt` files, files
+/// whose mtime is older than `stale_after` (a plugin that stopped refreshing),
+/// empty/whitespace-only bodies, and anything unreadable. Sorted by file name
+/// for stable, deterministic ordering across plugins.
+fn statusline_segments(
+    dir: &Path,
+    now: std::time::SystemTime,
+    stale_after: std::time::Duration,
+) -> Vec<String> {
+    let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("txt"))
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    entries.sort();
+    let mut out = Vec::new();
+    for path in entries {
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if let Ok(modified) = meta.modified() {
+            if now
+                .duration_since(modified)
+                .map(|age| age > stale_after)
+                .unwrap_or(false)
+            {
+                continue; // stale — plugin stopped refreshing
+            }
+        }
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(line) = body
+            .lines()
+            .map(str::trim_end)
+            .find(|l| !l.trim().is_empty())
+        {
+            out.push(line.to_string());
+        }
+    }
+    out
+}
+
+
 fn coordinator_status_message(session: &Session) -> String {
     let attached = session.attached.lock().unwrap().clone();
     // Same ordering as `cycle_worker`: newest coordinator first (spawn order
@@ -1408,15 +1554,85 @@ fn coordinator_status_message(session: &Session) -> String {
     // it. With no flash pending, the live attach/detach + schedule hint shows
     // through. The flash is dropped on the next attach/detach transition so the
     // fresh hint resurfaces.
+    // Fold cached plugin statusline segments (`~/.aish/state/statusline/*.txt`)
+    // onto the SecondStatusLine — e.g. the ccquota Claude-Code subscription-burn
+    // badge (SPR-073). Any plugin can drop a colorized `*.txt` file here; we read
+    // it cheaply on the idle repaint tick (no keystroke needed). Files gone stale
+    // (a plugin that stopped refreshing) or unreadable are skipped. Placed to the
+    // RIGHT of the live coordinator/schedule hint so operator state stays primary.
+    {
+        // TASK-318: first-class, core-owned in-memory segments come first
+        // (`provides.statusline` — cadence/cache/render owned by core), then the
+        // Phase 1 file-convention segments for backward compat with any plugin
+        // (or external process) still dropping a colorized `*.txt` badge.
+        let mut segs = crate::plugin_statusline::segments(STATUSLINE_SEGMENT_STALE_AFTER);
+        if let Some(dir) = statusline_segment_dir() {
+            segs.extend(statusline_segments(
+                &dir,
+                std::time::SystemTime::now(),
+                STATUSLINE_SEGMENT_STALE_AFTER,
+            ));
+        }
+        if !segs.is_empty() {
+            let joined = segs.join("  \u{b7}  ");
+            // Bound the segment area (escape-aware clip keeps ANSI intact) so a
+            // chatty plugin can't crowd the live hint off the row.
+            let clamped = crate::terminal::clip_visible(&joined, STATUSLINE_SEGMENT_MAX_COLS);
+            left = if left.is_empty() {
+                clamped
+            } else {
+                format!("{left}  \u{b7}  {clamped}")
+            };
+        }
+    }
+
     left = recent_message_row(left, session.flash.lock().ok().and_then(|b| b.clone()));
     // Right-justify the session name (`:rename`) on this row, directly above the
     // clock on the statusline below — in bold magenta. Blank when unnamed.
+    // Append live status badges to the RIGHT of the name: 🤖 when a background
+    // coordinator is still working, ⏰ when an `:alert` monitor is armed, 🎯 when
+    // a goal is active. Only shown when the session is named (there's no label
+    // to hang them off otherwise).
+    let decorated = session.name.as_ref().map(|n| {
+        let mut s = n.clone();
+        let badges = status_badges(session, &workers);
+        if !badges.is_empty() {
+            s.push(' ');
+            s.push_str(&badges);
+        }
+        s
+    });
     crate::style::second_statusline_at(
         &left,
-        session.name.as_deref(),
+        decorated.as_deref(),
         crate::style::footer_width(),
         color_on,
     )
+}
+
+/// Compose the live status-badge suffix appended to the right of the `:rename`
+/// label on the SecondStatusLine: 🤖 when any background coordinator is still
+/// running (non-terminal), ⏰ when at least one `:alert` monitor is armed, and
+/// 🎯 when a goal is active. Order is fixed (workers · alert · goal); each badge
+/// is a single 2-col emoji joined by a space. Empty string when none apply.
+fn status_badges(session: &Session, workers: &[(String, bool, String)]) -> String {
+    let mut badges: Vec<&str> = Vec::new();
+    if workers.iter().any(|(_, terminal, _)| !terminal) {
+        badges.push("🤖");
+    }
+    let alert_active = session
+        .alert_store
+        .as_ref()
+        .and_then(|s| s.armed_alerts().ok())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if alert_active {
+        badges.push("⏰");
+    }
+    if session.active_goal().is_some() {
+        badges.push("🎯");
+    }
+    badges.join(" ")
 }
 
 /// Max visible width of the task-hint suffix appended to an attached
@@ -3739,7 +3955,7 @@ fn collect_worker_rows(session: &Session) -> Vec<crate::workers_modal::WorkerRow
     };
     let mut in_mem: Vec<_> = session.worker_jobs.lock().unwrap().iter().cloned().collect();
     in_mem.sort_by(|a, b| b.started_epoch().cmp(&a.started_epoch())); // newest-first
-    in_mem
+    let mut rows: Vec<crate::workers_modal::WorkerRow> = in_mem
         .iter()
         .map(|w| {
             let (started_cell, runtime_cell) =
@@ -3751,6 +3967,7 @@ fn collect_worker_rows(session: &Session) -> Vec<crate::workers_modal::WorkerRow
             };
             crate::workers_modal::WorkerRow {
                 id: w.id.clone(),
+                type_emoji: crate::style::job_activity_emoji(&w.task).to_string(),
                 id_cell,
                 session_label: format!("{me_label} *"),
                 status: w.status(),
@@ -3758,9 +3975,104 @@ fn collect_worker_rows(session: &Session) -> Vec<crate::workers_modal::WorkerRow
                 runtime_cell,
                 task: one_line(&w.task),
                 result_cell: w.result_cell(),
+                parent_id: None,
+                depth: 0,
             }
         })
-        .collect()
+        .collect();
+    // TASK-315: fold in durable SUBWORKERS — coordinator_runs rows whose parent
+    // chain reaches one of this session's in-mem coordinators. A coordinator's
+    // spawned children live in their own session/process (not this session's
+    // `worker_jobs`), so we pull them from the shared store and stamp `parent_id`
+    // from `parent_run_id`; `build_worker_forest` then indents each beneath its
+    // parent. Display-only — attach still resolves ids on its own.
+    if let Some(store) = &session.coordinator_store {
+        if let Ok(all) = store.load_all() {
+            let mut visible: std::collections::HashSet<String> =
+                rows.iter().map(|r| r.id.clone()).collect();
+            loop {
+                let mut added = false;
+                for r in &all {
+                    let Some(parent) = r.parent_run_id.as_deref() else {
+                        continue;
+                    };
+                    if visible.contains(parent) && !visible.contains(&r.run_id) {
+                        rows.push(durable_worker_row(r, session.session_id.as_str(), now_epoch));
+                        visible.insert(r.run_id.clone());
+                        added = true;
+                    }
+                }
+                if !added {
+                    break;
+                }
+            }
+        }
+    }
+    crate::workers_modal::build_worker_forest(rows)
+}
+
+/// Convert a durable `coordinator_runs` row into a display [`WorkerRow`] for the
+/// `:workers` forest. Mirrors the static table's durable-row cell logic (status
+/// = phase, result derived from result/error, time cells frozen at heartbeat
+/// once terminal). `parent_id` carries `parent_run_id` so the row indents
+/// beneath its parent. Used only for SUBWORKERS not present in `worker_jobs`.
+fn durable_worker_row(
+    r: &crate::coordinator_store::CoordinatorRow,
+    me_session_id: &str,
+    now_epoch: i64,
+) -> crate::workers_modal::WorkerRow {
+    let one_line = |t: &str| {
+        let s = t.split_whitespace().collect::<Vec<_>>().join(" ");
+        if s.chars().count() > 70 {
+            format!("{}…", s.chars().take(70).collect::<String>())
+        } else {
+            s
+        }
+    };
+    let is_me = r.session_id.as_deref() == Some(me_session_id);
+    let label = r
+        .session_name
+        .clone()
+        .or_else(|| r.session_id.as_deref().map(|s| crate::batch::short_id(s).to_string()))
+        .unwrap_or_else(|| "—".into());
+    let session_label = if is_me { format!("{label} *") } else { label };
+    let result_cell = match (r.result.as_deref(), r.error.as_deref()) {
+        (Some(res), None) => res
+            .split_whitespace()
+            .find(|s| s.starts_with('#'))
+            .map(|pr| format!("✓ {pr}"))
+            .unwrap_or_else(|| "✓ success".to_string()),
+        (None, Some(e)) => {
+            let t = if e.chars().count() > 40 {
+                format!("{}…", e.chars().take(40).collect::<String>())
+            } else {
+                e.to_string()
+            };
+            format!("✗ {t}")
+        }
+        _ => "—".to_string(),
+    };
+    let started = r.created_at.as_deref().and_then(crate::style::parse_sqlite_utc);
+    let terminal = matches!(r.phase.as_str(), "done" | "failed" | "checkpoint");
+    let finished = if terminal {
+        r.heartbeat_at.as_deref().and_then(crate::style::parse_sqlite_utc)
+    } else {
+        None
+    };
+    let (started_cell, runtime_cell) = crate::style::time_cells(started, finished, now_epoch);
+    crate::workers_modal::WorkerRow {
+        id: r.run_id.clone(),
+        type_emoji: crate::style::job_activity_emoji(&r.task).to_string(),
+        id_cell: crate::batch::short_id(&r.run_id).to_string(),
+        session_label,
+        status: r.phase.clone(),
+        started_cell,
+        runtime_cell,
+        task: one_line(&r.task),
+        result_cell,
+        parent_id: r.parent_run_id.clone(),
+        depth: 0,
+    }
 }
 
 /// `:attach <id>` — attach the interactive session to a LIVE coordinator this
@@ -3787,7 +4099,7 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
                 crate::terminal::open_attach_view();
                 *session.attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
                 println!(
-                    "\x1b[1;33m⇄ attached to the goal\x1b[0m — streaming its turns live. \x1b[2mgoals are watch-only; :goal clear to stop it, :detach to stop watching.\x1b[0m"
+                    "\x1b[1;33m⇄ attached to the goal\x1b[0m — streaming its turns live. \x1b[2mtype a line to steer it (or :tell goal <msg>); :goal clear to stop it, :detach to stop watching.\x1b[0m"
                 );
                 // TASK-301: replay the goal's history the same way a worker's is
                 // replayed — header + input row + activity tail — so goal and
@@ -3810,6 +4122,23 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
                 w.id.clone(),
                 matches!(w.status().as_str(), "done" | "failed"),
             ));
+        }
+    }
+    // Subworker / cross-session fallback: an id absent from this session's
+    // `worker_jobs` may be a durable SUBWORKER (spawned by one of our
+    // coordinators) or a run owned by another session. Resolve it from the
+    // shared coordinator store and attach in REVIEW mode (replay its durable
+    // task + result). Only consulted when the in-mem lookup found nothing, so
+    // this session's own workers are never double-listed.
+    if matches.is_empty() {
+        if let Some(store) = &session.coordinator_store {
+            if let Ok(rows) = store.load_all() {
+                for r in &rows {
+                    if hit(&r.run_id) {
+                        matches.push((r.run_id.clone(), true));
+                    }
+                }
+            }
         }
     }
     match matches.as_slice() {
@@ -3865,7 +4194,14 @@ fn backfill_attached(run_id: &str, session: &Session) {
         .iter()
         .find(|w| w.id == *run_id)
         .cloned();
-    let Some(job) = job else { return };
+    let Some(job) = job else {
+        // Subworker / cross-session review: not one of THIS session's in-mem
+        // workers, so there's no live transcript to replay — surface the durable
+        // header + task from the coordinator store so an attach still shows what
+        // the worker is/was doing (its result follows via print_attached_result).
+        backfill_attached_durable(run_id, session);
+        return;
+    };
     let short = crate::batch::short_id(run_id);
     println!("{}", crate::worker::pane_replay_header(&short));
     // The task is the coordinator's "input" — the START of the conversation. It's
@@ -4155,7 +4491,61 @@ fn print_attached_result(run_id: &str, session: &Session) {
                 crate::worker::pane_row(run_id, "·result (empty result)")
             ),
         }
+    } else {
+        // Subworker / cross-session: no in-mem job, so read the final result
+        // (or failure) straight from the durable coordinator store.
+        if let Some(store) = &session.coordinator_store {
+            if let Ok(rows) = store.load_all() {
+                if let Some(r) = rows.iter().find(|r| r.run_id == *run_id) {
+                    let msg = match (r.result.as_deref(), r.error.as_deref()) {
+                        (Some(res), _) if !res.trim().is_empty() => res.trim().to_string(),
+                        (_, Some(e)) if !e.trim().is_empty() => format!("failed: {}", e.trim()),
+                        _ => format!("({} — no result captured yet)", r.phase),
+                    };
+                    let rendered = crate::md::render_stdout_within(
+                        &msg,
+                        crate::worker::pane_content_cols(run_id),
+                    );
+                    let mut lines = rendered.split('\n');
+                    match lines.next() {
+                        Some(first) => {
+                            println!(
+                                "{}",
+                                crate::worker::pane_row(run_id, &format!("·result {first}"))
+                            );
+                            for line in lines {
+                                println!("{}", crate::worker::pane_row(run_id, line));
+                            }
+                        }
+                        None => println!(
+                            "{}",
+                            crate::worker::pane_row(run_id, "·result (empty result)")
+                        ),
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Durable-only backfill for a SUBWORKER (or another session's run) not present
+/// in this session's `worker_jobs`: print the replay header + the coordinator's
+/// task (its "input") from the shared store. No transcript rows are available
+/// off-process, so this is header + prompt only; the final result is appended by
+/// `print_attached_result`'s own durable fallback.
+fn backfill_attached_durable(run_id: &str, session: &Session) {
+    let Some(store) = &session.coordinator_store else {
+        return;
+    };
+    let Ok(rows) = store.load_all() else {
+        return;
+    };
+    let Some(r) = rows.iter().find(|r| r.run_id == *run_id) else {
+        return;
+    };
+    let short = crate::batch::short_id(run_id);
+    println!("{}", crate::worker::pane_replay_header(&short));
+    println!("{}", crate::worker::pane_input_row(run_id, &r.task));
 }
 
 /// `:detach` — stop watching the attached coordinator. It keeps running in the
@@ -4397,18 +4787,38 @@ fn interrupt_attached_worker(session: &Session) -> bool {
 /// read a mailbox message — it RESUMES the run instead (relaunch seeded with the
 /// prior context + this message; see `resume_coordinator`). Called for every
 /// plain line typed while attached.
+/// Steer the active background `:goal` — queue an operator instruction that the
+/// goal folds into its next turn (see [`crate::goal::GoalLoop::steer`]). Shared
+/// by `:tell goal <msg>` and a line typed while `:attach`ed to the goal. Prints
+/// a confirmation, or a helpful notice when there is no active goal to steer.
+fn steer_active_goal(message: &str, session: &mut Session) {
+    let message = message.trim();
+    if message.is_empty() {
+        println!("usage: :tell goal <instruction>   — steer the active background goal");
+        return;
+    }
+    match &session.goal {
+        Some(g) if g.steer(message) => println!(
+            "\x1b[1;33m🎯 steer queued\x1b[0m \x1b[2m— folded into the goal's next turn\x1b[0m"
+        ),
+        Some(_) => {
+            println!("the goal has already finished — nothing to steer (`:goal` for status)")
+        }
+        None => println!("no goal set — `:goal <condition>` to start one (requires :batch on)"),
+    }
+}
+
+
 fn send_to_attached(run_id: &str, message: &str, session: &mut Session) {
     let message = message.trim();
     if message.is_empty() {
         return;
     }
-    // A goal is verifier-driven and has no operator mailbox — it can't be
-    // steered mid-flight. Say so rather than silently dropping the line into a
-    // coordinator-tell with no recipient.
+    // A line typed while `:attach`ed to the goal STEERS it: the message is
+    // queued and folded into the goal's next turn (the goal analogue of
+    // `:tell`-ing a coordinator). No coordinator mailbox is involved.
     if run_id == GOAL_ATTACH_ID {
-        println!(
-            "\x1b[2mthe goal is watch-only — it can't be steered. `:goal clear` to stop it, `:detach` to stop watching.\x1b[0m"
-        );
+        steer_active_goal(message, session);
         return;
     }
     // A TERMINAL (done/failed) coordinator has nothing to read a mailbox
@@ -4608,6 +5018,19 @@ OWN prior work, not a fresh task, and build on it.\n\n\
 /// `1..=running.len()` means `running[k - 1]`. An unknown `current` (e.g. it was
 /// `:close`d and removed from `running`) restarts the cycle from interactive.
 /// Returns 0 when there is nothing to cycle through.
+/// Whether a Shift-Tab cycle should be a silent no-op. It is a no-op ONLY when
+/// there is genuinely nothing to do: no live/terminal workers, no active `:goal`,
+/// AND the session is not currently attached to anything. The last clause is the
+/// fix for the "goal completes while attached → stuck" bug: when the operator is
+/// attached to the goal and it finishes (so `goal_active` flips false) with no
+/// workers, the cycle must STILL run so it can fall through to the index-0
+/// (interactive) branch and release the now-stale attach — otherwise Shift-Tab
+/// (and the mid-turn variant) dead-ends and the operator can never get back to
+/// the interactive prompt. Pure so it's unit-testable without a live Session.
+fn cycle_is_noop(worker_count: usize, goal_active: bool, attached: bool) -> bool {
+    worker_count == 0 && !goal_active && !attached
+}
+
 fn next_attach_index(running: &[String], current: Option<&str>) -> usize {
     if running.is_empty() {
         return 0;
@@ -4661,8 +5084,18 @@ fn cycle_worker(session: &mut Session) -> bool {
     // screen clear below (otherwise an empty cycle still wipes the screen).
     // TASK-299: the active background `:goal` joins the Shift-Tab rotation as a
     // final watch-only slot, so a goal-only session (no workers) still cycles.
+    // Stale-attach escape: if we're currently attached to something (e.g. the
+    // goal, which just COMPLETED so `goal_active` is now false) with no workers
+    // left, DON'T no-op — fall through so the cycle lands on the index-0
+    // (interactive) branch and releases the stuck attach. Without this the
+    // operator can't Shift-Tab back to interactive after a goal-only run ends.
     let goal_active = session.goal.as_ref().is_some_and(|g| g.is_active());
-    if session.worker_jobs.lock().unwrap().is_empty() && !goal_active {
+    let attached_now = session.attached.lock().unwrap().is_some();
+    if cycle_is_noop(
+        session.worker_jobs.lock().unwrap().len(),
+        goal_active,
+        attached_now,
+    ) {
         return false;
     }
     // Synchronously tear down any live worker "thinking…" spinner BEFORE we
@@ -4680,22 +5113,25 @@ fn cycle_worker(session: &mut Session) -> bool {
     // so `.rev()` puts the most recently spawned coordinator at slot 1 — the
     // first Shift-Tab from the interactive prompt lands on the newest worker and
     // each further press walks back toward the oldest, then wraps to interactive.
-    let workers: Vec<(String, bool, String)> = session
-        .worker_jobs
-        .lock()
-        .unwrap()
-        .iter()
-        .rev()
-        .map(|w| {
+    // TASK-315: the rotation walks the full forest — this session's in-mem
+    // coordinators (newest-first) AND their durable subworkers (each right after
+    // its parent, pre-order) — so Shift-Tab cycles into subworkers too. Attach
+    // resolves a subworker id via the store fallback in `attach_worker` and
+    // reviews it durably (`backfill_attached_durable` + `print_attached_result`).
+    let workers: Vec<(String, bool, String)> = collect_worker_rows(session)
+        .into_iter()
+        .map(|r| {
             (
-                w.id.clone(),
-                matches!(w.status().as_str(), "done" | "failed"),
-                w.task.clone(),
+                r.id.clone(),
+                matches!(r.status.as_str(), "done" | "failed"),
+                r.task,
             )
         })
         .collect();
-    // `worker_jobs` was non-empty at the top guard, so `workers` is non-empty
-    // here too — there is always at least one slot to cycle to.
+    // `workers` MAY be empty here (goal-only session, or a stale attach with no
+    // live workers): in that case `ids` is empty and `next_attach_index` returns
+    // 0, so we take the index-0 branch below and drop back to interactive — the
+    // stale-attach escape. Otherwise there's at least one slot to cycle to.
 
     // The cycle is [interactive, workers[0], workers[1], …]; index 0 is the
     // detached interactive prompt. The index math is factored into the pure,
@@ -4736,7 +5172,7 @@ fn cycle_worker(session: &mut Session) -> bool {
     // prompt row rustyline left behind so the attach header opens on a clean row
     // instead of starting ON the prompt.
     crate::terminal::open_attach_view();
-    // TASK-299/301: the goal is the last rotation slot — watch-only. Stream its
+    // TASK-299/301: the goal is the last rotation slot — steerable. Stream its
     // turns live and backfill its durable state (mirrors `:attach goal`), then
     // stop before the worker-index dereference (the goal is not in `workers`).
     if ids[next_idx - 1] == GOAL_ATTACH_ID {
@@ -4748,7 +5184,7 @@ fn cycle_worker(session: &mut Session) -> bool {
             .map(|g| g.condition.clone())
             .unwrap_or_default();
         println!(
-            "\x1b[1;33m⇄ attached to the goal\x1b[0m \x1b[2m({}/{} · watch-only; :goal clear to stop it, Shift-Tab to cycle, :detach to stop){}\x1b[0m",
+            "\x1b[1;33m⇄ attached to the goal\x1b[0m \x1b[2m({}/{} · type to steer it, :goal clear to stop it, Shift-Tab to cycle, :detach to stop){}\x1b[0m",
             next_idx,
             ids.len(),
             attach_task_suffix(&task)
@@ -4825,8 +5261,12 @@ fn cycle_worker_live(
             )
         })
         .collect();
-    if workers_v.is_empty() && !goal_active {
-        // No coordinators AND no active goal to attach to — take no action (no
+    // Stale-attach escape (mirrors `cycle_worker`): only no-op when there's
+    // nothing to attach to AND we're not currently attached. If the goal
+    // completed mid-turn while attached (goal_active now false, no workers), fall
+    // through so the index-0 branch releases the stuck attach.
+    if cycle_is_noop(workers_v.len(), goal_active, attached.lock().unwrap().is_some()) {
+        // No coordinators, no active goal, and not attached — take no action (no
         // hint, no redraw), matching the idle-prompt `cycle_worker` no-op.
         return;
     }
@@ -4943,6 +5383,17 @@ fn close_worker(id: Option<&str>, session: &mut Session) {
         .lock()
         .unwrap()
         .retain(|w| w.id != run_id);
+
+    // Cancel any armed/pending auto-resume for the worker we just closed.
+    // `:close` is an explicit dismissal, so the operator should NOT be dragged
+    // into an "⤵ auto-resume — reading finished background workers" model turn
+    // for a worker they just closed — that unsolicited turn blocks typing and
+    // Shift-Tab until it finishes (the reported hang). `forget` drops the id
+    // from the resume's pending/seen sets and disarms it when nothing else is
+    // pending. No-op when auto-resume never armed for this id.
+    if let Ok(mut r) = session.resume.lock() {
+        r.forget(&run_id);
+    }
 
     // Detach if we just closed the worker we were attached to.
     if attached.as_deref() == Some(run_id.as_str()) {
@@ -5521,6 +5972,13 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
         );
         return;
     }
+    // `:tell goal <msg>` steers the active background goal, not a coordinator:
+    // the goal has no store row or mailbox, it drains its own steer queue at the
+    // top of each turn. Exact-match so a worker-id prefix never collides.
+    if id == GOAL_ATTACH_ID {
+        steer_active_goal(message, session);
+        return;
+    }
     let Some(store) = session.coordinator_store.clone() else {
         println!("coordinator store unavailable — can't queue messages");
         return;
@@ -5951,6 +6409,52 @@ fn handle_plugin(args: Vec<&str>) {
     let id = args.get(1).copied();
     let flag = args.get(2).copied();
     match sub {
+        Some("add") => {
+            let Some(plugin_id) = id else {
+                println!("usage: :plugin add <plugin-id>");
+                println!("\navailable plugins:");
+                for p in crate::skill_provider::list_available_plugins() {
+                    println!("  {:<20} {}", p.id, p.description);
+                }
+                return;
+            };
+            // Spawn async task to download and install plugin
+            let plugins_dir = dir.clone();
+            let plugin_id = plugin_id.to_string();
+            std::thread::spawn(move || {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Use a blocking runtime since we're in a spawned thread
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        crate::skill_provider::install_plugin(&plugin_id, &plugins_dir).await
+                    })
+                })) {
+                    Ok(Ok(())) => {
+                        println!("\x1b[32m✓\x1b[0m plugin `{plugin_id}` installed successfully");
+                        println!("  reload with `:restart` to activate");
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("\x1b[31m✗\x1b[0m failed to install plugin: {e:#}");
+                    }
+                    Err(_) => {
+                        eprintln!("\x1b[31m✗\x1b[0m plugin installation panicked");
+                    }
+                }
+            });
+        }
+        Some("remove" | "rm") => {
+            let Some(plugin_id) = id else {
+                println!("usage: :plugin remove <plugin-id>");
+                return;
+            };
+            match crate::skill_provider::remove_plugin(plugin_id, &dir) {
+                Ok(()) => {
+                    println!("\x1b[32m✓\x1b[0m plugin `{plugin_id}` removed");
+                    println!("  reload with `:restart` to apply");
+                }
+                Err(e) => eprintln!("\x1b[31m✗\x1b[0m {e:#}"),
+            }
+        }
         Some("info") => {
             let Some(id) = id else {
                 println!("usage: :plugin info <id> [--schema]");
@@ -5984,6 +6488,7 @@ fn handle_plugin(args: Vec<&str>) {
                 println!("  {:<20} {name} v{ver}{state}", m.id);
             }
             println!("\n:plugin info <id> for full provenance");
+            println!(":plugin add <id> to install a plugin from the registry");
         }
         Some(other) => println!("unknown :plugin subcommand `{other}` — try :plugin list"),
     }
@@ -6250,6 +6755,9 @@ enum SkillCmd {
     List,
     /// `:skill remove <name>`
     Remove(String),
+    /// `:skill sources` — list configured skill sources by priority.
+    Sources,
+
     /// Anything else → print usage.
     Usage,
 }
@@ -6261,6 +6769,7 @@ fn parse_skill_command(args: &[&str]) -> SkillCmd {
     match args {
         ["add", reference, ..] => SkillCmd::Add((*reference).to_string()),
         ["search", rest @ ..] if !rest.is_empty() => SkillCmd::Search(rest.join(" ")),
+        ["sources" | "src"] => SkillCmd::Sources,
         ["list" | "ls"] => SkillCmd::List,
         ["remove" | "rm" | "delete", name, ..] => SkillCmd::Remove((*name).to_string()),
         _ => SkillCmd::Usage,
@@ -6299,22 +6808,152 @@ async fn handle_skill_command(args: &[&str], session: &mut Session) -> Result<()
             skill_list(session);
             Ok(())
         }
+        SkillCmd::Sources => {
+            skill_sources_list().await;
+            Ok(())
+        }
         SkillCmd::Remove(name) => skill_remove(&name, session),
         SkillCmd::Usage => {
             println!(
-                "usage: :skill add <owner/name[@version] | github:owner/repo[/path][@ref]> | search <query> | list | remove <name>"
+                "usage: :skill add <owner/name[@version] | github:owner/repo[/path][@ref]> | search <query> | list | sources | remove <name>"
             );
             Ok(())
         }
     }
 }
 
-/// `:skill add <ref>` — fetch a SKILL.md (from skill.fish or GitHub), import it,
-/// and reload the catalog so the model can use it from the next turn. A GitHub
-/// repo spec (`github:owner/repo`) may import several skills at once.
+/// One resolved skill source for the `:skill` fan-out — the in-process builtin
+/// or a plugin script source — carrying its façade handle and routing metadata.
+struct FanoutSource {
+    /// Display / dedup label (`skillfish` for the builtin, else the source id).
+    label: String,
+    /// Merge/precedence rank; higher wins the search-dedup and add-resolution.
+    priority: i64,
+    /// True for the in-process builtin (skipped in add-resolution: it's the
+    /// fall-through, not a claiming source).
+    is_builtin: bool,
+    /// The façade used to actually run search/add.
+    source: crate::skill_sources::SkillSource,
+    /// `handles` globs the source claims for `:skill add` routing.
+    handles: Vec<String>,
+    can_search: bool,
+    can_add: bool,
+}
+
+/// Build the priority-ordered skill-source list: the always-present in-process
+/// builtin (skill.fish + GitHub, id `skillfish`, priority 100) followed by every
+/// plugin that declares `provides.skill_source`, minus pure `@builtin` façade
+/// aliases (already represented by the builtin). Sorted priority desc, label asc
+/// — the deterministic order the search fan-out and add-resolution consume
+/// (design §4). A zero-plugin shell yields exactly one source (the builtin), so
+/// `:skill search` / `:skill add` behave identically to the pre-fan-out shell.
+fn skill_fanout_sources(plugins_dir: &Path) -> Vec<FanoutSource> {
+    let mut out = vec![FanoutSource {
+        label: "skillfish".to_string(),
+        priority: 100,
+        is_builtin: true,
+        source: crate::skill_sources::SkillSource::Builtin,
+        handles: vec!["*".into(), "*/*".into(), "github:*".into()],
+        can_search: true,
+        can_add: true,
+    }];
+    for rs in crate::plugins::discover_skill_sources(plugins_dir) {
+        // A pure `@builtin` façade is just an alias of the in-process builtin;
+        // skip it so search doesn't double-hit the same registry.
+        let search_builtin = rs.search.as_deref() == Some("@builtin");
+        let add_builtin = rs.add.as_deref() == Some("@builtin");
+        let has_script_search = rs.search.as_deref().is_some_and(|s| s != "@builtin");
+        let has_script_add = rs.add.as_deref().is_some_and(|s| s != "@builtin");
+        if !has_script_search && !has_script_add && (search_builtin || add_builtin) {
+            continue;
+        }
+        if rs.search.is_none() && rs.add.is_none() {
+            continue;
+        }
+        out.push(FanoutSource {
+            label: rs.id.clone(),
+            priority: rs.priority,
+            is_builtin: false,
+            source: crate::skill_sources::SkillSource::Script {
+                plugin_dir: rs.dir.clone(),
+            },
+            handles: rs.handles.clone(),
+            can_search: has_script_search,
+            can_add: has_script_add,
+        });
+    }
+    out.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.label.cmp(&b.label)));
+    out
+}
+
+/// Glob match for a `handles` pattern against a `:skill add` reference. Supports
+/// a trailing `*` wildcard (`github:*`, `acme/*`, `*`) and exact match; `*/*`
+/// matches any single-slash `owner/name` ref.
+fn handles_match(pattern: &str, reference: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if pattern == "*/*" {
+        let parts: Vec<&str> = reference.split('/').collect();
+        return parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty();
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return reference.starts_with(prefix);
+    }
+    pattern == reference
+}
+
+/// `:skill add <ref>` — resolve the reference against configured sources in
+/// priority order (design §4.2): the first *script* source whose `handles`
+/// globs claim it fetches + imports the skill; the in-process builtin
+/// (skill.fish / GitHub) is the fall-through when no plugin claims it, preserving
+/// pre-fan-out behavior exactly for a zero-plugin shell. A GitHub repo spec
+/// (`github:owner/repo`) may import several skills at once.
 async fn skill_add(reference: &str, session: &mut Session) -> Result<()> {
     let skills_dir = skills_dir_path();
     let _ = std::fs::create_dir_all(&skills_dir);
+
+    let plugins_dir = crate::plugins::default_plugins_dir();
+    for fs in skill_fanout_sources(&plugins_dir) {
+        if fs.is_builtin || !fs.can_add {
+            continue;
+        }
+        if !fs.handles.iter().any(|h| handles_match(h, reference)) {
+            continue;
+        }
+        println!("\x1b[2mfetching {reference} via {} …\x1b[0m", fs.label);
+        match fs.source.add(reference).await {
+            Ok(metas) if !metas.is_empty() => {
+                let mut names = Vec::new();
+                for m in &metas {
+                    crate::skill_provider::import(&m.content, &skills_dir)?;
+                    let name = crate::skills::parse_frontmatter(&m.content)
+                        .map(|(n, _)| n)
+                        .unwrap_or_else(|| m.path.clone());
+                    names.push(name);
+                }
+                session.reload_skills_from(&skills_dir);
+                for name in &names {
+                    println!(
+                        "\x1b[32m✓\x1b[0m added \x1b[1m{name}\x1b[0m \x1b[2m({})\x1b[0m",
+                        fs.label
+                    );
+                }
+                let n = names.len();
+                println!(
+                    "  catalog reloaded ({n} skill{}).",
+                    if n == 1 { "" } else { "s" }
+                );
+                return Ok(());
+            }
+            Ok(_) => { /* empty result → try the next-priority source */ }
+            Err(e) => {
+                println!("\x1b[2m{} could not resolve {reference}: {e}\x1b[0m", fs.label);
+            }
+        }
+    }
+
+    // Fall-through: in-process builtin (skill.fish + GitHub), unchanged.
     println!("\x1b[2mfetching {reference} …\x1b[0m");
     let imported = crate::skill_provider::add(reference, &skills_dir).await?;
     session.reload_skills_from(&skills_dir);
@@ -6336,14 +6975,126 @@ async fn skill_add(reference: &str, session: &mut Session) -> Result<()> {
     Ok(())
 }
 
-/// `:skill search <query>` — query the skill.fish catalog and print matches.
+/// `:skill search <query>` — fan out across every searchable configured source
+/// in parallel and print merged matches. A zero-plugin / single-source shell
+/// takes the exact pre-fan-out path (no SOURCE column) so its output stays
+/// byte-identical; with ≥2 sources, results are deduped priority-first and
+/// rendered with a SOURCE column.
 async fn skill_search(query: &str) -> Result<()> {
-    let results = crate::skill_provider::search(query).await?;
+    let plugins_dir = crate::plugins::default_plugins_dir();
+    let sources = skill_fanout_sources(&plugins_dir);
+    let searchable = sources.iter().filter(|s| s.can_search).count();
+
+    // Single searchable source (the builtin, zero plugins): identical to before.
+    if searchable <= 1 {
+        let results = crate::skill_provider::search(query).await?;
+        println!(
+            "{}",
+            crate::skill_provider::print_results_table(query, &results)
+        );
+        return Ok(());
+    }
+
+    // Fan out in parallel, each source bounded by a timeout so one slow source
+    // can't wedge the whole search. Failures / timeouts fail soft.
+    let per_source = std::time::Duration::from_secs(15);
+    let mut joins = Vec::new();
+    for fs in &sources {
+        if !fs.can_search {
+            continue;
+        }
+        let src = fs.source.clone();
+        let label = fs.label.clone();
+        let q = query.to_string();
+        joins.push(tokio::spawn(async move {
+            let r = tokio::time::timeout(per_source, src.search(&q)).await;
+            (label, r)
+        }));
+    }
+
+    // Collected in spawn order == priority-desc order, so the first writer wins
+    // the dedup (higher-priority source keeps the row).
+    let mut tagged: Vec<(crate::skill_provider::SearchResult, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for j in joins {
+        let (label, res) = match j.await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let rows = match res {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(e)) => {
+                eprintln!("\x1b[2m{label}: search failed: {e}\x1b[0m");
+                continue;
+            }
+            Err(_) => {
+                eprintln!("\x1b[2m{label}: search timed out\x1b[0m");
+                continue;
+            }
+        };
+        for r in rows {
+            if seen.insert(r.ref_or_synth()) {
+                tagged.push((r, label.clone()));
+            }
+        }
+    }
+
     println!(
         "{}",
-        crate::skill_provider::print_results_table(query, &results)
+        crate::skill_provider::print_results_table_sourced(query, &tagged)
     );
     Ok(())
+}
+
+/// `:skill sources` — list every configured skill source (builtin + plugins) in
+/// priority order: SOURCE | PRIORITY | SEARCH | ADD | HANDLES.
+async fn skill_sources_list() {
+    let plugins_dir = crate::plugins::default_plugins_dir();
+    let sources = skill_fanout_sources(&plugins_dir);
+    let color = crate::style::colors_enabled();
+    let (bold, cyan, reset) = if color {
+        ("\x1b[1m", "\x1b[36m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+    let rows: Vec<(String, String, String, String, String)> = sources
+        .iter()
+        .map(|s| {
+            (
+                s.label.clone(),
+                s.priority.to_string(),
+                if s.can_search { "yes".into() } else { "-".into() },
+                if s.can_add { "yes".into() } else { "-".into() },
+                if s.handles.is_empty() {
+                    "-".into()
+                } else {
+                    s.handles.join(", ")
+                },
+            )
+        })
+        .collect();
+    let id_w = rows
+        .iter()
+        .map(|r| r.0.chars().count())
+        .chain(std::iter::once("SOURCE".len()))
+        .max()
+        .unwrap_or(6);
+    let pr_w = rows
+        .iter()
+        .map(|r| r.1.chars().count())
+        .chain(std::iter::once("PRIORITY".len()))
+        .max()
+        .unwrap_or(8);
+    println!(
+        "{bold}{:<id_w$}  {:>pr_w$}  {:<6}  {:<3}  {}{reset}",
+        "SOURCE", "PRIORITY", "SEARCH", "ADD", "HANDLES"
+    );
+    for r in &rows {
+        println!(
+            "{cyan}{:<id_w$}{reset}  {:>pr_w$}  {:<6}  {:<3}  {}",
+            r.0, r.1, r.2, r.3, r.4
+        );
+    }
 }
 
 /// Classify a skill's on-disk `SKILL.md` path into a `:skill search`-style
@@ -6531,10 +7282,15 @@ async fn handle_colon(
                     "\x1b[2m🪝 webhook: not configured — set WEBHOOK_BROKER_URL and restart to enable\x1b[0m"
                 ),
             },
-            Some("reload") => match crate::webhook::reload(&mut session.webhook) {
-                Ok(n) => println!("\x1b[32m🪝\x1b[0m webhook reloaded — {n} handler(s) from plugins"),
-                Err(e) => println!("\x1b[33m🪝\x1b[0m {e}"),
-            },
+            Some("reload") => {
+                let flash = crate::webhook::flash_sink_from_slot(session.flash.clone());
+                match crate::webhook::reload(&mut session.webhook, Some(flash)) {
+                    Ok(n) => {
+                        println!("\x1b[32m🪝\x1b[0m webhook reloaded — {n} handler(s) from plugins")
+                    }
+                    Err(e) => println!("\x1b[33m🪝\x1b[0m {e}"),
+                }
+            }
             Some("logs") => {
                 let n = parts
                     .next()
@@ -6879,7 +7635,15 @@ async fn handle_colon(
             // launched from this terminal — so a busy multi-terminal host never
             // shows another terminal's background workers here. `:workers all`
             // widens to every session's durable runs (the old behavior).
-            let show_all = matches!(parts.next(), Some("all"));
+            // `:workers diagram` (aliases: `states`, `lifecycle`) prints the
+            // validated worker/coordinator lifecycle transition table — the same
+            // machine the coordinator enforces — instead of the live worker list.
+            let sub = parts.next();
+            if matches!(sub, Some("diagram") | Some("states") | Some("lifecycle")) {
+                print!("{}", crate::lifecycle::diagram());
+                return false;
+            }
+            let show_all = matches!(sub, Some("all"));
 
             // TASK-313: on an interactive TTY, drive this session's live workers
             // through a keyboard modal picker (↑/↓ select · Enter attach · Del/d
@@ -7138,7 +7902,15 @@ async fn handle_colon(
             // shows how offloading is paying off — outcomes (done/failed/running),
             // latency distribution, and a missed-inline heuristic. Scoped to THIS
             // session by default; `all` widens to every session's runs.
-            let show_all = matches!(parts.next(), Some("all"));
+            // `:workers diagram` (aliases: `states`, `lifecycle`) prints the
+            // validated worker/coordinator lifecycle transition table — the same
+            // machine the coordinator enforces — instead of the live worker list.
+            let sub = parts.next();
+            if matches!(sub, Some("diagram") | Some("states") | Some("lifecycle")) {
+                print!("{}", crate::lifecycle::diagram());
+                return false;
+            }
+            let show_all = matches!(sub, Some("all"));
             let scope = if show_all { "all sessions" } else { "this session" };
             match &session.coordinator_store {
                 Some(store) => match store.load_all() {
@@ -7698,6 +8470,7 @@ async fn handle_colon(
             return true;
         }
         Some("mcp") => handle_mcp(parts.collect(), session).await,
+        Some("codebase") => handle_codebase(parts.collect(), session).await,
         Some("skill" | "skills") => {
             let rest: Vec<&str> = parts.collect();
             if let Err(e) = handle_skill_command(&rest, session).await {
@@ -7908,6 +8681,100 @@ async fn handle_update(
 
 /// `:mcp` manages MCP servers (like Claude Code's `/mcp`): list, reconnect, add,
 /// remove, and inspect tools. Adds/removes persist to ~/.aish/.mcp.json.
+/// `:codebase <install|status>` — native enrollment for the DeusData
+/// `codebase-memory-mcp` server (TASK-404, SPR-071). `install` idempotently
+/// writes a `codebase-memory` stdio entry into the user-scope `~/.aish/.mcp.json`
+/// and, when the platform binary is present at `~/.aish/bin/`, connects it live
+/// so its code-intelligence tools join the model's tool set. Absence degrades
+/// gracefully: the entry is registered and the server stays dormant until the
+/// binary lands. `status` reports enrolled / binary / connected state.
+async fn handle_codebase(args: Vec<&str>, session: &mut Session) {
+    use crate::codebase_memory as cbm;
+    let home = cbm::aish_home();
+    let cfg = home.join(".mcp.json");
+    let read_root = || -> serde_json::Value {
+        std::fs::read_to_string(&cfg)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_else(|| serde_json::json!({ "mcpServers": {} }))
+    };
+    let bin = cbm::binary_path(&home);
+    let connected =
+        |session: &Session| session.mcp.server_names().iter().any(|n| n == cbm::SERVER_NAME);
+
+    match args.first().copied() {
+        None | Some("status") => {
+            let root = read_root();
+            let enrolled = cbm::is_enrolled(&root, cbm::SERVER_NAME);
+            let present = cbm::binary_present(&bin);
+            println!(
+                "codebase-memory: enrolled={enrolled}, binary={} ({}), connected={}",
+                if present { "present" } else { "missing" },
+                bin.display(),
+                connected(session),
+            );
+            if enrolled && !present {
+                println!(
+                    "  binary absent — tools stay dormant until `:codebase install` provisions it (graceful absence)."
+                );
+            } else if !enrolled {
+                println!("  run `:codebase install` to enroll the {} server.", cbm::LICENSE);
+            }
+        }
+        Some("install") => {
+            let mut root = read_root();
+            let spec = cbm::server_spec(&bin);
+            let outcome = cbm::merge_server_entry(&mut root, cbm::SERVER_NAME, spec);
+            if let Err(e) = std::fs::create_dir_all(&home).and_then(|()| {
+                std::fs::write(
+                    &cfg,
+                    format!(
+                        "{}\n",
+                        serde_json::to_string_pretty(&root).unwrap_or_default()
+                    ),
+                )
+            }) {
+                println!("codebase install: writing {}: {e}", cfg.display());
+                return;
+            }
+            match outcome {
+                cbm::MergeOutcome::Added => {
+                    println!("registered '{}' ({}) in {}", cbm::SERVER_NAME, cbm::LICENSE, cfg.display())
+                }
+                cbm::MergeOutcome::Unchanged => {
+                    println!("'{}' already registered — idempotent no-op", cbm::SERVER_NAME)
+                }
+                cbm::MergeOutcome::Updated => {
+                    println!("updated '{}' entry in {}", cbm::SERVER_NAME, cfg.display())
+                }
+            }
+            match cbm::platform_asset() {
+                None => println!(
+                    "  no prebuilt asset for {}/{} — build codebase-memory-mcp from source and place it at {}",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    bin.display(),
+                ),
+                Some(asset) if !cbm::binary_present(&bin) => println!(
+                    "  binary not yet present. Fetch {} and install it at {} (auto-download lands in a follow-up card).",
+                    cbm::asset_url(cbm::PINNED_VERSION, asset),
+                    bin.display(),
+                ),
+                Some(_) => println!("  binary present: {}", bin.display()),
+            }
+            if cbm::binary_present(&bin) && !connected(session) {
+                let added = session.mcp.reload().await;
+                if added.iter().any(|n| n == cbm::SERVER_NAME) {
+                    println!("  connected — codebase-memory tools now advertised (`:mcp tools {}`)", cbm::SERVER_NAME);
+                }
+            }
+        }
+        Some(other) => {
+            println!("usage: :codebase <install|status> (unknown subcommand '{other}')")
+        }
+    }
+}
+
 async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
     match args.split_first() {
         None | Some((&"list", _)) | Some((&"status", _)) => {
@@ -8284,6 +9151,60 @@ mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
     use std::collections::HashMap;
+
+    // ---- SPR-073: file-backed statusline segments (TASK-316) ---------------
+
+    #[test]
+    fn statusline_segments_reads_sorted_nonempty_txt() {
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!(
+            "aish_seg_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("20-ccquota.txt"), "\u{2691} wk 88%\n").unwrap();
+        std::fs::write(dir.join("10-first.txt"), "  \nFIRST body\nsecond\n").unwrap();
+        std::fs::write(dir.join("30-empty.txt"), "   \n\n").unwrap(); // skipped: blank
+        std::fs::write(dir.join("40-note.md"), "not a txt").unwrap(); // skipped: ext
+        let segs = statusline_segments(&dir, SystemTime::now(), Duration::from_secs(3600));
+        assert_eq!(
+            segs,
+            vec!["FIRST body".to_string(), "\u{2691} wk 88%".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn statusline_segments_skips_stale_and_missing_dir() {
+        use std::time::{Duration, SystemTime};
+        // Missing dir → empty, no panic.
+        let missing =
+            std::env::temp_dir().join(format!("aish_seg_missing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(statusline_segments(&missing, SystemTime::now(), Duration::from_secs(3600))
+            .is_empty());
+        // Stale file → skipped (now is 5s past mtime, stale_after = 0).
+        let dir = std::env::temp_dir().join(format!(
+            "aish_seg_stale_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("badge.txt"), "STALE\n").unwrap();
+        let future = SystemTime::now() + Duration::from_secs(5);
+        assert!(statusline_segments(&dir, future, Duration::from_secs(0)).is_empty());
+        // A generous fresh window includes it again.
+        let fresh = statusline_segments(&dir, SystemTime::now(), Duration::from_secs(3600));
+        assert_eq!(fresh, vec!["STALE".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // `:goal complete <phrase>` must route to the pursuit loop, not the CRUD
     // `complete` subcommand — only goal-id-shaped (hex/uuid) tails are refs.
@@ -9518,6 +10439,22 @@ mod tests {
     }
 
     #[test]
+    fn cycle_noop_only_when_idle_and_unattached() {
+        // Truly idle interactive prompt: nothing to attach to, not attached → no-op.
+        assert!(cycle_is_noop(0, false, false));
+        // A live worker exists → cycle runs.
+        assert!(!cycle_is_noop(1, false, false));
+        // An active goal exists → cycle runs (goal is a rotation slot).
+        assert!(!cycle_is_noop(0, true, false));
+        // THE BUG FIX: goal completed (goal_active=false) with no workers, but the
+        // operator is still attached to the now-finished goal → must NOT no-op, so
+        // Shift-Tab can fall through to the index-0 branch and return to interactive.
+        assert!(!cycle_is_noop(0, false, true));
+        // Pairs with `next_attach_index`: escaping a stale attach lands on interactive.
+        assert_eq!(next_attach_index(&[], Some(GOAL_ATTACH_ID)), 0);
+    }
+
+    #[test]
     fn cycle_includes_active_goal_as_last_target() {
         // `cycle_worker` appends the GOAL_ATTACH_ID sentinel after the live
         // workers when a `:goal` loop is active, so Shift-Tab lands on the goal
@@ -9851,6 +10788,19 @@ mod tests {
         let d = dispatch_coordinator("fix the failing test", &mut session);
         assert!(d.id.is_none(), "nested dispatch must not spawn");
         assert!(d.message.contains("nested"), "{}", d.message);
+    }
+
+    #[test]
+    fn status_badges_reflects_active_workers() {
+        let session = Session::new().unwrap();
+        // No workers, no alert, no goal → no badges.
+        assert_eq!(status_badges(&session, &[]), "");
+        // A terminal (finished) worker contributes no robot badge.
+        let done = vec![("w1".to_string(), true, "task".to_string())];
+        assert_eq!(status_badges(&session, &done), "");
+        // A live (non-terminal) worker shows the robot badge.
+        let live = vec![("w2".to_string(), false, "task".to_string())];
+        assert_eq!(status_badges(&session, &live), "🤖");
     }
 
     #[test]

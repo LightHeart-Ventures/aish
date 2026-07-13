@@ -15,12 +15,14 @@ mod editor;
 mod engine;
 mod git;
 mod git_repo;
+mod codebase_memory;
 mod goal;
 
 mod hooks;
 mod hwdetect;
 mod jobs;
 mod keywatch;
+mod lifecycle;
 mod loopguard;
 mod mcp;
 mod md;
@@ -32,6 +34,8 @@ mod oracle;
 mod pipeline;
 mod plugin_auth;
 mod plugin_dispatcher;
+mod plugin_timers;
+mod plugin_statusline;
 mod plugin_memory;
 #[cfg(test)]
 mod plugin_phase05_consolidation_tests;
@@ -49,7 +53,11 @@ mod script;
 mod session;
 mod skill_match;
 mod skill_provider;
+mod skill_sources;
 mod skills;
+mod spawn_broker;
+mod spawn_broker_host;
+mod spawn_broker_registry;
 mod stream_cancel;
 mod stream_render;
 mod style;
@@ -719,6 +727,17 @@ async fn main() -> Result<()> {
     if let Some(d) = plugin_dispatcher::dispatcher() {
         let _ = d.route(plugin_dispatcher::Event::WorkspaceOpen);
     }
+
+    // TASK-317 (SPR-073): arm declarative plugin timers — cheap, always-on
+    // interval loops that keep statusline cache files fresh without hanging
+    // refresh work off the agent turn loop. Error-isolated; a bad timer never
+    // blocks startup or disturbs the others.
+    plugin_timers::arm(&aish_dir.join("plugins"));
+
+    // TASK-318 (SPR-073): arm declarative first-class plugin statusline segments.
+    // Core owns the cadence, the in-memory cache, and the render contract — the
+    // plugin declares only `provides.statusline.command`. Also error-isolated.
+    plugin_statusline::arm(&aish_dir.join("plugins"));
 
     repl::run(
         backend,

@@ -43,8 +43,9 @@ pub struct PluginManifest {
     /// part of the canonical manifest surface (not silently dropped).
     #[serde(default)]
     pub webhook_url: Option<String>,
-    /// Phase 1.6 webhook opt-in: a shell command run on each lifecycle event
-    /// (event JSON on stdin). Consumed by [`crate::plugin_dispatcher`].
+    /// Phase 1.6 webhook opt-in: a command run (fork/exec as argv, NO shell —
+    /// SPR-069 TASK-379) on each lifecycle event, event JSON on stdin. Consumed
+    /// by [`crate::plugin_dispatcher`].
     #[serde(default)]
     pub webhook_command: Option<String>,
     /// Optional JSON-Schema-shaped description of the plugin's configuration
@@ -87,6 +88,124 @@ pub struct Provides {
     /// contributes no login command. See [`crate::plugin_auth`].
     #[serde(default)]
     pub login: Option<String>,
+    /// Phase 1 (plugin-skill-sources, design §3): declares this plugin a
+    /// **skill source** — a federated search/add provider that joins the
+    /// `:skill search` fan-out and `:skill add` priority-resolution. Absent →
+    /// the plugin contributes no skill source. Consumed by
+    /// [`discover_skill_sources`] and (later phases) the `SkillSource` façade
+    /// and `:skill` verb handlers.
+    #[serde(default)]
+    pub skill_source: Option<SkillSource>,
+    /// Phase 4 (TASK-317, SPR-073): declarative background **timers**. Each entry
+    /// runs a plain program on a fixed interval and (optionally) caches its
+    /// stdout to a file — a cheap, always-on alternative to throttling work
+    /// inside a `TurnEnd` hook, e.g. keeping a SecondStatusLine segment fresh.
+    /// Absent/empty → the plugin arms no timers. Consumed by
+    /// [`crate::plugin_timers::arm`].
+    #[serde(default)]
+    pub timers: Vec<PluginTimer>,
+    /// Phase 2b (TASK-318, SPR-073): a first-class **statusline** segment. The
+    /// plugin declares only a `command` (plus optional `args`/`every`/
+    /// `timeout_ms`); **core** owns the refresh cadence, the cache, and the
+    /// render contract — the plugin never touches the raw
+    /// `~/.aish/state/statusline/*.txt` file convention. Core runs the command
+    /// on a cadence and folds its stdout onto the SecondStatusLine. Absent →
+    /// the plugin contributes no first-class statusline segment. Consumed by
+    /// [`crate::plugin_statusline::arm`].
+    #[serde(default)]
+    pub statusline: Option<PluginStatusline>,
+}
+
+/// A `provides.statusline` block (TASK-318, SPR-073): a plugin's declarative,
+/// first-class SecondStatusLine segment. Unlike the Phase 1 file convention
+/// (where a plugin armed a timer, picked the magic cache path, and wrote a
+/// `*.txt` file itself), here the plugin declares ONLY a `command` and core
+/// owns everything else — cadence, an in-memory cache, staleness, and the
+/// render. `command` runs via direct fork/exec (NO shell) with the plugin
+/// directory as CWD; its first non-empty stdout line becomes the segment (the
+/// plugin owns any ANSI color). Unknown keys are dropped by serde for the usual
+/// forward-compat story.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct PluginStatusline {
+    /// Program to exec (`argv[0]`). A value that resolves to a file inside the
+    /// plugin directory runs that file; otherwise it's looked up on `PATH`.
+    pub command: String,
+    /// Extra arguments passed verbatim to `command`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Refresh interval as a compact duration — `"30s"`, `"10m"`, `"1h"`,
+    /// `"1d"` (a bare integer means seconds); same grammar as
+    /// [`crate::plugin_timers::parse_every`]. Absent/unparseable → the loader's
+    /// default cadence (see [`crate::plugin_statusline`]).
+    #[serde(default)]
+    pub every: Option<String>,
+    /// Per-run wall-clock timeout in milliseconds. A run that overruns is killed
+    /// and skipped; the prior segment ages out naturally. Absent → the loader
+    /// default.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// A single `provides.timers[]` entry (TASK-317, SPR-073): run `command` (with
+/// `args`) every `every`, and — when `cache` is set — write its stdout to that
+/// file. The turn-independent primitive that lets a plugin keep a status segment
+/// fresh without hanging refresh work off the agent turn loop. Programs run via
+/// direct fork/exec (NO shell) with the plugin directory as CWD; unknown keys
+/// are dropped by serde for the usual forward-compat story.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct PluginTimer {
+    /// Program to exec (`argv[0]`). A value that resolves to a file inside the
+    /// plugin directory runs that file; otherwise it's looked up on `PATH`.
+    pub command: String,
+    /// Extra arguments passed verbatim to `command`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Interval between runs as a compact duration — `"30s"`, `"10m"`, `"1h"`,
+    /// `"1d"` (a bare integer means seconds). Parsed by
+    /// [`crate::plugin_timers::parse_every`]; an unparseable/zero value disarms
+    /// the timer (logged, never fatal).
+    pub every: String,
+    /// Optional file the command's stdout is written to after each run (relative
+    /// paths resolve under `~/.aish/`). Absent → the command's own side effects
+    /// are the payload and nothing is written by the loader.
+    #[serde(default)]
+    pub cache: Option<String>,
+    /// Per-run wall-clock timeout in milliseconds (default 60000). A run that
+    /// overruns is killed and skipped; the interval cadence is preserved.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// The `provides.skill_source` block (design
+/// `docs/design/plugin-skill-sources.md` §3): declares a plugin as a federated
+/// skill **search/add** provider. Every field is optional so a source may be
+/// search-only, add-only, or a bare priority-labelled façade; unknown keys are
+/// dropped by serde for the same forward/backward-compat story as the rest of
+/// the manifest surface.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct SkillSource {
+    /// Source label shown in the SOURCE column and `:skill sources`. Defaults
+    /// to the owning plugin id when absent (resolved in
+    /// [`discover_skill_sources`]).
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Merge/precedence rank — higher wins on ref/name-dedup ties and orders
+    /// `add` attempts. The built-in embedded index sits at a low fixed priority
+    /// so plugins can outrank it. Defaults to `0`.
+    #[serde(default)]
+    pub priority: i64,
+    /// Handler script (relative to the plugin dir) answering `:skill search`.
+    /// `None` → the source is add-only.
+    #[serde(default)]
+    pub search: Option<String>,
+    /// Handler script resolving a `:skill add <ref>`. `None` → search-only.
+    #[serde(default)]
+    pub add: Option<String>,
+    /// Glob/prefix patterns of `reference` namespaces this source claims for
+    /// `add` routing (e.g. `"github:*"`, `"acme/*"`, `"*"`). Drives which
+    /// source(s) a given `:skill add` is offered to, in priority order.
+    #[serde(default)]
+    pub handles: Vec<String>,
 }
 
 impl PluginManifest {
@@ -112,6 +231,31 @@ impl PluginManifest {
     /// `Some("mycompany")`, `aish login mycompany` routes here (Phase 0.5.5).
     pub fn login_command(&self) -> Option<&str> {
         self.provides.as_ref().and_then(|p| p.login.as_deref())
+    }
+
+    /// This plugin's `provides.skill_source` block, if it declares one
+    /// (plugin-skill-sources design §3). `None` when the plugin contributes no
+    /// skill source. The paired discovery helper is [`discover_skill_sources`].
+    #[allow(dead_code)] // consumed by the Phase 2+ SkillSource façade / `:skill` verb handlers
+    pub fn skill_source(&self) -> Option<&SkillSource> {
+        self.provides.as_ref().and_then(|p| p.skill_source.as_ref())
+    }
+
+    /// This plugin's declared background timers (`provides.timers`, TASK-317).
+    /// Empty slice when the plugin declares no `provides` block or no timers.
+    /// Consumed by [`crate::plugin_timers::arm`].
+    pub fn timers(&self) -> &[PluginTimer] {
+        match &self.provides {
+            Some(p) => &p.timers,
+            None => &[],
+        }
+    }
+
+    /// This plugin's first-class statusline segment (`provides.statusline`,
+    /// TASK-318). `None` when the plugin declares no `provides` block or no
+    /// statusline. Consumed by [`crate::plugin_statusline::arm`].
+    pub fn statusline(&self) -> Option<&PluginStatusline> {
+        self.provides.as_ref().and_then(|p| p.statusline.as_ref())
     }
 
 
@@ -485,6 +629,64 @@ pub fn discover(dir: &Path) -> Vec<Plugin> {
 /// then skill name (each plugin's `skills::load` already pre-sorts by name).
 pub fn plugin_skills(dir: &Path) -> Vec<Skill> {
     discover(dir).into_iter().flat_map(|p| p.skills).collect()
+}
+
+/// A discovered plugin that declares `provides.skill_source`, resolved and
+/// paired with the plugin directory its handler scripts run in. Produced by
+/// [`discover_skill_sources`], one per skill-source plugin.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // fields consumed by the Phase 2+ SkillSource façade / search fan-out
+pub struct ResolvedSkillSource {
+    /// Owning plugin id (`manifest.id`).
+    pub plugin_id: String,
+    /// Source label — `skill_source.id` when set, else the owning plugin id.
+    pub id: String,
+    /// Merge/precedence rank; higher wins. Mirrors `skill_source.priority`.
+    pub priority: i64,
+    /// `search` handler script (relative to `dir`), if the source answers search.
+    pub search: Option<String>,
+    /// `add` handler script (relative to `dir`), if the source resolves add.
+    pub add: Option<String>,
+    /// `handles` globs the source claims for `:skill add` routing.
+    pub handles: Vec<String>,
+    /// Plugin directory the handler scripts are exec'd in.
+    pub dir: PathBuf,
+}
+
+/// Collect every discovered plugin that declares a `provides.skill_source`
+/// block into [`ResolvedSkillSource`]s, ordered by `priority` **descending**
+/// then source `id` **ascending** — the deterministic merge order the
+/// `:skill search` fan-out and `:skill add` priority-resolution consume
+/// (design §4). A source's `id` defaults to the owning plugin id when the
+/// manifest leaves `skill_source.id` unset. Mirrors [`plugin_skills`]'s
+/// `discover`-then-traverse shape and inherits its forgiving discovery — a
+/// broken plugin is skipped, never fatal.
+#[allow(dead_code)] // WIRED by TASK-342 (`:skill search` fan-out) / TASK-343 (`add` resolution)
+pub fn discover_skill_sources(dir: &Path) -> Vec<ResolvedSkillSource> {
+    let mut sources: Vec<ResolvedSkillSource> = discover(dir)
+        .into_iter()
+        .filter_map(|p| {
+            let src = p
+                .manifest
+                .provides
+                .as_ref()
+                .and_then(|pr| pr.skill_source.clone())?;
+            let plugin_id = p.manifest.id.clone();
+            let id = src.id.clone().unwrap_or_else(|| plugin_id.clone());
+            Some(ResolvedSkillSource {
+                plugin_id,
+                id,
+                priority: src.priority,
+                search: src.search,
+                add: src.add,
+                handles: src.handles,
+                dir: p.dir,
+            })
+        })
+        .collect();
+    // priority desc, then id asc — stable, total, deterministic.
+    sources.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
+    sources
 }
 
 // ---- Phase 0.5.3: `.mcp.json` merge from plugins into the client MCP set ----
@@ -1787,6 +1989,103 @@ mod tests {
         assert_eq!(ids, vec!["alpha", "zeta"]);
     }
 
+    // ---- Phase 1 (plugin-skill-sources, TASK-336 manifest / TASK-337 discovery) ----
+
+    #[test]
+    fn provides_skill_source_parses_all_fields() {
+        let m = manifest(
+            r#"{"id":"skillfish","provides":{"skill_source":{
+                "id":"skillfish","priority":100,"search":"search.sh","add":"add.sh",
+                "handles":["*","skillfish:*","*/*"]}}}"#,
+        );
+        let src = m.skill_source().expect("skill_source parsed");
+        assert_eq!(src.id.as_deref(), Some("skillfish"));
+        assert_eq!(src.priority, 100);
+        assert_eq!(src.search.as_deref(), Some("search.sh"));
+        assert_eq!(src.add.as_deref(), Some("add.sh"));
+        assert_eq!(src.handles, vec!["*", "skillfish:*", "*/*"]);
+    }
+
+    #[test]
+    fn provides_without_skill_source_is_none() {
+        // A `provides` block that declares only other capabilities → no source.
+        let m = manifest(r#"{"id":"p","provides":{"login":"acme"}}"#);
+        assert!(m.skill_source().is_none());
+    }
+
+    #[test]
+    fn skill_source_defaults_are_empty() {
+        // A bare block: search/add/id absent, priority 0, no handles.
+        let m = manifest(r#"{"id":"p","provides":{"skill_source":{}}}"#);
+        let src = m.skill_source().expect("empty block still parses");
+        assert!(src.id.is_none());
+        assert_eq!(src.priority, 0);
+        assert!(src.search.is_none() && src.add.is_none());
+        assert!(src.handles.is_empty());
+    }
+
+    #[test]
+    fn discover_skill_sources_collects_only_skill_source_plugins() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "plain", r#"{"id":"plain"}"#, Some(("s", "d")));
+        write_plugin(
+            &tmp,
+            "fish",
+            r#"{"id":"fish","provides":{"skill_source":{"search":"search.sh"}}}"#,
+            Some(("s", "d")),
+        );
+        let sources = discover_skill_sources(&tmp);
+        assert_eq!(sources.len(), 1, "only the skill_source plugin is collected");
+        assert_eq!(sources[0].plugin_id, "fish");
+        // id defaults to the owning plugin id when the block omits it.
+        assert_eq!(sources[0].id, "fish");
+        assert_eq!(sources[0].search.as_deref(), Some("search.sh"));
+        assert!(sources[0].add.is_none());
+        assert_eq!(sources[0].dir, tmp.join("fish"));
+    }
+
+    #[test]
+    fn discover_skill_sources_sorted_by_priority_desc_then_id_asc() {
+        let tmp = tempdir();
+        // Two sources share priority 50 → the tie breaks by id asc (aaa < bbb).
+        write_plugin(
+            &tmp,
+            "p_hi",
+            r#"{"id":"p_hi","provides":{"skill_source":{"id":"hi","priority":100}}}"#,
+            None,
+        );
+        write_plugin(
+            &tmp,
+            "p_bbb",
+            r#"{"id":"p_bbb","provides":{"skill_source":{"id":"bbb","priority":50}}}"#,
+            None,
+        );
+        write_plugin(
+            &tmp,
+            "p_aaa",
+            r#"{"id":"p_aaa","provides":{"skill_source":{"id":"aaa","priority":50}}}"#,
+            None,
+        );
+        write_plugin(
+            &tmp,
+            "p_lo",
+            r#"{"id":"p_lo","provides":{"skill_source":{"id":"lo","priority":1}}}"#,
+            None,
+        );
+        let ids: Vec<_> = discover_skill_sources(&tmp)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, vec!["hi", "aaa", "bbb", "lo"]);
+    }
+
+    #[test]
+    fn discover_skill_sources_empty_when_no_sources() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "plain", r#"{"id":"plain"}"#, Some(("s", "d")));
+        assert!(discover_skill_sources(&tmp).is_empty());
+    }
+
     // ---- Phase 0.5.3: `.mcp.json` merge from plugins into the client set ----
 
     /// Write `<root>/<id>/.mcp.json` with the given raw JSON body.
@@ -2377,6 +2676,52 @@ mod tests {
 
         // No-such-plugin → None.
         assert!(format_plugin_schemas(&tmp, "ghost").is_none());
+    }
+
+    /// TASK-376 (SPR-069) — schema-reconciliation guard.
+    ///
+    /// The ADR (`docs/design/webhook-plugin-routing.md`, Decision 1) pins the
+    /// canonical webhook-handler schema to the `webhooks[]` array parsed by
+    /// `aish_webhook_client::PluginManifest`, and asserts that a single
+    /// `plugin.json` "satisfies both" the aish-core loader
+    /// (`super::PluginManifest`) and the webhook-client loader. This test turns
+    /// that prose claim into a CI-enforced invariant: the shipped GitHub
+    /// reference plugin (`plugins/github/plugin.json`) must parse cleanly under
+    /// BOTH loaders, and the canonical loader must surface the declared
+    /// handlers. If a future change forks the schema (adds a competing field,
+    /// or tightens either struct to reject the other's keys), this test fails.
+    #[test]
+    fn github_plugin_manifest_satisfies_both_loaders() {
+        use aish_webhook_client::PluginManifest as WebhookManifest;
+
+        let text = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("plugins")
+                .join("github")
+                .join("plugin.json"),
+        )
+        .expect("plugins/github/plugin.json present");
+
+        // (1) aish-core loader accepts the manifest — the unknown
+        //     `webhooks`/`author`/`license` keys are dropped by serde, never a
+        //     hard error. One manifest, both loaders.
+        let core: PluginManifest =
+            serde_json::from_str(&text).expect("core PluginManifest parses github plugin");
+        assert_eq!(core.id, "github");
+
+        // (2) The canonical webhook-client loader parses the same bytes and
+        //     surfaces the declared handlers — the single source of truth.
+        let hooks: WebhookManifest =
+            serde_json::from_str(&text).expect("canonical PluginManifest parses github plugin");
+        assert_eq!(hooks.id, "github");
+        assert_eq!(hooks.webhooks.len(), 5, "all five handlers parsed");
+        let first = &hooks.webhooks[0];
+        assert_eq!(first.event_type, "pull_request");
+        assert_eq!(first.command, vec!["handlers/pr-review.sh".to_string()]);
+        assert_eq!(
+            first.filters.get("action").and_then(|v| v.as_str()),
+            Some("opened"),
+        );
     }
 
     /// A private, dependency-free temp dir (the crate doesn't pull in the

@@ -1,0 +1,8 @@
+{
+  "id": "hello-world",
+  "name": "Hello World",
+  "version": "0.1.0",
+  "description": "The smallest possible aish plugin — contributes a single greeting skill to prove plugin discovery and skill-registry expansion work end to end, and subscribes to lifecycle webhooks to flash a greeting on the SecondStatusLine.",
+  "enabled": true,
+  "webhook_command": "printf \"👋 Hello World plugin received: %s\\n\" \"$AISH_EVENT_TYPE\""
+}

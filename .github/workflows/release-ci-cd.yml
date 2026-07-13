@@ -1,0 +1,173 @@
+name: Release (CI/CD)
+
+# Auto-publish bleeding-edge builds from every main commit. This is the **continuous delivery**
+# half of the release channels (not an on-demand CI test gate — that's ci.yml). Tags these with
+# `ci-{run_number}-{short_sha}` and marks them prerelease so they don't override production.
+
+# Auto-publish on every main commit: bleeding-edge internal testing channel.
+# Tags: ci-{run_number}-{short_sha} (e.g., ci-12345-a1b2c3d4)
+# Marked as prerelease so these never override the latest production release.
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-ci
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build ${{ matrix.target }} (ci)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: aish-x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: aish-aarch64-apple-darwin
+          - os: blacksmith-4vcpu-ubuntu-2404
+            target: x86_64-unknown-linux-gnu
+            asset: aish-x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+        shell: bash
+
+      - name: Cache cargo + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --features local --target ${{ matrix.target }}
+        shell: bash
+
+      - name: Package binary + checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/aish" "dist/${{ matrix.asset }}"
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+          cat "${{ matrix.asset }}.sha256"
+        shell: bash
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}-ci
+          path: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish ci release
+    needs: build
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Generate release tag
+        id: tag
+        run: |
+          set -euo pipefail
+          shortsha=$(git rev-parse --short HEAD)
+          tag="ci-${{ github.run_number }}-${shortsha}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name 'aish-*' ! -name '*-ci' \) -exec cp {} dist/ \;
+          echo "CI release assets:"
+          ls -l dist
+
+      - name: Aggregate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          cat *.sha256 > SHA256SUMS 2>/dev/null || true
+          cat SHA256SUMS 2>/dev/null || echo "(no checksums)"
+
+      - name: Create and publish CI release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --prerelease \
+            --title "aish $tag (ci)" \
+            --notes "CI/CD build from ${{ github.event.head_commit.url || 'HEAD' }}. Internal testing only — highly unstable." \
+            dist/aish-* dist/SHA256SUMS
+        shell: bash
+
+      # Fail loudly if the published release is asset-less. `gh release create`
+      # uploads assets atomically before publish (unlike softprops' create-then-
+      # upload, which 422s on this immutable-release repo — see run 28553643115),
+      # but masking publish errors with `|| true` previously let zero-asset
+      # releases ship green and silently break `:update --channel ci`. Assert the
+      # 7 expected assets (3 binaries + 3 .sha256 + SHA256SUMS) exist.
+      - name: Verify release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          count="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')"
+          echo "Published $tag with $count assets."
+          if [ "$count" -lt 7 ]; then
+            echo "::error::CI release $tag published with $count assets (expected 7). ':update --channel ci' would break. Failing so this surfaces instead of shipping silently."
+            exit 1
+          fi
+        shell: bash
+
+  prune:
+    name: prune old ci releases
+    needs: release
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: always()
+    steps:
+      - name: Prune releases older than 10 latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # List all CI releases, sorted by creation date (newest first)
+          gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts \
+            --json tagName,createdAt --jq '.[] | select(.tagName | startswith("ci-"))' \
+            | tail -n +11 | jq -r '.tagName' | while read -r tag; do
+            echo "Deleting old CI release: $tag"
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes || true
+          done
+        shell: bash

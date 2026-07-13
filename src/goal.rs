@@ -102,6 +102,12 @@ struct Inner {
     /// Shift-Tab so the goal's history renders like a worker's. Capped at
     /// [`TRANSCRIPT_CAP`] lines.
     transcript: Vec<String>,
+    /// Operator steer mailbox — instructions queued via `:tell goal <msg>` or by
+    /// typing while `:attach`ed to the goal. Drained at the START of each turn
+    /// (see [`GoalLoop::take_steers`]) and folded into that turn's generator
+    /// directive by [`compose_guidance`], so the human can course-correct a
+    /// running goal mid-flight the way `:tell` steers a coordinator. FIFO.
+    steers: Vec<String>,
 }
 
 pub type Handle = Arc<GoalLoop>;
@@ -121,6 +127,36 @@ impl GoalLoop {
         if i.status == Status::Active {
             i.status = Status::Cleared;
         }
+    }
+
+    /// Queue an operator steer instruction (`:tell goal <msg>` or a line typed
+    /// while `:attach`ed to the goal). Folded into the NEXT turn's generator
+    /// directive so the human can course-correct a running goal without killing
+    /// it — the goal analogue of `:tell`-ing a coordinator. Returns `false`
+    /// (nothing queued) when the message is blank or the loop is no longer
+    /// active, so the caller can tell the operator there was nothing to steer.
+    pub fn steer(&self, msg: &str) -> bool {
+        let msg = msg.trim();
+        if msg.is_empty() {
+            return false;
+        }
+        {
+            let mut i = self.inner.lock().unwrap();
+            if i.status != Status::Active || i.cancel {
+                return false;
+            }
+            i.steers.push(msg.to_string());
+        }
+        self.note(&format!("operator steer queued: {msg}"));
+        true
+    }
+
+    /// Drain the pending operator steer messages (FIFO). Called once at the top
+    /// of each turn so a steer applies to the turn it precedes and is not
+    /// replayed on later turns (one-shot, like a coordinator `:tell`).
+    fn take_steers(&self) -> Vec<String> {
+        let mut i = self.inner.lock().unwrap();
+        std::mem::take(&mut i.steers)
     }
 
     /// Fire a goal-lifecycle hook (observe-only, best-effort, off the hot path).
@@ -195,15 +231,26 @@ impl GoalLoop {
     /// every per-turn announcement is also retained so `:attach goal` /
     /// Shift-Tab can replay the goal's history tail (see [`attach_backfill`]).
     fn note(&self, line: &str) {
-        {
-            let mut i = self.inner.lock().unwrap();
-            i.transcript.push(line.to_string());
-            let len = i.transcript.len();
-            if len > TRANSCRIPT_CAP {
-                i.transcript.drain(0..len - TRANSCRIPT_CAP);
-            }
-        }
+        self.record(line);
         announce(line);
+    }
+
+    /// Like [`note`], but records the line into the replay transcript WITHOUT
+    /// surfacing a transient `[goal]` line over the prompt. Used for the noisy
+    /// per-turn `working…`/`checking…` progress ticks: they stay available for
+    /// `:attach goal` / Shift-Tab replay but no longer spam the live console.
+    fn note_quiet(&self, line: &str) {
+        self.record(line);
+    }
+
+    /// Append `line` to the bounded replay transcript (no console output).
+    fn record(&self, line: &str) {
+        let mut i = self.inner.lock().unwrap();
+        i.transcript.push(line.to_string());
+        let len = i.transcript.len();
+        if len > TRANSCRIPT_CAP {
+            i.transcript.drain(0..len - TRANSCRIPT_CAP);
+        }
     }
 
     /// Backfill rows for `:attach goal` / Shift-Tab (TASK-301) — the goal
@@ -290,6 +337,7 @@ pub fn spawn(
             turn_started: None,
             phase: Step::Idle,
             transcript: Vec::new(),
+            steers: Vec::new(),
         }),
     });
     tokio::spawn(run_goal(goal.clone(), spec, model, cred));
@@ -303,7 +351,10 @@ pub fn spawn(
 ///
 /// The prefix also encodes the operator-requested plan-first + task-lifecycle
 /// discipline: the first turn must deconstruct/restate the goal, state its
-/// constraints and a measurable definition of success, map dependencies and
+/// constraints and a measurable definition of success, break the goal into
+/// bite-size, right-sized sub-tasks (a review→design→build pipeline for a
+/// mega-task; file-locality grouping so several TODOs touching one file go to a
+/// single worker instead of colliding parallel ones), map dependencies and
 /// parallelism, and persist that plan durably BEFORE building. Execution then
 /// fans independent sub-work out via `run_in_background`, tracks the work as a
 /// board task (spec/comments/branch/PR kept current, moved to completed only once
@@ -313,8 +364,9 @@ pub fn spawn(
 /// Because each goal turn runs as a full-tool coordinator subprocess
 /// ([`crate::worker::run_once`]), it has the always-surfaced `message_console`
 /// channel. We instruct it to post a per-turn note so the operator sees live
-/// progress even while the goal loop runs unattended: (1) a turn summary, and
-/// (2) any pull request it opened, with a one-line summary. `message_console`
+/// progress even while the goal loop runs unattended: (1) the work completed
+/// this turn, (2) the work remaining before the goal is met, and (3) any pull
+/// request it opened, with a one-line summary. `message_console`
 /// emits a `📣` sentinel line that is surfaced to the operator regardless of the
 /// `:worker-output` gate, without polluting the stdout result the verifier judges.
 ///
@@ -327,15 +379,20 @@ Plan before you build. On your FIRST turn (and whenever no plan exists yet), do 
 1. Deconstruct the goal and restate it in your own words in 60 characters or less.\n\
 2. Identify the constraints and limits — time, budget, access, and the tools/permissions the work needs.\n\
 3. State concretely and measurably what success looks like — the evidence that will prove the goal is met.\n\
-4. Review the existing work, map the dependencies between sub-tasks, and note which sub-tasks can run in parallel.\n\
+4. Break the goal into bite-size sub-tasks and right-size the work so no single worker bites off more than it can finish in one focused pass:\n\
+   a. Decompose a large or multi-phase goal into a logical pipeline of stages with real dependencies — e.g. review → design → build → test — and run the stages in order rather than handing one worker the whole mega-task at once.\n\
+   b. Size each sub-task so ONE worker can complete it in a single focused pass; if a unit spans many files or several unrelated concerns, split it further until each piece is self-contained.\n\
+   c. Optimize by file locality: bundle sub-tasks or TODOs that all touch the SAME file(s) into ONE worker so it does them together — do NOT split edits to a shared file across parallel workers that would collide, reload the same context, or conflict on the same lines.\n\
+   Then map the dependencies between the bite-size sub-tasks and note which are independent and file-disjoint (safe to run in parallel) versus which must wait on an upstream stage.\n\
 5. Persist that plan durably so it survives a restart: record the goal, its sub-tasks/milestones, dependencies, and success criteria in a durable store (the goal store or an aish.db table). Mark each sub-task complete in that store as you finish it.\n\n\
 Then build toward the goal:\n\
-6. Do the independent sub-tasks in parallel where it helps, using the run_in_background tool; keep serial only the work with real dependencies.\n\
+6. Dispatch the independent, file-disjoint sub-tasks in parallel with the run_in_background tool — one worker per bite-size unit, and one worker for all the TODOs that share a file — keeping serial only the work with real dependencies or that touches shared files.\n\
 7. Track the work as a board task: open a task (or reuse the linked one), keep its spec, comments, branch, and pull-request fields up to date as you progress, and move it to completed only once the goal is verified done.\n\
 8. Guard against cascading errors: have an independent agent or verifier fact-check each key result before you build further on it.\n\n\
-Before you finish this turn, call the `message_console` tool once to surface your progress to the operator:\n\
-1. A one- to two-line summary of what you did this turn and the evidence for it (on the first turn, include your 60-character restatement and your success definition).\n\
-2. If you opened a pull request this turn, include its number/URL and a one-line summary of what it changes.\n\n\
+Before you finish this turn, call the `message_console` tool once to summarize the work completed and the work remaining, so the operator sees live progress at each turn:\n\
+1. WORK COMPLETED: a one- to two-line summary of what you did this turn and the evidence for it (on the first turn, include your 60-character restatement and your success definition).\n\
+2. WORK REMAINING: a one- to two-line summary of the outstanding sub-tasks/milestones still to finish before the goal is met — or \"none — goal met\" when nothing is left.\n\
+3. If you opened a pull request this turn, include its number/URL and a one-line summary of what it changes.\n\n\
 Goal:\n";
 /// Marker separating the goal condition from the verifier's last-check guidance
 /// in a re-tried turn's directive.
@@ -399,6 +456,33 @@ pub(crate) fn goal_condition_from_directive(task: &str) -> Option<String> {
         None => rest,
     };
     Some(condition.to_string())
+}
+
+/// Merge the carried-forward verifier guidance with any fresh operator steer
+/// messages (`:tell goal <msg>` or input typed while `:attach`ed) into the
+/// single `guidance` string folded into this turn's generator directive.
+///
+/// Steer text is framed as a priority operator instruction. When a verifier
+/// note is also pending, both are carried (steer first, since an explicit human
+/// course-correction outranks the machine judge's last critique). Returns `None`
+/// when there is neither, so the first unsteered turn's directive stays clean
+/// and [`goal_condition_from_directive`] recovers a bare condition. Routed
+/// through the SAME [`GOAL_DIRECTIVE_GUIDANCE_MARKER`] channel as verifier
+/// feedback, so the `:workers` reverse-parser strips it identically and the
+/// goal-coalescing key stays stable regardless of steer content.
+pub(crate) fn compose_guidance(verifier: Option<&str>, steers: &[String]) -> Option<String> {
+    if steers.is_empty() {
+        return verifier.map(str::to_string);
+    }
+    let joined = steers.join(" | ");
+    let steer_block = format!(
+        "the operator steered this goal mid-flight — treat this as a priority \
+         instruction and fold it into your approach: {joined}"
+    );
+    match verifier {
+        Some(v) if !v.is_empty() => Some(format!("{steer_block}\n\n(prior verifier note: {v})")),
+        _ => Some(steer_block),
+    }
 }
 
 /// Terminal outcome of a goal pursuit, surfaced on the `GoalEnd` hook payload.
@@ -477,9 +561,21 @@ async fn run_goal_loop(
             i.turns
         };
 
+        // Fold any operator steer messages (`:tell goal` / typed input while
+        // `:attach`ed) into this turn's guidance so the human can course-correct
+        // a running goal mid-flight. Drained one-shot; `guidance` (verifier
+        // feedback) still carries across turns independently.
+        let steers = goal.take_steers();
+        if !steers.is_empty() {
+            goal.note(&format!(
+                "turn {turn}: folding {} operator steer(s) into this turn",
+                steers.len()
+            ));
+        }
+        let effective = compose_guidance(guidance.as_deref(), &steers);
         // Generator: a full-tool worker pursues the goal with the latest guidance.
-        let directive = goal_directive(&goal.condition, guidance.as_deref());
-        goal.note(&format!("turn {turn}: working…"));
+        let directive = goal_directive(&goal.condition, effective.as_deref());
+        goal.note_quiet(&format!("turn {turn}: working…"));
         {
             let mut i = goal.inner.lock().unwrap();
             i.turn_started = Some(Instant::now());
@@ -534,7 +630,7 @@ async fn run_goal_loop(
         }
 
         // Verifier: the batch model judges whether the output demonstrates the goal.
-        goal.note(&format!("turn {turn}: checking…"));
+        goal.note_quiet(&format!("turn {turn}: checking…"));
         goal.inner.lock().unwrap().phase = Step::Checking;
         let (met, reason) = match judge(&cred, &model, &goal.condition, &output).await {
             Ok((met, reason)) => (met, reason),
@@ -645,15 +741,32 @@ fn announce(line: &str) {
     crate::tools::announce("[goal]", line);
 }
 
+/// Build the goal-delivery blob: the dim `── goal achieved (N turn(s)) ──`
+/// banner, the verifier's one-line verdict, then the achieved output rendered as
+/// terminal markdown — each logical line `\n`-terminated so the whole thing can
+/// be handed to the prompt-preserving printer atomically. Pure — unit-tested.
+fn delivery_blob(turns: usize, reason: &str, rendered_output: &str) -> String {
+    format!(
+        "\x1b[2m── goal achieved ({turns} turn(s)) ──\x1b[0m\n\x1b[2m{reason}\x1b[0m\n{rendered_output}\n"
+    )
+}
+
 /// Deliver the achieved outcome over the prompt (rendered markdown), like a
-/// finished batch result.
+/// finished batch result. Routes through the serialized, prompt-preserving
+/// [`crate::tools::print_above_prompt`] (CRLF-normalized, coordinated with the
+/// live prompt + `:output` pane) so the delivery lands as clean, left-aligned
+/// lines instead of gluing onto the last transient `[goal]` activity row and
+/// stair-stepping off the border — the reported malformatted-goal-output bug.
+/// Falls back to a raw stdout write (erasing the transient line first) when no
+/// printer is installed (piped / headless / non-interactive).
 fn deliver(goal: &Handle, turns: usize, reason: &str, output: &str) {
     use std::io::Write;
-    print!("\r\x1b[2K");
-    println!("\x1b[2m── goal achieved ({turns} turn(s)) ──\x1b[0m");
-    println!("\x1b[2m{reason}\x1b[0m");
-    println!("{}", crate::md::render_stdout(output.trim()));
+    let blob = delivery_blob(turns, reason, &crate::md::render_stdout(output.trim()));
     let _ = goal; // handle kept for symmetry / future status integration
+    if crate::tools::print_above_prompt(blob.clone()) {
+        return;
+    }
+    print!("\r\x1b[2K{blob}");
     std::io::stdout().flush().ok();
 }
 
@@ -1176,6 +1289,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delivery_blob_is_left_aligned_and_line_terminated() {
+        let blob = delivery_blob(4, "goal met", "line one\nline two");
+        assert_eq!(
+            blob,
+            "\x1b[2m── goal achieved (4 turn(s)) ──\x1b[0m\n\x1b[2mgoal met\x1b[0m\nline one\nline two\n"
+        );
+        assert!(blob.ends_with('\n'));
+    }
+
+    #[test]
     fn fmt_duration_buckets() {
         assert_eq!(fmt_duration(Duration::from_secs(0)), "0s");
         assert_eq!(fmt_duration(Duration::from_secs(45)), "45s");
@@ -1218,8 +1341,80 @@ mod tests {
                 turn_started: turn_started.then(Instant::now),
                 phase,
                 transcript: Vec::new(),
+                steers: Vec::new(),
             }),
         }
+    }
+
+    // compose_guidance: no verifier note and no steers → clean (None) so the
+    // first turn's directive recovers a bare condition.
+    #[test]
+    fn compose_guidance_empty_is_none() {
+        assert_eq!(compose_guidance(None, &[]), None);
+    }
+
+    // Verifier feedback with no steer is carried through verbatim.
+    #[test]
+    fn compose_guidance_verifier_only_passthrough() {
+        assert_eq!(
+            compose_guidance(Some("tighten the error handling"), &[]),
+            Some("tighten the error handling".to_string())
+        );
+    }
+
+    // A steer with no verifier note is framed as a priority operator instruction.
+    #[test]
+    fn compose_guidance_steer_only_is_priority_block() {
+        let out = compose_guidance(None, &["prefer sqlite over postgres".to_string()]).unwrap();
+        assert!(out.contains("operator steered this goal"), "framed: {out}");
+        assert!(out.contains("prefer sqlite over postgres"), "carries msg: {out}");
+        assert!(!out.contains("prior verifier note"), "no verifier tail: {out}");
+    }
+
+    // Steer + verifier: both carried, steer FIRST (human course-correction
+    // outranks the machine judge's last critique), verifier demoted to a tail.
+    #[test]
+    fn compose_guidance_steer_and_verifier_orders_steer_first() {
+        let out = compose_guidance(
+            Some("add tests"),
+            &["ship it as a draft PR".to_string()],
+        )
+        .unwrap();
+        let steer_at = out.find("ship it as a draft PR").unwrap();
+        let verifier_at = out.find("add tests").unwrap();
+        assert!(steer_at < verifier_at, "steer precedes verifier: {out}");
+        assert!(out.contains("prior verifier note"), "verifier demoted: {out}");
+    }
+
+    // Multiple steers are joined FIFO into one directive.
+    #[test]
+    fn compose_guidance_joins_multiple_steers() {
+        let out = compose_guidance(
+            None,
+            &["first".to_string(), "second".to_string()],
+        )
+        .unwrap();
+        assert!(out.contains("first | second"), "FIFO join: {out}");
+    }
+
+    // steer(): queues on an active goal, is drained one-shot by take_steers,
+    // and a blank message is rejected.
+    #[test]
+    fn test_steer_queues_and_drains_once() {
+        let g = goal_with(Status::Active, Step::Working, true);
+        assert!(g.steer("narrow to the parser"), "active goal accepts steer");
+        assert!(!g.steer("   "), "blank steer rejected");
+        let drained = g.take_steers();
+        assert_eq!(drained, vec!["narrow to the parser".to_string()]);
+        assert!(g.take_steers().is_empty(), "one-shot: second drain empty");
+    }
+
+    // steer(): a finished (or cancelled) goal has nothing to steer.
+    #[test]
+    fn test_steer_rejected_when_not_active() {
+        let g = goal_with(Status::Achieved, Step::Idle, false);
+        assert!(!g.steer("too late"), "inactive goal rejects steer");
+        assert!(g.take_steers().is_empty());
     }
 
     // TASK-301: `:attach goal` history backfill surfaces the goal's durable
@@ -1862,10 +2057,15 @@ mod domain_tests {
         );
         assert!(
             d.to_lowercase().contains("summary of what you did this turn"),
-            "directive should ask for a per-turn summary"
+            "directive should ask for a per-turn work-completed summary"
+        );
+        let low = d.to_lowercase();
+        assert!(
+            low.contains("work completed") && low.contains("work remaining"),
+            "directive should ask for both work completed and work remaining each turn"
         );
         assert!(
-            d.to_lowercase().contains("pull request"),
+            low.contains("pull request"),
             "directive should ask for any opened PR with a summary"
         );
         // Instructions live in the prefix, so the condition still round-trips clean.
@@ -1874,6 +2074,38 @@ mod domain_tests {
             Some("ship the fix")
         );
     }
+
+    // The per-turn directive must tell the worker to right-size sub-tasks so it
+    // does not bite off more than it can chew: decompose a mega-task into a
+    // review→design→build pipeline, cap each unit at one focused worker pass, and
+    // group work by file locality (TODOs touching one file → one worker). This is
+    // the operator-requested anti-"mega-task" discipline (bite-size chunking +
+    // file-change optimization).
+    #[test]
+    fn goal_directive_instructs_bite_size_and_file_locality() {
+        let d = goal_directive("ship the fix", None).to_lowercase();
+        for needle in [
+            "bite-size",
+            "right-size",
+            "pipeline of stages",
+            "focused pass",
+            "file locality",
+            "same file",
+            "one worker",
+        ] {
+            assert!(
+                d.contains(needle),
+                "bite-size/file-locality directive missing instruction: {needle:?}"
+            );
+        }
+        // Instructions live in the prefix → the condition still round-trips clean,
+        // so `:workers` goal-turn coalescing is unaffected.
+        assert_eq!(
+            goal_condition_from_directive(&goal_directive("ship the fix", None)).as_deref(),
+            Some("ship the fix")
+        );
+    }
+
 
     // The per-turn directive must also encode the plan-first + task-lifecycle
     // discipline: deconstruct/restate, constraints, measurable success, dependency

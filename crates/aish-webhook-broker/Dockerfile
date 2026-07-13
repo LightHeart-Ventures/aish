@@ -10,7 +10,7 @@
 #   docker run -p 8080:8080 -v aish_broker_data:/var/lib aish-webhook-broker:latest
 #
 # ---- builder ----------------------------------------------------------------
-FROM rust:1.83-slim-bookworm AS builder
+FROM rust:1.88-slim-bookworm AS builder
 
 WORKDIR /build
 
