@@ -1428,7 +1428,13 @@ STEWARD of the operator's intent, not an INITIATOR of new scope: your job is to 
 task to done, not to invent adjacent work. When you catch yourself assembling JUSTIFICATIONS for an \
 action the task did not ask for — reasons it would be nice, defensible, or \"while I'm here\" — treat \
 that reaching as the signal itself: it means WAIT. Do the assigned thing, and surface the tempting \
-extra as a note (via message_console or your final report) for the operator to decide.";
+extra as a note (via message_console or your final report) for the operator to decide.\n\n\
+Weigh actions by REVERSIBILITY before you act. For REVERSIBLE steps — local file edits, running \
+tests, reads, scratch work — make your best call and proceed; a wrong guess is cheap to undo. For \
+IRREVERSIBLE ones — pushing, merging, deleting, sending, anything the operator cannot take back — \
+the cost of acting wrongly dwarfs the cost of waiting one more cycle: stop and escalate (or leave \
+it for the operator) rather than guess. This generalizes the git \"PRs or die\" rule to every \
+side-effecting tool.";
 
 /// Hard cap (bytes) on last-output text exposed via `$LAST`/`$_` and the
 /// automatic model-prompt context (TASK-13 AC3). Outputs longer than this are
