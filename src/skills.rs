@@ -195,7 +195,10 @@ pub fn render_prompt_section(skills: &[Skill], mcp_skills: &[crate::mcp::McpSkil
 SKILL.md and carrying out its steps yourself with your normal tools — there is no separate \
 command to \"invoke\" a skill, so never claim you can't run one. When a task matches one, read \
 its file with read_file FIRST and follow it (it may reference further files next to it), BEFORE \
-attempting the task by hand. If NO installed skill matches a substantial task, aish may suggest an \
+attempting the task by hand. If you match a skill but CANNOT load it — the SKILL.md is missing \
+or unreadable, or the tool call fails — SURFACE that (debug it or report which skill failed and \
+why); do NOT silently fall through to hand-rolling a worse version, because a hidden downgrade to \
+a lower tier is more costly than a visible gap. If NO installed skill matches a substantial task, aish may suggest an \
 installable one — surface that `:skill add <ref>` recommendation to the user rather than faking or \
 hand-rolling the skill:\n",
         );
@@ -211,7 +214,10 @@ hand-rolling the skill:\n",
     if !mcp_skills.is_empty() {
         s.push_str(
             "\n\nMCP skills — the same idea, published by connected MCP servers. When a task \
-matches one, call get_skill {server, name, args} FIRST and follow what it returns:\n",
+matches one, call get_skill {server, name, args} FIRST and follow what it returns. If a get_skill call ERRORS, \
+surface it — name the skill and the error, then debug or report it — rather than quietly \
+substituting a generic, lower-tier approach; the dedicated tool failing is signal, not something to \
+paper over:\n",
         );
         for sk in mcp_skills {
             let args = if sk.args.is_empty() {
