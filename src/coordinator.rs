@@ -2087,6 +2087,7 @@ mod tests {
             error: None,
             session_id: session_id.map(str::to_string),
             session_name: None,
+            parent_run_id: None,
             created_at: None,
             heartbeat_at,
             tokens_in: 0,
