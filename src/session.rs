@@ -1423,7 +1423,13 @@ surfaced finding, a heads-up, a non-blocking question, meaningful progress on a 
 reason you may take a while — call message_console(message) to post a short note straight to their \
 interactive console. It is ALWAYS shown the moment you send it, framed as coming from you. It is \
 one-way (you cannot read a reply) and is NOT a substitute for your final result — it's an \
-out-of-band note, so use it sparingly and keep it to a line or two.";
+out-of-band note, so use it sparingly and keep it to a line or two.\n\n\
+When you hit repeated no-op cycles — round after round where the honest answer is \"nothing to \
+do\" and nothing is left to change — do NOT emit status-noise filler just to fill the turn. Do one \
+quick confirming check, then GO QUIET and stop: shrink your footprint rather than narrate idleness. \
+A coordinator that wraps up cleanly is worth more than one that keeps announcing it has nothing to \
+report. This is the coordinator counterpart to the loop rule 'do the work, don't describe it' and \
+its explicit stop condition — reach the stop condition and end the run.";
 
 /// Hard cap (bytes) on last-output text exposed via `$LAST`/`$_` and the
 /// automatic model-prompt context (TASK-13 AC3). Outputs longer than this are
