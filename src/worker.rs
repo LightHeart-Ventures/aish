@@ -1619,6 +1619,15 @@ fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str, cwd: &std::path::
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Hierarchy link (`:workers` run tree): stamp OUR run id as the child's
+    // parent so the child's coordinator_store row records `parent_run_id`.
+    // `AISH_RUN_ID` is set by our own `coordinator::run` at startup; unset only
+    // in odd test paths, in which case the child is simply treated as a root.
+    if let Ok(rid) = std::env::var("AISH_RUN_ID") {
+        if !rid.is_empty() {
+            cmd.env("AISH_PARENT_RUN_ID", rid);
+        }
+    }
     if let Some(name) = &spec.launch_session_name {
         cmd.env("AISH_LAUNCH_SESSION_NAME", name);
     }

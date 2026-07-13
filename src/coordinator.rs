@@ -620,10 +620,30 @@ pub async fn drive(
         });
     }
 
+    // Stamp our own run id into the process env so any sub-coordinator we spawn
+    // (via `run_in_background` → `worker_command` / container `env_inline`) can
+    // read it as `AISH_PARENT_RUN_ID` and record us as its parent — this is what
+    // lets `:workers` render the run tree. Root (REPL-launched) runs leave the
+    // var set for their own children; they themselves have no parent.
+    // SAFETY: single-threaded startup, before any worker is spawned.
+    unsafe {
+        std::env::set_var("AISH_RUN_ID", run_id);
+    }
+    // Our parent, if we were spawned by another coordinator (unset ⇒ root run).
+    let parent_run_id = std::env::var("AISH_PARENT_RUN_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+
     if let Some(s) = store {
         // session.session_id/name were adopted from the LAUNCHING session at
         // startup (see main.rs), so the row attributes to who asked for the work.
-        let _ = s.insert(run_id, &input, &session.session_id, session.name.as_deref());
+        let _ = s.insert_with_parent(
+            run_id,
+            &input,
+            &session.session_id,
+            session.name.as_deref(),
+            parent_run_id.as_deref(),
+        );
         // TASK-289: record this live coordinator PROCESS in the durable registry
         // so a parent-death restart can reap our pid (and, once TASK-291 lands,
         // resume an in-flight Batches job). `coord_id` == `run_id`; generation 0
