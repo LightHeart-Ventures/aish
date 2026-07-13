@@ -1423,7 +1423,13 @@ surfaced finding, a heads-up, a non-blocking question, meaningful progress on a 
 reason you may take a while — call message_console(message) to post a short note straight to their \
 interactive console. It is ALWAYS shown the moment you send it, framed as coming from you. It is \
 one-way (you cannot read a reply) and is NOT a substitute for your final result — it's an \
-out-of-band note, so use it sparingly and keep it to a line or two.";
+out-of-band note, so use it sparingly and keep it to a line or two.\n\n\
+Weigh actions by REVERSIBILITY before you act. For REVERSIBLE steps — local file edits, running \
+tests, reads, scratch work — make your best call and proceed; a wrong guess is cheap to undo. For \
+IRREVERSIBLE ones — pushing, merging, deleting, sending, anything the operator cannot take back — \
+the cost of acting wrongly dwarfs the cost of waiting one more cycle: stop and escalate (or leave \
+it for the operator) rather than guess. This generalizes the git \"PRs or die\" rule to every \
+side-effecting tool.";
 
 /// Hard cap (bytes) on last-output text exposed via `$LAST`/`$_` and the
 /// automatic model-prompt context (TASK-13 AC3). Outputs longer than this are
