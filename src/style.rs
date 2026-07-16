@@ -408,6 +408,49 @@ pub fn time_cells(started: Option<i64>, finished: Option<i64>, now: i64) -> (Str
     (started_cell, runtime_cell)
 }
 
+/// Display threshold mirroring `coordinator::ORPHAN_STALE_AFTER` (15 min). A
+/// running coordinator whose last heartbeat is older than this is flagged stale
+/// in status listings. Kept local so this pure formatter carries no coordinator
+/// dependency; a coordinator-side test asserts the two stay equal.
+pub const HEARTBEAT_STALE_AFTER_SECS: i64 = 15 * 60;
+
+/// Freshness cell for a coordinator's last heartbeat — the at-a-glance
+/// "alive-and-quiet vs actually-hung" signal for `background_status` /
+/// `:workers`. `heartbeat_at` is the SQLite UTC string; `terminal` is true for
+/// done/failed/checkpoint rows (which have no live beat). `now` is epoch secs.
+/// Returns:
+///   * `—`            — terminal row, or a missing/unparseable beat
+///   * `♥ 12s`/`♥ 4m` — alive: age since last beat, under the stale threshold
+///   * `⚠ 22m`        — stale: beat older than `HEARTBEAT_STALE_AFTER_SECS`
+/// Pure — unit-tested, no chrono.
+pub fn fmt_heartbeat_age(heartbeat_at: Option<&str>, terminal: bool, now: i64) -> String {
+    if terminal {
+        return "—".to_string();
+    }
+    let Some(beat) = heartbeat_at.and_then(parse_sqlite_utc) else {
+        return "—".to_string();
+    };
+    let age = (now - beat).max(0);
+    // Single-unit compact age: 12s · 4m · 2h · 3d.
+    const MIN: i64 = 60;
+    const HOUR: i64 = 60 * MIN;
+    const DAY: i64 = 24 * HOUR;
+    let label = if age < MIN {
+        format!("{age}s")
+    } else if age < HOUR {
+        format!("{}m", age / MIN)
+    } else if age < DAY {
+        format!("{}h", age / HOUR)
+    } else {
+        format!("{}d", age / DAY)
+    };
+    if age > HEARTBEAT_STALE_AFTER_SECS {
+        format!("⚠ {label}")
+    } else {
+        format!("♥ {label}")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Statusline — a left/right-justified info bar printed above the REPL prompt
 // ---------------------------------------------------------------------------
@@ -601,6 +644,24 @@ pub fn statusline_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fmt_heartbeat_age_fresh_stale_terminal() {
+        let beat = "2026-01-01 00:00:00";
+        let base = parse_sqlite_utc(beat).expect("parse beat");
+        // Fresh: under the 15-min stale threshold → ♥ + single-unit age.
+        assert_eq!(fmt_heartbeat_age(Some(beat), false, base + 10), "♥ 10s");
+        assert_eq!(fmt_heartbeat_age(Some(beat), false, base + 5 * 60), "♥ 5m");
+        assert_eq!(fmt_heartbeat_age(Some(beat), false, base + 14 * 60), "♥ 14m");
+        // Stale: beat older than HEARTBEAT_STALE_AFTER_SECS → ⚠.
+        assert_eq!(fmt_heartbeat_age(Some(beat), false, base + 20 * 60), "⚠ 20m");
+        assert_eq!(fmt_heartbeat_age(Some(beat), false, base + 3 * 3600), "⚠ 3h");
+        // Terminal rows, missing/unparseable beats, and clock skew degrade safely.
+        assert_eq!(fmt_heartbeat_age(Some(beat), true, base + 20 * 60), "—");
+        assert_eq!(fmt_heartbeat_age(None, false, base), "—");
+        assert_eq!(fmt_heartbeat_age(Some("not-a-date"), false, base), "—");
+        assert_eq!(fmt_heartbeat_age(Some(beat), false, base - 100), "♥ 0s");
+    }
 
     #[test]
     fn fmt_duration_compact_two_units() {

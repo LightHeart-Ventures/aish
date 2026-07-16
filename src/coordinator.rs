@@ -1699,6 +1699,17 @@ fn worker_store_repo_key(dir: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn heartbeat_stale_threshold_matches_display_const() {
+        // Display threshold (style::fmt_heartbeat_age) mirrors the reaper's
+        // ORPHAN_STALE_AFTER so "⚠ stale" in :workers / background_status lines
+        // up with when a coordinator row actually gets reaped.
+        assert_eq!(
+            super::ORPHAN_STALE_AFTER.as_secs() as i64,
+            crate::style::HEARTBEAT_STALE_AFTER_SECS
+        );
+    }
+
     use super::*;
 
     #[test]
