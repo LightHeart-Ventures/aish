@@ -2434,9 +2434,15 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
     };
 
     let mut out = String::from(
-        "| ID | Kind | Owner | Status | Since | Task | Result |\n|---|---|---|---|---|---|---|\n",
+        "| ID | Kind | Owner | Status | Beat | Since | Task | Result |\n|---|---|---|---|---|---|---|---|\n",
     );
     let mut any = false;
+    // Current UTC epoch seconds for heartbeat-age rendering (the Beat column) —
+    // the "alive-and-quiet vs actually-hung" signal for coordinator rows.
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
 
     // This session's full-tool background coordinators (in memory; the live
     // subprocess handle is session-local even though its durable row is shared).
@@ -2453,7 +2459,7 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
         }
         any = true;
         out.push_str(&format!(
-            "| `{}` | coordinator | you | {} | — | {} | — |\n",
+            "| `{}` | coordinator | you | {} | — | — | {} | — |\n",
             crate::batch::short_id(&w.id),
             w.status(),
             trunc(&w.task)
@@ -2506,11 +2512,17 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
                         r.phase, r.turns, r.tool_calls, r.tokens_in, r.tokens_out
                     )
                 };
+                // done/failed/checkpoint rows have no live beat → em-dash; a
+                // running "coordinating" row shows ♥ age (alive) or ⚠ age (stale).
+                let terminal = matches!(r.phase.as_str(), "done" | "failed" | "checkpoint");
+                let beat =
+                    crate::style::fmt_heartbeat_age(r.heartbeat_at.as_deref(), terminal, now_epoch);
                 out.push_str(&format!(
-                    "| `{}` | coordinator | {} | {} | {} | {} | {} |\n",
+                    "| `{}` | coordinator | {} | {} | {} | {} | {} | {} |\n",
                     crate::batch::short_id(&r.run_id),
                     owner,
                     phase_cell,
+                    beat,
                     r.created_at.as_deref().unwrap_or("—"),
                     trunc(&r.task),
                     result
@@ -2548,7 +2560,7 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
                 };
                 let result = format_result(r.result.as_ref(), r.error.as_ref());
                 out.push_str(&format!(
-                    "| `{}` | batch | {} | {} | {} | {} | {} |\n",
+                    "| `{}` | batch | {} | {} | — | {} | {} | {} |\n",
                     crate::batch::short_id(&r.local_id),
                     owner,
                     r.status,
