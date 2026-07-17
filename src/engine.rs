@@ -44,6 +44,32 @@ fn serial_chain_yield_depth() -> usize {
         .unwrap_or(crate::loopguard::SERIAL_CHAIN_YIELD_DEPTH)
 }
 
+/// Operator overrides for the per-turn cumulative tool-call budget, read from
+/// `AISH_CALL_BUDGET_SOFT` / `AISH_CALL_BUDGET_HARD`. Each defaults to its
+/// compile-time counterpart ([`crate::loopguard::CALL_BUDGET_SOFT`] /
+/// [`CALL_BUDGET_HARD`](crate::loopguard::CALL_BUDGET_HARD)); a parsed value is
+/// honoured only inside `[1, 100000]`, otherwise the default stands (a typo can
+/// never uncap or zero-cap the guard). Lets a genuinely-wide but legitimate turn
+/// — a large multi-file edit+build+test batch that can't be split — run past the
+/// default hard ceiling instead of false-tripping the yield and draining the
+/// coordinator's auto-recovery budget. A bad pairing where soft ≥ hard is benign:
+/// `record` checks hard first, so the turn just yields hard-first and the soft
+/// advisory never fires. Same forgiving parse/clamp discipline as
+/// `AISH_SERIAL_CHAIN_YIELD_DEPTH`.
+fn call_budget() -> (usize, usize) {
+    fn resolve(var: &str, default: usize) -> usize {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| (1..=100_000).contains(&n))
+            .unwrap_or(default)
+    }
+    (
+        resolve("AISH_CALL_BUDGET_SOFT", crate::loopguard::CALL_BUDGET_SOFT),
+        resolve("AISH_CALL_BUDGET_HARD", crate::loopguard::CALL_BUDGET_HARD),
+    )
+}
+
 /// One full agentic turn: user input → (model ⇄ tools)* → final text.
 /// Frontend-agnostic: confirmation is a callback, output goes through eprintln
 /// only for transient activity lines.
@@ -366,7 +392,9 @@ async fn run_turn_inner(
     // orthogonal to the round/iteration budget and the serial-chain SHAPE guard.
     // A soft advisory logs at CALL_BUDGET_SOFT; the turn yields (resumably) once
     // the tally crosses CALL_BUDGET_HARD.
-    let mut call_budget_guard = crate::loopguard::CallBudgetGuard::default();
+    let (call_budget_soft, call_budget_hard) = call_budget();
+    let mut call_budget_guard =
+        crate::loopguard::CallBudgetGuard::with_budget(call_budget_soft, call_budget_hard);
 
     for iteration in 1..=MAX_ITERATIONS {
         // ── Operator interrupt seam (Ctrl-C on an `:attach`ed worker). A
@@ -607,13 +635,13 @@ async fn run_turn_inner(
             crate::loopguard::CallBudgetAction::SoftWarn { count } => {
                 eprintln!(
                     "\x1b[2m  ⚠ call-budget-guard: {count} tool calls this turn (soft {}) — consider converging\x1b[0m",
-                    crate::loopguard::CALL_BUDGET_SOFT
+                    call_budget_soft
                 );
             }
             crate::loopguard::CallBudgetAction::HardYield { count } => {
                 eprintln!(
                     "\x1b[2m  ⚠ call-budget-guard: {count} tool calls this turn (hard {}) — yielding to resume with fresh context\x1b[0m",
-                    crate::loopguard::CALL_BUDGET_HARD
+                    call_budget_hard
                 );
             }
             crate::loopguard::CallBudgetAction::Continue => {}

@@ -740,18 +740,53 @@ pub struct CallBudgetGuard {
     count: usize,
     /// Latches once the soft advisory has fired, so it warns at most once.
     soft_fired: bool,
+    /// Per-turn soft-advisory ceiling. `None` uses the compile-time
+    /// [`CALL_BUDGET_SOFT`] default; `Some(n)` is an operator override (env
+    /// `AISH_CALL_BUDGET_SOFT`, resolved at construction in the engine). The env
+    /// read stays out of this pure core so `record` remains unit-testable
+    /// without touching process env — same discipline as [`SerialChainGuard`].
+    soft: Option<usize>,
+    /// Per-turn hard-yield ceiling. `None` uses the compile-time
+    /// [`CALL_BUDGET_HARD`] default; `Some(n)` is an operator override (env
+    /// `AISH_CALL_BUDGET_HARD`) that lets a genuinely-wide but legitimate turn —
+    /// e.g. a large multi-file edit+build+test batch that cannot be split — run
+    /// past the default 30 instead of false-tripping the yield and burning the
+    /// coordinator's auto-recovery budget.
+    hard: Option<usize>,
 }
 
 impl CallBudgetGuard {
+    /// Construct a guard with explicit soft/hard budgets — the operator override
+    /// path. The tally starts fresh; only the ceilings differ from
+    /// [`CallBudgetGuard::default`].
+    pub fn with_budget(soft: usize, hard: usize) -> Self {
+        Self {
+            count: 0,
+            soft_fired: false,
+            soft: Some(soft),
+            hard: Some(hard),
+        }
+    }
+
+    /// Effective soft ceiling: the override when set, else [`CALL_BUDGET_SOFT`].
+    fn soft(&self) -> usize {
+        self.soft.unwrap_or(CALL_BUDGET_SOFT)
+    }
+
+    /// Effective hard ceiling: the override when set, else [`CALL_BUDGET_HARD`].
+    fn hard(&self) -> usize {
+        self.hard.unwrap_or(CALL_BUDGET_HARD)
+    }
+
     /// Record a round that executed `calls_this_round` tool calls, advancing the
     /// cumulative tally. Returns the action the caller should take. Hard takes
     /// precedence over soft; the soft advisory fires at most once per turn.
     pub fn record(&mut self, calls_this_round: usize) -> CallBudgetAction {
         self.count = self.count.saturating_add(calls_this_round);
-        if self.count > CALL_BUDGET_HARD {
+        if self.count > self.hard() {
             return CallBudgetAction::HardYield { count: self.count };
         }
-        if self.count > CALL_BUDGET_SOFT && !self.soft_fired {
+        if self.count > self.soft() && !self.soft_fired {
             self.soft_fired = true;
             return CallBudgetAction::SoftWarn { count: self.count };
         }
@@ -1245,6 +1280,26 @@ mod tests {
             CallBudgetAction::HardYield {
                 count: CALL_BUDGET_HARD + 5
             }
+        );
+    }
+
+    #[test]
+    fn call_budget_guard_with_budget_overrides_ceilings() {
+        // Operator override: wider soft/hard than the compile-time defaults.
+        let (soft, hard) = (40usize, 60usize);
+        let mut g = CallBudgetGuard::with_budget(soft, hard);
+        // The built-in ceilings no longer apply — a round that would trip the
+        // default hard (30) is still Continue under the raised budget.
+        assert_eq!(g.record(CALL_BUDGET_HARD + 1), CallBudgetAction::Continue);
+        // Cross the raised soft cap → one SoftWarn carrying the tally.
+        assert_eq!(
+            g.record(soft - CALL_BUDGET_HARD),
+            CallBudgetAction::SoftWarn { count: soft + 1 }
+        );
+        // Cross the raised hard cap → HardYield.
+        assert_eq!(
+            g.record(hard - soft),
+            CallBudgetAction::HardYield { count: hard + 1 }
         );
     }
 
