@@ -2444,6 +2444,23 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
+    // Load the durable coordinator rows ONCE, up front. Two reasons: (1) the
+    // in-memory worker loop below needs to know which run_ids already have a
+    // durable row so it can suppress the sparse duplicate (same job otherwise
+    // prints twice — once sparse from `worker_jobs`, once detailed from the
+    // store); (2) it lets the durable loop reuse the same snapshot instead of
+    // re-querying. Reap orphans first (mutates the store) so the snapshot is
+    // already reconciled. `None` store / load error → empty, everything degrades
+    // to the pre-existing in-memory-only behavior.
+    let coord_rows = if let Some(store) = &session.coordinator_store {
+        crate::coordinator::reap_orphaned_runs(store, session.session_id.as_str());
+        store.load_all().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let durable_ids: std::collections::HashSet<&str> =
+        coord_rows.iter().map(|r| r.run_id.as_str()).collect();
+
     // This session's full-tool background coordinators (in memory; the live
     // subprocess handle is session-local even though its durable row is shared).
     for w in session.worker_jobs.lock().unwrap().iter() {
@@ -2457,6 +2474,13 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
         if !scope.matches(&jref, me) {
             continue;
         }
+        // De-dupe: if this coordinator also has a durable row, skip the sparse
+        // in-memory line and let the richer store row (beat/since/telemetry/
+        // result) below represent it. Only shown here during the brief window
+        // before the child writes its first `coordinating` row.
+        if durable_ids.contains(w.id.as_str()) {
+            continue;
+        }
         any = true;
         out.push_str(&format!(
             "| `{}` | coordinator | you | {} | — | — | {} | — |\n",
@@ -2467,15 +2491,10 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
     }
     // Durable coordinator runs from the shared store — every session's, so this
     // surfaces runs that outlive (or were started by) another aish process.
-    if let Some(store) = &session.coordinator_store {
-        // Live orphan reap before we read: flip any stale, unowned, non-terminal
-        // row to `failed` so a zombie coordinator (owner process exited before
-        // reconciling its detached sub-coordinator tasks) shows as failed here
-        // instead of lingering forever at `coordinating`. Startup does this too,
-        // but a long-lived interactive session never restarts.
-        crate::coordinator::reap_orphaned_runs(store, session.session_id.as_str());
-        if let Ok(rows) = store.load_all() {
-            for r in rows {
+    // Reuses the up-front `coord_rows` snapshot (already reaped + loaded).
+    {
+        {
+            for r in &coord_rows {
                 let jref = JobRef {
                     owner_session_id: r.session_id.as_deref(),
                     repo_key: None, // Phase 1: populate from the durable repo_key column.
