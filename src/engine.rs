@@ -885,8 +885,7 @@ async fn run_turn_inner(
         // from the checkpoint and re-plans toward batching independent calls.
         if let Some(depth) = serial_yield {
             let reason = crate::loopguard::ExitReason::SerialChainYield { depth };
-            eprintln!("\x1b[2maish: {}\x1b[0m", reason.log_line());
-            
+
             // Invoke the advisor to evaluate the serial-chain pattern and optionally
             // inject a resume directive based on whether this is a batching opportunity
             // or a stuck pattern. The advisor reads the turn-audit (if available).
@@ -903,6 +902,36 @@ async fn run_turn_inner(
                 advice.summary
             );
             
+            // Interactive (non-coordinator) binding-nudge path. An interactive
+            // session has NO durable goal loop to catch the yield banner and
+            // resume, so a plain return would just print the advisory to the
+            // prompt and the model would never act on it — the "aish got the
+            // advisory but did nothing with it" defect. For a batching
+            // opportunity, inject the advisor's directive into the one-shot
+            // batch-nudge carrier (consumed by pending_batch_nudge.take() at the
+            // top of the next iteration and folded into effective_system, so it is
+            // BINDING, not advisory-only), RESET the serial-chain depth to grant a
+            // fresh window, and CONTINUE the turn so the model re-plans toward
+            // batching in place. A coordinator keeps the yield-and-resume path (its
+            // goal loop re-plans from the banner via recovery_guidance); a stuck
+            // pattern always yields so the operator can intervene.
+            if !session.nested {
+                if let (
+                    crate::advisor::YieldClassification::BatchingOpportunity,
+                    Some(directive),
+                ) = (advice.classification, advice.resume_directive.as_ref())
+                {
+                    pending_batch_nudge = Some(directive.clone());
+                    serial_chain_guard.reset();
+                    eprintln!(
+                        "\x1b[2m  → injecting batching directive into the next round (binding); re-planning in place\x1b[0m"
+                    );
+                    continue;
+                }
+            }
+
+            eprintln!("\x1b[2maish: {}\x1b[0m", reason.log_line());
+
             let mut partial = if turn.text.trim().is_empty() {
                 format!(
                     "Yielded after a deep serial call chain ({depth} consecutive single-call \
@@ -912,32 +941,16 @@ rounds) to re-plan toward batching independent calls."
                 turn.text.clone()
             };
             
-            // If the advisor has a resume directive (for batching opportunities),
-            // append it to guide the next round's planning AND route it into the
-            // binding nudge channel (TASK-324) so the next round's system prompt
-            // injects it, making it binding (not advisory-only). This ensures a
-            // smaller/faster model cannot ignore the directive.
+            // Carry the advisor's directive to the resumer by appending it to the
+            // banner text. For a COORDINATOR this is what the durable goal loop
+            // reads (via recovery_guidance) to re-plan toward batching on the next
+            // turn; for an interactive stuck/unknown pattern it is surfaced to the
+            // operator. (The interactive BATCHING path never reaches here — above,
+            // it consumes the directive as a binding nudge and continues in place.)
             if let Some(directive) = &advice.resume_directive {
                 partial.push('\n');
                 partial.push('\n');
                 partial.push_str(directive);
-                
-                // TASK-358 AC1: reuse the TASK-324 batching nudge carrier to make
-                // this directive binding. The next iteration will consume
-                // pending_batch_nudge.take() at line 453 and inject it into
-                // effective_system, forcing the model to see it in the system prompt.
-                if matches!(
-                    advice.classification,
-                    crate::advisor::YieldClassification::BatchingOpportunity
-                ) {
-                    #[allow(unused_assignments)]
-                    {
-                        pending_batch_nudge = Some(directive.clone());
-                    }
-                    eprintln!(
-                        "\x1b[2m  → routing resume_directive to batching-nudge channel for binding injection\x1b[0m"
-                    );
-                }
             }
             
             // TASK-358 AC2: when a stuck pattern is detected, escalate to operator.

@@ -702,6 +702,14 @@ impl SerialChainGuard {
         }
         None
     }
+
+    /// Reset the chain depth to zero. Used when the caller CONSUMES a yield
+    /// signal but CONTINUES the turn (the interactive binding-nudge path) rather
+    /// than ending it — the model gets a fresh single-call window before the
+    /// guard can yield again.
+    pub fn reset(&mut self) {
+        self.depth = 0;
+    }
 }
 
 /// TASK-357: per-turn CUMULATIVE tool-call budget. Where [`SerialChainGuard`]
@@ -1216,6 +1224,27 @@ mod tests {
         }
         assert!(g2.record(0).is_none(), "no-call round resets the chain");
         assert!(g2.record(1).is_none(), "streak restarted at 1");
+    }
+
+    #[test]
+    fn serial_chain_guard_reset_grants_fresh_window() {
+        // Interactive binding-nudge path: after a yield fires, the caller injects
+        // the batching directive and CONTINUES the turn, calling reset() so the
+        // model gets a fresh single-call window instead of yielding again on the
+        // very next single call.
+        let mut g = SerialChainGuard::with_threshold(3);
+        assert!(g.record(1).is_none());
+        assert!(g.record(1).is_none());
+        assert!(g.record(1).is_none());
+        assert_eq!(g.record(1), Some(4), "climbs past threshold → yields");
+
+        g.reset();
+
+        // Fresh window: the immediate next single call must NOT re-yield.
+        assert!(g.record(1).is_none(), "reset must clear the depth");
+        assert!(g.record(1).is_none());
+        assert!(g.record(1).is_none());
+        assert_eq!(g.record(1), Some(4), "chain climbs again after reset");
     }
 
     #[test]
