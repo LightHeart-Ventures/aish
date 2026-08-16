@@ -637,6 +637,21 @@ async fn run_turn_inner(
                     "\x1b[2m  ⚠ call-budget-guard: {count} tool calls this turn (soft {}) — consider converging\x1b[0m",
                     call_budget_soft
                 );
+                // Make the soft warning BINDING, not advisory-only. Fold a
+                // converge/batch directive into the NEXT round's prompt via the
+                // same one-shot carrier the batch-guard and serial-chain advisor
+                // use (consumed by pending_batch_nudge.take() at the top of the
+                // next iteration). Previously the soft warn only logged to stderr,
+                // so the model got no in-prompt nudge and blasted straight from
+                // the soft cap to the hard yield — the "call-budget warning with
+                // no advisory" defect. Assigning here intentionally supersedes any
+                // batch-guard nudge armed earlier this round: the call-budget
+                // signal is the broader, more urgent one and names the hard cap.
+                pending_batch_nudge = Some(crate::loopguard::call_budget_soft_suffix(
+                    count,
+                    call_budget_soft,
+                    call_budget_hard,
+                ));
             }
             crate::loopguard::CallBudgetAction::HardYield { count } => {
                 eprintln!(

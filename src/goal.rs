@@ -423,7 +423,16 @@ pub(crate) fn recovery_guidance(err: &str) -> String {
     let batching_flag = low.contains("single-call")
         || low.contains("serial chain")
         || low.contains("serial-chain")
-        || low.contains("batch");
+        || low.contains("batch")
+        // Call-budget hard-yield wording (ExitReason::CallBudgetExceeded detail):
+        // "yielded after N tool calls this turn (per-turn hard budget) …". Without
+        // these the resumed coordinator got the generic review/resume guidance but
+        // NOT the explicit batch-independent-calls instruction, so it just tripped
+        // the same per-turn call cap again.
+        || low.contains("call budget")
+        || low.contains("call-budget")
+        || low.contains("per-turn")
+        || low.contains("tool calls this turn");
     let mut g = format!(
         "your previous work turn was cut short by an internal execution guard, \
          NOT because the goal is impossible: {err}. Do not restart from scratch and \
