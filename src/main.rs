@@ -1,3 +1,4 @@
+mod advisor;
 mod alert;
 mod autosuggest;
 mod backend;

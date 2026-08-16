@@ -886,7 +886,24 @@ async fn run_turn_inner(
         if let Some(depth) = serial_yield {
             let reason = crate::loopguard::ExitReason::SerialChainYield { depth };
             eprintln!("\x1b[2maish: {}\x1b[0m", reason.log_line());
-            let partial = if turn.text.trim().is_empty() {
+            
+            // Invoke the advisor to evaluate the serial-chain pattern and optionally
+            // inject a resume directive based on whether this is a batching opportunity
+            // or a stuck pattern. The advisor reads the turn-audit (if available).
+            let turns_audit = build_turns_audit_from_history(&session.history);
+            let advice = crate::advisor::SerialYieldAdvisor::evaluate(&turns_audit);
+            
+            eprintln!(
+                "\x1b[2m  → advisor: {} — {}\x1b[0m",
+                match advice.classification {
+                    crate::advisor::YieldClassification::BatchingOpportunity => "batching-opportunity",
+                    crate::advisor::YieldClassification::StuckPattern => "stuck-pattern",
+                    crate::advisor::YieldClassification::Unknown => "unknown",
+                },
+                advice.summary
+            );
+            
+            let mut partial = if turn.text.trim().is_empty() {
                 format!(
                     "Yielded after a deep serial call chain ({depth} consecutive single-call \
 rounds) to re-plan toward batching independent calls."
@@ -894,6 +911,15 @@ rounds) to re-plan toward batching independent calls."
             } else {
                 turn.text.clone()
             };
+            
+            // If the advisor has a resume directive (for batching opportunities),
+            // append it to guide the next round's planning.
+            if let Some(directive) = &advice.resume_directive {
+                partial.push('\n');
+                partial.push('\n');
+                partial.push_str(directive);
+            }
+            
             return Ok(crate::loopguard::with_banner(&reason, &partial));
         }
 
@@ -1713,6 +1739,49 @@ fn physical_rows(formatted_line: &str, cols: usize) -> usize {
     }
     let w = ansi_stripped_width(formatted_line);
     w.div_ceil(cols).max(1)
+}
+
+/// Build a turns audit from the conversation history for the advisor.
+/// Extracts (round_number, tool_names, file_paths) tuples from the last ~10
+/// assistant messages, which the advisor uses to detect batching opportunities
+/// or stuck patterns.
+fn build_turns_audit_from_history(history: &[Msg]) -> Vec<(usize, Vec<String>, Vec<String>)> {
+    let mut turns = Vec::new();
+    let mut round = 1;
+    
+    // Walk backwards through history, collecting assistant messages with tool calls.
+    for msg in history.iter().rev().take(40) {
+        if msg.role == Role::Assistant && !msg.tool_calls.is_empty() {
+            let tool_names: Vec<String> = 
+                msg.tool_calls.iter().map(|c| c.name.clone()).collect();
+            
+            // Extract file paths from tool arguments (heuristic: look for
+            // "path", "file_path", "pattern" fields that look like file paths).
+            let mut file_paths = Vec::new();
+            for call in &msg.tool_calls {
+                if let Some(args) = call.args.as_object() {
+                    for (key, val) in args {
+                        if (key.contains("path") || key.contains("file") || key == "pattern")
+                            && val.is_string() 
+                        {
+                            if let Some(s) = val.as_str() {
+                                if !s.is_empty() && s.len() < 200 {
+                                    file_paths.push(s.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            turns.push((round, tool_names, file_paths));
+            round += 1;
+        }
+    }
+    
+    // Reverse to get chronological order.
+    turns.reverse();
+    turns
 }
 
 /// Perform the Ctrl-O raw-output toggle, rendering the last turn's tool output
