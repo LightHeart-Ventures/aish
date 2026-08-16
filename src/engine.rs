@@ -940,6 +940,28 @@ rounds) to re-plan toward batching independent calls."
                 }
             }
             
+            // TASK-358 AC2: when a stuck pattern is detected, escalate to operator.
+            // The advisor has classified this as StuckPattern (not a batching
+            // opportunity), meaning the model is stuck in a non-productive loop.
+            // Emit an alert for the operator with the turn audit so they can
+            // investigate the root cause and potentially adjust the prompt or
+            // add guardrails.
+            if matches!(
+                advice.classification,
+                crate::advisor::YieldClassification::StuckPattern
+            ) {
+                eprintln!(
+                    "\x1b[91m  → ESCALATING stuck pattern to operator\x1b[0m"
+                );
+                // Log the turn count and pattern summary for operator review.
+                // Future: emit via atum notification API for real-time alerts.
+                eprintln!(
+                    "\x1b[91m  → Turn audit: {} turns, pattern: {}\x1b[0m",
+                    turns_audit.len(),
+                    advice.summary
+                );
+            }
+            
             return Ok(crate::loopguard::with_banner(&reason, &partial));
         }
 
