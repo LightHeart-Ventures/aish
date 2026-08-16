@@ -631,6 +631,26 @@ read that exact line).]",
     )
 }
 
+/// The one-shot system-prompt suffix injected when the cumulative per-turn call
+/// budget crosses its SOFT cap (TASK-357). Parallel to [`batch_nudge_suffix`]:
+/// folded into the NEXT round's prompt via the same `pending_batch_nudge`
+/// carrier, then dropped so the base prompt stays byte-stable for cache reuse.
+///
+/// Without this the soft warning only logged to stderr — the model got NO
+/// in-prompt nudge and blasted straight from the soft cap to the HARD yield.
+/// This makes the soft warning BINDING: between `count` and `hard` the model is
+/// told to batch/converge so it can avoid the hard yield entirely.
+pub fn call_budget_soft_suffix(count: usize, soft: usize, hard: usize) -> String {
+    format!(
+        "\n\n[CALL BUDGET — you've issued {count} tool calls this turn (soft cap {soft}, hard \
+yield at {hard}). You're spending your per-turn call budget fast and will YIELD the turn if you \
+reach {hard}. CONVERGE NOW: fire every INDEPENDENT call (reads/greps/list_dirs/status queries) \
+together in ONE round instead of one per round, finish the highest-value step first, and move to \
+wrap up. Only keep a call serial when its input genuinely depends on a previous call's output. \
+Stop drip-feeding calls one per round.]"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // TASK-358: serial-chain depth yield
 // ---------------------------------------------------------------------------
@@ -1354,5 +1374,22 @@ mod tests {
             .expect("abnormal → Some");
         assert_eq!(exit.disposition, Disposition::Resume);
         assert!(exit.directive().unwrap().contains("[auto-resume]"));
+    }
+
+    // TASK-357: the soft-cap suffix is the BINDING nudge that was missing — it
+    // must name the live count, the hard yield target, and tell the model to
+    // batch independent calls so it can dodge the hard cap.
+    #[test]
+    fn call_budget_soft_suffix_names_counts_and_urges_batching() {
+        let s = call_budget_soft_suffix(22, 20, 30);
+        assert!(s.contains("22"), "must quote the live call count");
+        assert!(s.contains("30"), "must name the hard yield target");
+        let low = s.to_lowercase();
+        assert!(low.contains("call budget"), "must label the signal");
+        assert!(
+            low.contains("independent"),
+            "must tell the model to batch independent calls"
+        );
+        assert!(low.contains("yield"), "must warn a hard yield is coming");
     }
 }
