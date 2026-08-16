@@ -913,11 +913,31 @@ rounds) to re-plan toward batching independent calls."
             };
             
             // If the advisor has a resume directive (for batching opportunities),
-            // append it to guide the next round's planning.
+            // append it to guide the next round's planning AND route it into the
+            // binding nudge channel (TASK-324) so the next round's system prompt
+            // injects it, making it binding (not advisory-only). This ensures a
+            // smaller/faster model cannot ignore the directive.
             if let Some(directive) = &advice.resume_directive {
                 partial.push('\n');
                 partial.push('\n');
                 partial.push_str(directive);
+                
+                // TASK-358 AC1: reuse the TASK-324 batching nudge carrier to make
+                // this directive binding. The next iteration will consume
+                // pending_batch_nudge.take() at line 453 and inject it into
+                // effective_system, forcing the model to see it in the system prompt.
+                if matches!(
+                    advice.classification,
+                    crate::advisor::YieldClassification::BatchingOpportunity
+                ) {
+                    #[allow(unused_assignments)]
+                    {
+                        pending_batch_nudge = Some(directive.clone());
+                    }
+                    eprintln!(
+                        "\x1b[2m  → routing resume_directive to batching-nudge channel for binding injection\x1b[0m"
+                    );
+                }
             }
             
             return Ok(crate::loopguard::with_banner(&reason, &partial));
