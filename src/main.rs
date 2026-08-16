@@ -68,6 +68,7 @@ mod tools;
 mod tool_telemetry;
 mod transcript_ring;
 mod turn_audit;
+mod turn_completion_recap;
 mod update;
 mod schedule;
 mod webhook;
