@@ -28,6 +28,29 @@ Mostly ~/models (412G of GGUF weights) — 87% of your usage.
 - iOS/Android
 - FreeBSD (possible but untested)
 
+## Voice input (optional)
+
+Push-to-talk speech-to-text, gated behind the `voice` feature and **off by
+default** (FR-334 / SPR-068). Build it with `cargo build --features voice`
+(Linux needs `libasound2-dev` + a C/C++ toolchain — see
+[DEVELOPMENT.md](./DEVELOPMENT.md#building-the-optional-voice-feature-spr-068--fr-334)).
+
+- Press **`Ctrl-G`** at the interactive prompt to start recording; press it
+  again (or `Esc`) to stop. Audio is captured with `cpal`, resampled to 16 kHz
+  with `rubato`, and transcribed **locally** with Whisper (`whisper-rs`, ggml
+  `base.en` by default). The transcript is inserted into the line editor as if
+  typed — it is **not** auto-submitted; you edit and press Enter as normal.
+- **Graceful degradation.** No mic, no model, or a non-`voice` build → a
+  single-line error above the prompt with the line buffer untouched. `Ctrl-G`
+  stays unbound in default builds; the prompt is never broken for users who
+  don't opt in.
+- **Config** (`~/.aish/config`): `voice.model`, `voice.device`,
+  `voice.language` (default `en`), `voice.autosubmit` (default `false`).
+- **Interactive-only** — background coordinators have no TTY/mic, so voice is a
+  foreground-REPL feature with no coordinator surface.
+
+Design: [docs/design/voice-input.md](./docs/design/voice-input.md).
+
 ## How a line is routed
 
 1. `:command` — REPL meta (`:help`, `:mode`, `:model`, …)

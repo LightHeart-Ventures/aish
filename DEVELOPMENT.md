@@ -70,3 +70,36 @@ calling the same command. Always eyeball a plain `scripts/cleanup-worktrees.sh`
 The script resolves the matching worktree from `git worktree list --porcelain`,
 force-removes it, and prunes the branch only if it is merged to trunk — exiting
 `0` (no-op) if the tree is already gone.
+
+## Building the optional voice feature (SPR-068 / FR-334)
+
+Push-to-talk voice input is gated behind the `voice` Cargo feature and is **off
+by default** — the standard build and the CI `--no-default-features --locked`
+gate never pull in the audio stack. To build or work on it you must opt in and
+install the native prerequisites the audio + Whisper crates compile against.
+
+```bash
+# Linux (Debian/Ubuntu): ALSA headers for cpal + a C/C++ toolchain for whisper-rs
+sudo apt-get install -y libasound2-dev cmake clang libclang-dev build-essential
+
+# Build / run with the feature enabled
+cargo build   --features voice
+cargo run     --features voice
+cargo clippy  --features voice --all-targets
+```
+
+| Prereq | Needed by | Why |
+|--------|-----------|-----|
+| `libasound2-dev` | `cpal` | ALSA capture backend on Linux (CoreAudio on macOS needs no extra pkg). |
+| `cmake`, `clang`, `libclang-dev` | `whisper-rs` | Builds the bundled `whisper.cpp` C/C++ sources + bindgen. |
+| `build-essential` | native crates | C/C++ compiler + linker. |
+
+macOS needs no extra system packages (CoreAudio + the Xcode CLT toolchain
+cover it). The `voice-api` feature (`--features voice-api`) swaps local Whisper
+inference for a hosted endpoint and pulls the same capture front-end.
+
+The optional stack is exercised in CI by
+[`.github/workflows/voice-feature-build.yml`](./.github/workflows/voice-feature-build.yml),
+which builds `--features voice` on PRs that touch voice paths. It is
+**non-gating** until the `src/voice.rs` module lands, so it never blocks
+unrelated merges.

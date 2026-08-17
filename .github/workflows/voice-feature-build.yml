@@ -1,0 +1,63 @@
+name: Voice feature build
+
+# SPR-068 / FR-334 (TASK-369): compile the optional `voice` feature so the
+# audio + Whisper stack (cpal / rubato / whisper-rs / crossterm) can't silently
+# rot outside the default `--no-default-features` CI gate.
+#
+# NON-GATING until the `src/voice.rs` module lands: the job is
+# `continue-on-error: true` so a red voice build never blocks an unrelated PR.
+# Flip that to `false` once the implementation (TASK-362..367) is merged and the
+# feature is expected to compile clean.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/voice.rs'
+      - 'src/voice/**'
+      - '.github/workflows/voice-feature-build.yml'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/voice.rs'
+      - 'src/voice/**'
+      - '.github/workflows/voice-feature-build.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: voice-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  voice-build:
+    name: cargo build --features voice
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Non-gating until src/voice.rs exists; surfaces the result without blocking.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install native voice prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev cmake clang libclang-dev build-essential
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-voice-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build voice feature
+        run: cargo build --features voice --locked
