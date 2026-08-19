@@ -172,7 +172,8 @@ async fn run_directly(
     // program; otherwise it routes to the model (matching the REPL).
     if let Some(stages) = pipeline::parse(line) {
         let all_resolve = stages.iter().all(|s| {
-            s.first()
+            s.argv
+                .first()
                 .is_some_and(|p| resolve_program(p, &session.cwd, &path_var).is_some())
         });
         if all_resolve {

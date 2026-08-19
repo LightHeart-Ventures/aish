@@ -391,6 +391,287 @@ pub fn tokenize_diagnosed(
     Ok(words)
 }
 
+/// How a redirection connects an fd to a file (see [`Redir`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileMode {
+    /// `<` — open the file read-only for stdin.
+    Read,
+    /// `>` — truncate/create the file for writing.
+    Write,
+    /// `>>` — create/append to the file.
+    Append,
+}
+
+/// A single I/O redirection parsed out of a command stage by [`tokenize_redir`].
+/// The pipeline executor applies these per stage, in order, after wiring the
+/// inter-stage pipes (an explicit redirection overrides the pipe wiring for its
+/// fd, matching a POSIX shell).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Redir {
+    /// `<`, `>`, `>>`, `n>`, `n>>` — connect `fd` to `path`.
+    File { fd: i32, mode: FileMode, path: String },
+    /// `&>`, `&>>`, `>&file` — connect both stdout and stderr to `path`.
+    Both { append: bool, path: String },
+    /// `n>&m` / `n<&m` — make `fd` a duplicate of fd `from` (e.g. `2>&1`).
+    Dup { fd: i32, from: i32 },
+    /// `n>&-` / `n<&-` — close `fd`.
+    Close { fd: i32 },
+}
+
+/// Redirection-aware sibling of [`tokenize_diagnosed`]. Word-splitting and
+/// `$VAR` expansion are identical, but the I/O-redirection operators
+/// (`<`, `>`, `>>`, `n>`, `n>>`, `n>&m`, `n<&m`, `n>&-`, `&>`, `&>>`, `>&file`)
+/// are parsed into a `Vec<Redir>` instead of rejected. Every other shell
+/// metacharacter (`;` `` ` `` `*` `?` `(` `)` `{` `}` `\`, a bare `&`, `&&`) is
+/// still rejected, so those lines route to the model exactly as before. Only
+/// fds 0/1/2 are accepted; a higher fd routes the line to the model. The
+/// pipeline executor consumes the returned redirections.
+pub fn tokenize_redir(
+    line: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<(Vec<String>, Vec<Redir>), crate::diag::AishDiagnostic> {
+    use crate::diag::AishDiagnostic as D;
+    // Metacharacters we still reject even in redirection mode. `<`, `>`, `&`
+    // are handled explicitly below (redirections); everything here routes to
+    // the model exactly as `tokenize_diagnosed` does.
+    const META: &[char] = &['|', ';', '`', '*', '?', '(', ')', '{', '}', '\\'];
+    let mut words: Vec<String> = Vec::new();
+    let mut redirs: Vec<Redir> = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    // A file/both redirection whose target word we have not read yet:
+    // (fd, mode, both).
+    let mut pending: Option<(i32, FileMode, bool)> = None;
+    let mut chars = line.char_indices().peekable();
+
+    // Flush the current word — to an open redirection target if one is pending,
+    // else to the argv word list.
+    macro_rules! flush_word {
+        () => {
+            if in_word {
+                let w = std::mem::take(&mut cur);
+                in_word = false;
+                if let Some((fd, mode, both)) = pending.take() {
+                    if both {
+                        redirs.push(Redir::Both {
+                            append: mode == FileMode::Append,
+                            path: w,
+                        });
+                    } else {
+                        redirs.push(Redir::File { fd, mode, path: w });
+                    }
+                } else {
+                    words.push(w);
+                }
+            }
+        };
+    }
+
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some((_, '\'')) => break,
+                        Some((_, ch)) => cur.push(ch),
+                        None => return Err(D::unbalanced_quote(line, i)),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some((_, '"')) => break,
+                        Some((bi, '`')) => return Err(D::unsupported_meta(line, bi, '`')),
+                        Some((di, '$')) => match expand_dollar(&mut chars, &lookup) {
+                            Some(Dollar::Expanded(val)) => cur.push_str(&val),
+                            Some(Dollar::Literal) => cur.push('$'),
+                            None => return Err(D::bad_var_ref(line, di)),
+                        },
+                        Some((_, ch)) => cur.push(ch),
+                        None => return Err(D::unbalanced_quote(line, i)),
+                    }
+                }
+            }
+            '$' => match expand_dollar(&mut chars, &lookup) {
+                Some(Dollar::Expanded(val)) => {
+                    if !val.is_empty() {
+                        cur.push_str(&val);
+                        in_word = true;
+                    }
+                }
+                Some(Dollar::Literal) => {
+                    cur.push('$');
+                    in_word = true;
+                }
+                None => return Err(D::bad_var_ref(line, i)),
+            },
+            c if c.is_whitespace() => flush_word!(),
+            '<' | '>' => {
+                // A run of digits immediately before the operator is an explicit
+                // fd (`2>`); otherwise the pending word is a normal argv word.
+                let explicit_fd = if in_word
+                    && !cur.is_empty()
+                    && cur.chars().all(|d| d.is_ascii_digit())
+                {
+                    let fd: i32 = cur.parse().unwrap_or(-1);
+                    cur.clear();
+                    in_word = false;
+                    Some(fd)
+                } else {
+                    None
+                };
+                if explicit_fd.is_none() {
+                    flush_word!();
+                }
+                if pending.is_some() {
+                    // A prior redirection never got its target (`> >`).
+                    return Err(D::empty_stage(line, i));
+                }
+                if let Some(r) = parse_redir_op(c, explicit_fd, &mut chars, line, i, &mut pending)? {
+                    redirs.push(r);
+                }
+            }
+            '&' => {
+                // Only valid as `&>` / `&>>`; a bare `&` or `&&` is unsupported.
+                if !matches!(chars.peek(), Some((_, '>'))) {
+                    return Err(D::unsupported_meta(line, i, '&'));
+                }
+                flush_word!();
+                if pending.is_some() {
+                    return Err(D::empty_stage(line, i));
+                }
+                chars.next(); // consume '>'
+                let mode = if matches!(chars.peek(), Some((_, '>'))) {
+                    chars.next();
+                    FileMode::Append
+                } else {
+                    FileMode::Write
+                };
+                pending = Some((1, mode, true));
+            }
+            c if META.contains(&c) => return Err(D::unsupported_meta(line, i, c)),
+            c => {
+                in_word = true;
+                cur.push(c);
+            }
+        }
+    }
+    flush_word!();
+    if pending.is_some() {
+        // A redirection with no target (`echo >`).
+        return Err(D::empty_stage(line, line.len().saturating_sub(1)));
+    }
+    Ok((words, redirs))
+}
+
+/// Parse the redirection operator that starts at `op` (`<` or `>`), the `op`
+/// already consumed. Returns `Ok(Some(redir))` for a dup/close (target read
+/// inline) or `Ok(None)` after arming `pending` for a file target the caller's
+/// word loop will fill.
+fn parse_redir_op(
+    op: char,
+    explicit_fd: Option<i32>,
+    chars: &mut std::iter::Peekable<std::str::CharIndices>,
+    line: &str,
+    at: usize,
+    pending: &mut Option<(i32, FileMode, bool)>,
+) -> Result<Option<Redir>, crate::diag::AishDiagnostic> {
+    use crate::diag::AishDiagnostic as D;
+    if op == '>' {
+        let append = if matches!(chars.peek(), Some((_, '>'))) {
+            chars.next();
+            true
+        } else {
+            false
+        };
+        if matches!(chars.peek(), Some((_, '&'))) {
+            chars.next(); // consume '&'
+            return parse_dup_or_both(explicit_fd.unwrap_or(1), append, chars, line, at, pending);
+        }
+        let fd = explicit_fd.unwrap_or(1);
+        if !(0..=2).contains(&fd) {
+            return Err(D::unsupported_meta(line, at, '>'));
+        }
+        *pending = Some((
+            fd,
+            if append {
+                FileMode::Append
+            } else {
+                FileMode::Write
+            },
+            false,
+        ));
+        Ok(None)
+    } else {
+        // '<'
+        if matches!(chars.peek(), Some((_, '&'))) {
+            chars.next(); // consume '&'
+            return parse_dup_or_both(explicit_fd.unwrap_or(0), false, chars, line, at, pending);
+        }
+        let fd = explicit_fd.unwrap_or(0);
+        if !(0..=2).contains(&fd) {
+            return Err(D::unsupported_meta(line, at, '<'));
+        }
+        *pending = Some((fd, FileMode::Read, false));
+        Ok(None)
+    }
+}
+
+/// After a `>&` / `<&` / `>>&`: a digit run is a dup (`2>&1`), `-` is a close
+/// (`2>&-`), and anything else means "both stdout+stderr to a file" (`>&file`),
+/// armed as a pending both-target.
+fn parse_dup_or_both(
+    fd: i32,
+    append: bool,
+    chars: &mut std::iter::Peekable<std::str::CharIndices>,
+    line: &str,
+    at: usize,
+    pending: &mut Option<(i32, FileMode, bool)>,
+) -> Result<Option<Redir>, crate::diag::AishDiagnostic> {
+    use crate::diag::AishDiagnostic as D;
+    match chars.peek().map(|&(_, c)| c) {
+        Some(c) if c.is_ascii_digit() => {
+            let mut n = String::new();
+            while let Some(&(_, c)) = chars.peek() {
+                if c.is_ascii_digit() {
+                    n.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let from: i32 = n.parse().unwrap_or(-1);
+            if !(0..=2).contains(&from) || !(0..=2).contains(&fd) {
+                return Err(D::unsupported_meta(line, at, '&'));
+            }
+            Ok(Some(Redir::Dup { fd, from }))
+        }
+        Some('-') => {
+            chars.next();
+            if !(0..=2).contains(&fd) {
+                return Err(D::unsupported_meta(line, at, '&'));
+            }
+            Ok(Some(Redir::Close { fd }))
+        }
+        _ => {
+            *pending = Some((
+                1,
+                if append {
+                    FileMode::Append
+                } else {
+                    FileMode::Write
+                },
+                true,
+            ));
+            Ok(None)
+        }
+    }
+}
+
+
 /// Result of reading a `$…` reference after the `$` has been consumed.
 enum Dollar {
     /// A `$NAME` / `${NAME}` reference, a special parameter (`$?`/`$$`), or a

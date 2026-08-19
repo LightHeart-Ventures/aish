@@ -92,7 +92,8 @@ async fn run_native(line: &str, session: &Session) -> Native {
     // 1. Native pipeline path — the real parser + the real executor.
     if let Some(stages) = pipeline::parse(line) {
         let all_real = stages.iter().all(|s| {
-            s.first()
+            s.argv
+                .first()
                 .is_some_and(|p| resolve_program(p, &session.cwd, &path).is_some())
         });
         if !all_real {
