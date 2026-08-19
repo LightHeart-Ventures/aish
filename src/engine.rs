@@ -28,6 +28,16 @@ type SpinState = Arc<Mutex<Spin>>;
 // answer before the hard limit is ever reached.
 const MAX_ITERATIONS: usize = 50;
 
+/// Per-turn tool-call hard limit (enforced platform-wide by the orchestrator).
+/// Used in the system prompt to give the model dynamic guidance relative to the
+/// actual configured limit. If this changes, the prompt guidance auto-updates.
+pub const MAX_TOOL_CALLS_PER_TURN: usize = 30;
+
+/// Threshold at which the model should start prioritizing completion and
+/// spawning background workers instead of chaining calls indefinitely.
+/// Typically 5 calls shy of the hard limit to leave margin for cleanup.
+pub const WARN_TOOL_CALLS_THRESHOLD: usize = 25;
+
 /// Operator override for the serial-chain yield depth, read from
 /// `AISH_SERIAL_CHAIN_YIELD_DEPTH`. Defaults to
 /// [`crate::loopguard::SERIAL_CHAIN_YIELD_DEPTH`]; a parsed value is honoured

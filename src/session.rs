@@ -884,6 +884,21 @@ impl Session {
         }
     }
 
+    /// Check database health and emit a warning if unhealthy. Returns true if DB is ok.
+    pub fn check_db_health(&self) -> bool {
+        match &self.db {
+            None => true, // No DB = healthy (offline mode)
+            Some(db) => {
+                if db.health_check() {
+                    true
+                } else {
+                    eprintln!("\x1b[33maish:\x1b[0m ⚠ database health check failed; persistence may be degraded");
+                    false
+                }
+            }
+        }
+    }
+
     /// The single active top-level goal, if any (TASK-282). "Active" =
     /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
     /// the cache holds more than one (see `reconcile_active_goal`, which keeps
@@ -1247,7 +1262,7 @@ locate a symbol and the read_file of a DIFFERENT already-known path are independ
 together; reading three files you already know you need is ONE turn of three read_files, not three \
 turns. Grep-then-read of the SAME file IS dependent (you need the line number first) — that's the \
 one case to serialize. Denser turns, fewer \
-no-op closes that waste a round-trip (and trip the continue-nudge). **Per-turn hard limit: 30 calls max per turn (enforced platform-wide). If you approach 25+, prioritize — complete one analysis/step and report, then spawn a fresh background worker for the next task rather than chaining indefinitely in one turn. Hitting the limit after auto-recovery attempts = operator escalation, so refactor heavy tasks into smaller pieces: batch reads upfront, use ranged I/O, grep-then-read, and defer multi-step analysis to `run_in_background`.**\n\
+no-op closes that waste a round-trip (and trip the continue-nudge). **Per-turn hard limit: {max_tool_calls} calls max per turn (enforced platform-wide). If you approach {warn_tool_calls}+, prioritize — complete one analysis/step and report, then spawn a fresh background worker for the next task rather than chaining indefinitely in one turn. Hitting the limit after auto-recovery attempts = operator escalation, so refactor heavy tasks into smaller pieces: batch reads upfront, use ranged I/O, grep-then-read, and defer multi-step analysis to `run_in_background`.**\n\
 - Ranged I/O (narrow reads by default): reading a file larger than 5KB WITHOUT line_start/line_end \
 is rejected at the tool layer — always pass a line range for big files. For a large source file, \
 grep_files FIRST to locate the region, THEN ranged-read only that slice; for grep hits read just the \
@@ -1315,6 +1330,8 @@ fluff.{skills}{batch}{escalate}{console}{goal}{task}",
                 .as_deref()
                 .map(task_anchor_block)
                 .unwrap_or_default(),
+            max_tool_calls = crate::engine::MAX_TOOL_CALLS_PER_TURN,
+            warn_tool_calls = crate::engine::WARN_TOOL_CALLS_THRESHOLD,
         )
     }
 
@@ -2111,5 +2128,27 @@ mod tests {
         session.reload_skills_from(&tmp);
         assert_eq!(session.skills_prompt, fresh);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn prompt_guidance_reflects_actual_tool_call_limits() {
+        // Verify that the system prompt guidance for per-turn tool-call limits
+        // references the actual configured constants from engine.rs. If the
+        // constants change in the future, the prompt will automatically update
+        // and CI will verify the guidance stays in sync.
+        let session = Session::new().unwrap();
+        let prompt = session.system_prompt(false);
+        let max_str = crate::engine::MAX_TOOL_CALLS_PER_TURN.to_string();
+        let warn_str = crate::engine::WARN_TOOL_CALLS_THRESHOLD.to_string();
+        assert!(
+            prompt.contains(&max_str),
+            "Prompt must contain MAX_TOOL_CALLS_PER_TURN ({}); prompt may be stale",
+            max_str
+        );
+        assert!(
+            prompt.contains(&warn_str),
+            "Prompt must contain WARN_TOOL_CALLS_THRESHOLD ({}); prompt may be stale",
+            warn_str
+        );
     }
 }

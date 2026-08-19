@@ -57,7 +57,8 @@ pub const REPEAT_HARD_LIMIT: usize = 4;
 /// How many automatic recoveries (resume/nudge) the coordinator will attempt for
 /// a worker that keeps ending abnormally before it gives up and flags the
 /// operator. Keeps an auto-recovery from becoming its own infinite loop.
-pub const MAX_AUTO_RECOVERIES: usize = 2;
+/// Fix #4: Increased from 2 to 4 to reduce false-positive flagging on transient errors.
+pub const MAX_AUTO_RECOVERIES: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Iteration budget — soft-warning → forced-summarize before the hard limit
