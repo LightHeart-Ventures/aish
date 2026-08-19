@@ -1247,7 +1247,7 @@ locate a symbol and the read_file of a DIFFERENT already-known path are independ
 together; reading three files you already know you need is ONE turn of three read_files, not three \
 turns. Grep-then-read of the SAME file IS dependent (you need the line number first) — that's the \
 one case to serialize. Denser turns, fewer \
-no-op closes that waste a round-trip (and trip the continue-nudge).\n\
+no-op closes that waste a round-trip (and trip the continue-nudge). **Per-turn hard limit: 30 calls max per turn (enforced platform-wide). If you approach 25+, prioritize — complete one analysis/step and report, then spawn a fresh background worker for the next task rather than chaining indefinitely in one turn. Hitting the limit after auto-recovery attempts = operator escalation, so refactor heavy tasks into smaller pieces: batch reads upfront, use ranged I/O, grep-then-read, and defer multi-step analysis to `run_in_background`.**\n\
 - Ranged I/O (narrow reads by default): reading a file larger than 5KB WITHOUT line_start/line_end \
 is rejected at the tool layer — always pass a line range for big files. For a large source file, \
 grep_files FIRST to locate the region, THEN ranged-read only that slice; for grep hits read just the \
