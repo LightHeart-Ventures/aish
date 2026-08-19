@@ -9,6 +9,14 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 - **`npx-skills` plugin removed**: npx-skills (npm registry skill search + install) is archived. Live skill import and search is now unified under `npx-skillfish` (agentskills.io/skillfish), which is more performant and upstream-maintained. Removed `plugins/npx-skills/` from the tree; documentation updated to remove references to npm-sourced skills.
 
 
+## [0.40.3] - 2026-08-19
+
+### Fixed
+- **DB health guard + self-check on launch (PR #727)**: aish now self-checks the SQLite health gate on startup (catches corrupted databases before the REPL bakes in the corruption), and enforces per-session guardrails so a DB-side write failure triggers a graceful fallback (session-local memory store, no data loss). The explicit `check_db_health()` callsite is available for future health checks.
+- **Worktree lifecycle + .atum telemetry exclusion (PR #727, #728)**: fixed worktree dirty-state probes (`is_clean()`, `sweep_worktrees()`) to exclude the `.atum` directory (telemetry, session logs, transient state) from git porcelain checks. Prevents false-positive "dirty" states when `.atum/` contains untracked session files, so worktree sweeps no longer trap on noise. Also improved error thresholds on worker dispatch failures.
+- **System prompt budget guidance now reflects actual tool-call limits (PR #726)**: the per-turn tool-call budget guidance in the system prompt now dynamically embeds the actual configured constants (`MAX_TOOL_CALLS_PER_TURN`, `WARN_TOOL_CALLS_THRESHOLD`) instead of stale hardcoded numbers, so the prompt always stays in sync with the engine's runtime behavior.
+
+
 ## [0.36.2] - 2026-07-08
 
 ### Added
