@@ -884,6 +884,21 @@ impl Session {
         }
     }
 
+    /// Check database health and emit a warning if unhealthy. Returns true if DB is ok.
+    pub fn check_db_health(&self) -> bool {
+        match &self.db {
+            None => true, // No DB = healthy (offline mode)
+            Some(db) => {
+                if db.health_check() {
+                    true
+                } else {
+                    eprintln!("\x1b[33maish:\x1b[0m ⚠ database health check failed; persistence may be degraded");
+                    false
+                }
+            }
+        }
+    }
+
     /// The single active top-level goal, if any (TASK-282). "Active" =
     /// `GoalStatus::Active` and not a subgoal; the newest-updated one wins when
     /// the cache holds more than one (see `reconcile_active_goal`, which keeps

@@ -137,12 +137,121 @@ impl Db {
                  created_at   INTEGER NOT NULL DEFAULT 0,
                  fired_at     INTEGER
              );
-             CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts (state);",
+             CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts (state);
+             -- Worktree lifecycle tracking for background coordinators (Fix #3).
+             -- Records worktree creation and cleanup events to detect stale/orphaned trees.
+             CREATE TABLE IF NOT EXISTS worktree_lifecycle (
+                 id           INTEGER PRIMARY KEY,
+                 worktree_id  TEXT NOT NULL,
+                 worktree_path TEXT NOT NULL,
+                 run_id       TEXT NOT NULL,
+                 created_at   TEXT NOT NULL DEFAULT current_timestamp,
+                 cleaned_up_at TEXT,
+                 cleanup_failed INTEGER NOT NULL DEFAULT 0,
+                 cleanup_error TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_worktree_run ON worktree_lifecycle (run_id);
+             CREATE INDEX IF NOT EXISTS idx_worktree_cleaned ON worktree_lifecycle (cleaned_up_at);",
         )
         .context("schema init failed")?;
         let db = Self { conn };
         db.migrate_memory_store();
         Ok(db)
+    }
+
+    /// Health check: test database connectivity and basic table access.
+    /// Returns true if the database is healthy, false otherwise.
+    pub fn health_check(&self) -> bool {
+        // Test 1: Can we ping the database?
+        if self.conn.execute_batch("SELECT 1").is_err() {
+            return false;
+        }
+
+        // Test 2: Can we access critical tables (memories, history)?
+        let tables_ok = self
+            .conn
+            .execute_batch("SELECT 1 FROM memories LIMIT 1; SELECT 1 FROM history LIMIT 1;")
+            .is_ok();
+
+        tables_ok
+    }
+
+    /// Get database WAL checkpoint mode and current file sizes for diagnostics.
+    pub fn wal_status(&self) -> Result<(String, Option<u64>, Option<u64>)> {
+        let mode: String = self
+            .conn
+            .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        // Attempt to get file sizes from the filesystem via PRAGMA (best-effort).
+        let _page_size: i64 = self
+            .conn
+            .query_row("PRAGMA page_size;", [], |row| row.get(0))
+            .unwrap_or(4096);
+
+        // Return mode and None for now; in production, you'd stat the files.
+        Ok((mode, None, None))
+    }
+
+    /// Record a worktree creation event (Fix #3: worktree lifecycle tracking).
+    pub fn record_worktree_created(
+        &self,
+        worktree_id: &str,
+        worktree_path: &std::path::Path,
+        run_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO worktree_lifecycle (worktree_id, worktree_path, run_id)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                worktree_id,
+                worktree_path.display().to_string(),
+                run_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record a successful worktree cleanup event.
+    pub fn record_worktree_cleaned_up(&self, worktree_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE worktree_lifecycle
+             SET cleaned_up_at = current_timestamp, cleanup_failed = 0
+             WHERE worktree_id = ?1 AND cleaned_up_at IS NULL",
+            rusqlite::params![worktree_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record a failed cleanup attempt.
+    pub fn record_worktree_cleanup_failed(&self, worktree_id: &str, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE worktree_lifecycle
+             SET cleanup_failed = 1, cleanup_error = ?2
+             WHERE worktree_id = ?1 AND cleaned_up_at IS NULL",
+            rusqlite::params![worktree_id, error],
+        )?;
+        Ok(())
+    }
+
+    /// List orphaned worktrees (created but never cleaned up, run is old/gone).
+    /// This helps detect stale background coordinator worktrees that need manual cleanup.
+    pub fn list_orphaned_worktrees(&self, hours_old: i64) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT worktree_id, worktree_path, run_id
+             FROM worktree_lifecycle
+             WHERE cleaned_up_at IS NULL
+             AND datetime(created_at) < datetime('now', ?1 || ' hours')
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![format!("-{}", hours_old)], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r?);
+        }
+        Ok(result)
     }
 
     /// One-time, idempotent memory-store migrations (safe to run on every open):
