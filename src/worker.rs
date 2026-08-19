@@ -2129,7 +2129,10 @@ fn worktree_is_clean(wt: &Worktree) -> bool {
     let porcelain = std::process::Command::new("git")
         .arg("-C")
         .arg(&wt.path)
-        .args(["status", "--porcelain"])
+        // Exclude coordinator telemetry (`.atum/`) so a worktree holding only
+        // its own turn-audit journal reads as CLEAN and is torn down. Real work
+        // (modified tracked files, other untracked) still marks it dirty.
+        .args(["status", "--porcelain", "--", ":(exclude).atum"])
         .output();
     let dirty = match porcelain {
         Ok(o) if o.status.success() => !o.stdout.is_empty(),
@@ -2291,7 +2294,10 @@ pub fn sweep_worktrees(src: &std::path::Path) {
         let orphaned = !registered.contains(&canon);
         // Probe cleanliness IN the leaf. A git error → can't confirm clean → treat
         // as dirty (keep): never delete work we can't account for.
-        let dirty = match git_out(&leaf, &["status", "--porcelain"]) {
+        // Exclude coordinator telemetry (`.atum/`) from the dirty probe: a
+        // completed worktree carrying only its `.atum/run-*.jsonl` journal must
+        // read as clean so the age/orphan sweep can reclaim it (ISS-2046).
+        let dirty = match git_out(&leaf, &["status", "--porcelain", "--", ":(exclude).atum"]) {
             Some(s) => !s.trim().is_empty(),
             None => true,
         };
