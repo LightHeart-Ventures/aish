@@ -2,6 +2,11 @@
 
 All notable changes to aish are documented here. Dates are the GitHub release published dates (UTC). Burned/failed release tags that never shipped valid assets (v0.18.1, v0.18.3, v0.19.0) are intentionally omitted.
 
+## [0.41.1] - 2026-08-21
+
+### Fixed
+- **Ghost-worker launch race (PR #737)**: a coordinator could return and let `main` tear down its in-flight worker children in the window between `tokio::spawn` and the child's PID being set — leaving detached processes that died at spawn and surfaced as stale `coordinating ♥` rows. `engine::run_coordinator` now holds coordinator exit behind a launch-handoff barrier that waits until every sub-worker has fully detached (PID set), with a 30s ceiling that degrades to exit-anyway. Adds `worker::launching_count()` and `worker::await_launch_handoff()`.
+
 ## [0.41.0] - 2026-08-21
 
 ### Added
