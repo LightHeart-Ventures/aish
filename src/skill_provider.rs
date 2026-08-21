@@ -762,14 +762,20 @@ fn filter_local(results: Vec<SearchResult>, query: &str) -> Vec<SearchResult> {
 /// A helpful, multi-line error for the Vercel bot-challenge: skill.fish's search
 /// endpoint sits behind Vercel's bot protection, which rejects automated clients
 /// with HTTP 429 + `x-vercel-mitigated: challenge`. There's nothing aish can do
-/// to clear the challenge from the CLI, so we point the user at the paths that
-/// *do* work instead of failing with an opaque status code.
+/// to clear the challenge from the CLI. Only the skill.fish *registry/search*
+/// API is gated — fetching a skill straight from GitHub bypasses the challenge
+/// entirely, so we steer the user to that (genuinely-working) path first rather
+/// than back at the same blocked endpoint.
 fn vercel_challenge_message() -> String {
     "skill.fish is behind a bot challenge right now (HTTP 429, x-vercel-mitigated: challenge) \
-     and is refusing automated requests.\n\nTry one of these instead:\n  \
-     • aish --skill-fetch <owner/name>   fetch a skill directly if you know its name\n  \
-     • export AISH_SKILL_REGISTRY=<url>  point aish at a custom mirror of the registry\n  \
-     • open https://skill.fish           browse and search in a browser as a last resort"
+     and is refusing automated requests.\n\n\
+     Only skill.fish's search/registry API is gated — fetching a skill straight from GitHub \
+     is NOT challenged. If you know (or can find) the skill's GitHub home, install it directly:\n  \
+     • :skill add github:<owner>/<repo>[/path/to/skill]                          from a repo (or sub-path)\n  \
+     • :skill add https://github.com/<owner>/<repo>/tree/<ref>/<path>            paste a repo/dir URL\n  \
+     • :skill add https://raw.githubusercontent.com/<owner>/<repo>/<ref>/.../SKILL.md   paste a raw URL\n  \
+     • export AISH_SKILL_REGISTRY=<url>   point aish at a self-hosted registry mirror\n  \
+     • open https://skill.fish           browse in a browser, then copy the skill's GitHub link"
         .to_string()
 }
 
@@ -2016,7 +2022,9 @@ mod tests {
         let err = search_with_base(&base, "github").await.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("bot challenge"), "got: {msg}");
-        assert!(msg.contains("--skill-fetch"), "got: {msg}");
+        // Steer users at the GitHub-bypass path (the one that actually works),
+        // not back at the same challenge-gated skill.fish endpoint.
+        assert!(msg.contains("github:"), "got: {msg}");
         assert!(msg.contains("AISH_SKILL_REGISTRY"), "got: {msg}");
         assert!(msg.contains("https://skill.fish"), "got: {msg}");
     }
