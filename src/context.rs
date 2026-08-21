@@ -64,6 +64,18 @@ pub fn context_window(model: &str) -> usize {
         200_000
     } else if m.contains("grok") {
         131_072
+    } else if m.contains("gpt-5")
+        || m.contains("gpt-4.1")
+        || m.contains("o3")
+        || m.contains("o4")
+    {
+        // OpenAI GPT-5 / GPT-4.1 / o-series expose very large windows.
+        1_000_000
+    } else if m.contains("gpt-4o") || m.contains("gpt-4") {
+        128_000
+    } else if m.contains("/") {
+        // OpenRouter model slugs are "vendor/model"; assume a modern large window.
+        128_000
     } else {
         // Local / unknown model — assume a small window so compaction kicks in
         // early rather than letting an overflow fail the request.

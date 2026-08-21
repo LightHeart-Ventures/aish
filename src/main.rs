@@ -440,6 +440,18 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| backend::grok::DEFAULT_MODEL.into()),
             &session.env,
         )?,
+        "openai" => backend::Backend::new_openai(
+            backend::openai::Provider::OpenAi,
+            args.model
+                .unwrap_or_else(|| backend::openai::OPENAI_DEFAULT_MODEL.into()),
+            &session.env,
+        )?,
+        "openrouter" => backend::Backend::new_openai(
+            backend::openai::Provider::OpenRouter,
+            args.model
+                .unwrap_or_else(|| backend::openai::OPENROUTER_DEFAULT_MODEL.into()),
+            &session.env,
+        )?,
         #[cfg(feature = "local")]
         "local" => {
             // Ensure a local model is selected before constructing the backend.
@@ -461,7 +473,9 @@ async fn main() -> Result<()> {
         }
         #[cfg(not(feature = "local"))]
         "local" => anyhow::bail!("aish was built without the 'local' feature"),
-        other => anyhow::bail!("unknown backend: {other} (available: claude, grok, local)"),
+        other => anyhow::bail!(
+            "unknown backend: {other} (available: claude, grok, openai, openrouter, local)"
+        ),
     };
     timer.mark("backend built");
     // Record which provider the interactive session runs on, so background
