@@ -1047,6 +1047,21 @@ pub async fn run_coordinator(
     eprintln!("\x1b[2maish: coordinator run {run_id} starting\x1b[0m");
     let store = session.coordinator_store.clone();
     let outcome = crate::coordinator::drive(backend, session, input, run_id, store.as_ref()).await;
+
+    // Launch-handoff barrier (coordinator-lifecycle bug). `run_in_background`
+    // spawns each sub-coordinator as a detached tokio task that, in `run_worker`,
+    // creates a worktree then `cmd.spawn()`s a `setsid()`-detached child. Between
+    // `tokio::spawn` and that `set_pid`, the child does NOT yet exist as an OS
+    // process — so if this coordinator returns now and `main` tears down the
+    // tokio runtime, those in-flight launches are killed before they detach
+    // (the "never got a worktree / killed before first heartbeat" ghosts, where
+    // a parent wrote its "all dispatched" result and finished seconds later).
+    // Once a child's pid is set it is a real detached process that outlives us,
+    // so we wait only for the launch HANDOFF, never for the workers to finish.
+    // Applies to every terminal phase (Done/Checkpoint/Failed) since it sits at
+    // the single choke point before we return to `main`.
+    crate::worker::await_launch_handoff(&session.worker_jobs).await;
+
     match outcome.phase {
         crate::coordinator::Phase::Done => {
             if let Some(result) = &outcome.result {

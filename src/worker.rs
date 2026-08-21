@@ -3580,6 +3580,55 @@ pub fn running_count(jobs: &WorkerJobs) -> usize {
         .count()
 }
 
+/// Count of workers that have been registered but whose child subprocess has
+/// not yet been launched (`pid` still unset) — the in-flight LAUNCH window in
+/// `run_worker` between `tokio::spawn` and `cmd.spawn()` + `set_pid`. A headless
+/// coordinator must NOT return/exit (tearing down the tokio runtime) while this
+/// is non-zero, or it kills its own just-spawned children before they detach —
+/// the "never got a worktree / killed before first heartbeat" coordinator-
+/// lifecycle bug. Once `pid` is set the child is a real `setsid()`-detached
+/// process that outlives the parent's exit, so it no longer counts here.
+pub fn launching_count(jobs: &WorkerJobs) -> usize {
+    jobs.lock()
+        .unwrap()
+        .iter()
+        .filter(|j| !j.is_terminal() && j.pid().is_none())
+        .count()
+}
+
+/// Block until every in-flight `run_in_background` launch has handed off — i.e.
+/// each spawned worker's child subprocess exists (`pid` set) or its launch
+/// terminated. This is the barrier a headless coordinator awaits before it
+/// returns, so `main`'s runtime teardown can't kill a child mid-launch (the
+/// coordinator-lifecycle race where a parent wrote its "all dispatched" result
+/// and finished seconds later, orphaning children that never detached). A launch
+/// only spans worktree creation + `cmd.spawn()` — sub-second in the common case —
+/// so the wait is bounded: a wedged launch degrades to today's exit-anyway
+/// behavior instead of hanging shutdown forever.
+pub async fn await_launch_handoff(jobs: &WorkerJobs) {
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    let deadline = std::time::Instant::now() + MAX_WAIT;
+    let mut announced = false;
+    while launching_count(jobs) > 0 {
+        if !announced {
+            eprintln!(
+                "\x1b[2maish: holding exit for {} in-flight worker launch(es) to detach\x1b[0m",
+                launching_count(jobs)
+            );
+            announced = true;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "\x1b[2maish: launch-handoff barrier timed out with {} worker(s) still launching; exiting anyway\x1b[0m",
+                launching_count(jobs)
+            );
+            break;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// The most recent still-fresh badge pulse across ALL workers (most-recent
 /// wins), or `None` when no worker has had an event within [`PULSE_FADE`]. Drives
 /// the colour of the prompt's `⟳N` badge.
@@ -3657,6 +3706,82 @@ fn flush_results(jobs: &WorkerJobs) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a bare in-memory `WorkerJob` for barrier tests — no subprocess, no
+    /// worktree. `pid: None` models the launch window (registered but child not
+    /// yet spawned); `Some` models a handed-off, detached child.
+    fn barrier_test_job(id: &str, pid: Option<u32>) -> Arc<WorkerJob> {
+        Arc::new(WorkerJob {
+            id: id.to_string(),
+            task: "t".to_string(),
+            inner: Mutex::new(JobInner {
+                pid,
+                status: "running".into(),
+                resumes: 0,
+                result: None,
+                error: None,
+                displayed: false,
+                branch: None,
+                last_tool_outcome: None,
+                last_turn_completion: None,
+                transcript: TranscriptRing::default(),
+                backfill_spinner: None,
+                started: SystemTime::now(),
+                finished: None,
+            }),
+        })
+    }
+
+    #[test]
+    fn launching_count_tracks_the_pid_handoff_window() {
+        let jobs: WorkerJobs = Arc::new(Mutex::new(Vec::new()));
+        let job = barrier_test_job("w_launch", None);
+        jobs.lock().unwrap().push(job.clone());
+        // Registered + non-terminal + no pid yet == mid-launch: barrier must hold.
+        assert_eq!(launching_count(&jobs), 1);
+        // Child subprocess spawned → pid recorded → launch handed off, no longer
+        // counted (the detached child now outlives the parent's exit).
+        job.set_pid(Some(4242));
+        assert_eq!(launching_count(&jobs), 0);
+    }
+
+    #[test]
+    fn launching_count_ignores_terminal_jobs() {
+        let jobs: WorkerJobs = Arc::new(Mutex::new(Vec::new()));
+        let job = barrier_test_job("w_dead", None);
+        // A launch that FAILED before spawning: no pid, but terminal. The barrier
+        // must NOT wait on it (it will never detach) — else shutdown hangs.
+        job.set_failed("couldn't launch worker subprocess".into());
+        jobs.lock().unwrap().push(job);
+        assert_eq!(launching_count(&jobs), 0);
+    }
+
+    #[tokio::test]
+    async fn await_launch_handoff_returns_once_pid_is_set() {
+        let jobs: WorkerJobs = Arc::new(Mutex::new(Vec::new()));
+        let job = barrier_test_job("w_barrier", None);
+        jobs.lock().unwrap().push(job.clone());
+        // Hand off the pid shortly after; the barrier should observe it via its
+        // poll loop and return far under the 30s ceiling.
+        let handoff = job.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            handoff.set_pid(Some(999));
+        });
+        let start = std::time::Instant::now();
+        await_launch_handoff(&jobs).await;
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(launching_count(&jobs), 0);
+    }
+
+    #[tokio::test]
+    async fn await_launch_handoff_returns_immediately_when_idle() {
+        // No in-flight launches → the barrier is a no-op and returns at once.
+        let jobs: WorkerJobs = Arc::new(Mutex::new(Vec::new()));
+        let start = std::time::Instant::now();
+        await_launch_handoff(&jobs).await;
+        assert!(start.elapsed() < std::time::Duration::from_millis(200));
+    }
 
     #[test]
     fn reconcile_only_patches_non_terminal_phases() {
