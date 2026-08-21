@@ -2,6 +2,18 @@
 
 All notable changes to aish are documented here. Dates are the GitHub release published dates (UTC). Burned/failed release tags that never shipped valid assets (v0.18.1, v0.18.3, v0.19.0) are intentionally omitted.
 
+## [0.41.0] - 2026-08-21
+
+### Added
+- **OpenAI-compatible backends (PR #735, #733)**: aish now supports OpenAI and OpenRouter as alternative LLM backends. Set `OPENAI_API_KEY` and use `:backend openai` or `:model gpt-4o` to switch. Backends are transparently integrated into the agentic loop and honor the same tool-call orchestration, system prompt layering, and streaming contract as Claude. Full parity on reasoning, function calling, and error recovery.
+- **Native I/O redirection in the pipeline (PR #732)**: shell-style I/O redirection operators (`>`, `>>`, `<`, `2>`, `2>&1`, `&>`) are now first-class constructs in aish's native in-subset language. No shell is invoked; piping and redirection are part of the core pipeline grammar, enabling cleaner scripting without escaping to bash.
+
+### Changed
+- **Piping and redirection fully documented**: see `docs/plans/piping-redirection.md` for the design rationale, grammar, and examples.
+
+### Fixed
+- **Test oracle cleanup**: removed stale negative cases for redirection now that `>` is native in the in-subset grammar.
+
 ## [Unreleased]
 
 ### Changed
