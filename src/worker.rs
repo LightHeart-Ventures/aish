@@ -2425,6 +2425,11 @@ fn describe_failure(status: std::process::ExitStatus, role: &str, stderr: &str) 
 pub fn coordinator_model(backend_kind: &str, batch_model: &str) -> String {
     match backend_kind {
         "grok" => crate::backend::grok::DEFAULT_MODEL.to_string(),
+        // OpenAI-compatible coordinators run the provider default (mirrors Grok);
+        // a session-pinned custom model isn't threaded here.
+        "openai" | "openrouter" => crate::backend::openai::default_model_for_kind(backend_kind)
+            .unwrap_or(batch_model)
+            .to_string(),
         _ => batch_model.to_string(),
     }
 }

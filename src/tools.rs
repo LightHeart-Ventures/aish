@@ -2010,12 +2010,16 @@ steer, or pass `force: true` (or set AISH_BG_ALLOW_DUP=1) to spawn a duplicate a
     // tool-less batch path below additionally needs a metered key (checked there).
     let cred_ok = match session.backend_kind.as_str() {
         "grok" => crate::backend::grok::credential_available(&session.env),
+        "openai" | "openrouter" => crate::backend::openai::provider_for_kind(&session.backend_kind)
+            .map(|p| crate::backend::openai::credential_available(p, &session.env))
+            .unwrap_or(false),
         _ => crate::backend::claude::Credential::resolve(&session.env).is_ok(),
     };
     if !cred_ok {
         anyhow::bail!(
             "no credential for the active backend — Claude needs CLAUDE_CODE_OAUTH_TOKEN or \
-ANTHROPIC_API_KEY; Grok needs a Grok CLI login (~/.grok/auth.json) or XAI_API_KEY (env or ~/.aishrc)"
+ANTHROPIC_API_KEY; Grok needs a Grok CLI login (~/.grok/auth.json) or XAI_API_KEY; OpenAI needs \
+OPENAI_API_KEY; OpenRouter needs OPENROUTER_API_KEY (env or ~/.aishrc)"
         );
     }
 

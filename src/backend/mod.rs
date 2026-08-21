@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod grok;
+pub mod openai;
 #[cfg(feature = "local")]
 pub mod local;
 
@@ -313,6 +314,7 @@ pub type StreamSink<'a> = &'a mut dyn FnMut(StreamDelta<'_>);
 pub enum Backend {
     Claude(claude::ClaudeBackend),
     Grok(grok::GrokBackend),
+    OpenAi(openai::OpenAiBackend),
     #[cfg(feature = "local")]
     Local(local::LocalBackend),
 }
@@ -324,6 +326,16 @@ impl Backend {
 
     pub fn new_grok(model: String, extra_env: &[(String, String)]) -> Result<Self> {
         Ok(Backend::Grok(grok::GrokBackend::new(model, extra_env)?))
+    }
+
+    pub fn new_openai(
+        provider: openai::Provider,
+        model: String,
+        extra_env: &[(String, String)],
+    ) -> Result<Self> {
+        Ok(Backend::OpenAi(openai::OpenAiBackend::new(
+            provider, model, extra_env,
+        )?))
     }
 
     #[cfg(feature = "local")]
@@ -338,6 +350,7 @@ impl Backend {
         match self {
             Backend::Claude(_) => "claude",
             Backend::Grok(_) => "grok",
+            Backend::OpenAi(b) => b.kind(),
             #[cfg(feature = "local")]
             Backend::Local(_) => "local",
         }
@@ -350,6 +363,7 @@ impl Backend {
         match self {
             Backend::Claude(b) => b.model.clone(),
             Backend::Grok(b) => b.model.clone(),
+            Backend::OpenAi(b) => b.model.clone(),
             #[cfg(feature = "local")]
             Backend::Local(_) => crate::hwdetect::selected_model_id(),
         }
@@ -360,6 +374,7 @@ impl Backend {
         match self {
             Backend::Claude(_) => Ok(()),
             Backend::Grok(_) => Ok(()),
+            Backend::OpenAi(_) => Ok(()),
             #[cfg(feature = "local")]
             Backend::Local(b) => b.prepare().await,
         }
@@ -369,6 +384,7 @@ impl Backend {
         match self {
             Backend::Claude(b) => b.complete(system, history, tools).await,
             Backend::Grok(b) => b.complete(system, history, tools).await,
+            Backend::OpenAi(b) => b.complete(system, history, tools).await,
             #[cfg(feature = "local")]
             Backend::Local(b) => b.complete(system, history, tools).await,
         }
@@ -394,6 +410,9 @@ impl Backend {
         match self {
             Backend::Claude(b) => b.complete_streaming(system, history, tools, sink).await,
             Backend::Grok(b) => deferred_stream(b.complete(system, history, tools).await?, sink),
+            Backend::OpenAi(b) => {
+                deferred_stream(b.complete(system, history, tools).await?, sink)
+            }
             #[cfg(feature = "local")]
             Backend::Local(b) => {
                 deferred_stream(b.complete(system, history, tools).await?, sink)
@@ -413,6 +432,7 @@ impl Backend {
         match self {
             Backend::Claude(b) => format!("claude ({} · {})", b.auth_label(), b.model),
             Backend::Grok(b) => format!("grok ({} · {})", b.auth_label(), b.model),
+            Backend::OpenAi(b) => format!("{} ({} · {})", b.kind(), b.auth_label(), b.model),
             #[cfg(feature = "local")]
             Backend::Local(_) => format!("local ({})", crate::hwdetect::selected_model_id()),
         }
@@ -424,6 +444,7 @@ impl Backend {
         match self {
             Backend::Claude(b) => crate::context::context_window(&b.model),
             Backend::Grok(b) => crate::context::context_window(&b.model),
+            Backend::OpenAi(b) => crate::context::context_window(&b.model),
             #[cfg(feature = "local")]
             Backend::Local(_) => 4096, // conservative context floor for local GGUF models
         }
@@ -438,6 +459,7 @@ impl Backend {
         match self {
             Backend::Claude(b) => b.model = model,
             Backend::Grok(b) => b.model = model,
+            Backend::OpenAi(b) => b.model = model,
             #[cfg(feature = "local")]
             Backend::Local(_) => {} // Model is baked in for local backend
         }
@@ -462,6 +484,7 @@ impl Backend {
         match self {
             Backend::Claude(b) => resolve_escalation("claude", &b.model, batch_model),
             Backend::Grok(b) => resolve_escalation("grok", &b.model, batch_model),
+            Backend::OpenAi(b) => resolve_escalation(b.kind(), &b.model, batch_model),
             #[cfg(feature = "local")]
             Backend::Local(_) => {
                 // Local can escalate to Claude if credentials are available

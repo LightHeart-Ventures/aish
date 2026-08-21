@@ -500,7 +500,7 @@ lack API access; re-run the Grok CLI to refresh ~/.grok/auth.json"
 /// Deliberately minimal — it doesn't recurse into nested schemas. Some MCP tool
 /// schemas (atum ships 140+) may still need follow-up if xAI's validator rejects
 /// a deeper construct.
-fn sanitize_schema(schema: &Value) -> Value {
+pub(super) fn sanitize_schema(schema: &Value) -> Value {
     let Some(obj) = schema.as_object() else {
         // A non-object schema (or a bare value) → wrap as an empty object schema,
         // which is the safe "no parameters" shape.
@@ -525,7 +525,7 @@ fn sanitize_schema(schema: &Value) -> Value {
 /// Pure (no IO) so the truncation handling is unit-testable. `raw` is always
 /// `None`: OpenAI has no thinking-block echo requirement, so `render_messages`
 /// rebuilds a clean assistant message from the normalized fields.
-fn parse_response(v: &Value) -> Result<Turn> {
+pub(super) fn parse_response(v: &Value) -> Result<Turn> {
     let choice = v["choices"]
         .get(0)
         .context("malformed API response: no choices[0]")?;
@@ -588,7 +588,7 @@ same oversized call.]",
 
 /// Render normalized history into OpenAI chat-completions messages. The system
 /// prompt is prepended separately by `complete`.
-fn render_messages(history: &[Msg]) -> Vec<Value> {
+pub(super) fn render_messages(history: &[Msg]) -> Vec<Value> {
     // A tool-results Msg expands to N `role:"tool"` messages, so we may push more
     // than one entry per history item.
     let mut out = Vec::with_capacity(history.len());

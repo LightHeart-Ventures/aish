@@ -1821,7 +1821,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
         "attach",
         "watch + steer a coordinator, or `goal` to watch the goal",
     ),
-    ("backend", "switch backend (claude|grok|local)"),
+    ("backend", "switch backend (claude|grok|openai|openrouter|local)"),
     ("batch", "background batch mode (on|off|status)"),
     (
         "close",
@@ -3774,11 +3774,14 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
     }
     let no_credential = match session.backend_kind.as_str() {
         "grok" => !crate::backend::grok::credential_available(&session.env),
+        "openai" | "openrouter" => !crate::backend::openai::provider_for_kind(&session.backend_kind)
+            .map(|p| crate::backend::openai::credential_available(p, &session.env))
+            .unwrap_or(false),
         _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
     };
     if no_credential {
         return Dispatched::message_only(
-            "no credential for the active backend — Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY",
+            "no credential for the active backend — Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY · OpenAI: OPENAI_API_KEY · OpenRouter: OPENROUTER_API_KEY",
         );
     }
     // Nesting-depth guard (TASK-287): refuse `:dispatch` once the spawn budget
@@ -4917,11 +4920,14 @@ fn resume_coordinator(prev_run_id: &str, message: &str, session: &mut Session) {
     };
     let no_credential = match session.backend_kind.as_str() {
         "grok" => !crate::backend::grok::credential_available(&session.env),
+        "openai" | "openrouter" => !crate::backend::openai::provider_for_kind(&session.backend_kind)
+            .map(|p| crate::backend::openai::credential_available(p, &session.env))
+            .unwrap_or(false),
         _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
     };
     if no_credential {
         println!(
-            "no credential for the active backend — can't resume (Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY)"
+            "no credential for the active backend — can't resume (Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY · OpenAI: OPENAI_API_KEY · OpenRouter: OPENROUTER_API_KEY)"
         );
         return;
     }
@@ -6075,6 +6081,9 @@ fn spawn_alert_coordinator(session: &mut Session, id: i64, description: &str) ->
     // A coordinator needs a credential for the active backend and our own exe.
     let no_credential = match session.backend_kind.as_str() {
         "grok" => !crate::backend::grok::credential_available(&session.env),
+        "openai" | "openrouter" => !crate::backend::openai::provider_for_kind(&session.backend_kind)
+            .map(|p| crate::backend::openai::credential_available(p, &session.env))
+            .unwrap_or(false),
         _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
     };
     if no_credential {
@@ -7367,7 +7376,7 @@ async fn handle_colon(
                                                      normal only for write/create/delete, yolo never)\n\
                  :model <opus|sonnet|haiku|full-id>  switch model\n\
                  :model-detect                       re-detect + select the best local model for this machine\n\
-                 :backend <claude|grok|local>        switch backend\n\
+                 :backend <claude|grok|openai|openrouter|local>  switch backend\n\
                  :mcp [list|status]                  list connected MCP servers\n\
                  :mcp reconnect [name|all]           restart MCP server(s)\n\
                  :mcp reload                          connect servers newly added to .mcp.json (no restart)\n\
@@ -8397,6 +8406,26 @@ async fn handle_colon(
                     }
                 }
             }
+            Some(name @ ("openai" | "openrouter")) => {
+                let provider = crate::backend::openai::Provider::parse(name)
+                    .expect("matched openai/openrouter literal");
+                if backend.kind() == provider.kind() {
+                    println!("already on {}", backend.describe());
+                } else {
+                    match Backend::new_openai(
+                        provider,
+                        provider.default_model().into(),
+                        &session.env,
+                    ) {
+                        Ok(b) => {
+                            *backend = b;
+                            session.backend_kind = backend.kind().to_string();
+                            println!("backend → {}", backend.describe());
+                        }
+                        Err(e) => println!("can't switch: {e:#}"),
+                    }
+                }
+            }
             #[cfg(feature = "local")]
             Some("local") => {
                 if matches!(backend, Backend::Local(_)) {
@@ -8428,7 +8457,7 @@ async fn handle_colon(
             Some("local") => {
                 println!("built without the local feature (cargo build --features local)")
             }
-            _ => println!("usage: :backend <claude|grok|local>"),
+            _ => println!("usage: :backend <claude|grok|openai|openrouter|local>"),
         },
         Some("mode") => match parts.next().and_then(crate::session::Mode::parse) {
             Some(m) => {
