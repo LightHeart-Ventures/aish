@@ -2261,7 +2261,8 @@ fn route_preview(
     // A pipeline runs directly only when every stage resolves to a program.
     if let Some(stages) = pipeline::parse(l) {
         let all = stages.iter().all(|s| {
-            s.first()
+            s.argv
+                .first()
                 .is_some_and(|p| resolve_program(p, cwd, path).is_some())
         });
         return if all { Preview::Direct } else { Preview::Model };
@@ -2927,7 +2928,8 @@ async fn dispatch(
             .or_else(|| std::env::var("PATH").ok())
             .unwrap_or_default();
         if stages.iter().all(|s| {
-            s.first()
+            s.argv
+                .first()
                 .is_some_and(|p| resolve_program(p, &session.cwd, &path_var).is_some())
         }) {
             match pipeline::run(&stages, session).await {

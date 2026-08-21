@@ -57,7 +57,7 @@ pub enum AishDiagnostic {
     #[error("unsupported shell metacharacter `{ch}`")]
     #[diagnostic(
         code(aish::parse::unsupported_meta),
-        help("there's no shell underneath aish — pipes, redirection, globbing, and command substitution aren't available in a directly-run command")
+        help("aish runs pipes and I/O redirection itself, but there's no shell underneath for globbing, command substitution, or control operators (`&&`/`||`/`;`) — those aren't available in a directly-run command")
     )]
     UnsupportedMeta {
         ch: char,

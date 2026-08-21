@@ -370,8 +370,9 @@ To register an already-installed binary without rebuilding: `make register-shell
 ## Status
 
 Working prototype. Known gaps vs a classic shell (see the gap analysis):
-no pipes/redirection/`$VAR`/globs in direct dispatch (those lines route to the
-model), no job control (Ctrl-Z), path-only tab completion. History and memories
+pipes (`|`), I/O redirection (`>`, `>>`, `<`, `2>`, `2>&1`, `&>`), and `$VAR`
+run directly; globs, command substitution, and control operators (`&&`, `||`,
+`;`) still route to the model. No job control (Ctrl-Z), path-only tab completion. History and memories
 are stored unencrypted in `~/.aish/aish.db`.
 
 ## License
