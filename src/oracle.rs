@@ -11,7 +11,7 @@
 //! Any divergence fails the test. Scope is deliberately narrow: only the subset
 //! aish runs natively (single external commands and multi-stage pipelines of
 //! external commands). Lines aish hands to the model instead — globs,
-//! redirection, command substitution, `&&`/`||`, prose — are out of scope and
+//! command substitution, `&&`/`||`, prose — are out of scope and
 //! reported as [`Native::NotNative`], so a case can assert a line stays
 //! model-routed rather than silently passing.
 //!
@@ -300,7 +300,7 @@ async fn deliberate_divergence_is_detected() {
 #[tokio::test]
 async fn out_of_subset_lines_are_not_native() {
     let session = session_with_env(&[]);
-    for line in ["echo *", "cat a > b", "echo $(date)", "true && false"] {
+    for line in ["echo *", "echo $(date)", "true && false"] {
         assert!(
             matches!(run_native(line, &session).await, Native::NotNative),
             "`{line}` should route to the model, not run natively"
