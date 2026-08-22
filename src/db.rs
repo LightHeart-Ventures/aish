@@ -2240,7 +2240,7 @@ mod tests {
             .insert(
                 "batch_1",
                 "summarize logs",
-                "claude-opus-4-8",
+                "claude-opus-4-9",
                 "sess-a",
                 Some("alpha"),
             )
@@ -2248,7 +2248,7 @@ mod tests {
         store.set_anthropic_id("batch_1", "msgbatch_abc").unwrap();
         store.set_status("batch_1", "in_progress").unwrap();
         store
-            .insert("batch_2", "translate", "claude-opus-4-8", "sess-b", None)
+            .insert("batch_2", "translate", "claude-opus-4-9", "sess-b", None)
             .unwrap();
         store.set_done("batch_2", "the result").unwrap();
 

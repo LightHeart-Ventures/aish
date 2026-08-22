@@ -27,7 +27,7 @@ const POLL_WALL_CLOCK_CAP: Duration = Duration::from_secs(6 * 60 * 60); // 6h, m
 /// The model every background batch runs on. Batches are Anthropic-only, and the
 /// user wants the strongest model for deferred work — so this is fixed to Opus
 /// regardless of the interactive backend/model. Overridable via `:batch model`.
-pub const DEFAULT_BATCH_MODEL: &str = "claude-opus-4-8";
+pub const DEFAULT_BATCH_MODEL: &str = "claude-opus-4-9";
 
 /// A background batch job, tracked for the life of the session. Shared between
 /// the REPL (which lists/fetches it) and the poll task (which mutates it).

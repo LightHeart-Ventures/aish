@@ -1266,7 +1266,7 @@ mod tests {
         // A normal request whose last message is from the user enables thinking
         // on Opus/Sonnet.
         let hist = vec![Msg::user("hi")];
-        assert!(wants_thinking("claude-opus-4-8", &hist));
+        assert!(wants_thinking("claude-opus-4-9", &hist));
         assert!(wants_thinking("claude-sonnet-4-6", &hist));
         // Haiku never takes adaptive thinking.
         assert!(!wants_thinking("claude-haiku-4-5", &hist));
@@ -1283,7 +1283,7 @@ mod tests {
             },
         ];
         assert!(
-            !wants_thinking("claude-opus-4-8", &prefill),
+            !wants_thinking("claude-opus-4-9", &prefill),
             "no thinking on prefill"
         );
     }

@@ -8345,7 +8345,7 @@ async fn handle_colon(
         Some("model") => match parts.next() {
             Some(m) => {
                 let id = match m {
-                    "opus" => "claude-opus-4-8",
+                    "opus" => "claude-opus-4-9",
                     "sonnet" => "claude-sonnet-4-6",
                     "haiku" => "claude-haiku-4-5",
                     other => other,
@@ -8380,7 +8380,7 @@ async fn handle_colon(
                     println!("already on {}", backend.describe());
                 } else {
                     match crate::backend::claude::Credential::resolve(&session.env)
-                        .and_then(|cred| Backend::new_claude("claude-opus-4-8".into(), cred))
+                        .and_then(|cred| Backend::new_claude("claude-opus-4-9".into(), cred))
                     {
                         Ok(b) => {
                             *backend = b;
@@ -9045,7 +9045,7 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
         Some("model") => match arg {
             Some(m) => {
                 let id = match m {
-                    "opus" => "claude-opus-4-8",
+                    "opus" => "claude-opus-4-9",
                     "sonnet" => "claude-sonnet-4-6",
                     "haiku" => "claude-haiku-4-5",
                     other => other,
