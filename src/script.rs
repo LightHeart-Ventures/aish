@@ -105,7 +105,7 @@ pub async fn run(
         // A non-command line (or a `?`-forced one) goes to the model, exactly as
         // at the interactive prompt. Errors don't abort the script — they set a
         // non-zero `$?` and execution continues, like `sh` without `set -e`.
-        match engine::run_turn(backend, session, line, &mut confirm).await {
+        match engine::run_turn_with_recovery(backend, session, line, &mut confirm).await {
             Ok(text) => {
                 let text = text.trim();
                 if !text.is_empty() {

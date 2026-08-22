@@ -125,6 +125,60 @@ pub async fn run_turn(
     result
 }
 
+/// Drive [`run_turn`] with the same auto-resume policy the coordinator loop
+/// uses ([`crate::coordinator::drive`]): when a round ends with a resumable stop
+/// banner (`forced-summarize` / `budget-exhausted` / `serial-chain-yield` /
+/// `call-budget-exceeded`, or a `loop-detected` nudge), fold the recovery
+/// directive into the NEXT round and keep driving, bounded by
+/// [`crate::loopguard::MAX_AUTO_RECOVERIES`]. Non-interactive callers (the
+/// headless `-p` one-shot and script execution) use this so a stop banner is
+/// never handed back RAW as the "answer" with the work abandoned mid-flight —
+/// the summarize step is followed by an actual resume, exactly as it is for a
+/// background coordinator. Returns the final answer (still a labelled partial if
+/// the recovery budget is exhausted). The interactive REPL implements the same
+/// policy inline because it must keep its per-round Ctrl-C / Shift-Tab handling.
+pub async fn run_turn_with_recovery(
+    backend: &Backend,
+    session: &mut Session,
+    input: String,
+    confirm: &mut Confirm<'_>,
+) -> Result<String> {
+    let mut next_input = input;
+    let mut auto_recoveries = 0usize;
+    loop {
+        let answer = run_turn(backend, session, next_input, confirm).await?;
+        match crate::loopguard::RoundExit::evaluate(
+            &answer,
+            auto_recoveries,
+            crate::loopguard::MAX_AUTO_RECOVERIES,
+        ) {
+            // A resumable stop → fold the recovery directive and drive again.
+            Some(exit)
+                if matches!(
+                    exit.disposition,
+                    crate::loopguard::Disposition::Resume | crate::loopguard::Disposition::Nudge
+                ) =>
+            {
+                let Some(dir) = exit.directive() else {
+                    return Ok(answer);
+                };
+                auto_recoveries += 1;
+                eprintln!(
+                    "\x1b[2maish: turn ended [{}] — {} (auto-recovery {auto_recoveries}/{})\x1b[0m",
+                    exit.reason.tag(),
+                    exit.disposition.verb(),
+                    crate::loopguard::MAX_AUTO_RECOVERIES,
+                );
+                next_input = dir;
+            }
+            // A normal answer, or a terminal stop (recoveries exhausted /
+            // flag-operator) → return what we have.
+            _ => return Ok(answer),
+        }
+    }
+}
+
+/// TASK-407 (SPR-071): repo-open auto-index handoff. When aish enters any repo
 /// TASK-407 (SPR-071): repo-open auto-index handoff. When aish enters any repo
 /// where the `codebase-memory` server is enrolled AND connected, warm its
 /// structural index ONCE per repo-open so the graph is ready before the first
