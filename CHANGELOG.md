@@ -2,6 +2,11 @@
 
 All notable changes to aish are documented here. Dates are the GitHub release published dates (UTC). Burned/failed release tags that never shipped valid assets (v0.18.1, v0.18.3, v0.19.0) are intentionally omitted.
 
+## [Unreleased]
+
+### Changed
+- **Per-turn call-budget defaults raised (soft 20→35, hard 30→50)**: the cumulative per-turn tool-call budget (`loopguard::CALL_BUDGET_SOFT` / `CALL_BUDGET_HARD`) now defaults to a soft advisory at 35 and a graceful hard yield at 50 (was 20/30). This gives a legitimately-wide multi-file edit+build+test turn more headroom before it yields to resume with fresh context. Both ceilings remain operator-configurable at runtime via the existing `AISH_CALL_BUDGET_SOFT` / `AISH_CALL_BUDGET_HARD` env vars (resolved in `engine::call_budget`, clamped to `[1, 100000]`); this change only moves the compile-time DEFAULTS. The system-prompt budget guidance and the `loop-guards.md` env-var reference were updated to match.
+
 ## [0.41.1] - 2026-08-21
 
 ### Fixed
