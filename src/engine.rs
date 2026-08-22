@@ -921,25 +921,33 @@ async fn run_turn_inner(
             // session has NO durable goal loop to catch the yield banner and
             // resume, so a plain return would just print the advisory to the
             // prompt and the model would never act on it — the "aish got the
-            // advisory but did nothing with it" defect. For a batching
-            // opportunity, inject the advisor's directive into the one-shot
+            // advisory but did nothing with it" defect. Whenever the advisor
+            // produced a resume_directive (a BatchingOpportunity OR an Unknown
+            // pattern — both carry one), inject that directive into the one-shot
             // batch-nudge carrier (consumed by pending_batch_nudge.take() at the
             // top of the next iteration and folded into effective_system, so it is
             // BINDING, not advisory-only), RESET the serial-chain depth to grant a
-            // fresh window, and CONTINUE the turn so the model re-plans toward
-            // batching in place. A coordinator keeps the yield-and-resume path (its
-            // goal loop re-plans from the banner via recovery_guidance); a stuck
-            // pattern always yields so the operator can intervene.
+            // fresh window, and CONTINUE the turn so the model updates its
+            // behavior and re-plans in place instead of dumping the banner to the
+            // prompt and stalling. This mirrors the forced-summarize contract:
+            // aish RESUMES the work when it receives the yield, rather than
+            // handing the operator a raw stop banner. The cumulative per-turn
+            // call-budget guard is NOT reset here, so a chain that keeps refusing
+            // to batch still eventually HardYields — no infinite in-place loop. A
+            // coordinator keeps the yield-and-resume path (its goal loop re-plans
+            // from the banner via recovery_guidance); only a StuckPattern (no
+            // directive) yields to the prompt so the operator can intervene.
             if !session.nested {
-                if let (
-                    crate::advisor::YieldClassification::BatchingOpportunity,
-                    Some(directive),
-                ) = (advice.classification, advice.resume_directive.as_ref())
-                {
+                if let Some(directive) = advice.resume_directive.as_ref() {
                     pending_batch_nudge = Some(directive.clone());
                     serial_chain_guard.reset();
                     eprintln!(
-                        "\x1b[2m  → injecting batching directive into the next round (binding); re-planning in place\x1b[0m"
+                        "\x1b[2m  → {} — injecting resume directive into the next round (binding); re-planning in place\x1b[0m",
+                        match advice.classification {
+                            crate::advisor::YieldClassification::BatchingOpportunity =>
+                                "batching opportunity",
+                            _ => "unknown pattern",
+                        }
                     );
                     continue;
                 }
