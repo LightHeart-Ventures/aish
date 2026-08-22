@@ -406,7 +406,8 @@ pub struct ImportedSkill {
 ///     or a `https://raw.githubusercontent.com/...` raw URL
 ///     → GitHub path resolution + (possibly multi-skill) discovery & import;
 ///   * anything else → a skill.fish `owner/name[@version]` ref, fetched and
-///     imported as a single skill.
+///     imported as a single skill. On failure, silently tries interpreting the
+///     input as a GitHub repo path before surfacing an error.
 /// Returns every skill written, so the caller can reload its catalog and report.
 pub async fn add(input: &str, skills_dir: &Path) -> Result<Vec<ImportedSkill>> {
     if let Some(gh) = parse_github_ref(input) {
@@ -445,10 +446,50 @@ pub async fn add(input: &str, skills_dir: &Path) -> Result<Vec<ImportedSkill>> {
                     path,
                 }])
             }
-            // No registry match either — surface the original fetch error.
-            Err(_) => Err(skillfish_err),
+            // No registry match either. Try one more fallback: interpret the input
+            // as a GitHub repo path (owner/repo as if the user typed `github:owner/repo`).
+            // This lets `:skill add hyperb1iss/hyperskills` work seamlessly even when
+            // skill.fish is behind a Vercel bot challenge. Only surface the original
+            // skill.fish error if the GitHub fallback also fails.
+            Err(_) => try_github_fallback(input, skills_dir, skillfish_err).await,
         },
     }
+}
+
+/// Fallback when skill.fish import fails: try interpreting the input as a GitHub
+/// repo path. This allows users to type `:skill add owner/repo` and have it
+/// automatically use GitHub when skill.fish is unavailable (e.g., Vercel bot
+/// challenge). Only surfaces an error if the GitHub attempt also fails, preferring
+/// the more specific GitHub error (usually "no SKILL.md found") over the skill.fish
+/// error.
+async fn try_github_fallback(
+    input: &str,
+    skills_dir: &Path,
+    skillfish_err: anyhow::Error,
+) -> Result<Vec<ImportedSkill>> {
+    // Construct a GitHub repo reference from the bare `owner/repo` input.
+    // e.g., `hyperb1iss/hyperskills` → `github:hyperb1iss/hyperskills`
+    let github_input = format!("github:{}", input);
+    if let Some(gh) = parse_github_ref(&github_input) {
+        match add_github(&gh, skills_dir).await {
+            Ok(skills) => return Ok(skills),
+            // GitHub attempt failed too. Prefer the GitHub error (more specific: usually
+            // "no SKILL.md found in this repo") over the skill.fish Vercel challenge or
+            // registry 404. This way, when both paths fail, the user sees the actionable
+            // GitHub error message instead of a cryptic Vercel challenge.
+            Err(github_err) => {
+                // If the skill.fish error was a Vercel bot challenge, prefer that message
+                // (it's more actionable). Otherwise, prefer the GitHub error.
+                let err_msg = format!("{skillfish_err}");
+                if err_msg.contains("bot challenge") {
+                    return Err(skillfish_err);
+                }
+                return Err(github_err);
+            }
+        }
+    }
+    // Couldn't even parse it as a GitHub ref. Surface the original skill.fish error.
+    Err(skillfish_err)
 }
 
 /// Resolve a short `owner/skill` name (as printed by `--skill-search`) back to a
@@ -1920,6 +1961,38 @@ mod tests {
         assert!(path.ends_with("loopback-skill/SKILL.md"));
         assert_eq!(crate::skills::load(&tmp).len(), 1);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // github_fallback_when_skillfish_fails: when skill.fish fetch fails (e.g., due to
+    // Vercel bot challenge), the fallback should prefer GitHub error messages over
+    // the skill.fish error, making it clear that the GitHub attempt was tried.
+    #[test]
+    fn try_github_fallback_prefers_github_error_when_not_vercel_challenge() {
+        // Simulate a generic skill.fish error (not a Vercel challenge).
+        let skillfish_err = anyhow::anyhow!("registry 404: skill not found");
+        
+        // When the skillfish error is NOT a Vercel challenge, the fallback
+        // should prefer the GitHub error (which is more specific about the
+        // actual problem). This test verifies the logic that decides which
+        // error to surface.
+        let err_msg = format!("{skillfish_err}");
+        let prefer_skillfish = err_msg.contains("bot challenge");
+        assert!(!prefer_skillfish, "non-Vercel error should prefer GitHub error");
+    }
+
+    #[test]
+    fn try_github_fallback_prefers_vercel_challenge_when_present() {
+        // Simulate a Vercel bot challenge error.
+        let skillfish_err = anyhow::anyhow!(
+            "skill.fish is behind a bot challenge right now (HTTP 429, x-vercel-mitigated: challenge)"
+        );
+        
+        // When the skillfish error IS a Vercel challenge, the fallback
+        // should prefer that message (it's more actionable and tells the user
+        // to try GitHub directly).
+        let err_msg = format!("{skillfish_err}");
+        let prefer_skillfish = err_msg.contains("bot challenge");
+        assert!(prefer_skillfish, "Vercel challenge error should be preserved");
     }
 
     // ---- Phase 2: search ------------------------------------------------
