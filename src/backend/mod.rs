@@ -629,7 +629,7 @@ mod tests {
 
     #[test]
     fn escalation_policy() {
-        let opus = "claude-opus-4-8";
+        let opus = "claude-opus-4-9";
         // Small Claude frontends escalate to the batch (strong) model.
         assert_eq!(
             resolve_escalation("claude", "claude-haiku-4-5", opus),

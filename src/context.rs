@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn window_sizes_by_model_family() {
         assert_eq!(context_window("claude-haiku-4-5"), 200_000);
-        assert_eq!(context_window("claude-opus-4-8"), 200_000);
+        assert_eq!(context_window("claude-opus-4-9"), 200_000);
         assert_eq!(context_window("grok-4"), 131_072);
         assert_eq!(context_window("some-local-gguf"), 8_192);
     }
