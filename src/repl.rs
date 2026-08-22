@@ -1646,23 +1646,32 @@ fn coordinator_status_message(session: &Session) -> String {
     // clock on the statusline below — in bold magenta. Blank when unnamed.
     // Append live status badges to the RIGHT of the name: 🤖 when a background
     // coordinator is still working, ⏰ when an `:alert` monitor is armed, 🎯 when
-    // a goal is active. Only shown when the session is named (there's no label
-    // to hang them off otherwise).
-    let decorated = session.name.as_ref().map(|n| {
-        let mut s = n.clone();
-        let badges = status_badges(session, &workers);
-        if !badges.is_empty() {
-            s.push(' ');
-            s.push_str(&badges);
-        }
-        s
-    });
+    // a goal is active. Badges render even when the session is UNNAMED — an armed
+    // alert (⏰) must always be visible in the statusline, not gated behind a
+    // `:rename`.
+    let decorated = decorate_name(session.name.as_deref(), &status_badges(session, &workers));
     crate::style::second_statusline_at(
         &left,
         decorated.as_deref(),
         crate::style::footer_width(),
         color_on,
     )
+}
+
+/// Combine the optional session name (`:rename`) with the live status-badge
+/// suffix into the right-justified SecondStatusLine label. Badges show even when
+/// the session is UNNAMED, so an armed `:alert` (⏰), a working coordinator (🤖),
+/// or an active goal (🎯) is always visible in the statusline — not gated behind
+/// a name. Returns `None` only when there's neither a name nor any badge (so the
+/// row stays blank). Pure — unit-testable without a live `Session`.
+fn decorate_name(name: Option<&str>, badges: &str) -> Option<String> {
+    let name = name.filter(|n| !n.is_empty());
+    match (name, badges.is_empty()) {
+        (Some(n), true) => Some(n.to_string()),
+        (Some(n), false) => Some(format!("{n} {badges}")),
+        (None, false) => Some(badges.to_string()),
+        (None, true) => None,
+    }
 }
 
 /// Compose the live status-badge suffix appended to the right of the `:rename`
@@ -10447,6 +10456,20 @@ mod tests {
             recent_message_row(baseline.clone(), Some("   ".to_string())),
             baseline
         );
+    }
+
+    #[test]
+    fn decorate_name_shows_badges_even_when_unnamed() {
+        // Named session + badges → "name <badges>".
+        assert_eq!(decorate_name(Some("proj"), "⏰"), Some("proj ⏰".to_string()));
+        // Named, no badges → just the name.
+        assert_eq!(decorate_name(Some("proj"), ""), Some("proj".to_string()));
+        // UNNAMED but an alert is armed → the ⏰ badge still shows (the fix).
+        assert_eq!(decorate_name(None, "⏰"), Some("⏰".to_string()));
+        assert_eq!(decorate_name(Some(""), "🤖 ⏰"), Some("🤖 ⏰".to_string()));
+        // Neither name nor badge → blank row.
+        assert_eq!(decorate_name(None, ""), None);
+        assert_eq!(decorate_name(Some(""), ""), None);
     }
 
     #[test]
