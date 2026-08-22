@@ -127,8 +127,8 @@ rather than letting redundant work run.
 | `AISH_COORDINATOR_FAILED_KEEP` | 50 | 0–100000 | Max retained terminal `failed` rows (keep-recent bound); `0` keeps none. |
 | `AISH_COORDINATOR_FAILED_MAX_AGE_DAYS` | 14 | 0–3650 | Drop retained `failed` rows older than this many days. |
 | `AISH_SERIAL_CHAIN_YIELD_DEPTH` | 12 | 1–1000 | Consecutive single-tool-call rounds allowed before a turn gracefully yields (`serial-chain-yield`). Raise it for genuinely-serial workloads whose dependent calls can't be batched, so they don't false-trip and exhaust the auto-recovery budget. Default behaviour is unchanged. |
-| `AISH_CALL_BUDGET_SOFT` | 20 | 1–100000 | Cumulative tool calls in one turn before a one-shot soft advisory logs (`call-budget-guard` soft). Advisory only — never yields. |
-| `AISH_CALL_BUDGET_HARD` | 30 | 1–100000 | Cumulative tool calls in one turn before the turn gracefully yields to resume with fresh context (`call-budget-guard` hard / `CallBudgetExceeded`). Raise it for a genuinely-wide but legitimate turn — a large multi-file edit+build+test batch that can't be split — so it doesn't false-trip and drain the auto-recovery budget. Default behaviour is unchanged. |
+| `AISH_CALL_BUDGET_SOFT` | 35 | 1–100000 | Cumulative tool calls in one turn before a one-shot soft advisory logs (`call-budget-guard` soft). Advisory only — never yields. |
+| `AISH_CALL_BUDGET_HARD` | 50 | 1–100000 | Cumulative tool calls in one turn before the turn gracefully yields to resume with fresh context (`call-budget-guard` hard / `CallBudgetExceeded`). Raise it for a genuinely-wide but legitimate turn — a large multi-file edit+build+test batch that can't be split — so it doesn't false-trip and drain the auto-recovery budget. Default behaviour is unchanged. |
 
 ## Tests
 

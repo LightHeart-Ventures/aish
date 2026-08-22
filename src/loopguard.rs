@@ -742,10 +742,13 @@ impl SerialChainGuard {
 /// that case a natural checkpoint so the durable coordinator loop can re-plan with
 /// fresh context. Soft advisory at [`CALL_BUDGET_SOFT`] (logged only); hard yield
 /// once the tally crosses [`CALL_BUDGET_HARD`].
-pub const CALL_BUDGET_SOFT: usize = 20;
+pub const CALL_BUDGET_SOFT: usize = 35;
 /// Hard per-turn cumulative tool-call budget — the turn yields (resumably) once
-/// the cumulative count crosses this. Per the TASK-357 card: soft @ 20, hard @ 30.
-pub const CALL_BUDGET_HARD: usize = 30;
+/// the cumulative count crosses this. Originally soft @ 20 / hard @ 30 (TASK-357);
+/// raised to soft @ 35 / hard @ 50 so a legitimately-wide multi-file turn has more
+/// headroom before yielding. Both remain overridable via the `AISH_CALL_BUDGET_SOFT`
+/// / `AISH_CALL_BUDGET_HARD` env vars (resolved in `engine::call_budget`).
+pub const CALL_BUDGET_HARD: usize = 50;
 
 /// What the [`CallBudgetGuard`] wants the caller to do after a round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -779,7 +782,7 @@ pub struct CallBudgetGuard {
     /// [`CALL_BUDGET_HARD`] default; `Some(n)` is an operator override (env
     /// `AISH_CALL_BUDGET_HARD`) that lets a genuinely-wide but legitimate turn —
     /// e.g. a large multi-file edit+build+test batch that cannot be split — run
-    /// past the default 30 instead of false-tripping the yield and burning the
+    /// past the default 50 instead of false-tripping the yield and burning the
     /// coordinator's auto-recovery budget.
     hard: Option<usize>,
 }
@@ -1336,10 +1339,10 @@ mod tests {
     #[test]
     fn call_budget_guard_with_budget_overrides_ceilings() {
         // Operator override: wider soft/hard than the compile-time defaults.
-        let (soft, hard) = (40usize, 60usize);
+        let (soft, hard) = (70usize, 90usize);
         let mut g = CallBudgetGuard::with_budget(soft, hard);
         // The built-in ceilings no longer apply — a round that would trip the
-        // default hard (30) is still Continue under the raised budget.
+        // default hard (50) is still Continue under the raised budget.
         assert_eq!(g.record(CALL_BUDGET_HARD + 1), CallBudgetAction::Continue);
         // Cross the raised soft cap → one SoftWarn carrying the tally.
         assert_eq!(
