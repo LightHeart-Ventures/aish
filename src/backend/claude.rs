@@ -189,6 +189,16 @@ environment or ~/.aishrc"
         }
     }
 
+    /// The subscription (OAuth) bearer token, if this credential is one — used
+    /// to detect whether a token reloaded from `~/.aishrc` actually differs from
+    /// the running one. Never logged; `None` for a metered API key.
+    fn oauth_token(&self) -> Option<&str> {
+        match &self.auth {
+            Auth::Oauth(t) => Some(t.as_str()),
+            Auth::ApiKey(_) => None,
+        }
+    }
+
     /// Add the auth header(s) for this credential to a Messages request. OAuth
     /// uses a Bearer header plus the oauth beta flag and must NOT also send
     /// `x-api-key`; a metered key uses `x-api-key`.
@@ -258,9 +268,28 @@ fn token_from_credentials_json(contents: &str, now_ms: u64) -> Option<String> {
     Some(token.to_string())
 }
 
+/// Decide whether a set of `~/.aishrc` exports reloaded after an auth failure
+/// carries a subscription (OAuth) token that DIFFERS from `current`. Returns the
+/// fresh [`Credential`] to swap in only when it resolves to a different OAuth
+/// token; `None` when it resolves to the same token, a non-OAuth credential, or
+/// nothing — so the caller surfaces the revoked-token error instead of retrying
+/// with an identical (still-revoked) token. Split out from the file IO so the
+/// token-diff policy is unit-testable without touching `$HOME`/`~/.aishrc`.
+fn reloaded_oauth_swap(current: &str, reloaded_exports: &[(String, String)]) -> Option<Credential> {
+    let fresh = Credential::resolve(reloaded_exports).ok()?;
+    match fresh.oauth_token() {
+        Some(tok) if tok != current => Some(fresh),
+        _ => None,
+    }
+}
+
 pub struct ClaudeBackend {
     client: reqwest::Client,
-    cred: Credential,
+    // Interior mutability so a revoked OAuth token can be hot-swapped for a
+    // freshly-set one from ~/.aishrc (see `try_reload_oauth_token`) without
+    // rebuilding the backend. Read on every request; written only on an
+    // auth-failure reload.
+    cred: std::sync::RwLock<Credential>,
     pub model: String,
 }
 
@@ -268,7 +297,33 @@ impl ClaudeBackend {
     /// Non-secret auth-kind label for this backend's credential
     /// ("subscription" | "api key") — surfaced in `describe()` / the statusline.
     pub fn auth_label(&self) -> &'static str {
-        self.cred.auth_label()
+        self.cred.read().unwrap().auth_label()
+    }
+
+    /// On an OAuth auth failure, try to hot-swap the running (revoked) token for
+    /// a freshly-set one from `~/.aishrc`. Returns `true` — and updates the
+    /// stored credential — ONLY when the reloaded `~/.aishrc` exports resolve to
+    /// a DIFFERENT subscription token, so the caller can retry the request once.
+    /// A matching, absent, or non-OAuth reload yields `false`, so the caller
+    /// surfaces the revoked-token error instead of looping on an identical token.
+    fn try_reload_oauth_token(&self) -> bool {
+        let current = match self.cred.read().unwrap().oauth_token() {
+            Some(t) => t.to_string(),
+            None => return false,
+        };
+        // Re-read ~/.aishrc: the user may have run `claude setup-token` and
+        // updated CLAUDE_CODE_OAUTH_TOKEN there since aish started.
+        let rc = crate::rc::load();
+        match reloaded_oauth_swap(&current, &rc.env) {
+            Some(fresh) => {
+                *self.cred.write().unwrap() = fresh;
+                eprintln!(
+                    "\x1b[2m  reloaded CLAUDE_CODE_OAUTH_TOKEN from ~/.aishrc — retrying…\x1b[0m"
+                );
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn new(model: String, cred: Credential) -> Result<Self> {
@@ -276,7 +331,7 @@ impl ClaudeBackend {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(300))
                 .build()?,
-            cred,
+            cred: std::sync::RwLock::new(cred),
             model,
         })
     }
@@ -324,7 +379,7 @@ impl ClaudeBackend {
         if let Some(last) = tool_defs.last_mut() {
             last["cache_control"] = cache_breakpoint();
         }
-        let system = cache_system(self.cred.system_value(system));
+        let system = cache_system(self.cred.read().unwrap().system_value(system));
         cache_last_message(&mut messages);
 
         let mut body = json!({
@@ -398,13 +453,19 @@ impl ClaudeBackend {
         // (capped at RATE_LIMIT_MAX_DELAY) since its window routinely exceeds
         // the exponential cap.
         let mut budget = RetryBudget::new();
+        // Guards the one-shot ~/.aishrc token reload on an OAuth auth failure, so
+        // a still-revoked reloaded token can't spin the loop.
+        let mut reload_attempted = false;
         loop {
             let req = self
                 .client
                 .post(API_URL)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json");
-            let resp = self.cred.apply(req).json(body).send().await;
+            // Clone the credential out of the lock BEFORE the await — a std
+            // RwLock guard must never be held across `.await`.
+            let cred = self.cred.read().unwrap().clone();
+            let resp = cred.apply(req).json(body).send().await;
 
             match resp {
                 Ok(r) => {
@@ -451,7 +512,19 @@ impl ClaudeBackend {
                     // Auth failures never clear on retry — surface immediately,
                     // with a token-refresh nudge for subscription (OAuth) creds.
                     if is_auth_error(status, msg) {
-                        if matches!(self.cred.auth, Auth::Oauth(_)) {
+                        let is_oauth = matches!(self.cred.read().unwrap().auth, Auth::Oauth(_));
+                        if is_oauth {
+                            // The running subscription token may have been revoked
+                            // while a freshly-minted one already sits in ~/.aishrc
+                            // (the user ran `claude setup-token` and updated it
+                            // since aish started). Reload it and retry ONCE before
+                            // surfacing the revoked-token error.
+                            if !reload_attempted {
+                                reload_attempted = true;
+                                if self.try_reload_oauth_token() {
+                                    continue;
+                                }
+                            }
                             eprint_oauth_expired_hint();
                             bail!(
                                 "claude api authentication failed ({status}): {msg} — \
@@ -522,6 +595,8 @@ ride-out budget: {msg}"
         const MAX_DELAY: Duration = Duration::from_secs(60);
         const RATE_LIMIT_MAX_DELAY: Duration = Duration::from_secs(90);
         let mut delay = Duration::from_secs(2);
+        // Guards the one-shot ~/.aishrc token reload on an OAuth auth failure.
+        let mut reload_attempted = false;
         for attempt in 0..MAX_ATTEMPTS {
             let last = attempt + 1 == MAX_ATTEMPTS;
             let req = self
@@ -530,7 +605,9 @@ ride-out budget: {msg}"
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
                 .header("accept", "text/event-stream");
-            let resp = match self.cred.apply(req).json(body).send().await {
+            // Clone the credential out of the lock BEFORE the await.
+            let cred = self.cred.read().unwrap().clone();
+            let resp = match cred.apply(req).json(body).send().await {
                 Ok(r) => r,
                 Err(e) if !last => {
                     eprintln!("\x1b[2m  network error ({e}), retrying…\x1b[0m");
@@ -585,14 +662,17 @@ ride-out budget: {msg}"
                     let m = msg.to_ascii_lowercase();
                     m.contains("invalid") || m.contains("expired") || m.contains("unauthorized")
                 });
-            if is_auth_error && matches!(self.cred.auth, Auth::Oauth(_)) && !last {
-                eprintln!("\x1b[1m\n⚠ Claude OAuth token expired\x1b[0m");
-                eprintln!(
-                    "  Your Claude Max/Pro subscription token needs to be refreshed.\n\
-  Run: \x1b[1mclaude setup-token\x1b[0m\n\
-  Then set CLAUDE_CODE_OAUTH_TOKEN in your shell or ~/.aishrc"
-                );
-                eprintln!();
+            let is_oauth = matches!(self.cred.read().unwrap().auth, Auth::Oauth(_));
+            if is_auth_error && is_oauth {
+                // A freshly-set token may already be in ~/.aishrc (the user ran
+                // `claude setup-token`). Reload it and retry once before giving up.
+                if !reload_attempted && !last {
+                    reload_attempted = true;
+                    if self.try_reload_oauth_token() {
+                        continue;
+                    }
+                }
+                eprint_oauth_expired_hint();
                 bail!(
                     "claude api authentication failed ({status}): {msg} — \
 please refresh your token with `claude setup-token`"
@@ -1648,6 +1728,36 @@ mod tests {
             m.contains("invalid") || m.contains("expired") || m.contains("unauthorized")
         };
         assert!(is_auth_error);
+    }
+
+    #[test]
+    fn reload_swaps_in_a_new_oauth_token_from_aishrc() {
+        // The user ran `claude setup-token` and updated ~/.aishrc: the reloaded
+        // exports carry a DIFFERENT token, so it is swapped in for a retry.
+        let exports = vec![(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            "sk-ant-oat-fresh".to_string(),
+        )];
+        let swapped = reloaded_oauth_swap("sk-ant-oat-stale", &exports)
+            .expect("a different reloaded token should be swapped in");
+        assert_eq!(swapped.oauth_token(), Some("sk-ant-oat-fresh"));
+    }
+
+    #[test]
+    fn reload_no_swap_when_token_unchanged() {
+        // ~/.aishrc still holds the same (revoked) token → nothing to retry with,
+        // so we surface the revoked-token error instead of looping.
+        let exports = vec![(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            "sk-ant-oat-same".to_string(),
+        )];
+        assert!(reloaded_oauth_swap("sk-ant-oat-same", &exports).is_none());
+    }
+
+    #[test]
+    fn oauth_token_accessor_matches_auth_kind() {
+        assert_eq!(oauth().oauth_token(), Some("sk-ant-oat-test"));
+        assert_eq!(api_key().oauth_token(), None);
     }
 
     #[test]
