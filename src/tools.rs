@@ -1242,6 +1242,31 @@ branch, and open a pull request (gh pr create) instead."
         return spawn_background(&program, &args, &env, session, display);
     }
 
+    // sudo / doas require a live TTY for their password prompt: they open
+    // /dev/tty directly and need to be the terminal's foreground process group
+    // to do so reliably.  The standard run_program path sets stdin=null and
+    // pipes stdout/stderr — that severs the TTY, so the password prompt either
+    // goes unnoticed or sudo fails with "no tty present".  Route these through
+    // run_on_tty instead (inherited stdin/stdout/stderr + proper tcsetpgrp
+    // hand-off), exactly as run_interactive does.  The user sees the prompt and
+    // all output in their terminal; the model gets back the exit status.
+    if matches!(bin_name(&program), "sudo" | "doas") {
+        let status = run_on_tty(&program, &args, &env, session).await?;
+        session.set_last_status(&status);
+        let b = bin_name(&program);
+        return Ok(match status.code() {
+            Some(0) => format!("[{b}: ran interactively, exit 0]"),
+            Some(code) => format!("[{b}: ran interactively, exit {code}]"),
+            None => {
+                use std::os::unix::process::ExitStatusExt;
+                match status.signal() {
+                    Some(sig) => format!("[{b}: killed by signal {sig}]"),
+                    None => format!("[{b}: exited]"),
+                }
+            }
+        });
+    }
+
     let mut child = tokio::process::Command::new(&program)
         .args(&args)
         .current_dir(&session.cwd)
