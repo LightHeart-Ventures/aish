@@ -28,7 +28,7 @@
 pub mod capture {
     use anyhow::Context as _;
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    use cpal::{FromSample, SampleFormat, SizedSample, Stream};
+    use cpal::{Sample, SampleFormat, Stream};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -57,14 +57,10 @@ pub mod capture {
         Cancelled,
         #[error("voice: no input device available")]
         NoDevice,
-        #[error("voice: failed to get device config: {0}")]
-        Config(#[from] cpal::DefaultStreamConfigError),
         #[error("voice: unsupported sample format: {0:?}")]
         UnsupportedFormat(SampleFormat),
-        #[error("voice: failed to build input stream: {0}")]
-        Build(#[from] cpal::BuildStreamError),
-        #[error("voice: failed to start stream: {0}")]
-        Play(#[from] cpal::PlayStreamError),
+        #[error("voice: audio device error: {0}")]
+        Device(#[from] cpal::Error),
         #[error("voice: stream error: {0}")]
         Stream(String),
     }
@@ -96,7 +92,7 @@ pub mod capture {
 
         let supported_config = device
             .default_input_config()
-            .map_err(CaptureError::Config)
+            .map_err(CaptureError::Device)
             .context("voice: failed to query input device config")?;
 
         let channels = supported_config.channels() as usize;
@@ -116,7 +112,7 @@ pub mod capture {
             Arc::clone(&stream_err),
         )?;
 
-        stream.play().map_err(CaptureError::Play)?;
+        stream.play().map_err(CaptureError::Device)?;
 
         // Polling loop: collect audio while waiting for the stop signal.
         // Tick every 10 ms — low enough latency for the user, cheap on CPU.
@@ -177,7 +173,7 @@ pub mod capture {
                 let err = Arc::clone(&err_flag);
                 device
                     .build_input_stream(
-                        config,
+                        *config,
                         move |data: &[$ty], _: &cpal::InputCallbackInfo| {
                             let mut guard = buf.lock().unwrap();
                             // Downmix interleaved N-channel frames to mono f32.
