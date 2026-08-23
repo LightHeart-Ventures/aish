@@ -8444,7 +8444,7 @@ async fn handle_colon(
                     println!("already on {}", backend.describe());
                 } else {
                     match crate::backend::claude::Credential::resolve(&session.env)
-                        .and_then(|cred| Backend::new_claude("claude-opus-4-9".into(), cred))
+                        .and_then(|cred| Backend::new_claude(session.batch_model.clone(), cred))
                     {
                         Ok(b) => {
                             *backend = b;
