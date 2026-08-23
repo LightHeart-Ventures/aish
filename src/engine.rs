@@ -125,6 +125,60 @@ pub async fn run_turn(
     result
 }
 
+/// Drive [`run_turn`] with the same auto-resume policy the coordinator loop
+/// uses ([`crate::coordinator::drive`]): when a round ends with a resumable stop
+/// banner (`forced-summarize` / `budget-exhausted` / `serial-chain-yield` /
+/// `call-budget-exceeded`, or a `loop-detected` nudge), fold the recovery
+/// directive into the NEXT round and keep driving, bounded by
+/// [`crate::loopguard::MAX_AUTO_RECOVERIES`]. Non-interactive callers (the
+/// headless `-p` one-shot and script execution) use this so a stop banner is
+/// never handed back RAW as the "answer" with the work abandoned mid-flight —
+/// the summarize step is followed by an actual resume, exactly as it is for a
+/// background coordinator. Returns the final answer (still a labelled partial if
+/// the recovery budget is exhausted). The interactive REPL implements the same
+/// policy inline because it must keep its per-round Ctrl-C / Shift-Tab handling.
+pub async fn run_turn_with_recovery(
+    backend: &Backend,
+    session: &mut Session,
+    input: String,
+    confirm: &mut Confirm<'_>,
+) -> Result<String> {
+    let mut next_input = input;
+    let mut auto_recoveries = 0usize;
+    loop {
+        let answer = run_turn(backend, session, next_input, confirm).await?;
+        match crate::loopguard::RoundExit::evaluate(
+            &answer,
+            auto_recoveries,
+            crate::loopguard::MAX_AUTO_RECOVERIES,
+        ) {
+            // A resumable stop → fold the recovery directive and drive again.
+            Some(exit)
+                if matches!(
+                    exit.disposition,
+                    crate::loopguard::Disposition::Resume | crate::loopguard::Disposition::Nudge
+                ) =>
+            {
+                let Some(dir) = exit.directive() else {
+                    return Ok(answer);
+                };
+                auto_recoveries += 1;
+                eprintln!(
+                    "\x1b[2maish: turn ended [{}] — {} (auto-recovery {auto_recoveries}/{})\x1b[0m",
+                    exit.reason.tag(),
+                    exit.disposition.verb(),
+                    crate::loopguard::MAX_AUTO_RECOVERIES,
+                );
+                next_input = dir;
+            }
+            // A normal answer, or a terminal stop (recoveries exhausted /
+            // flag-operator) → return what we have.
+            _ => return Ok(answer),
+        }
+    }
+}
+
+/// TASK-407 (SPR-071): repo-open auto-index handoff. When aish enters any repo
 /// TASK-407 (SPR-071): repo-open auto-index handoff. When aish enters any repo
 /// where the `codebase-memory` server is enrolled AND connected, warm its
 /// structural index ONCE per repo-open so the graph is ready before the first
@@ -921,25 +975,33 @@ async fn run_turn_inner(
             // session has NO durable goal loop to catch the yield banner and
             // resume, so a plain return would just print the advisory to the
             // prompt and the model would never act on it — the "aish got the
-            // advisory but did nothing with it" defect. For a batching
-            // opportunity, inject the advisor's directive into the one-shot
+            // advisory but did nothing with it" defect. Whenever the advisor
+            // produced a resume_directive (a BatchingOpportunity OR an Unknown
+            // pattern — both carry one), inject that directive into the one-shot
             // batch-nudge carrier (consumed by pending_batch_nudge.take() at the
             // top of the next iteration and folded into effective_system, so it is
             // BINDING, not advisory-only), RESET the serial-chain depth to grant a
-            // fresh window, and CONTINUE the turn so the model re-plans toward
-            // batching in place. A coordinator keeps the yield-and-resume path (its
-            // goal loop re-plans from the banner via recovery_guidance); a stuck
-            // pattern always yields so the operator can intervene.
+            // fresh window, and CONTINUE the turn so the model updates its
+            // behavior and re-plans in place instead of dumping the banner to the
+            // prompt and stalling. This mirrors the forced-summarize contract:
+            // aish RESUMES the work when it receives the yield, rather than
+            // handing the operator a raw stop banner. The cumulative per-turn
+            // call-budget guard is NOT reset here, so a chain that keeps refusing
+            // to batch still eventually HardYields — no infinite in-place loop. A
+            // coordinator keeps the yield-and-resume path (its goal loop re-plans
+            // from the banner via recovery_guidance); only a StuckPattern (no
+            // directive) yields to the prompt so the operator can intervene.
             if !session.nested {
-                if let (
-                    crate::advisor::YieldClassification::BatchingOpportunity,
-                    Some(directive),
-                ) = (advice.classification, advice.resume_directive.as_ref())
-                {
+                if let Some(directive) = advice.resume_directive.as_ref() {
                     pending_batch_nudge = Some(directive.clone());
                     serial_chain_guard.reset();
                     eprintln!(
-                        "\x1b[2m  → injecting batching directive into the next round (binding); re-planning in place\x1b[0m"
+                        "\x1b[2m  → {} — injecting resume directive into the next round (binding); re-planning in place\x1b[0m",
+                        match advice.classification {
+                            crate::advisor::YieldClassification::BatchingOpportunity =>
+                                "batching opportunity",
+                            _ => "unknown pattern",
+                        }
                     );
                     continue;
                 }

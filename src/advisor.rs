@@ -202,6 +202,41 @@ mod tests {
     }
 
     #[test]
+    fn resume_directive_present_iff_not_stuck() {
+        // Engine contract (src/engine.rs interactive serial-chain-yield path):
+        // aish RESUMES the turn in place whenever the advisor produced a
+        // resume_directive, and only escalates the yield banner to the operator
+        // for a StuckPattern. Lock that invariant here so a future advisor change
+        // can't silently turn a resumable yield into an operator-facing stall.
+
+        // Batching opportunity → has a directive (resumes).
+        let batching = SerialYieldAdvisor::evaluate(&[
+            (1, vec!["grep_files".to_string()], vec!["a.rs".to_string()]),
+            (2, vec!["read_file".to_string()], vec!["b.rs".to_string()]),
+            (3, vec!["edit_file".to_string()], vec!["c.rs".to_string()]),
+        ]);
+        assert_eq!(
+            batching.classification,
+            YieldClassification::BatchingOpportunity
+        );
+        assert!(batching.resume_directive.is_some());
+
+        // Unknown (empty audit) → has a directive (resumes, per the fix).
+        let unknown = SerialYieldAdvisor::evaluate(&[]);
+        assert_eq!(unknown.classification, YieldClassification::Unknown);
+        assert!(unknown.resume_directive.is_some());
+
+        // Stuck → NO directive (escalates the banner to the operator).
+        let stuck = SerialYieldAdvisor::evaluate(&[
+            (1, vec!["read_file".to_string()], vec!["x.rs".to_string()]),
+            (2, vec!["read_file".to_string()], vec!["x.rs".to_string()]),
+            (3, vec!["read_file".to_string()], vec!["x.rs".to_string()]),
+        ]);
+        assert_eq!(stuck.classification, YieldClassification::StuckPattern);
+        assert!(stuck.resume_directive.is_none());
+    }
+
+    #[test]
     fn test_mixed_pattern() {
         // 6 rounds: 4 repeated (grep) + 2 unique → still batching opportunity (67% not > 80%).
         let turns = vec![

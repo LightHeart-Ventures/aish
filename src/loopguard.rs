@@ -1113,6 +1113,43 @@ mod tests {
         assert!(flagged.directive().is_none());
     }
 
+    // The auto-resume loop the non-coordinator call sites (interactive REPL,
+    // headless `-p`, scripts) now run, matching `coordinator::drive`: a resumable
+    // stop banner drives another round with a recovery directive, bounded by
+    // MAX_AUTO_RECOVERIES; the final over-budget stop is terminal (FlagOperator).
+    // Regression guard for "aish printed the forced-summarize banner but never
+    // did the summarize→resume cycle".
+    #[test]
+    fn forced_summarize_banner_auto_resumes_until_budget_then_stops() {
+        let max = MAX_AUTO_RECOVERIES;
+        // Simulate a worker that keeps hitting the forced-summarize step every
+        // round. Count how many times the caller loop would fold a directive and
+        // drive again before it gives up and surfaces the partial to the operator.
+        let mut auto_recoveries = 0usize;
+        let mut resumes = 0usize;
+        loop {
+            let banner = ExitReason::ForcedSummarize { iterations: 45 }.banner();
+            let exit = RoundExit::evaluate(&banner, auto_recoveries, max)
+                .expect("a banner is always an abnormal stop");
+            match exit.disposition {
+                Disposition::Resume | Disposition::Nudge => {
+                    // The directive must exist for a resume/nudge, else the loop
+                    // would spin without steering.
+                    assert!(exit.directive().is_some());
+                    auto_recoveries += 1;
+                    resumes += 1;
+                }
+                // Terminal: recoveries exhausted → hand the partial back.
+                Disposition::FlagOperator => break,
+                Disposition::None => panic!("forced-summarize must never classify to None"),
+            }
+        }
+        assert_eq!(
+            resumes, max,
+            "a forced-summarize should auto-resume exactly MAX_AUTO_RECOVERIES times, then stop"
+        );
+    }
+
     // ── batch-nudge guard ─────────────────────────────────────────────────
     #[test]
     fn is_batchable_read_only_pure_inspection_tools() {

@@ -707,7 +707,9 @@ async fn main() -> Result<()> {
             session.output_json = matches!(args.output, OutputFormat::Json);
             return engine::run_coordinator(&backend, &mut session, prompt, &run_id).await;
         }
-        match engine::run_turn(&backend, &mut session, prompt, &mut repl::confirm_tty).await {
+        match engine::run_turn_with_recovery(&backend, &mut session, prompt, &mut repl::confirm_tty)
+            .await
+        {
             Ok(out) => match args.output {
                 OutputFormat::Text => println!("{}", md::render_stdout(&out)),
                 OutputFormat::Json => println!("{}", json_ok(&out)),

@@ -1119,9 +1119,25 @@ pub async fn run(
                 // signals directly via its own pgrp, so aish only gets SIGINT here
                 // when it owns the terminal — i.e. the turn itself is what to abort.
                 // No tty_handoff flag needed (TASK-116).
-                let pre_len = session.history.len();
                 let mut aborted = false;
-                let mut reply: Option<String> = None;
+                // Reset at the top of every resume round (the loop always runs
+                // once and assigns before any break, so it's read-safe after).
+                let mut reply: Option<String>;
+                // Auto-resume policy for the interactive path — mirrors
+                // coordinator::drive / engine::run_turn_with_recovery: a round that
+                // ends with a resumable stop banner (forced-summarize /
+                // budget-exhausted / serial-chain-yield / call-budget-exceeded, or
+                // a loop-detected nudge) is NOT the final answer. Fold the recovery
+                // directive and drive another round instead of printing the raw
+                // `[aish-stop …]` banner and abandoning the work. Kept inline (not
+                // via run_turn_with_recovery) so each round keeps its own Ctrl-C
+                // abort + Shift-Tab keywatch handling.
+                let mut next_input = line;
+                let mut auto_recoveries = 0usize;
+                let mut pre_len;
+                'resume: loop {
+                    reply = None;
+                    pre_len = session.history.len();
                 {
                     // Clone the attach-cursor handles up front so a mid-turn
                     // Shift-Tab can cycle the operator's view WITHOUT touching
@@ -1200,7 +1216,8 @@ pub async fn run(
                             crate::terminal::set_midturn_input(&midturn_prompt, "");
                         }
                     }
-                    let turn = engine::run_turn(&backend, &mut session, line, &mut confirm);
+                    let turn =
+                        engine::run_turn(&backend, &mut session, next_input.clone(), &mut confirm);
                     tokio::pin!(turn);
                     loop {
                         tokio::select! {
@@ -1237,10 +1254,48 @@ pub async fn run(
                     }
                     crate::terminal::clear_midturn_input();
                 }
+                    if aborted {
+                        // A half-finished turn can leave a dangling tool_use with
+                        // no tool_result — the next request would 400. Roll back
+                        // just this round and stop the resume loop.
+                        session.history.truncate(pre_len);
+                        break 'resume;
+                    }
+                    // Resumable stop banner → auto-resume the work (bounded by the
+                    // recovery cap) instead of handing back the raw banner. This is
+                    // the interactive counterpart of the coordinator's disposition
+                    // routing: forced-summarize/budget/serial-chain/call-budget →
+                    // Resume, loop-detected → Nudge; both feed a directive into the
+                    // next round. A terminal disposition (recoveries exhausted)
+                    // falls through and the banner+partial is shown to the operator.
+                    if let Some(exit) = reply.as_deref().and_then(|t| {
+                        crate::loopguard::RoundExit::evaluate(
+                            t,
+                            auto_recoveries,
+                            crate::loopguard::MAX_AUTO_RECOVERIES,
+                        )
+                    }) {
+                        if matches!(
+                            exit.disposition,
+                            crate::loopguard::Disposition::Resume
+                                | crate::loopguard::Disposition::Nudge
+                        ) {
+                            if let Some(dir) = exit.directive() {
+                                auto_recoveries += 1;
+                                eprintln!(
+                                    "\x1b[2maish: turn ended [{}] — {} (auto-recovery {auto_recoveries}/{})\x1b[0m",
+                                    exit.reason.tag(),
+                                    exit.disposition.verb(),
+                                    crate::loopguard::MAX_AUTO_RECOVERIES,
+                                );
+                                next_input = dir;
+                                continue 'resume;
+                            }
+                        }
+                    }
+                    break 'resume;
+                }
                 if aborted {
-                    // A half-finished turn can leave a dangling tool_use with no
-                    // tool_result — the next request would 400. Roll it back.
-                    session.history.truncate(pre_len);
                     println!("\x1b[33m^C\x1b[0m turn aborted");
                     // A Ctrl-C also abandons any in-flight `:loop` — the operator
                     // wanted out, not just this one iteration.
@@ -1591,23 +1646,32 @@ fn coordinator_status_message(session: &Session) -> String {
     // clock on the statusline below — in bold magenta. Blank when unnamed.
     // Append live status badges to the RIGHT of the name: 🤖 when a background
     // coordinator is still working, ⏰ when an `:alert` monitor is armed, 🎯 when
-    // a goal is active. Only shown when the session is named (there's no label
-    // to hang them off otherwise).
-    let decorated = session.name.as_ref().map(|n| {
-        let mut s = n.clone();
-        let badges = status_badges(session, &workers);
-        if !badges.is_empty() {
-            s.push(' ');
-            s.push_str(&badges);
-        }
-        s
-    });
+    // a goal is active. Badges render even when the session is UNNAMED — an armed
+    // alert (⏰) must always be visible in the statusline, not gated behind a
+    // `:rename`.
+    let decorated = decorate_name(session.name.as_deref(), &status_badges(session, &workers));
     crate::style::second_statusline_at(
         &left,
         decorated.as_deref(),
         crate::style::footer_width(),
         color_on,
     )
+}
+
+/// Combine the optional session name (`:rename`) with the live status-badge
+/// suffix into the right-justified SecondStatusLine label. Badges show even when
+/// the session is UNNAMED, so an armed `:alert` (⏰), a working coordinator (🤖),
+/// or an active goal (🎯) is always visible in the statusline — not gated behind
+/// a name. Returns `None` only when there's neither a name nor any badge (so the
+/// row stays blank). Pure — unit-testable without a live `Session`.
+fn decorate_name(name: Option<&str>, badges: &str) -> Option<String> {
+    let name = name.filter(|n| !n.is_empty());
+    match (name, badges.is_empty()) {
+        (Some(n), true) => Some(n.to_string()),
+        (Some(n), false) => Some(format!("{n} {badges}")),
+        (None, false) => Some(badges.to_string()),
+        (None, true) => None,
+    }
 }
 
 /// Compose the live status-badge suffix appended to the right of the `:rename`
@@ -8345,7 +8409,7 @@ async fn handle_colon(
         Some("model") => match parts.next() {
             Some(m) => {
                 let id = match m {
-                    "opus" => "claude-opus-4-8",
+                    "opus" => "claude-opus-4-9",
                     "sonnet" => "claude-sonnet-4-6",
                     "haiku" => "claude-haiku-4-5",
                     other => other,
@@ -8380,7 +8444,7 @@ async fn handle_colon(
                     println!("already on {}", backend.describe());
                 } else {
                     match crate::backend::claude::Credential::resolve(&session.env)
-                        .and_then(|cred| Backend::new_claude("claude-opus-4-8".into(), cred))
+                        .and_then(|cred| Backend::new_claude("claude-opus-4-9".into(), cred))
                     {
                         Ok(b) => {
                             *backend = b;
@@ -9045,7 +9109,7 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
         Some("model") => match arg {
             Some(m) => {
                 let id = match m {
-                    "opus" => "claude-opus-4-8",
+                    "opus" => "claude-opus-4-9",
                     "sonnet" => "claude-sonnet-4-6",
                     "haiku" => "claude-haiku-4-5",
                     other => other,
@@ -10392,6 +10456,20 @@ mod tests {
             recent_message_row(baseline.clone(), Some("   ".to_string())),
             baseline
         );
+    }
+
+    #[test]
+    fn decorate_name_shows_badges_even_when_unnamed() {
+        // Named session + badges → "name <badges>".
+        assert_eq!(decorate_name(Some("proj"), "⏰"), Some("proj ⏰".to_string()));
+        // Named, no badges → just the name.
+        assert_eq!(decorate_name(Some("proj"), ""), Some("proj".to_string()));
+        // UNNAMED but an alert is armed → the ⏰ badge still shows (the fix).
+        assert_eq!(decorate_name(None, "⏰"), Some("⏰".to_string()));
+        assert_eq!(decorate_name(Some(""), "🤖 ⏰"), Some("🤖 ⏰".to_string()));
+        // Neither name nor badge → blank row.
+        assert_eq!(decorate_name(None, ""), None);
+        assert_eq!(decorate_name(Some(""), ""), None);
     }
 
     #[test]
