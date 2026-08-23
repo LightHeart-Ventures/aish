@@ -75,6 +75,10 @@ mod webhook;
 mod worker;
 mod worker_store;
 mod workers_modal;
+// FR-334 / SPR-068 voice input pipeline — compiled only when `--features voice`.
+// Default and CI builds (`--no-default-features --locked`) never see this file.
+#[cfg(feature = "voice")]
+mod voice;
 
 use anyhow::Result;
 use clap::Parser;
