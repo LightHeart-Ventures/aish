@@ -499,7 +499,7 @@ pub mod capture {
                 let found = host
                     .input_devices()
                     .map_err(CaptureError::Device)?
-                    .find(|d| d.name().map(|n| n == name).unwrap_or(false));
+                    .find(|d| d.to_string() == name);
 
                 if found.is_none() {
                     eprintln!(
@@ -1288,7 +1288,7 @@ pub mod model {
             let tty = is_stderr_tty();
             let mut downloaded: u64 = 0;
             let mut last_print = Instant::now();
-            let mut resp = resp;
+            let resp = resp;
 
             use futures_util::StreamExt as _;
             let mut stream = resp.bytes_stream();
