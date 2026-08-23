@@ -405,17 +405,188 @@ pub mod resample {
 }
 
 // ---------------------------------------------------------------------------
-// TASK-364 stub: whisper-rs transcription  (filled in by the TASK-364 PR)
+// TASK-364: whisper-rs speech-to-text transcription
 // ---------------------------------------------------------------------------
 
-/// Local STT via whisper-rs.
+/// Local speech-to-text via whisper-rs.
 ///
 /// Contract (frozen by SPR-068 design doc):
 /// ```text
-/// stt::Transcriber::new(model_path) -> Self
-/// stt::Transcriber::transcribe(&[f32]) -> Result<String>
+/// stt::Transcriber::new(model_path) -> Self         // infallible; model loaded lazily
+/// stt::Transcriber::transcribe(&[f32]) -> Result<String>  // 16 kHz mono f32 PCM in
 /// ```
-pub mod stt {}
+///
+/// The [`WhisperContext`][whisper_rs::WhisperContext] is created on the **first** call to
+/// [`Transcriber::transcribe`] and reused for all subsequent calls, amortising the
+/// (expensive) model-load cost.
+pub mod stt {
+    use anyhow::Context as _;
+    use std::path::{Path, PathBuf};
+    use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
+    // -----------------------------------------------------------------------
+    // Error type
+    // -----------------------------------------------------------------------
+
+    /// Errors specific to the STT module.
+    #[derive(Debug, thiserror::Error)]
+    pub enum SttError {
+        /// The ggml model file could not be loaded by whisper-rs.
+        #[error("voice: failed to load Whisper model from {path}: {source}")]
+        ModelLoad {
+            path: PathBuf,
+            source: whisper_rs::WhisperError,
+        },
+        /// An error occurred while creating the Whisper inference state.
+        #[error("voice: failed to create Whisper state: {0}")]
+        StateCreate(whisper_rs::WhisperError),
+        /// Whisper's `full()` inference call returned an error.
+        #[error("voice: Whisper inference failed: {0}")]
+        Inference(whisper_rs::WhisperError),
+    }
+
+    // -----------------------------------------------------------------------
+    // Public API
+    // -----------------------------------------------------------------------
+
+    /// Local STT engine backed by whisper-rs.
+    ///
+    /// # Lifecycle
+    /// 1. Call [`Self::new`] with the path to a ggml Whisper model file.
+    ///    Construction is **infallible** — the model is not touched yet.
+    /// 2. Call [`Self::transcribe`] with 16 kHz mono f32 PCM.  On the first
+    ///    call the model is loaded from disk; subsequent calls reuse the
+    ///    already-loaded context (lazy-initialisation, reused).
+    pub struct Transcriber {
+        model_path: PathBuf,
+        /// The context is `None` until the first call to `transcribe`.
+        ctx: Option<WhisperContext>,
+    }
+
+    impl Transcriber {
+        /// Create a new `Transcriber` that will use the model at `model_path`.
+        ///
+        /// The model file is **not** opened here; loading is deferred to the
+        /// first call to [`Self::transcribe`].
+        pub fn new(model_path: impl AsRef<Path>) -> Self {
+            Self {
+                model_path: model_path.as_ref().to_owned(),
+                ctx: None,
+            }
+        }
+
+        /// Transcribe `pcm` (16 kHz, mono, f32) and return the text.
+        ///
+        /// On the **first** call the Whisper model is loaded from disk (may
+        /// take several seconds depending on model size and storage speed).
+        /// Subsequent calls reuse the already-loaded [`WhisperContext`][whisper_rs::WhisperContext].
+        ///
+        /// # Returns
+        /// - `Ok(text)` — the trimmed transcript; may be empty if no speech
+        ///   was detected (e.g. silence-only input).
+        /// - `Err(_)` — model load, state creation, or inference failure.
+        ///   The caller (TASK-367 REPL wiring) must show a single-line error
+        ///   above the prompt and return to Idle without touching the buffer.
+        pub fn transcribe(&mut self, pcm: &[f32]) -> anyhow::Result<String> {
+            // --- Lazy-load the WhisperContext on first use -------------------
+            if self.ctx.is_none() {
+                let ctx =
+                    WhisperContext::new_with_params(&self.model_path, WhisperContextParameters::new())
+                        .map_err(|source| SttError::ModelLoad {
+                            path: self.model_path.clone(),
+                            source,
+                        })
+                        .context("voice: failed to initialise Whisper context")?;
+                self.ctx = Some(ctx);
+            }
+
+            // --- Create per-call inference state ----------------------------
+            // WhisperContext is not Send/Sync, so the state is local to this call.
+            let ctx = self.ctx.as_ref().unwrap();
+            let mut state = ctx
+                .create_state()
+                .map_err(SttError::StateCreate)
+                .context("voice: failed to create Whisper state")?;
+
+            // --- Build inference parameters ---------------------------------
+            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+            // Hint the decoder to English to avoid spurious language-detection latency.
+            params.set_language(Some("en"));
+            // Suppress internal stderr chatter that would pollute the REPL.
+            params.set_print_special(false);
+            params.set_print_progress(false);
+            params.set_print_realtime(false);
+            params.set_print_timestamps(false);
+
+            // --- Run inference ----------------------------------------------
+            state
+                .full(params, pcm)
+                .map_err(SttError::Inference)
+                .context("voice: Whisper inference failed")?;
+
+            // --- Collect segment text ---------------------------------------
+            let n = state.full_n_segments();
+            let mut out = String::new();
+            for i in 0..n {
+                if let Some(seg) = state.get_segment(i) {
+                    match seg.to_str() {
+                        Ok(text) => out.push_str(text),
+                        Err(e) => {
+                            // Log and skip — a single bad segment should not
+                            // abort the whole transcript.
+                            tracing::warn!("voice: stt segment {i} text error: {e}");
+                        }
+                    }
+                }
+            }
+
+            // Trim leading/trailing whitespace that Whisper commonly adds.
+            Ok(out.trim().to_owned())
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests
+    // -----------------------------------------------------------------------
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `new` must be infallible — even a non-existent path is accepted at
+        /// construction time; the error surfaces on `transcribe`.
+        #[test]
+        fn new_does_not_load_model() {
+            let t = Transcriber::new("/nonexistent/ggml-tiny.en.bin");
+            assert!(t.ctx.is_none(), "context must not be loaded at construction");
+        }
+
+        /// `transcribe` must return an error (not panic) when the model file
+        /// does not exist.
+        #[test]
+        fn transcribe_returns_err_on_missing_model() {
+            let mut t = Transcriber::new("/nonexistent/ggml-tiny.en.bin");
+            let result = t.transcribe(&[0.0f32; 16_000]);
+            assert!(result.is_err(), "expected Err for missing model");
+            let msg = result.unwrap_err().to_string();
+            // The error chain should mention voice: somewhere.
+            assert!(
+                msg.contains("voice:"),
+                "error message should contain 'voice:'; got: {msg}"
+            );
+        }
+
+        /// `transcribe` must still return an error on the *second* call if the
+        /// model could not be loaded on the first (ctx remains None).
+        #[test]
+        fn transcribe_retries_load_on_subsequent_calls() {
+            let mut t = Transcriber::new("/nonexistent/ggml-tiny.en.bin");
+            // Both calls should return Err (not panic, not succeed).
+            assert!(t.transcribe(&[0.0f32; 16_000]).is_err());
+            assert!(t.ctx.is_none(), "ctx should remain None after failed load");
+            assert!(t.transcribe(&[0.0f32; 16_000]).is_err());
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // TASK-365: ggml Whisper model download and cache management
