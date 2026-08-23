@@ -1,6 +1,6 @@
 # SPR-068 — Voice Input Design Decisions (finalized)
 
-**Status:** Decided (2026-08) · **Supersedes open questions in** `docs/design/voice-input.md` §5
+**Status:** Core implementation complete (2026-08-23) · In-progress: TASK-366–368 · **Supersedes open questions in** `docs/design/voice-input.md` §5
 **Tracking:** FR-334 · SPR-068 · TASK-360 · **Feature flag:** `voice` (off by default)
 **Prior art:** FR-334 survey/design (PR #567, merged) · feature-gate scaffolding (TASK-361, PR #721, merged)
 
@@ -81,14 +81,14 @@ line buffer splice (no submit)
 
 Frozen contract for downstream tasks:
 
-| Symbol | Owner task | Signature (contract) |
-|--------|-----------|----------------------|
-| `capture::record_until_stop(stop: StopSignal) -> Result<Vec<f32>>` | TASK-362 | mono f32 @ device rate |
-| `resample::to_whisper_pcm(&[f32], src_rate: u32) -> Result<Vec<f32>>` | TASK-363 | f32 @ 16 kHz mono |
-| `stt::Transcriber::new(model_path) / .transcribe(&[f32]) -> Result<String>` | TASK-364 | lazy `WhisperContext`, reused |
-| `model::ensure_model(name) -> Result<PathBuf>` | TASK-365 | resolve/download/verify into cache |
-| `ReadOutcome::Voice` + `Ctrl-G` bind | TASK-366 | editor seam (see survey §3) |
-| repl `Voice` arm: capture→resample→transcribe→insert | TASK-367 | `spawn_blocking` for whisper |
+| Symbol | Owner task | Signature (contract) | Status |
+|--------|-----------|----------------------|--------|
+| `capture::record_until_stop(stop: StopSignal) -> Result<Vec<f32>>` | TASK-362 | mono f32 @ device rate | ✅ PR #748 + #749 |
+| `resample::to_whisper_pcm(&[f32], src_rate: u32) -> Result<Vec<f32>>` | TASK-363 | f32 @ 16 kHz mono | ✅ PR #750 |
+| `stt::Transcriber::new(model_path) / .transcribe(&[f32]) -> Result<String>` | TASK-364 | lazy `WhisperContext`, reused | ✅ PR #751 |
+| `model::ensure_model(name) -> Result<PathBuf>` | TASK-365 | resolve/download/verify into cache | ✅ Merged (commit 9ac5edf) |
+| `ReadOutcome::Voice` + `Ctrl-G` bind | TASK-366 | editor seam (see survey §3) | ⏳ In progress |
+| repl `Voice` arm: capture→resample→transcribe→insert | TASK-367 | `spawn_blocking` for whisper | ⏳ Blocked by 366 |
 
 All symbols live in `src/voice.rs` behind `#[cfg(feature = "voice")]`; the
 default/CI build (`--no-default-features --locked`) never compiles them.
@@ -128,11 +128,18 @@ uses the default (never fails the prompt).
 
 ## 6. Downstream gating
 
-This doc is the contract for the remaining SPR-068 tasks:
+## 7. Implementation progress
 
-- **TASK-362** cpal capture · **TASK-363** rubato resample · **TASK-364** whisper-rs STT ·
-  **TASK-365** model fetch → all in `src/voice.rs` (one module, one owner to avoid collisions).
-- **TASK-366** editor seam (`ReadOutcome::Voice` + `Ctrl-G`) · **TASK-367** repl wiring (depends on 362–366).
-- **TASK-368** config keys + degradation (§4/§5) · **TASK-369** docs + CI feature-build check.
+✅ **Complete** (all merged to main):
+- **TASK-362** cpal capture (PR #748, #749)
+- **TASK-363** rubato resample (PR #750)
+- **TASK-364** whisper-rs STT (PR #751)
+- **TASK-365** model fetch (commit 9ac5edf)
+- **TASK-369** docs + CI feature-build check (PR #725, already merged)
+
+⏳ **In progress**:
+- **TASK-366** editor seam (`ReadOutcome::Voice` + `Ctrl-G`) — rustyline integration
+- **TASK-367** repl wiring (capture→resample→transcribe→insert; `spawn_blocking` for whisper) — depends on 366
+- **TASK-368** config keys + graceful degradation (§4/§5)
 
 Out of scope (unchanged from survey §6): TTS, wake-word, voice control of `:` commands.
