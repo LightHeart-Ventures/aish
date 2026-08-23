@@ -150,6 +150,34 @@ pub mod capture {
     }
 
     // -----------------------------------------------------------------------
+    // Public API — supplemental (TASK-367)
+    // -----------------------------------------------------------------------
+
+    /// Query the native sample rate of the default input device.
+    ///
+    /// Used by the REPL wiring (TASK-367) to pass `src_rate` to
+    /// [`super::resample::to_whisper_pcm`].  Calls into `cpal` to inspect the
+    /// default device config without opening a stream, so it is cheap to call
+    /// before `record_until_stop`.
+    ///
+    /// # Errors
+    /// Returns an error if there is no default input device or querying its
+    /// configuration fails.
+    pub fn default_sample_rate() -> anyhow::Result<u32> {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .ok_or(CaptureError::NoDevice)
+            .context("voice: no input device")?;
+        let config = device
+            .default_input_config()
+            .map_err(CaptureError::Device)
+            .context("voice: failed to query device config")?;
+        Ok(config.sample_rate().0)
+    }
+
+    // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
 

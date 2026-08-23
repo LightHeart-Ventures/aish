@@ -1344,10 +1344,209 @@ pub async fn run(
                 continue;
             }
             ReadOutcome::Voice => {
-                // Ctrl-G: voice dictation requested (feature = "voice"). TASK-367
-                // wires the full capture → transcribe → insert pipeline here; for
-                // now the seam is present and the loop simply continues to the next
-                // prompt, which is the correct fallback on non-voice builds too.
+                // Ctrl-G: voice dictation — capture → resample → transcribe → insert.
+                // Gated behind `#[cfg(feature = "voice")]`; the non-voice path is a
+                // no-op continue (buffer untouched) so `--no-default-features` builds
+                // compile and behave identically to before.
+                #[cfg(feature = "voice")]
+                {
+                    use crate::voice::{capture, model, resample, stt};
+                    use crossterm::event::{Event, KeyCode, KeyModifiers};
+                    use std::io::Write as _;
+
+                    // Hard-coded silence-timeout; TASK-368 will wire this to the
+                    // `voice.silence_ms` config key (default 2 000 ms per SPR-068 §5).
+                    const VOICE_SILENCE_MS: u64 = 2_000;
+
+                    // --- Step 1: show the recording indicator. ----------------
+                    eprint!("\r\x1b[2m🎤 listening…  Ctrl-G: stop  Esc: cancel\x1b[0m\x1b[K");
+                    let _ = std::io::stderr().flush();
+
+                    // --- Step 2: query device rate (needed for resample). -----
+                    let src_rate = match capture::default_sample_rate() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprint!("\r\x1b[K");
+                            let _ = std::io::stderr().flush();
+                            eprintln!("voice: {e:#}");
+                            continue;
+                        }
+                    };
+
+                    // --- Step 3: create the stop channel. ---------------------
+                    let (stop_tx, stop_rx) =
+                        tokio::sync::oneshot::channel::<capture::StopAction>();
+
+                    // --- Step 4: start audio capture on a blocking thread. ----
+                    let capture_handle = tokio::task::spawn_blocking(move || {
+                        capture::record_until_stop(stop_rx)
+                    });
+
+                    // --- Step 5: read the stop key on a blocking thread. ------
+                    // Waits for Ctrl-G (stop) or Esc (cancel).  If the timeout
+                    // fires first (step 6) this thread remains alive until the
+                    // user presses any key — an acceptable v1 trade-off; a
+                    // future revision can use crossterm::event::poll to make the
+                    // key-reader interruptible.
+                    let key_handle =
+                        tokio::task::spawn_blocking(|| -> anyhow::Result<capture::StopAction> {
+                            crossterm::terminal::enable_raw_mode()?;
+                            let action = loop {
+                                match crossterm::event::read()? {
+                                    Event::Key(e)
+                                        if e.code == KeyCode::Char('g')
+                                            && e.modifiers
+                                                .contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        break capture::StopAction::Stop;
+                                    }
+                                    Event::Key(e) if e.code == KeyCode::Esc => {
+                                        break capture::StopAction::Cancel;
+                                    }
+                                    _ => continue,
+                                }
+                            };
+                            let _ = crossterm::terminal::disable_raw_mode();
+                            Ok(action)
+                        });
+
+                    // --- Step 6: race key vs silence-timeout. -----------------
+                    let stop_action = tokio::select! {
+                        res = key_handle => {
+                            res.unwrap_or_else(|e| {
+                                tracing::warn!("voice: key reader task panicked: {e}");
+                                Ok(capture::StopAction::Cancel)
+                            })
+                            .unwrap_or(capture::StopAction::Cancel)
+                        }
+                        _ = tokio::time::sleep(
+                            std::time::Duration::from_millis(VOICE_SILENCE_MS)
+                        ) => {
+                            capture::StopAction::Stop
+                        }
+                    };
+
+                    // Ensure raw mode is cleaned up regardless of which branch won.
+                    let _ = crossterm::terminal::disable_raw_mode();
+
+                    // --- Step 7: send the stop signal, clear indicator. -------
+                    let _ = stop_tx.send(stop_action);
+                    eprint!("\r\x1b[K");
+                    let _ = std::io::stderr().flush();
+
+                    // --- Step 8: user cancelled → drop capture, re-prompt. ---
+                    if stop_action == capture::StopAction::Cancel {
+                        drop(capture_handle);
+                        continue;
+                    }
+
+                    // --- Step 9: await capture result. ------------------------
+                    let samples = match capture_handle.await {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            use capture::CaptureError;
+                            if e.downcast_ref::<CaptureError>()
+                                .map_or(false, |ce| matches!(ce, CaptureError::Cancelled))
+                            {
+                                continue; // clean cancel via channel
+                            }
+                            eprintln!("voice: {e:#}");
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("voice: capture task panicked: {e}");
+                            continue;
+                        }
+                    };
+
+                    // --- Step 10: show transcription spinner. -----------------
+                    eprint!("\r\x1b[2m⌛ transcribing…\x1b[0m\x1b[K");
+                    let _ = std::io::stderr().flush();
+
+                    // --- Step 11: await model download (fast when cached). ----
+                    let model_path = match model::ensure_model("tiny.en").await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprint!("\r\x1b[K");
+                            let _ = std::io::stderr().flush();
+                            eprintln!("voice: {e:#}");
+                            continue;
+                        }
+                    };
+
+                    // --- Step 12: resample + transcribe in spawn_blocking. ----
+                    // Both are CPU-bound; running on the blocking thread pool
+                    // keeps the tokio worker thread free for other I/O.
+                    let transcript_result =
+                        tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                            let pcm = resample::to_whisper_pcm(&samples, src_rate)?;
+                            if pcm.is_empty() {
+                                return Ok(String::new());
+                            }
+                            let mut t = stt::Transcriber::new(&model_path);
+                            t.transcribe(&pcm)
+                        })
+                        .await;
+
+                    eprint!("\r\x1b[K");
+                    let _ = std::io::stderr().flush();
+
+                    // --- Step 13: extract transcript text. -------------------
+                    let text = match transcript_result {
+                        Ok(Ok(t)) => t.trim().to_string(),
+                        Ok(Err(e)) => {
+                            eprintln!("voice: {e:#}");
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("voice: transcribe task panicked: {e}");
+                            continue;
+                        }
+                    };
+
+                    if text.is_empty() {
+                        // Silence-only capture — no-op hint, back to Idle.
+                        eprintln!("\x1b[2mvoice: (no speech detected)\x1b[0m");
+                        continue;
+                    }
+
+                    // --- Step 14: insert into line buffer via read_line_with_initial.
+                    // The user sees the transcript pre-filled in the prompt, can
+                    // edit it, and presses Enter to dispatch.  Never auto-submits
+                    // (design decision D3 from SPR-068 design doc).
+                    let voice_outcome = editor.read_line_with_initial(&prompt, &text);
+                    match voice_outcome {
+                        ReadOutcome::Line(line) => {
+                            let line = line.trim().to_string();
+                            if !line.is_empty() {
+                                // Route through the normal dispatch path (history,
+                                // routing, AI turn) exactly as if typed.
+                                injected = Some(line);
+                            }
+                        }
+                        ReadOutcome::Voice => {
+                            // Ctrl-G pressed while editing the pre-filled transcript
+                            // — discard the pre-fill and loop; the outer Voice arm
+                            // will fire again on the next iteration.
+                        }
+                        ReadOutcome::Interrupted => {
+                            // Ctrl-C while editing — cancel; buffer untouched.
+                        }
+                        ReadOutcome::CtrlO => toggle_raw_output(&mut session),
+                        ReadOutcome::ShiftTab => {
+                            if cycle_worker(&mut session) {
+                                needs_gap = true;
+                            }
+                        }
+                        ReadOutcome::Eof => break,
+                        ReadOutcome::Error(e) => eprintln!("aish: readline error: {e}"),
+                    }
+                    continue;
+                }
+                // Non-voice builds: Voice is a no-op (Ctrl-G is unbound, so
+                // this arm is nominally unreachable, but the enum variant must
+                // still be present for exhaustiveness).
+                #[cfg(not(feature = "voice"))]
                 continue;
             }
             ReadOutcome::Interrupted => {
