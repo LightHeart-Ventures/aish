@@ -254,7 +254,7 @@ pub mod capture {
 }
 
 // ---------------------------------------------------------------------------
-// TASK-363 stub: rubato resampler  (filled in by the TASK-363 PR)
+// TASK-363: rubato resampler — device-rate mono f32 → 16 kHz mono f32
 // ---------------------------------------------------------------------------
 
 /// Resampler: converts device-rate mono f32 PCM → 16 kHz mono f32 for Whisper.
@@ -263,7 +263,146 @@ pub mod capture {
 /// ```text
 /// resample::to_whisper_pcm(&[f32], src_rate: u32) -> Result<Vec<f32>>
 /// ```
-pub mod resample {}
+pub mod resample {
+    use anyhow::Context as _;
+    use rubato::audioadapter_buffers::owned::InterleavedOwned;
+    use rubato::{Fft, FixedSync, Resampler};
+
+    // -----------------------------------------------------------------------
+    // Public constants
+    // -----------------------------------------------------------------------
+
+    /// Sample rate expected by whisper-rs (16 kHz).
+    pub const WHISPER_RATE: u32 = 16_000;
+
+    // -----------------------------------------------------------------------
+    // Public API (contract from SPR-068 design doc)
+    // -----------------------------------------------------------------------
+
+    /// Resample a mono f32 PCM buffer to 16 kHz for Whisper.
+    ///
+    /// # Arguments
+    /// - `samples` — mono f32 PCM at `src_rate` Hz (output of
+    ///   `capture::record_until_stop`).
+    /// - `src_rate` — the sample rate of `samples` (the device's native rate,
+    ///   as reported by `cpal::StreamConfig::sample_rate`).
+    ///
+    /// # Returns
+    /// Mono f32 PCM at 16 kHz, ready to pass to `stt::Transcriber::transcribe`.
+    /// If `src_rate` is already `WHISPER_RATE` (16 000 Hz) the buffer is returned
+    /// as-is (cloned but not re-processed) so the path is zero-cost on devices
+    /// that already capture at 16 kHz.
+    ///
+    /// # Errors
+    /// Returns an error if the FFT resampler cannot be constructed (only possible
+    /// for nonsensical rates like 0) or if the resampling itself fails (should not
+    /// happen for valid mono f32 input).
+    ///
+    /// # Threading
+    /// This function is CPU-bound and blocking.  Run it inside
+    /// `tokio::task::spawn_blocking` (the REPL wiring in TASK-367 does this).
+    pub fn to_whisper_pcm(samples: &[f32], src_rate: u32) -> anyhow::Result<Vec<f32>> {
+        // Nothing to do for an empty capture (e.g. silence-timeout triggered
+        // immediately).  Return early so the resampler constructor never sees
+        // a zero-length buffer.
+        if samples.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Fast path: no conversion needed if the device already captures at 16 kHz.
+        if src_rate == WHISPER_RATE {
+            return Ok(samples.to_vec());
+        }
+
+        // Wrap the mono input in the interleaved-owned adapter that rubato's
+        // process_all() expects.  `channels = 1`, `frames = samples.len()`.
+        let input_buf = InterleavedOwned::new_from(samples.to_vec(), 1, samples.len())
+            .context("voice: failed to wrap capture buffer for resampling")?;
+
+        // FFT synchronous resampler: good quality, fast on CPU.
+        // chunk_size=1024 keeps the anti-aliasing delay low; process_all() handles
+        // the whole clip in one call so the chunk boundary details are invisible
+        // to the caller.
+        let mut resampler =
+            Fft::<f32>::new(src_rate as usize, WHISPER_RATE as usize, 1024, 1, FixedSync::Both)
+                .context("voice: failed to create FFT resampler")?;
+
+        let resampled = resampler
+            .process_all(&input_buf, samples.len(), None)
+            .context("voice: resampling failed")?;
+
+        // process_all() allocates an InterleavedOwned<f32>.  For mono (1 channel)
+        // the interleaved flat Vec<f32> *is* the mono PCM — no de-interleaving needed.
+        Ok(resampled.take_data())
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests
+    // -----------------------------------------------------------------------
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn passthrough_when_already_16k() {
+            // Exact passthrough: no rubato involved.
+            let samples: Vec<f32> = (0..64).map(|i| i as f32 * 0.01).collect();
+            let result = to_whisper_pcm(&samples, 16_000).unwrap();
+            assert_eq!(result, samples, "16 kHz input should be returned unchanged");
+        }
+
+        #[test]
+        fn empty_input_returns_empty() {
+            // Should not try to construct a resampler with zero frames.
+            let result = to_whisper_pcm(&[], 44_100).unwrap();
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn output_length_approx_for_44100_to_16000() {
+            // One second of 44.1 kHz silence → expect ~16 000 output frames.
+            let samples = vec![0.0f32; 44_100];
+            let result = to_whisper_pcm(&samples, 44_100).unwrap();
+            let expected: usize = 16_000;
+            // Allow ±1 % tolerance to cover resampler delay / rounding.
+            let tolerance = expected / 100 + 10;
+            assert!(
+                result.len().abs_diff(expected) <= tolerance,
+                "expected ~{expected} output frames for 44.1→16 kHz, got {}",
+                result.len()
+            );
+        }
+
+        #[test]
+        fn output_length_approx_for_48000_to_16000() {
+            // One second of 48 kHz silence → expect ~16 000 output frames.
+            let samples = vec![0.0f32; 48_000];
+            let result = to_whisper_pcm(&samples, 48_000).unwrap();
+            let expected: usize = 16_000;
+            let tolerance = expected / 100 + 10;
+            assert!(
+                result.len().abs_diff(expected) <= tolerance,
+                "expected ~{expected} output frames for 48→16 kHz, got {}",
+                result.len()
+            );
+        }
+
+        #[test]
+        fn output_is_correct_ratio_for_22050_to_16000() {
+            // ~0.5 second at 22.05 kHz → expect ~half a second at 16 kHz.
+            let samples = vec![0.0f32; 22_050];
+            let result = to_whisper_pcm(&samples, 22_050).unwrap();
+            let expected: usize = 16_000;
+            let tolerance = expected / 100 + 50;
+            assert!(
+                result.len().abs_diff(expected) <= tolerance,
+                "expected ~{expected} output frames for 22.05→16 kHz, got {}",
+                result.len()
+            );
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // TASK-364 stub: whisper-rs transcription  (filled in by the TASK-364 PR)
