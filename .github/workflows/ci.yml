@@ -37,12 +37,30 @@ jobs:
       # pipeline/direct-dispatch path against real bash; bash ships on the
       # runner. Test builds must NOT pull in mistralrs-core unless a job
       # explicitly opts back in with `--features local`.
+      - name: Probe runner environment
+        run: |
+          rustc --version && cargo --version
+          rustup show || true
+          echo "CPU cores:" && nproc
+          echo "Memory:" && free -h
+          echo "Disk:" && df -h
+          echo "Env (relevant):" && env | grep -E "CARGO|RUST" | sort || true
+
       - name: Test
-        run: cargo test --no-default-features --locked
+        run: |
+          set -o pipefail
+          cargo test --no-default-features --locked --verbose -j 1 -- --nocapture 2>&1 | tee test-output.log
+
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output
+          path: test-output.log
 
       # SPR-059 webhook broker client (TASK-264/265/268). Hermetic tests build
       # with --no-default-features against the in-crate MockTransport (drops the
       # tokio-tungstenite `net` transport). Gated explicitly so the crate can't
       # silently rot outside the root package's test surface.
       - name: Test webhook client (SPR-059)
-        run: cargo test -p aish-webhook-client --no-default-features --locked
+        run: cargo test -p aish-webhook-client --no-default-features --locked -j 1 -- --nocapture
