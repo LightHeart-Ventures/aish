@@ -174,7 +174,7 @@ pub mod capture {
             .default_input_config()
             .map_err(CaptureError::Device)
             .context("voice: failed to query device config")?;
-        Ok(config.sample_rate().0)
+        Ok(config.sample_rate())
     }
 
     // -----------------------------------------------------------------------
@@ -860,7 +860,7 @@ pub mod model {
             let tty = is_stderr_tty();
             let mut downloaded: u64 = 0;
             let mut last_print = Instant::now();
-            let mut resp = resp;
+            let resp = resp;
 
             use futures_util::StreamExt as _;
             let mut stream = resp.bytes_stream();
