@@ -1,16 +1,357 @@
-//! FR-334 / SPR-068 – voice input pipeline (TASK-362–367).
+//! FR-334 / SPR-068 – voice input pipeline (TASK-362–368).
 //!
 //! All symbols here are gated behind the `voice` feature.  The default build
 //! (`--no-default-features --locked`, the CI gate) never compiles this file.
 //!
 //! Module layout (one owner per submodule to avoid merge collisions):
 //!
-//! | Submodule | Owner task | Responsibility                          |
-//! |-----------|------------|-----------------------------------------|
-//! | `capture` | TASK-362   | cpal audio capture → mono f32 samples   |
-//! | `resample`| TASK-363   | rubato resampler → 16 kHz for Whisper   |
-//! | `stt`     | TASK-364   | whisper-rs transcription                |
-//! | `model`   | TASK-365   | model download / checksum verification  |
+//! | Submodule | Owner task | Responsibility                              |
+//! |-----------|------------|---------------------------------------------|
+//! | `config`  | TASK-368   | `VoiceConfig` — keys + graceful degradation |
+//! | `capture` | TASK-362   | cpal audio capture → mono f32 samples       |
+//! | `resample`| TASK-363   | rubato resampler → 16 kHz for Whisper       |
+//! | `stt`     | TASK-364   | whisper-rs transcription                    |
+//! | `model`   | TASK-365   | model download / checksum verification      |
+
+// ---------------------------------------------------------------------------
+// TASK-368: voice configuration keys + graceful-degradation wiring
+// ---------------------------------------------------------------------------
+
+/// Voice configuration loaded from `~/.aish/config`.
+///
+/// This module is intentionally dependency-free (no cpal, no whisper-rs) so
+/// it is easy to unit-test.  All keys are namespaced `voice.*`.
+///
+/// # Configuration file format
+///
+/// The file is a simple `key = value` text file (one entry per line).
+/// Lines starting with `#` and blank lines are ignored.
+/// Spaces around `=` are optional.
+/// Non-`voice.*` keys are silently ignored so the file can hold other aish
+/// settings as well.
+///
+/// | Key                | Default    | Meaning                                              |
+/// |--------------------|------------|------------------------------------------------------|
+/// | `voice.model`      | `tiny.en`  | ggml model name (see `model::default_model_path`)    |
+/// | `voice.device`     | *(system)* | cpal input-device name; empty → system default       |
+/// | `voice.language`   | `en`       | Whisper language hint passed to `params.set_language`|
+/// | `voice.autosubmit` | `false`    | If `true`, press Enter automatically after insert    |
+/// | `voice.silence_ms` | `2000`     | Silence-timeout (ms) that auto-stops Recording       |
+pub mod config {
+    use std::path::PathBuf;
+
+    /// Runtime configuration for the voice dictation pipeline.
+    ///
+    /// Construct via [`VoiceConfig::load`] (reads `~/.aish/config`) or
+    /// [`VoiceConfig::default`] (all defaults, no I/O).
+    ///
+    /// All fields are `pub` so callers can override individual keys after
+    /// loading, e.g. `cfg.autosubmit = true` for tests.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct VoiceConfig {
+        /// ggml model name, e.g. `"tiny.en"` or `"base.en"`.
+        pub model: String,
+        /// cpal input-device name, or `None` for the system default.
+        pub device: Option<String>,
+        /// Whisper language code, e.g. `"en"`.
+        pub language: String,
+        /// If `true`, press Enter automatically after inserting the
+        /// transcript.
+        pub autosubmit: bool,
+        /// Silence-timeout in milliseconds; recording stops when this
+        /// elapses without audio above the noise floor.
+        pub silence_ms: u64,
+    }
+
+    impl Default for VoiceConfig {
+        fn default() -> Self {
+            Self {
+                model: "tiny.en".to_string(),
+                device: None,
+                language: "en".to_string(),
+                autosubmit: false,
+                silence_ms: 2_000,
+            }
+        }
+    }
+
+    impl VoiceConfig {
+        /// Load voice configuration from `~/.aish/config`.
+        ///
+        /// If the file is absent or unreadable all defaults are used.
+        /// Malformed values emit a `voice: warning:` line on stderr and fall
+        /// back to the documented default — this function never fails.
+        pub fn load() -> Self {
+            Self::load_from_path(&aish_config_path())
+        }
+
+        /// Same as [`load`] but reads from an explicit `path` — useful for
+        /// unit tests that need an isolated config file.
+        pub(crate) fn load_from_path(path: &std::path::Path) -> Self {
+            match std::fs::read_to_string(path) {
+                Ok(text) => Self::parse(&text),
+                Err(_) => Self::default(),
+            }
+        }
+
+        /// Parse a `key = value` config file text and return a `VoiceConfig`.
+        ///
+        /// Only `voice.*` keys are consumed; all other keys are silently
+        /// ignored.  This is the building block behind [`load`] and is also
+        /// exposed for testing.
+        pub fn parse(text: &str) -> Self {
+            let mut cfg = Self::default();
+            for raw_line in text.lines() {
+                let line = raw_line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                // Accept `key=value` and `key = value`.
+                let Some((key, val)) = line.split_once('=') else {
+                    continue; // No `=` — silently skip.
+                };
+                let key = key.trim();
+                let val = val.trim();
+                match key {
+                    "voice.model" => {
+                        if val.is_empty() {
+                            eprintln!(
+                                "voice: warning: voice.model is empty \
+                                 — using default \"tiny.en\""
+                            );
+                        } else {
+                            cfg.model = val.to_string();
+                        }
+                    }
+                    "voice.device" => {
+                        cfg.device = if val.is_empty() {
+                            None
+                        } else {
+                            Some(val.to_string())
+                        };
+                    }
+                    "voice.language" => {
+                        if val.is_empty() {
+                            eprintln!(
+                                "voice: warning: voice.language is empty \
+                                 — using default \"en\""
+                            );
+                        } else {
+                            cfg.language = val.to_string();
+                        }
+                    }
+                    "voice.autosubmit" => match val {
+                        "true" | "1" | "yes" => cfg.autosubmit = true,
+                        "false" | "0" | "no" => cfg.autosubmit = false,
+                        other => {
+                            eprintln!(
+                                "voice: warning: invalid voice.autosubmit \
+                                 value {other:?} — using false"
+                            );
+                        }
+                    },
+                    "voice.silence_ms" => match val.parse::<u64>() {
+                        Ok(ms) => cfg.silence_ms = ms,
+                        Err(_) => {
+                            eprintln!(
+                                "voice: warning: invalid voice.silence_ms \
+                                 value {val:?} — using 2000"
+                            );
+                        }
+                    },
+                    _ => {} // Non-voice keys are intentionally ignored.
+                }
+            }
+            cfg
+        }
+    }
+
+    /// Path to the aish per-user config file: `~/.aish/config`.
+    fn aish_config_path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_default();
+        PathBuf::from(&home).join(".aish").join("config")
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests (all pure, no audio/model I/O)
+    // -----------------------------------------------------------------------
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // ── Defaults ────────────────────────────────────────────────────────
+
+        #[test]
+        fn default_model_is_tiny_en() {
+            assert_eq!(VoiceConfig::default().model, "tiny.en");
+        }
+
+        #[test]
+        fn default_device_is_none() {
+            assert!(VoiceConfig::default().device.is_none());
+        }
+
+        #[test]
+        fn default_language_is_en() {
+            assert_eq!(VoiceConfig::default().language, "en");
+        }
+
+        #[test]
+        fn default_autosubmit_is_false() {
+            assert!(!VoiceConfig::default().autosubmit);
+        }
+
+        #[test]
+        fn default_silence_ms_is_2000() {
+            assert_eq!(VoiceConfig::default().silence_ms, 2_000);
+        }
+
+        // ── parse: happy paths ──────────────────────────────────────────────
+
+        #[test]
+        fn parse_empty_string_gives_defaults() {
+            assert_eq!(VoiceConfig::parse(""), VoiceConfig::default());
+        }
+
+        #[test]
+        fn parse_comment_only_gives_defaults() {
+            let cfg = VoiceConfig::parse("# nothing here\n# nope\n");
+            assert_eq!(cfg, VoiceConfig::default());
+        }
+
+        #[test]
+        fn parse_voice_model_key() {
+            let cfg = VoiceConfig::parse("voice.model = base.en\n");
+            assert_eq!(cfg.model, "base.en");
+        }
+
+        #[test]
+        fn parse_voice_device_key() {
+            let cfg = VoiceConfig::parse("voice.device = Built-in Microphone\n");
+            assert_eq!(cfg.device, Some("Built-in Microphone".to_string()));
+        }
+
+        #[test]
+        fn parse_voice_device_empty_gives_none() {
+            let cfg = VoiceConfig::parse("voice.device = \n");
+            assert!(cfg.device.is_none());
+        }
+
+        #[test]
+        fn parse_voice_language_key() {
+            let cfg = VoiceConfig::parse("voice.language = fr\n");
+            assert_eq!(cfg.language, "fr");
+        }
+
+        #[test]
+        fn parse_voice_autosubmit_true_variants() {
+            for val in ["true", "1", "yes"] {
+                let cfg = VoiceConfig::parse(&format!("voice.autosubmit = {val}\n"));
+                assert!(cfg.autosubmit, "expected autosubmit=true for {val:?}");
+            }
+        }
+
+        #[test]
+        fn parse_voice_autosubmit_false_variants() {
+            for val in ["false", "0", "no"] {
+                let cfg = VoiceConfig::parse(&format!("voice.autosubmit = {val}\n"));
+                assert!(!cfg.autosubmit, "expected autosubmit=false for {val:?}");
+            }
+        }
+
+        #[test]
+        fn parse_voice_silence_ms_key() {
+            let cfg = VoiceConfig::parse("voice.silence_ms = 3500\n");
+            assert_eq!(cfg.silence_ms, 3_500);
+        }
+
+        #[test]
+        fn parse_multiple_voice_keys() {
+            let text = concat!(
+                "voice.model = small.en\n",
+                "voice.language = de\n",
+                "voice.silence_ms = 1000\n",
+            );
+            let cfg = VoiceConfig::parse(text);
+            assert_eq!(cfg.model, "small.en");
+            assert_eq!(cfg.language, "de");
+            assert_eq!(cfg.silence_ms, 1_000);
+            assert!(!cfg.autosubmit);
+            assert!(cfg.device.is_none());
+        }
+
+        #[test]
+        fn parse_ignores_non_voice_keys() {
+            let text = "somekey = somevalue\nclaude.model = sonnet\n";
+            let cfg = VoiceConfig::parse(text);
+            assert_eq!(cfg, VoiceConfig::default());
+        }
+
+        #[test]
+        fn parse_accepts_no_spaces_around_equals() {
+            let cfg = VoiceConfig::parse("voice.model=large-v3\n");
+            assert_eq!(cfg.model, "large-v3");
+        }
+
+        #[test]
+        fn parse_skips_lines_without_equals() {
+            let cfg =
+                VoiceConfig::parse("this is not a key-value pair\nvoice.silence_ms = 500\n");
+            assert_eq!(cfg.silence_ms, 500);
+        }
+
+        // ── parse: graceful-degradation paths ───────────────────────────────
+
+        #[test]
+        fn parse_invalid_silence_ms_falls_back_to_default() {
+            let cfg = VoiceConfig::parse("voice.silence_ms = not_a_number\n");
+            assert_eq!(cfg.silence_ms, 2_000);
+        }
+
+        #[test]
+        fn parse_invalid_autosubmit_falls_back_to_false() {
+            let cfg = VoiceConfig::parse("voice.autosubmit = maybe\n");
+            assert!(!cfg.autosubmit);
+        }
+
+        #[test]
+        fn parse_empty_model_falls_back_to_default() {
+            let cfg = VoiceConfig::parse("voice.model = \n");
+            assert_eq!(cfg.model, "tiny.en");
+        }
+
+        #[test]
+        fn parse_empty_language_falls_back_to_default() {
+            let cfg = VoiceConfig::parse("voice.language = \n");
+            assert_eq!(cfg.language, "en");
+        }
+
+        // ── load_from_path ──────────────────────────────────────────────────
+
+        #[test]
+        fn load_from_nonexistent_path_gives_defaults() {
+            let cfg =
+                VoiceConfig::load_from_path(std::path::Path::new("/nonexistent/voice.cfg"));
+            assert_eq!(cfg, VoiceConfig::default());
+        }
+
+        #[test]
+        fn load_from_path_reads_file() {
+            let dir = std::env::temp_dir().join("aish-test-voice-config");
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("config");
+            std::fs::write(
+                &path,
+                "voice.model = base.en\nvoice.silence_ms = 4000\n",
+            )
+            .expect("write tmp config");
+            let cfg = VoiceConfig::load_from_path(&path);
+            assert_eq!(cfg.model, "base.en");
+            assert_eq!(cfg.silence_ms, 4_000);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // TASK-362: cpal audio capture
@@ -82,71 +423,10 @@ pub mod capture {
     /// This function **blocks the calling thread** (it is designed to be run
     /// inside `tokio::task::spawn_blocking` by the REPL wiring, TASK-367).
     /// cpal's audio callback runs on a separate OS audio thread.
-    pub fn record_until_stop(mut stop: StopSignal) -> anyhow::Result<Vec<f32>> {
+    pub fn record_until_stop(stop: StopSignal) -> anyhow::Result<Vec<f32>> {
         let host = cpal::default_host();
-
-        let device = host
-            .default_input_device()
-            .ok_or(CaptureError::NoDevice)
-            .context("voice: no input device")?;
-
-        let supported_config = device
-            .default_input_config()
-            .map_err(CaptureError::Device)
-            .context("voice: failed to query input device config")?;
-
-        let channels = supported_config.channels() as usize;
-        let sample_format = supported_config.sample_format();
-        let stream_config: cpal::StreamConfig = supported_config.into();
-
-        // Shared buffers between the cpal callback thread and this thread.
-        let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-        let stream_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-
-        let stream = build_input_stream(
-            &device,
-            &stream_config,
-            sample_format,
-            channels,
-            Arc::clone(&buffer),
-            Arc::clone(&stream_err),
-        )?;
-
-        stream.play().map_err(CaptureError::Device)?;
-
-        // Polling loop: collect audio while waiting for the stop signal.
-        // Tick every 10 ms — low enough latency for the user, cheap on CPU.
-        loop {
-            std::thread::sleep(Duration::from_millis(10));
-
-            // Check for an audio-thread error first.
-            if let Some(err) = stream_err.lock().unwrap().take() {
-                return Err(CaptureError::Stream(err).into());
-            }
-
-            // Non-blocking poll of the stop channel.
-            match stop.try_recv() {
-                Ok(StopAction::Stop) => {
-                    // Pause before reading the buffer to avoid a data race on
-                    // the final callback flush.
-                    drop(stream);
-                    // Give the audio thread one tick to flush its last callback.
-                    std::thread::sleep(Duration::from_millis(10));
-                    let samples = std::mem::take(&mut *buffer.lock().unwrap());
-                    return Ok(samples);
-                }
-                Ok(StopAction::Cancel) => {
-                    return Err(CaptureError::Cancelled.into());
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                    // Signal not yet sent — keep recording.
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    // Sender was dropped without sending — treat as cancel.
-                    return Err(CaptureError::Cancelled.into());
-                }
-            }
-        }
+        let device = open_input_device(&host, None)?;
+        record_with_device(&device, stop)
     }
 
     // -----------------------------------------------------------------------
@@ -177,9 +457,133 @@ pub mod capture {
         Ok(config.sample_rate())
     }
 
+    /// Like [`record_until_stop`] but honours `cfg.device`.
+    ///
+    /// If `cfg.device` names an input device that cannot be found, a warning
+    /// is printed on stderr and the system default is used (graceful
+    /// degradation — the pipeline must never hard-fail on a missing device
+    /// name).
+    pub fn record_until_stop_with_config(
+        stop: StopSignal,
+        cfg: &super::config::VoiceConfig,
+    ) -> anyhow::Result<Vec<f32>> {
+        let host = cpal::default_host();
+        let device = open_input_device(&host, cfg.device.as_deref())?;
+        record_with_device(&device, stop)
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
+
+    /// Open a cpal input device by optional name.
+    ///
+    /// - `device_name = None` → system default input device.
+    /// - `device_name = Some(name)` → search for a device whose name matches
+    ///   `name` exactly.  If not found, emit a `voice: warning:` on stderr and
+    ///   fall back to the system default (graceful degradation per design doc
+    ///   §4).
+    ///
+    /// Returns `Err(CaptureError::NoDevice)` only when no input device at all
+    /// is available (not even a system default).
+    fn open_input_device(
+        host: &cpal::Host,
+        device_name: Option<&str>,
+    ) -> anyhow::Result<cpal::Device> {
+        match device_name {
+            None => host
+                .default_input_device()
+                .ok_or(CaptureError::NoDevice)
+                .context("voice: no input device"),
+            Some(name) => {
+                let found = host
+                    .input_devices()
+                    .map_err(CaptureError::Device)?
+                    .find(|d| d.to_string() == name);
+
+                if found.is_none() {
+                    eprintln!(
+                        "voice: warning: input device {name:?} not found \
+                         — falling back to system default"
+                    );
+                }
+
+                // Prefer the named device; fall back to system default.
+                found
+                    .or_else(|| host.default_input_device())
+                    .ok_or(CaptureError::NoDevice)
+                    .context("voice: no input device")
+            }
+        }
+    }
+
+    /// Core recording loop: stream from `device` until `stop` fires.
+    ///
+    /// Extracted so both [`record_until_stop`] and
+    /// [`record_until_stop_with_config`] share the same polling logic without
+    /// duplication.
+    fn record_with_device(
+        device: &cpal::Device,
+        mut stop: StopSignal,
+    ) -> anyhow::Result<Vec<f32>> {
+        let supported_config = device
+            .default_input_config()
+            .map_err(CaptureError::Device)
+            .context("voice: failed to query input device config")?;
+
+        let channels = supported_config.channels() as usize;
+        let sample_format = supported_config.sample_format();
+        let stream_config: cpal::StreamConfig = supported_config.into();
+
+        // Shared buffers between the cpal callback thread and this thread.
+        let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+        let stream_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let stream = build_input_stream(
+            device,
+            &stream_config,
+            sample_format,
+            channels,
+            Arc::clone(&buffer),
+            Arc::clone(&stream_err),
+        )?;
+
+        stream.play().map_err(CaptureError::Device)?;
+
+        // Polling loop: collect audio while waiting for the stop signal.
+        // Tick every 10 ms — low enough latency for the user, cheap on CPU.
+        loop {
+            std::thread::sleep(Duration::from_millis(10));
+
+            // Check for an audio-thread error first.
+            if let Some(err) = stream_err.lock().unwrap().take() {
+                return Err(CaptureError::Stream(err).into());
+            }
+
+            // Non-blocking poll of the stop channel.
+            match stop.try_recv() {
+                Ok(StopAction::Stop) => {
+                    // Drop the stream before reading the buffer to avoid a
+                    // data race on the final callback flush.
+                    drop(stream);
+                    // Give the audio thread one tick to flush its last callback.
+                    std::thread::sleep(Duration::from_millis(10));
+                    let samples = std::mem::take(&mut *buffer.lock().unwrap());
+                    return Ok(samples);
+                }
+                Ok(StopAction::Cancel) => {
+                    return Err(CaptureError::Cancelled.into());
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    // Signal not yet sent — keep recording.
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    // Sender was dropped without sending — treat as cancel.
+                    return Err(CaptureError::Cancelled.into());
+                }
+            }
+        }
+    }
 
     /// Dispatch over sample format to build the correctly-typed cpal stream.
     ///
@@ -487,6 +891,8 @@ pub mod stt {
     ///    already-loaded context (lazy-initialisation, reused).
     pub struct Transcriber {
         model_path: PathBuf,
+        /// Whisper language hint, e.g. `"en"`.  Defaults to `"en"`.
+        language: String,
         /// The context is `None` until the first call to `transcribe`.
         ctx: Option<WhisperContext>,
     }
@@ -499,8 +905,24 @@ pub mod stt {
         pub fn new(model_path: impl AsRef<Path>) -> Self {
             Self {
                 model_path: model_path.as_ref().to_owned(),
+                language: "en".to_string(),
                 ctx: None,
             }
+        }
+
+        /// Override the Whisper language hint (default `"en"`).
+        ///
+        /// Returns `self` for method-chaining:
+        /// ```rust,ignore
+        /// let t = Transcriber::new(path).with_language("fr");
+        /// ```
+        ///
+        /// The language is forwarded to `FullParams::set_language` on every
+        /// call to [`Self::transcribe`].  Pass an empty string to let Whisper
+        /// auto-detect the language (slightly slower).
+        pub fn with_language(mut self, lang: impl Into<String>) -> Self {
+            self.language = lang.into();
+            self
         }
 
         /// Transcribe `pcm` (16 kHz, mono, f32) and return the text.
@@ -539,7 +961,13 @@ pub mod stt {
             // --- Build inference parameters ---------------------------------
             let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
             // Hint the decoder to English to avoid spurious language-detection latency.
-            params.set_language(Some("en"));
+            // Use configured language; empty string → Whisper auto-detect.
+            let lang_hint = if self.language.is_empty() {
+                None
+            } else {
+                Some(self.language.as_str())
+            };
+            params.set_language(lang_hint);
             // Suppress internal stderr chatter that would pollute the REPL.
             params.set_print_special(false);
             params.set_print_progress(false);
