@@ -934,6 +934,10 @@ pub async fn run(
                                 // Shift-Tab is a worker-cycle key, not meaningful
                                 // while editing a candidate — dismiss it.
                                 ReadOutcome::ShiftTab => {}
+                                // Voice (Ctrl-G) inside a rewrite preview is also
+                                // not meaningful — dismiss and let the outer loop
+                                // re-read the prompt (TASK-367 wires the pipeline).
+                                ReadOutcome::Voice => {}
                                 ReadOutcome::Eof => break,
                                 ReadOutcome::Error(e) => eprintln!("aish: readline error: {e}"),
                             }
@@ -1009,6 +1013,9 @@ pub async fn run(
                                 // Shift-Tab is a worker-cycle key, not meaningful
                                 // while editing a candidate — dismiss it.
                                 ReadOutcome::ShiftTab => {}
+                                // Voice (Ctrl-G) inside a suggest preview — dismiss;
+                                // TASK-367 wires the pipeline in the main loop.
+                                ReadOutcome::Voice => {}
                                 ReadOutcome::Eof => break,
                                 ReadOutcome::Error(e) => eprintln!("aish: readline error: {e}"),
                             }
@@ -1334,6 +1341,13 @@ pub async fn run(
                 if cycle_worker(&mut session) {
                     needs_gap = true;
                 }
+                continue;
+            }
+            ReadOutcome::Voice => {
+                // Ctrl-G: voice dictation requested (feature = "voice"). TASK-367
+                // wires the full capture → transcribe → insert pipeline here; for
+                // now the seam is present and the loop simply continues to the next
+                // prompt, which is the correct fallback on non-voice builds too.
                 continue;
             }
             ReadOutcome::Interrupted => {

@@ -35,6 +35,12 @@ pub enum ReadOutcome {
     /// Shift-Tab: cycle the interactive session through the running
     /// coordinators (interactive → first worker → … → back to interactive).
     ShiftTab,
+    /// Ctrl-G: voice dictation key (feature = "voice"). When the user presses
+    /// Ctrl-G the line editor is exited and the REPL runs the voice
+    /// capture → transcribe → insert pipeline (TASK-367). Present
+    /// unconditionally so REPL `match` arms compile with `--no-default-features`;
+    /// the binding that raises it is gated behind `#[cfg(feature = "voice")]`.
+    Voice,
     /// Ctrl-D on an empty line: exit the shell.
     Eof,
     /// A fatal editor error — the loop prints it and breaks.
@@ -93,6 +99,12 @@ pub struct RustylineEditor {
     /// distinguish a worker-cycle request from a Ctrl-O / plain Ctrl-C — all
     /// three surface as rustyline's `Interrupted`.
     shift_tab: Arc<AtomicBool>,
+    /// Raised by the Ctrl-G key handler (only compiled when `feature = "voice"`),
+    /// drained by `read_line` to distinguish a voice dictation request from the
+    /// other interrupt-routed keys. Gated so the default/CI build
+    /// (`--no-default-features --locked`) sees no dead-code warnings.
+    #[cfg(feature = "voice")]
+    voice_flag: Arc<AtomicBool>,
 }
 
 impl RustylineEditor {
@@ -158,11 +170,27 @@ impl RustylineEditor {
             EventHandler::Conditional(Box::new(AcceptHint)),
         );
 
+        // Ctrl-G voice dictation — bind the key and init the flag only when the
+        // `voice` feature is compiled in; neither exists in default/CI builds.
+        #[cfg(feature = "voice")]
+        let voice_flag = {
+            let flag = Arc::new(AtomicBool::new(false));
+            rl.bind_sequence(
+                KeyEvent::ctrl('G'),
+                EventHandler::Conditional(Box::new(CtrlGVoice {
+                    pending: flag.clone(),
+                })),
+            );
+            flag
+        };
+
         Ok(Self {
             rl,
             history_path,
             raw_toggle,
             shift_tab,
+            #[cfg(feature = "voice")]
+            voice_flag,
         })
     }
 
@@ -181,7 +209,13 @@ impl RustylineEditor {
                 // flag can never bleed into a later interrupt.
                 let shift_tab = self.shift_tab.swap(false, Ordering::SeqCst);
                 let raw_toggle = self.raw_toggle.swap(false, Ordering::SeqCst);
-                interrupt_outcome(shift_tab, raw_toggle)
+                // Voice flag: drained here so a stale Ctrl-G can never bleed
+                // into a subsequent Interrupted. Always false on non-voice builds.
+                #[cfg(feature = "voice")]
+                let voice = self.voice_flag.swap(false, Ordering::SeqCst);
+                #[cfg(not(feature = "voice"))]
+                let voice = false;
+                interrupt_outcome(shift_tab, raw_toggle, voice)
             }
             Err(ReadlineError::Eof) => ReadOutcome::Eof,
             Err(e) => ReadOutcome::Error(e.to_string()),
@@ -330,8 +364,16 @@ impl LineEditor for RustylineEditor {
 /// TASK-134): the caller passes the result of each read-and-clear `swap`.
 /// Shift-Tab wins over Ctrl-O if both were somehow raised; a clear pair is a
 /// plain Ctrl-C clear-line.
-fn interrupt_outcome(shift_tab_was_set: bool, raw_toggle_was_set: bool) -> ReadOutcome {
-    if shift_tab_was_set {
+fn interrupt_outcome(
+    shift_tab_was_set: bool,
+    raw_toggle_was_set: bool,
+    voice_was_set: bool,
+) -> ReadOutcome {
+    // Voice takes priority: a deliberate dictation request is more specific
+    // than a worker-cycle or raw-toggle key.
+    if voice_was_set {
+        ReadOutcome::Voice
+    } else if shift_tab_was_set {
         ReadOutcome::ShiftTab
     } else if raw_toggle_was_set {
         ReadOutcome::CtrlO
@@ -375,6 +417,24 @@ struct ShiftTabCycle {
 }
 
 impl ConditionalEventHandler for ShiftTabCycle {
+    fn handle(&self, _: &Event, _: RepeatCount, _: bool, _: &EventContext) -> Option<Cmd> {
+        self.pending.store(true, Ordering::SeqCst);
+        Some(Cmd::Interrupt)
+    }
+}
+
+/// Ctrl-G voice dictation key handler (feature = "voice"): raise the voice flag
+/// and exit the line editor so the REPL can run the capture → transcribe →
+/// insert pipeline (TASK-367). Returns `Cmd::Interrupt` to discard the current
+/// draft line; `RustylineEditor::read_line` drains the flag and reports
+/// [`ReadOutcome::Voice`].
+#[cfg(feature = "voice")]
+struct CtrlGVoice {
+    pending: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "voice")]
+impl ConditionalEventHandler for CtrlGVoice {
     fn handle(&self, _: &Event, _: RepeatCount, _: bool, _: &EventContext) -> Option<Cmd> {
         self.pending.store(true, Ordering::SeqCst);
         Some(Cmd::Interrupt)
@@ -601,25 +661,60 @@ mod tests {
     /// toggle is a raw-output request, a clear one is a plain clear-line.
     #[test]
     fn interrupt_outcome_distinguishes_shift_tab_ctrl_o_and_ctrl_c() {
-        // Shift-Tab (first flag) wins and surfaces as a worker-cycle request.
+        // Voice (third flag) takes top priority: a deliberate dictation
+        // request beats every other interrupt-routed key.
         assert!(
-            matches!(interrupt_outcome(true, false), ReadOutcome::ShiftTab),
+            matches!(interrupt_outcome(false, false, true), ReadOutcome::Voice),
+            "a drained voice flag must surface as Voice"
+        );
+        // Voice wins even when ShiftTab or CtrlO were also co-raised.
+        assert!(
+            matches!(interrupt_outcome(true, false, true), ReadOutcome::Voice),
+            "Voice wins over a co-raised Shift-Tab"
+        );
+        assert!(
+            matches!(interrupt_outcome(false, true, true), ReadOutcome::Voice),
+            "Voice wins over a co-raised Ctrl-O"
+        );
+        // Shift-Tab (second priority) wins over Ctrl-O when voice is clear.
+        assert!(
+            matches!(interrupt_outcome(true, false, false), ReadOutcome::ShiftTab),
             "a drained Shift-Tab flag must surface as ShiftTab"
         );
         // Shift-Tab takes precedence even if Ctrl-O was also somehow raised.
         assert!(
-            matches!(interrupt_outcome(true, true), ReadOutcome::ShiftTab),
+            matches!(interrupt_outcome(true, true, false), ReadOutcome::ShiftTab),
             "Shift-Tab wins over a co-raised Ctrl-O"
         );
         // Ctrl-O alone is the raw-output toggle.
         assert!(
-            matches!(interrupt_outcome(false, true), ReadOutcome::CtrlO),
+            matches!(interrupt_outcome(false, true, false), ReadOutcome::CtrlO),
             "a drained Ctrl-O toggle must surface as CtrlO"
         );
         // Neither flag is a plain Ctrl-C clear-line.
         assert!(
-            matches!(interrupt_outcome(false, false), ReadOutcome::Interrupted),
-            "a clear pair is a plain Ctrl-C clear-line"
+            matches!(interrupt_outcome(false, false, false), ReadOutcome::Interrupted),
+            "a clear triple is a plain Ctrl-C clear-line"
+        );
+    }
+
+    /// The voice flag (like raw_toggle and shift_tab) is a read-and-clear swap:
+    /// a Ctrl-G raise is seen exactly once, and the very next `Interrupted`
+    /// is therefore a plain Ctrl-C / Shift-Tab / Ctrl-O as appropriate. This pins
+    /// the drain contract that prevents a stale voice flag from eating a later
+    /// unrelated interrupt.
+    #[test]
+    fn voice_flag_drains_exactly_once() {
+        let flag = Arc::new(AtomicBool::new(false));
+        // Simulate CtrlGVoice handler raising it.
+        flag.store(true, Ordering::SeqCst);
+        assert!(
+            flag.swap(false, Ordering::SeqCst),
+            "first drain sees the raised voice flag"
+        );
+        assert!(
+            !flag.swap(false, Ordering::SeqCst),
+            "second drain is clear (voice already consumed)"
         );
     }
 
