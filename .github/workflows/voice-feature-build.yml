@@ -1,13 +1,11 @@
 name: Voice feature build
 
-# SPR-068 / FR-334 (TASK-369): compile the optional `voice` feature so the
+# SPR-068 / FR-334 (TASK-362..367): compile the optional `voice` feature so the
 # audio + Whisper stack (cpal / rubato / whisper-rs / crossterm) can't silently
 # rot outside the default `--no-default-features` CI gate.
 #
-# NON-GATING until the `src/voice.rs` module lands: the job is
-# `continue-on-error: true` so a red voice build never blocks an unrelated PR.
-# Flip that to `false` once the implementation (TASK-362..367) is merged and the
-# feature is expected to compile clean.
+# GATING: TASK-367 (REPL wiring) is the final implementation task; the voice
+# feature is now expected to compile clean, so continue-on-error is set to false.
 
 on:
   push:
@@ -17,6 +15,7 @@ on:
       - 'Cargo.lock'
       - 'src/voice.rs'
       - 'src/voice/**'
+      - 'src/repl.rs'
       - '.github/workflows/voice-feature-build.yml'
   pull_request:
     paths:
@@ -24,6 +23,7 @@ on:
       - 'Cargo.lock'
       - 'src/voice.rs'
       - 'src/voice/**'
+      - 'src/repl.rs'
       - '.github/workflows/voice-feature-build.yml'
   workflow_dispatch:
 
@@ -35,8 +35,8 @@ jobs:
   voice-build:
     name: cargo build --features voice
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    # Non-gating until src/voice.rs exists; surfaces the result without blocking.
-    continue-on-error: true
+    # Gating as of TASK-367 — voice feature pipeline is complete.
+    continue-on-error: false
     steps:
       - uses: actions/checkout@v6
 

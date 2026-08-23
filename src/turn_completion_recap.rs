@@ -6,7 +6,6 @@
 /// as a dim line for visibility without distraction.
 
 use crate::context::Usage;
-use crate::session::Session;
 use std::time::Duration;
 
 /// Configuration for turn-completion recap output.
