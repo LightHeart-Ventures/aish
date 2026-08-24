@@ -24,10 +24,10 @@ const POLL_INITIAL: Duration = Duration::from_secs(5);
 const POLL_MAX: Duration = Duration::from_secs(60);
 const POLL_WALL_CLOCK_CAP: Duration = Duration::from_secs(6 * 60 * 60); // 6h, matching atum
 
-/// The model every background batch runs on. Batches are Anthropic-only, and the
-/// user wants the strongest model for deferred work — so this is fixed to Opus
-/// regardless of the interactive backend/model. Overridable via `:batch model`.
-pub const DEFAULT_BATCH_MODEL: &str = "claude-opus-4-9";
+/// The model every background batch runs on. Batches are Anthropic-only.
+/// Defaults to Sonnet — strong, available, and cost-effective for deferred work.
+/// Overridable at runtime via `:batch model <opus|sonnet|haiku|full-id>`.
+pub const DEFAULT_BATCH_MODEL: &str = "claude-sonnet-4-6";
 
 /// A background batch job, tracked for the life of the session. Shared between
 /// the REPL (which lists/fetches it) and the poll task (which mutates it).
