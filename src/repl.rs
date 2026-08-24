@@ -1383,31 +1383,44 @@ pub async fn run(
                     });
 
                     // --- Step 5: read the stop key on a blocking thread. ------
-                    // Waits for Ctrl-G (stop) or Esc (cancel).  If the timeout
-                    // fires first (step 6) this thread remains alive until the
-                    // user presses any key — an acceptable v1 trade-off; a
-                    // future revision can use crossterm::event::poll to make the
-                    // key-reader interruptible.
+                    // Uses poll() with a shutdown flag to avoid leaving an orphaned
+                    // thread blocked in event::read() that would steal user keystrokes
+                    // if the silence timeout fires first.
+                    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let shutdown_for_thread = std::sync::Arc::clone(&shutdown);
+
                     let key_handle =
-                        tokio::task::spawn_blocking(|| -> anyhow::Result<capture::StopAction> {
+                        tokio::task::spawn_blocking(move || -> anyhow::Result<capture::StopAction> {
                             crossterm::terminal::enable_raw_mode()?;
-                            let action = loop {
-                                match crossterm::event::read()? {
-                                    Event::Key(e)
-                                        if e.code == KeyCode::Char('g')
-                                            && e.modifiers
-                                                .contains(KeyModifiers::CONTROL) =>
-                                    {
-                                        break capture::StopAction::Stop;
+                            let result = loop {
+                                if shutdown_for_thread.load(std::sync::atomic::Ordering::Relaxed) {
+                                    break capture::StopAction::Stop;
+                                }
+                                match crossterm::event::poll(std::time::Duration::from_millis(50)) {
+                                    Ok(true) => {
+                                        if let Ok(Event::Key(key)) = crossterm::event::read() {
+                                            match (key.code, key.modifiers.contains(KeyModifiers::CONTROL)) {
+                                                (KeyCode::Char('g'), true) => {
+                                                    break capture::StopAction::Stop;
+                                                }
+                                                (KeyCode::Esc, _) => {
+                                                    break capture::StopAction::Cancel;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
                                     }
-                                    Event::Key(e) if e.code == KeyCode::Esc => {
+                                    Ok(false) => {
+                                        // poll timeout; loop to check shutdown flag
+                                    }
+                                    Err(_) => {
+                                        // poll error; exit cleanly
                                         break capture::StopAction::Cancel;
                                     }
-                                    _ => continue,
                                 }
                             };
                             let _ = crossterm::terminal::disable_raw_mode();
-                            Ok(action)
+                            Ok(result)
                         });
 
                     // --- Step 6: race key vs silence-timeout. -----------------
@@ -1422,12 +1435,12 @@ pub async fn run(
                         _ = tokio::time::sleep(
                             std::time::Duration::from_millis(VOICE_SILENCE_MS)
                         ) => {
+                            // Signal the key reader thread to shut down cleanly.
+                            // It will restore raw mode before exiting.
+                            shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
                             capture::StopAction::Stop
                         }
                     };
-
-                    // Ensure raw mode is cleaned up regardless of which branch won.
-                    let _ = crossterm::terminal::disable_raw_mode();
 
                     // --- Step 7: send the stop signal, clear indicator. -------
                     let _ = stop_tx.send(stop_action);
