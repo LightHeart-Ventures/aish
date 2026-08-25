@@ -326,6 +326,49 @@ impl ClaudeBackend {
         }
     }
 
+    /// After an immediate reload attempt finds no fresh token (the user has not
+    /// yet run `claude setup-token`), poll `~/.aishrc` and
+    /// `~/.claude/.credentials.json` every [`POLL_INTERVAL`] for up to
+    /// [`WAIT_TIMEOUT`], printing a one-time prompt. Returns `true` — and
+    /// hot-swaps the stored credential — once a **different** OAuth token is
+    /// detected, so the caller can retry the request transparently (the
+    /// coordinator never sees an error and auto-resumes). Returns `false` when
+    /// the timeout elapses without a fresh token.
+    async fn wait_for_fresh_oauth_token(&self) -> bool {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600); // 10 min
+
+        let current = match self.cred.read().unwrap().oauth_token() {
+            Some(t) => t.to_string(),
+            None => return false, // non-OAuth credential, nothing to wait for
+        };
+
+        eprintln!(
+            "\x1b[1m\n⏳ Waiting for a refreshed OAuth token (up to 10 min)…\x1b[0m\n\
+  Run \x1b[1mclaude setup-token\x1b[0m in another terminal, then aish will \
+auto-resume.\n"
+        );
+
+        let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            // Check ~/.aishrc (CLAUDE_CODE_OAUTH_TOKEN) and, transitively via
+            // Credential::resolve, ~/.claude/.credentials.json (written by
+            // `claude setup-token`).
+            let rc = crate::rc::load();
+            if let Some(fresh) = reloaded_oauth_swap(&current, &rc.env) {
+                *self.cred.write().unwrap() = fresh;
+                eprintln!(
+                    "\x1b[2m  fresh OAuth token detected — resuming work…\x1b[0m"
+                );
+                return true;
+            }
+        }
+    }
+
     pub fn new(model: String, cred: Credential) -> Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
@@ -514,14 +557,20 @@ impl ClaudeBackend {
                     if is_auth_error(status, msg) {
                         let is_oauth = matches!(self.cred.read().unwrap().auth, Auth::Oauth(_));
                         if is_oauth {
-                            // The running subscription token may have been revoked
-                            // while a freshly-minted one already sits in ~/.aishrc
-                            // (the user ran `claude setup-token` and updated it
-                            // since aish started). Reload it and retry ONCE before
-                            // surfacing the revoked-token error.
+                            // The running subscription token may have been revoked.
+                            // 1. Try an immediate hot-swap from ~/.aishrc /
+                            //    ~/.claude/.credentials.json (the user may have
+                            //    already run `claude setup-token`).
+                            // 2. If that fails (token not yet refreshed), wait up to
+                            //    10 min polling for a fresh one — so coordinators
+                            //    auto-resume when the operator refreshes without
+                            //    having to explicitly `:tell` them to continue.
                             if !reload_attempted {
                                 reload_attempted = true;
                                 if self.try_reload_oauth_token() {
+                                    continue;
+                                }
+                                if self.wait_for_fresh_oauth_token().await {
                                     continue;
                                 }
                             }
@@ -664,11 +713,19 @@ ride-out budget: {msg}"
                 });
             let is_oauth = matches!(self.cred.read().unwrap().auth, Auth::Oauth(_));
             if is_auth_error && is_oauth {
-                // A freshly-set token may already be in ~/.aishrc (the user ran
-                // `claude setup-token`). Reload it and retry once before giving up.
-                if !reload_attempted && !last {
+                // 1. Immediate hot-swap: the user may have already run
+                //    `claude setup-token` since aish started.
+                // 2. Wait-and-poll: if no fresh token yet, block up to 10 min
+                //    so coordinators auto-resume when the operator refreshes
+                //    without having to explicitly `:tell` them to continue.
+                // Both checks are guarded by `reload_attempted` so they run
+                // at most once even if the request keeps failing.
+                if !reload_attempted {
                     reload_attempted = true;
                     if self.try_reload_oauth_token() {
+                        continue;
+                    }
+                    if self.wait_for_fresh_oauth_token().await {
                         continue;
                     }
                 }
