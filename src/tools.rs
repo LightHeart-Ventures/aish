@@ -471,7 +471,9 @@ this whenever the user says cd / go to / work in some directory."
             name: "job_output".into(),
             description: "Read a background job's accumulated output and status (started via \
 run_program with background:true). Use this to check on watchers/listeners you started earlier — \
-their output does NOT reach you by push, only the user's terminal sees it live."
+their output does NOT reach you by push, only the user's terminal sees it live. For coordinator \
+runs (background workers started via run_in_background), the output includes the full original \
+task brief so you can confirm what a peer is working on."
                 .into(),
             schema: json!({
                 "type": "object",
@@ -526,8 +528,10 @@ a backend or worry about batches — just describe the task and offload it."
                 "List ALL background jobs and their LIVE status — background coordinators \
 (running in this session) and durable coordinator runs / Anthropic batch jobs (shared across \
 sessions). Call this to answer \"what's running?\" / \"status\" instead of guessing or inventing \
-your own tracking. Returns a table: id, kind, owner, status, task, result. \
-Pass `scope` to narrow the listing: omit it (or \"all\") for every session's jobs (the \
+your own tracking. Returns a table: id, kind, owner, status, task, result. The Task column is \
+capped at 56 chars for readability; the full untruncated task brief for every job appears in a \
+'Full task briefs' section below the table so you can always see exactly what each peer is working \
+on. Pass `scope` to narrow the listing: omit it (or \"all\") for every session's jobs (the \
 default); \"session\"/\"mine\" for only THIS shell's jobs; a job id / id-prefix for one job; \
 a repo name for a repo (repo filtering is not yet wired to the durable store)."
                     .into(),
@@ -1753,7 +1757,13 @@ fn durable_job_output(q: &str, session: &Session) -> Result<String> {
 
     // In-memory workers / batches (this session) — freshest state, live result.
     if let Some(w) = session.worker_jobs.lock().unwrap().iter().find(|j| hit(&j.id)) {
-        return Ok(format!("[{} {}]\n{}", crate::batch::short_id(&w.id), w.status(), w.fetch()));
+        return Ok(format!(
+            "[{} {}]\nTask: {}\n\n{}",
+            crate::batch::short_id(&w.id),
+            w.status(),
+            w.task,
+            w.fetch()
+        ));
     }
     if let Some(j) = session.batch_jobs.lock().unwrap().iter().find(|j| hit(&j.id)) {
         return Ok(format!("[{} {}]\n{}", crate::batch::short_id(&j.id), j.status(), j.fetch()));
@@ -1769,7 +1779,13 @@ fn durable_job_output(q: &str, session: &Session) -> Result<String> {
                     .clone()
                     .or_else(|| r.error.clone())
                     .unwrap_or_else(|| format!("(no result yet — phase: {})", r.phase));
-                return Ok(format!("[{} {}]\n{}", crate::batch::short_id(&r.run_id), r.phase, body));
+                return Ok(format!(
+                    "[{} {}]\nTask: {}\n\n{}",
+                    crate::batch::short_id(&r.run_id),
+                    r.phase,
+                    r.task,
+                    body
+                ));
             }
         }
     }
@@ -2430,6 +2446,12 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
     }
     let me = session.session_id.as_str();
 
+    // Collect full task texts for the appendix section below the table.
+    // The table cell is capped at 56 chars for readability; the appendix gives
+    // workers/operators the FULL brief so they can see exactly what each peer is
+    // doing without having to guess from a truncated snippet.
+    let mut full_tasks: Vec<(String, String)> = Vec::new();
+
     let trunc = |t: &str| -> String {
         let t = t.replace('|', "\\|");
         if t.chars().count() > 56 {
@@ -2511,6 +2533,7 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
             continue;
         }
         any = true;
+        full_tasks.push((crate::batch::short_id(&w.id).to_string(), w.task.clone()));
         out.push_str(&format!(
             "| `{}` | coordinator | you | {} | — | — | {} | — |\n",
             crate::batch::short_id(&w.id),
@@ -2565,6 +2588,7 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
                 let terminal = matches!(r.phase.as_str(), "done" | "failed" | "checkpoint");
                 let beat =
                     crate::style::fmt_heartbeat_age(r.heartbeat_at.as_deref(), terminal, now_epoch);
+                full_tasks.push((crate::batch::short_id(&r.run_id).to_string(), r.task.clone()));
                 out.push_str(&format!(
                     "| `{}` | coordinator | {} | {} | {} | {} | {} | {} |\n",
                     crate::batch::short_id(&r.run_id),
@@ -2607,6 +2631,7 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
                     owner
                 };
                 let result = format_result(r.result.as_ref(), r.error.as_ref());
+                full_tasks.push((crate::batch::short_id(&r.local_id).to_string(), r.task.clone()));
                 out.push_str(&format!(
                     "| `{}` | batch | {} | {} | — | {} | {} | {} |\n",
                     crate::batch::short_id(&r.local_id),
@@ -2630,6 +2655,17 @@ session's jobs)."
             JobScope::Job(q) => format!("No background job matching `{q}`."),
             _ => "No background jobs running.".into(),
         });
+    }
+    // Append full task briefs below the table so workers and operators can see
+    // the complete, untruncated task text for each job — not just the 56-char
+    // table snippet. This is the primary fix for the "can't tell what a peer is
+    // working on" bug: the table stays compact; the briefs section is
+    // authoritative.
+    if !full_tasks.is_empty() {
+        out.push_str("\n### Full task briefs\n\n");
+        for (id, task) in &full_tasks {
+            out.push_str(&format!("**{}**: {}\n\n", id, task));
+        }
     }
     Ok(out)
 }
