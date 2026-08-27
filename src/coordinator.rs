@@ -659,6 +659,40 @@ pub async fn drive(
         );
     }
 
+    // ── Background heartbeat keeper: beat the durable heartbeat every
+    // HEARTBEAT_INTERVAL throughout the FULL lifetime of drive(), not only
+    // during batch waits.  A round's tool-call phase can block for tens of
+    // minutes (cargo build, long network fetches, etc.) without any round
+    // boundary firing — leaving the heartbeat stale and the row visually
+    // flagged ⚠ in `:workers` / `background_status`, or even reaped as
+    // orphaned by a concurrent startup.
+    //
+    // Design: a oneshot sender held on THIS stack frame (`_heartbeat_cancel`)
+    // is the cancellation token.  The spawned task loops, sleeping
+    // HEARTBEAT_INTERVAL then beating, and exits as soon as `select!` sees the
+    // receiver resolve (i.e. when the sender is dropped on any return path —
+    // normal completion, failure, checkpoint, or circuit-break).  Best-effort:
+    // a store write error never stalls the task.
+    let _heartbeat_cancel = if let Some(s) = store {
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        let store_hb = s.clone();
+        let run_id_hb = run_id.to_string();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut rx => break,
+                    _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
+                        let _ = store_hb.heartbeat(&run_id_hb);
+                    }
+                }
+            }
+        });
+        Some(tx)
+    } else {
+        None
+    };
+
+
     // ── Pre-dispatch circuit breaker (loop guard, per the loop-exhaustion
     // review). If this exact task has already failed `max_failed_attempts()`
     // times, a fresh identical run is very unlikely to fare differently —
