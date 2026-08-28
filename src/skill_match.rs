@@ -834,4 +834,78 @@ mod tests {
             None
         );
     }
+
+    // ── Regression: coordinator preamble pollution (TASK-XXX) ──────────────
+    //
+    // The coordinator wraps the user's task in a large boilerplate preamble
+    // (PHASE0_GUARD + PHASE_PIPELINE + ...) that ends with "\nTASK:\n<user_task>".
+    // The PHASE_PIPELINE text contains "cargo" (from "for aish: `cargo test
+    // --no-default-features --locked`"), which maps via INTENT_KEYWORDS to the
+    // "infrastructure" category.  A skill whose categories include
+    // "infrastructure" (e.g. thirdchair-sre) therefore scored ≥ MIN_SCORE even
+    // when the user's actual task had nothing to do with it.
+    //
+    // The fix lives in engine.rs: `task` is extracted from after the last
+    // "\nTASK:\n" marker so the boilerplate never reaches skill_match.  These
+    // tests verify that the *matcher* itself is not the source of the false
+    // positive — i.e. the SHORT user task doesn't score the infra skill at all,
+    // while the FULL preamble (with "cargo") does.
+    #[test]
+    fn short_task_does_not_match_infra_skill() {
+        // Simulate what the user actually asked — no preamble keywords.
+        let user_task = "review the interaction we just had - there is a bug in aish \
+(LightHeart-Ventures/aish) - find and fix it; open pr";
+        let infra_skill = skill_meta(
+            "thirdchair-sre",
+            "Troubleshoot and operate the Thirdchair / Expy production stack on AWS \
+— ECS Fargate (webui + workers), ALB, DynamoDB tenant directory, Google-SSO login, \
+logs, and deploy/rollout verification. Use for any \"app is down / login 403 / rollout \
+stuck / who's running what / tail the logs\" SRE question.",
+            &["infrastructure", "sre", "aws", "troubleshooting"],
+            &["thirdchair", "expy"],
+            &[],
+        );
+        let skills = [infra_skill];
+        let ranked = skill_match(user_task, None, &skills);
+        assert!(
+            ranked.is_empty(),
+            "thirdchair-sre should NOT match a task about fixing aish code; got: {ranked:?}"
+        );
+    }
+
+    #[test]
+    fn full_coordinator_preamble_does_match_infra_skill() {
+        // Confirm that the bug was real: if the preamble leaks into the matcher
+        // it DOES produce a false positive (score ≥ MIN_SCORE).  The engine fix
+        // ensures this string never reaches skill_match in production, but we
+        // document it here so the regression is visible.
+        let infra_skill = skill_meta(
+            "thirdchair-sre",
+            "Troubleshoot and operate the Thirdchair / Expy production stack on AWS \
+— ECS Fargate (webui + workers), ALB, DynamoDB tenant directory, Google-SSO login, \
+logs, and deploy/rollout verification. Use for any \"app is down / login 403 / rollout \
+stuck / who's running what / tail the logs\" SRE question.",
+            &["infrastructure", "sre", "aws", "troubleshooting"],
+            &["thirdchair", "expy"],
+            &[],
+        );
+        // A coordinator preamble fragment containing the "cargo" keyword that
+        // triggers the infrastructure intent (via INTENT_KEYWORDS).
+        let preamble_fragment = "--- PHASE 4: VALIDATION --- Run the canonical gate once \
+(for aish: `cargo test --no-default-features --locked`) and confirm green, then open/finish the PR.\
+\nTASK:\nreview the interaction we just had - there is a bug in aish - find and fix it; open pr";
+        let skills = [infra_skill];
+        let ranked = skill_match(preamble_fragment, None, &skills);
+        // The preamble's "cargo" → "infrastructure" intent boosts thirdchair-sre
+        // above MIN_SCORE — exactly the false positive the engine fix prevents.
+        assert!(
+            !ranked.is_empty(),
+            "expected the preamble fragment to produce the false-positive score (to document the bug)"
+        );
+        assert!(
+            ranked[0].score >= MIN_SCORE as i32,
+            "expected score ≥ MIN_SCORE; got {}",
+            ranked[0].score
+        );
+    }
 }
