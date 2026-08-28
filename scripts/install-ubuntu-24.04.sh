@@ -2,9 +2,9 @@
 # aish — one-command Ubuntu 24.04 installer
 #
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/LightHeart-Ventures/aish/main/install-ubuntu-24.04.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/LightHeart-Ventures/aish/main/scripts/install-ubuntu-24.04.sh | bash
 #   # or
-#   bash install-ubuntu-24.04.sh
+#   bash scripts/install-ubuntu-24.04.sh
 #
 # This script:
 # 1. Installs build dependencies (build-essential, rustup, git)
