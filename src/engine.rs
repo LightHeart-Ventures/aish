@@ -318,7 +318,25 @@ async fn run_turn_inner(
     // (before context-seeding) so a prepended preamble can't skew the keyword
     // match; the note goes into the turn input, never the cached system prompt,
     // so the prompt-cache prefix stays byte-stable.
-    let task = input.clone();
+    //
+    // TASK-XXX: coordinator turns wrap the user's request in a large boilerplate
+    // preamble (PHASE0_GUARD, PHASE_PIPELINE, etc.) that ends with "\nTASK:\n".
+    // That preamble contains incidental domain keywords — e.g. "cargo" from the
+    // PHASE_PIPELINE validation step — which map to INTENT_KEYWORDS categories
+    // (here "cargo" → "infrastructure"), boosting unrelated skills (e.g.
+    // thirdchair-sre, whose categories include "infrastructure") past MIN_SCORE
+    // even when the user's actual task has nothing to do with them.
+    // Fix: strip the preamble by extracting only the portion AFTER the last
+    // "\nTASK:\n" sentinel. Interactive turns never contain that marker so
+    // rfind returns None and the fallback (full input) preserves today's
+    // behaviour for the interactive hot-path.
+    let task = {
+        const TASK_MARKER: &str = "\nTASK:\n";
+        input
+            .rfind(TASK_MARKER)
+            .map(|pos| input[pos + TASK_MARKER.len()..].to_string())
+            .unwrap_or_else(|| input.clone())
+    };
     // `:new` sets suppress_context_seed so the freshly-cleared (empty) history
     // doesn't re-trigger the last-output seed below. Consume it one-shot: a later
     // command's output can still seed a genuinely fresh prompt.
