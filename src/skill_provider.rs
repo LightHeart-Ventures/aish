@@ -966,7 +966,7 @@ async fn search_plugins(query: &str) -> Vec<SearchResult> {
 /// Search for `query` across the full skill-source federation.
 ///
 /// Precedence: **plugin skill sources first** (highest priority — a
-/// `provides.skill_source` plugin such as `npx-skills` answers before the
+/// `provides.skill_source` plugin such as `npx-skillfish` answers before the
 /// built-in), then the built-in [`search_core`] (the offline, embedded
 /// index). Plugin hits are deduped ahead of the built-in results by
 /// reference so the same skill never shows twice; plugin failures fail soft.
