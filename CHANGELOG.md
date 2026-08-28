@@ -4,7 +4,17 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
-## [0.42.0] - 2026-08-22
+## [0.45.0] - 2025-04-18
+
+### Added
+- **Voice input stack (SPR-068): full push-to-talk acquisition** (PR #748-760): aish now captures audio via `cpal`, resamples to 16 kHz using `rubato`, and feeds it to Whisper (via `whisper-rs`) for local speech-to-text. New `voice` feature gate (opt-in, disabled by default) avoids heavy native deps (ALSA/libasound2-dev, whisper.cpp C++ build) in the standard binary. Ctrl-G to record, full pipeline wired (capture→resample→transcribe→insert). Graceful degradation when audio is unavailable. See `docs/spr-068-voice-input-design.md`.
+
+### Fixed
+- **Coordinator preamble pollution in skill matching (PR #760)**: background coordinators were injecting their initialization preamble into the system context used for skill matching, causing false negatives on skills that matched the user intent perfectly. Now stripped before matching.
+- **Orphaned key reader thread in voice shutdown**: eliminated a race where the voice key capture thread outlived the voice module, causing keyboard latency and delayed shutdown. Proper thread lifecycle coordination on disable.
+- **Voice feature gate build isolation**: voice optional deps (`cpal`, `rubato`, `whisper-rs`, `crossterm`) are now gated correctly so they never leak into the default (Claude-only) build — reduces CI gate size and link time dramatically.
+
+## [0.42.0] - 2026-08-22 - 2026-08-22
 
 ### Added
 - **Silent GitHub fallback for skill imports (PR #740)**: when `:skill add owner/repo` fails on skill.fish (e.g., Vercel bot challenge), aish now silently tries interpreting it as a GitHub repo path before surfacing an error. Users can type `:skill add hyperb1iss/hyperskills` and it works seamlessly — skill.fish is tried first, but if that fails, GitHub takes over. Three-path fallback: skill.fish → resolve_ref_via_search → GitHub import, with error prioritization (Vercel challenge → GitHub-specific error).
