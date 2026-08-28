@@ -60,6 +60,17 @@ pub const REPEAT_HARD_LIMIT: usize = 4;
 /// Fix #4: Increased from 2 to 4 to reduce false-positive flagging on transient errors.
 pub const MAX_AUTO_RECOVERIES: usize = 4;
 
+/// Independent recovery cap for [`ExitReason::SerialChainYield`] specifically.
+/// Coordinators doing inherently sequential work (git: fetch→checkout→rebase→
+/// resolve→commit→push, or step-by-step code investigation) naturally produce
+/// long chains of single-tool-call rounds that are not batching failures — the
+/// calls ARE dependent and cannot be parallelised. Sharing the general
+/// `MAX_AUTO_RECOVERIES` cap caused sequential-but-correct coordinators to be
+/// killed after just 4×12=48 rounds of legitimate work. This separate, higher
+/// cap lets them run to completion while the main cap still catches true runaway
+/// loops and budget exhaustion.
+pub const MAX_SERIAL_CHAIN_RECOVERIES: usize = 12;
+
 // ---------------------------------------------------------------------------
 // Iteration budget — soft-warning → forced-summarize before the hard limit
 // ---------------------------------------------------------------------------

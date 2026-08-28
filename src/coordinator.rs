@@ -763,6 +763,13 @@ pub async fn drive(
     // abnormally this run. Bounded by `loopguard::MAX_AUTO_RECOVERIES` so the
     // recovery can't itself spin forever — past the cap we flag the operator.
     let mut auto_recoveries = 0usize;
+    // SerialChainYield recoveries are tracked SEPARATELY from the general
+    // auto_recoveries counter so that coordinators doing inherently sequential
+    // work (git workflows, step-by-step code investigation) are not killed by
+    // the same cap that catches true runaway loops. Each serial-chain yield
+    // increments THIS counter instead of auto_recoveries; it has its own
+    // higher cap (MAX_SERIAL_CHAIN_RECOVERIES). See loopguard.rs for rationale.
+    let mut serial_chain_recoveries = 0usize;
     // Read the round cap once per run so a single env value governs the whole
     // loop (a mid-run env change can't move the goalposts under us).
     let round_cap = max_rounds();
@@ -1126,13 +1133,44 @@ final status plus your best partial result. After this turn you are terminated."
                 // is preserved in history + the turn-audit replay, so a resume
                 // continues rather than restarting from scratch.
                 crate::loopguard::Disposition::Resume | crate::loopguard::Disposition::Nudge => {
-                    auto_recoveries += 1;
+                    // SerialChainYield is tracked with its own counter so that
+                    // coordinators doing genuinely sequential work (git workflows,
+                    // step-by-step investigation) are not killed by the same cap
+                    // that governs true runaway loops and budget exhaustion.
+                    let is_serial_chain = matches!(
+                        exit.reason,
+                        crate::loopguard::ExitReason::SerialChainYield { .. }
+                    );
+                    let (recovery_count, recovery_cap) = if is_serial_chain {
+                        serial_chain_recoveries += 1;
+                        (serial_chain_recoveries, crate::loopguard::MAX_SERIAL_CHAIN_RECOVERIES)
+                    } else {
+                        auto_recoveries += 1;
+                        (auto_recoveries, crate::loopguard::MAX_AUTO_RECOVERIES)
+                    };
                     eprintln!(
-                        "\x1b[2maish: round {rounds} ended [{}] — {} (auto-recovery {auto_recoveries}/{})\x1b[0m",
+                        "\x1b[2maish: round {rounds} ended [{}] — {} (auto-recovery {recovery_count}/{recovery_cap})\x1b[0m",
                         exit.reason.tag(),
                         exit.disposition.verb(),
-                        crate::loopguard::MAX_AUTO_RECOVERIES,
                     );
+                    // If the serial-chain counter is itself exhausted, flag the
+                    // operator — the coordinator is stuck in serial-only mode
+                    // despite repeated nudges to batch.
+                    if is_serial_chain && serial_chain_recoveries >= crate::loopguard::MAX_SERIAL_CHAIN_RECOVERIES {
+                        let error = format!(
+                            "flagged for operator after {serial_chain_recoveries} serial-chain-yield attempt(s): {}",
+                            exit.reason.detail()
+                        );
+                        eprintln!("\x1b[2maish: {error}\x1b[0m");
+                        persist_terminal(store, run_id, Phase::Failed, None, Some(&error), session);
+                        finalize_worker_store(run_id, "failed", Some(&answer));
+                        return Outcome {
+                            phase: Phase::Failed,
+                            result: Some(answer),
+                            error: Some(error),
+                            rounds,
+                        };
+                    }
                     next_input = exit
                         .directive()
                         .unwrap_or_else(|| "Continue the task from where you left off.".to_string());
