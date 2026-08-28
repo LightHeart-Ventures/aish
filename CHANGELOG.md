@@ -4,6 +4,10 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Changed
+- **Embedded mcpmarket skill search removed — live search now comes from the plugin**: dropped the in-process mcpmarket network search path from `skill_provider` (the `wreq`/`wreq-util` browser-impersonating HTTP client is gone from `Cargo.toml`). `:skill search` now reads the offline embedded curated index for the builtin source, while live/community search is served exclusively by the `npx-skillfish` plugin (a `provides.skill_source`). The offline index, `:skill add` (GitHub + skill.fish), and the plugin skill-source fan-out are unchanged.
+- **`npx-skills` plugin removed**: npx-skills (npm registry skill search + install) is archived. Live skill import and search is now unified under `npx-skillfish` (agentskills.io/skillfish), which is more performant and upstream-maintained. Removed `plugins/npx-skills/` from the tree; documentation updated to remove references to npm-sourced skills.
+
 ## [0.45.0] - 2025-04-18
 
 ### Added
@@ -38,16 +42,6 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ### Fixed
 - **Test oracle cleanup**: removed stale negative cases for redirection now that `>` is native in the in-subset grammar.
-
-## [Unreleased]
-
-### Changed
-- **Embedded mcpmarket skill search removed — live search now comes from the plugin**: dropped the in-process mcpmarket network search path from `skill_provider` (the `wreq`/`wreq-util` browser-impersonating HTTP client is gone from `Cargo.toml`). `:skill search` now reads the offline embedded curated index for the builtin source, while live/community search is served exclusively by the `npx-skillfish` plugin (a `provides.skill_source`). The offline index, `:skill add` (GitHub + skill.fish), and the plugin skill-source fan-out are unchanged.
-- **`npx-skills` plugin removed**: npx-skills (npm registry skill search + install) is archived. Live skill import and search is now unified under `npx-skillfish` (agentskills.io/skillfish), which is more performant and upstream-maintained. Removed `plugins/npx-skills/` from the tree; documentation updated to remove references to npm-sourced skills.
-
-### Fixed
-- **Sub-coordinator launch-handoff race (ghost workers)**: a coordinator that spawned background workers via `run_in_background` could return and let `main` tear down the tokio runtime *before* an in-flight worker finished detaching its `setsid()` child. The child was killed between `tokio::spawn` and `set_pid` — surfacing as "never got a worktree" / "killed before first heartbeat" ghost rows where the parent wrote its "all dispatched" result then exited seconds later. Added a launch-handoff barrier (`worker::await_launch_handoff`) at the single choke point in `engine::run_coordinator`, before returning to `main` on every terminal phase (Done/Checkpoint/Failed). It waits only for the launch **handoff** (until each child's pid is set and it is a real detached process that outlives the parent), never for the workers to finish.
-
 
 ## [0.40.3] - 2026-08-19
 
