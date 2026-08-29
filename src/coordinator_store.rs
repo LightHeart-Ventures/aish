@@ -361,6 +361,7 @@ impl CoordinatorStore {
     /// Back-compat 4-arg insert for a run with NO parent (a root coordinator
     /// launched from an interactive REPL, and every test call site). Delegates
     /// to `insert_with_parent` with `parent_run_id = None`.
+    #[allow(dead_code)]
     pub fn insert(
         &self,
         run_id: &str,
