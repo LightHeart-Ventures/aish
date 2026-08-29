@@ -22,7 +22,7 @@
       "configKey": "codebaseMemory.autoIndex",
       "configFile": "~/.aish/.mcp.json",
       "resolutionOrder": "env override (AISH_CODEBASE_AUTO_INDEX) -> codebaseMemory.autoIndex bool in ~/.aish/.mcp.json -> ON by default",
-      "enrollmentCaveat": "The repo-open auto-index handoff also checks is_enrolled() against ~/.aish/.mcp.json (mcpServers.codebase-memory). Serving the tools via this plugin makes them AVAILABLE, but auto-index stays dormant unless that enrollment entry is present in ~/.aish/.mcp.json (e.g. via ':codebase install') OR a newer aish teaches the probe to consult plugin .mcp.json. Manual `index_repository` calls work either way. See docs/plugins/codebase-memory-plugin.md."
+      "enrollmentCaveat": "The repo-open auto-index handoff also checks is_enrolled() against ~/.aish/.mcp.json (mcpServers.codebase-memory). Serving the tools via this plugin makes them AVAILABLE, but auto-index stays dormant unless that enrollment entry is present in ~/.aish/.mcp.json (e.g. via ':codebase install') OR a newer aish teaches the probe to consult plugin .mcp.json. Manual `index_repository` calls work either way. See this plugin's README.md § Auto-index gate."
     }
   }
 }
