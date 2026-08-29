@@ -16,6 +16,14 @@
 //! WebSocket transport ([`transport::TungsteniteTransport`]) is behind the
 //! default `net` feature.
 //!
+//! `BrokerConfig` can be loaded from a JSON file via [`BrokerConfig::load`], which
+//! is handy for embedders who want file-based config. **aish's own integration
+//! does not use it** — `src/webhook.rs::config_from_env` in the parent `aish`
+//! crate builds `BrokerConfig` from environment variables
+//! (`WEBHOOK_BROKER_URL` etc.) instead; see the broker's
+//! [`docs/CLIENT.md`](https://github.com/LightHeart-Ventures/aish/blob/main/crates/aish-webhook-broker/docs/CLIENT.md)
+//! for that flow.
+//!
 //! ```no_run
 //! # #[cfg(feature = "net")]
 //! # async fn demo() -> aish_webhook_client::Result<()> {
@@ -26,7 +34,7 @@
 //! };
 //! use tokio::sync::watch;
 //!
-//! let config = BrokerConfig::load("~/.aish/config/broker.json")?;
+//! let config = BrokerConfig::load("~/.aish/config/broker.json")?; // file-based config (library API)
 //! let mut client = BrokerClient::new(config.clone());
 //! let transport = TungsteniteTransport::connect(&config.broker_url).await?;
 //! client.connect(transport).await?;

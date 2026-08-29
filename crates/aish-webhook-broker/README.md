@@ -22,7 +22,7 @@ One broker serves an entire organization: webhooks are keyed by
 | [docs/API.md](docs/API.md) | Full endpoint spec, WebSocket protocol, signature verification, envelope shape |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Every CLI flag + env var, defaults, tuning guidance |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Docker, systemd, AWS (EC2/ECS/Lambda), TLS, hardening; shipped `deploy/` assets (#516) |
-| [docs/CLIENT.md](docs/CLIENT.md) | `aish-webhook-client` (#518): `broker.json`, reconnect/backoff, WS protocol, handler dispatch |
+| [docs/CLIENT.md](docs/CLIENT.md) | `aish-webhook-client` (#518): env-var config, reconnect/backoff, WS protocol, handler dispatch |
 | [docs/PLUGINS.md](docs/PLUGINS.md) | Authoring webhook handlers; the GitHub reference plugin (#517) |
 
 ## Architecture

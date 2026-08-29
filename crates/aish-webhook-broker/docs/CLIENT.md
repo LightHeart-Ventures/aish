@@ -16,34 +16,39 @@ acknowledge them, and fork/exec plugin **handlers** to process each event.
                      ack)           backoff)               filters → run)       stdin+env)
 ```
 
-## Configuration — `broker.json`
+## Configuration — environment variables
 
-Loaded from `~/.aish/config/broker.json` via `BrokerConfig::load()`.
+aish itself (`src/webhook.rs::config_from_env`) builds `BrokerConfig` from
+environment variables, not a config file — this is what `WebhookHandle::spawn_from_env`
+actually reads at REPL startup:
 
-```json
-{
-  "broker_url": "wss://webhook-broker.example.com/ws",
-  "tenant_id": "acme",
-  "plugin": "github",
-  "transport": "websocket",
-  "enabled": true,
-  "secret": "shared-secret-echoed-in-auth",
-  "client_id": "workstation-1"
-}
+| Var | Req | Default | Meaning |
+|-----|-----|---------|---------|
+| `WEBHOOK_BROKER_URL` | ✅ | — | Broker WebSocket URL (`ws://` or `wss://`). Unset ⇒ the broker client never starts (soft no-op). |
+| `WEBHOOK_TENANT_ID` | | `default` | Tenant this client authenticates as. |
+| `WEBHOOK_BROKER_SECRET` | | `null` | Shared secret echoed in the auth frame. |
+| `WEBHOOK_CLIENT_ID` | | generated | Stable client id; auto-generated when absent. |
+| `AISH_PLUGINS_DIR` | | `~/.aish/plugins` | Directory scanned for `plugin.json` webhook handlers. |
+
+```bash
+export WEBHOOK_BROKER_URL="wss://webhook-broker.example.com/ws"
+export WEBHOOK_TENANT_ID="acme"
+aish
 ```
 
-| Field | Req | Default | Meaning |
-|-------|-----|---------|---------|
-| `broker_url` | ✅ | — | Broker WebSocket URL (`ws://` or `wss://`). |
-| `tenant_id` | ✅ | — | Tenant this client authenticates as. |
-| `plugin` | | `null` | Optional plugin scope; broker may fan out per-plugin. |
-| `transport` | | `websocket` | Transport hint; only `websocket` is implemented. |
-| `enabled` | | `true` | Master switch — aish skips broker init when `false`. |
-| `secret` | | `null` | Shared secret echoed in the auth frame. |
-| `client_id` | | generated | Stable client id; auto-generated when absent. |
+See [the README's Webhook Integration section](../../../README.md#webhook-integration)
+for the end-user view of this same flow.
 
-A missing file or `enabled: false` is treated as a soft "no broker" no-op — aish
-starts normally without a broker connection.
+### Library-level file config
+
+The `aish-webhook-client` crate itself also offers `BrokerConfig::load(path)`,
+which parses a `BrokerConfig` from a JSON file (fields: `broker_url`,
+`tenant_id`, `plugin?`, `transport`, `enabled`, `secret?`, `client_id?`) — a
+convenience for embedders who want file-based config instead of environment
+variables. **aish's own integration does not call it**; the `spawn_from_env`
+path above is what actually runs when you start `aish`. A missing file or
+`enabled: false` passed to `load()` is a caller's choice to treat as a soft
+"no broker" no-op — that logic lives in the caller, not in `load()` itself.
 
 ## Connection lifecycle
 
