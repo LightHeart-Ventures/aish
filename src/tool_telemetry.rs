@@ -168,14 +168,22 @@ pub fn classify(content: &str) -> ErrorClass {
         || has("no such file")
         || has("does not exist")
         || has("doesn't exist")
+        || has("enoent")
     {
         return ErrorClass::NotFound;
     }
     if has(" 409") || has("conflict") || has("already exists") {
         return ErrorClass::Conflict;
     }
-    if has("permission denied") || has("eacces") || has("operation not permitted") {
+    if has("permission denied")
+        || has("eacces")
+        || has("operation not permitted")
+        || has("access denied")
+    {
         return ErrorClass::Permission;
+    }
+    if has("is a directory") || has("isadirectory") || has("illegal operation on a directory") {
+        return ErrorClass::InvalidArgs;
     }
     if has("connection refused")
         || has("connection reset")
@@ -768,5 +776,43 @@ mod tests {
         let mut s = Session::new().unwrap();
         s.db = None;
         assert!(aggregate_cached(&mut s).is_none());
+    }
+
+    #[test]
+    fn classify_directory_error() {
+        assert_eq!(
+            classify("is a directory"),
+            ErrorClass::InvalidArgs,
+            "should categorize 'is a directory' as InvalidArgs"
+        );
+        assert_eq!(
+            classify("IsADirectory"),
+            ErrorClass::InvalidArgs,
+            "case-insensitive"
+        );
+        assert_eq!(
+            classify("illegal operation on a directory"),
+            ErrorClass::InvalidArgs,
+            "should match verbose form"
+        );
+    }
+
+    #[test]
+    fn classify_permission_errors() {
+        assert_eq!(classify("permission denied"), ErrorClass::Permission);
+        assert_eq!(classify("EACCES"), ErrorClass::Permission);
+        assert_eq!(classify("access denied"), ErrorClass::Permission);
+        assert_eq!(
+            classify("operation not permitted"),
+            ErrorClass::Permission
+        );
+    }
+
+    #[test]
+    fn classify_not_found_errors() {
+        assert_eq!(classify("no such file"), ErrorClass::NotFound);
+        assert_eq!(classify("ENOENT"), ErrorClass::NotFound);
+        assert_eq!(classify("does not exist"), ErrorClass::NotFound);
+        assert_eq!(classify("not found"), ErrorClass::NotFound);
     }
 }
