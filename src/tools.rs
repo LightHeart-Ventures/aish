@@ -1891,7 +1891,22 @@ the strong model sees nothing else"
             } else {
                 format!("[escalated] {}. Resolved in {}ms.", task, latency_ms)
             };
-            let _ = db.remember(&memory_content, Some("escalation"));
+            match db.remember(&memory_content, Some("escalation")) {
+                Ok(id) => {
+                    eprintln!("[aish] stored escalation memory id={id} for topic={:?}", task);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[aish] WARNING: failed to store escalation memory for topic={:?}: {e:#}",
+                        task
+                    );
+                }
+            }
+        } else {
+            eprintln!(
+                "[aish] WARNING: no database session available to store escalation memory for topic={:?}",
+                task
+            );
         }
     }
     
@@ -1963,16 +1978,35 @@ fn reasoning_note(call: &ToolCall, session: &Session) -> Result<String> {
                         risk.as_str()
                     )
                 };
-                if let Some(ref db) = session.db {
-                    let _ = db.remember(&memory_content, Some("reasoning"));
-                }
+                let memory_stored = if let Some(ref db) = session.db {
+                    match db.remember(&memory_content, Some("reasoning")) {
+                        Ok(mem_id) => {
+                            eprintln!("[aish] stored reasoning memory id={mem_id} for decision={}", decision.as_str());
+                            true
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[aish] WARNING: failed to store reasoning memory for decision={}: {e:#}",
+                                decision.as_str()
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "[aish] WARNING: no database session available to store reasoning memory for decision={}",
+                        decision.as_str()
+                    );
+                    false
+                };
                 
                 Ok(format!(
-                    "logged reasoning note {id} ({}, complexity={}, risk={}). Close the loop later with \
+                    "logged reasoning note {id} ({}, complexity={}, risk={}){} Close the loop later with \
 event_id={id} + outcome=correct|wrong_turn.",
                     decision.as_str(),
                     complexity.as_str(),
-                    risk.as_str()
+                    risk.as_str(),
+                    if memory_stored { ". " } else { " (note: memory storage failed) " }
                 ))
             }
             None => Ok(
