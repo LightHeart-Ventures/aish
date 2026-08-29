@@ -1850,6 +1850,9 @@ the strong model sees nothing else"
     }
     .map_err(|e| anyhow::anyhow!("couldn't reach the strong model for escalation: {e:#}"))?;
 
+    // DEBUG: Check if session.db is available before attempting memory write.
+    eprintln!("[DEBUG escalate] session.db is Some={}", session.db.is_some());
+    
     // Time the escalation call to measure latency.
     let start = std::time::Instant::now();
     let turn = backend
@@ -1882,31 +1885,46 @@ the strong model sees nothing else"
         // from its own hard judgments and can use memory to avoid re-escalating
         // the same problem. Fixes the reinforcing loop: no memory → escalate →
         // forget → repeat. Format: "[escalated] <topic>. Resolved in <latency>ms, <tokens> tokens."
-        if let Some(ref db) = session.db {
-            let memory_content = if let Some(tokens) = tokens_used {
-                format!(
-                    "[escalated] {}. Resolved in {}ms, {} tokens.",
-                    task, latency_ms, tokens
-                )
-            } else {
-                format!("[escalated] {}. Resolved in {}ms.", task, latency_ms)
-            };
-            match db.remember(&memory_content, Some("escalation")) {
-                Ok(id) => {
-                    eprintln!("[aish] stored escalation memory id={id} for topic={:?}", task);
+        let memory_content = if let Some(tokens) = tokens_used {
+            format!(
+                "[escalated] {}. Resolved in {}ms, {} tokens.",
+                task, latency_ms, tokens
+            )
+        } else {
+            format!("[escalated] {}. Resolved in {}ms.", task, latency_ms)
+        };
+        
+        // Try to store the memory. First, check if session.db is available.
+        // If not, try to open it as a fallback (fixes the case where escalate()
+        // is called from a context where the session db wasn't initialized).
+        let store_result = if let Some(ref db) = session.db {
+            db.remember(&memory_content, Some("escalation"))
+        } else {
+            // Fallback: try to open the database ourselves.
+            match crate::db::Db::open(&crate::db_paths::main_db_path()) {
+                Ok(db) => {
+                    eprintln!("[aish] opened database fallback for escalation memory store");
+                    db.remember(&memory_content, Some("escalation"))
                 }
                 Err(e) => {
                     eprintln!(
-                        "[aish] WARNING: failed to store escalation memory for topic={:?}: {e:#}",
-                        task
+                        "[aish] WARNING: could not open database for escalation memory: {e:#}"
                     );
+                    Err(anyhow::anyhow!("database unavailable"))
                 }
             }
-        } else {
-            eprintln!(
-                "[aish] WARNING: no database session available to store escalation memory for topic={:?}",
-                task
-            );
+        };
+        
+        match store_result {
+            Ok(id) => {
+                eprintln!("[aish] stored escalation memory id={id} for topic={:?}", task);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[aish] WARNING: failed to store escalation memory for topic={:?}: {e:#}",
+                    task
+                );
+            }
         }
     }
     
