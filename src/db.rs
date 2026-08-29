@@ -161,6 +161,7 @@ impl Db {
 
     /// Health check: test database connectivity and basic table access.
     /// Returns true if the database is healthy, false otherwise.
+    #[allow(dead_code)]
     pub fn health_check(&self) -> bool {
         // Test 1: Can we ping the database?
         if self.conn.execute_batch("SELECT 1").is_err() {
@@ -177,6 +178,7 @@ impl Db {
     }
 
     /// Get database WAL checkpoint mode and current file sizes for diagnostics.
+    #[allow(dead_code)]
     pub fn wal_status(&self) -> Result<(String, Option<u64>, Option<u64>)> {
         let mode: String = self
             .conn
@@ -194,6 +196,7 @@ impl Db {
     }
 
     /// Record a worktree creation event (Fix #3: worktree lifecycle tracking).
+    #[allow(dead_code)]
     pub fn record_worktree_created(
         &self,
         worktree_id: &str,
@@ -213,6 +216,7 @@ impl Db {
     }
 
     /// Record a successful worktree cleanup event.
+    #[allow(dead_code)]
     pub fn record_worktree_cleaned_up(&self, worktree_id: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE worktree_lifecycle
@@ -224,6 +228,7 @@ impl Db {
     }
 
     /// Record a failed cleanup attempt.
+    #[allow(dead_code)]
     pub fn record_worktree_cleanup_failed(&self, worktree_id: &str, error: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE worktree_lifecycle
@@ -236,6 +241,7 @@ impl Db {
 
     /// List orphaned worktrees (created but never cleaned up, run is old/gone).
     /// This helps detect stale background coordinator worktrees that need manual cleanup.
+    #[allow(dead_code)]
     pub fn list_orphaned_worktrees(&self, hours_old: i64) -> Result<Vec<(String, String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT worktree_id, worktree_path, run_id
@@ -881,6 +887,7 @@ impl Db {
     }
 
     /// Fetch one goal by id, or `None` when it doesn't exist.
+    #[allow(dead_code)]
     pub fn get_goal(&self, id: &str) -> Result<Option<crate::goal::Goal>> {
         self.conn
             .query_row(
@@ -910,6 +917,7 @@ impl Db {
     }
 
     /// Direct children of `parent_id` (one level of the subgoal tree).
+    #[allow(dead_code)]
     pub fn child_goals(&self, parent_id: &str) -> Result<Vec<crate::goal::Goal>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, description, status, parent_id,
@@ -928,6 +936,7 @@ impl Db {
     /// Delete a goal and its entire subgoal subtree (depth-first). Returns the
     /// number of rows removed. SQLite has no recursive DELETE, so we walk the
     /// tree in Rust to avoid orphaning descendants.
+    #[allow(dead_code)]
     pub fn delete_goal(&self, id: &str) -> Result<usize> {
         let mut removed = 0;
         let child_ids: Vec<String> = {
