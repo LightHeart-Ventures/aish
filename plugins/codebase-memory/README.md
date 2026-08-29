@@ -130,5 +130,3 @@ matching tasks.
 | `.mcp.json` | The `codebase-memory` stdio server entry aish auto-merges. |
 | `PREREQUISITES.md` | How to install the `codebase-memory-mcp` binary. |
 | `skills/code-intelligence/SKILL.md` | Graph-first code-discovery playbook. |
-
-See also: [`docs/plugins/codebase-memory-plugin.md`](../../docs/plugins/codebase-memory-plugin.md).
