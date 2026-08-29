@@ -3282,8 +3282,40 @@ fn read_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) 
             return Ok("user declined the read".into());
         }
     }
-    let content =
-        std::fs::read_to_string(&full).map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
+    // Try to read as UTF-8 first; if that fails with invalid UTF-8, fall back to
+    // lossy decoding (common for log files, binary config, mixed encodings). For
+    // other IO errors (permission, not-found, etc.), propagate with context.
+    let content = match std::fs::read_to_string(&full) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            // UTF-8 decoding error; try reading as binary and decode with lossy replacement
+            match std::fs::read(&full) {
+                Ok(bytes) => {
+                    String::from_utf8_lossy(&bytes).into_owned()
+                }
+                Err(e2) => {
+                    return Err(anyhow::anyhow!(
+                        "{}: cannot read (tried UTF-8 and binary fallback): {}",
+                        full.display(),
+                        e2
+                    ))
+                }
+            }
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "{}: {} ({})",
+                full.display(),
+                e,
+                match e.kind() {
+                    std::io::ErrorKind::PermissionDenied => "check file permissions (chmod +r)",
+                    std::io::ErrorKind::NotFound => "file not found or invalid symlink",
+                    std::io::ErrorKind::IsADirectory => "is a directory, not a file",
+                    _ => "see error details above"
+                }
+            ))
+        }
+    };
 
     // Optional 1-based inclusive line range. Reading a slice of a large file is
     // cheaper than the whole thing and sidesteps the duplicate-read loop-guard.

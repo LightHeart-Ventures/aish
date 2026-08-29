@@ -523,6 +523,7 @@ impl HookSet {
 
     /// Load + merge an explicit, ordered list of config files. Earlier files
     /// register first (so they dispatch first). The testable core of [`load`].
+    #[allow(dead_code)]
     pub fn load_from(paths: &[PathBuf]) -> Self {
         let mut hooks: Vec<Hook> = Vec::new();
         for path in paths {

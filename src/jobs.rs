@@ -18,6 +18,7 @@ const JOB_BUFFER_CAP: usize = 64_000;
 /// its output streaming to the user (background).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
+    #[allow(dead_code)]
     Foreground,
     Background,
 }
@@ -27,6 +28,7 @@ pub enum JobKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobState {
     Running,
+    #[allow(dead_code)]
     Stopped,
     Done(String),
 }
@@ -53,6 +55,7 @@ impl JobState {
 pub struct Job {
     pub id: usize,
     pub desc: String,
+    #[allow(dead_code)]
     pub kind: JobKind,
     state: Mutex<JobState>,
     buffer: Mutex<String>,
@@ -87,6 +90,7 @@ impl Job {
     }
 
     /// A foreground job (the shell waits on it; no kill channel).
+    #[allow(dead_code)]
     pub fn foreground(id: usize, desc: String) -> Arc<Self> {
         Arc::new(Job {
             id,
@@ -131,6 +135,7 @@ impl Job {
     }
 
     /// Suspend a running job (SIGTSTP / Ctrl-Z). No-op once finished.
+    #[allow(dead_code)]
     pub fn stop(&self) {
         let mut state = self.state.lock().unwrap();
         if !state.is_done() {

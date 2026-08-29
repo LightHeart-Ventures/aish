@@ -126,12 +126,14 @@ pub fn confirm_tty(prompt: &str) -> tools::Decision {
 }
 
 /// Emit an OSC 0 (icon name & window title) sequence to set the terminal window title.
+#[allow(dead_code)]
 fn set_window_title(title: &str) {
     print!("\x1b]0;{}\x07", title);
     let _ = std::io::stdout().flush();
 }
 
 /// Emit an OSC 0 sequence with an empty string to reset the terminal window title.
+#[allow(dead_code)]
 fn reset_window_title() {
     print!("\x1b]0;\x07");
     let _ = std::io::stdout().flush();
