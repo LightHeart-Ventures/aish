@@ -1,7 +1,7 @@
 # Plugin Memory Schema (Phase 2)
 
 **Status:** implemented — `src/plugin_memory.rs`
-**Related:** `docs/PLUGIN_SYSTEM_DESIGN.md` §"Plugin Memory Schema" and §Phase 2; sibling store `src/plugin_state.rs` (Phase 1.5, SQLite).
+**Related:** sibling store `src/plugin_state.rs` (Phase 1.5, SQLite).
 
 Plugin memory is a persistent, **namespaced, per-plugin** store backed by plain
 JSON files. It is deliberately *not* the SQLite `plugin_state` store: those are
@@ -27,12 +27,11 @@ two complementary layers.
 └── prefs.json     # user preferences — mode 0644, user-editable
 ```
 
-> **Path reconciliation.** `PLUGIN_SYSTEM_DESIGN.md` shows the directory tree
-> under `~/.aish/plugins/<id>/memory/` **and** (in the struct comment) an
-> alternate `~/.aish/memory/plugins/<id>/<ns>.json`. Phase 2 uses the former —
-> co-locating a plugin's memory with the plugin keeps everything a plugin owns
-> under one directory (skills, config, credentials, memory), matches the
-> canonical directory diagram, and makes uninstall a single `rm -rf`.
+> **Path reconciliation.** An earlier design sketch considered an alternate
+> layout, `~/.aish/memory/plugins/<id>/<ns>.json`. The implementation uses
+> `~/.aish/plugins/<id>/memory/` instead — co-locating a plugin's memory with
+> the plugin keeps everything a plugin owns under one directory (skills,
+> config, credentials, memory), and makes uninstall a single `rm -rf`.
 
 **Format: JSON.** Chosen over TOML for consistency with the rest of the plugin
 system (`plugin.json`, `config.json`, `plugin_state`'s `serde_json::Value`) and
