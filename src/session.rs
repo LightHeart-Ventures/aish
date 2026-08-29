@@ -373,10 +373,6 @@ pub struct Session {
     /// `background_status` / startup rehydrate can see runs across restarts.
     /// None if it failed to open — coordinator runs then aren't persisted.
     pub coordinator_store: Option<crate::db::CoordinatorStore>,
-    /// Durable goal-tree store (own SQLite connection, TASK-276). Persists goals,
-    /// subgoals, milestones, blockers, and task links alongside memories in
-    /// aish.db. None if it failed to open — goals then aren't persisted.
-    pub goal_store: Option<crate::db::GoalStore>,
     /// Durable `:alert` monitor store (shares aish.db). Cloneable — the
     /// background presenter, the `:alert` command handler, and the `set_alert`
     /// tool all hold a handle. None if it failed to open.
@@ -659,7 +655,6 @@ impl Session {
             recent_dispatches: std::collections::HashMap::new(),
             schedule: crate::schedule::Scheduler::new(),
             coordinator_store: None,
-            goal_store: None,
             alert_store: None,
             activity_store: None,
             flash: std::sync::Arc::new(std::sync::Mutex::new(None)),
