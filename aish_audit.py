@@ -204,11 +204,11 @@ class AishAudit:
                 # Phase values: 'coordinating', 'awaiting_batch', 'checkpoint', 'done', 'failed'
                 
                 # First, proactively clean up stalled runs (5+ minutes no heartbeat activity)
-                # before counting active ones.
+                # before counting active ones. Include 'checkpoint' phase in cleanup.
                 cur.execute(f"""
                     UPDATE {table}
                     SET phase = 'failed', error = 'stalled: no heartbeat activity for 5+ minutes'
-                    WHERE phase IN ('coordinating', 'awaiting_batch')
+                    WHERE phase IN ('coordinating', 'awaiting_batch', 'checkpoint')
                     AND (heartbeat_at IS NULL OR (strftime('%s', 'now') - strftime('%s', heartbeat_at)) > 300)
                 """)
                 
