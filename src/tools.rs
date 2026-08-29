@@ -1877,6 +1877,22 @@ the strong model sees nothing else"
             Some(latency_ms),
             None, // trigger_reason: caller knows their own reason; not available here
         );
+        
+        // Auto-store a durable memory for this escalation so the system learns
+        // from its own hard judgments and can use memory to avoid re-escalating
+        // the same problem. Fixes the reinforcing loop: no memory → escalate →
+        // forget → repeat. Format: "[escalated] <topic>. Resolved in <latency>ms, <tokens> tokens."
+        if let Some(ref db) = session.db {
+            let memory_content = if let Some(tokens) = tokens_used {
+                format!(
+                    "[escalated] {}. Resolved in {}ms, {} tokens.",
+                    task, latency_ms, tokens
+                )
+            } else {
+                format!("[escalated] {}. Resolved in {}ms.", task, latency_ms)
+            };
+            let _ = db.remember(&memory_content, Some("escalation"));
+        }
     }
     
     Ok(answer.to_string())
