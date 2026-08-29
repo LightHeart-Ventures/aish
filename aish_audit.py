@@ -169,6 +169,7 @@ class AishAudit:
                 else:
                     self.log("database", f"  Table '{table}': error - {e}", "warning")
         
+        conn.commit()  # Persist any stall cleanup updates
         conn.close()
         self._save_checkpoint("aish_db_complete")
     
