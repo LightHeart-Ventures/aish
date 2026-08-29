@@ -6,7 +6,7 @@
 # aish captures this script's STDOUT and parses any `KEY=VALUE` lines into the
 # session environment, so every command you subsequently spawn sees them.
 #
-# Rules the loader enforces (see docs/PLUGIN_SYSTEM_DESIGN.md §0.5.4):
+# Rules the loader enforces:
 #   * Only `NAME=VALUE` lines are parsed; NAME must be [A-Za-z_][A-Za-z0-9_]*.
 #   * Any other stdout (status text, banners, comments) is ignored — so it's
 #     safe to print human-readable progress alongside your exports.

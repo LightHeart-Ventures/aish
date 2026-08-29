@@ -81,5 +81,5 @@ type mismatch) never drops the plugin — its skills still load; only the resolv
 `config` is withheld.
 
 Unknown fields are ignored, so this manifest stays forward-compatible with the
-richer plugin schema in [`docs/PLUGIN_SYSTEM_DESIGN.md`](../../../docs/PLUGIN_SYSTEM_DESIGN.md)
+richer plugin schema documented under [`docs/reference/plugins/`](../../../docs/reference/plugins/)
 (MCP servers, tools, webhooks, hooks, memory, schemas) as those phases land.

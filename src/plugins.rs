@@ -7,12 +7,13 @@
 //! [`crate::skills::load`] already understands, so a plugin's skills flow into
 //! the same catalog the agent sees for `~/.aish/skills`.
 //!
-//! This is deliberately the smallest useful piece of the broader design in
-//! `docs/PLUGIN_SYSTEM_DESIGN.md` (webhooks, hooks, MCP servers, tools, memory,
-//! schemas). Everything not needed to expand the skill registry is ignored —
-//! unknown `plugin.json` keys parse and are dropped — so a richer manifest still
-//! loads today and future phases can grow into it without breaking existing
-//! plugins.
+//! This is deliberately the smallest useful piece of a broader plugin system
+//! (webhooks, hooks, MCP servers, tools, memory, schemas — see
+//! `docs/reference/plugins/` and `docs/design/*-plugin-integration.md` for the
+//! surfaces that have since landed). Everything not needed to expand the skill
+//! registry is ignored — unknown `plugin.json` keys parse and are dropped — so
+//! a richer manifest still loads today and future phases can grow into it
+//! without breaking existing plugins.
 
 use crate::skills::Skill;
 use serde::Deserialize;
@@ -24,7 +25,7 @@ use std::path::{Path, PathBuf};
 /// serde's default unknown-field-dropping so a fuller manifest still
 /// deserializes.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // name/version/description are parsed manifest surface, consumed by later plugin phases (docs/PLUGIN_SYSTEM_DESIGN.md)
+#[allow(dead_code)] // name/version/description are parsed manifest surface, consumed by later plugin phases
 pub struct PluginManifest {
     /// Stable plugin identifier, e.g. `"hello-world"`.
     pub id: String,
@@ -55,8 +56,7 @@ pub struct PluginManifest {
     #[serde(default)]
     pub config_schema: Option<Value>,
     /// The capabilities a plugin contributes to the shell — lifecycle hooks,
-    /// event hooks, config/env injection, login command, … (see
-    /// `docs/PLUGIN_SYSTEM_DESIGN.md` § Enterprise Addendum). Only the fields
+    /// event hooks, config/env injection, login command, … Only the fields
     /// modeled on [`Provides`] are understood today; unknown keys are dropped.
     #[serde(default)]
     pub provides: Option<Provides>,

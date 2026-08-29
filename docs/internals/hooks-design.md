@@ -52,11 +52,11 @@ and a phased implementation plan.
 
 ### 1.2 Relationship to the plugin system
 
-`docs/PLUGIN_SYSTEM_DESIGN.md` introduces a narrow, plugin-scoped notion of
-"hooks" — four shell scripts (`on_init`, `on_shell_ready`,
-`on_webhook_url_changed`, `on_shutdown`) that live in a plugin directory and run
-at startup/shutdown. This document **generalizes and subsumes** that idea into a
-first-class lifecycle-hook subsystem:
+Plugins introduce a narrow, plugin-scoped notion of "hooks" — four shell
+scripts (`on_init`, `on_shell_ready`, `on_webhook_url_changed`, `on_shutdown`)
+that live in a plugin directory and run at startup/shutdown (see
+`docs/reference/plugins/`). This document **generalizes and subsumes** that
+idea into a first-class lifecycle-hook subsystem:
 
 - The plugin doc's four scripts map onto a strict subset of this catalog:
   `on_init`/`on_shell_ready` → `SessionStart`/`McpServersReady`,
