@@ -69,7 +69,7 @@ regardless of the process cwd the dispatcher launches them under.
 {
   "id": "github",
   "version": "0.1.0",
-  "webhooks": [                    // alias "handlers" also accepted for back-compat
+  "webhooks": [                    // canonical key; legacy top-level "handlers" is rejected (TASK-447)
     {
       "event_type": "pull_request", // "*" matches all events
       "command": ["handlers/pr-review.sh"], // argv[0] + args; no shell
@@ -80,15 +80,14 @@ regardless of the process cwd the dispatcher launches them under.
 }
 ```
 
-## Known limitation — handler path resolution
+## Handler path resolution
 
-The current `aish-webhook-client` dispatcher fork/exec's `command[0]` **without
-setting the child's cwd or resolving the path relative to the plugin
-directory**. A relative `handlers/pr-review.sh` therefore resolves against the
-broker process's cwd, not `plugins/github/`. Until core wires plugin-dir
-resolution (tracked in the routing ADR, `docs/design/webhook-plugin-routing.md`),
-deployments should either run the broker with cwd at the plugin root or rewrite
-`command[0]` to an absolute path at load time.
+`PluginRegistry::load_dir` resolves a relative `command[0]` (one containing a
+`/`, e.g. `handlers/pr-review.sh`) against the plugin's own directory at
+manifest-load time, so `plugins/github/handlers/pr-review.sh` runs correctly
+regardless of the broker process's cwd. Bare program names (no `/`) are left
+alone for `PATH` lookup, and absolute paths are unchanged. See
+`crates/aish-webhook-client/src/dispatcher.rs` (`PluginRegistry::load_dir`).
 
 ## Local smoke test
 
