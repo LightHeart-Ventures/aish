@@ -361,6 +361,7 @@ impl CoordinatorStore {
     /// Back-compat 4-arg insert for a run with NO parent (a root coordinator
     /// launched from an interactive REPL, and every test call site). Delegates
     /// to `insert_with_parent` with `parent_run_id = None`.
+    #[allow(dead_code)]
     pub fn insert(
         &self,
         run_id: &str,
@@ -445,10 +446,12 @@ impl CoordinatorStore {
         
         let conn = self.conn.lock().unwrap();
         // Mark any active phase with stale heartbeat as failed.
+        // Includes 'checkpoint' phase (TASK-330: resumable-pause coordinator)
+        // in addition to 'coordinating' and 'awaiting_batch'.
         conn.execute(
             "UPDATE coordinator_runs 
              SET phase = 'failed', error = 'stalled: no heartbeat activity for 5+ minutes'
-             WHERE phase IN ('coordinating', 'awaiting_batch')
+             WHERE phase IN ('coordinating', 'awaiting_batch', 'checkpoint')
              AND (heartbeat_at IS NULL OR (strftime('%s', 'now') - strftime('%s', heartbeat_at)) > ?)",
             [STALL_THRESHOLD_SECS],
         )?;
@@ -592,6 +595,26 @@ impl CoordinatorStore {
         });
         rows.truncate(limit);
         Ok(rows)
+    }
+
+    /// Proactively detect and mark any stalled runs (5+ min no heartbeat) as
+    /// failed. Useful for explicit cleanup; `load_all()` calls this automatically
+    /// at startup. Returns the count of stalled runs marked as failed.
+    #[allow(dead_code)]
+    pub fn reap_stalled_runs(&self) -> Result<usize> {
+        const STALL_THRESHOLD_SECS: i64 = 5 * 60;
+        
+        let conn = self.conn.lock().unwrap();
+        // Mark any active phase with stale heartbeat as failed.
+        conn.execute(
+            "UPDATE coordinator_runs 
+             SET phase = 'failed', error = 'stalled: no heartbeat activity for 5+ minutes'
+             WHERE phase IN ('coordinating', 'awaiting_batch', 'checkpoint')
+             AND (heartbeat_at IS NULL OR (strftime('%s', 'now') - strftime('%s', heartbeat_at)) > ?)",
+            [STALL_THRESHOLD_SECS],
+        )
+        .map(|count| count as usize)
+        .map_err(Into::into)
     }
 
 

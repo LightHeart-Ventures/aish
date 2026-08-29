@@ -641,22 +641,30 @@ fn encode_query(s: &str) -> String {
 
 /// Plugin metadata from the registry.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct PluginInfo {
     pub id: String,
+    #[allow(dead_code)]
     pub name: String,
     pub description: String,
+    #[allow(dead_code)]
     pub author: String,
+    #[allow(dead_code)]
     pub repository: String,
     pub reference: String,
     pub branch: String,
+    #[allow(dead_code)]
     pub version: String,
+    #[allow(dead_code)]
     pub enabled: bool,
+    #[allow(dead_code)]
     pub provides: std::collections::HashMap<String, bool>,
 }
 
 /// Plugin registry wrapper.
 #[derive(Debug, serde::Deserialize)]
 struct PluginRegistry {
+    #[allow(dead_code)]
     version: String,
     plugins: Vec<PluginInfo>,
 }
@@ -759,6 +767,7 @@ pub fn list_available_plugins() -> Vec<PluginInfo> {
 }
 
 /// Get plugin info from the registry.
+#[allow(dead_code)]
 pub fn get_plugin_info(plugin_id: &str) -> Option<PluginInfo> {
     local_plugins_catalog()
         .into_iter()
