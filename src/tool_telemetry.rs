@@ -160,6 +160,9 @@ pub fn classify(content: &str) -> ErrorClass {
         || has("bad credentials")
         || has("invalid token")
         || has("not authorized")
+        || has("token authentication required")
+        || has("requires authentication")
+        || has("authentication required")
     {
         return ErrorClass::Auth;
     }
@@ -172,7 +175,13 @@ pub fn classify(content: &str) -> ErrorClass {
     {
         return ErrorClass::NotFound;
     }
-    if has(" 409") || has("conflict") || has("already exists") {
+    if has(" 409")
+        || has("conflict")
+        || has("already exists")
+        || has("pull request already exists")
+        || has("reference already exists")
+        || has("branch already exists")
+    {
         return ErrorClass::Conflict;
     }
     if has("permission denied")
