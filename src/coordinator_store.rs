@@ -437,6 +437,24 @@ impl CoordinatorStore {
         Ok(())
     }
 
+    /// Detect and mark stalled runs (non-terminal phase + heartbeat > 5 minutes old)
+    /// as failed. Called automatically by `load_all()` to proactively clean up
+    /// hung coordinators without requiring an aish restart.
+    fn cleanup_stalled_runs(&self) -> Result<()> {
+        const STALL_THRESHOLD_SECS: i64 = 5 * 60;
+        
+        let conn = self.conn.lock().unwrap();
+        // Mark any active phase with stale heartbeat as failed.
+        conn.execute(
+            "UPDATE coordinator_runs 
+             SET phase = 'failed', error = 'stalled: no heartbeat activity for 5+ minutes'
+             WHERE phase IN ('coordinating', 'awaiting_batch')
+             AND (heartbeat_at IS NULL OR (strftime('%s', 'now') - strftime('%s', heartbeat_at)) > ?)",
+            [STALL_THRESHOLD_SECS],
+        )?;
+        Ok(())
+    }
+
     pub fn set_failed(&self, run_id: &str, error: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE coordinator_runs \
@@ -507,8 +525,12 @@ impl CoordinatorStore {
     }
 
     /// Every persisted run, oldest first — used at startup to surface completed
-    /// runs and reap orphaned ones.
+    /// runs and reap orphaned ones. Automatically marks any stalled runs as failed
+    /// before returning (stall threshold: 5 minutes no heartbeat activity).
     pub fn load_all(&self) -> Result<Vec<CoordinatorRow>> {
+        // First, detect and mark any stalled runs.
+        self.cleanup_stalled_runs()?;
+        
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT run_id, task, phase, result, error, session_id, session_name, created_at, heartbeat_at, \

@@ -42,20 +42,23 @@ class AishAudit:
             self.client = None
         else:
             try:
-                client_kwargs = {"api_key": api_key}
-                workspace_id = os.getenv("ANTHROPIC_WORKSPACE_ID")
-                if workspace_id:
-                    client_kwargs["default_headers"] = {"anthropic-workspace-id": workspace_id}
-                self.client = anthropic.Anthropic(**client_kwargs)
-                # Test the client with a cheap models call to verify auth
+                # Try without workspace header first (for standard API keys)
+                self.client = anthropic.Anthropic(api_key=api_key)
                 try:
                     self.client.models.list()
                 except anthropic.BadRequestError as e:
                     if "workspace" in str(e).lower():
-                        # Try again without workspace header
-                        self.log("llm", "Retrying without workspace header...", "info")
-                        self.client = anthropic.Anthropic(api_key=api_key)
-                        self.client.models.list()  # Verify it works
+                        # Need workspace ID for identity-linked keys
+                        workspace_id = os.getenv("ANTHROPIC_WORKSPACE_ID")
+                        if workspace_id:
+                            client_kwargs = {"api_key": api_key, "default_headers": {"anthropic-workspace-id": workspace_id}}
+                            self.client = anthropic.Anthropic(**client_kwargs)
+                            self.client.models.list()
+                        else:
+                            self.log("llm", "Identity-linked API key requires ANTHROPIC_WORKSPACE_ID — LLM analysis skipped", "warning")
+                            self.client = None
+                    else:
+                        raise
             except anthropic.AuthenticationError as e:
                 self.log("llm", f"Authentication failed: {e} — LLM analysis will be skipped", "warning")
                 self.client = None
@@ -198,6 +201,16 @@ class AishAudit:
             elif table == "coordinator_runs":
                 # coordinator_runs: run_id, task, phase, result, error, session_id, session_name, created_at, heartbeat_at, stand_down, checkpoint
                 # Phase values: 'coordinating', 'awaiting_batch', 'checkpoint', 'done', 'failed'
+                
+                # First, proactively clean up stalled runs (5+ minutes no heartbeat activity)
+                # before counting active ones.
+                cur.execute(f"""
+                    UPDATE {table}
+                    SET phase = 'failed', error = 'stalled: no heartbeat activity for 5+ minutes'
+                    WHERE phase IN ('coordinating', 'awaiting_batch')
+                    AND (heartbeat_at IS NULL OR (strftime('%s', 'now') - strftime('%s', heartbeat_at)) > 300)
+                """)
+                
                 cur.execute(f"""
                     SELECT COUNT(*) FROM {table} 
                     WHERE phase IN ('coordinating', 'awaiting_batch', 'checkpoint')
