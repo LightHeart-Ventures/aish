@@ -223,6 +223,7 @@ pub fn job_activity_emoji(task: &str) -> &'static str {
 /// `:workers` table uses for `:alert` monitors, so the fire is instantly legible
 /// as an alert. Bold yellow when color is on (it stands apart from the worker
 /// badges); plain glyph + text otherwise. Pure, so it's unit-testable.
+#[allow(dead_code)]
 pub fn alert_badge(banner: &str, color_on: bool) -> String {
     if color_on {
         format!("\x1b[1;33m{ALERT_GLYPH} {banner}\x1b[0m")

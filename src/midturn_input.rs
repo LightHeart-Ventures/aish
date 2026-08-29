@@ -237,16 +237,19 @@ impl LineBuf {
     }
 
     /// Cursor position as a char index.
+    #[allow(dead_code)]
     pub fn cursor(&self) -> usize {
         self.cursor
     }
 
     /// Number of chars in the buffer.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.chars.len()
     }
 
     /// True when the buffer holds no chars.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.chars.is_empty()
     }
@@ -395,6 +398,7 @@ pub enum Action {
 /// That serialization is the wiring layer's job (see `docs/design/midturn-input.md`);
 /// this type deliberately owns no tty and no lock so the escape sequences can be
 /// asserted byte-for-byte in tests.
+#[allow(dead_code)]
 pub struct FooterRender<'a> {
     /// The prompt sigil (e.g. `"» "`), rendered verbatim before the text.
     pub prompt: &'a str,
@@ -408,6 +412,7 @@ pub struct FooterRender<'a> {
 impl<'a> FooterRender<'a> {
     /// Physical terminal rows the prompt line occupies (always ≥ 1), accounting
     /// for soft-wrap at `cols`. Uses display width (so wide CJK/emoji count as 2).
+    #[allow(dead_code)]
     pub fn prompt_rows(&self) -> usize {
         let w = UnicodeWidthStr::width(self.prompt) + UnicodeWidthStr::width(self.text);
         if self.cols == 0 {
@@ -421,6 +426,7 @@ impl<'a> FooterRender<'a> {
 
     /// ANSI to paint the footer: a blank gap line then `prompt + text`, leaving
     /// the cursor at the end of the text.
+    #[allow(dead_code)]
     pub fn draw(&self) -> String {
         format!("\n{}{}", self.prompt, self.text)
     }
@@ -428,6 +434,7 @@ impl<'a> FooterRender<'a> {
     /// ANSI to remove a previously-[`draw`](Self::draw)n footer, returning the
     /// cursor to column 0 of the line where `draw` began. Clears the last prompt
     /// row, then walks up clearing the remaining prompt rows and the blank gap.
+    #[allow(dead_code)]
     pub fn erase(&self) -> String {
         let rows = self.prompt_rows();
         let mut s = String::from("\r\x1b[2K");
