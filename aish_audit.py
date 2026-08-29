@@ -42,25 +42,28 @@ class AishAudit:
             self.client = None
         else:
             try:
-                # Try without workspace header first (for standard API keys)
-                self.client = anthropic.Anthropic(api_key=api_key)
+                # Check if workspace ID is needed (identity-linked keys require it)
+                workspace_id = os.getenv("ANTHROPIC_WORKSPACE_ID")
+                if workspace_id:
+                    # Create client with workspace header for identity-linked keys
+                    client_kwargs = {"api_key": api_key, "default_headers": {"anthropic-workspace-id": workspace_id}}
+                    self.client = anthropic.Anthropic(**client_kwargs)
+                else:
+                    # Try standard API key first
+                    self.client = anthropic.Anthropic(api_key=api_key)
+                
+                # Verify client works with a quick models.list() call
                 try:
                     self.client.models.list()
                 except anthropic.BadRequestError as e:
-                    if "workspace" in str(e).lower():
-                        # Need workspace ID for identity-linked keys
-                        workspace_id = os.getenv("ANTHROPIC_WORKSPACE_ID")
-                        if workspace_id:
-                            client_kwargs = {"api_key": api_key, "default_headers": {"anthropic-workspace-id": workspace_id}}
-                            self.client = anthropic.Anthropic(**client_kwargs)
-                            self.client.models.list()
-                        else:
-                            self.log("llm", "Identity-linked API key requires ANTHROPIC_WORKSPACE_ID — LLM analysis skipped", "warning")
-                            self.client = None
+                    if "workspace" in str(e).lower() and not workspace_id:
+                        # Identity-linked key detected, needs workspace ID
+                        self.log("llm", "Identity-linked API key requires ANTHROPIC_WORKSPACE_ID env var — LLM analysis skipped", "warning")
+                        self.client = None
                     else:
                         raise
-            except anthropic.AuthenticationError as e:
-                self.log("llm", f"Authentication failed: {e} — LLM analysis will be skipped", "warning")
+            except (anthropic.AuthenticationError, anthropic.BadRequestError) as e:
+                self.log("llm", f"Anthropic auth failed: {str(e)[:80]} — LLM analysis will be skipped", "warning")
                 self.client = None
         
     def _load_checkpoint(self):
@@ -480,16 +483,15 @@ Focus on concrete, measurable recommendations."""
                     return block.text
             return None
         except anthropic.BadRequestError as e:
-            if "workspace" in str(e).lower():
-                self.log("llm", f"Authentication failed: identity-linked API key requires ANTHROPIC_WORKSPACE_ID env var", "warning")
-                return "(LLM analysis skipped — identity-linked API key requires workspace ID)"
+            error_msg = str(e)
+            if "workspace" in error_msg.lower():
+                self.log("llm", "Identity-linked API key requires ANTHROPIC_WORKSPACE_ID — LLM analysis skipped", "warning")
+                return "(LLM analysis skipped — set ANTHROPIC_WORKSPACE_ID for identity-linked keys)"
             else:
-                print(f"DEBUG: LLM error: {type(e).__name__}: {e}", file=sys.stderr)
-                self.log("llm", f"Failed to get LLM analysis: {type(e).__name__}: {str(e)[:100]}", "error")
+                self.log("llm", f"LLM API error: {error_msg[:80]}", "error")
                 return None
         except Exception as e:
-            print(f"DEBUG: LLM error: {type(e).__name__}: {e}", file=sys.stderr)
-            self.log("llm", f"Failed to get LLM analysis: {type(e).__name__}: {str(e)[:100]}", "error")
+            self.log("llm", f"Unexpected LLM error: {type(e).__name__}: {str(e)[:80]}", "error")
             return None
     
     def print_report(self):
