@@ -314,9 +314,26 @@ class AishAudit:
             self.log("filesystem", "Skipping filesystem audit (--skip-fs flag set)", "info")
             return
         
-        # Get total size (with timeout fallback)
+        # Use du -sh for accurate, fast total (avoids file-by-file walk)
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["du", "-sh", str(AISH_HOME)],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                size_str = result.stdout.split()[0]
+                self.log("filesystem", f"Total size: {size_str} (using du -sh for accuracy)", "info")
+                return
+        except Exception:
+            pass
+        
+        # Fallback: scan up to 10K files with early exit
         total_size = 0
         count = 0
+        aborted = False
         for root, dirs, files in os.walk(AISH_HOME, onerror=lambda e: None):
             # Skip worktrees for speed
             dirs[:] = [d for d in dirs if d not in ['worktrees']]
@@ -327,12 +344,21 @@ class AishAudit:
                     count += 1
                 except:
                     pass
-                # Timeout after 1000 files
-                if count > 1000:
-                    self.log("filesystem", "Scan aborted (>1000 files); use du -sh for full count", "warning")
+                # Hard limit: stop and report via du
+                if count > 10000:
+                    aborted = True
                     break
+            if aborted:
+                break
         
-        self.log("filesystem", f"Scanned {count} files, total: {total_size/1024/1024:.1f}MB (excluding worktrees)", "info")
+        if aborted:
+            self.log("filesystem", 
+                f"Scan limit exceeded ({count}+ files); use `du -sh {AISH_HOME}` for exact total", 
+                "info")
+        else:
+            self.log("filesystem", 
+                f"Scanned {count} files, total: {total_size/1024/1024:.1f}MB (excluding worktrees)", 
+                "info")
     
     def get_llm_analysis(self):
         """Use Claude to analyze telemetry, memories, and history."""
