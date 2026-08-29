@@ -6,7 +6,7 @@ results and own a `:skill add <ref>` namespace **without recompiling aish**.
 
 This guide is the practical companion to the design
 (`docs/design/plugin-skill-sources.md`). The bundled
-[`plugins/npx-skills`](../../plugins/npx-skills) is a complete, working
+[`plugins/npx-skillfish`](../../plugins/npx-skillfish) is a complete, working
 reference implementation.
 
 ---
@@ -124,4 +124,4 @@ cat "/path/to/${spec}/SKILL.md"   # single-skill: raw SKILL.md on stdout
 - [ ] Both scripts are executable (`chmod +x`).
 - [ ] Test end-to-end: `:skill sources`, `:skill search`, `:skill add`.
 
-See [`plugins/npx-skills`](../../plugins/npx-skills) for a full working example.
+See [`plugins/npx-skillfish`](../../plugins/npx-skillfish) for a full working example.

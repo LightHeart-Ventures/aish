@@ -89,21 +89,6 @@
       }
     },
     {
-      "id": "npx-skills",
-      "name": "NPX Skills Integration",
-      "description": "Integration with npx-skills for community skill management.",
-      "author": "LightHeart Ventures",
-      "repository": "LightHeart-Ventures/aish",
-      "reference": "LightHeart-Ventures/aish/plugins/npx-skills",
-      "branch": "main",
-      "version": "0.25.0",
-      "enabled": true,
-      "provides": {
-        "skills": true,
-        "skill_source": true
-      }
-    },
-    {
       "id": "npx-skillfish",
       "name": "NPX Skillfish Integration",
       "description": "Integration with npx-skillfish for skill.fish registry access.",
