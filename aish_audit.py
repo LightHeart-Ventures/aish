@@ -274,6 +274,36 @@ class AishAudit:
                 else:
                     self.log("reliability", 
                         f"  Tool call failure rate: {fail_rate:.1f}%", "info")
+                
+                # Check for tools with high failure rates (even if total rate is low)
+                cur.execute(f"""
+                    SELECT tool, 
+                      COUNT(*) as total,
+                      SUM(CASE WHEN is_error = 1 THEN 1 ELSE 0 END) as failures,
+                      ROUND(SUM(CASE WHEN is_error = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 1) as fail_pct
+                    FROM {table}
+                    GROUP BY tool
+                    HAVING CAST(SUM(CASE WHEN is_error = 1 THEN 1 ELSE 0 END) AS FLOAT) / COUNT(*) > 0.5
+                    ORDER BY fail_pct DESC
+                """)
+                high_error_tools = cur.fetchall()
+                if high_error_tools:
+                    mcp_tools = [t for t in high_error_tools if 'mcp' in t[0].lower()]
+                    non_mcp_tools = [t for t in high_error_tools if 'mcp' not in t[0].lower()]
+                    
+                    if mcp_tools:
+                        self.log("reliability", 
+                            f"  ⚠️ MCP tools logged with 100% error rate (may indicate swarm unavailability):", "warning")
+                        for tool, total, failures, fail_pct in mcp_tools:
+                            self.log("reliability", 
+                                f"    {tool}: {failures}/{total} ({fail_pct}%)", "warning")
+                    
+                    if non_mcp_tools:
+                        self.log("reliability", 
+                            f"  ⚠️ Non-MCP tools with >50% error rate:", "warning")
+                        for tool, total, failures, fail_pct in non_mcp_tools:
+                            self.log("reliability", 
+                                f"    {tool}: {failures}/{total} ({fail_pct}%)", "warning")
         except Exception as e:
             self.log("database", f"  Error auditing {table}: {e}", "warning")
     
