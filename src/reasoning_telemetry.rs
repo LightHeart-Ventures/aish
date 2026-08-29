@@ -395,6 +395,29 @@ pub fn update_outcome(id: &str, outcome: Outcome) -> bool {
     append_line(&record.to_string())
 }
 
+/// Record escalation outcome metrics after an escalate call completes.
+/// Captures whether the escalated answer differed from a local guess,
+/// cost metrics (tokens, latency), and trigger reason for analysis.
+/// All fields best-effort; None means unmeasurable or unset.
+pub fn record_escalation_outcome(
+    escalation_id: &str,
+    differed_from_local: Option<bool>,
+    tokens_used: Option<u32>,
+    latency_ms: Option<u32>,
+    trigger_reason: Option<&str>,
+) -> bool {
+    let record = serde_json::json!({
+        "kind": "escalation_outcome",
+        "id": escalation_id,
+        "ts": now_iso8601(),
+        "differed_from_local": differed_from_local,
+        "tokens_used": tokens_used,
+        "latency_ms": latency_ms,
+        "trigger_reason": trigger_reason.map(|r| truncate(r, MAX_TEXT_LEN)),
+    });
+    append_line(&record.to_string())
+}
+
 /// A per-bucket tally used in the summary: how many decisions fell in this
 /// bucket, how many were guesses, and of the guesses with a known result, how
 /// many took a wrong turn.

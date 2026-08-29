@@ -1850,24 +1850,72 @@ the strong model sees nothing else"
     }
     .map_err(|e| anyhow::anyhow!("couldn't reach the strong model for escalation: {e:#}"))?;
 
+    // Time the escalation call to measure latency.
+    let start = std::time::Instant::now();
     let turn = backend
         .complete(ESCALATE_SYSTEM, &[crate::backend::Msg::user(task)], &[])
         .await
         .map_err(|e| anyhow::anyhow!("escalation consult failed: {e:#}"))?;
+    let latency_ms = start.elapsed().as_millis() as u32;
+    
     let answer = turn.text.trim();
     if answer.is_empty() {
         anyhow::bail!("the strong model returned no usable text");
     }
+    
     // Reasoning-quality telemetry: every escalate is, by definition, a decision
     // to reach for the stronger model rather than guess — record it (best-effort,
     // never fails the consult) so the escalate-vs-guess boundary is measurable.
-    let _ = crate::reasoning_telemetry::record_escalation(task);
+    // Also capture outcome metrics: tokens used, latency, and trigger reason.
+    if let Some(event_id) = crate::reasoning_telemetry::record_escalation(task) {
+        let tokens_used = turn.usage.as_ref().map(|u| u.output_tokens as u32);
+        // Record escalation outcome metrics (best-effort, never fails the answer).
+        let _ = crate::reasoning_telemetry::record_escalation_outcome(
+            &event_id,
+            None, // differed_from_local: can't measure sync escalation vs. local path
+            tokens_used,
+            Some(latency_ms),
+            None, // trigger_reason: caller knows their own reason; not available here
+        );
+        
+        // Auto-store a durable memory for this escalation so the system learns
+        // from its own hard judgments and can use memory to avoid re-escalating
+        // the same problem. Fixes the reinforcing loop: no memory → escalate →
+        // forget → repeat. Format: "[escalated] <topic>. Resolved in <latency>ms, <tokens> tokens."
+        if let Some(ref db) = session.db {
+            let memory_content = if let Some(tokens) = tokens_used {
+                format!(
+                    "[escalated] {}. Resolved in {}ms, {} tokens.",
+                    task, latency_ms, tokens
+                )
+            } else {
+                format!("[escalated] {}. Resolved in {}ms.", task, latency_ms)
+            };
+            match db.remember(&memory_content, Some("escalation")) {
+                Ok(id) => {
+                    eprintln!("[aish] stored escalation memory id={id} for topic={:?}", task);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[aish] WARNING: failed to store escalation memory for topic={:?}: {e:#}",
+                        task
+                    );
+                }
+            }
+        } else {
+            eprintln!(
+                "[aish] WARNING: no database session available to store escalation memory for topic={:?}",
+                task
+            );
+        }
+    }
+    
     Ok(answer.to_string())
 }
 
 /// `reasoning_note` — log one reasoning-quality data point (or close the loop on
 /// a prior one). Purely observational; see `crate::reasoning_telemetry`.
-fn reasoning_note(call: &ToolCall, _session: &Session) -> Result<String> {
+fn reasoning_note(call: &ToolCall, session: &Session) -> Result<String> {
     use crate::reasoning_telemetry as rt;
 
     let get = |k: &str| call.args[k].as_str().map(str::trim).filter(|s| !s.is_empty());
@@ -1908,13 +1956,59 @@ fn reasoning_note(call: &ToolCall, _session: &Session) -> Result<String> {
             .with_levels(complexity, ambiguity, risk)
             .with_rationale(get("rationale").map(str::to_string));
         match rt::record(&event) {
-            Some(id) => Ok(format!(
-                "logged reasoning note {id} ({}, complexity={}, risk={}). Close the loop later with \
+            Some(id) => {
+                // Auto-store a durable memory of the reasoning decision (best-effort).
+                // Format: "[decision] topic at complexity/risk level. rationale"
+                let rationale_str = get("rationale").unwrap_or("");
+                let memory_content = if rationale_str.is_empty() {
+                    format!(
+                        "[{}] {}. Complexity: {}, Risk: {}.",
+                        decision.as_str(),
+                        topic,
+                        complexity.as_str(),
+                        risk.as_str()
+                    )
+                } else {
+                    format!(
+                        "[{}] {}. {}. Complexity: {}, Risk: {}.",
+                        decision.as_str(),
+                        topic,
+                        rationale_str,
+                        complexity.as_str(),
+                        risk.as_str()
+                    )
+                };
+                let memory_stored = if let Some(ref db) = session.db {
+                    match db.remember(&memory_content, Some("reasoning")) {
+                        Ok(mem_id) => {
+                            eprintln!("[aish] stored reasoning memory id={mem_id} for decision={}", decision.as_str());
+                            true
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[aish] WARNING: failed to store reasoning memory for decision={}: {e:#}",
+                                decision.as_str()
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "[aish] WARNING: no database session available to store reasoning memory for decision={}",
+                        decision.as_str()
+                    );
+                    false
+                };
+                
+                Ok(format!(
+                    "logged reasoning note {id} ({}, complexity={}, risk={}){} Close the loop later with \
 event_id={id} + outcome=correct|wrong_turn.",
-                decision.as_str(),
-                complexity.as_str(),
-                risk.as_str()
-            )),
+                    decision.as_str(),
+                    complexity.as_str(),
+                    risk.as_str(),
+                    if memory_stored { ". " } else { " (note: memory storage failed) " }
+                ))
+            }
             None => Ok(
                 "note: telemetry store unwritable — reasoning note not persisted, continuing".into(),
             ),
