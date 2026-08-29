@@ -4,6 +4,9 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Removed
+- **Dead per-tool/per-turn pulse tracking in `worker.rs`**: `JobInner::last_tool_outcome`/`last_turn_completion`, `WorkerJob::record_tool_outcome`/`record_turn_completion`/`latest_pulse`, and the module-level `fresh_pulse` aggregator were all unreachable — `cargo check` flagged `fresh_pulse` and `latest_pulse` as never-used. The prompt's `⟳N` badge has been state-based (running count + `fresh_terminal`) since an earlier change; this chain was leftover plumbing that recorded events nothing read. The live `Pulse` broadcast bus (`crate::pulse`, feeding `:pulse-report`) and `pulse_badge`/`fresh_terminal` are unaffected.
+
 ### Changed
 - **Embedded mcpmarket skill search removed — live search now comes from the plugin**: dropped the in-process mcpmarket network search path from `skill_provider` (the `wreq`/`wreq-util` browser-impersonating HTTP client is gone from `Cargo.toml`). `:skill search` now reads the offline embedded curated index for the builtin source, while live/community search is served exclusively by the `npx-skillfish` plugin (a `provides.skill_source`). The offline index, `:skill add` (GitHub + skill.fish), and the plugin skill-source fan-out are unchanged.
 - **`npx-skills` plugin removed**: npx-skills (npm registry skill search + install) is archived. Live skill import and search is now unified under `npx-skillfish` (agentskills.io/skillfish), which is more performant and upstream-maintained. Removed `plugins/npx-skills/` from the tree; documentation updated to remove references to npm-sourced skills.
