@@ -347,7 +347,7 @@ User-defined or imported playbooks (SKILL.md format) that agents can discover an
 
 Custom tools via the Model Context Protocol. Loaded from:
 - **Local plugins:** `~/.aish/plugins/*/mcp.json`
-- **Remote:** Configured in project's `aish.toml` or `.repospec.json`
+- **Remote:** Configured via project or user-scope `.mcp.json` (see `src/mcp.rs`)
 
 ### Coordinators as Programmable Agents
 
