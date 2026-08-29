@@ -2,7 +2,32 @@
 
 This document tracks findings from the comprehensive aish audit (run via `aish_audit.py`) and their remediation status.
 
-## Finding #1: Escalation Instrumentation ✅ RESOLVED
+## Finding #1: Memory Persistence Visibility 🔍 IN PROGRESS
+
+**Severity:** CRITICAL (blocking root-cause analysis)
+
+**Finding:** 62 reasoning events produced 0 stored memories, but system had no visibility into WHY.
+
+**Root Cause:** Both `escalate()` and `reasoning_note()` wrapped memory writes with `let _ =`, silently discarding any database errors.
+
+**Solution Implemented (PR #786):**
+- `escalate()`: Match on `db.remember()` result, log success/error to stderr
+- `reasoning_note()`: Match on `db.remember()` result, report in function output
+- Check for missing database session and log that separately
+- Best-effort: failures still never block the answer
+
+**Impact:**
+- ✅ System now has visibility into memory persistence failures
+- ✅ Can debug why memories aren't being stored
+- ⏳ Prerequisite to fixing the actual root cause once we see the error
+
+**Status:** Waiting for stderr logs from deployed fix to identify actual failure reason.
+
+**Next Step:** Once this lands in production and we see error logs, implement the real fix.
+
+---
+
+## Finding #2: Escalation Instrumentation ✅ RESOLVED
 
 **Severity:** HIGH (cost/necessity measurement)
 
@@ -33,37 +58,31 @@ This document tracks findings from the comprehensive aish audit (run via `aish_a
 
 ---
 
-## Finding #2: Zero Durable Memories ✅ RESOLVED
+## Finding #2: Silent Memory Persistence Failures ⏳ IN PROGRESS (PR #786)
 
-**Severity:** CRITICAL (reinforcing loop: no memory → escalate → forget → repeat)
+**Severity:** CRITICAL (no visibility into memory storage failures)
 
-**Finding:** 62 reasoning events produced 0 stored memories.
+**Finding:** Same as Finding #1 but from a different angle: The code tried to store memories via `db.remember()`, but both call sites silently swallowed errors with `let _ =`.
 
 **Root Cause:** 
-- `escalate()` only logged telemetry JSONL, never created DB memories
-- `reasoning_note()` created memories but was never auto-called for escalations
-- System re-derived conclusions it had already reached; memory cache stayed empty
+- `escalate()` calls `db.remember()` but wraps it with `let _ =`
+- `reasoning_note()` calls `db.remember()` but wraps it with `let _ =`
+- Any database error (connection, permission, table schema) was silently discarded
+- System had no way to know if memories were failing to persist
 
-**Solution Implemented:**
-- Enhanced `escalate()` to call `db.remember()` after successful resolution
-- Memory format: `"[escalated] <topic>. Resolved in <ms>, <tokens> tokens."`
-- Tagged as "escalation" for recall filtering
-- Best-effort: DB failures never block the answer
+**Solution Implemented (PR #786):**
+- `escalate()`: Match on `db.remember()` result, log success/error to stderr
+- `reasoning_note()`: Match on `db.remember()` result, include in function output
+- Add check for missing database session and log that separately
+- Best-effort: failures still never block the answer
 
-**PR:** #785 (commit: 1be2e72)
+**Status:** Ready for testing. Once deployed, stderr logs will reveal the actual failure reason.
 
-**Verification:**
-- ✅ Builds without errors
-- ✅ Every escalation creates a durable memory
-- ✅ Backward compatible
-
-**Expected Impact:**
-- 100% of escalations now produce a durable memory
-- System learns from its own hard judgments
-- Enables future cache-hit optimization (recall to avoid re-escalating)
-- Prerequisite for memory-driven confidence threshold tuning
-
-**Target:** >80% memory-assisted escalation within 2 weeks as recall cache grows.
+**Next Steps:**
+1. Merge PR #786 to get error visibility
+2. Monitor stderr logs to identify the actual failure  
+3. Implement the real fix based on what we learn
+4. Verify 100% of escalations create durable memories
 
 ---
 
@@ -104,15 +123,20 @@ This document tracks findings from the comprehensive aish audit (run via `aish_a
 
 | Finding | Status | PR | Impact |
 |---------|--------|----|----|
-| Escalation metrics | ✅ RESOLVED | #785 | Cost/necessity measurement enabled |
-| Memory persistence | ✅ RESOLVED | #785 | Learning loop closed, 100% memory coverage |
-| Coordinator stall detection | ⏳ PENDING | — | Silent cost multiplier, safe to defer |
+| Memory persistence visibility | ⏳ IN PROGRESS | #786 | Prerequisite to identifying root cause |
+| Silent memory failures | ⏳ IN PROGRESS | #786 | Once deployed, stderr logs will reveal actual error |
+| Coordinator stall detection | ⏳ PENDING | — | Safe to defer until memory issue is fixed |
 | Escalation reason attribution | ⏳ PENDING | — | Threshold tuning prerequisite, defer |
 
-**Next Steps:**
-1. Merge PR #785 to main
-2. Monitor memory cache growth over next week (expect 50-80% memory-assisted escalations by day 7)
-3. Once cache is warm, implement coordinator stall detection (#3)
-4. Once patterns are clear, implement reason attribution (#4) and recalibrate thresholds
+**Current Focus:** 
+- PR #786 adds comprehensive error logging to memory persistence
+- Once deployed, stderr logs will reveal WHY memories aren't being stored
+- Could be: missing database session, schema mismatch, permission issue, or something else
 
-**Sequencing Rationale:** #1 and #2 are pure bug fixes and must land first. #3 and #4 are tuning work that should wait for data from the fixed system.
+**Next Steps:**
+1. Merge PR #786 to main
+2. Deploy and monitor stderr logs to identify the actual memory persistence failure
+3. Implement the real fix based on what the logs show
+4. Verify ≥40 stored memories from next 62 reasoning events
+
+**Sequencing Rationale:** Finding #1 and #2 are the same issue seen two ways. The visibility fix (#786) is prerequisite to finding and fixing the root cause.
