@@ -357,7 +357,7 @@ All tests are `#[cfg(test)]` unit tests co-located in `src/diag.rs` and `src/rc.
 
 **Test seam for AC #5:** `parse_into` currently returns `()`. To assert a diagnostic was emitted without scraping stderr, add an internal `parse_into_diagnosed(text, rc, src_name) -> Vec<AishDiagnostic>` that `parse_into` wraps (rendering each to stderr). Tests call the `_diagnosed` form and inspect the `Vec`. Keeps production behavior (render to stderr, continue) while making emission observable.
 
-**Integration test (optional, recommended):** add to `tests/` a forced-shell case asserting the rendered string shape, mirroring the `golden_routing_heuristics` style. Not a PTY test — `render()` is pure, so a plain string assertion suffices.
+**Integration test (optional, recommended):** add to `tests/` a forced-shell case asserting the rendered string shape, mirroring the golden-snapshot style of `routing_decision_snapshot` in `src/repl.rs` (`tests/golden/routing_decisions.snap`). Not a PTY test — `render()` is pure, so a plain string assertion suffices.
 
 ---
 
