@@ -1867,7 +1867,7 @@ the strong model sees nothing else"
 
 /// `reasoning_note` — log one reasoning-quality data point (or close the loop on
 /// a prior one). Purely observational; see `crate::reasoning_telemetry`.
-fn reasoning_note(call: &ToolCall, _session: &Session) -> Result<String> {
+fn reasoning_note(call: &ToolCall, session: &Session) -> Result<String> {
     use crate::reasoning_telemetry as rt;
 
     let get = |k: &str| call.args[k].as_str().map(str::trim).filter(|s| !s.is_empty());
@@ -1908,13 +1908,40 @@ fn reasoning_note(call: &ToolCall, _session: &Session) -> Result<String> {
             .with_levels(complexity, ambiguity, risk)
             .with_rationale(get("rationale").map(str::to_string));
         match rt::record(&event) {
-            Some(id) => Ok(format!(
-                "logged reasoning note {id} ({}, complexity={}, risk={}). Close the loop later with \
+            Some(id) => {
+                // Auto-store a durable memory of the reasoning decision (best-effort).
+                // Format: "[decision] topic at complexity/risk level. rationale"
+                let rationale_str = get("rationale").unwrap_or("");
+                let memory_content = if rationale_str.is_empty() {
+                    format!(
+                        "[{}] {}. Complexity: {}, Risk: {}.",
+                        decision.as_str(),
+                        topic,
+                        complexity.as_str(),
+                        risk.as_str()
+                    )
+                } else {
+                    format!(
+                        "[{}] {}. {}. Complexity: {}, Risk: {}.",
+                        decision.as_str(),
+                        topic,
+                        rationale_str,
+                        complexity.as_str(),
+                        risk.as_str()
+                    )
+                };
+                if let Some(ref db) = session.db {
+                    let _ = db.remember(&memory_content, Some("reasoning"));
+                }
+                
+                Ok(format!(
+                    "logged reasoning note {id} ({}, complexity={}, risk={}). Close the loop later with \
 event_id={id} + outcome=correct|wrong_turn.",
-                decision.as_str(),
-                complexity.as_str(),
-                risk.as_str()
-            )),
+                    decision.as_str(),
+                    complexity.as_str(),
+                    risk.as_str()
+                ))
+            }
             None => Ok(
                 "note: telemetry store unwritable — reasoning note not persisted, continuing".into(),
             ),
