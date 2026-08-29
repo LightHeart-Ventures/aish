@@ -1850,18 +1850,35 @@ the strong model sees nothing else"
     }
     .map_err(|e| anyhow::anyhow!("couldn't reach the strong model for escalation: {e:#}"))?;
 
+    // Time the escalation call to measure latency.
+    let start = std::time::Instant::now();
     let turn = backend
         .complete(ESCALATE_SYSTEM, &[crate::backend::Msg::user(task)], &[])
         .await
         .map_err(|e| anyhow::anyhow!("escalation consult failed: {e:#}"))?;
+    let latency_ms = start.elapsed().as_millis() as u32;
+    
     let answer = turn.text.trim();
     if answer.is_empty() {
         anyhow::bail!("the strong model returned no usable text");
     }
+    
     // Reasoning-quality telemetry: every escalate is, by definition, a decision
     // to reach for the stronger model rather than guess — record it (best-effort,
     // never fails the consult) so the escalate-vs-guess boundary is measurable.
-    let _ = crate::reasoning_telemetry::record_escalation(task);
+    // Also capture outcome metrics: tokens used, latency, and trigger reason.
+    if let Some(event_id) = crate::reasoning_telemetry::record_escalation(task) {
+        let tokens_used = turn.usage.as_ref().map(|u| u.output_tokens as u32);
+        // Record escalation outcome metrics (best-effort, never fails the answer).
+        let _ = crate::reasoning_telemetry::record_escalation_outcome(
+            &event_id,
+            None, // differed_from_local: can't measure sync escalation vs. local path
+            tokens_used,
+            Some(latency_ms),
+            None, // trigger_reason: caller knows their own reason; not available here
+        );
+    }
+    
     Ok(answer.to_string())
 }
 
