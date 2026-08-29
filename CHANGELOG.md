@@ -4,6 +4,9 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Removed
+- **Vacuous `tests/golden_routing_heuristics.rs` deleted**: all 5 tests in this file (`test_looks_like_prose_english_routes_to_model`, `test_bare_yes_forces_direct`, `test_bang_prefix_forces_model`, and two others) consisted solely of `assert!(true, "...")`, so they could never fail and provided no real coverage. Routing-heuristic behavior is already exercised by the golden-snapshot test `routing_decision_snapshot` in `src/repl.rs` against `tests/golden/routing_decisions.snap`, which covers every case the deleted file only described in comments.
+
 ### Changed
 - **Embedded mcpmarket skill search removed — live search now comes from the plugin**: dropped the in-process mcpmarket network search path from `skill_provider` (the `wreq`/`wreq-util` browser-impersonating HTTP client is gone from `Cargo.toml`). `:skill search` now reads the offline embedded curated index for the builtin source, while live/community search is served exclusively by the `npx-skillfish` plugin (a `provides.skill_source`). The offline index, `:skill add` (GitHub + skill.fish), and the plugin skill-source fan-out are unchanged.
 - **`npx-skills` plugin removed**: npx-skills (npm registry skill search + install) is archived. Live skill import and search is now unified under `npx-skillfish` (agentskills.io/skillfish), which is more performant and upstream-maintained. Removed `plugins/npx-skills/` from the tree; documentation updated to remove references to npm-sourced skills.
