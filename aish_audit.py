@@ -32,7 +32,24 @@ class AishAudit:
             self.log("llm", "ANTHROPIC_API_KEY not set — LLM analysis will be skipped", "warning")
             self.client = None
         else:
-            self.client = anthropic.Anthropic(api_key=api_key)
+            try:
+                client_kwargs = {"api_key": api_key}
+                workspace_id = os.getenv("ANTHROPIC_WORKSPACE_ID")
+                if workspace_id:
+                    client_kwargs["default_headers"] = {"anthropic-workspace-id": workspace_id}
+                self.client = anthropic.Anthropic(**client_kwargs)
+                # Test the client with a cheap models call to verify auth
+                try:
+                    self.client.models.list()
+                except anthropic.BadRequestError as e:
+                    if "workspace" in str(e).lower():
+                        # Try again without workspace header
+                        self.log("llm", "Retrying without workspace header...", "info")
+                        self.client = anthropic.Anthropic(api_key=api_key)
+                        self.client.models.list()  # Verify it works
+            except anthropic.AuthenticationError as e:
+                self.log("llm", f"Authentication failed: {e} — LLM analysis will be skipped", "warning")
+                self.client = None
         
     def log(self, category, message, severity="info"):
         """Log a finding with category, message, and severity level."""
@@ -110,44 +127,56 @@ class AishAudit:
     def _audit_coordinator_table(self, cur, table):
         """Audit coordinator/job tables for performance patterns."""
         try:
-            # Check for stalled/long-running jobs
-            cur.execute(f"""
-                SELECT COUNT(*) FROM {table} 
-                WHERE status IN ('running', 'pending', 'queued')
-            """)
-            active = cur.fetchone()[0]
-            if active > 0:
-                self.log("coordinator", f"  {active} jobs still in active state (may be stalled)", "warning")
-            
-            # Check completion times
-            cur.execute(f"""
-                SELECT 
-                  COUNT(*) as completed,
-                  AVG(CAST(duration_ms AS FLOAT)) as avg_duration,
-                  MAX(CAST(duration_ms AS FLOAT)) as max_duration
-                FROM {table}
-                WHERE status = 'done'
-                  AND duration_ms IS NOT NULL
-                LIMIT 100
-            """)
-            row = cur.fetchone()
-            if row and row[1]:
-                self.log("performance", 
-                    f"  Job avg completion: {row[1]:.0f}ms, max: {row[2]:.0f}ms", "info")
-                if row[2] > 300000:  # > 5min
-                    self.log("performance", 
-                        f"  Some jobs taking > 5min (max: {row[2]/1000:.1f}s)", "warning")
+            # Different tables have different schemas
+            if table == "batch_jobs":
+                # batch_jobs: local_id, anthropic_id, task, model, status, result, error, created_at, session_id, session_name
+                # No duration_ms, just created_at timestamp
+                cur.execute(f"""
+                    SELECT COUNT(*) FROM {table} 
+                    WHERE status IN ('running', 'pending', 'queued')
+                """)
+                active = cur.fetchone()[0]
+                if active > 0:
+                    self.log("coordinator", f"  {active} batch jobs still in active state (may be stalled)", "warning")
+                # Can't compute duration without end time; skip
+                
+            elif table == "coordinator_runs":
+                # coordinator_runs: run_id, task, phase, result, error, session_id, session_name, created_at, heartbeat_at, stand_down, checkpoint
+                # Phase values: 'coordinating', 'awaiting_batch', 'checkpoint', 'done', 'failed'
+                cur.execute(f"""
+                    SELECT COUNT(*) FROM {table} 
+                    WHERE phase IN ('coordinating', 'awaiting_batch', 'checkpoint')
+                """)
+                active = cur.fetchone()[0]
+                if active > 0:
+                    self.log("coordinator", f"  {active} coordinator runs still in active phase (may be stalled)", "warning")
+                # Can't compute duration without explicit end time; skip
+                
+            elif table == "coordinator_registry":
+                # coordinator_registry: coord_id, generation, pid, batch_job_id, phase, started_at, owner_session
+                cur.execute(f"""
+                    SELECT COUNT(*) FROM {table} 
+                    WHERE phase IN ('coordinating', 'awaiting_batch')
+                """)
+                active = cur.fetchone()[0]
+                if active > 0:
+                    self.log("coordinator", f"  {active} coordinator processes still running", "info")
         except Exception as e:
             self.log("database", f"  Error auditing {table}: {e}", "warning")
     
     def _audit_tool_table(self, cur, table):
         """Audit tool call patterns."""
         try:
+            # Skip allowed_tools — it's just a permission list, not telemetry
+            if table == "allowed_tools":
+                return
+            
+            # tool_telemetry: tool column, is_error flag
             # Most commonly called tools
             cur.execute(f"""
-                SELECT tool_name, COUNT(*) as count
+                SELECT tool, COUNT(*) as count
                 FROM {table}
-                GROUP BY tool_name
+                GROUP BY tool
                 ORDER BY count DESC
                 LIMIT 10
             """)
@@ -157,11 +186,11 @@ class AishAudit:
                 for tool, count in tools:
                     self.log("tools", f"    - {tool}: {count} calls", "info")
             
-            # Failure rate
+            # Failure rate (using is_error flag, not status column)
             cur.execute(f"""
                 SELECT 
                   COUNT(*) as total,
-                  SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as failures
+                  SUM(CASE WHEN is_error = 1 THEN 1 ELSE 0 END) as failures
                 FROM {table}
             """)
             row = cur.fetchone()
@@ -338,7 +367,7 @@ Focus on concrete, measurable recommendations."""
 
         try:
             response = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
+                model="claude-opus-5",
                 max_tokens=1200,
                 messages=[
                     {
@@ -347,7 +376,19 @@ Focus on concrete, measurable recommendations."""
                     }
                 ]
             )
-            return response.content[0].text
+            # Handle thinking blocks (skip them, find the text block)
+            for block in response.content:
+                if hasattr(block, 'text'):
+                    return block.text
+            return None
+        except anthropic.BadRequestError as e:
+            if "workspace" in str(e).lower():
+                self.log("llm", f"Authentication failed: identity-linked API key requires ANTHROPIC_WORKSPACE_ID env var", "warning")
+                return "(LLM analysis skipped — identity-linked API key requires workspace ID)"
+            else:
+                print(f"DEBUG: LLM error: {type(e).__name__}: {e}", file=sys.stderr)
+                self.log("llm", f"Failed to get LLM analysis: {type(e).__name__}: {str(e)[:100]}", "error")
+                return None
         except Exception as e:
             print(f"DEBUG: LLM error: {type(e).__name__}: {e}", file=sys.stderr)
             self.log("llm", f"Failed to get LLM analysis: {type(e).__name__}: {str(e)[:100]}", "error")
