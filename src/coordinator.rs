@@ -1408,16 +1408,23 @@ pub fn rehydrate(session: &mut Session) {
     // process is dead as `orphaned` (parent-death recovery) and log any that
     // carried an in-flight batch job as resurrectable (full resume is TASK-291).
     let (regs_reaped, regs_resurrectable) = scan_coordinator_registry(&store, digest);
+    
+    // #129: detect and reap stalled coordinators (coordinating/awaiting_batch but
+    // no recent heartbeat activity). This catches the case where a coordinator
+    // process hangs/deadlocks without crashing.
+    let stalled_reaped = detect_and_reap_stalled_runs(&store, digest);
+    
     if digest
         && (surfaced > 0
             || reaped > 0
             || salvaged > 0
             || reaped_failed > 0
             || regs_reaped > 0
-            || regs_resurrectable > 0)
+            || regs_resurrectable > 0
+            || stalled_reaped > 0)
     {
         eprintln!(
-            "\x1b[2maish: reattached coordinator runs ({surfaced} delivered, {reaped} reaped, {salvaged} salvaged, {reaped_failed} failed-pruned, {regs_reaped} registry-orphaned, {regs_resurrectable} resurrectable)\x1b[0m"
+            "\x1b[2maish: reattached coordinator runs ({surfaced} delivered, {reaped} reaped, {salvaged} salvaged, {reaped_failed} failed-pruned, {regs_reaped} registry-orphaned, {regs_resurrectable} resurrectable, {stalled_reaped} stalled-reaped)\x1b[0m"
         );
     }
 }
@@ -1482,6 +1489,62 @@ fn pid_is_alive(pid: i64) -> bool {
     // rc == -1: alive only when the failure is EPERM (exists, not permitted),
     // dead on ESRCH (no such process).
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// #129: detect and reap stalled coordinators.
+/// A coordinator is "stalled" if it is in a non-terminal phase (Coordinating or
+/// AwaitingBatch) but hasn't updated its heartbeat for longer than STALL_THRESHOLD.
+/// This catches deadlocks / hangs that don't kill the OS process. Returns the count
+/// of reaped stalled runs.
+fn detect_and_reap_stalled_runs(store: &CoordinatorStore, digest: bool) -> usize {
+    // Stall threshold: if heartbeat is older than 5 minutes, mark as stalled.
+    const STALL_THRESHOLD_SECS: u64 = 5 * 60;
+    
+    let rows = match store.load_all() {
+        Ok(r) => r,
+        Err(_) => return 0, // non-fatal
+    };
+    
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    
+    let mut stalled_reaped = 0usize;
+    for row in rows {
+        let phase = Phase::parse(&row.phase);
+        
+        // Only check non-terminal phases: Coordinating and AwaitingBatch.
+        // Done, Failed, and Checkpoint are not candidates for staleness.
+        let is_active = matches!(phase, Phase::Coordinating | Phase::AwaitingBatch);
+        if !is_active {
+            continue;
+        }
+        
+        // Parse the heartbeat timestamp. If missing or unparseable, treat as
+        // stale (a coordinator that never heartbeats is surely stuck).
+        let heartbeat_ts = row.heartbeat_at
+            .as_ref()
+            .and_then(|ts_str| ts_str.parse::<u64>().ok())
+            .unwrap_or(0);
+        
+        if now.saturating_sub(heartbeat_ts) > STALL_THRESHOLD_SECS {
+            // Stalled: mark as failed with a message.
+            let short_id = crate::batch::short_id(&row.run_id);
+            if store.set_failed(&row.run_id, "stalled: no heartbeat activity for 5+ minutes")
+                .is_ok() {
+                stalled_reaped += 1;
+                if digest {
+                    eprintln!(
+                        "\x1b[2maish: coordinator {} stalled (no heartbeat activity for 5+ minutes) — marked failed\x1b[0m",
+                        short_id
+                    );
+                }
+            }
+        }
+    }
+    
+    stalled_reaped
 }
 
 /// Pure salvage decision: a worktree that still holds work but has NO surviving
