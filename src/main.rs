@@ -636,17 +636,6 @@ async fn main() -> Result<()> {
     }
     timer.mark("coordinator rehydrate");
 
-    // Durable goal trees (TASK-276): open the store so the goal/milestone/blocker
-    // tables are created (idempotent migration) on the shared aish.db. Foundation
-    // for the goal domain model + tracker; failure here is non-fatal.
-    match db::GoalStore::open(&db_paths::main_db_path()) {
-        Ok(store) => session.goal_store = Some(store),
-        Err(e) => {
-            startup_notices.push(format!("\x1b[33maish:\x1b[0m goal store unavailable: {e:#}"))
-        }
-    }
-    timer.mark("goal store open");
-
     // Durable `:alert` monitors: open the store (shared aish.db). The presenter
     // polls native alerts and surfaces fired ones; a delegated coordinator fires
     // semantic ones via the `set_alert` tool. Non-fatal on failure.
