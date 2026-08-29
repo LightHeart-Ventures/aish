@@ -42,25 +42,28 @@ class AishAudit:
             self.client = None
         else:
             try:
-                # Try without workspace header first (for standard API keys)
-                self.client = anthropic.Anthropic(api_key=api_key)
+                # Check if workspace ID is needed (identity-linked keys require it)
+                workspace_id = os.getenv("ANTHROPIC_WORKSPACE_ID")
+                if workspace_id:
+                    # Create client with workspace header for identity-linked keys
+                    client_kwargs = {"api_key": api_key, "default_headers": {"anthropic-workspace-id": workspace_id}}
+                    self.client = anthropic.Anthropic(**client_kwargs)
+                else:
+                    # Try standard API key first
+                    self.client = anthropic.Anthropic(api_key=api_key)
+                
+                # Verify client works with a quick models.list() call
                 try:
                     self.client.models.list()
                 except anthropic.BadRequestError as e:
-                    if "workspace" in str(e).lower():
-                        # Need workspace ID for identity-linked keys
-                        workspace_id = os.getenv("ANTHROPIC_WORKSPACE_ID")
-                        if workspace_id:
-                            client_kwargs = {"api_key": api_key, "default_headers": {"anthropic-workspace-id": workspace_id}}
-                            self.client = anthropic.Anthropic(**client_kwargs)
-                            self.client.models.list()
-                        else:
-                            self.log("llm", "Identity-linked API key requires ANTHROPIC_WORKSPACE_ID — LLM analysis skipped", "warning")
-                            self.client = None
+                    if "workspace" in str(e).lower() and not workspace_id:
+                        # Identity-linked key detected, needs workspace ID
+                        self.log("llm", "Identity-linked API key requires ANTHROPIC_WORKSPACE_ID env var — LLM analysis skipped", "warning")
+                        self.client = None
                     else:
                         raise
-            except anthropic.AuthenticationError as e:
-                self.log("llm", f"Authentication failed: {e} — LLM analysis will be skipped", "warning")
+            except (anthropic.AuthenticationError, anthropic.BadRequestError) as e:
+                self.log("llm", f"Anthropic auth failed: {str(e)[:80]} — LLM analysis will be skipped", "warning")
                 self.client = None
         
     def _load_checkpoint(self):
@@ -271,6 +274,36 @@ class AishAudit:
                 else:
                     self.log("reliability", 
                         f"  Tool call failure rate: {fail_rate:.1f}%", "info")
+                
+                # Check for tools with high failure rates (even if total rate is low)
+                cur.execute(f"""
+                    SELECT tool, 
+                      COUNT(*) as total,
+                      SUM(CASE WHEN is_error = 1 THEN 1 ELSE 0 END) as failures,
+                      ROUND(SUM(CASE WHEN is_error = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 1) as fail_pct
+                    FROM {table}
+                    GROUP BY tool
+                    HAVING CAST(SUM(CASE WHEN is_error = 1 THEN 1 ELSE 0 END) AS FLOAT) / COUNT(*) > 0.5
+                    ORDER BY fail_pct DESC
+                """)
+                high_error_tools = cur.fetchall()
+                if high_error_tools:
+                    mcp_tools = [t for t in high_error_tools if 'mcp' in t[0].lower()]
+                    non_mcp_tools = [t for t in high_error_tools if 'mcp' not in t[0].lower()]
+                    
+                    if mcp_tools:
+                        self.log("reliability", 
+                            f"  ⚠️ MCP tools logged with 100% error rate (may indicate swarm unavailability):", "warning")
+                        for tool, total, failures, fail_pct in mcp_tools:
+                            self.log("reliability", 
+                                f"    {tool}: {failures}/{total} ({fail_pct}%)", "warning")
+                    
+                    if non_mcp_tools:
+                        self.log("reliability", 
+                            f"  ⚠️ Non-MCP tools with >50% error rate:", "warning")
+                        for tool, total, failures, fail_pct in non_mcp_tools:
+                            self.log("reliability", 
+                                f"    {tool}: {failures}/{total} ({fail_pct}%)", "warning")
         except Exception as e:
             self.log("database", f"  Error auditing {table}: {e}", "warning")
     
@@ -480,16 +513,15 @@ Focus on concrete, measurable recommendations."""
                     return block.text
             return None
         except anthropic.BadRequestError as e:
-            if "workspace" in str(e).lower():
-                self.log("llm", f"Authentication failed: identity-linked API key requires ANTHROPIC_WORKSPACE_ID env var", "warning")
-                return "(LLM analysis skipped — identity-linked API key requires workspace ID)"
+            error_msg = str(e)
+            if "workspace" in error_msg.lower():
+                self.log("llm", "Identity-linked API key requires ANTHROPIC_WORKSPACE_ID — LLM analysis skipped", "warning")
+                return "(LLM analysis skipped — set ANTHROPIC_WORKSPACE_ID for identity-linked keys)"
             else:
-                print(f"DEBUG: LLM error: {type(e).__name__}: {e}", file=sys.stderr)
-                self.log("llm", f"Failed to get LLM analysis: {type(e).__name__}: {str(e)[:100]}", "error")
+                self.log("llm", f"LLM API error: {error_msg[:80]}", "error")
                 return None
         except Exception as e:
-            print(f"DEBUG: LLM error: {type(e).__name__}: {e}", file=sys.stderr)
-            self.log("llm", f"Failed to get LLM analysis: {type(e).__name__}: {str(e)[:100]}", "error")
+            self.log("llm", f"Unexpected LLM error: {type(e).__name__}: {str(e)[:80]}", "error")
             return None
     
     def print_report(self):
