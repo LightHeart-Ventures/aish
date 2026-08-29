@@ -2,8 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Client-side broker configuration, typically loaded from
-/// `~/.aish/config/broker.json`.
+/// Client-side broker configuration. Loadable from a JSON file via
+/// [`BrokerConfig::load`] (a library convenience for embedders). aish's own
+/// integration does not use `load()` — it builds this struct from environment
+/// variables instead; see `src/webhook.rs::config_from_env` in the parent
+/// `aish` crate and the broker's `docs/CLIENT.md`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BrokerConfig {
     /// e.g. `wss://webhook-broker.example.com/ws`.

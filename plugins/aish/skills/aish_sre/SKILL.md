@@ -22,7 +22,9 @@ Prefer a feature branch + draft PR; **never push to `main`** and **never push a
 release tag yourself unless you hold org-admin / ruleset bypass** (see §1).
 Sections are ordered by how often they bite.
 
-Architecture in one breath (see `.repospec.json` for the full map):
+Architecture in one breath (see `docs/ARCHITECTURE.md` for the full map —
+`.repospec.json` was removed from the repo in commit 3271425, "chore: remove
+.repospec.json integration (deprecation)"):
 `repl.rs` (routing + `:commands`) → `engine.rs` (agentic turn loop) →
 `tools.rs` (read/write/run) → `backend/` (Claude API default; `local` =
 llama.cpp in-process). Background work runs as separate aish processes:

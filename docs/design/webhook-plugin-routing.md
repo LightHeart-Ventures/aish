@@ -41,9 +41,11 @@ plugin's `plugin.json`, as parsed by
 
 Reconciliation rules:
 
-- **`webhooks` is canonical**; `handlers` is accepted as a serde `alias` for one
-  release so older manifests keep loading (TASK-447 removes the fork by making
-  every first-party manifest use `webhooks`).
+- **`webhooks` is canonical**; `handlers` was accepted as a serde `alias` for
+  one release so older manifests kept loading, but TASK-447 removed the fork —
+  a manifest still using the legacy top-level `handlers` key now fails fast
+  (skipped with an actionable warning) instead of silently loading zero
+  handlers. Every first-party manifest uses `webhooks`.
 - The aish core loader (`src/plugins.rs::PluginManifest`) and the webhook-client
   loader are **both lenient** (`#[serde(default)]` on optional fields, unknown
   keys dropped), so one manifest satisfies both. There is **no** competing
@@ -87,19 +89,20 @@ metacharacters (`; rm -rf`, `$(...)`, backticks) reaches the handler verbatim on
 stdin and is never executed. Any future change that routes handler invocation
 through a shell must be rejected in review.
 
-## Known limitation — handler path resolution
+## Resolved — handler path resolution
 
-The dispatcher does **not** set the child process cwd or resolve `command[0]`
-relative to the plugin directory. Relative handler paths resolve against the
-broker's cwd. Options for the wiring card (TASK-379 follow-up):
+`PluginRegistry::load_dir` resolves a relative `command[0]` (containing a `/`)
+against the plugin's own directory at manifest-load time (Option 1 below),
+so relative handler scripts work regardless of the broker's cwd. Bare program
+names are left for `PATH` lookup; absolute paths are unchanged.
+
+Original options considered for the wiring card (TASK-379 follow-up), for
+reference:
 
 1. Resolve `command[0]` to `<plugin_dir>/<command[0]>` at manifest-load time when
    the path is relative and the file exists under the plugin dir (preferred —
-   keeps manifests portable).
-2. Set `Command::current_dir(plugin_dir)` per handler.
-
-Option 1 is recommended because it keeps absolute-path and PATH-resolved commands
-working unchanged while making relative handler scripts "just work".
+   keeps manifests portable). **Implemented.**
+2. Set `Command::current_dir(plugin_dir)` per handler. Not implemented.
 
 ## Consequences
 

@@ -92,7 +92,7 @@ a turn (round-trip latency + re-sent context) for no added information.
 |---|---|---|
 | **Serial read-act loop** | read one file → think → read the next known file → think … one call per turn | Front-load: fire *all* independent reads/greps/status in **one** batch (§3). Enforced by TASK-324 (PR #541). |
 | **Per-file inspection** | `read_file` a whole 20 KB file to find one symbol | `grep_files` to locate, then `read_file` with `line_start`/`line_end`. Enforced by TASK-322 (PR #548): bulk reads > 5 KiB without line bounds are refused. |
-| **Detail-first reasoning** | diving into implementation before the change is scoped | Do Phase 1→2 (breadth then decision) before Phase 3. Read the *map* (`.repospec.json`, `list_dir`) before the *territory*. |
+| **Detail-first reasoning** | diving into implementation before the change is scoped | Do Phase 1→2 (breadth then decision) before Phase 3. Read the *map* (`docs/ARCHITECTURE.md`, `list_dir`) before the *territory*. |
 | **Re-reading the same file** | reading a large file end-to-end repeatedly across turns | Read the slice you need once; keep the line range. The loop-guard flags duplicate full reads. |
 | **Huge listings** | `list_dir` / `glob` a giant tree and scroll | Scope the glob (`src/**/*.rs`), cap results, or `grep_files` with a `glob` filter. |
 | **Close-a-turn-to-think** | ending a turn on output you already have | Decide-then-act: go straight to the next action batch; don't spend a round-trip narrating. |
@@ -211,4 +211,6 @@ have moved), and continue from the next uncommitted step.
 - [`coordinator-loop-guards.md`](./coordinator-loop-guards.md) — circuit breaker, turn cap, synthesis logging, decision points
 - [`coordinator-stale-row-prevention.md`](./coordinator-stale-row-prevention.md) — durable-registry / orphan-salvage semantics
 - [`telemetry-efficiency.md`](./telemetry-efficiency.md) — `:telemetry` / `:reasoning` cost knobs
-- `.repospec.json` — repo map: build/test commands, module layout, guardrails
+- `docs/ARCHITECTURE.md` — repo map: build/test commands, module layout, guardrails
+  (`.repospec.json` was removed from the repo in commit 3271425 and is no longer
+  a source of this map)
