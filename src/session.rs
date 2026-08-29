@@ -880,6 +880,7 @@ impl Session {
     }
 
     /// Check database health and emit a warning if unhealthy. Returns true if DB is ok.
+    #[allow(dead_code)]
     pub fn check_db_health(&self) -> bool {
         match &self.db {
             None => true, // No DB = healthy (offline mode)

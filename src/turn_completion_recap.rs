@@ -10,6 +10,7 @@ use std::time::Duration;
 
 /// Configuration for turn-completion recap output.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct RecapConfig {
     /// Enable turn-completion recaps.
     pub enabled: bool,
@@ -33,6 +34,7 @@ impl Default for RecapConfig {
 }
 
 /// Recap data collected during a turn.
+#[allow(dead_code)]
 pub struct TurnRecapData {
     /// Total tool calls executed this turn.
     pub tool_count: usize,
@@ -45,6 +47,7 @@ pub struct TurnRecapData {
 }
 
 impl TurnRecapData {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             tool_count: 0,
@@ -55,12 +58,14 @@ impl TurnRecapData {
     }
 
     /// Record a tool call.
+    #[allow(dead_code)]
     pub fn record_tool(&mut self, name: &str) {
         self.tool_count += 1;
         *self.tools_by_name.entry(name.to_string()).or_insert(0) += 1;
     }
 
     /// Build the recap text.
+    #[allow(dead_code)]
     pub fn format_recap(&self, config: &RecapConfig) -> String {
         if !config.enabled || (self.tool_count == 0 && self.usage.is_none()) {
             return String::new();
@@ -133,6 +138,7 @@ impl TurnRecapData {
 }
 
 /// Emit a turn-completion recap if enabled.
+#[allow(dead_code)]
 pub fn emit_recap(recap: &TurnRecapData, config: &RecapConfig) {
     let text = recap.format_recap(config);
     if !text.is_empty() {
