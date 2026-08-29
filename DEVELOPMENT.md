@@ -6,18 +6,25 @@ these accumulate: merged branches never get pruned, abandoned coordinator trees
 pile up, and stale `release/*` checkouts collide on merge. SPR-064 formalizes the
 retention policy and ships the tooling that keeps the pool clean.
 
-## Retention policy (single source of truth)
+## Retention policy
 
-The policy lives in [`.repospec.json`](./.repospec.json) under
-`worktreeRetention` so both humans and the cleanup tooling read the same values:
+SPR-064 originally centralized these values in a repo-root `.repospec.json`
+(`worktreeRetention` key), but that file was removed in
+`chore: remove .repospec.json integration (deprecation)` shortly after SPR-064
+landed. There is no live config file today — `ttlIdleDays` is a hardcoded
+default (`ttl_days=30`) in `scripts/audit-worktrees.sh` and
+`scripts/cleanup-worktrees.sh` (each optionally re-reads `.repospec.json` if
+one happens to exist, but the repo does not ship one, so this always falls
+through to the default). The other fields below are documentation-only
+convention, not enforced by any script:
 
-| Field | Default | Meaning |
-|-------|---------|---------|
-| `ttlIdleDays` | `30` | A worktree idle (no new commit) longer than this is reclaimable. |
-| `maxConcurrentPerBranch` | `1` | At most one worktree per branch — duplicates are a collision smell. |
-| `allowedPrefixes` | `feat/ fix/ docs/ aish/w_ release/` | Branch prefixes worktrees may use. |
-| `autoCleanupSchedule` | `0 2 * * *` | Cron for the nightly TTL reaper. |
-| `worktreeRoot` | `~/.aish/worktrees` | Where worktrees are created. |
+| Field | Default | Meaning | Enforced by |
+|-------|---------|---------|-------------|
+| `ttlIdleDays` | `30` | A worktree idle (no new commit) longer than this is reclaimable. | `scripts/audit-worktrees.sh`, `scripts/cleanup-worktrees.sh` (hardcoded default; override with `--ttl N`) |
+| `maxConcurrentPerBranch` | `1` | At most one worktree per branch — duplicates are a collision smell. | convention only — not checked by any script |
+| `allowedPrefixes` | `feat/ fix/ docs/ aish/w_ release/` | Branch prefixes worktrees may use. | convention only — not checked by any script |
+| `autoCleanupSchedule` | `0 2 * * *` | Cron for the nightly TTL reaper. | `.github/workflows/worktree-hygiene.yml` schedule trigger |
+| `worktreeRoot` | `~/.aish/worktrees` | Where worktrees are created. | convention only — not checked by any script |
 
 ## Lifecycle
 
@@ -49,7 +56,7 @@ GitHub runners can't see your local worktree pool, so the actual disk
 reclamation runs where the worktrees live. Cron:
 
 ```cron
-# nightly worktree reaper (matches worktreeRetention.autoCleanupSchedule)
+# nightly worktree reaper (matches the schedule trigger in worktree-hygiene.yml)
 0 2 * * * cd ~/projects/aish && bash scripts/cleanup-worktrees.sh --apply >> ~/.aish/worktree-cron.log 2>&1
 ```
 

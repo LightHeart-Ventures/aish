@@ -32,6 +32,10 @@ current="$(cd "$root" && pwd -P)"
 log="$root/.worktree-cleanup.log"
 
 ttl_days=30
+# Default TTL. .repospec.json's worktreeRetention integration was removed
+# from this repo (see DEVELOPMENT.md#retention-policy); the block below is a
+# no-op today unless a caller re-introduces that file, and is kept only so a
+# future repo-level override still works without a code change.
 if command -v python3 >/dev/null 2>&1 && [ -f "$root/.repospec.json" ]; then
   ttl_days="$(python3 -c "import json;print(json.load(open('$root/.repospec.json')).get('worktreeRetention',{}).get('ttlIdleDays',30))" 2>/dev/null || echo 30)"
 fi

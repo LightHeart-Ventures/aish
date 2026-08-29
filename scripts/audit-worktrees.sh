@@ -15,7 +15,10 @@ set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
 out="${1:-$root/.worktree-audit.csv}"
 
-# TTL from the repospec worktreeRetention policy (single source of truth).
+# Default TTL. .repospec.json's worktreeRetention integration was removed
+# from this repo (see DEVELOPMENT.md#retention-policy); the block below is a
+# no-op today unless a caller re-introduces that file, and is kept only so a
+# future repo-level override still works without a code change.
 ttl_days=30
 if command -v python3 >/dev/null 2>&1 && [ -f "$root/.repospec.json" ]; then
   ttl_days="$(python3 -c "import json;print(json.load(open('$root/.repospec.json')).get('worktreeRetention',{}).get('ttlIdleDays',30))" 2>/dev/null || echo 30)"
