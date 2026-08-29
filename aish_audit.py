@@ -18,6 +18,8 @@ AISH_HOME = Path.home() / ".aish"
 AISH_DB = AISH_HOME / "database" / "aish.db"
 PLUGINS_DB = AISH_HOME / "database" / "plugins.db"
 TELEMETRY_LOG = AISH_HOME / "reasoning-telemetry.jsonl"
+AUDIT_CHECKPOINT = AISH_HOME / "audit_checkpoint.json"
+AUDIT_LOG = AISH_HOME / "audit_log.jsonl"
 
 class AishAudit:
     def __init__(self):
@@ -26,6 +28,13 @@ class AishAudit:
         self.memories = []
         self.history = []
         self.telemetry = []
+        
+        # Load checkpoint to resume from where we left off
+        self.checkpoint = self._load_checkpoint()
+        self.run_id = self.checkpoint.get("run_id", datetime.now().isoformat())
+        if "run_id" not in self.checkpoint:
+            self.checkpoint["run_id"] = self.run_id
+        
         # Initialize Anthropic client with API key from environment
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
@@ -51,13 +60,52 @@ class AishAudit:
                 self.log("llm", f"Authentication failed: {e} — LLM analysis will be skipped", "warning")
                 self.client = None
         
+    def _load_checkpoint(self):
+        """Load the audit checkpoint to resume from previous run."""
+        if AUDIT_CHECKPOINT.exists():
+            try:
+                with open(AUDIT_CHECKPOINT, "r") as f:
+                    cp = json.load(f)
+                    print(f"[✓] Resuming from checkpoint: {cp.get('last_stage', 'unknown')}")
+                    return cp
+            except Exception as e:
+                print(f"[!] Failed to load checkpoint: {e} — starting fresh")
+                return {}
+        return {}
+    
+    def _save_checkpoint(self, stage, data=None):
+        """Save checkpoint to resume from this stage later."""
+        self.checkpoint["last_stage"] = stage
+        self.checkpoint["timestamp"] = datetime.now().isoformat()
+        if data:
+            self.checkpoint.update(data)
+        try:
+            AUDIT_CHECKPOINT.parent.mkdir(parents=True, exist_ok=True)
+            with open(AUDIT_CHECKPOINT, "w") as f:
+                json.dump(self.checkpoint, f, indent=2)
+        except Exception as e:
+            print(f"[!] Failed to save checkpoint: {e}")
+    
+    def _append_audit_log(self, finding):
+        """Append finding to persistent audit log."""
+        try:
+            finding["run_id"] = self.run_id
+            finding["timestamp"] = datetime.now().isoformat()
+            AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(AUDIT_LOG, "a") as f:
+                f.write(json.dumps(finding) + "\n")
+        except Exception as e:
+            print(f"[!] Failed to append to audit log: {e}")
+    
     def log(self, category, message, severity="info"):
         """Log a finding with category, message, and severity level."""
-        self.findings.append({
+        finding = {
             "category": category,
             "message": message,
             "severity": severity
-        })
+        }
+        self.findings.append(finding)
+        self._append_audit_log(finding)
         
     def connect_db(self, db_path):
         """Connect to a database, return cursor or None."""
@@ -71,9 +119,15 @@ class AishAudit:
     
     def audit_aish_db(self):
         """Audit the main aish.db database."""
+        # Skip if already completed in this run
+        if self.checkpoint.get("last_stage") == "aish_db_complete":
+            print("[✓] aish.db audit already completed — skipping")
+            return
+        
         print("[*] Auditing aish.db...")
         conn = self.connect_db(AISH_DB)
         if not conn:
+            self._save_checkpoint("aish_db_failed")
             return
         
         cur = conn.cursor()
@@ -113,6 +167,7 @@ class AishAudit:
                     self.log("database", f"  Table '{table}': error - {e}", "warning")
         
         conn.close()
+        self._save_checkpoint("aish_db_complete")
     
     def _load_history(self, cur, table):
         """Load turn history for LLM analysis."""
@@ -252,6 +307,7 @@ class AishAudit:
             self.log("database", f"  Table '{table}': {row_count} rows", "info")
         
         conn.close()
+        self._save_checkpoint("plugins_db_complete")
     
     def audit_telemetry(self):
         """Audit reasoning telemetry log."""
@@ -300,6 +356,7 @@ class AishAudit:
                         f"Escalation rate: {escalated/(escalated+guessed)*100:.1f}%", "info")
         except Exception as e:
             self.log("telemetry", f"Error parsing telemetry: {e}", "warning")
+        self._save_checkpoint("telemetry_complete")
     
     def audit_filesystem(self, skip_large_dirs=False):
         """Audit aish filesystem usage."""
@@ -359,6 +416,7 @@ class AishAudit:
             self.log("filesystem", 
                 f"Scanned {count} files, total: {total_size/1024/1024:.1f}MB (excluding worktrees)", 
                 "info")
+        self._save_checkpoint("filesystem_complete")
     
     def get_llm_analysis(self):
         """Use Claude to analyze telemetry, memories, and history."""
