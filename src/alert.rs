@@ -159,43 +159,41 @@ pub fn parse_condition(condition: &str) -> AlertKind {
     let lower = condition.to_lowercase();
 
     // 1) PR merged — the canonical example. "PR 333 is merged".
-    if lower.contains("merg") {
-        if let Ok(re) = Regex::new(r"(?:pr|pull\s*request)\D{0,6}(\d{1,7})") {
-            if let Some(c) = re.captures(&lower) {
-                if let Some(num) = c.get(1) {
-                    let n = num.as_str().to_string();
-                    return AlertKind::Command {
-                        program: "gh".into(),
-                        args: vec![
-                            "pr".into(),
-                            "view".into(),
-                            n,
-                            "--json".into(),
-                            "state".into(),
-                            "-q".into(),
-                            ".state".into(),
-                        ],
-                        expect: Some("MERGED".into()),
-                    };
-                }
-            }
-        }
+    if lower.contains("merg")
+        && let Ok(re) = Regex::new(r"(?:pr|pull\s*request)\D{0,6}(\d{1,7})")
+        && let Some(c) = re.captures(&lower)
+        && let Some(num) = c.get(1)
+    {
+        let n = num.as_str().to_string();
+        return AlertKind::Command {
+            program: "gh".into(),
+            args: vec![
+                "pr".into(),
+                "view".into(),
+                n,
+                "--json".into(),
+                "state".into(),
+                "-q".into(),
+                ".state".into(),
+            ],
+            expect: Some("MERGED".into()),
+        };
     }
 
     // 2) File change / existence watch.
     let file_cue = ["file", "change", "chang", "modif", "watch", "exist", "creat", "delet", "touch", "appear"]
         .iter()
         .any(|k| lower.contains(k));
-    if file_cue {
-        if let Some(path) = first_path(condition) {
-            let baseline_exists = path.exists();
-            let baseline_mtime = mtime_of(&path);
-            return AlertKind::FileChange {
-                path,
-                baseline_mtime,
-                baseline_exists,
-            };
-        }
+    if file_cue
+        && let Some(path) = first_path(condition)
+    {
+        let baseline_exists = path.exists();
+        let baseline_mtime = mtime_of(&path);
+        return AlertKind::FileChange {
+            path,
+            baseline_mtime,
+            baseline_exists,
+        };
     }
 
     // 3) Delegate to a coordinator.
