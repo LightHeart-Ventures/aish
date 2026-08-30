@@ -46,6 +46,12 @@ jobs:
   testbox:
     name: testbox warmup (Rust, Claude-only)
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      # Kept in lockstep with ci.yml's CARGO_INCREMENTAL=0 — see that file
+      # for why. This job shares the same `target`/Cargo.lock-only cache key,
+      # so it carries the identical stale-incremental-state risk; testbox
+      # exists specifically to mirror ci.yml's gate, so the env must match.
+      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v6
 
