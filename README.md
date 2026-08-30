@@ -244,8 +244,9 @@ aish --mode careful     # confirm writes only
 **Telemetry & startup efficiency knobs** — batching, caching, JSONL rotation,
 and update-check TTL are all tunable via `AISH_TELEMETRY_*`, `AISH_REASONING_*`,
 and `AISH_UPDATE_CHECK_*` env vars (all best-effort, no behavior change). See
-[`docs/telemetry-efficiency.md`](docs/telemetry-efficiency.md) for the full
-table of defaults and how to force a fresh update check / reasoning rescan.
+[`docs/internals/telemetry-efficiency.md`](docs/internals/telemetry-efficiency.md)
+for the full table of defaults and how to force a fresh update check /
+reasoning rescan.
 
 ### REPL Commands
 

@@ -126,7 +126,7 @@ prevents an 87-call runaway.";
 /// then fire ALL Phase 3 writes/commits in one parallel batch and TRUST them
 /// (no read-back verification), collapsing an 87-call serial chain to ~15–20
 /// calls. Phase transition markers ("--- PHASE n ---") let turn logging count
-/// calls per phase. See `docs/coordinator-patterns.md` (TASK-359) for the full
+/// calls per phase. See `docs/reference/coordinator/patterns.md` (TASK-359) for the full
 /// pipeline table and batching rules. Held as a `const` so it is unit-testable
 /// without driving a whole run.
 const PHASE_PIPELINE: &str = "5-PHASE PIPELINE — after the Phase-0 guard clears, run the work in \

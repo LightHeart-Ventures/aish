@@ -21,8 +21,8 @@
 //! Each file is a **flat JSON object** mapping keys to arbitrary JSON values.
 //! Nested access uses dot-notation (`webhooks.github.last_delivery_id`), so a
 //! key path descends into nested objects. There is no on-disk envelope/version
-//! field in v1 — see `docs/plugin-memory-schema.md` § Migration for the reserved
-//! `__*` key namespace and the forward-migration plan.
+//! field in v1 — see `docs/reference/plugins/memory.md` § Version field /
+//! migrations for the reserved `__*` key namespace and the forward-migration plan.
 //!
 //! ## Namespaces & rules
 //!

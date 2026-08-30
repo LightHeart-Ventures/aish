@@ -306,5 +306,5 @@ is directly reusable by every other API-backed integration.
 | `webhook_command` env (`AISH_EVENT_TYPE`, `AISH_PLUGIN_ID`) + result captured to `plugins.db` | `docs/plugin-webhook-events.md` §Command delivery |
 | Blocking/mutating hooks are design-only (Phases 2/3) | `docs/aish-hooks-design.md` §1.2, §2 |
 | Login handler exists (`aish login <plugin>` → `[profile:*]`) | `src/plugin_auth.rs` (~24 KB) |
-| K/V-only state store | `src/plugin_state.rs`; `docs/plugin-state-schema.md` |
+| K/V-only state store | `src/plugin_state.rs`; `docs/reference/plugins/state.md` |
 | Inbound broker + reference plugin scoped in SPR-059 | `blacksmith-plugin-integration.md` §4.1 (`card_73605f4530c3`) |
