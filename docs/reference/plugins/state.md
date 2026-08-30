@@ -11,7 +11,7 @@ namespaced key/value store. Implemented in [`src/plugin_state.rs`]; tests in
 ```
 
 All aish databases live under `~/.aish/database/` — see
-[`DATABASE_PATHS.md`](./DATABASE_PATHS.md). One file for all plugins. Initialized
+[`database.md`](../database.md). One file for all plugins. Initialized
 once on shell startup (see
 [Initialization](#initialization)). WAL sidecars (`plugins.db-wal`,
 `plugins.db-shm`) may appear next to it — that is normal for WAL journaling.

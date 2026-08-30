@@ -266,5 +266,5 @@ so today the choice is *push-blind-and-round-trip-through-CI* or *OOM locally*.
 | Outbound-only, non-blocking dispatch; only `workspace_open` wired | `docs/plugin-webhook-events.md`; `src/plugin_dispatcher.rs` |
 | Blocking/mutating hooks are design-only (Phases 2/3) | `docs/aish-hooks-design.md` §1.2, §2 |
 | Login handler exists | `src/plugin_auth.rs` (~24 KB) |
-| K/V-only state store | `src/plugin_state.rs`; `docs/plugin-state-schema.md` |
+| K/V-only state store | `src/plugin_state.rs`; `docs/reference/plugins/state.md` |
 | Testbox CLI + Blacksmith integration | `blacksmith-testbox` SKILL.md; `.github/workflows/ci-testbox.yml` (PR #471) |

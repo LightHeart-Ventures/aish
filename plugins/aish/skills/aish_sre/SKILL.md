@@ -42,7 +42,7 @@ now DO carry llama.cpp; only CI tests + coordinator rebuilds stay Claude-only
 
 **When:** you've been asked to "cut a release", "tag vX.Y.Z", "ship a new
 version", or "release aish". This is the proactive procedure; §1–2 are the
-failure modes it exists to avoid. Canonical source: `docs/RELEASING.md`.
+failure modes it exists to avoid. Canonical source: `docs/RELEASE.md`.
 
 **Mental model:** the runtime version is baked from `Cargo.toml`
 (`env!("CARGO_PKG_VERSION")` → `src/update.rs::current_version()`). `:update`
@@ -238,7 +238,7 @@ the per-platform binaries `:update` depends on → 422.
   ruleset can block re-pushing the same tag. If `git push origin vX.Y.Z` is
   rejected after a delete, **stop re-trying** — bump to the next patch instead
   (this is why v0.19.0 was abandoned for v0.19.1). Canonical procedure lives in
-  `docs/RELEASING.md`.
+  `docs/RELEASE.md`.
 
 ### 2. `verify-version` passed but `origin/main` is the OLD version — tag cut off-main
 
@@ -251,7 +251,7 @@ side/off-main commit and **never merged**. The tag is real and consistent with
 its own commit; `main` never advanced.
 
 - **Lesson — the version bump must land on `main` FIRST, then tag the merge
-  commit.** Correct order (`docs/RELEASING.md`): (1) bump `version` in
+  commit.** Correct order (`docs/RELEASE.md`): (1) bump `version` in
   `Cargo.toml` **and** refresh `Cargo.lock`, open `release/vX.Y.Z`, **merge**;
   (2) `git tag vX.Y.Z <merge-commit-sha> && git push origin vX.Y.Z` (only the
   tag). The `verify-version` job (`tag == Cargo.toml version`) only proves
@@ -340,7 +340,7 @@ ad-hoc signature. macOS AMFI SIGKILLs it the moment it's copied to a new path.
 synthesis repeatedly, or exhausts its turn budget without finishing or declaring
 a blocker. Shows as long-running in `background_status` / `:workers`.
 
-**Root cause & the shipped guards** (`docs/coordinator-loop-guards.md`,
+**Root cause & the shipped guards** (`docs/reference/coordinator/loop-guards.md`,
 `src/coordinator.rs`):
 
 - **Inspect the journal first.** Every run writes `.atum/run-<id>.jsonl`: each
