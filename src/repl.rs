@@ -6703,8 +6703,11 @@ fn handle_hooks(sub: Option<&str>, session: &mut Session) {
 /// `list` enumerates discovered plugins; `info <id>` renders one plugin's full
 /// capability report (metadata, login, lifecycle + event hooks, MCP servers,
 /// schemas, skills). `info <id> --schema` (Phase 3.5) renders the plugin's
-/// JSON-Schema shapes instead. Bare `:plugin` is an alias for `list`.
-fn handle_plugin(args: Vec<&str>) {
+/// JSON-Schema shapes instead; `info <id> --mcp` (Phase 0.5.3 diagnostic)
+/// renders which of the plugin's `.mcp.json` servers will actually connect
+/// vs. lose a name collision against the session's already-configured MCP
+/// servers. Bare `:plugin` is an alias for `list`.
+fn handle_plugin(args: Vec<&str>, session: &Session) {
     let dir = crate::plugins::default_plugins_dir();
     let sub = args.first().copied();
     let id = args.get(1).copied();
@@ -6758,12 +6761,23 @@ fn handle_plugin(args: Vec<&str>) {
         }
         Some("info") => {
             let Some(id) = id else {
-                println!("usage: :plugin info <id> [--schema]");
+                println!("usage: :plugin info <id> [--schema|--mcp]");
                 return;
             };
             // Phase 3.5: `--schema` drills into the plugin's shipped schemas.
             if matches!(flag, Some("--schema") | Some("--schemas")) {
                 match crate::plugins::format_plugin_schemas(&dir, id) {
+                    Some(report) => println!("{report}"),
+                    None => println!("no such plugin `{id}` — try :plugin list"),
+                }
+                return;
+            }
+            // Phase 0.5.3 diagnostic: `--mcp` reports which of the plugin's
+            // `.mcp.json` servers will connect vs. lose a name collision,
+            // resolved against the session's already-configured MCP servers.
+            if matches!(flag, Some("--mcp")) {
+                let existing = session.mcp.server_names();
+                match crate::plugins::format_plugin_mcp(&dir, id, &existing) {
                     Some(report) => println!("{report}"),
                     None => println!("no such plugin `{id}` — try :plugin list"),
                 }
@@ -8809,7 +8823,7 @@ async fn handle_colon(
         }
         Some("memories" | "memory") => handle_memories(parts.next(), session),
         Some("hooks") => handle_hooks(parts.next(), session),
-        Some("plugin" | "plugins") => handle_plugin(parts.collect()),
+        Some("plugin" | "plugins") => handle_plugin(parts.collect(), session),
         Some("telemetry" | "tool-stats") => handle_telemetry(parts.collect(), session),
         Some("tokens" | "token-spend") => handle_tokens(session),
         Some(other) => println!("unknown command :{other} — try :help"),
