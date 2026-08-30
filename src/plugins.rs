@@ -1172,6 +1172,47 @@ pub fn format_plugin_schemas(dir: &Path, id: &str) -> Option<String> {
     Some(out.trim_end().to_string())
 }
 
+/// Render the `:plugin info <id> --mcp` detail block: this plugin's own
+/// `.mcp.json` server contributions, resolved against `existing` (server
+/// names already claimed by project/user config or an earlier-discovered
+/// plugin) via [`collect_plugin_mcp_servers`] — so the report shows exactly
+/// which of the plugin's servers will actually connect and which lose to a
+/// name collision. `None` when no such plugin exists. Never echoes a spec's
+/// resolved secret refs, only server names.
+pub fn format_plugin_mcp(dir: &Path, id: &str, existing: &[String]) -> Option<String> {
+    let plugins = discover(dir);
+    let plugin = plugins.iter().find(|p| p.manifest.id == id)?;
+    let mut out = format!("plugin `{}` mcp servers\n", plugin.manifest.id);
+
+    let raw = read_plugin_mcp(&plugin.dir).unwrap_or_default();
+    if raw.is_empty() {
+        out.push_str("  (none)\n");
+        return Some(out.trim_end().to_string());
+    }
+
+    let (servers, collisions) = collect_plugin_mcp_servers(dir, existing);
+    let mut names: Vec<&String> = raw.keys().collect();
+    names.sort();
+    for name in names {
+        if servers.iter().any(|s| s.plugin_id == id && s.name == *name) {
+            out.push_str(&format!("  {name} — will connect\n"));
+        } else if let Some(c) = collisions
+            .iter()
+            .find(|c| c.loser_plugin_id == id && c.name == *name)
+        {
+            out.push_str(&format!(
+                "  {name} — skipped, name already claimed by {}\n",
+                c.winner
+            ));
+        } else {
+            // Shouldn't happen (every raw name is either accepted or a
+            // collision), but stay forgiving rather than panic on a report.
+            out.push_str(&format!("  {name} — unresolved\n"));
+        }
+    }
+    Some(out.trim_end().to_string())
+}
+
 // ---- Phase 0.5.4: session-env injection from lifecycle-hook stdout ----
 //
 // A plugin lifecycle hook (`<plugin>/hooks/<name>.sh`) may print `KEY=VALUE`
@@ -2676,6 +2717,49 @@ mod tests {
 
         // No-such-plugin → None.
         assert!(format_plugin_schemas(&tmp, "ghost").is_none());
+    }
+
+    #[test]
+    fn format_plugin_mcp_renders_connect_and_collision() {
+        let tmp = tempdir();
+        // "aaa" claims `shared` first (id-sorted discovery); "bbb" loses it to
+        // "aaa" and also contributes an uncontested server of its own.
+        write_plugin(&tmp, "aaa", r#"{"id":"aaa"}"#, None);
+        write_plugin_mcp(&tmp, "aaa", r#"{"mcpServers":{"shared":{"command":"a"}}}"#);
+        write_plugin(&tmp, "bbb", r#"{"id":"bbb"}"#, None);
+        write_plugin_mcp(
+            &tmp,
+            "bbb",
+            r#"{"mcpServers":{"shared":{"command":"b"},"solo":{"command":"c"}}}"#,
+        );
+
+        let winner = format_plugin_mcp(&tmp, "aaa", &[]).unwrap();
+        assert!(winner.contains("shared — will connect"), "winner: {winner}");
+
+        let loser = format_plugin_mcp(&tmp, "bbb", &[]).unwrap();
+        assert!(
+            loser.contains("shared — skipped, name already claimed by plugin:aaa"),
+            "loser: {loser}"
+        );
+        assert!(loser.contains("solo — will connect"), "loser: {loser}");
+
+        // A server name already reserved by project/user config also renders
+        // as a collision, attributed to "config".
+        write_plugin(&tmp, "ccc", r#"{"id":"ccc"}"#, None);
+        write_plugin_mcp(&tmp, "ccc", r#"{"mcpServers":{"github":{"command":"c"}}}"#);
+        let vs_config = format_plugin_mcp(&tmp, "ccc", &["github".to_string()]).unwrap();
+        assert!(
+            vs_config.contains("github — skipped, name already claimed by config"),
+            "vs_config: {vs_config}"
+        );
+
+        // A plugin with no `.mcp.json` at all.
+        write_plugin(&tmp, "none", r#"{"id":"none"}"#, None);
+        let empty = format_plugin_mcp(&tmp, "none", &[]).unwrap();
+        assert!(empty.contains("(none)"), "empty: {empty}");
+
+        // No-such-plugin → None.
+        assert!(format_plugin_mcp(&tmp, "ghost", &[]).is_none());
     }
 
     /// TASK-376 (SPR-069) — schema-reconciliation guard.
