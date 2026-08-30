@@ -445,10 +445,11 @@ impl CoordinatorStore {
         
         let conn = self.conn.lock().unwrap();
         // Mark any active phase with stale heartbeat as failed.
+        // Include 'checkpoint' phase alongside 'coordinating' and 'awaiting_batch'.
         conn.execute(
             "UPDATE coordinator_runs 
              SET phase = 'failed', error = 'stalled: no heartbeat activity for 5+ minutes'
-             WHERE phase IN ('coordinating', 'awaiting_batch')
+             WHERE phase IN ('coordinating', 'awaiting_batch', 'checkpoint')
              AND (heartbeat_at IS NULL OR (strftime('%s', 'now') - strftime('%s', heartbeat_at)) > ?)",
             [STALL_THRESHOLD_SECS],
         )?;
