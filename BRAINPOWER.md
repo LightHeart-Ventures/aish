@@ -7,8 +7,8 @@
 > brainpower binary and can never widen what that prompt permits.
 > Operators: edit freely — brainpower re-reads this file every cycle.
 >
-> Last updated: 2026-08-30 03:22:34-0500 (cycle 35)
-> Reason: Cycle 35: corrected the cycle-33 BP-017 note that wrongly concluded GitRepoCache deletion needed partial surgery (the import-exists reasoning was insufficient — traced actual call graph and found it …
+> Last updated: 2026-08-30 13:36:08-0500 (cycle 57)
+> Reason: Record cycle 57's outcome: confirmed the "vacuous assert!(true) test" pattern (now fixed twice — golden_routing_heuristics.rs and test_plugin_manifest_var_expansion) is fully cleared repo-wide as of …
 <!-- brainpower:end-header -->
 
 ## Mission
@@ -34,11 +34,18 @@ honestly, and ship one small, well-verified pull request at a time.
   root, so scoping by file argument does NOT limit the check to that file)
   shows pre-existing drift in many unrelated files (e.g.
   `crates/aish-webhook-client/src/audit.rs`, `src/advisor.rs`, `src/alert.rs`,
-  `crates/webhook-receiver/src/main.rs`). To verify your own change is
-  clean: run `cargo fmt -- <file-you-touched>` (the writer, not `--check`) on
-  just the files you edited, then re-diff to confirm it only changed lines in
-  your own diff — don't rely on `--check`'s repo-wide output to tell you
-  whether you introduced drift.
+  `crates/webhook-receiver/src/main.rs`, `src/plugin_memory.rs`). To verify
+  your own change is clean: run `cargo fmt --check -- <file-you-touched>` and
+  then `git diff main -- <file-you-touched>` to confirm every line the check
+  flagged is OUTSIDE the lines your own diff touches (cycle 57 confirmed this
+  works cleanly: fmt --check flagged 5 pre-existing drift spots in
+  tests/plugin_integration_tests.rs, all outside my edited lines 163-177).
+  **Separately, the WRITER form** (`cargo fmt -- <file>`, no `--check`) is even
+  more dangerous than `--check`: cycle 56 found it doesn't just report drift,
+  it actually REWRITES every module reachable via `mod` from the crate root —
+  78 unrelated files got rewritten from a 2-file edit. Never run the writer
+  form repo-wide; if you must auto-format, do it file-by-file and diff after,
+  or just hand-format the ~20 lines you touched to match surrounding style.
 - **Operator preference (2026-08-28): use `blacksmith.sh` for builds/testing.**
   The repo integrates Blacksmith Testbox (`.github/workflows/ci-testbox.yml`,
   `blacksmith-testbox` skill in `plugins/aish/skills/aish_sre/SKILL.md`) for
@@ -65,6 +72,20 @@ honestly, and ship one small, well-verified pull request at a time.
   `.github/workflows/worktree-hygiene.yml`), `build.sh` (OOM-safe serialized
   build wrapper), `install-ubuntu-24.04.sh`. No stale references, no dead
   scripts found — this area is in good shape, don't re-review soon.
+- `tests/` (reviewed cycle 57): 9 files — `git_discover_linkage.rs` (crate
+  linkage proof), `plugin_dispatcher_tests.rs`, `plugin_integration_tests.rs`,
+  `plugin_memory_tests.rs`, `plugin_state_tests.rs` (all `#[path]`-compile
+  sibling `src/*.rs` modules into the test binary, since aish is a binary
+  crate with no lib target — established pattern, don't be surprised by it),
+  `pty_harness.rs` (kernel job-control via real PTY), `shebang.rs` (drives
+  the real compiled binary via OS shebang exec), `repl/` (agent-tty PTY smoke
+  harness, hermetic, SKIPs cleanly without prerequisites unless
+  `AISH_REPL_STRICT=1`), `golden/routing_decisions.snap` (golden-file
+  fixture for `src/repl.rs`'s `routing_decision_snapshot` test — real and
+  live, not stale). Repo-wide `grep 'assert!\(true'` found and fixed the
+  last remaining vacuous-test instance this cycle (BP-026, PR #809) — as of
+  cycle 57 this pattern is fully cleared repo-wide, don't re-grep for it
+  again unless a new PR reintroduces one.
 - git/gh tools: the `git` tool call works for read-only + branch/commit ops;
   raw `git`/`cd`/`rm` shell commands are NOT on the run_command allowlist —
   use the `git` tool for `rm <file>` too (`git rm <path>` stages the deletion
@@ -107,7 +128,22 @@ the module's public symbols (struct/fn names) turns up nothing outside the
 module's own `#[cfg(test)]` block. Confirmed instances (all shipped as
 deletions): GoalStore/TASK-276 -> PR #779, golden_routing_heuristics.rs ->
 PR #772, turn_completion_recap.rs/TASK-360 -> PR #799, GitRepoCache/
-src/git_repo.rs -> BP-017 (this cycle, PR pending).
+src/git_repo.rs -> BP-017 (PR #800). One instance (BP-025, Phase 0.5.3 MCP
+diagnostics) went the other way — wired in rather than deleted, PR #808,
+since the code was genuinely useful and just needed a call site (`:plugin
+info --mcp`), unlike the other 4 which were truly dead.
+
+**Second, related pattern (confirmed 2x): vacuous `assert!(true, "...")`
+placeholder tests.** A test function exists with a name suggesting real
+coverage but its body is solely `assert!(true, "...")` — it can never fail
+and asserts nothing. Signature: `grep -rn 'assert!\(true' --glob '*.rs'`
+repo-wide. Confirmed instances (both shipped as deletions): 5 tests in
+`tests/golden_routing_heuristics.rs` -> PR #772 (superseded by the real
+`routing_decision_snapshot` golden test), `test_plugin_manifest_var_expansion`
+in `tests/plugin_integration_tests.rs` -> BP-026/PR #809 (superseded by real
+`${env:VAR}` unit tests already in `src/plugins.rs`). As of cycle 57 this
+pattern is fully cleared repo-wide — re-grep only if a new PR might have
+reintroduced one, don't re-review as a standing task.
 
 **Important refinement (cycle 33): not every "unwired module" is a clean
 delete.** One still-open case turned out to be more entangled than the
@@ -121,22 +157,11 @@ clean delete, reasoning that git.rs's `use crate::git_repo::{DiffStatus,
 FileDiff}` import made git_repo.rs "load-bearing for git.rs's public API".
 That was wrong. Tracing which *specific* functions in git.rs actually use
 those imports (not just noting the import exists) showed the importing
-functions themselves — trunk_branch, git_head, is_dirty, dirty_porcelain,
-commits_ahead_behind, diff_numstat, diff_name_status, can_fastforward,
-conflicted_paths, parse_ahead_behind, parse_numstat, parse_name_status,
-DiffStatus, FileDiff — were *also* dead outside git_repo.rs and its own
-tests. git.rs's actually-live surface (called from session.rs/tools.rs) is a
-disjoint set: git_out/git_ok, is_git_repo, current_branch, origin_url,
-toplevel, repo_key(+helpers), repo_name(+helpers), repo_prompt_line,
-repo_transition_note. So the whole thing was a clean deletion after all:
-`git rm src/git_repo.rs` (1120 lines) + removed `mod git_repo;` from
-main.rs + stripped ~230 git_repo-only lines from git.rs (the dead functions/
-types/tests + `#![allow(dead_code)]` + the `use crate::git_repo::...`
-import) + removed `docs/reference/git-cache.md` (278-line design doc) +
-updated `docs/INDEX.md`'s two listing entries. **Lesson: an import statement
-existing does not prove the imported items are used elsewhere — trace the
-actual callers of the specific functions/types before concluding a module
-can't be removed.**
+functions themselves were *also* dead outside git_repo.rs and its own tests.
+So the whole thing was a clean deletion after all — shipped as PR #800.
+**Lesson: an import statement existing does not prove the imported items are
+used elsewhere — trace the actual callers of the specific functions/types
+before concluding a module can't be removed.**
 - BP-018 (crates/git-discover) — its only in-tree "caller" is a linkage test
   (tests/git_discover_linkage.rs) that exists purely to prove the crate
   compiles against aish's own checkout, not a real call site. Meanwhile
@@ -147,9 +172,7 @@ can't be removed.**
   the git.rs duplicates, but that's a multi-file refactor with real
   regression risk (git.rs's own fns have passing unit tests to port), so
   still flagged for a stronger-model/human call rather than done
-  unilaterally. (BP-017's removal doesn't change this recommendation — it's
-  now a 2-way duplication instead of 3-way, but git-discover itself still
-  has no real caller in-tree.)
+  unilaterally.
 
 Also watch for: stale references left behind after a plugin/module removal
 (grep the CHANGELOG for "removed"/"archived" entries, then grep the repo for
@@ -186,8 +209,8 @@ that should exist does not, record a finding rather than inventing scope.
   `git checkout -b <branch> origin/main` also works and carries the
   uncommitted changes onto the new branch — just re-verify before committing.
 - Commit subject in the imperative, under ~72 chars. Repo mixes
-  `fix:`/`feat:`/`chore:`/`docs:` prefixes with plain imperative subjects;
-  either is fine, prefixed is more common on recent history.
+  `fix:`/`feat:`/`chore:`/`docs:`/`test:` prefixes with plain imperative
+  subjects; either is fine, prefixed is more common on recent history.
 - PR title: specific and reviewable. PR body: Summary, Problem, Change,
   Documentation, Verification, Risk & rollback (this repo's own PRs don't
   follow a strict template, but ours should per the brainpower protocol).
@@ -231,15 +254,13 @@ Record what actually works for this repo; start from these defaults.
 - Implementation, debugging, design and prose (specs, PR bodies): a strong model.
 - Switch down as soon as the hard reasoning is over, and note why in `set_model`.
 - Models that worked well here: `claude-sonnet-5` (default) has now handled
-  12+ full cycles — repair checks, dead-code investigation via git log +
+  13+ full cycles — repair checks, dead-code investigation via git log +
   repo-wide grep, mechanical deletions, cargo verification, and PR prose —
-  without needing to escalate. The "feature built but never wired" pattern is
-  now well-understood enough (4 confirmed instances) that sonnet-5 alone can
-  both find and safely remove new instances of it in one cycle, including
-  correcting its own earlier over-cautious analysis (BP-017, cycle 33→35)
-  by tracing actual function-level call graphs instead of stopping at "an
-  import exists". Still didn't need to escalate model tier for that, just
-  more turns of grep + read_file.
+  without needing to escalate. Both confirmed repo-wide patterns ("feature
+  built but never wired", "vacuous assert!(true) test") are now well-
+  understood enough that sonnet-5 alone can find, verify, and safely fix new
+  instances in one cycle without escalating model tier — the reasoning
+  needed is grep + read_file + git log tracing, not deep design judgment.
 - Models that struggled here: none noted yet.
 
 ## Pacing
@@ -251,64 +272,41 @@ Record what actually works for this repo; start from these defaults.
 
 ## Lessons learned
 
+- **cycle 57:** REPAIR: `pr_status` confirmed all 7 open PRs (#808, #807,
+  #806, #805, #804, #803, #802) healthy — MERGEABLE/CLEAN, checks passing,
+  awaiting human review. No repair needed. SWARM MESSAGES: acknowledged two
+  broadcasts — my own PR #808 (already tracked from last cycle) and a
+  chimera PR #388 in a different repo (not actionable here, no cross-repo
+  action taken per the "stay inside this repository" rule). Reviewed
+  `tests/` (not covered in the last 10 cycles) — all 9 files are real,
+  live, well-documented coverage EXCEPT one vacuous placeholder:
+  `tests/plugin_integration_tests.rs::test_plugin_manifest_var_expansion`
+  was solely `assert!(true, "placeholder for Phase 1.4 var expansion test")`
+  — the exact pattern already fixed once for `golden_routing_heuristics.rs`.
+  Confirmed via repo-wide `grep 'assert!\(true'` this was the only remaining
+  instance, and confirmed the real feature (`${env:VAR}` expansion) already
+  has genuine unit-test coverage in `src/plugins.rs`. Recorded BP-026,
+  removed the placeholder, updated CHANGELOG.md, verified full
+  `cargo test --no-default-features --locked` suite green (1255+1+12+5+26+
+  6+4+2 tests, 0 failed across all binaries), confirmed via `git diff main`
+  that `cargo fmt --check`'s flagged drift in the touched file is entirely
+  pre-existing and outside my edited lines. Shipped as PR #809. Model:
+  claude-sonnet-5 throughout — mechanical grep-driven pattern matching
+  against an already-well-understood repo pattern, no design judgment
+  needed.
+- **cycle 56:** Finished BP-025 (collect_plugin_mcp_servers wiring) — wired
+  a new `:plugin info <id> --mcp` diagnostic subcommand. Hit and recovered
+  from the `cargo fmt` writer-form trap (see Repo conventions above) — cost
+  real turns, now documented more forcefully so it doesn't recur. Shipped
+  PR #808.
 - **cycle 35:** REPAIR: confirmed PR #799 (turn_completion_recap removal,
-  carried from cycle 32/33) is MERGED (`gh pr view 799` →
-  mergedAt 2026-08-30T07:23:49Z) and main's last 5 CI runs are all
-  `completed success` — no repair needed. Found cycle 34 had left a fully
-  investigated and locally-verified but *uncommitted* fix in the worktree
-  (BP-017 GitRepoCache removal: `git rm src/git_repo.rs`, `mod git_repo;`
-  removed from main.rs, git_repo-only helpers stripped from git.rs,
-  `docs/reference/git-cache.md` removed, `docs/INDEX.md` updated) —
-  cut a fresh `brainpower/remove-git-repo-cache` branch off `origin/main`
-  (which had advanced past the branch the worktree was sitting on), which
-  correctly carried the uncommitted changes forward. Re-verified: `cargo
-  build --no-default-features` clean (only pre-existing BP-015 warnings),
-  `cargo test --no-default-features --locked` — full suite green including
-  the 5 `git::tests::*` unit tests. Found and fixed a real formatting gap
-  my own edit to git.rs introduced (two `rustfmt`-reformattable spots at
-  the join seams where deleted code met kept code) — `cargo fmt -- src/git.rs`
-  fixed it; re-ran the git:: tests after to confirm still green. Confirmed
-  via `rustfmt --check --edition 2021 src/main.rs` that the remaining
-  repo-wide fmt drift (advisor.rs, alert.rs, worker.rs, workers_modal.rs,
-  crates/webhook-receiver/src/main.rs, etc.) is pre-existing and unrelated —
-  none of those files are in my diff. Corrected the cycle-33 BRAINPOWER.md
-  note that had wrongly blocked this deletion ("git.rs has a hard dependency
-  on git_repo.rs's types" — true only of the import statement, not of which
-  functions were actually still called elsewhere; see the "Correction
-  (cycle 35)" note above). Shipped as PR (see below). Model: claude-sonnet-5
-  throughout — this cycle was executing/verifying/documenting work whose
-  hard investigation was already done in cycles 33-34, not new design
-  reasoning, so no escalation was needed.
-- **cycle 33:** REPAIR: `pr_status` showed PR #799 (turn_completion_recap
-  removal) healthy — OPEN/MERGEABLE/CLEAN, 5 checks passing, just waiting on
-  human review. No repair action needed. Swarm broadcast claimed
-  `main_ci FAIL` on aish (`e_az1jt6`/`e_6ygg09` health messages, comparing
-  against a stale/unreachable origin/main due to their own auth failure) —
-  cross-checked with `gh run list --repo LightHeart-Ventures/aish --branch
-  main --limit 5` (this DOES work locally, unlike `gh api` which is on the
-  hard deny-list) and found the 5 most recent main-branch CI runs are all
-  `completed success` as of 2026-08-30, so the DEGRADED broadcast does not
-  apply to aish's actual main — no fix needed, false alarm from a stale
-  comparison on the broadcaster's end. Investigated BP-017 (GitRepoCache)
-  and BP-018 (git-discover) in depth since they'd sat as P3/open for 2+
-  cycles just saying "needs a decision" with no actual recommendation —
-  the BP-017 conclusion from this cycle turned out to be wrong; see the
-  cycle-35 correction above. Did not ship a PR this cycle — no item was
-  both well-understood AND safe to do mechanically; investigation +
-  backlog refinement was the honest output.
-- **cycle 32:** All 10 PRs listed in the REPAIR briefing (#770-#779) were
-  already merged — `pr_status` correctly reported "none open" and `gh pr
-  list --head <branch> --state all` confirmed MERGED for the one checked
-  directly. Updated 4 backlog findings (BP-007, BP-012, BP-016, plus the
-  already-shipped note) to `shipped` with their PR URLs — they'd drifted to
-  stale `in_progress` status across cycles. Reviewed `scripts/` (due for
-  rotation, last touched cycle <22): found it in good shape, no findings.
-  Then applied the "built but never wired" pattern (now 2 confirmed prior
-  hits: BP-012/GoalStore, BP-007/routing tests) to BP-014
-  (turn_completion_recap.rs) — confirmed via `git log --oneline -- <file>`
-  showing only the creation commit + 2 unrelated drive-by fixes, no wiring
-  commit ever landed, and a repo-wide grep for its symbols found zero
-  callers outside its own tests. Shipped PR #799 removing it.
+  carried from cycle 32/33) is MERGED and main's CI is green. Found cycle 34
+  had left a fully investigated and locally-verified but *uncommitted* fix
+  in the worktree (BP-017 GitRepoCache removal) — cut a fresh branch off
+  `origin/main`, re-verified, fixed a real formatting gap my own edit
+  introduced, shipped as PR #800. Corrected the cycle-33 BRAINPOWER.md note
+  that had wrongly blocked this deletion (see the "Correction (cycle 35)"
+  note above).
 - **cycle 6:** Operator said "use blacksmith.sh for builds/testing" mid-cycle.
   Investigated: `blacksmith` CLI is not reachable via `run_command` in this
   sandbox (not on the allowlist). Local `cargo check`/`cargo test
@@ -316,14 +314,7 @@ Record what actually works for this repo; start from these defaults.
   here; used them and said so explicitly in the PR rather than claiming a
   Testbox run that didn't happen. If a future cycle finds `blacksmith` IS
   reachable, prefer it per the operator's instruction and update this note.
-- **cycle 6:** After 3 PRs (#764, #765, #766) all merged between cycles,
-  `pr_status` correctly reported "none open" — this is normal, not a repair
-  signal. Don't waste turns hunting for phantom failures; `gh pr view --json
-  state,mergedAt` confirms quickly.
 - **cycle 6:** A worktree can carry real, verified, uncommitted fixes across
-  cycle boundaries (found `docs/plugins/skill-source-authoring.md`,
-  `registry/plugins.json`, `src/skill_provider.rs` already edited in the
-  working tree, fixing stale `npx-skills` references). Always check `git
-  status`/`git diff` before assuming a clean slate — someone (a prior cycle,
-  possibly interrupted) may have left verifiable, shippable work sitting
-  there.
+  cycle boundaries. Always check `git status`/`git diff` before assuming a
+  clean slate — someone (a prior cycle, possibly interrupted) may have left
+  verifiable, shippable work sitting there.
