@@ -1850,9 +1850,6 @@ the strong model sees nothing else"
     }
     .map_err(|e| anyhow::anyhow!("couldn't reach the strong model for escalation: {e:#}"))?;
 
-    // DEBUG: Check if session.db is available before attempting memory write.
-    eprintln!("[DEBUG escalate] session.db is Some={}", session.db.is_some());
-    
     // Time the escalation call to measure latency.
     let start = std::time::Instant::now();
     let turn = backend
