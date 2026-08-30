@@ -14,6 +14,24 @@ jobs:
   test:
     name: cargo test (Claude-only)
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      # Incremental-compilation state is a fine-grained, environment-specific
+      # cache that rustc does not guarantee is safe to restore verbatim onto
+      # a different checkout/toolchain. This job's cache key
+      # (`hashFiles('**/Cargo.lock')`, no rustc version, no restore-keys) plus
+      # `cancel-in-progress: true` above means a `target/` dir can be
+      # committed to the cache mid-write (job cancelled by a superseding
+      # push) and then restored unmodified for a *different*, unrelated PR
+      # that happens to share the same lockfile hash. Symptom seen in BP-020:
+      # a pure, zero-I/O unit test (pipeline::tests::parse_splits_stages)
+      # failing an assertion against content that does not match the
+      # checked-out source — consistent with a stale/corrupted incremental
+      # unit surviving cache reuse rather than any real test flakiness.
+      # Disabling incremental compilation in CI is the standard fix: a CI job
+      # builds from scratch every time regardless (no local iterative
+      # recompiles to speed up), so incremental buys nothing here and only
+      # adds this correctness risk.
+      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v6
 
