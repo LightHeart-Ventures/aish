@@ -15,7 +15,6 @@ mod dispatch_stats;
 mod editor;
 mod engine;
 mod git;
-mod git_repo;
 mod codebase_memory;
 mod goal;
 
