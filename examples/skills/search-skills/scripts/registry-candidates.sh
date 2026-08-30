@@ -3,9 +3,10 @@
 #
 # Used by the no-local-match path: when no installed skill fits, recommend an
 # installable one. Reads the SAME offline registry index the aish engine's
-# recommend_install reads (~/.aish/registry/index.json), scores each entry with
-# the engine's name-weighted relevance rule, and prints the best matches that
-# are NOT already installed. Network is never touched.
+# recommend_install reads (~/.aish/registry/skills.json, née index.json before
+# the JSONL split in commit bf29105), scores each entry with the engine's
+# name-weighted relevance rule, and prints the best matches that are NOT
+# already installed. Network is never touched.
 #
 # Usage: registry-candidates.sh "<task description>"
 # Output: ranked JSON lines  {"reference":…,"name":…,"score":N,"description":…}
@@ -13,7 +14,7 @@
 set -eu
 
 task="${1:-}"
-index="${HOME}/.aish/registry/index.json"
+index="${HOME}/.aish/registry/skills.json"
 skills_dir="${HOME}/.aish/skills"
 
 [[ -f "$index" ]] || { echo '[]'; exit 0; }
