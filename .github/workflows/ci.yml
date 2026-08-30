@@ -64,3 +64,35 @@ jobs:
       # silently rot outside the root package's test surface.
       - name: Test webhook client (SPR-059)
         run: cargo test -p aish-webhook-client --no-default-features --locked -j 1 -- --nocapture
+
+      # The root Cargo.toml is a *mixed* manifest (both `[workspace]` and
+      # `[package]`), so a bare `cargo test` above only tests the `aish`
+      # package itself — it silently skips every other workspace member
+      # unless named explicitly with `-p`. git-discover's own unit tests
+      # (crates/git-discover/src/lib.rs `#[cfg(test)] mod tests`) were never
+      # run by CI as a result; only `tests/git_discover_linkage.rs` (a
+      # compile-linkage smoke test in the root package) touched the crate at
+      # all. Run it directly so its real coverage isn't silently skipped.
+      - name: Test git-discover
+        run: cargo test -p git-discover --no-default-features --locked -j 1 -- --nocapture
+
+      # webhook-receiver (SPR-059) is a workspace member but is deliberately
+      # NOT added here yet: its `sqlx` dependency currently pulls in the
+      # `runtime-tokio-native-tls` feature, which needs a system OpenSSL dev
+      # package this runner doesn't have (see BP-023/BP-024 in the brainpower
+      # backlog). A pending fix (PR #806) rewrites its test module against
+      # the crate's real API AND switches sqlx to `runtime-tokio-rustls`,
+      # which removes that native dependency. Add
+      # `cargo test -p webhook-receiver --no-default-features --locked -j 1`
+      # here once #806 (or its equivalent) has merged to main.
+
+      # aish-webhook-broker (SPR-059, TASK-257) is intentionally a *separate*
+      # Cargo workspace (its own `[workspace]` table + Cargo.lock — see the
+      # comment at the top of crates/aish-webhook-broker/Cargo.toml) so its
+      # build graph never picks up aish's heavy `local`-feature deps. That
+      # decoupling means it is invisible to every `-p <name>` flag above,
+      # which resolves against the root workspace's member list — it has
+      # never been built or tested in CI at all. Point cargo at its manifest
+      # directly.
+      - name: Test webhook broker
+        run: cargo test --manifest-path crates/aish-webhook-broker/Cargo.toml --locked -j 1 -- --nocapture
