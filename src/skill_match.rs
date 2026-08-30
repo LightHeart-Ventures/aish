@@ -835,6 +835,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn no_recommendation_when_registry_is_empty() {
+        // Even a skill-worthy task returns None if the registry is empty.
+        assert_eq!(
+            recommend_install("deploy the service to our kubernetes cluster", &[], &[]),
+            None
+        );
+    }
+
     // ── Regression: coordinator preamble pollution (TASK-XXX) ──────────────
     //
     // The coordinator wraps the user's task in a large boilerplate preamble
