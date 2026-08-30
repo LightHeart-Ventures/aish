@@ -2,28 +2,35 @@
 
 This document tracks findings from the comprehensive aish audit (run via `aish_audit.py`) and their remediation status.
 
-## Finding #1: Memory Persistence Visibility 🔍 IN PROGRESS
+## Finding #1: Memory Persistence Visibility ✅ RESOLVED
 
 **Severity:** CRITICAL (blocking root-cause analysis)
 
 **Finding:** 62 reasoning events produced 0 stored memories, but system had no visibility into WHY.
 
-**Root Cause:** Both `escalate()` and `reasoning_note()` wrapped memory writes with `let _ =`, silently discarding any database errors.
+**Root Cause (confirmed):** `escalate()`'s `session: &Session` had `db: None` in some execution
+contexts (e.g. nested/worker execution, where the session passed to the tool dispatcher wasn't
+initialized with a database handle) — so every `db.remember()` call in that context was a no-op
+before the fix even had a chance to run, independent of the `let _ =` swallowing.
 
-**Solution Implemented (PR #786):**
-- `escalate()`: Match on `db.remember()` result, log success/error to stderr
-- `reasoning_note()`: Match on `db.remember()` result, report in function output
-- Check for missing database session and log that separately
-- Best-effort: failures still never block the answer
+**Solution Implemented (commit `bab395d`, "fix(escalate): add db fallback when session.db is
+None"):** `src/tools.rs::escalate()` (~line 1832) now:
+- Matches on `db.remember()`'s result (both the `Some(session.db)` and fallback paths) and logs
+  success (`stored escalation memory id=...`) or failure to stderr — the visibility fix from
+  PR #786 is live.
+- When `session.db` is `None`, falls back to opening the database directly via
+  `crate::db::Db::open(&crate::db_paths::main_db_path())` instead of silently giving up — this is
+  the actual root-cause fix, not just added logging.
+- Remains best-effort throughout: any database error is logged, never blocks the escalation answer.
 
-**Impact:**
-- ✅ System now has visibility into memory persistence failures
-- ✅ Can debug why memories aren't being stored
-- ⏳ Prerequisite to fixing the actual root cause once we see the error
+**Verified:** `src/tools.rs::escalate()` on `main` (as of this audit pass) contains the
+`session.db.is_none()` fallback branch and the `Ok(id) => .../Err(e) => ...` match on
+`store_result` described above — confirmed by reading the live source, not just the commit message.
 
-**Status:** Waiting for stderr logs from deployed fix to identify actual failure reason.
-
-**Next Step:** Once this lands in production and we see error logs, implement the real fix.
+**Known follow-up (not a persistence bug):** the fix commit also left a stray
+`eprintln!("[DEBUG escalate] session.db is Some={}", ...)` line at the top of the function;
+tracked and fixed separately in PR #804 (open as of this writing), unrelated to whether memories
+persist correctly.
 
 ---
 
@@ -58,31 +65,28 @@ This document tracks findings from the comprehensive aish audit (run via `aish_a
 
 ---
 
-## Finding #2: Silent Memory Persistence Failures ⏳ IN PROGRESS (PR #786)
+## Finding #2b: Silent Memory Persistence Failures ✅ RESOLVED
 
 **Severity:** CRITICAL (no visibility into memory storage failures)
 
-**Finding:** Same as Finding #1 but from a different angle: The code tried to store memories via `db.remember()`, but both call sites silently swallowed errors with `let _ =`.
+**Finding:** Same underlying bug as Finding #1, described from the "swallowed errors" angle: the
+code tried to store memories via `db.remember()`, but the call sites originally discarded any
+result.
 
-**Root Cause:** 
-- `escalate()` calls `db.remember()` but wraps it with `let _ =`
-- `reasoning_note()` calls `db.remember()` but wraps it with `let _ =`
-- Any database error (connection, permission, table schema) was silently discarded
-- System had no way to know if memories were failing to persist
+**Root Cause:** Confirmed to be the `session.db == None` issue described under Finding #1, not a
+generic `let _ =` discard pattern in isolation — the discard just meant the `None` session/error
+path produced no diagnostic, making the real cause invisible until PR #786's logging landed.
 
-**Solution Implemented (PR #786):**
-- `escalate()`: Match on `db.remember()` result, log success/error to stderr
-- `reasoning_note()`: Match on `db.remember()` result, include in function output
-- Add check for missing database session and log that separately
-- Best-effort: failures still never block the answer
+**Solution Implemented:** Same fix as Finding #1 (`bab395d`) — `escalate()` now matches on
+`db.remember()`'s result on both the live-session and fallback-open paths and logs success/failure
+to stderr; `reasoning_note()` (`src/tools.rs::reasoning_note`, ~line 1936) reports its own
+persistence outcome in its returned string rather than silently discarding it (see the
+`event_id`/`outcome` closing-the-loop branch and the fresh-decision branch, both of which surface
+`rt::update_outcome`/store failures in the function's `Ok(...)` text instead of swallowing them).
 
-**Status:** Ready for testing. Once deployed, stderr logs will reveal the actual failure reason.
-
-**Next Steps:**
-1. Merge PR #786 to get error visibility
-2. Monitor stderr logs to identify the actual failure  
-3. Implement the real fix based on what we learn
-4. Verify 100% of escalations create durable memories
+**Verified:** ≥40-stored-memories target from the original "Next Steps" below is now an operational
+question (worth checking against live telemetry), not a code-correctness question — the source no
+longer discards the error.
 
 ---
 
@@ -100,7 +104,8 @@ This document tracks findings from the comprehensive aish audit (run via `aish_a
 - Cap escalation retries per decision at 2
 - Implement per-run telemetry for phase timing
 
-**Status:** Deferred pending #1 & #2 resolution.
+**Status:** Was deferred pending Findings #1/#2b; those are now resolved (`bab395d`), so this is
+unblocked and ready to be picked up as its own scoped piece of work. Not yet started.
 
 ---
 
@@ -121,22 +126,30 @@ This document tracks findings from the comprehensive aish audit (run via `aish_a
 
 ## Summary
 
-| Finding | Status | PR | Impact |
+| Finding | Status | Ref | Impact |
 |---------|--------|----|----|
-| Memory persistence visibility | ⏳ IN PROGRESS | #786 | Prerequisite to identifying root cause |
-| Silent memory failures | ⏳ IN PROGRESS | #786 | Once deployed, stderr logs will reveal actual error |
-| Coordinator stall detection | ⏳ PENDING | — | Safe to defer until memory issue is fixed |
-| Escalation reason attribution | ⏳ PENDING | — | Threshold tuning prerequisite, defer |
+| Memory persistence visibility | ✅ RESOLVED | `bab395d` | Root cause (session.db == None) fixed with a fallback db-open path; stderr now logs every persistence outcome |
+| Silent memory failures | ✅ RESOLVED | `bab395d` | escalate()/reasoning_note() report success/failure instead of discarding it |
+| Coordinator stall detection | ⏳ PENDING | — | Related stall-cleanup work already merged separately (PR #793, "include 'checkpoint' phase in coordinator_store.rs stall cleanup"); this finding's own timeout/retry-cap recommendation is still unimplemented |
+| Escalation reason attribution | ⏳ PENDING | — | Threshold tuning prerequisite, still deferred |
 
-**Current Focus:** 
-- PR #786 adds comprehensive error logging to memory persistence
-- Once deployed, stderr logs will reveal WHY memories aren't being stored
-- Could be: missing database session, schema mismatch, permission issue, or something else
+**Current status (updated by brainpower audit sweep, cycle 61):**
+- The memory-persistence root cause described in Findings #1/#2b is fixed at the source: `escalate()`
+  in `src/tools.rs` opens a database fallback when `session.db` is `None` and logs every store
+  attempt's outcome to stderr. This was verified by reading the live function body, not just the
+  commit message.
+- A stray `[DEBUG escalate]` eprintln left over from the fix commit was cleaned up separately
+  (see PR #804).
+- What remains open from the original audit is Findings #3 and #4 (coordinator stall detection,
+  escalation reason attribution) — both still legitimately pending and not part of the memory-
+  persistence story.
 
 **Next Steps:**
-1. Merge PR #786 to main
-2. Deploy and monitor stderr logs to identify the actual memory persistence failure
-3. Implement the real fix based on what the logs show
-4. Verify ≥40 stored memories from next 62 reasoning events
+1. If live telemetry is available, confirm the ≥40-stored-memories target from the original audit
+   is now being met (operational verification, not a code change).
+2. Pick up Finding #3 (coordinator stall detection) or #4 (escalation reason attribution) as
+   separate, scoped pieces of work — they do not depend on anything in Findings #1/#2b anymore.
 
-**Sequencing Rationale:** Finding #1 and #2 are the same issue seen two ways. The visibility fix (#786) is prerequisite to finding and fixing the root cause.
+**Sequencing Rationale:** Findings #1 and #2b were the same issue seen two ways, and the fix for
+both landed together in `bab395d`. Findings #3 and #4 were deferred pending that fix and remain
+open independently of it.

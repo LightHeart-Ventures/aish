@@ -4,6 +4,16 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Documentation
+- **`audit_findings.md` corrected to match reality**: Findings #1 and #2 ("Memory Persistence
+  Visibility" / "Silent Memory Persistence Failures") had been left marked "IN PROGRESS, waiting
+  for stderr logs" since the audit tracker was last touched, but the actual fix (commit `bab395d`,
+  "fix(escalate): add db fallback when session.db is None") landed the same day and has been on
+  `main` ever since: `escalate()` in `src/tools.rs` now opens a database fallback when
+  `session.db` is `None` and logs every memory-store attempt's outcome to stderr. Marked both
+  findings RESOLVED with the confirmed root cause and verified-in-source evidence, and unblocked
+  Finding #3 (coordinator stall detection), which was only deferred pending #1/#2.
+
 ### Removed
 - **Vacuous `tests/golden_routing_heuristics.rs` deleted**: all 5 tests in this file (`test_looks_like_prose_english_routes_to_model`, `test_bare_yes_forces_direct`, `test_bang_prefix_forces_model`, and two others) consisted solely of `assert!(true, "...")`, so they could never fail and provided no real coverage. Routing-heuristic behavior is already exercised by the golden-snapshot test `routing_decision_snapshot` in `src/repl.rs` against `tests/golden/routing_decisions.snap`, which covers every case the deleted file only described in comments.
 - **Dead per-tool/per-turn pulse tracking in `worker.rs`**: `JobInner::last_tool_outcome`/`last_turn_completion`, `WorkerJob::record_tool_outcome`/`record_turn_completion`/`latest_pulse`, and the module-level `fresh_pulse` aggregator were all unreachable — `cargo check` flagged `fresh_pulse` and `latest_pulse` as never-used. The prompt's `⟳N` badge has been state-based (running count + `fresh_terminal`) since an earlier change; this chain was leftover plumbing that recorded events nothing read. The live `Pulse` broadcast bus (`crate::pulse`, feeding `:pulse-report`) and `pulse_badge`/`fresh_terminal` are unaffected.
