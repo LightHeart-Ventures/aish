@@ -39,7 +39,6 @@ Implementation details, schemas, and how things work.
 
 ### Infrastructure & Data
 - [reference/database.md](./reference/database.md) — Database schema and key paths
-- [reference/git-cache.md](./reference/git-cache.md) — Git repository caching mechanism
 - [webhooks.md](./webhooks.md) — Webhook handler dispatch and routing
 
 ---
@@ -91,8 +90,7 @@ docs/
 │   ├── coordinator/                  # Coordinator patterns & safety
 │   ├── plugins/                      # Plugin schemas & APIs
 │   ├── codebase-memory/              # Knowledge graph
-│   ├── database.md                   # DB schema
-│   └── git-cache.md                  # Git caching
+│   └── database.md                   # DB schema
 │
 ├── internals/                        # Deep dives & design
 │   ├── error-diagnostics.md
