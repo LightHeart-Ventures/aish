@@ -16,7 +16,7 @@
 //! ```
 //!
 //! There is **no auto-migration** from the old flat paths — see
-//! `docs/DATABASE_PATHS.md`. Old `~/.aish/*.db` files can be removed by hand.
+//! `docs/reference/database.md`. Old `~/.aish/*.db` files can be removed by hand.
 
 use std::path::PathBuf;
 

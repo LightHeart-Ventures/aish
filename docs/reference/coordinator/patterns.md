@@ -12,8 +12,8 @@ It is the connective tissue between three shipped bodies of work:
 - **Token-efficiency sprint** — cache repair (TASK-320), run-length cap
   (TASK-321), ranged reads (TASK-322), MCP schema scoping (TASK-323), batching
   enforcement (TASK-324), token telemetry (TASK-325)
-- **Loop-exhaustion guards** — see [`coordinator-loop-guards.md`](./coordinator-loop-guards.md)
-  and [`coordinator-stale-row-prevention.md`](./coordinator-stale-row-prevention.md)
+- **Loop-exhaustion guards** — see [`loop-guards.md`](./loop-guards.md)
+  and [`stale-row-prevention.md`](./stale-row-prevention.md)
 
 If you only read one section, read **§0 (Phase-0 guard)** and **§3 (batching)** —
 they prevent the two most expensive failure modes: rebuilding shipped work, and
@@ -145,7 +145,7 @@ unsure.
 
 **Hard budget (circuit breaker + turn cap):** the runtime refuses to *start* a
 run whose identical task text has already terminated `failed` ≥ N times, and caps
-rounds per run. See [`coordinator-loop-guards.md`](./coordinator-loop-guards.md).
+rounds per run. See [`loop-guards.md`](./loop-guards.md).
 
 | Env var | Default | Effect |
 |---|---|---|
@@ -159,7 +159,7 @@ rounds per run. See [`coordinator-loop-guards.md`](./coordinator-loop-guards.md)
 - `:tokens` — per-run / per-session token spend, in:out ratio, top-N runs
   (TASK-325, PR #543).
 - `:telemetry` / `:reasoning` — tool-call and escalate-vs-guess aggregates
-  (see [`telemetry-efficiency.md`](./telemetry-efficiency.md)).
+  (see [`telemetry-efficiency.md`](../../internals/telemetry-efficiency.md)).
 - Turn-audit journal — `.atum/run-<id>.jsonl` logs each turn's tool calls **and**
   end-of-round synthesis, so a run emitting the same synthesis round after round
   is visibly looping.
@@ -208,9 +208,9 @@ have moved), and continue from the next uncommitted step.
 
 ## Related
 
-- [`coordinator-loop-guards.md`](./coordinator-loop-guards.md) — circuit breaker, turn cap, synthesis logging, decision points
-- [`coordinator-stale-row-prevention.md`](./coordinator-stale-row-prevention.md) — durable-registry / orphan-salvage semantics
-- [`telemetry-efficiency.md`](./telemetry-efficiency.md) — `:telemetry` / `:reasoning` cost knobs
+- [`loop-guards.md`](./loop-guards.md) — circuit breaker, turn cap, synthesis logging, decision points
+- [`stale-row-prevention.md`](./stale-row-prevention.md) — durable-registry / orphan-salvage semantics
+- [`telemetry-efficiency.md`](../../internals/telemetry-efficiency.md) — `:telemetry` / `:reasoning` cost knobs
 - `docs/ARCHITECTURE.md` — repo map: build/test commands, module layout, guardrails
   (`.repospec.json` was removed from the repo in commit 3271425 and is no longer
   a source of this map)

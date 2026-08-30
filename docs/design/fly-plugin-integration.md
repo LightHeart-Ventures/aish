@@ -432,7 +432,7 @@ non-starter for a fleet.
 | Outbound-only, non-blocking dispatch; only `workspace_open` wired | `docs/plugin-webhook-events.md`; `src/plugin_dispatcher.rs` |
 | Blocking/mutating hooks are design-only (Phases 2/3) | `docs/aish-hooks-design.md` §1.2, §2 |
 | Login handler exists (single-shot JSON→`[profile:*]`) | `src/plugin_auth.rs` (~24 KB) |
-| K/V-only state store | `src/plugin_state.rs`; `docs/plugin-state-schema.md` |
+| K/V-only state store | `src/plugin_state.rs`; `docs/reference/plugins/state.md` |
 | Plugin skills + JSON-schema contribution | `src/plugins.rs` `discover` / `PluginSchema` |
 | Local Docker worker backend + OOM risk | `src/container.rs`; `Dockerfile.worker`; `aish_sre` SKILL.md §3; `docs/spikes/S1.4-reaper-vs-waitpid.md` |
 | Fly Machines API / `flyctl` / GraphQL / token auth | fly.io platform docs (`api.machines.dev/v1`, `api.fly.io/graphql`, `fly auth token`) |
