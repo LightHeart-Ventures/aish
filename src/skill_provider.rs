@@ -14,7 +14,7 @@
 //! only advertises it to the model, so importing one can't run anything.
 //!
 //! Search defaults to a curated index embedded in the aish binary and written
-//! to ~/.aish/registry/index.json on startup (see `initialize_registry`), so
+//! to ~/.aish/registry/skills.json on startup (see `initialize_registry`), so
 //! the catalog is discoverable and searchable fully offline. Point
 //! `AISH_SKILL_REGISTRY` at `https://skill.fish`, a self-hosted mirror, or
 //! another `file://` index to use an alternate source.
@@ -610,9 +610,7 @@ fn short_name_from_ref(reference: &str) -> String {
                 tail.pop();
             }
             // Skip generic container directories so the leaf is the real skill.
-            while tail.len() > 1
-                && matches!(tail.last().copied(), Some("skills") | Some("skill"))
-            {
+            while tail.len() > 1 && matches!(tail.last().copied(), Some("skills") | Some("skill")) {
                 tail.pop();
             }
             match tail.last() {
@@ -680,7 +678,10 @@ pub async fn install_plugin(plugin_id: &str, plugins_dir: &Path) -> Result<()> {
     // Extract owner, repo, and path from reference (e.g., "LightHeart-Ventures/aish/plugins/hello-world")
     let parts: Vec<&str> = plugin.reference.split('/').collect();
     if parts.len() < 3 {
-        return Err(anyhow::anyhow!("invalid plugin reference: {}", plugin.reference));
+        return Err(anyhow::anyhow!(
+            "invalid plugin reference: {}",
+            plugin.reference
+        ));
     }
 
     let owner = parts[0];
@@ -748,8 +749,7 @@ pub fn remove_plugin(plugin_id: &str, plugins_dir: &Path) -> Result<()> {
     if !plugin_dir.exists() {
         return Err(anyhow::anyhow!("plugin `{plugin_id}` not found"));
     }
-    std::fs::remove_dir_all(&plugin_dir)
-        .context("removing plugin directory")?;
+    std::fs::remove_dir_all(&plugin_dir).context("removing plugin directory")?;
     Ok(())
 }
 
@@ -1035,7 +1035,13 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
     let names: Vec<String> = ranked.iter().map(|r| r.short_name()).collect();
     let stars: Vec<String> = ranked
         .iter()
-        .map(|r| if r.stars > 0 { format!("★ {}", r.stars) } else { "-".to_string() })
+        .map(|r| {
+            if r.stars > 0 {
+                format!("★ {}", r.stars)
+            } else {
+                "-".to_string()
+            }
+        })
         .collect();
     let statuses: Vec<String> = ranked
         .iter()
@@ -1207,7 +1213,9 @@ pub fn print_results_table_sourced(query: &str, results: &[(SearchResult, String
 
     let color = crate::style::colors_enabled();
     let (bold, dim, green, yellow, cyan, reset) = if color {
-        ("\x1b[1m", "\x1b[2m", "\x1b[32m", "\x1b[33m", "\x1b[36m", "\x1b[0m")
+        (
+            "\x1b[1m", "\x1b[2m", "\x1b[32m", "\x1b[33m", "\x1b[36m", "\x1b[0m",
+        )
     } else {
         ("", "", "", "", "", "")
     };
@@ -1232,7 +1240,6 @@ pub fn print_results_table_sourced(query: &str, results: &[(SearchResult, String
     ));
     out
 }
-
 
 /// Collapse newlines and cap a string at `max` display chars (ellipsis when cut).
 pub(crate) fn truncate(s: &str, max: usize) -> String {
@@ -1440,20 +1447,19 @@ pub fn parse_github_ref(input: &str) -> Option<GithubRef> {
     // Resolve the ref + the in-repo path from whatever segments remain.
     let mut git_ref = at_ref.unwrap_or_else(|| GITHUB_DEFAULT_REF.to_string());
     let rest_segs = &segs[2..];
-    let path_segs: &[&str] = if url_form
-        && matches!(rest_segs.first().copied(), Some("tree") | Some("blob"))
-    {
-        // /tree/<ref>/<path…> or /blob/<ref>/<path…>
-        match rest_segs.get(1) {
-            Some(r) => {
-                git_ref = (*r).to_string();
-                &rest_segs[2..]
+    let path_segs: &[&str] =
+        if url_form && matches!(rest_segs.first().copied(), Some("tree") | Some("blob")) {
+            // /tree/<ref>/<path…> or /blob/<ref>/<path…>
+            match rest_segs.get(1) {
+                Some(r) => {
+                    git_ref = (*r).to_string();
+                    &rest_segs[2..]
+                }
+                None => return None, // `/tree` with no ref is malformed
             }
-            None => return None, // `/tree` with no ref is malformed
-        }
-    } else {
-        rest_segs
-    };
+        } else {
+            rest_segs
+        };
 
     if !valid_github_ref(&git_ref) {
         return None;
@@ -1609,7 +1615,10 @@ async fn fetch_github_text(url: &str, token: Option<&str>) -> Result<String> {
     if !resp.status().is_success() {
         bail!("GitHub returned HTTP {} for {url}", resp.status().as_u16());
     }
-    let body = resp.text().await.context("reading the GitHub response body")?;
+    let body = resp
+        .text()
+        .await
+        .context("reading the GitHub response body")?;
     if body.trim().is_empty() {
         bail!("GitHub returned an empty body for {url}");
     }
@@ -1970,14 +1979,17 @@ mod tests {
     fn try_github_fallback_prefers_github_error_when_not_vercel_challenge() {
         // Simulate a generic skill.fish error (not a Vercel challenge).
         let skillfish_err = anyhow::anyhow!("registry 404: skill not found");
-        
+
         // When the skillfish error is NOT a Vercel challenge, the fallback
         // should prefer the GitHub error (which is more specific about the
         // actual problem). This test verifies the logic that decides which
         // error to surface.
         let err_msg = format!("{skillfish_err}");
         let prefer_skillfish = err_msg.contains("bot challenge");
-        assert!(!prefer_skillfish, "non-Vercel error should prefer GitHub error");
+        assert!(
+            !prefer_skillfish,
+            "non-Vercel error should prefer GitHub error"
+        );
     }
 
     #[test]
@@ -1986,13 +1998,16 @@ mod tests {
         let skillfish_err = anyhow::anyhow!(
             "skill.fish is behind a bot challenge right now (HTTP 429, x-vercel-mitigated: challenge)"
         );
-        
+
         // When the skillfish error IS a Vercel challenge, the fallback
         // should prefer that message (it's more actionable and tells the user
         // to try GitHub directly).
         let err_msg = format!("{skillfish_err}");
         let prefer_skillfish = err_msg.contains("bot challenge");
-        assert!(prefer_skillfish, "Vercel challenge error should be preserved");
+        assert!(
+            prefer_skillfish,
+            "Vercel challenge error should be preserved"
+        );
     }
 
     // ---- Phase 2: search ------------------------------------------------
@@ -2171,8 +2186,7 @@ mod tests {
             author: String::new(),
             description: "Low stars.".into(),
             version: String::new(),
-            reference:
-                "https://github.com/openhands/skills/tree/abc123/skills/github".into(),
+            reference: "https://github.com/openhands/skills/tree/abc123/skills/github".into(),
             stars: 3,
         };
         let high = SearchResult {
@@ -2180,8 +2194,7 @@ mod tests {
             author: String::new(),
             description: "High stars.".into(),
             version: String::new(),
-            reference:
-                "https://github.com/clawdbot/clawdbot/tree/def456/skills/github".into(),
+            reference: "https://github.com/clawdbot/clawdbot/tree/def456/skills/github".into(),
             stars: 99,
         };
         let s = print_results_table("github", &[low, high]);
@@ -2198,20 +2211,19 @@ mod tests {
     fn short_name_from_url_distills_owner_and_skill() {
         // tree URL with a skills/ container → owner + leaf skill dir.
         assert_eq!(
-            short_name_from_ref(
-                "https://github.com/openhands/skills/tree/f5b98/skills/github"
-            ),
+            short_name_from_ref("https://github.com/openhands/skills/tree/f5b98/skills/github"),
             "openhands/github"
         );
         // blob URL ending in SKILL.md → strip the filename, take the dir.
         assert_eq!(
-            short_name_from_ref(
-                "https://github.com/acme/repo/blob/main/packs/git/SKILL.md"
-            ),
+            short_name_from_ref("https://github.com/acme/repo/blob/main/packs/git/SKILL.md"),
             "acme/git"
         );
         // A bare owner/name ref passes through untouched.
-        assert_eq!(short_name_from_ref("anthropic/github-pr"), "anthropic/github-pr");
+        assert_eq!(
+            short_name_from_ref("anthropic/github-pr"),
+            "anthropic/github-pr"
+        );
         // A scheme-less github path also works.
         assert_eq!(
             short_name_from_ref("github.com/foo/bar/tree/main/skills/baz"),
@@ -2298,7 +2310,9 @@ mod tests {
         );
         // branch name with a slash survives via @ref
         assert_eq!(
-            parse_github_ref("github:acme/skills@release/v2").unwrap().git_ref,
+            parse_github_ref("github:acme/skills@release/v2")
+                .unwrap()
+                .git_ref,
             "release/v2"
         );
     }
@@ -2462,7 +2476,11 @@ mod tests {
             path: Some("packs/git".into()),
         };
         assert_eq!(
-            github_raw_url_on("https://raw.githubusercontent.com", &gh, "packs/git/SKILL.md"),
+            github_raw_url_on(
+                "https://raw.githubusercontent.com",
+                &gh,
+                "packs/git/SKILL.md"
+            ),
             "https://raw.githubusercontent.com/acme/skills/main/packs/git/SKILL.md"
         );
         assert_eq!(
@@ -2487,8 +2505,14 @@ mod tests {
         assert!(path_under_prefix("packs/git/sub/SKILL.md", "packs/git"));
         assert!(!path_under_prefix("packs/other/SKILL.md", "packs/git"));
         // A SKILL.md prefix matches only that exact file.
-        assert!(path_under_prefix("packs/git/SKILL.md", "packs/git/SKILL.md"));
-        assert!(!path_under_prefix("packs/git/sub/SKILL.md", "packs/git/SKILL.md"));
+        assert!(path_under_prefix(
+            "packs/git/SKILL.md",
+            "packs/git/SKILL.md"
+        ));
+        assert!(!path_under_prefix(
+            "packs/git/sub/SKILL.md",
+            "packs/git/SKILL.md"
+        ));
     }
 
     #[test]

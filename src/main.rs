@@ -3,6 +3,7 @@ mod alert;
 mod autosuggest;
 mod backend;
 mod batch;
+mod codebase_memory;
 mod container;
 mod context;
 mod control;
@@ -15,7 +16,6 @@ mod dispatch_stats;
 mod editor;
 mod engine;
 mod git;
-mod codebase_memory;
 mod goal;
 
 mod hooks;
@@ -34,12 +34,12 @@ mod oracle;
 mod pipeline;
 mod plugin_auth;
 mod plugin_dispatcher;
-mod plugin_timers;
-mod plugin_statusline;
 mod plugin_memory;
 #[cfg(test)]
 mod plugin_phase05_consolidation_tests;
 mod plugin_state;
+mod plugin_statusline;
+mod plugin_timers;
 mod plugins;
 mod present;
 mod pulse;
@@ -59,17 +59,17 @@ mod spawn_broker;
 mod spawn_broker_host;
 mod spawn_broker_registry;
 
+mod schedule;
 mod stream_cancel;
 mod stream_render;
 mod style;
 mod suggest;
 mod terminal;
-mod tools;
 mod tool_telemetry;
+mod tools;
 mod transcript_ring;
 mod turn_audit;
 mod update;
-mod schedule;
 mod webhook;
 mod worker;
 mod worker_store;
@@ -293,7 +293,7 @@ async fn main() -> Result<()> {
     // `aish --skill-search <query>`: opt-in skill registry search. Like
     // --skill-fetch it needs no backend or credentials. By default it reads the
     // curated, binary-embedded catalog from the local `file://` index at
-    // ~/.aish/registry/index.json (set up by skill_provider::initialize_registry
+    // ~/.aish/registry/skills.json (set up by skill_provider::initialize_registry
     // on a normal launch); override AISH_SKILL_REGISTRY to query skill.fish or a
     // self-hosted mirror over HTTPS instead. Prints the matches as a table, then
     // exits. See src/skill_provider.rs.
@@ -403,7 +403,7 @@ async fn main() -> Result<()> {
     session.set_var("AISH_SESSION_ID", session.session_id.clone());
 
     // ~/.aish/ — config home. Create it and the skill-registry directory, then
-    // write the binary-embedded curated skill index to ~/.aish/registry/index.json
+    // write the binary-embedded curated skill index to ~/.aish/registry/skills.json
     // (idempotent; refreshed every launch so it tracks this binary). This runs
     // early — after aish_dir exists, before the backend is built — so the default
     // `file://` skill registry always has a catalog to search, even fully offline.
@@ -411,7 +411,9 @@ async fn main() -> Result<()> {
     let _ = std::fs::create_dir_all(&aish_dir);
     let _ = std::fs::create_dir_all(aish_dir.join("registry"));
     if let Err(e) = skill_provider::initialize_registry(&aish_dir) {
-        startup_notices.push(format!("\x1b[33maish:\x1b[0m skill registry init failed: {e:#}"));
+        startup_notices.push(format!(
+            "\x1b[33maish:\x1b[0m skill registry init failed: {e:#}"
+        ));
     }
     timer.mark("registry init");
 
@@ -424,11 +426,7 @@ async fn main() -> Result<()> {
     }
 
     // --local is a shorthand for --backend=local
-    let backend_name = if args.local {
-        "local"
-    } else {
-        &args.backend
-    };
+    let backend_name = if args.local { "local" } else { &args.backend };
 
     let backend = match backend_name {
         "claude" => {
@@ -467,10 +465,9 @@ async fn main() -> Result<()> {
                     hwdetect::apply_env(&sel);
                     eprintln!("\x1b[2m{}\x1b[0m", hwdetect::short_line(&sel));
                 }
-                Err(e) => {
-                    startup_notices
-                        .push(format!("\x1b[33maish:\x1b[0m local model detection failed: {e:#}"))
-                }
+                Err(e) => startup_notices.push(format!(
+                    "\x1b[33maish:\x1b[0m local model detection failed: {e:#}"
+                )),
             }
             backend::Backend::new_local()?
         }
@@ -499,7 +496,9 @@ async fn main() -> Result<()> {
     // ~/.aish/database/plugins.db, initialized once here so plugin hooks can reach it via
     // `plugin_state::global()`. Non-fatal — a bad DB must never block startup.
     if let Err(e) = plugin_state::init_global(&db_paths::plugin_state_db_path()) {
-        startup_notices.push(format!("\x1b[33maish:\x1b[0m plugin state store unavailable: {e}"));
+        startup_notices.push(format!(
+            "\x1b[33maish:\x1b[0m plugin state store unavailable: {e}"
+        ));
     }
     // Plugin webhook dispatcher (Phase 1.6): route lifecycle events to plugins
     // that opt in via `webhook_url` / `webhook_command` in their manifest.
@@ -587,8 +586,9 @@ async fn main() -> Result<()> {
     session.db = match db::Db::open(&db_paths::main_db_path()) {
         Ok(d) => Some(d),
         Err(e) => {
-            startup_notices
-                .push(format!("\x1b[33maish:\x1b[0m persistent store unavailable: {e:#}"));
+            startup_notices.push(format!(
+                "\x1b[33maish:\x1b[0m persistent store unavailable: {e:#}"
+            ));
             None
         }
     };
@@ -617,9 +617,9 @@ async fn main() -> Result<()> {
             session.batch_store = Some(store);
             batch::rehydrate(&mut session);
         }
-        Err(e) => {
-            startup_notices.push(format!("\x1b[33maish:\x1b[0m batch store unavailable: {e:#}"))
-        }
+        Err(e) => startup_notices.push(format!(
+            "\x1b[33maish:\x1b[0m batch store unavailable: {e:#}"
+        )),
     }
     timer.mark("batch rehydrate");
 
@@ -630,8 +630,9 @@ async fn main() -> Result<()> {
             session.coordinator_store = Some(store);
             coordinator::rehydrate(&mut session);
         }
-        Err(e) => startup_notices
-            .push(format!("\x1b[33maish:\x1b[0m coordinator store unavailable: {e:#}")),
+        Err(e) => startup_notices.push(format!(
+            "\x1b[33maish:\x1b[0m coordinator store unavailable: {e:#}"
+        )),
     }
     timer.mark("coordinator rehydrate");
 
@@ -640,9 +641,9 @@ async fn main() -> Result<()> {
     // semantic ones via the `set_alert` tool. Non-fatal on failure.
     match db::AlertStore::open(&db_paths::main_db_path()) {
         Ok(store) => session.alert_store = Some(store),
-        Err(e) => {
-            startup_notices.push(format!("\x1b[33maish:\x1b[0m alert store unavailable: {e:#}"))
-        }
+        Err(e) => startup_notices.push(format!(
+            "\x1b[33maish:\x1b[0m alert store unavailable: {e:#}"
+        )),
     }
     timer.mark("alert store open");
 
@@ -651,9 +652,9 @@ async fn main() -> Result<()> {
     // single-line footer. Non-fatal on failure.
     match db::ActivityStore::open(&db_paths::main_db_path()) {
         Ok(store) => session.activity_store = Some(store),
-        Err(e) => {
-            startup_notices.push(format!("\x1b[33maish:\x1b[0m activity store unavailable: {e:#}"))
-        }
+        Err(e) => startup_notices.push(format!(
+            "\x1b[33maish:\x1b[0m activity store unavailable: {e:#}"
+        )),
     }
     timer.mark("activity store open");
 
