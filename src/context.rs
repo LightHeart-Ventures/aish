@@ -46,6 +46,7 @@ impl Usage {
     /// Cache-read hit rate for THIS usage: cached-read tokens as a fraction of
     /// the full input prompt, 0.0–100.0. Returns `None` when there was no input
     /// to measure against. AC #3's measurement primitive (TASK-320).
+    #[allow(dead_code)]
     pub fn cache_hit_pct(self) -> Option<f64> {
         if self.input_tokens == 0 {
             None
