@@ -451,6 +451,7 @@ pub fn tokenize_redir(
             if in_word {
                 in_word = false;
                 let w = std::mem::take(&mut cur);
+                in_word = false;
                 if let Some((fd, mode, both)) = pending.take() {
                     if both {
                         redirs.push(Redir::Both {
