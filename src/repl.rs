@@ -8651,7 +8651,7 @@ async fn handle_colon(
         Some("model") => match parts.next() {
             Some(m) => {
                 let id = match m {
-                    "opus" => "claude-opus-4-9",
+                    "opus" => "claude-opus-5",
                     "sonnet" => "claude-sonnet-4-6",
                     "haiku" => "claude-haiku-4-5",
                     other => other,
@@ -9351,7 +9351,7 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
         Some("model") => match arg {
             Some(m) => {
                 let id = match m {
-                    "opus" => "claude-opus-4-9",
+                    "opus" => "claude-opus-5",
                     "sonnet" => "claude-sonnet-4-6",
                     "haiku" => "claude-haiku-4-5",
                     other => other,
