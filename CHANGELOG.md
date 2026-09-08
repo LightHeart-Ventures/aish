@@ -4,6 +4,9 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Fixed
+- **CI test flakiness traced to stale incremental-compilation cache, not test flakiness (BP-020)**: `.github/workflows/ci.yml` and `ci-testbox.yml` cache `target/` keyed only on `hashFiles('**/Cargo.lock')`, with `cancel-in-progress: true` and no `restore-keys`/rustc-version component in the key — a `target/` dir can be cached mid-write by a cancelled run and later restored verbatim onto an unrelated PR that shares the same lockfile hash. Investigation of a real CI failure (`pipeline::tests::parse_splits_stages`, a pure zero-I/O test) showed an assertion mismatch against content that didn't match the checked-out source, consistent with a stale incremental unit surviving cache reuse rather than genuine flakiness. Both workflows now set `CARGO_INCREMENTAL: '0'`, the standard fix — CI always builds from scratch regardless, so incremental compilation bought nothing there and only added this correctness risk.
+
 ### Documentation
 - **`audit_findings.md` corrected to match reality**: Findings #1 and #2 ("Memory Persistence
   Visibility" / "Silent Memory Persistence Failures") had been left marked "IN PROGRESS, waiting
