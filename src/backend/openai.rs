@@ -383,7 +383,13 @@ mod tests {
 
     #[test]
     fn key_resolution_precedence() {
-        let env = vec![("OPENAI_API_KEY".to_string(), "sk-test".to_string())];
+        // Explicitly blank out all other provider keys so the test is
+        // isolated from whatever OPENROUTER_API_KEY the CI runner may
+        // have set in the real process environment.
+        let env = vec![
+            ("OPENAI_API_KEY".to_string(), "sk-test".to_string()),
+            ("OPENROUTER_API_KEY".to_string(), "".to_string()),
+        ];
         assert!(credential_available(Provider::OpenAi, &env));
         assert!(!credential_available(Provider::OpenRouter, &env));
     }
