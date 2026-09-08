@@ -2,8 +2,9 @@
 
 Reference for agents (and humans) working *inside* aish: how the shell surfaces
 the right skill for a task, and the I/O disciplines that keep token spend low.
-Pairs with [`docs/SKILL-FORMAT.md`](docs/SKILL-FORMAT.md) (skill authoring) and
-[`docs/telemetry-efficiency.md`](docs/telemetry-efficiency.md).
+Pairs with [`docs/formats/skill-format.md`](docs/formats/skill-format.md) (skill
+authoring) and
+[`docs/internals/telemetry-efficiency.md`](docs/internals/telemetry-efficiency.md).
 
 ## Semantic Skill Matching
 

@@ -19,7 +19,7 @@
 //! but a single plugin obviously needs many keys, so the PRIMARY KEY here is the
 //! composite `(plugin_id, key)` — the only correct choice for namespace
 //! isolation. Timestamps are stored as SQLite `datetime('now')` TEXT (UTC) so we
-//! avoid pulling `chrono` into the build; see `docs/plugin-state-schema.md`.
+//! avoid pulling `chrono` into the build; see `docs/reference/plugins/state.md`.
 //!
 //! This module is intentionally self-contained (only `std`, `rusqlite`, and
 //! `serde_json`) so `tests/plugin_state_tests.rs` can include it directly with
@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Schema DDL. `IF NOT EXISTS` makes init idempotent — safe to run on every
 /// startup. The `PRAGMA user_version` doubles as a migration marker (see the
-/// migration path in `docs/plugin-state-schema.md`).
+/// migration path in `docs/reference/plugins/state.md`).
 const INIT_SQL: &str = "\
 CREATE TABLE IF NOT EXISTS plugin_state (
     plugin_id  TEXT NOT NULL,
