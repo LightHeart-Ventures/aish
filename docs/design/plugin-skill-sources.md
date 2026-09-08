@@ -37,7 +37,7 @@ Verified against `src/repl.rs` (`handle_skill_command`, `skill_search`,
 
 1. `AISH_SKILL_REGISTRY` override — authoritative when set.
 2. **mcpmarket.com** live skills API (dynamic primary), merged with…
-3. the curated **binary-embedded** index (`registry/index.json`) — offline
+3. the curated **binary-embedded** index (`registry/skills.json`) — offline
    fallback.
 
 Results merge/dedupe via `merge_results` (keyed on `SearchResult::ref_or_synth`)

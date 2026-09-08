@@ -69,9 +69,9 @@ banner instead of inventing a second, competing score.
 ${CLAUDE_PLUGIN_ROOT}/scripts/registry-stars.sh <skill-name-1> <skill-name-2> …
 ```
 
-Stars come from the offline registry index (`~/.aish/registry/index.json`) when
-present, else 0. This is a presentation nicety only — never let a star count
-override a clearly-better keyword match. Network is never required.
+Stars come from the offline registry index (`~/.aish/registry/skills.json`)
+when present, else 0. This is a presentation nicety only — never let a star
+count override a clearly-better keyword match. Network is never required.
 
 ## Step 4: When No Installed Skill Fits — Recommend an Installable One
 

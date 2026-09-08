@@ -367,7 +367,7 @@ registry stack** the plugin subsystem lacks:
 | Concern | **Skills** (has a registry) | **Plugins** (has none) |
 |---|---|---|
 | Discovery | `aish --skill-search <query>` → registry catalog | directory listing of `~/.aish/plugins/` only |
-| Catalog | `~/.aish/registry/index.json` (binary-embedded, offline) | — |
+| Catalog | `~/.aish/registry/skills.json` (binary-embedded, offline) | — |
 | Remote source | `AISH_SKILL_REGISTRY` → skill.fish / mcpmarket / mirror | — |
 | Install | `:skill add <owner/name>` (fetch → import) | copy files by hand |
 | Update / version | ref-pinned fetch, re-import | — (edit files in place) |
@@ -399,7 +399,7 @@ The cheapest path is to **reuse the skill-registry machinery** rather than inven
 a parallel one — the shapes already rhyme:
 
 1. **Plugin catalog** — a `plugins`-flavoured index (mirror
-   `~/.aish/registry/index.json`) listing `id / version / source / description`,
+   `~/.aish/registry/plugins.json`) listing `id / version / source / description`,
    with an `AISH_PLUGIN_REGISTRY` override paralleling `AISH_SKILL_REGISTRY`.
 2. **`aish plugin add <ref>`** — fetch → verify → materialise under
    `~/.aish/plugins/<id>/`, the plugin analogue of `:skill add`. `discover`
@@ -437,4 +437,4 @@ non-starter for a fleet.
 | Local Docker worker backend + OOM risk | `src/container.rs`; `Dockerfile.worker`; `aish_sre` SKILL.md §3; `docs/spikes/S1.4-reaper-vs-waitpid.md` |
 | Fly Machines API / `flyctl` / GraphQL / token auth | fly.io platform docs (`api.machines.dev/v1`, `api.fly.io/graphql`, `fly auth token`) |
 | Plugins are local-disk-only (no registry): loaded by a `read_dir` of `~/.aish/plugins/` | `src/plugins.rs` `discover` / `default_plugins_dir` |
-| Skills, by contrast, have a full registry (catalog, `AISH_SKILL_REGISTRY`, install, recommend-on-miss) | `src/skill_provider.rs`; `registry/index.json`; `src/skill_match.rs` |
+| Skills, by contrast, have a full registry (catalog, `AISH_SKILL_REGISTRY`, install, recommend-on-miss) | `src/skill_provider.rs`; `registry/skills.json`; `src/skill_match.rs` |

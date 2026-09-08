@@ -14,7 +14,7 @@ binary.
 | Trigger | Per-turn token match on the task | User asks "find / recommend a skill" |
 | Installed match | Prepends an `[aish skill-awareness]` note | Step 2–5: ranked table + stars |
 | No local match | `recommend_install` → `:skill add <ref>` | Step 4: same recommendation, richer copy |
-| Registry source | offline `~/.aish/registry/index.json` (`skill_provider::local_index_catalog`) | **same** offline index, via `scripts/` |
+| Registry source | offline `~/.aish/registry/skills.json` (`skill_provider::local_index_catalog`) | **same** offline index, via `scripts/` |
 | Relevance rule | `skill_match::relevance` (name-weighted) | **same** rule, re-stated in `discover-skills.sh` |
 
 Because this skill is installed, the engine's automatic awareness will itself
