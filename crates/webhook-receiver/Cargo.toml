@@ -20,7 +20,7 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
-sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "sqlite", "json", "uuid", "chrono", "macros"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "json", "uuid", "chrono", "macros"] }
 dotenv = "0.15"
 hex = "0.4"
 sha2 = "0.10"
