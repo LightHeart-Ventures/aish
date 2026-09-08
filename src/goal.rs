@@ -992,6 +992,7 @@ impl Goal {
     }
 
     /// A fresh subgoal parented under `parent_id`.
+    #[allow(dead_code)]
     pub fn subgoal(title: impl Into<String>, parent_id: impl Into<String>) -> Self {
         let mut g = Goal::new(title);
         g.parent_id = Some(parent_id.into());
@@ -999,6 +1000,7 @@ impl Goal {
     }
 
     /// Builder-style description setter (used in construction chains).
+    #[allow(dead_code)]
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
         self
@@ -1198,6 +1200,7 @@ impl Goal {
 /// cross-tree progress rollup: a parent's real progress folds in its subgoals.
 /// Unknown `root_id` yields `(0, 0)`. Pure over the slice — no DB, no ordering
 /// assumptions beyond parent_id links.
+#[allow(dead_code)]
 pub fn subtree_progress(root_id: &str, all: &[Goal]) -> (usize, usize) {
     let mut done = 0;
     let mut total = 0;
@@ -1222,6 +1225,7 @@ pub fn subtree_progress(root_id: &str, all: &[Goal]) -> (usize, usize) {
 
 /// Subtree progress as a rounded 0–100 percentage (see [`subtree_progress`]).
 /// Empty/unknown subtrees report 0.
+#[allow(dead_code)]
 pub fn subtree_percent(root_id: &str, all: &[Goal]) -> u8 {
     let (done, total) = subtree_progress(root_id, all);
     if total == 0 {
@@ -1288,6 +1292,7 @@ impl NextWork<'_> {
 /// the first [`Goal::is_actionable`] goal in input order (deterministic), or
 /// `None` when everything is paused/blocked/terminal/done. This is the seam the
 /// invoke path builds on to route work toward the user's live goals.
+#[allow(dead_code)]
 pub fn route_next(goals: &[Goal]) -> Option<&Goal> {
     goals.iter().find(|g| g.is_actionable())
 }

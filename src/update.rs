@@ -814,15 +814,18 @@ fn find_binary(root: &Path, name: &str) -> Option<PathBuf> {
 /// uses). A coordinator that recognises this sentinel at its round boundary
 /// flushes its S9.3 transcript and, if attached, detaches — so a restart can't
 /// sever it mid-turn. A fixed internal token, not user-forgeable into code.
+#[allow(dead_code)]
 pub const CHECKPOINT_SENTINEL: &str = "__aish_checkpoint_detach__";
 
 /// Default bound on how long `drain` awaits background jobs reaching a turn-
 /// boundary checkpoint before proceeding (AC4). Overridable per-invocation via
 /// `AISH_DRAIN_TIMEOUT` (whole seconds).
+#[allow(dead_code)]
 pub const DEFAULT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The drain await bound, read from `AISH_DRAIN_TIMEOUT` (seconds). Falls back
 /// to [`DEFAULT_DRAIN_TIMEOUT`] when the var is unset, unparseable, or zero.
+#[allow(dead_code)]
 pub fn drain_timeout() -> std::time::Duration {
     std::env::var("AISH_DRAIN_TIMEOUT")
         .ok()
@@ -835,6 +838,7 @@ pub fn drain_timeout() -> std::time::Duration {
 /// Everything `drain` / `perform_with_drain` need to quiesce background work,
 /// captured up front so the orchestration is decoupled from `Session`. The
 /// caller (the `:update --drain` handler) fills it from the live session.
+#[allow(dead_code)]
 pub struct DrainCtx<'a> {
     /// The durable coordinator store — the source of truth for which runs are
     /// live (goal-loop turns, other-session runs, reattached runs). `None` when
@@ -859,6 +863,7 @@ pub struct DrainCtx<'a> {
 /// were left mid-flight at the deadline (safe once containerized + persisted;
 /// recorded for S9.5 rediscovery). A transient, in-memory summary (no schema).
 #[derive(Debug, Default, Clone)]
+#[allow(dead_code)]
 pub struct DrainReport {
     /// Run ids handed a checkpoint+detach signal (AC2).
     pub attached_detached: Vec<String>,
@@ -912,6 +917,7 @@ where
 /// Partition the set of signalled run ids into those that quiesced (NOT in the
 /// still-active set at the deadline) and those left mid-flight (still active).
 /// Pure → unit-tested for the AC4 report split.
+#[allow(dead_code)]
 pub fn partition_drain(
     signalled: &[String],
     still_active: &std::collections::HashSet<String>,
@@ -931,6 +937,7 @@ pub fn partition_drain(
 /// The AC8 host-subprocess confirmation prompt: with host workers in flight, a
 /// restart WILL lose them (they're children of the shell), so the user must
 /// confirm explicitly. Pure over the count for unit-testing.
+#[allow(dead_code)]
 pub fn host_drain_warning(running: usize) -> String {
     let plural = if running == 1 { "" } else { "s" };
     format!(
@@ -941,6 +948,7 @@ pub fn host_drain_warning(running: usize) -> String {
 /// The set of live (non-terminal) coordinator run ids in the durable store,
 /// per [`crate::coordinator::Phase`]. Empty on no store / read error (best-
 /// effort: a store hiccup must never wedge a drain).
+#[allow(dead_code)]
 fn live_run_ids(ctx: &DrainCtx<'_>) -> Vec<String> {
     let Some(store) = ctx.store else {
         return Vec::new();
@@ -965,6 +973,7 @@ fn live_run_ids(ctx: &DrainCtx<'_>) -> Vec<String> {
 /// Total background work still tied to THIS binary: in-memory batches + workers
 /// + durable coordinator runs the in-memory tallies miss. Mirrors the prompt's
 /// ⟳N tally; the quiesce loop polls this to zero (or the timeout).
+#[allow(dead_code)]
 fn drain_running_count(ctx: &DrainCtx<'_>) -> usize {
     let batches = crate::batch::running_count(ctx.batch_jobs);
     let workers = crate::worker::running_count(ctx.worker_jobs);
@@ -989,6 +998,7 @@ fn drain_running_count(ctx: &DrainCtx<'_>) -> usize {
 ///      `left_mid_flight` (safe once containerized + persisted) and we proceed.
 /// Always returns a report — drain is best-effort; a store error degrades to an
 /// empty signal set rather than failing the update.
+#[allow(dead_code)]
 pub async fn drain(ctx: &DrainCtx<'_>) -> DrainReport {
     let mut report = DrainReport::default();
 
@@ -1100,6 +1110,7 @@ fn strip_deleted_suffix(p: &Path) -> Option<PathBuf> {
 /// swap it calls [`restart_in_place`], which returns ONLY if the re-exec failed
 /// — surfaced as `restart_error` so the caller can advise a manual restart with
 /// the new binary already in place.
+#[allow(dead_code)]
 pub async fn perform_with_drain(info: &UpdateInfo, ctx: &DrainCtx<'_>) -> Result<DrainOutcome> {
     // Pre-flight: fail fast if the destination isn't writable, BEFORE quiescing
     // for nothing (edge case — don't tear down interactive work then bail).
@@ -1128,6 +1139,7 @@ pub async fn perform_with_drain(info: &UpdateInfo, ctx: &DrainCtx<'_>) -> Result
 /// is `Some` only when the post-swap re-exec FAILED (the new binary is in place;
 /// advise a manual restart). On a successful re-exec the process image is
 /// replaced and this value is never constructed.
+#[allow(dead_code)]
 pub struct DrainOutcome {
     pub report: DrainReport,
     pub restart_error: Option<std::io::Error>,

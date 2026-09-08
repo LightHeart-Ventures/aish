@@ -726,6 +726,7 @@ pub fn plugin_mcp_paths(dir: &Path) -> Vec<PathBuf> {
 
 /// One MCP server a plugin contributes to the client set.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub struct PluginMcpServer {
     pub plugin_id: String,
     pub name: String,
@@ -736,6 +737,7 @@ pub struct PluginMcpServer {
 /// claimed by an earlier (higher-precedence) source. `winner` is the source
 /// that keeps the name (`"config"` for project/user scope, or `"plugin:<id>"`).
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub struct McpCollision {
     pub name: String,
     pub winner: String,
@@ -750,6 +752,7 @@ pub struct McpCollision {
 /// ([`plugin_mcp_paths`] + `McpHost`'s earlier-path-wins connect), so
 /// `:plugin info` and diagnostics can report exactly what will (and won't)
 /// merge without connecting anything. Malformed/absent `.mcp.json` skipped.
+#[allow(dead_code)]
 pub fn collect_plugin_mcp_servers(
     dir: &Path,
     existing: &[String],
