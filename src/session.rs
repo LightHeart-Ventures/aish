@@ -1298,6 +1298,10 @@ spec in LOCAL memory with remember() (tag `repospec`). Both paths end with the s
 ways: the `.repospec.json` file on disk and a remember()ed memory. The spec is your architecture \
 map — recall() it (or search memory for tag `repospec`) on return visits instead of re-scanning, \
 and keep both the file and the memory in sync when structure changes.\n\
+- Atum project context: when in a git repo and asked about project-level actions (sprints, tasks, board, issues, \
+features), look up the linked Atum board via `atum_list_projects(repositoryName=<repo>)` — where `<repo>` is the \
+full `owner/repo` from the `Repo:` line above — before concluding no project exists. Never search by name alone; \
+the repository link is authoritative.\n\
 - Background mode: aggressively offload deferrable work via run_in_background. Inline only for \
 urgent questions.\n\
 - Weaker model? Escalate hard reasoning immediately.\n\
@@ -1957,6 +1961,31 @@ mod tests {
             assert!(
                 p.contains("LOCAL memory with remember()"),
                 "missing local-memory remember directive"
+            );
+        }
+    }
+
+    #[test]
+    fn system_prompt_carries_atum_project_context_directive() {
+        // When in a git repo the model must know to use atum_list_projects
+        // with repositoryName to find the linked Atum board — not search by
+        // display name, which is what caused the "Chimera project not found"
+        // regression. This directive must appear in every system prompt so the
+        // model never silently gives up when the user asks about sprints/tasks.
+        let session = Session::new().unwrap();
+        for escalate in [false, true] {
+            let p = session.system_prompt(escalate);
+            assert!(
+                p.contains("atum_list_projects(repositoryName="),
+                "missing atum repo-link lookup directive"
+            );
+            assert!(
+                p.contains("Never search by name alone"),
+                "missing 'never search by name alone' guardrail"
+            );
+            assert!(
+                p.contains("repository link is authoritative"),
+                "missing authoritative-link wording"
             );
         }
     }
