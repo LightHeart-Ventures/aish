@@ -449,8 +449,8 @@ pub fn tokenize_redir(
     macro_rules! flush_word {
         () => {
             if in_word {
-                let w = std::mem::take(&mut cur);
                 in_word = false;
+                let w = std::mem::take(&mut cur);
                 if let Some((fd, mode, both)) = pending.take() {
                     if both {
                         redirs.push(Redir::Both {

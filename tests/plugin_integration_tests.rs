@@ -160,18 +160,12 @@ fn test_hello_world_webhook_manifest() {
     );
 }
 
-/// Test 6: Plugin manifest roundtrip (Phase 1.4 config loading)
-///
-/// Verifies that ${VAR} expansion in plugin.json works (if integrated).
-#[test]
-fn test_plugin_manifest_var_expansion() {
-    // This test is a placeholder for Phase 1.4 integration.
-    // Once plugin manifests support ${VAR} expansion, verify that
-    // a manifest with environment variables is correctly expanded
-    // during plugin discovery.
-
-    // Note: env::set_var is unsafe; we skip this for now.
-    // The Phase 1.4 config loader should be tested via the hello-world
-    // plugin's webhook_command field, which may contain ${VAR} expansion.
-    assert!(true, "placeholder for Phase 1.4 var expansion test");
-}
+// Test 6 ("plugin manifest ${VAR} expansion") used to live here as a
+// `assert!(true, "placeholder for Phase 1.4 var expansion test")` — a test
+// that could never fail and asserted nothing. Phase 1.4's `${env:VAR}`
+// expansion is implemented (`load_config`/`interpolate_env`/`resolve_env_refs`
+// in src/plugins.rs) and is exercised for real by that module's own unit
+// tests: `env_reference_is_substituted`, `env_reference_resolves_inside_nested_structures`,
+// `unset_env_reference_errors`, and `env_default_reference_is_resolved`
+// (src/plugins.rs, `mod tests`). Removed the vacuous placeholder rather than
+// leave dead, always-green coverage in the suite.
