@@ -522,7 +522,8 @@ impl McpHost {
         Ok((count, elapsed))
     }
 
-    /// Route an `mcp__server__tool` call to its server.
+    /// Route an `mcp__server__tool` call to its server, with one automatic
+    /// reconnect on a broken-pipe / dead-child error (stdio transport).
     pub async fn call(&mut self, qualified: &str, args: &Value) -> Result<String> {
         let rest = qualified
             .strip_prefix("mcp__")
@@ -530,19 +531,41 @@ impl McpHost {
         let (server_name, tool) = rest
             .split_once("__")
             .ok_or_else(|| anyhow::anyhow!("malformed mcp tool name: {qualified}"))?;
-        let server = self
-            .servers
-            .iter_mut()
-            .find(|s| s.name == server_name)
-            .ok_or_else(|| anyhow::anyhow!("unknown mcp server: {server_name}"))?;
 
-        let result = server
-            .request(
-                "tools/call",
-                json!({"name": tool, "arguments": args}),
-                CALL_TIMEOUT,
-            )
-            .await?;
+        let call_args = json!({"name": tool, "arguments": args});
+
+        // First attempt — store the result without keeping a live server borrow
+        // so we can call reconnect() below without fighting the borrow checker.
+        let first = {
+            let server = self
+                .servers
+                .iter_mut()
+                .find(|s| s.name == server_name)
+                .ok_or_else(|| anyhow::anyhow!("unknown mcp server: {server_name}"))?;
+            server
+                .request("tools/call", call_args.clone(), CALL_TIMEOUT)
+                .await
+        };
+
+        // On stdio broken-pipe (dead child process), reconnect once and retry.
+        let result = if first.as_ref().err().map_or(false, is_broken_pipe) {
+            eprintln!(
+                "\x1b[33maish:\x1b[0m mcp:{server_name} disconnected — reconnecting…"
+            );
+            self.reconnect(server_name)
+                .await
+                .with_context(|| format!("mcp:{server_name} reconnect failed"))?;
+            let server = self
+                .servers
+                .iter_mut()
+                .find(|s| s.name == server_name)
+                .expect("just reconnected");
+            server
+                .request("tools/call", call_args, CALL_TIMEOUT)
+                .await?
+        } else {
+            first?
+        };
 
         let mut out = String::new();
         for block in result["content"]
@@ -1080,6 +1103,27 @@ fn extract_jsonrpc_bodies(body: &str) -> Vec<Value> {
         .filter_map(|l| l.strip_prefix("data:"))
         .filter_map(|d| serde_json::from_str(d.trim()).ok())
         .collect()
+}
+
+/// True when an MCP error is a dead-pipe / dead-child error on the stdio
+/// transport: EPIPE on the write side, or EOF / io error on the read side.
+/// Used by [`McpHost::call`] to trigger a one-shot auto-reconnect.
+fn is_broken_pipe(e: &anyhow::Error) -> bool {
+    for cause in e.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            match io_err.kind() {
+                std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset => return true,
+                _ => {}
+            }
+        }
+        let s = cause.to_string();
+        if s.contains("server closed its stdout") || s.contains("server pipe error") {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
