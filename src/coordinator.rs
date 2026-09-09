@@ -1491,59 +1491,71 @@ fn pid_is_alive(pid: i64) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// #129: detect and reap stalled coordinators.
-/// A coordinator is "stalled" if it is in a non-terminal phase (Coordinating or
-/// AwaitingBatch) but hasn't updated its heartbeat for longer than STALL_THRESHOLD.
-/// This catches deadlocks / hangs that don't kill the OS process. Returns the count
-/// of reaped stalled runs.
+/// A non-terminal run whose heartbeat is older than this is considered STALLED.
+/// Distinct from `ORPHAN_STALE_AFTER`: an orphan's owner PROCESS is gone, while
+/// a stalled run may still be alive (a deadlock or a wedged tool call), so the
+/// pid-liveness scan never catches it. A healthy run beats every
+/// `HEARTBEAT_INTERVAL` (30s), so this is ~10 consecutive missed beats.
+const STALL_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// Pure predicate: should this coordinator row be reaped as STALLED? (#129)
+///
+/// Stalled = non-terminal phase (`Coordinating`/`AwaitingBatch`) whose last
+/// heartbeat is older than `STALL_AFTER`. Heartbeats are SQLite
+/// `current_timestamp` strings — UTC `"YYYY-MM-DD HH:MM:SS"`, NOT unix-epoch
+/// integers — so they MUST go through `parse_sqlite_timestamp`. Parsing one as
+/// an integer yields `Err` for every row, which previously collapsed the
+/// heartbeat to `0` and reaped every live coordinator on the first read.
+///
+/// Fail-OPEN on a missing/unparseable heartbeat: reaping marks a run failed and
+/// abandons its in-flight work, so a timestamp we cannot read is never grounds
+/// to kill. A genuinely dead run is still reaped by the pid-liveness orphan
+/// scan (`is_orphaned_row`) — the irreversible action stays with the check that
+/// has hard evidence.
+fn is_stalled_row(phase: &str, heartbeat_at: Option<&str>, now: i64) -> bool {
+    if !matches!(
+        Phase::parse(phase),
+        Phase::Coordinating | Phase::AwaitingBatch
+    ) {
+        return false; // Done/Failed/Checkpoint are not stall candidates
+    }
+    let Some(hb) = heartbeat_at else {
+        return false; // no beat recorded → fail open, let the orphan scan judge
+    };
+    match parse_sqlite_timestamp(hb) {
+        Some(beat) => now.saturating_sub(beat) > STALL_AFTER.as_secs() as i64,
+        None => false, // unparseable → fail open (never reap on a bad read)
+    }
+}
+
+/// #129: detect and reap stalled coordinators — non-terminal runs that stopped
+/// beating (deadlocks / hangs that do NOT kill the OS process, which the
+/// pid-liveness orphan scan therefore misses). Returns the count reaped.
 fn detect_and_reap_stalled_runs(store: &CoordinatorStore, digest: bool) -> usize {
-    // Stall threshold: if heartbeat is older than 5 minutes, mark as stalled.
-    const STALL_THRESHOLD_SECS: u64 = 5 * 60;
-    
     let rows = match store.load_all() {
         Ok(r) => r,
         Err(_) => return 0, // non-fatal
     };
-    
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    
+    let now = now_unix_secs();
+    let mins = STALL_AFTER.as_secs() / 60;
+
     let mut stalled_reaped = 0usize;
     for row in rows {
-        let phase = Phase::parse(&row.phase);
-        
-        // Only check non-terminal phases: Coordinating and AwaitingBatch.
-        // Done, Failed, and Checkpoint are not candidates for staleness.
-        let is_active = matches!(phase, Phase::Coordinating | Phase::AwaitingBatch);
-        if !is_active {
+        if !is_stalled_row(&row.phase, row.heartbeat_at.as_deref(), now) {
             continue;
         }
-        
-        // Parse the heartbeat timestamp. If missing or unparseable, treat as
-        // stale (a coordinator that never heartbeats is surely stuck).
-        let heartbeat_ts = row.heartbeat_at
-            .as_ref()
-            .and_then(|ts_str| ts_str.parse::<u64>().ok())
-            .unwrap_or(0);
-        
-        if now.saturating_sub(heartbeat_ts) > STALL_THRESHOLD_SECS {
-            // Stalled: mark as failed with a message.
-            let short_id = crate::batch::short_id(&row.run_id);
-            if store.set_failed(&row.run_id, "stalled: no heartbeat activity for 5+ minutes")
-                .is_ok() {
-                stalled_reaped += 1;
-                if digest {
-                    eprintln!(
-                        "\x1b[2maish: coordinator {} stalled (no heartbeat activity for 5+ minutes) — marked failed\x1b[0m",
-                        short_id
-                    );
-                }
+        let short_id = crate::batch::short_id(&row.run_id);
+        let reason = format!("stalled: no heartbeat activity for {mins}+ minutes");
+        if store.set_failed(&row.run_id, &reason).is_ok() {
+            stalled_reaped += 1;
+            if digest {
+                eprintln!(
+                    "\x1b[2maish: coordinator {short_id} stalled (no heartbeat activity for {mins}+ minutes) — marked failed\x1b[0m"
+                );
             }
         }
     }
-    
+
     stalled_reaped
 }
 
@@ -2351,5 +2363,72 @@ mod tests {
         let mth = if mp < 10 { mp + 3 } else { mp - 9 };
         let year = if mth <= 2 { y + 1 } else { y };
         format!("{year:04}-{mth:02}-{d:02} {h:02}:{m:02}:{s:02}")
+    }
+
+    // ---- #129: stall reaper (`is_stalled_row`) ----
+
+    const NOW: i64 = 1_700_000_000;
+
+    /// THE REGRESSION. Heartbeats are SQLite `current_timestamp` strings, not
+    /// epoch integers: the old reaper did `ts.parse::<u64>().unwrap_or(0)`,
+    /// which failed on EVERY row, collapsed the beat to 0, and made every live
+    /// coordinator look 50+ years stale — so the first sweep marked healthy
+    /// runs `failed` and their workers stalled with no work landed.
+    #[test]
+    fn stalled_row_does_not_reap_live_run_with_sqlite_timestamp() {
+        let hb = unix_to_sqlite(NOW - 60);
+        assert!(
+            hb.parse::<u64>().is_err(),
+            "fixture must be a non-numeric SQLite timestamp, got {hb}"
+        );
+        assert!(!is_stalled_row("coordinating", Some(&hb), NOW));
+        assert!(!is_stalled_row("awaiting_batch", Some(&hb), NOW));
+    }
+
+    #[test]
+    fn stalled_row_ignores_terminal_and_checkpoint_phases() {
+        let ancient = unix_to_sqlite(NOW - 30 * 3_600);
+        for phase in ["done", "failed", "checkpoint", "bogus_legacy_value"] {
+            assert!(
+                !is_stalled_row(phase, Some(&ancient), NOW),
+                "phase `{phase}` must never be reaped as stalled"
+            );
+        }
+    }
+
+    #[test]
+    fn stalled_row_reaps_beyond_threshold() {
+        let stale = unix_to_sqlite(NOW - (STALL_AFTER.as_secs() as i64 + 60));
+        assert!(is_stalled_row("coordinating", Some(&stale), NOW));
+        assert!(is_stalled_row("awaiting_batch", Some(&stale), NOW));
+    }
+
+    #[test]
+    fn stalled_row_boundary_is_exclusive() {
+        let exact = unix_to_sqlite(NOW - STALL_AFTER.as_secs() as i64);
+        assert!(!is_stalled_row("coordinating", Some(&exact), NOW));
+        let past = unix_to_sqlite(NOW - STALL_AFTER.as_secs() as i64 - 1);
+        assert!(is_stalled_row("coordinating", Some(&past), NOW));
+    }
+
+    /// Fail-OPEN: reaping is irreversible (marks the run failed, abandons its
+    /// work), so an absent/unreadable beat is never grounds to kill. Dead runs
+    /// are still caught by the pid-liveness orphan scan, which has evidence.
+    #[test]
+    fn stalled_row_fails_open_on_unreadable_heartbeat() {
+        for hb in [None, Some(""), Some("not-a-timestamp"), Some("0")] {
+            assert!(
+                !is_stalled_row("coordinating", hb, NOW),
+                "unreadable heartbeat {hb:?} must not trigger a reap"
+            );
+        }
+    }
+
+    /// A clock skew that puts the beat in the FUTURE must not underflow into a
+    /// huge age and reap the run.
+    #[test]
+    fn stalled_row_tolerates_future_heartbeat() {
+        let future = unix_to_sqlite(NOW + 3_600);
+        assert!(!is_stalled_row("coordinating", Some(&future), NOW));
     }
 }
