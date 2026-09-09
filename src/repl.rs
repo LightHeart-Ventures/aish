@@ -8788,6 +8788,9 @@ async fn handle_colon(
         }
         Some("new") => {
             session.reset_conversation();
+            // Clear the terminal before starting the fresh conversation so the
+            // operator sees a clean slate (matching what `:new` implies).
+            print!("\x1b[2J\x1b[H");
             println!("history cleared");
         }
         Some("allow") => handle_allow(parts.next(), parts.next(), session),
