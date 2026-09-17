@@ -24,8 +24,8 @@ For each plugin, read its **`INSTALL.md`** file. All guides follow the same stru
 | **ccquota** | Local (MCP) | Anthropic API | Monitoring Claude API spend and quota |
 | **codebase-memory** | MCP Server | DeusData/codebase-memory-mcp binary | Graph-based code search instead of grep |
 | **github** | Webhook Handlers | GitHub webhooks, (optional) gh CLI | Ingesting GitHub PR/workflow/release events |
+| **gstack** | Local (Shell) | curl, jq | Searching/importing skills from garrytan/gstack |
 | **hello-world** | Local (Reference) | None | Testing plugin discovery, reference implementation |
-
 | **npx-skillfish** | Local (Shell) | Node.js/npx | Importing skills from agentskills.io/skillfish |
 | **signoz-observability** | MCP Server | SigNoz instance, API key | Querying logs, traces, metrics, alerts |
 
@@ -48,6 +48,7 @@ For each plugin, read its **`INSTALL.md`** file. All guides follow the same stru
 - **[github/INSTALL.md](./github/INSTALL.md)** — Webhook handlers for GitHub events
 
 #### Skill Management
+- **[gstack/INSTALL.md](./gstack/INSTALL.md)** — Search and import skills from garrytan/gstack
 - **[npx-skillfish/INSTALL.md](./npx-skillfish/INSTALL.md)** — Import skills from agentskills.io/skillfish
 
 #### Observability

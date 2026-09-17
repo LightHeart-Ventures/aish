@@ -89,6 +89,21 @@
       }
     },
     {
+      "id": "gstack",
+      "name": "gstack skills (garrytan/gstack)",
+      "description": "Skill source for the gstack skill library — `:skill search gstack:<query>` and `:skill add gstack:<name>` (or `gstack:*` for the whole library).",
+      "author": "LightHeart Ventures",
+      "repository": "LightHeart-Ventures/aish",
+      "reference": "LightHeart-Ventures/aish/plugins/gstack",
+      "branch": "main",
+      "version": "0.25.0",
+      "enabled": true,
+      "provides": {
+        "skills": true,
+        "skill_source": true
+      }
+    },
+    {
       "id": "npx-skillfish",
       "name": "NPX Skillfish Integration",
       "description": "Integration with npx-skillfish for skill.fish registry access.",

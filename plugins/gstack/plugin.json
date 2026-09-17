@@ -1,0 +1,31 @@
+{
+  "id": "gstack",
+  "name": "gstack (garrytan/gstack) skill suite",
+  "version": "1.0.0",
+  "description": "Skill source for the gstack skill suite (github.com/garrytan/gstack) — 54 agent skills covering plan/spec/ship/review, design consultation + review, QA, iOS live-device workflows, security (cso), docs, and browser automation. Adds gstack to the `:skill search` fan-out and lets `:skill add gstack:<name>` pull any gstack SKILL.md straight from GitHub. Ships a router skill that maps intent to the right gstack skill.",
+  "author": "LightHeart Ventures (wrapper) / Garry Tan (gstack skills)",
+  "license": "Apache-2.0 (plugin wrapper); gstack skills are licensed by their upstream repo — see https://github.com/garrytan/gstack",
+  "homepage": "https://github.com/garrytan/gstack",
+  "provides": {
+    "skill_source": {
+      "id": "gstack",
+      "priority": 90,
+      "search": "search.sh",
+      "add": "add.sh",
+      "executable": true,
+      "handles": ["gstack:*", "garrytan/gstack/*", "garrytan/gstack"]
+    }
+  },
+  "config": {
+    "ref": {
+      "default": "main",
+      "description": "Git ref (branch/tag/SHA) of garrytan/gstack that `add.sh` fetches SKILL.md files from. Pin to a tag for reproducible imports.",
+      "envVar": "AISH_GSTACK_REF"
+    },
+    "catalog": {
+      "default": "catalog.json",
+      "description": "Offline skill catalog used by `search.sh` (no network needed for search). Regenerate against upstream with ./refresh-catalog.sh.",
+      "envVar": "AISH_GSTACK_CATALOG"
+    }
+  }
+}
