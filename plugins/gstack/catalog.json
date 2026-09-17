@@ -1,0 +1,320 @@
+[
+  {
+    "name": "autoplan",
+    "description": "Auto-review pipeline — reads the full CEO, design, eng, and DX review skills from disk and runs them sequentially with auto-decisions using 6 decision princi...",
+    "version": "1.0.0",
+    "dir": "autoplan"
+  },
+  {
+    "name": "benchmark",
+    "description": "Performance regression detection. (gstack)",
+    "version": "1.0.0",
+    "dir": "benchmark"
+  },
+  {
+    "name": "benchmark-models",
+    "description": "Cross-model benchmark for gstack skills. (gstack)",
+    "version": "1.0.0",
+    "dir": "benchmark-models"
+  },
+  {
+    "name": "browse",
+    "description": "Drive a real browser through Aside: open a page, read it, click through a flow, take screenshots, check console errors. (gstack)",
+    "version": "2.0.0",
+    "dir": "browse"
+  },
+  {
+    "name": "canary",
+    "description": "Post-deploy canary monitoring. (gstack)",
+    "version": "1.0.0",
+    "dir": "canary"
+  },
+  {
+    "name": "careful",
+    "description": "Safety guardrails for destructive commands. (gstack)",
+    "version": "0.1.0",
+    "dir": "careful"
+  },
+  {
+    "name": "codex",
+    "description": "OpenAI Codex CLI wrapper — three modes. (gstack)",
+    "version": "1.0.0",
+    "dir": "codex"
+  },
+  {
+    "name": "context-restore",
+    "description": "Restore working context saved earlier by /context-save. (gstack)",
+    "version": "1.0.0",
+    "dir": "context-restore"
+  },
+  {
+    "name": "context-save",
+    "description": "Save working context. (gstack)",
+    "version": "1.0.0",
+    "dir": "context-save"
+  },
+  {
+    "name": "cso",
+    "description": "Security audit: supported static findings; qualified profiles add reproduction and repair candidates. (gstack)",
+    "version": "3.0.0",
+    "dir": "cso"
+  },
+  {
+    "name": "design-consultation",
+    "description": "Design consultation: understands your product, researches the landscape, proposes a complete design system (aesthetic, typography, color, layout, spacing, mo...",
+    "version": "1.0.0",
+    "dir": "design-consultation"
+  },
+  {
+    "name": "design-html",
+    "description": "Design finalization: generates production-quality Pretext-native HTML/CSS. (gstack)",
+    "version": "1.0.0",
+    "dir": "design-html"
+  },
+  {
+    "name": "design-review",
+    "description": "Designer's eye QA: finds visual inconsistency, spacing issues, hierarchy problems, AI slop patterns, and slow interactions — then fixes them. (gstack)",
+    "version": "2.0.0",
+    "dir": "design-review"
+  },
+  {
+    "name": "design-shotgun",
+    "description": "Design shotgun: generate multiple AI design variants, open a comparison board, collect structured feedback, and iterate. (gstack)",
+    "version": "1.0.0",
+    "dir": "design-shotgun"
+  },
+  {
+    "name": "devex-review",
+    "description": "Live developer experience audit. (gstack)",
+    "version": "1.0.0",
+    "dir": "devex-review"
+  },
+  {
+    "name": "diagram",
+    "description": "Turn an English description (or mermaid source) into a diagram triplet: the source, an editable .excalidraw file you can open on excalidraw.com, and rendered...",
+    "version": "1.0.0",
+    "dir": "diagram"
+  },
+  {
+    "name": "document-generate",
+    "description": "Generate missing documentation from scratch for a feature, module, or entire project. (gstack)",
+    "version": "1.0.0",
+    "dir": "document-generate"
+  },
+  {
+    "name": "document-release",
+    "description": "Post-ship documentation update. (gstack)",
+    "version": "1.0.0",
+    "dir": "document-release"
+  },
+  {
+    "name": "freeze",
+    "description": "Restrict file edits to a specific directory for the session. (gstack)",
+    "version": "0.1.0",
+    "dir": "freeze"
+  },
+  {
+    "name": "gstack-upgrade",
+    "description": "Upgrade gstack to the latest version.",
+    "version": "1.1.0",
+    "dir": "gstack-upgrade"
+  },
+  {
+    "name": "guard",
+    "description": "Full safety mode: destructive command warnings + directory-scoped edits. (gstack)",
+    "version": "0.1.0",
+    "dir": "guard"
+  },
+  {
+    "name": "health",
+    "description": "Code quality dashboard. (gstack)",
+    "version": "1.0.0",
+    "dir": "health"
+  },
+  {
+    "name": "investigate",
+    "description": "Systematic debugging with root cause investigation. (gstack)",
+    "version": "1.0.0",
+    "dir": "investigate"
+  },
+  {
+    "name": "ios-clean",
+    "description": "Remove the DebugBridge SPM package and all #if DEBUG wiring from an iOS app. (gstack)",
+    "version": "1.0.0",
+    "dir": "ios-clean"
+  },
+  {
+    "name": "ios-design-review",
+    "description": "Visual design audit for iOS apps on real hardware. (gstack)",
+    "version": "1.0.0",
+    "dir": "ios-design-review"
+  },
+  {
+    "name": "ios-fix",
+    "description": "Autonomous iOS bug fixer. (gstack)",
+    "version": "1.0.0",
+    "dir": "ios-fix"
+  },
+  {
+    "name": "ios-qa",
+    "description": "Live-device iOS QA for SwiftUI apps. (gstack)",
+    "version": "1.0.0",
+    "dir": "ios-qa"
+  },
+  {
+    "name": "ios-sync",
+    "description": "Regenerate the iOS debug bridge against the latest upstream gstack templates. (gstack)",
+    "version": "1.0.0",
+    "dir": "ios-sync"
+  },
+  {
+    "name": "land-and-deploy",
+    "description": "Land and deploy workflow. (gstack)",
+    "version": "1.0.0",
+    "dir": "land-and-deploy"
+  },
+  {
+    "name": "landing-report",
+    "description": "Read-only queue dashboard for workspace-aware ship. (gstack)",
+    "version": "0.1.0",
+    "dir": "landing-report"
+  },
+  {
+    "name": "learn",
+    "description": "Manage project learnings.",
+    "version": "1.0.0",
+    "dir": "learn"
+  },
+  {
+    "name": "make-pdf",
+    "description": "Turn any markdown file into a publication-quality PDF. (gstack)",
+    "version": "1.0.0",
+    "dir": "make-pdf"
+  },
+  {
+    "name": "office-hours",
+    "description": "YC Office Hours — two modes. (gstack)",
+    "version": "2.0.0",
+    "dir": "office-hours"
+  },
+  {
+    "name": "open-gstack-browser",
+    "description": "Launch GStack Browser — AI-controlled Chromium with the sidebar extension baked in.",
+    "version": "0.2.0",
+    "dir": "open-gstack-browser"
+  },
+  {
+    "name": "pair-agent",
+    "description": "Pair a remote AI agent with your browser. (gstack)",
+    "version": "0.1.0",
+    "dir": "pair-agent"
+  },
+  {
+    "name": "plan-ceo-review",
+    "description": "CEO/founder-mode plan review. (gstack)",
+    "version": "1.0.0",
+    "dir": "plan-ceo-review"
+  },
+  {
+    "name": "plan-design-review",
+    "description": "Designer's eye plan review — interactive, like CEO and Eng review. (gstack)",
+    "version": "2.0.0",
+    "dir": "plan-design-review"
+  },
+  {
+    "name": "plan-devex-review",
+    "description": "Interactive developer experience plan review. (gstack)",
+    "version": "2.0.0",
+    "dir": "plan-devex-review"
+  },
+  {
+    "name": "plan-eng-review",
+    "description": "Eng manager-mode plan review. (gstack)",
+    "version": "1.0.0",
+    "dir": "plan-eng-review"
+  },
+  {
+    "name": "plan-tune",
+    "description": "Self-tuning question sensitivity + developer psychographic for gstack (v1: observational). (gstack)",
+    "version": "1.0.0",
+    "dir": "plan-tune"
+  },
+  {
+    "name": "qa",
+    "description": "Systematically QA test a web application and fix bugs found. (gstack)",
+    "version": "2.0.0",
+    "dir": "qa"
+  },
+  {
+    "name": "qa-only",
+    "description": "Report-only QA testing. (gstack)",
+    "version": "1.0.0",
+    "dir": "qa-only"
+  },
+  {
+    "name": "retro",
+    "description": "Weekly engineering retrospective. (gstack)",
+    "version": "2.0.0",
+    "dir": "retro"
+  },
+  {
+    "name": "review",
+    "description": "Pre-landing PR review. (gstack)",
+    "version": "1.0.0",
+    "dir": "review"
+  },
+  {
+    "name": "scrape",
+    "description": "Pull data from a web page through the Aside browser — your real, already signed-in sessions. (gstack)",
+    "version": "2.0.0",
+    "dir": "scrape"
+  },
+  {
+    "name": "setup-browser-cookies",
+    "description": "Import cookies from your real Chromium browser into the headless browse session. (gstack)",
+    "version": "1.0.0",
+    "dir": "setup-browser-cookies"
+  },
+  {
+    "name": "setup-deploy",
+    "description": "Configure deployment settings for /land-and-deploy.",
+    "version": "1.0.0",
+    "dir": "setup-deploy"
+  },
+  {
+    "name": "setup-gbrain",
+    "description": "Set up gbrain for this coding agent: install the CLI, initialize a local PGLite or Supabase brain, register MCP, capture per-remote trust policy. (gstack)",
+    "version": "1.0.0",
+    "dir": "setup-gbrain"
+  },
+  {
+    "name": "ship",
+    "description": "Ship workflow: detect + merge base branch, run tests, review diff, bump VERSION, update CHANGELOG, commit, push, create PR. (gstack)",
+    "version": "1.0.0",
+    "dir": "ship"
+  },
+  {
+    "name": "skillify",
+    "description": "Codify the most recent successful /scrape flow into a permanent browser-skill on disk. (gstack)",
+    "version": "1.0.0",
+    "dir": "skillify"
+  },
+  {
+    "name": "spec",
+    "description": "Turn vague intent into a precise, executable spec in five phases. (gstack)",
+    "version": "0.1.0",
+    "dir": "spec"
+  },
+  {
+    "name": "sync-gbrain",
+    "description": "Keep gbrain current with this repo's code and refresh agent search guidance in CLAUDE.md. (gstack)",
+    "version": "1.0.0",
+    "dir": "sync-gbrain"
+  },
+  {
+    "name": "unfreeze",
+    "description": "Clear the freeze boundary set by /freeze, allowing edits to all directories again. (gstack)",
+    "version": "0.1.0",
+    "dir": "unfreeze"
+  }
+]
