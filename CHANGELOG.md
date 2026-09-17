@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to aish are documented here. Dates are the GitHub release published dates (UTC). Burned/failed release tags that never shipped valid assets (v0.18.1, v0.18.3, v0.19.0) are intentionally omitted.
+All notable changes to aish are documented here. Dates are the GitHub release published dates (UTC). Burned/failed release tags that never shipped valid assets (v0.18.1, v0.18.3, v0.19.0, v0.48.0) are intentionally omitted. `v0.48.0` is permanently unusable: the tag name was consumed by an immutable release that was later deleted, so GitHub's pre-receive hook now rejects any attempt to recreate the ref (`tag_name was used by an immutable release` / `Cannot create ref due to creations being restricted`). The 0.48.0 work shipped as **0.48.1**.
 
 ## [Unreleased]
 
