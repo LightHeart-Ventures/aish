@@ -450,6 +450,18 @@ fn clamp_usize(raw: Option<String>, default: usize, min: usize, max: usize) -> u
 /// atum's `DEFAULT_HEARTBEAT_INTERVAL_MS`.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Cancellation token for the heartbeat keeper thread spawned by [`drive`].
+/// Held on `drive`'s stack frame, so EVERY return path — normal completion,
+/// failure, checkpoint, circuit-break, or an early `?` — stops the beat without
+/// a bespoke teardown call at each exit.
+struct HeartbeatGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// A run is considered orphaned at startup when its owner is gone and its last
 /// heartbeat is older than this. Generous so a momentarily-paused awaiting run
 /// (a long batch poll) is never falsely reaped.
@@ -667,30 +679,40 @@ pub async fn drive(
     // flagged ⚠ in `:workers` / `background_status`, or even reaped as
     // orphaned by a concurrent startup.
     //
-    // Design: a oneshot sender held on THIS stack frame (`_heartbeat_cancel`)
-    // is the cancellation token.  The spawned task loops, sleeping
-    // HEARTBEAT_INTERVAL then beating, and exits as soon as `select!` sees the
-    // receiver resolve (i.e. when the sender is dropped on any return path —
-    // normal completion, failure, checkpoint, or circuit-break).  Best-effort:
-    // a store write error never stalls the task.
-    let _heartbeat_cancel = if let Some(s) = store {
-        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+    // Design: a DEDICATED OS THREAD, not a `tokio::spawn`ed task.  This is the
+    // load-bearing detail.  A tokio task only beats when the runtime gets to
+    // poll it, so ANY blocking work on the runtime — a synchronous tool call, a
+    // long `run_program`, a CPU-bound stretch — starves the keeper and the
+    // heartbeat goes stale while the coordinator is perfectly healthy.  That is
+    // exactly how live runs got stamped `failed` with
+    // "stalled: no heartbeat activity for 5+ minutes".  An OS thread is
+    // scheduled by the kernel and beats regardless of what the runtime is doing.
+    //
+    // `_heartbeat_cancel` is a drop guard held on THIS stack frame: dropping it
+    // on any return path (completion, failure, checkpoint, circuit-break) flips
+    // the flag and the thread exits at its next 250ms tick.  Best-effort — a
+    // store write error never stalls the thread.
+    let _heartbeat_cancel = store.map(|s| {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_thread = std::sync::Arc::clone(&stop);
         let store_hb = s.clone();
         let run_id_hb = run_id.to_string();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = &mut rx => break,
-                    _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
-                        let _ = store_hb.heartbeat(&run_id_hb);
-                    }
+        std::thread::spawn(move || {
+            // Short tick so cancellation is prompt; the durable WRITE still only
+            // happens once per HEARTBEAT_INTERVAL.
+            const TICK: Duration = Duration::from_millis(250);
+            let mut waited = Duration::ZERO;
+            while !stop_thread.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(TICK);
+                waited += TICK;
+                if waited >= HEARTBEAT_INTERVAL {
+                    waited = Duration::ZERO;
+                    let _ = store_hb.heartbeat(&run_id_hb);
                 }
             }
         });
-        Some(tx)
-    } else {
-        None
-    };
+        HeartbeatGuard(stop)
+    });
 
 
     // ── Pre-dispatch circuit breaker (loop guard, per the loop-exhaustion
@@ -1539,10 +1561,27 @@ fn detect_and_reap_stalled_runs(store: &CoordinatorStore, digest: bool) -> usize
     let now = now_unix_secs();
     let mins = STALL_AFTER.as_secs() / 60;
 
+    // Hard evidence beats circumstantial evidence: a stale heartbeat only says
+    // "nobody stamped the row lately", which a starved keeper thread, a paused
+    // machine, or a wedged SQLite write can all produce on a perfectly healthy
+    // run. A LIVE pid says "this coordinator still exists" — so a run whose
+    // registered process is alive is never reaped, however old its beat. Runs
+    // with no registry row (pre-TASK-289 rows) keep the old heartbeat-only
+    // behaviour, since there is no better signal available for them.
+    let live_pids: std::collections::HashMap<String, i64> = store
+        .get_live_runs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.coord_id, r.pid))
+        .collect();
+
     let mut stalled_reaped = 0usize;
     for row in rows {
         if !is_stalled_row(&row.phase, row.heartbeat_at.as_deref(), now) {
             continue;
+        }
+        if live_pids.get(&row.run_id).is_some_and(|&pid| pid_is_alive(pid)) {
+            continue; // process still alive — stale beat, not a dead run
         }
         let short_id = crate::batch::short_id(&row.run_id);
         let reason = format!("stalled: no heartbeat activity for {mins}+ minutes");
@@ -1858,6 +1897,45 @@ mod tests {
     }
 
     use super::*;
+
+    /// A stale heartbeat is CIRCUMSTANTIAL; a live pid is HARD evidence.
+    /// A run whose registered process is still alive must never be reaped —
+    /// that is the class of false positive that stamped healthy live runs
+    /// `failed` with "stalled: no heartbeat activity for 5+ minutes".
+    #[test]
+    fn stall_reap_spares_runs_whose_process_is_still_alive() {
+        let path =
+            std::env::temp_dir().join(format!("aish_stallpid_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+
+        // Two identically-stale rows. Only one has a live process behind it.
+        store.insert("run_alive", "long build", "s", None).unwrap();
+        store.insert("run_dead", "abandoned", "s", None).unwrap();
+        store
+            .register_run(
+                "run_alive",
+                1,
+                i64::from(std::process::id()),
+                None,
+                "coordinating",
+                None,
+            )
+            .unwrap();
+
+        store.backdate_heartbeat_for_test("run_alive", 30);
+        store.backdate_heartbeat_for_test("run_dead", 30);
+
+        assert_eq!(detect_and_reap_stalled_runs(&store, false), 1);
+
+        let rows = store.load_all().unwrap();
+        let phase = |id: &str| rows.iter().find(|r| r.run_id == id).unwrap().phase.clone();
+        assert_eq!(phase("run_alive"), "coordinating", "live pid vetoes the reap");
+        assert_eq!(phase("run_dead"), "failed", "no live process → reaped");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
 
     #[test]
     fn phase0_guard_directs_existence_check_before_build() {

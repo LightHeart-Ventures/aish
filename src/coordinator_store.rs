@@ -438,26 +438,6 @@ impl CoordinatorStore {
         Ok(())
     }
 
-    /// Detect and mark stalled runs (non-terminal phase + heartbeat > 5 minutes old)
-    /// as failed. Called automatically by `load_all()` to proactively clean up
-    /// hung coordinators without requiring an aish restart.
-    fn cleanup_stalled_runs(&self) -> Result<()> {
-        const STALL_THRESHOLD_SECS: i64 = 5 * 60;
-        
-        let conn = self.conn.lock().unwrap();
-        // Mark any active phase with stale heartbeat as failed.
-        // Includes 'checkpoint' phase (TASK-330: resumable-pause coordinator)
-        // in addition to 'coordinating' and 'awaiting_batch'.
-        conn.execute(
-            "UPDATE coordinator_runs 
-             SET phase = 'failed', error = 'stalled: no heartbeat activity for 5+ minutes'
-             WHERE phase IN ('coordinating', 'awaiting_batch', 'checkpoint')
-             AND (heartbeat_at IS NULL OR (strftime('%s', 'now') - strftime('%s', heartbeat_at)) > ?)",
-            [STALL_THRESHOLD_SECS],
-        )?;
-        Ok(())
-    }
-
     pub fn set_failed(&self, run_id: &str, error: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE coordinator_runs \
@@ -528,12 +508,16 @@ impl CoordinatorStore {
     }
 
     /// Every persisted run, oldest first — used at startup to surface completed
-    /// runs and reap orphaned ones. Automatically marks any stalled runs as failed
-    /// before returning (stall threshold: 5 minutes no heartbeat activity).
+    /// runs and reap orphaned ones.
+    ///
+    /// PURE READ (#129 follow-up): this used to call `cleanup_stalled_runs()`,
+    /// so *every* reader — `:workers`, `background_status`, the cost summary —
+    /// silently flipped live rows to `failed` as a side effect, from any
+    /// process, with no logging and no pid evidence. A read must never take an
+    /// irreversible action. Stall reaping now happens in exactly one place,
+    /// `coordinator::detect_and_reap_stalled_runs`, which applies the
+    /// fail-open `is_stalled_row` policy and requires a dead pid.
     pub fn load_all(&self) -> Result<Vec<CoordinatorRow>> {
-        // First, detect and mark any stalled runs.
-        self.cleanup_stalled_runs()?;
-        
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT run_id, task, phase, result, error, session_id, session_name, created_at, heartbeat_at, \
@@ -597,20 +581,28 @@ impl CoordinatorStore {
         Ok(rows)
     }
 
-    /// Proactively detect and mark any stalled runs (5+ min no heartbeat) as
-    /// failed. Useful for explicit cleanup; `load_all()` calls this automatically
-    /// at startup. Returns the count of stalled runs marked as failed.
+    /// Explicit, opt-in stall reap (never called from a read path). Marks
+    /// non-terminal runs whose heartbeat is older than `STALL_THRESHOLD_SECS`
+    /// as failed and returns how many were flipped.
+    ///
+    /// Policy matches `coordinator::is_stalled_row` — the two MUST agree, since
+    /// disagreeing reapers was the original bug:
+    ///   * `checkpoint` is EXCLUDED — it is a deliberate, resumable pause
+    ///     (TASK-294), not a hang; reaping it destroys the operator's pause.
+    ///   * a NULL `heartbeat_at` FAILS OPEN — "no beat recorded" is absence of
+    ///     evidence, not evidence of death. The pid-liveness orphan scan owns
+    ///     that call because it has hard evidence.
     #[allow(dead_code)]
     pub fn reap_stalled_runs(&self) -> Result<usize> {
         const STALL_THRESHOLD_SECS: i64 = 5 * 60;
-        
+
         let conn = self.conn.lock().unwrap();
-        // Mark any active phase with stale heartbeat as failed.
         conn.execute(
-            "UPDATE coordinator_runs 
+            "UPDATE coordinator_runs
              SET phase = 'failed', error = 'stalled: no heartbeat activity for 5+ minutes'
-             WHERE phase IN ('coordinating', 'awaiting_batch', 'checkpoint')
-             AND (heartbeat_at IS NULL OR (strftime('%s', 'now') - strftime('%s', heartbeat_at)) > ?)",
+             WHERE phase IN ('coordinating', 'awaiting_batch')
+             AND heartbeat_at IS NOT NULL
+             AND (strftime('%s', 'now') - strftime('%s', heartbeat_at)) > ?",
             [STALL_THRESHOLD_SECS],
         )
         .map(|count| count as usize)
@@ -902,6 +894,23 @@ impl CoordinatorStore {
         Ok(deleted)
     }
 
+    /// Test-only: push a run's heartbeat `minutes` into the past so stall
+    /// policy can be exercised without sleeping. Kept next to the real writers
+    /// so the column name stays in one place.
+    #[cfg(test)]
+    pub fn backdate_heartbeat_for_test(&self, run_id: &str, minutes: i64) {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE coordinator_runs
+                    SET heartbeat_at = datetime('now', ?2)
+                  WHERE run_id = ?1",
+                rusqlite::params![run_id, format!("-{minutes} minutes")],
+            )
+            .unwrap();
+    }
+
     /// TASK-289: register (or re-register) a live coordinator PROCESS in the
     /// `coordinator_registry`. Keyed by `coord_id`; a re-register from a
     /// resurrected process upserts the pid/batch/phase and bumps `generation`
@@ -1081,6 +1090,47 @@ mod tests {
             assert_eq!(r.run_id, format!("run_{i}"));
             assert_eq!(r.result.as_deref(), Some(format!("PR #{} done", 100 + i).as_str()));
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    // Regression (#129 follow-up): `load_all` is a PURE READ. It used to call
+    // `cleanup_stalled_runs()`, so every `:workers` / `background_status` /
+    // cost-summary call — from ANY process — flipped live rows to `failed`
+    // behind the operator's back. And `reap_stalled_runs` must agree with
+    // `coordinator::is_stalled_row`: never touch a deliberate `checkpoint`
+    // pause, and leave a freshly-beating run alone.
+    fn load_all_is_pure_and_stall_reap_respects_policy() {
+        let path = std::env::temp_dir().join(format!("aish_stall_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+
+        store.insert("run_hung", "long build", "s", None).unwrap();
+        store.insert("run_paused", "paused work", "s", None).unwrap();
+        store.insert("run_fresh", "just started", "s", None).unwrap();
+        store.set_phase("run_paused", "checkpoint").unwrap();
+
+        // Backdate two beats well past the 5-minute stall threshold. `run_fresh`
+        // keeps the beat stamped at insert.
+        store.backdate_heartbeat_for_test("run_hung", 30);
+        store.backdate_heartbeat_for_test("run_paused", 30);
+
+        // READ: nothing changes, however stale the beats look.
+        let phase_of = |rows: &[CoordinatorRow], id: &str| {
+            rows.iter().find(|r| r.run_id == id).unwrap().phase.clone()
+        };
+        let rows = store.load_all().unwrap();
+        assert_eq!(phase_of(&rows, "run_hung"), "coordinating");
+        assert_eq!(phase_of(&rows, "run_paused"), "checkpoint");
+        assert_eq!(phase_of(&rows, "run_fresh"), "coordinating");
+
+        // EXPLICIT reap: only the genuinely-stale non-terminal run is flipped.
+        assert_eq!(store.reap_stalled_runs().unwrap(), 1);
+        let rows = store.load_all().unwrap();
+        assert_eq!(phase_of(&rows, "run_hung"), "failed");
+        assert_eq!(phase_of(&rows, "run_paused"), "checkpoint"); // pause survives
+        assert_eq!(phase_of(&rows, "run_fresh"), "coordinating"); // still beating
+
         let _ = std::fs::remove_file(&path);
     }
 
