@@ -178,7 +178,10 @@ impl CoordinatorStore {
             .with_context(|| format!("can't open coordinator store at {}", path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA busy_timeout = 5000;
+             -- Several coordinators (parent + workers) write this same db
+             -- concurrently; 5s was short enough that a child's ONE terminal
+             -- write could lose the race and get reported as an orphaned row.
+             PRAGMA busy_timeout = 15000;
              PRAGMA synchronous = NORMAL;
              CREATE TABLE IF NOT EXISTS coordinator_runs (
                  run_id       TEXT PRIMARY KEY,
