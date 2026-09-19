@@ -8079,6 +8079,11 @@ async fn handle_colon(
                 // reconciled) self-heal in a long-lived session, not just at
                 // startup. Shares the startup reaper's predicate.
                 crate::coordinator::reap_orphaned_runs(store, session.session_id.as_str());
+                // ...and a live STALL reap. The orphan predicate above skips
+                // rows owned by THIS session, so a sub-coordinator killed when
+                // its parent exited (same session_id) would stay `coordinating`
+                // forever. The stall reaper has no session filter.
+                crate::coordinator::reap_stalled_runs_live(store);
                 if let Ok(rows) = store.load_all() {
                     // Sort newest-first by creation time.
                     let mut durable: Vec<&_> = rows.iter().filter(|r| {

@@ -1760,6 +1760,31 @@ pub fn reap_orphaned_runs(store: &CoordinatorStore, own_session_id: &str) -> usi
     reaped
 }
 
+/// Live STALL reap for the status-read paths (`:workers`, `background_status`),
+/// the counterpart to [`reap_orphaned_runs`].
+///
+/// The orphan reaper alone leaves a real zombie class visible: it requires the
+/// row to be owned by a DIFFERENT session (`session_id != own`) and its
+/// heartbeat to exceed `ORPHAN_STALE_AFTER` (15 min). A coordinator that fans
+/// out sub-coordinators and then exits takes its children down with it — the
+/// children's rows are left `coordinating`, and because they were stamped with
+/// the SAME `session_id` as the reader, `is_orphaned_row` skips them FOREVER, no
+/// matter how stale the heartbeat gets. Observed in the wild: four sub-workers
+/// killed ~10s after spawn when their parent exited, all four still reported
+/// `coordinating` long afterwards.
+///
+/// `detect_and_reap_stalled_runs` has no session filter and a 5-minute
+/// threshold, so it catches exactly that case — but it was only ever wired into
+/// the STARTUP path (`reattach_saved_runs`), and a long-lived interactive
+/// session never restarts. Running it on every status read closes the gap:
+/// same-session zombies self-heal in <=5 min instead of never.
+///
+/// `digest: false` — an interactive status read prints its own table, so the
+/// startup digest line would be noise here. Returns the number reaped.
+pub fn reap_stalled_runs_live(store: &CoordinatorStore) -> usize {
+    detect_and_reap_stalled_runs(store, false)
+}
+
 /// Pure core of the reap: the run-ids among `rows` that are orphans for the
 /// reading session `own`. Split out from the store I/O so the full ownership ×
 /// phase × staleness matrix is unit-testable without a live DB.
@@ -1885,6 +1910,50 @@ fn worker_store_repo_key(dir: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Regression: the zombie class the live stall reap exists for.
+    ///
+    /// A sub-coordinator torn down when its PARENT process exited keeps the
+    /// parent's `session_id`. `is_orphaned_row` skips same-session rows by
+    /// design, so no amount of staleness ever makes it an orphan — the row
+    /// would sit at `coordinating` forever on the status-read path. The stall
+    /// predicate has no session filter, so it is the one that must catch it.
+    #[test]
+    fn same_session_dead_child_is_never_orphan_but_is_stalled() {
+        let hb = "2024-01-01 00:00:00";
+        let beat = super::parse_sqlite_timestamp(hb).expect("parseable heartbeat");
+        // Ancient heartbeat, but the row belongs to the READING session.
+        assert!(
+            !super::is_orphaned_row(
+                Some("sess-1"),
+                "sess-1",
+                &super::Phase::Coordinating,
+                Some(hb)
+            ),
+            "same-session rows are excluded from the orphan reap by design"
+        );
+        // 10 minutes of silence — past STALL_AFTER (5 min).
+        assert!(
+            super::is_stalled_row("coordinating", Some(hb), beat + 10 * 60),
+            "stall reap must catch it; nothing else will"
+        );
+    }
+
+    /// The two reapers must not disagree about terminal rows: a `done`/`failed`
+    /// row is never a stall candidate, so wiring the stall reap into the live
+    /// status read cannot re-fail an already-finished run.
+    #[test]
+    fn terminal_rows_are_not_stall_candidates() {
+        let hb = "2024-01-01 00:00:00";
+        let beat = super::parse_sqlite_timestamp(hb).unwrap();
+        let ancient = beat + 10 * 60;
+        for phase in ["done", "failed"] {
+            assert!(
+                !super::is_stalled_row(phase, Some(hb), ancient),
+                "{phase} must not be reaped as stalled"
+            );
+        }
+    }
+
     #[test]
     fn heartbeat_stale_threshold_matches_display_const() {
         // Display threshold (style::fmt_heartbeat_age) mirrors the reaper's

@@ -2614,6 +2614,10 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
     // to the pre-existing in-memory-only behavior.
     let coord_rows = if let Some(store) = &session.coordinator_store {
         crate::coordinator::reap_orphaned_runs(store, session.session_id.as_str());
+        // ...plus the stall reap: orphan-reaping never touches rows owned by
+        // this session, so a sub-coordinator torn down with its parent stays
+        // `coordinating` indefinitely without this.
+        crate::coordinator::reap_stalled_runs_live(store);
         store.load_all().unwrap_or_default()
     } else {
         Vec::new()
