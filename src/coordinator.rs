@@ -1860,8 +1860,17 @@ fn finalize_worker_store(run_id: &str, status: &str, result: Option<&str>) {
 /// muddies resume/reporting). Routed through [`CoordinatorStore::finish_run`],
 /// the phase, result/error, heartbeat, and metrics commit as a unit — a re-read
 /// after a rolled-back mid-write sees the prior resumable row intact.
-/// Best-effort: a store error is swallowed so persistence can never sink a
-/// completing run (the same contract the two calls it replaces had).
+/// Never sinks a completing run: a store error can't propagate out. But it is
+/// no longer SILENT. The terminal write is the single point where a child hands
+/// its outcome to the parent, and dropping it on the floor is exactly what
+/// produces the parent-side
+/// `reconciled orphaned coordinator row <id> (child exited without finalizing
+/// its status)` notice — the child DID finish, its one durable write just lost a
+/// race (typically `SQLITE_BUSY` from a sibling coordinator holding the write
+/// lock) and nobody noticed. So we retry with exponential backoff
+/// ([`TERMINAL_PERSIST_ATTEMPTS`] attempts starting at
+/// [`TERMINAL_PERSIST_BACKOFF_MS`] ms), and if every attempt fails we say so on
+/// stderr instead of exiting quietly and letting the parent guess.
 fn persist_terminal(
     store: Option<&CoordinatorStore>,
     run_id: &str,
@@ -1870,15 +1879,52 @@ fn persist_terminal(
     error: Option<&str>,
     session: &Session,
 ) {
-    if let Some(s) = store {
-        let metrics = crate::coordinator_store::RunMetrics {
-            tokens_in: session.tokens_in as u64,
-            tokens_out: session.tokens_out as u64,
-            turns: session.turns_total as u64,
-            tool_calls: session.tool_calls_total as u64,
-        };
-        let _ = s.finish_run(run_id, phase.as_str(), result, error, metrics);
+    let Some(s) = store else { return };
+    let metrics = crate::coordinator_store::RunMetrics {
+        tokens_in: session.tokens_in as u64,
+        tokens_out: session.tokens_out as u64,
+        turns: session.turns_total as u64,
+        tool_calls: session.tool_calls_total as u64,
+    };
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=TERMINAL_PERSIST_ATTEMPTS {
+        match s.finish_run(run_id, phase.as_str(), result, error, metrics) {
+            Ok(()) => return,
+            Err(e) => {
+                last_err = Some(e.to_string());
+                if attempt < TERMINAL_PERSIST_ATTEMPTS {
+                    std::thread::sleep(terminal_persist_backoff(attempt));
+                }
+            }
+        }
     }
+    if let Some(err) = last_err {
+        eprintln!(
+            "\x1b[33maish: could not persist terminal phase '{}' for {} after {} attempts: {} \
+             — the parent will reconcile this row as orphaned\x1b[0m",
+            phase.as_str(),
+            run_id,
+            TERMINAL_PERSIST_ATTEMPTS,
+            err
+        );
+    }
+}
+
+/// Attempts for the terminal-phase write before giving up (see
+/// [`persist_terminal`]). Five attempts with doubling backoff spans ~1.5s on top
+/// of SQLite's own `busy_timeout`, which comfortably outlasts the write-lock
+/// window of a sibling coordinator committing its own turn.
+const TERMINAL_PERSIST_ATTEMPTS: u32 = 5;
+
+/// First backoff step (ms) between terminal-write retries; doubles each attempt.
+const TERMINAL_PERSIST_BACKOFF_MS: u64 = 100;
+
+/// Exponential backoff for retry `attempt` (1-based) of the terminal write:
+/// 100ms, 200ms, 400ms, 800ms… Pulled out of [`persist_terminal`] so the
+/// schedule is unit-testable without a contended database.
+fn terminal_persist_backoff(attempt: u32) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(16);
+    std::time::Duration::from_millis(TERMINAL_PERSIST_BACKOFF_MS << shift)
 }
 
 /// Best-effort current git branch of `dir`, recorded in the worker `meta.json`
@@ -1910,6 +1956,18 @@ fn worker_store_repo_key(dir: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The terminal-write retry schedule doubles and stays bounded, so a child
+    /// that loses the write race to a sibling gets ~1.5s of retries before the
+    /// parent is left to reconcile its row as orphaned.
+    #[test]
+    fn terminal_persist_backoff_doubles_and_totals_over_a_second() {
+        let steps: Vec<u64> = (1..super::TERMINAL_PERSIST_ATTEMPTS)
+            .map(|a| super::terminal_persist_backoff(a).as_millis() as u64)
+            .collect();
+        assert_eq!(steps, vec![100, 200, 400, 800]);
+        assert!(steps.iter().sum::<u64>() >= 1_000);
+    }
+
     /// Regression: the zombie class the live stall reap exists for.
     ///
     /// A sub-coordinator torn down when its PARENT process exited keeps the
