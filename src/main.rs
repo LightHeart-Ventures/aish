@@ -15,6 +15,7 @@ mod diag;
 mod dispatch_stats;
 mod editor;
 mod engine;
+mod fd_shield;
 mod git;
 mod goal;
 
@@ -698,7 +699,15 @@ async fn main() -> Result<()> {
                 }
             }
             session.output_json = matches!(args.output, OutputFormat::Json);
-            return engine::run_coordinator(&backend, &mut session, prompt, &run_id).await;
+            // Broken-pipe shield. Our stdout/stderr are pipes owned by the
+            // launching parent; `setsid()` keeps us alive when that parent
+            // exits, but the pipes still break, and the next `println!` would
+            // PANIC on EPIPE and kill this coordinator mid-work. Relay through
+            // a pipe we own so writes never fail, then drain last.
+            let shield = fd_shield::engage();
+            let out = engine::run_coordinator(&backend, &mut session, prompt, &run_id).await;
+            shield.drain();
+            return out;
         }
         match engine::run_turn_with_recovery(&backend, &mut session, prompt, &mut repl::confirm_tty)
             .await
