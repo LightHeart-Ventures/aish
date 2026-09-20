@@ -1498,6 +1498,19 @@ fn scan_coordinator_registry(store: &CoordinatorStore, digest: bool) -> (usize, 
 /// signal but performs the existence + permission check: `Ok`/`EPERM` ⇒ the
 /// process exists, `ESRCH` ⇒ it does not. A non-positive pid is never a live
 /// process. Used by the TASK-289 registry scan to reap dead coordinators.
+///
+/// ZOMBIES COUNT AS DEAD. A background coordinator is spawned as a CHILD of the
+/// interactive aish process; when it exits, the kernel keeps its pid slot as a
+/// `Z (defunct)` entry until the parent `wait()`s. aish never waits on detached
+/// coordinator children, so `kill(pid, 0)` on an exited coordinator returns
+/// `Ok` — "alive" — for the entire remaining life of the session. Every reaper
+/// here is gated on this predicate (a live pid is the HARD evidence that vetoes
+/// a stale heartbeat), so a zombie child pinned its `coordinating` row forever:
+/// the worker showed as live-and-coordinating in `:workers` /
+/// `background_status` long after it had finished, and only a restart (which
+/// re-parents the zombies to init, which reaps them) cleared it. Checking the
+/// `/proc` state field demotes a defunct child to dead and lets the stall
+/// reaper do its job in a long-lived session.
 fn pid_is_alive(pid: i64) -> bool {
     if pid <= 0 {
         return false;
@@ -1505,12 +1518,38 @@ fn pid_is_alive(pid: i64) -> bool {
     // SAFETY: kill with signal 0 is the documented liveness probe; it never
     // delivers a signal, only reports existence/permission via errno.
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
+    let exists = if rc == 0 {
+        true
+    } else {
+        // rc == -1: exists only when the failure is EPERM (exists, not
+        // permitted), gone on ESRCH (no such process).
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    };
+    exists && !pid_is_zombie(pid)
+}
+
+/// True when `pid` names a process that has already exited but has not been
+/// reaped by its parent (state `Z`, "defunct"). Reads `/proc/<pid>/stat`; a
+/// missing/unreadable `/proc` (non-Linux, hidepid, racing exit) answers `false`
+/// so behaviour degrades to the plain signal-0 probe rather than declaring live
+/// processes dead.
+fn pid_is_zombie(pid: i64) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => proc_stat_is_zombie(&stat),
+        Err(_) => false,
     }
-    // rc == -1: alive only when the failure is EPERM (exists, not permitted),
-    // dead on ESRCH (no such process).
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Pure parser for a `/proc/<pid>/stat` line: is the state field `Z`?
+///
+/// Field 2 is the executable name in parentheses and MAY CONTAIN SPACES AND
+/// PARENS (`(my prog (x))`), so the state char cannot be found by splitting on
+/// whitespace — it is the first non-space character after the LAST `)`.
+fn proc_stat_is_zombie(stat: &str) -> bool {
+    match stat.rfind(')') {
+        Some(close) => stat[close + 1..].trim_start().starts_with('Z'),
+        None => false,
+    }
 }
 
 /// A non-terminal run whose heartbeat is older than this is considered STALLED.
@@ -2060,6 +2099,85 @@ mod tests {
         assert_eq!(phase("run_alive"), "coordinating", "live pid vetoes the reap");
         assert_eq!(phase("run_dead"), "failed", "no live process → reaped");
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `/proc/<pid>/stat` field 2 is `(comm)` and may contain spaces AND
+    /// parens, so the state char is the first non-space byte after the LAST
+    /// `)` — never `split_whitespace().nth(2)`.
+    #[test]
+    fn proc_stat_zombie_state_parses_past_a_nasty_comm() {
+        assert!(super::proc_stat_is_zombie("6747 (python3) Z 6635 6635 0"));
+        assert!(!super::proc_stat_is_zombie("6635 (aish) S 1896 6635 0"));
+        assert!(!super::proc_stat_is_zombie("1 (systemd) R 0 1 1"));
+        // comm with embedded spaces + parens must not shift the state field.
+        assert!(super::proc_stat_is_zombie("42 (next-server (v1)) Z 1 42 0"));
+        assert!(!super::proc_stat_is_zombie("42 (next-server (v1)) S 1 42 0"));
+        // Garbage degrades to "not a zombie" rather than panicking.
+        assert!(!super::proc_stat_is_zombie(""));
+        assert!(!super::proc_stat_is_zombie("no parens here"));
+    }
+
+    /// REGRESSION (stale `coordinating` workers): a coordinator child that has
+    /// EXITED but not been `wait()`ed stays in the process table as
+    /// `Z (defunct)`, and `kill(pid, 0)` happily reports it alive. Because a
+    /// live pid is the hard evidence that vetoes the stall reap, such a zombie
+    /// used to pin its row in `coordinating` for the rest of the session — the
+    /// "workers go stale" symptom. A defunct pid must read as DEAD so the row
+    /// gets reaped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stall_reap_treats_a_defunct_child_as_dead() {
+        // Spawn + let it exit, but deliberately do NOT wait() — that is exactly
+        // what aish does with detached coordinator children.
+        let mut child = std::process::Command::new("/bin/true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn /bin/true");
+        let zombie_pid = i64::from(child.id());
+        // Wait for the exit to land without reaping it.
+        for _ in 0..100 {
+            if super::pid_is_zombie(zombie_pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            super::pid_is_zombie(zombie_pid),
+            "child should be defunct (unreaped) by now"
+        );
+        assert!(
+            !super::pid_is_alive(zombie_pid),
+            "a defunct child must NOT count as a live process"
+        );
+
+        let path = std::env::temp_dir().join(format!("aish_zombiepid_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+        store
+            .insert("run_zombie", "finished long ago", "s", None)
+            .unwrap();
+        store
+            .register_run("run_zombie", 1, zombie_pid, None, "coordinating", None)
+            .unwrap();
+        store.backdate_heartbeat_for_test("run_zombie", 30);
+
+        assert_eq!(
+            detect_and_reap_stalled_runs(&store, false),
+            1,
+            "zombie-owned stale row must be reaped"
+        );
+        let rows = store.load_all().unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.run_id == "run_zombie")
+                .unwrap()
+                .phase,
+            "failed"
+        );
+
+        let _ = child.wait(); // clean up the zombie
         let _ = std::fs::remove_file(&path);
     }
 
