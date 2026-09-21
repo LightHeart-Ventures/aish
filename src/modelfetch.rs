@@ -11,7 +11,10 @@
 //! [`ensure_model_file`] closes that gap. It maps the selection to a real
 //! `.gguf` path under `~/.aish/models/<repo_slug>/`, downloading the weights
 //! from `hf_repo` (streamed to a `.part` then atomically renamed) when they are
-//! not already cached, handling multi-shard (`-NNNNN-of-MMMMM.gguf`) models, and
+//! not already cached. Downloads are **resumable and retried**: the `.part`
+//! survives a crash or a dropped connection and is continued via an HTTP
+//! `Range` request rather than restarted, so a half-finished 20 GB pull costs
+//! only the missing bytes. Handles multi-shard (`-NNNNN-of-MMMMM.gguf`) models, and
 //! persisting the resolved absolute path back into the selection so every later
 //! launch is a clean, download-free pin.
 //!
@@ -326,6 +329,12 @@ fn hf_token() -> Option<String> {
 fn build_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("aish/", env!("CARGO_PKG_VERSION")))
+        // Deliberately NO total-request timeout: a multi-GB GGUF legitimately
+        // streams for an hour. Bound only the parts that can hang silently —
+        // the TCP connect, and any single stalled read mid-body. A stall now
+        // surfaces as a retryable error instead of a wedged process.
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(60))
         .build()
         .context("building HTTP client for model download")
 }
@@ -348,26 +357,58 @@ async fn fetch_siblings(client: &reqwest::Client, base: &str, repo: &str) -> Res
     Ok(parse_siblings(&body))
 }
 
-/// Stream a single file to `dest`, via a `.part` temp that is atomically renamed
-/// on success, with a TTY progress line on stderr.
+/// Number of download attempts per file. `AISH_MODEL_DOWNLOAD_RETRIES` sets the
+/// number of *re*tries (default 5 → 6 attempts); `0` disables retrying.
+fn max_attempts() -> u32 {
+    std::env::var("AISH_MODEL_DOWNLOAD_RETRIES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(5)
+        .saturating_add(1)
+        .clamp(1, 21)
+}
+
+/// A failed attempt, tagged with whether another try could plausibly help.
+struct Attempt {
+    err: anyhow::Error,
+    retryable: bool,
+}
+
+fn fatal(err: anyhow::Error) -> Attempt {
+    Attempt { err, retryable: false }
+}
+
+fn transient(err: anyhow::Error) -> Attempt {
+    Attempt { err, retryable: true }
+}
+
+/// Status codes worth another attempt: rate limits, request timeouts, and any
+/// 5xx. Everything else (401/403/404/…) is a hard failure — retrying a bad
+/// token or a missing file just burns time.
+fn retryable_status(s: reqwest::StatusCode) -> bool {
+    s.is_server_error()
+        || s == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || s == reqwest::StatusCode::REQUEST_TIMEOUT
+}
+
+/// Stream a single file to `dest`, **resumably**.
+///
+/// Bytes accumulate in a sibling `<dest>.part` that survives both a failed
+/// attempt and a killed process: on re-entry the existing `.part` length is
+/// replayed as an HTTP `Range: bytes=N-` offset, so an interrupted multi-GB
+/// fetch continues where it stopped instead of starting over. The `.part` is
+/// renamed onto `dest` only once the whole body has landed, so the final path
+/// is never a truncated file.
+///
+/// Transient failures (connection reset, stalled read, short body, 5xx, 429,
+/// 408) are retried with exponential backoff; auth/not-found failures fail
+/// fast. Either way the partial bytes are left on disk for the next run.
 async fn download_file(
     client: &reqwest::Client,
     url: &str,
     dest: &Path,
     label: &str,
 ) -> Result<()> {
-    let mut req = client.get(url);
-    if let Some(tok) = hf_token() {
-        req = req.bearer_auth(tok);
-    }
-    let resp = req
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?
-        .error_for_status()
-        .with_context(|| format!("GET {url}"))?;
-
-    let total = resp.content_length();
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -377,40 +418,157 @@ async fn download_file(
     tmp.push(".part");
     let tmp = PathBuf::from(tmp);
 
-    let file = std::fs::File::create(&tmp)
-        .with_context(|| format!("creating {}", tmp.display()))?;
+    let attempts = max_attempts();
+    for attempt in 1..=attempts {
+        match download_attempt(client, url, &tmp, label).await {
+            Ok(()) => {
+                std::fs::rename(&tmp, dest)
+                    .with_context(|| format!("finalizing {}", dest.display()))?;
+                return Ok(());
+            }
+            Err(a) => {
+                if !a.retryable || attempt == attempts {
+                    return Err(a.err.context(format!(
+                        "downloading {label} (attempt {attempt}/{attempts}); \
+                         partial bytes kept at {} — re-run to resume",
+                        tmp.display()
+                    )));
+                }
+                // 1s, 2s, 4s, 8s, 16s, 32s (capped).
+                let backoff = Duration::from_secs(1u64 << (attempt - 1).min(5));
+                eprintln!(
+                    "\x1b[2m  {label}: {} — retrying in {}s (attempt {}/{attempts})\x1b[0m",
+                    a.err,
+                    backoff.as_secs(),
+                    attempt + 1
+                );
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+    unreachable!("retry loop returns on the final attempt")
+}
+
+/// One resume-aware GET into `tmp`. Returns `Ok(())` only when the body is
+/// fully on disk; otherwise reports whether the caller should retry.
+async fn download_attempt(
+    client: &reqwest::Client,
+    url: &str,
+    tmp: &Path,
+    label: &str,
+) -> std::result::Result<(), Attempt> {
+    // What a previous attempt (or a previous *process*) already wrote.
+    let have = std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
+
+    let mut req = client.get(url);
+    if let Some(tok) = hf_token() {
+        req = req.bearer_auth(tok);
+    }
+    if have > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| transient(anyhow::Error::new(e).context(format!("GET {url}"))))?;
+
+    let status = resp.status();
+
+    // Range past EOF ⇒ the `.part` already holds the entire file.
+    if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE && have > 0 {
+        eprintln!(
+            "\x1b[2m  {label}: already complete ({})\x1b[0m",
+            fmt_bytes(have)
+        );
+        return Ok(());
+    }
+    if !status.is_success() {
+        let err = anyhow!("HTTP {status} for {url}");
+        return Err(if retryable_status(status) {
+            transient(err)
+        } else {
+            fatal(err)
+        });
+    }
+
+    // A server that ignores `Range` answers 200 with the *whole* body — the
+    // partial file is then worthless and we start over from zero.
+    let resuming = have > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+    if have > 0 && !resuming {
+        eprintln!("\x1b[2m  {label}: server ignored Range; restarting from 0\x1b[0m");
+    }
+    let start = if resuming { have } else { 0 };
+
+    // `content_length` describes *this* response — the remainder when resuming.
+    let total = resp.content_length().map(|n| n + start);
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(resuming)
+        .truncate(!resuming)
+        .open(tmp)
+        .map_err(|e| fatal(anyhow::Error::new(e).context(format!("opening {}", tmp.display()))))?;
     let mut writer = std::io::BufWriter::new(file);
 
     let tty = is_stderr_tty();
-    eprintln!("\x1b[2m  downloading {label}…\x1b[0m");
+    if resuming {
+        eprintln!("\x1b[2m  resuming {label} at {}…\x1b[0m", fmt_bytes(start));
+    } else {
+        eprintln!("\x1b[2m  downloading {label}…\x1b[0m");
+    }
 
-    let mut downloaded: u64 = 0;
+    let mut downloaded = start;
     let mut last_print = Instant::now();
     let mut resp = resp;
-    while let Some(chunk) = resp.chunk().await.context("reading response body")? {
+    loop {
+        let chunk = match resp.chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) => {
+                // Flush what we have so the next attempt resumes from it.
+                let _ = writer.flush();
+                return Err(transient(
+                    anyhow::Error::new(e).context("reading response body"),
+                ));
+            }
+        };
         writer
             .write_all(chunk.as_ref())
-            .context("writing model file")?;
+            .map_err(|e| fatal(anyhow::Error::new(e).context("writing model file")))?;
         downloaded += chunk.len() as u64;
         if tty && last_print.elapsed() >= Duration::from_millis(200) {
             print_progress(downloaded, total);
             last_print = Instant::now();
         }
     }
-    writer.flush().context("flushing model file")?;
+    writer
+        .flush()
+        .map_err(|e| fatal(anyhow::Error::new(e).context("flushing model file")))?;
     drop(writer);
     if tty {
         print_progress(downloaded, total);
         eprintln!();
     }
 
-    std::fs::rename(&tmp, dest)
-        .with_context(|| format!("finalizing {}", dest.display()))?;
+    // Short body ⇒ the connection dropped mid-transfer without erroring. Keep
+    // the partial bytes and let the retry loop resume from the new offset.
+    if let Some(t) = total {
+        if downloaded < t {
+            return Err(transient(anyhow!(
+                "truncated transfer: {} of {}",
+                fmt_bytes(downloaded),
+                fmt_bytes(t)
+            )));
+        }
+    }
     Ok(())
 }
 
-/// A file counts as cached when it exists and is non-empty (a stale `.part` from
-/// an interrupted run is ignored — `file_ready` checks the final name only).
+/// A file counts as cached when it exists and is non-empty. Only the *final*
+/// name is checked: a `.part` left by an interrupted run is not "ready", but it
+/// is not discarded either — [`download_file`] resumes from it.
 fn file_ready(dest: &Path) -> bool {
     std::fs::metadata(dest).map(|m| m.len() > 0).unwrap_or(false)
 }
@@ -582,6 +740,32 @@ mod tests {
         // malformed / missing siblings → empty, never panics.
         assert!(parse_siblings("not json").is_empty());
         assert!(parse_siblings(r#"{"id":"x"}"#).is_empty());
+    }
+
+    #[test]
+    fn only_transient_statuses_are_retried() {
+        use reqwest::StatusCode;
+        // Worth another attempt.
+        for s in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::REQUEST_TIMEOUT,
+        ] {
+            assert!(retryable_status(s), "{s} should be retryable");
+        }
+        // Hard failures — retrying a bad token or a missing file just burns time.
+        for s in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::BAD_REQUEST,
+            StatusCode::RANGE_NOT_SATISFIABLE,
+        ] {
+            assert!(!retryable_status(s), "{s} should not be retryable");
+        }
     }
 
     #[test]
