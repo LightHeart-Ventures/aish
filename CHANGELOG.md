@@ -34,6 +34,14 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 - **Embedded mcpmarket skill search removed — live search now comes from the plugin**: dropped the in-process mcpmarket network search path from `skill_provider` (the `wreq`/`wreq-util` browser-impersonating HTTP client is gone from `Cargo.toml`). `:skill search` now reads the offline embedded curated index for the builtin source, while live/community search is served exclusively by the `npx-skillfish` plugin (a `provides.skill_source`). The offline index, `:skill add` (GitHub + skill.fish), and the plugin skill-source fan-out are unchanged.
 - **`npx-skills` plugin removed**: npx-skills (npm registry skill search + install) is archived. Live skill import and search is now unified under `npx-skillfish` (agentskills.io/skillfish), which is more performant and upstream-maintained. Removed `plugins/npx-skills/` from the tree; documentation updated to remove references to npm-sourced skills.
 
+## [0.48.3] - 2026-09-22
+
+### Fixed
+- **Detached background coordinators killed by `EPIPE`** (PR #825): a detached coordinator whose parent terminal went away took `SIGPIPE`/`EPIPE` on its next write and died mid-run. Detached coordinators are now shielded from broken-pipe death so background work survives the parent shell exiting.
+- **Unreaped zombie children counted as live workers** (PR #826): the coordinator's liveness check treated an unreaped zombie pid as a running child, so finished-but-unwaited workers kept stale `coordinating` rows alive forever. Zombie pids are now treated as dead.
+- **GGUF model downloads are resumable and retryable** (PR #827): an interrupted local-model fetch restarted from zero. `modelfetch` now resumes partial downloads and retries transient failures.
+
+
 ## [0.45.0] - 2025-04-18
 
 ### Added
