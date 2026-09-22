@@ -39,6 +39,15 @@ pub const FOOTER_ROWS: u16 = 3;
 /// below 4 the caller falls back to inline printing.
 pub const MIN_FOOTER_ROWS: u16 = 5;
 
+/// Hard ceiling on the DSR (`ESC[6n`) cursor-position exchange in
+/// [`query_cursor_row`]. Generous for a local pty and still imperceptible, but
+/// bounded so a terminal that never answers costs one blink, not a hung shell.
+const CURSOR_QUERY_TIMEOUT: Duration = Duration::from_millis(120);
+
+/// Byte ceiling on the same exchange, so a terminal streaming unrelated input
+/// can't grow the buffer without bound while we look for the reply.
+const CURSOR_QUERY_MAX_BYTES: usize = 256;
+
 /// Whether a scroll region is currently installed. Read by the panic hook (to
 /// decide whether it must reset margins on unwind) and by [`restore_after_clear`].
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -197,9 +206,7 @@ fn pack_size(rows: u16, cols: u16) -> u64 {
 /// `false` (nothing to refresh). Cheap: one TIOCGWINSZ ioctl + an atomic load.
 fn size_changed_since_paint() -> bool {
     match term_size() {
-        Some((rows, cols)) => {
-            pack_size(rows, cols) != LAST_PAINTED_SIZE.load(Ordering::Relaxed)
-        }
+        Some((rows, cols)) => pack_size(rows, cols) != LAST_PAINTED_SIZE.load(Ordering::Relaxed),
         None => false,
     }
 }
@@ -275,8 +282,8 @@ pub fn spawn_footer_heartbeat() {
                 {
                     continue;
                 }
-                let idle =
-                    heartbeat_now_ms().saturating_sub(LAST_FOOTER_ACTIVITY_MS.load(Ordering::Relaxed));
+                let idle = heartbeat_now_ms()
+                    .saturating_sub(LAST_FOOTER_ACTIVITY_MS.load(Ordering::Relaxed));
                 // Repaint when idle-timed-out OR the terminal was resized since
                 // the last paint. The resize case bypasses the idle gate so the
                 // footer tracks the new canvas size within one tick rather than
@@ -624,10 +631,7 @@ impl Terminal {
         self.cols = cols;
         if self.footer_enabled() {
             self.init_scroll_region();
-            let (msg, bar) = LAST_FOOTER
-                .lock()
-                .map(|l| l.clone())
-                .unwrap_or_default();
+            let (msg, bar) = LAST_FOOTER.lock().map(|l| l.clone()).unwrap_or_default();
             if !bar.is_empty() || !msg.is_empty() {
                 self.draw_footer(&msg, &bar);
             }
@@ -688,7 +692,6 @@ pub fn resync_after_wake() {
 }
 
 /// Suspend the bottom-anchored footer scroll region for the duration of a
-/// Suspend the bottom-anchored footer scroll region for the duration of a
 /// foreground child that inherits the terminal (`sudo`, `vim`, `less`, …).
 /// Resets DECSTBM to the full screen and erases the three footer rows so the
 /// child sees an ordinary terminal with no reserved bottom rows — otherwise a
@@ -730,29 +733,209 @@ pub fn suspend_footer_region() -> bool {
 /// next prompt grows up from just above the footer. Kept pure (no I/O, no shared
 /// state) so the sequence is unit-testable byte-for-byte.
 ///
-/// KNOWN LIMITATION — output-clobber on resume (root cause of the "`ls -al`
-/// loses its last few lines" report): while the child ran, the footer region
-/// was suspended to the FULL screen (see [`suspend_footer_region`]), so any
-/// output that scrolled into the bottom `FOOTER_ROWS` rows now lives there. This
-/// resume paints the footer straight over those rows, hiding the command's last
-/// lines from the viewport (they survive in native scrollback — aish never
-/// emits ESC[3J). It is NOT the off-by-one once suspected in `scroll_region_seq`:
-/// that math is correct (24 → `ESC[1;21r`, and 21 body + 3 footer = 24, pinned
-/// by `scroll_region_reserves_three_bottom_rows`).
-///
-/// The correct fix is to scroll the body UP by the overflow
-/// (`cursor_row - body_bottom`, clamped to `0..=FOOTER_ROWS`) BEFORE reclaiming
-/// the rows — but the overflow is only knowable from a DSR (ESC[6n)
-/// cursor-position query, which must run with a bounded, non-blocking read and a
-/// total fallback to this behavior so a non-conforming terminal can never hang
-/// the shell. An UNCONDITIONAL scroll-up is NOT viable: the prompt is
-/// bottom-anchored, so nearly every command (even `echo hi`) leaves the cursor
-/// in the footer zone, and a fixed scroll-up would jerk the screen up on every
-/// command and after every alt-screen app. Deferred until it can be verified
-/// against a real TTY.
+/// This is the BARE reclaim — it assumes nothing of the child's output has
+/// landed in the rows the footer is about to repaint. Callers that can measure
+/// the cursor should use [`resume_region_seq_with_cursor`], which prepends the
+/// corrective scroll-up that keeps the tail of the output visible; see
+/// [`footer_overflow_rows`] for the "`ls -al` loses its last few lines" bug this
+/// fixes.
 pub fn resume_region_seq(rows: u16) -> String {
     let body_bottom = rows.saturating_sub(FOOTER_ROWS).max(1);
     format!("{}\x1b[{body_bottom};1H", scroll_region_seq(rows))
+}
+
+/// How many rows the body must scroll UP before the footer reclaims the bottom
+/// [`FOOTER_ROWS`] rows — the fix for the output-clobber on resume.
+///
+/// THE BUG: while a foreground child ran, the footer region was suspended to
+/// the FULL screen (see [`suspend_footer_region`]), so the child's output was
+/// free to scroll into the bottom `FOOTER_ROWS` rows. Resuming used to paint the
+/// footer straight over those rows, silently eating the command's last 1..=3
+/// lines from the viewport — `ls` (one line) looked fine, `ls -al` (many lines)
+/// lost its tail. (It was NOT the off-by-one once suspected in
+/// [`scroll_region_seq`]: 24 → `ESC[1;21r`, and 21 body + 3 footer = 24, pinned
+/// by `scroll_region_reserves_three_bottom_rows`.)
+///
+/// THE FIX: lift the overflow — `cursor_row - body_bottom` — out of the footer
+/// zone first. `cursor_row` is the 1-based row the child left the cursor on
+/// (i.e. where the next prompt would print), measured with a DSR query by
+/// [`query_cursor_row`]. Scrolling by exactly that amount is position-preserving
+/// in content-space: the line under the cursor lands on `body_bottom`, so the
+/// last output line ends up at `body_bottom - 1` and nothing is repainted over.
+///
+/// The result is clamped to `0..=FOOTER_ROWS`. Zero when the cursor is already
+/// at or above the last body row — which is exactly the alt-screen case (`vim`,
+/// `less` restore the pre-launch cursor on exit), so a full-screen app never
+/// jerks the view. The upper clamp is defensive: `cursor_row <= rows` already
+/// caps the overflow at `FOOTER_ROWS`.
+///
+/// An UNCONDITIONAL scroll-up would NOT work here — the prompt is
+/// bottom-anchored, so nearly every command leaves the cursor in the footer
+/// zone and a fixed scroll would jerk the screen on every single command. The
+/// measured overflow is what makes this safe.
+pub fn footer_overflow_rows(rows: u16, cursor_row: u16) -> u16 {
+    let body_bottom = rows.saturating_sub(FOOTER_ROWS).max(1);
+    cursor_row.saturating_sub(body_bottom).min(FOOTER_ROWS)
+}
+
+/// [`resume_region_seq`] preceded by the corrective scroll-up derived from the
+/// measured cursor row (see [`footer_overflow_rows`]). `SU` (`ESC[nS`) is issued
+/// BEFORE the DECSTBM re-assert, while the region is still the full screen, so
+/// it scrolls the whole viewport and the lifted rows land in the terminal's
+/// native scrollback.
+///
+/// `cursor_row: None` — the terminal did not answer the DSR query, or querying
+/// was disabled — degrades to the exact byte sequence [`resume_region_seq`]
+/// emitted before this fix, so a non-conforming terminal is never worse off.
+/// Kept pure (no I/O, no shared state) so the choreography is unit-testable
+/// byte-for-byte.
+pub fn resume_region_seq_with_cursor(rows: u16, cursor_row: Option<u16>) -> String {
+    let scroll = match cursor_row.map(|cr| footer_overflow_rows(rows, cr)) {
+        None | Some(0) => String::new(),
+        Some(n) => format!("\x1b[{n}S"),
+    };
+    format!("{scroll}{}", resume_region_seq(rows))
+}
+
+/// Parse a DSR cursor-position reply — `ESC [ row ; col R` — out of a raw read
+/// buffer, returning the 1-based `(row, col)`.
+///
+/// Tolerant by design: the reply is scanned for anywhere in the buffer (a
+/// keystroke the operator typed in the instant between the child exiting and the
+/// query landing shares the same input stream), the `ESC [ ? … R` extended form
+/// some terminals answer with is accepted, and when several complete replies are
+/// present the LAST one wins (freshest position). Returns `None` for a buffer
+/// with no complete reply, which the caller treats as "terminal didn't answer".
+fn parse_dsr_reply(buf: &[u8]) -> Option<(u16, u16)> {
+    let digits_end = |from: usize| {
+        let mut k = from;
+        while buf.get(k).is_some_and(u8::is_ascii_digit) {
+            k += 1;
+        }
+        k
+    };
+    let mut found = None;
+    let mut i = 0usize;
+    while i + 1 < buf.len() {
+        if buf[i] != 0x1b || buf[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+        // Optional private-parameter marker in the extended reply form.
+        let row_start = i + 2 + usize::from(buf.get(i + 2) == Some(&b'?'));
+        let row_end = digits_end(row_start);
+        if row_end == row_start || buf.get(row_end) != Some(&b';') {
+            i += 1;
+            continue;
+        }
+        let col_start = row_end + 1;
+        let col_end = digits_end(col_start);
+        if col_end == col_start || buf.get(col_end) != Some(&b'R') {
+            i += 1;
+            continue;
+        }
+        let num = |r: std::ops::Range<usize>| {
+            std::str::from_utf8(&buf[r])
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok())
+        };
+        if let (Some(row), Some(col)) = (num(row_start..row_end), num(col_start..col_end)) {
+            found = Some((row, col));
+        }
+        i = col_end + 1;
+    }
+    found
+}
+
+/// Ask the terminal where the cursor is (DSR, `ESC[6n`) and return the 1-based
+/// row. Used by [`resume_footer_region`] to size the corrective scroll-up.
+///
+/// SAFETY RAILS — this runs on every foreground-command exit, so it must never
+/// hang the shell and must never leave the tty in a strange mode:
+/// * hard-bounded: at most [`CURSOR_QUERY_TIMEOUT`] of `poll(2)` across the
+///   whole exchange, and at most [`CURSOR_QUERY_MAX_BYTES`] consumed;
+/// * `None` on ANY doubt (not a tty, `tcgetattr`/`tcsetattr` failure, write
+///   failure, timeout, EOF, unparseable reply) — the caller then emits the
+///   pre-fix sequence, so a terminal that ignores DSR simply keeps the old
+///   behavior;
+/// * termios is snapshotted and restored on every exit path (the query needs
+///   `ICANON`/`ECHO` off so the reply isn't line-buffered or echoed as visible
+///   garbage);
+/// * opt-out via `AISH_NO_CURSOR_QUERY=1` for anyone on a terminal where the
+///   probe misbehaves.
+///
+/// Known tradeoff: bytes that arrive ahead of the reply are consumed with it.
+/// The window is the few hundred microseconds between the child being reaped and
+/// the probe, so type-ahead loss is a theoretical rather than practical concern —
+/// and it is the same tradeoff every shell that probes the cursor makes.
+fn query_cursor_row() -> Option<u16> {
+    if std::env::var_os("AISH_NO_CURSOR_QUERY").is_some() {
+        return None;
+    }
+    // SAFETY: plain isatty queries on the shell's own stdin/stdout.
+    if unsafe { libc::isatty(0) } != 1 || unsafe { libc::isatty(1) } != 1 {
+        return None;
+    }
+    // SAFETY: termios is POD; tcgetattr fills it or reports failure.
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(0, &mut saved) } != 0 {
+        return None;
+    }
+    let mut raw = saved;
+    raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+    raw.c_cc[libc::VMIN] = 0;
+    raw.c_cc[libc::VTIME] = 0;
+    // SAFETY: applying a minimally-modified copy of the attributes just read.
+    if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
+        return None;
+    }
+
+    let answer = read_dsr_reply();
+
+    // SAFETY: restoring the exact attributes captured above, on every path.
+    unsafe { libc::tcsetattr(0, libc::TCSANOW, &saved) };
+    answer.map(|(row, _col)| row)
+}
+
+/// Write `ESC[6n` and read back the reply under the bounds documented on
+/// [`query_cursor_row`]. Split out so the caller owns termios save/restore and
+/// this body can return early freely.
+fn read_dsr_reply() -> Option<(u16, u16)> {
+    let mut out = std::io::stdout();
+    write!(out, "\x1b[6n").ok()?;
+    out.flush().ok()?;
+
+    let deadline = Instant::now() + CURSOR_QUERY_TIMEOUT;
+    let mut buf: Vec<u8> = Vec::with_capacity(32);
+    let mut chunk = [0u8; 32];
+    loop {
+        if let Some(rc) = parse_dsr_reply(&buf) {
+            return Some(rc);
+        }
+        if buf.len() >= CURSOR_QUERY_MAX_BYTES {
+            return None;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        let mut pfd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = left.as_millis().min(i32::MAX as u128) as libc::c_int;
+        // SAFETY: single-entry pollfd array on the shell's stdin, bounded wait.
+        if unsafe { libc::poll(&mut pfd, 1, ms) } <= 0 {
+            return None; // timeout, EINTR or error → fall back to the old path
+        }
+        // SAFETY: read into a stack buffer of exactly `chunk.len()` bytes.
+        let n = unsafe { libc::read(0, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n <= 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n as usize]);
+    }
 }
 
 /// Re-establish the footer scroll region and repaint the cached footer after a
@@ -760,9 +943,13 @@ pub fn resume_region_seq(rows: u16) -> String {
 /// [`suspend_footer_region`]. Homes the cursor into the last body row so the
 /// next prompt grows up from just above the footer (mirrors
 /// [`Terminal::init_scroll_region`]). No-op when the terminal is now too short
-/// to host the footer (e.g. it was resized smaller while the child ran). See
-/// [`resume_region_seq`] for the choreography and the known output-clobber
-/// limitation.
+/// to host the footer (e.g. it was resized smaller while the child ran).
+///
+/// Before reclaiming the rows it measures where the child left the cursor
+/// ([`query_cursor_row`]) and scrolls any output that spilled into the footer
+/// zone clear of it — see [`footer_overflow_rows`] for the choreography and the
+/// output-clobber bug it fixes. The measurement happens BEFORE the first byte of
+/// the resume sequence is written, while the region is still full-screen.
 pub fn resume_footer_region() {
     let Some((rows, _cols)) = term_size() else {
         return;
@@ -770,12 +957,20 @@ pub fn resume_footer_region() {
     if rows < MIN_FOOTER_ROWS {
         return;
     }
-    // Re-assert the region + home into the last body row, and re-suppress
-    // alternate-scroll alongside it (cursor-neutral: `suppress_alt_scroll_seq`
-    // only toggles private mode 1007, so its position relative to the home move
-    // is immaterial; it also returns "" after the first suppression so the saved
-    // original setting is preserved).
-    let seq = format!("{}{}", resume_region_seq(rows), suppress_alt_scroll_seq());
+    // Measure first: how far did the child's output run into the rows the
+    // footer is about to repaint? `None` (terminal ignored the DSR query, or it
+    // was disabled) degrades to the pre-fix behavior.
+    let cursor_row = query_cursor_row();
+    // Scroll the overflow clear, re-assert the region + home into the last body
+    // row, and re-suppress alternate-scroll alongside it (cursor-neutral:
+    // `suppress_alt_scroll_seq` only toggles private mode 1007, so its position
+    // relative to the home move is immaterial; it also returns "" after the
+    // first suppression so the saved original setting is preserved).
+    let seq = format!(
+        "{}{}",
+        resume_region_seq_with_cursor(rows, cursor_row),
+        suppress_alt_scroll_seq()
+    );
     let mut out = std::io::stdout();
     let _ = write!(out, "{seq}");
     let _ = out.flush();
@@ -784,7 +979,6 @@ pub fn resume_footer_region() {
     // its paint in DECSC/DECRC).
     paint_cached_footer(false);
 }
-
 
 /// Re-anchor the cursor into the bottom of the body after a screen wipe / buffer
 /// switch: footer mode re-asserts the region + repaints the footer (which homes
@@ -1003,6 +1197,100 @@ mod tests {
     }
 
     #[test]
+    fn dsr_reply_parses_row_and_column() {
+        // The canonical answer to ESC[6n: ESC [ row ; col R, 1-based.
+        assert_eq!(parse_dsr_reply(b"\x1b[12;34R"), Some((12, 34)));
+        assert_eq!(parse_dsr_reply(b"\x1b[1;1R"), Some((1, 1)));
+        // The extended `ESC [ ? … R` form some terminals answer with.
+        assert_eq!(parse_dsr_reply(b"\x1b[?24;80R"), Some((24, 80)));
+    }
+
+    #[test]
+    fn dsr_reply_survives_interleaved_input() {
+        // A keystroke that landed in the same read as the reply must not
+        // defeat the parse — the reply is found anywhere in the buffer.
+        assert_eq!(parse_dsr_reply(b"q\x1b[12;34R"), Some((12, 34)));
+        assert_eq!(parse_dsr_reply(b"\x1b[12;34Rq"), Some((12, 34)));
+        // Several replies → the freshest (last complete) position wins.
+        assert_eq!(parse_dsr_reply(b"\x1b[1;1R\x1b[9;5R"), Some((9, 5)));
+    }
+
+    #[test]
+    fn dsr_reply_rejects_incomplete_or_absent() {
+        // Nothing usable → None, which the caller reads as "terminal didn't
+        // answer" and falls back to the pre-fix resume sequence.
+        assert_eq!(parse_dsr_reply(b""), None);
+        assert_eq!(parse_dsr_reply(b"hello"), None);
+        assert_eq!(parse_dsr_reply(b"\x1b[12;34"), None); // truncated: no final R
+        assert_eq!(parse_dsr_reply(b"\x1b[12R"), None); // no ; col
+        assert_eq!(parse_dsr_reply(b"\x1b[;34R"), None); // empty row
+        assert_eq!(parse_dsr_reply(b"\x1b[12;R"), None); // empty col
+    }
+
+    #[test]
+    fn footer_overflow_is_zero_above_the_body_floor() {
+        // 24-row terminal → body is rows 1..=21. A cursor at or above the last
+        // body row needs no scroll: nothing of the output is sitting in the
+        // rows the footer is about to reclaim. This is the alt-screen case —
+        // vim/less restore the pre-launch cursor, so leaving them never jerks
+        // the viewport.
+        assert_eq!(footer_overflow_rows(24, 21), 0);
+        assert_eq!(footer_overflow_rows(24, 10), 0);
+        assert_eq!(footer_overflow_rows(24, 1), 0);
+    }
+
+    #[test]
+    fn footer_overflow_measures_rows_spilled_into_the_footer() {
+        // THE BUG, in numbers: `ls -al` on a 24-row terminal left the cursor at
+        // row 24 while the region was suspended, so 3 rows of output sat under
+        // the footer and got painted over. Lift exactly that many.
+        assert_eq!(footer_overflow_rows(24, 22), 1);
+        assert_eq!(footer_overflow_rows(24, 23), 2);
+        assert_eq!(footer_overflow_rows(24, 24), 3);
+        // Never more than the footer's own height — that is all it can hide.
+        assert_eq!(footer_overflow_rows(24, 99), FOOTER_ROWS);
+        // Tiny terminals reuse the `.max(1)` body floor from scroll_region_seq,
+        // so the two never disagree about where the body ends.
+        assert_eq!(footer_overflow_rows(3, 3), 2);
+    }
+
+    #[test]
+    fn resume_lifts_overflow_before_reclaiming_the_rows() {
+        // Order is load-bearing: SU (ESC[nS) must come BEFORE the DECSTBM
+        // re-assert, while the region is still full-screen, so the whole
+        // viewport scrolls and the lifted rows reach native scrollback.
+        let seq = resume_region_seq_with_cursor(24, Some(24));
+        assert_eq!(seq, "\x1b[3S\x1b[1;21r\x1b[21;1H");
+        assert!(seq.find("\x1b[3S").unwrap() < seq.find("\x1b[1;21r").unwrap());
+
+        // One spilled row scrolls one row.
+        assert_eq!(
+            resume_region_seq_with_cursor(24, Some(22)),
+            "\x1b[1S\x1b[1;21r\x1b[21;1H"
+        );
+    }
+
+    #[test]
+    fn resume_without_a_cursor_answer_matches_pre_fix_bytes() {
+        // Terminal ignored the DSR query (or AISH_NO_CURSOR_QUERY is set):
+        // emit exactly what shipped before this fix, byte for byte. A
+        // non-conforming terminal is never made worse.
+        assert_eq!(
+            resume_region_seq_with_cursor(24, None),
+            resume_region_seq(24)
+        );
+        assert_eq!(
+            resume_region_seq_with_cursor(24, None),
+            "\x1b[1;21r\x1b[21;1H"
+        );
+        // Cursor already clear of the footer zone → also no scroll emitted.
+        assert_eq!(
+            resume_region_seq_with_cursor(24, Some(21)),
+            resume_region_seq(24)
+        );
+    }
+
+    #[test]
     fn bottom_home_targets_last_row() {
         // Anchors the inline-mode attach view to the bottom row (col 1).
         assert_eq!(bottom_home_seq(50), "\x1b[50;1H");
@@ -1127,7 +1415,9 @@ mod tests {
 
     #[test]
     fn resync_after_wake_resets_idle_timer_when_inactive() {
-        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = FOOTER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // No footer region installed in the test harness (ACTIVE stays false),
         // so resync_after_wake takes the no-op-but-rearm branch: it must still
         // reset the idle timer so a post-suspend heartbeat waits a clean
@@ -1145,7 +1435,9 @@ mod tests {
 
     #[test]
     fn set_reading_line_toggles_and_arms_timer() {
-        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = FOOTER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Entering a read marks the idle-at-prompt window AND refreshes the
         // timer (so the first heartbeat waits a full interval at a new prompt).
         set_reading_line(true);
@@ -1161,7 +1453,9 @@ mod tests {
 
     #[test]
     fn input_dirty_flag_round_trips_and_read_clears_it() {
-        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = FOOTER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // A non-empty in-progress line sets the dirty flag; the heartbeat reads
         // it and backs off (verified indirectly — the gate is a plain load).
         set_input_dirty(true);
@@ -1176,7 +1470,9 @@ mod tests {
     #[test]
     fn midturn_empty_text_surfaces_bare_prompt_then_clears() {
         // Serialize against sibling tests that mutate footer-state globals.
-        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = FOOTER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Turn-start priming: set_midturn_input with EMPTY text must surface the
         // bare prompt affordance (so the operator SEES a prompt to type into
         // during thinking / tool-calls), overriding the cached status message.
@@ -1212,7 +1508,9 @@ mod tests {
     fn midturn_inline_seq_draws_bare_prompt_then_line() {
         // Serialize against sibling tests that mutate footer-state globals
         // (this test calls clear_midturn_input at the end).
-        let _g = FOOTER_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = FOOTER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Gate #1 (short / non-footer terminals): the inline affordance must
         // carriage-return to col 0, erase the row, then paint the prompt sigil.
         let prompt = "\x1b[2m❯\x1b[0m ";
@@ -1275,6 +1573,9 @@ mod tests {
         // A stored size equal to the probe ⇒ unchanged; a different one ⇒ changed.
         LAST_PAINTED_SIZE.store(pack_size(24, 80), Ordering::Relaxed);
         assert_eq!(pack_size(24, 80), LAST_PAINTED_SIZE.load(Ordering::Relaxed));
-        assert_ne!(pack_size(30, 100), LAST_PAINTED_SIZE.load(Ordering::Relaxed));
+        assert_ne!(
+            pack_size(30, 100),
+            LAST_PAINTED_SIZE.load(Ordering::Relaxed)
+        );
     }
 }
