@@ -420,14 +420,18 @@ pub const HEARTBEAT_STALE_AFTER_SECS: i64 = 15 * 60;
 /// `:workers`. `heartbeat_at` is the SQLite UTC string; `terminal` is true for
 /// done/failed/checkpoint rows (which have no live beat). `now` is epoch secs.
 /// Returns:
-///   * `—`            — terminal row, or a missing/unparseable beat
+///   * `—`            — missing/unparseable beat (nothing is known)
+///   * `· 22m`        — terminal row: how long ago it last beat (i.e. finished)
 ///   * `♥ 12s`/`♥ 4m` — alive: age since last beat, under the stale threshold
 ///   * `⚠ 22m`        — stale: beat older than `HEARTBEAT_STALE_AFTER_SECS`
+///
+/// Terminal rows used to render a flat `—`, which made the Beat column a second
+/// echo of the phase column rather than independent evidence — an empty beat
+/// next to a `done` phase reads as two sources agreeing when it is really one
+/// fact printed twice. Showing the real age keeps the column informative
+/// ("finished 22m ago") and keeps `—` meaning exactly one thing: no data.
 /// Pure — unit-tested, no chrono.
 pub fn fmt_heartbeat_age(heartbeat_at: Option<&str>, terminal: bool, now: i64) -> String {
-    if terminal {
-        return "—".to_string();
-    }
     let Some(beat) = heartbeat_at.and_then(parse_sqlite_utc) else {
         return "—".to_string();
     };
@@ -445,7 +449,10 @@ pub fn fmt_heartbeat_age(heartbeat_at: Option<&str>, terminal: bool, now: i64) -
     } else {
         format!("{}d", age / DAY)
     };
-    if age > HEARTBEAT_STALE_AFTER_SECS {
+    if terminal {
+        // Finished: no liveness claim, just "last beat was N ago".
+        format!("· {label}")
+    } else if age > HEARTBEAT_STALE_AFTER_SECS {
         format!("⚠ {label}")
     } else {
         format!("♥ {label}")
@@ -658,7 +665,13 @@ mod tests {
         assert_eq!(fmt_heartbeat_age(Some(beat), false, base + 20 * 60), "⚠ 20m");
         assert_eq!(fmt_heartbeat_age(Some(beat), false, base + 3 * 3600), "⚠ 3h");
         // Terminal rows, missing/unparseable beats, and clock skew degrade safely.
-        assert_eq!(fmt_heartbeat_age(Some(beat), true, base + 20 * 60), "—");
+        // Terminal rows report the real age of their last beat ("finished 20m
+        // ago"), NOT a blank. A blank made the Beat column silently re-state
+        // the phase column, manufacturing fake corroboration for a stale row.
+        assert_eq!(fmt_heartbeat_age(Some(beat), true, base + 20 * 60), "· 20m");
+        assert_eq!(fmt_heartbeat_age(Some(beat), true, base + 30), "· 30s");
+        // `—` now means exactly one thing: no beat data at all.
+        assert_eq!(fmt_heartbeat_age(None, true, base), "—");
         assert_eq!(fmt_heartbeat_age(None, false, base), "—");
         assert_eq!(fmt_heartbeat_age(Some("not-a-date"), false, base), "—");
         assert_eq!(fmt_heartbeat_age(Some(beat), false, base - 100), "♥ 0s");
