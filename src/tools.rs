@@ -2537,6 +2537,43 @@ interactive session has no parent console to message".into());
     Ok("delivered to the operator's console".into())
 }
 
+/// Which source represents a worker in the status table when the in-memory
+/// handle and the durable row disagree.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum WorkerRowSource {
+    /// Print from the in-memory handle. `supersede` marks the durable row under
+    /// the same visible id as a finished PRIOR thread, to be dropped from the
+    /// durable pass so one id never prints two contradicting lines.
+    Memory { supersede: bool },
+    /// Print the richer durable row (beat/since/telemetry/result) and skip the
+    /// sparse in-memory line — the two agree, so nothing is lost.
+    Durable,
+}
+
+/// Reconcile a live/terminal in-memory worker against the durable row filed
+/// under its VISIBLE id.
+///
+/// Liveness is the one fact the store CANNOT know: the visible id belongs to
+/// thread 1, and every in-place resume mints a fresh run id, so after a resume
+/// the visible id's row is frozen at thread 1's terminal `done` while the
+/// process runs on. Trusting "richer = truer" there reports `done` for a live
+/// run — with a real token count and a dead heartbeat that look like
+/// corroboration but are just the same stale row rendered twice.
+pub(crate) fn reconcile_worker_row(live: bool, durable_phase: Option<&str>) -> WorkerRowSource {
+    let Some(phase) = durable_phase else {
+        // No durable row yet (child hasn't written its first `coordinating`) —
+        // memory is all there is.
+        return WorkerRowSource::Memory { supersede: false };
+    };
+    let terminal = matches!(phase, "done" | "failed");
+    if live && terminal {
+        // The contradiction. The process handle wins; the stale row is dropped.
+        WorkerRowSource::Memory { supersede: true }
+    } else {
+        WorkerRowSource::Durable
+    }
+}
+
 fn background_status(call: &ToolCall, session: &Session) -> Result<String> {
     use crate::scope::{JobRef, JobScope};
 
@@ -2622,8 +2659,10 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
     } else {
         Vec::new()
     };
-    let durable_ids: std::collections::HashSet<&str> =
-        coord_rows.iter().map(|r| r.run_id.as_str()).collect();
+    // Visible ids whose durable row is a SUPERSEDED terminal record (the worker
+    // is live on a later thread). Populated by the in-memory loop below and
+    // honored by the durable loop so the stale `done` never reaches the table.
+    let mut superseded: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // This session's full-tool background coordinators (in memory; the live
     // subprocess handle is session-local even though its durable row is shared).
@@ -2638,19 +2677,73 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
         if !scope.matches(&jref, me) {
             continue;
         }
-        // De-dupe: if this coordinator also has a durable row, skip the sparse
-        // in-memory line and let the richer store row (beat/since/telemetry/
-        // result) below represent it. Only shown here during the brief window
-        // before the child writes its first `coordinating` row.
-        if durable_ids.contains(w.id.as_str()) {
-            continue;
+        // ── Liveness beats the durable snapshot. ─────────────────────────────
+        // A worker's VISIBLE id is its FIRST thread's coordinator run id. Every
+        // in-place resume (`worker::resume_in_place`) mints a FRESH run id for
+        // the new thread, so the durable row filed under the visible id stays
+        // frozen at the PREVIOUS thread's terminal `done` — real token counts,
+        // dead heartbeat — while the worker itself is very much alive.
+        //
+        // Preferring the store row because it's "richer" printed that stale
+        // `done` and discarded the one handle that KNOWS the process is
+        // running. Worse, it looked corroborated: a terminal token count and an
+        // em-dashed Beat are not two independent signals, they are two renders
+        // of the same stale row. Reproducible, so it read as "consistent".
+        //
+        // Rule: the in-memory handle is AUTHORITATIVE FOR LIVENESS. A live
+        // worker is listed from memory, and the superseded terminal row under
+        // the same id is suppressed below so one id never prints two
+        // contradicting rows. Where they agree, nothing changes: the richer
+        // durable row still wins.
+        let live = !w.is_terminal();
+        let visible_phase = coord_rows
+            .iter()
+            .find(|r| r.run_id == w.id)
+            .map(|r| r.phase.as_str());
+        match reconcile_worker_row(live, visible_phase) {
+            // No disagreement (or the worker really is finished) → let the
+            // richer store row (beat/since/telemetry/result) represent it.
+            WorkerRowSource::Durable => continue,
+            WorkerRowSource::Memory { supersede } => {
+                if supersede {
+                    superseded.insert(w.id.clone());
+                }
+            }
         }
         any = true;
+        // Resolve the beat through the CURRENT thread's row, not the visible id
+        // — that's the whole point of `WorkerJob::run_id()`.
+        let thread_row = {
+            let rid = w.run_id();
+            coord_rows.iter().find(|r| r.run_id == rid)
+        };
+        let beat = thread_row
+            .map(|r| {
+                crate::style::fmt_heartbeat_age(
+                    r.heartbeat_at.as_deref(),
+                    matches!(r.phase.as_str(), "done" | "failed" | "checkpoint"),
+                    now_epoch,
+                )
+            })
+            .unwrap_or_else(|| "—".into());
+        let since = thread_row
+            .and_then(|r| r.created_at.clone())
+            .unwrap_or_else(|| "—".into());
+        // Surface the thread number when this worker has been resumed, so a
+        // reader can see why the id's first durable row says something else.
+        let threads = w.thread_count();
+        let status_cell = if threads > 1 {
+            format!("{} · thread {}", w.status(), threads)
+        } else {
+            w.status()
+        };
         full_tasks.push((crate::batch::short_id(&w.id).to_string(), w.task.clone()));
         out.push_str(&format!(
-            "| `{}` | coordinator | you | {} | — | — | {} | — |\n",
+            "| `{}` | coordinator | you | {} | {} | {} | {} | — |\n",
             crate::batch::short_id(&w.id),
-            w.status(),
+            status_cell,
+            beat,
+            since,
             trunc(&w.task)
         ));
     }
@@ -2666,6 +2759,14 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
                     id: &r.run_id,
                 };
                 if !scope.matches(&jref, me) {
+                    continue;
+                }
+                // Superseded by a live in-memory worker on a later thread: this
+                // row is a finished PRIOR thread, and printing it would put a
+                // second, contradicting line under an id the table already
+                // showed as running. The prior thread's result is still
+                // reachable via `job_output`.
+                if superseded.contains(r.run_id.as_str()) {
                     continue;
                 }
                 any = true;
@@ -4571,6 +4672,63 @@ fn char_ceil(s: &str, mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE regression: `background_status` reported `done` for a LIVE worker,
+    /// twice, consistently, with a terminal token count and an empty heartbeat.
+    /// Root cause: the visible worker id is thread 1's coordinator run id, and
+    /// an in-place resume mints a fresh run id for the new thread — so the row
+    /// under the visible id is frozen at thread 1's terminal `done` while the
+    /// worker runs on. The table preferred that row because it was "richer".
+    #[test]
+    fn live_worker_beats_a_stale_terminal_durable_row() {
+        for phase in ["done", "failed"] {
+            assert_eq!(
+                reconcile_worker_row(true, Some(phase)),
+                WorkerRowSource::Memory { supersede: true },
+                "a live worker must never be rendered from a {phase} row"
+            );
+        }
+    }
+
+    /// The narrow fix must not become a broad one: where the two sources AGREE,
+    /// the durable row still wins, keeping beat/since/telemetry/result.
+    #[test]
+    fn durable_row_still_wins_when_the_two_agree() {
+        // Worker finished, row finished → richer row.
+        assert_eq!(
+            reconcile_worker_row(false, Some("done")),
+            WorkerRowSource::Durable
+        );
+        assert_eq!(
+            reconcile_worker_row(false, Some("failed")),
+            WorkerRowSource::Durable
+        );
+        // Worker live, row live → richer row (the ordinary thread-1 case).
+        assert_eq!(
+            reconcile_worker_row(true, Some("coordinating")),
+            WorkerRowSource::Durable
+        );
+        // A checkpoint is a resumable pause, not a terminal claim — a live
+        // worker sitting on one is consistent, so no supersede.
+        assert_eq!(
+            reconcile_worker_row(true, Some("checkpoint")),
+            WorkerRowSource::Durable
+        );
+    }
+
+    /// Before the child writes its first row there is nothing to reconcile
+    /// against — memory is the only source, and nothing is superseded.
+    #[test]
+    fn missing_durable_row_falls_back_to_memory_without_superseding() {
+        assert_eq!(
+            reconcile_worker_row(true, None),
+            WorkerRowSource::Memory { supersede: false }
+        );
+        assert_eq!(
+            reconcile_worker_row(false, None),
+            WorkerRowSource::Memory { supersede: false }
+        );
+    }
 
     #[test]
     fn dup_guard_exact_and_normalized_match() {

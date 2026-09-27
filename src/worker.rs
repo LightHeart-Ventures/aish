@@ -2534,6 +2534,16 @@ struct JobInner {
     /// binding. This is what makes "type a message to a finished worker" continue
     /// the SAME worker instead of spawning a brand-new one each time.
     resumes: u32,
+    /// The coordinator `run_id` of the CURRENTLY-RUNNING thread — equal to the
+    /// worker's visible `id` for the original run, and a fresh id after every
+    /// [`resume_in_place`]. Stamped by `run_worker` as each thread starts.
+    ///
+    /// Without this, a status reader holding only the visible `id` looks up the
+    /// FIRST thread's durable row — which, after a resume, is frozen at that
+    /// thread's terminal `done` (real token counts, dead heartbeat) even though
+    /// the worker is live. That mismatch is exactly what made
+    /// `background_status` report `done` for a running worker.
+    run_id: String,
 }
 
 pub type WorkerJobs = Arc<Mutex<Vec<Arc<WorkerJob>>>>;
@@ -2817,11 +2827,23 @@ impl WorkerJob {
     pub fn pid(&self) -> Option<u32> {
         self.inner.lock().unwrap().pid
     }
-    fn is_terminal(&self) -> bool {
+    pub fn is_terminal(&self) -> bool {
         matches!(
             self.inner.lock().unwrap().status.as_str(),
             "done" | "failed"
         )
+    }
+    /// The coordinator `run_id` of the thread running RIGHT NOW (see
+    /// [`JobInner::run_id`]). Status readers must resolve a worker's durable row
+    /// through THIS, not through the visible `id`, or a resumed worker's live
+    /// state reads back as the previous thread's terminal row.
+    pub fn run_id(&self) -> String {
+        self.inner.lock().unwrap().run_id.clone()
+    }
+    /// Stamp the current thread's coordinator `run_id`. Called by `run_worker`
+    /// as each thread (original or resumed) starts.
+    pub fn set_run_id(&self, run_id: &str) {
+        self.inner.lock().unwrap().run_id = run_id.to_string();
     }
     fn is_displayed(&self) -> bool {
         self.inner.lock().unwrap().displayed
@@ -3118,6 +3140,9 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
             pid: None,
             status: "running".into(),
             resumes: 0,
+            // Thread 1's run id IS the visible id; `run_worker` re-stamps this
+            // on every in-place resume.
+            run_id: id.clone(),
             result: None,
             error: None,
             displayed: false,
@@ -3168,6 +3193,11 @@ pub fn resume_in_place(jobs: &WorkerJobs, job: Arc<WorkerJob>, task: String, spe
 /// operator-facing labels (`[{}]` announces, `:workers` row) stay keyed on the
 /// stable `job.id`.
 async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, run_id: String, task: String, spec: WorkerSpec) {
+    // Bind the worker handle to THIS thread's durable identity before anything
+    // can observe it. `background_status` resolves a live worker's heartbeat
+    // through this id; leaving it pointed at the previous (terminal) thread is
+    // what let a running worker render as `done`.
+    job.set_run_id(&run_id);
     // Isolation: a writing/building coordinator gets its own git worktree
     // (branched from `spec.base` — a clean trunk baseline by default, or the
     // current HEAD on request) so parallel coordinators can't clobber the shared
@@ -3659,6 +3689,7 @@ mod tests {
                 pid,
                 status: "running".into(),
                 resumes: 0,
+                run_id: id.to_string(),
                 result: None,
                 error: None,
                 displayed: false,
@@ -3910,7 +3941,8 @@ mod tests {
             inner: Mutex::new(JobInner {
                 status: "running".into(),
                 pid: None,
-            resumes: 0,
+                resumes: 0,
+                run_id: String::new(),
                 result: None,
                 error: None,
                 displayed: false,
@@ -3934,7 +3966,8 @@ mod tests {
             inner: Mutex::new(JobInner {
                 status: "running".into(),
                 pid: None,
-            resumes: 0,
+                resumes: 0,
+                run_id: String::new(),
                 result: None,
                 error: None,
                 displayed: false,
@@ -4565,7 +4598,8 @@ mod tests {
             inner: Mutex::new(JobInner {
                 status: "running".into(),
                 pid: None,
-            resumes: 0,
+                resumes: 0,
+                run_id: String::new(),
                 result: None,
                 error: None,
                 displayed: false,
