@@ -57,6 +57,17 @@ const MESSAGES_API: &str = "https://api.anthropic.com/v1/messages";
 /// Cap the work output handed to the judge so a chatty turn can't blow the
 /// verifier's context.
 const JUDGE_INPUT_CAP: usize = 16_000;
+/// Output budget for the verdict. The verdict itself is tiny, but a judge that
+/// narrates its reasoning before the JSON can run out of room and emit a reply
+/// that ends mid-string — the `EOF while parsing a string` failure. Headroom is
+/// cheap insurance; [`salvage_verdict`] is the backstop when it isn't enough.
+const JUDGE_MAX_TOKENS: usize = 1024;
+/// Hard cap on a verdict reason. It is echoed into the goal banner and fed back
+/// as the next turn's guidance, so an essay here poisons both.
+const JUDGE_REASON_CAP: usize = 240;
+/// Attempts for a single verdict before the turn is recorded unverified. One
+/// retry absorbs the transient truncated/empty reply without stalling the loop.
+const JUDGE_ATTEMPTS: usize = 2;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Status {
@@ -641,10 +652,10 @@ async fn run_goal_loop(
         // Verifier: the batch model judges whether the output demonstrates the goal.
         goal.note_quiet(&format!("turn {turn}: checking…"));
         goal.inner.lock().unwrap().phase = Step::Checking;
-        let (met, reason) = match judge(&cred, &model, &goal.condition, &output).await {
-            Ok((met, reason)) => (met, reason),
+        let (met, reason, verified) = match judge(&cred, &model, &goal.condition, &output).await {
+            Ok((met, reason)) => (met, reason, true),
             // Couldn't verify — keep going but record why; don't silently stop.
-            Err(e) => (false, format!("could not verify this turn: {e}")),
+            Err(e) => (false, format!("could not verify this turn: {e}"), false),
         };
         goal.fire_hook(crate::hooks::HookEvent::GoalTurnEnd, |p| {
             p.with("turn", turn as u64)
@@ -661,13 +672,39 @@ async fn run_goal_loop(
             };
         }
         goal.set(Status::Active, Some(reason.clone()));
-        guidance = Some(reason);
+        // Only a REAL verdict steers the next turn. A verifier malfunction says
+        // nothing about the work, so folding "could not verify this turn: …"
+        // into the directive just sends the worker chasing the judge's bug
+        // instead of the goal — keep the last genuine guidance instead.
+        if verified {
+            guidance = Some(reason);
+        }
     }
+}
+
+/// Ask the verifier for a verdict, retrying once. A truncated or text-free
+/// reply is transient — the same prompt usually returns clean JSON on the
+/// second ask — and burning a whole goal turn on one malformed response is a
+/// far worse trade than one extra sub-second call.
+async fn judge(
+    cred: &crate::backend::claude::Credential,
+    model: &str,
+    condition: &str,
+    work: &str,
+) -> Result<(bool, String), String> {
+    let mut last = String::from("judge never ran");
+    for _ in 0..JUDGE_ATTEMPTS {
+        match judge_once(cred, model, condition, work).await {
+            Ok(verdict) => return Ok(verdict),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 /// Ask the verifier (batch model) whether the goal is demonstrably met. Returns
 /// `(met, reason)`. A strict judge: evidence in the output, not mere claims.
-async fn judge(
+async fn judge_once(
     cred: &crate::backend::claude::Credential,
     model: &str,
     condition: &str,
@@ -681,13 +718,14 @@ async fn judge(
     };
     let body = json!({
         "model": model,
-        "max_tokens": 512,
+        "max_tokens": JUDGE_MAX_TOKENS,
         // Shaped per credential (OAuth needs the Claude Code identity block).
         "system": cred.system_value(
             "You are a strict completion judge for an autonomous agent. Decide whether the \
     GOAL is DEMONSTRABLY met by the WORK OUTPUT — judge only what the output shows as evidence (command \
     results, file contents, exit codes), never what is merely asserted without proof. If the goal \
-    states a turn/time bound, honor it. Reply with ONLY a JSON object, no prose: \
+    states a turn/time bound, honor it. Reply with ONLY a JSON object on a single line, no prose, \
+    no preamble, no code fences, and keep the reason under 200 characters: \
     {\"met\": true|false, \"reason\": \"<one sentence>\"}.",
         ),
         "messages": [{
@@ -728,21 +766,92 @@ async fn judge(
         })
         .unwrap_or("")
         .trim();
-    // The judge should return bare JSON, but tolerate prose around a {...}.
-    let parsed: Value = serde_json::from_str(text)
-        .or_else(|_| {
-            match (text.find('{'), text.rfind('}')) {
-                (Some(s), Some(e)) if e > s => serde_json::from_str(&text[s..=e]),
-                _ => serde_json::from_str(text), // re-raise the original error
+    if text.is_empty() {
+        // No text block at all — a thinking-only turn, a refusal, or the budget
+        // spent before any prose. Say so. Handing "" to serde produced the
+        // useless `EOF while parsing a value at line 1 column 0`, which named
+        // neither the cause nor the fix.
+        let stop = v["stop_reason"].as_str().unwrap_or("none");
+        return Err(format!(
+            "judge returned no verdict text (stop_reason: {stop})"
+        ));
+    }
+    parse_verdict(text)
+}
+
+/// Parse the judge's reply into `(met, reason)`. Strict JSON first, then a
+/// `{…}` slice lifted out of surrounding prose, then [`salvage_verdict`] for a
+/// reply cut off mid-JSON. A truncated verdict still carries its `met` bit, so
+/// recovering it beats discarding a turn's work over a missing quote. Pure —
+/// unit-tested.
+fn parse_verdict(text: &str) -> Result<(bool, String), String> {
+    let parsed = serde_json::from_str::<Value>(text).ok().or_else(|| {
+        match (text.find('{'), text.rfind('}')) {
+            (Some(s), Some(e)) if e > s => serde_json::from_str::<Value>(&text[s..=e]).ok(),
+            _ => None,
+        }
+    });
+    if let Some(v) = parsed {
+        let met = v["met"].as_bool().unwrap_or(false);
+        let reason = v["reason"].as_str().unwrap_or("(no reason given)");
+        return Ok((met, cap_reason(reason)));
+    }
+    salvage_verdict(text).ok_or_else(|| format!("couldn't parse judge verdict (got: {text})"))
+}
+
+/// Last-ditch extraction from a malformed or truncated verdict: find the `met`
+/// boolean, then whatever of `reason` survived. Targets the dominant failure
+/// mode — the reply ends mid-string, so the closing quote and brace never
+/// arrive and strict JSON has nothing to work with. Pure — unit-tested.
+fn salvage_verdict(text: &str) -> Option<(bool, String)> {
+    let met_at = text.find("\"met\"")?;
+    let tail = &text[met_at + 5..];
+    let met = match (tail.find("true"), tail.find("false")) {
+        (Some(t), Some(f)) => t < f,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => return None,
+    };
+    // Walk the reason body by hand: serde can't, and the terminating quote may
+    // simply not exist. Stop at the first unescaped quote or at end-of-text.
+    let body = text
+        .find("\"reason\"")
+        .and_then(|i| text[i + 8..].find('"').map(|q| i + 8 + q + 1))
+        .map(|start| {
+            let mut out = String::new();
+            let mut chars = text[start..].chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => match chars.next() {
+                        Some('n') => out.push('\n'),
+                        Some('t') => out.push('\t'),
+                        Some(esc) => out.push(esc),
+                        None => break,
+                    },
+                    '"' => break,
+                    _ => out.push(c),
+                }
             }
+            out
         })
-        .map_err(|e| format!("couldn't parse judge verdict: {e} (got: {text})"))?;
-    let met = parsed["met"].as_bool().unwrap_or(false);
-    let reason = parsed["reason"]
-        .as_str()
-        .unwrap_or("(no reason given)")
-        .to_string();
-    Ok((met, reason))
+        .unwrap_or_default();
+    let body = cap_reason(&body);
+    Some(if body.is_empty() {
+        (met, "(verdict truncated; no reason recovered)".to_string())
+    } else {
+        (met, format!("{body} [recovered from a truncated verdict]"))
+    })
+}
+
+/// Squash a verdict reason to one bounded line. It lands in the goal banner and
+/// in the next turn's guidance, so newlines and essays both have to go.
+fn cap_reason(reason: &str) -> String {
+    let one_line = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= JUDGE_REASON_CAP {
+        return one_line;
+    }
+    let head: String = one_line.chars().take(JUDGE_REASON_CAP).collect();
+    format!("{head}…")
 }
 
 /// Print a transient `[goal]` progress/announce line over the prompt.
@@ -1310,6 +1419,70 @@ mod tests {
             "\x1b[2m── goal achieved (4 turn(s)) ──\x1b[0m\n\x1b[2mgoal met\x1b[0m\nline one\nline two\n"
         );
         assert!(blob.ends_with('\n'));
+    }
+
+    #[test]
+    fn parse_verdict_accepts_bare_json() {
+        let (met, reason) = parse_verdict(r#"{"met": true, "reason": "tests pass"}"#).unwrap();
+        assert!(met);
+        assert_eq!(reason, "tests pass");
+    }
+
+    #[test]
+    fn parse_verdict_tolerates_surrounding_prose_and_fences() {
+        let (met, reason) =
+            parse_verdict("```json\n{\"met\": false, \"reason\": \"no PR opened\"}\n```").unwrap();
+        assert!(!met);
+        assert_eq!(reason, "no PR opened");
+    }
+
+    // The reported bug: the reply ends mid-string, so serde reports
+    // "EOF while parsing a string" and the whole turn used to be discarded.
+    #[test]
+    fn parse_verdict_salvages_a_truncated_reason() {
+        let truncated = r#"{"met": false, "reason": "the worker committed but left the"#;
+        let (met, reason) = parse_verdict(truncated).unwrap();
+        assert!(!met);
+        assert!(reason.starts_with("the worker committed but left the"));
+        assert!(reason.contains("truncated"));
+    }
+
+    #[test]
+    fn parse_verdict_salvages_met_true_when_cut_before_reason() {
+        let (met, reason) = parse_verdict(r#"{"met": true, "rea"#).unwrap();
+        assert!(met);
+        assert!(reason.contains("truncated"));
+    }
+
+    #[test]
+    fn parse_verdict_salvage_unescapes_quotes_in_a_truncated_reason() {
+        let (met, reason) =
+            parse_verdict(r#"{"met": false, "reason": "card is \"open\" and not"#).unwrap();
+        assert!(!met);
+        assert!(reason.starts_with(r#"card is "open" and not"#));
+    }
+
+    #[test]
+    fn parse_verdict_rejects_text_with_no_verdict_at_all() {
+        assert!(parse_verdict("I cannot help with that request.").is_err());
+        assert!(parse_verdict("").is_err());
+    }
+
+    #[test]
+    fn salvage_picks_the_boolean_nearest_the_met_key() {
+        // "false" appears later in the reason — it must not flip the verdict.
+        let (met, _) =
+            salvage_verdict(r#"{"met": true, "reason": "no false positives in the"#).unwrap();
+        assert!(met);
+    }
+
+    #[test]
+    fn cap_reason_collapses_newlines_and_bounds_length() {
+        assert_eq!(cap_reason("one\n  two\tthree"), "one two three");
+        let long = "x".repeat(JUDGE_REASON_CAP + 50);
+        let capped = cap_reason(&long);
+        assert_eq!(capped.chars().count(), JUDGE_REASON_CAP + 1); // + the ellipsis
+        assert!(capped.ends_with('…'));
     }
 
     #[test]
