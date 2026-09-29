@@ -2817,3 +2817,381 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
+
+/// TASK-699 (SPR-100) — **loopback mirror conformance**.
+///
+/// These tests stand up a local HTTP server that implements the registry wire
+/// contract frozen in TASK-693, then drive the *real* client code paths against
+/// it end to end:
+///
+///   * discovery — [`search_url_with_base`] builds the URL, [`search_with_base`]
+///     performs the request and [`parse_search_body`] decodes the payload;
+///   * retrieval — [`raw_url_on`] builds the URL and [`fetch_url`] performs the
+///     request, whose body is then handed to [`import`].
+///
+/// They are the executable definition of "this mirror is conformant": any server
+/// that behaves like [`serve_mirror`] is one aish can talk to, and the moment a
+/// client-side change breaks that contract these tests go red.
+///
+/// Deliberately **env-free** — every entry point exercised here takes an explicit
+/// `base`, so nothing mutates `AISH_SKILL_REGISTRY` and all of it is safe under
+/// `cargo test`'s parallel harness.
+#[cfg(test)]
+mod mirror_conformance {
+    use super::*;
+
+    /// One catalog row in the shape the contract specifies.
+    fn row(reference: &str, name: &str, author: &str, description: &str) -> serde_json::Value {
+        serde_json::json!({
+            "reference": reference,
+            "name": name,
+            "author": author,
+            "description": description,
+            "version": "1.0.0",
+        })
+    }
+
+    /// The fixture catalog the mirror serves.
+    fn catalog() -> Vec<serde_json::Value> {
+        vec![
+            row(
+                "acme/git-helper",
+                "git-helper",
+                "acme",
+                "Helps with git rebases.",
+            ),
+            row(
+                "acme/tf-plan",
+                "tf-plan",
+                "acme",
+                "Reviews Terraform plans before apply.",
+            ),
+            row(
+                "globex/log-triage",
+                "log-triage",
+                "globex",
+                "Triage error logs on call.",
+            ),
+        ]
+    }
+
+    fn mirror_skill_md(name: &str) -> String {
+        format!("---\nname: {name}\ndescription: Mirror-served {name}.\n---\nBody of {name}.\n")
+    }
+
+    /// Split a request target into its path and decoded query pairs.
+    fn split_target(target: &str) -> (String, Vec<(String, String)>) {
+        let (path, qs) = match target.split_once('?') {
+            Some((p, q)) => (p, q),
+            None => (target, ""),
+        };
+        let pairs = qs
+            .split('&')
+            .filter(|s| !s.is_empty())
+            .filter_map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                let v = urlencoding::decode(v).map(|s| s.into_owned()).ok()?;
+                Some((k.to_string(), v))
+            })
+            .collect();
+        (path.to_string(), pairs)
+    }
+
+    /// A **conformant skill-registry mirror** on loopback — the reference
+    /// implementation of the TASK-693 wire contract.
+    ///
+    /// Routes:
+    ///   * `GET /api/v1/search?q=&limit=` → `200 application/json` with
+    ///     `{"results":[…]}`, filtered by a case-insensitive substring match over
+    ///     `name`/`reference`/`author`/`description` and truncated to `limit`. An
+    ///     unmatched `q` returns `{"results":[]}` — an empty catalog is a
+    ///     *success*, never an error.
+    ///   * `GET /{owner}/{name}/raw` → `200 text/plain` carrying the SKILL.md, or
+    ///     `404` with a JSON error body when the ref is not in the catalog.
+    ///   * anything else → `404`.
+    ///
+    /// Serves for the lifetime of the test. Returns the bound port.
+    async fn serve_mirror() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let target = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("")
+                        .to_string();
+                    let (path, query) = split_target(&target);
+
+                    let (status, ctype, body) = if path == "/api/v1/search" {
+                        let q = query
+                            .iter()
+                            .find(|(k, _)| k == "q")
+                            .map(|(_, v)| v.to_lowercase())
+                            .unwrap_or_default();
+                        let limit = query
+                            .iter()
+                            .find(|(k, _)| k == "limit")
+                            .and_then(|(_, v)| v.parse::<usize>().ok())
+                            .unwrap_or(50);
+                        let hits: Vec<serde_json::Value> = catalog()
+                            .into_iter()
+                            .filter(|r| {
+                                q.is_empty()
+                                    || ["name", "reference", "author", "description"].iter().any(
+                                        |k| {
+                                            r.get(*k)
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_lowercase().contains(&q))
+                                                .unwrap_or(false)
+                                        },
+                                    )
+                            })
+                            .take(limit)
+                            .collect();
+                        (
+                            "200 OK",
+                            "application/json",
+                            serde_json::json!({ "results": hits }).to_string(),
+                        )
+                    } else if let Some(rest) = path.strip_suffix("/raw") {
+                        let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+                        let known = |owner: &str, name: &str| {
+                            let want = format!("{owner}/{name}");
+                            catalog()
+                                .iter()
+                                .any(|r| r["reference"].as_str() == Some(want.as_str()))
+                        };
+                        match segs.as_slice() {
+                            [owner, name] if known(owner, name) => {
+                                ("200 OK", "text/plain; charset=utf-8", mirror_skill_md(name))
+                            }
+                            _ => (
+                                "404 Not Found",
+                                "application/json",
+                                r#"{"error":"not_found"}"#.to_string(),
+                            ),
+                        }
+                    } else {
+                        (
+                            "404 Not Found",
+                            "application/json",
+                            r#"{"error":"no_such_route"}"#.to_string(),
+                        )
+                    };
+
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: {ctype}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        port
+    }
+
+    fn base_for(port: u16) -> String {
+        format!("http://127.0.0.1:{port}")
+    }
+
+    // ---- wire-shape assertions (the contract, statically) -------------------
+
+    /// The search URL the client emits is exactly what the contract specifies:
+    /// `{base}/api/v1/search?q={urlencoded}&limit=50`, with a trailing slash on
+    /// the base absorbed rather than doubled.
+    #[test]
+    fn search_url_shape_matches_contract() {
+        assert_eq!(
+            search_url_with_base("https://mirror.example", "git helper"),
+            "https://mirror.example/api/v1/search?q=git%20helper&limit=50"
+        );
+        assert_eq!(
+            search_url_with_base("https://mirror.example/", "git"),
+            "https://mirror.example/api/v1/search?q=git&limit=50"
+        );
+    }
+
+    /// The raw URL the client emits is `{base}/{owner}/{name}/raw`, with the
+    /// optional version carried as a `?version=` query parameter.
+    #[test]
+    fn raw_url_shape_matches_contract() {
+        let r = parse_ref("acme/git-helper").unwrap();
+        assert_eq!(
+            raw_url_on("https://mirror.example/", &r),
+            "https://mirror.example/acme/git-helper/raw"
+        );
+        let pinned = parse_ref("acme/git-helper@2.1.0").unwrap();
+        assert_eq!(
+            raw_url_on("https://mirror.example", &pinned),
+            "https://mirror.example/acme/git-helper/raw?version=2.1.0"
+        );
+    }
+
+    /// A loopback mirror is reachable over plain HTTP (self-hosted mirrors and
+    /// these tests depend on it), while any other non-HTTPS origin is refused.
+    #[test]
+    fn loopback_mirror_passes_the_transport_gate() {
+        assert!(check_url("http://127.0.0.1:8080/acme/x/raw").is_ok());
+        assert!(check_url("http://localhost:8080/api/v1/search?q=x").is_ok());
+        assert!(check_url("https://mirror.example/acme/x/raw").is_ok());
+        assert!(check_url("http://mirror.example/acme/x/raw").is_err());
+    }
+
+    // ---- live conformance against the loopback mirror -----------------------
+
+    /// Discovery round-trip: the client's own URL builder + request + decoder
+    /// against a conformant mirror yields the expected, fully-populated row.
+    #[tokio::test]
+    async fn mirror_search_returns_matching_rows() {
+        let base = base_for(serve_mirror().await);
+
+        let hits = search_with_base(&base, "git").await.unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected exactly the git-helper row: {hits:?}"
+        );
+        let hit = &hits[0];
+        assert_eq!(hit.reference, "acme/git-helper");
+        assert_eq!(hit.name, "git-helper");
+        assert_eq!(hit.author, "acme");
+        assert!(hit.description.contains("git rebases"));
+
+        // Matching is substring-based across every indexed field, so an author
+        // query pulls both of that author's skills.
+        let by_author = search_with_base(&base, "acme").await.unwrap();
+        assert_eq!(
+            by_author.len(),
+            2,
+            "author query should match both: {by_author:?}"
+        );
+
+        // A description-only term still matches.
+        let by_desc = search_with_base(&base, "terraform").await.unwrap();
+        assert_eq!(by_desc.len(), 1);
+        assert_eq!(by_desc[0].reference, "acme/tf-plan");
+    }
+
+    /// An empty result set is a **success**, not an error — the contract is
+    /// explicit that "no matches" and "request failed" are distinct outcomes.
+    #[tokio::test]
+    async fn mirror_search_empty_result_is_ok_not_error() {
+        let base = base_for(serve_mirror().await);
+        let hits = search_with_base(&base, "definitely-no-such-skill")
+            .await
+            .expect("an empty catalog must not be an error");
+        assert!(hits.is_empty());
+    }
+
+    /// An empty query returns the whole catalog (the client uses this for
+    /// "browse everything").
+    #[tokio::test]
+    async fn mirror_search_empty_query_returns_whole_catalog() {
+        let base = base_for(serve_mirror().await);
+        let hits = search_with_base(&base, "").await.unwrap();
+        assert_eq!(
+            hits.len(),
+            3,
+            "empty query should list the catalog: {hits:?}"
+        );
+    }
+
+    /// Retrieval round-trip: build the raw URL, fetch it from the mirror, and
+    /// feed the body straight into [`import`] — the exact sequence `:skill add`
+    /// performs. Proves the client accepts a conformant mirror's response with
+    /// no error and that the payload survives validation.
+    #[tokio::test]
+    async fn mirror_raw_fetch_round_trips_into_import() {
+        let base = base_for(serve_mirror().await);
+        let r = parse_ref("acme/git-helper").unwrap();
+
+        let url = raw_url_on(&base, &r);
+        let body = fetch_url(&url)
+            .await
+            .expect("a conformant mirror's raw response must be accepted");
+        assert!(body.contains("name: git-helper"), "body was: {body:?}");
+
+        let tmp = std::env::temp_dir().join(format!(
+            "aish-mirror-conf-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let path = import(&body, &tmp).unwrap();
+        assert!(path.ends_with("git-helper/SKILL.md"));
+        let loaded = crate::skills::load(&tmp);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "git-helper");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Every row the mirror advertises via search is fetchable via its raw URL —
+    /// the two halves of the contract agree, so a search result is always
+    /// actionable.
+    #[tokio::test]
+    async fn every_advertised_row_is_fetchable() {
+        let base = base_for(serve_mirror().await);
+        let hits = search_with_base(&base, "").await.unwrap();
+        assert_eq!(hits.len(), 3);
+        for hit in hits {
+            let r = parse_ref(&hit.reference)
+                .unwrap_or_else(|e| panic!("advertised ref {:?} must parse: {e}", hit.reference));
+            let body = fetch_url(&raw_url_on(&base, &r)).await.unwrap_or_else(|e| {
+                panic!("advertised ref {:?} must be fetchable: {e}", hit.reference)
+            });
+            assert!(body.starts_with("---"), "expected SKILL.md frontmatter");
+            assert!(body.contains(&format!("name: {}", hit.name)));
+        }
+    }
+
+    /// An unknown ref is a hard error (404), surfaced with the URL so the user
+    /// can see what was attempted — never a silent empty success.
+    #[tokio::test]
+    async fn mirror_raw_unknown_ref_is_an_error() {
+        let base = base_for(serve_mirror().await);
+        let r = parse_ref("acme/no-such-skill").unwrap();
+        let err = fetch_url(&raw_url_on(&base, &r))
+            .await
+            .expect_err("a 404 from the mirror must be an error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("404"), "error should name the status: {msg}");
+    }
+
+    /// A non-conformant mirror that answers search with garbage fails loudly at
+    /// the decode step rather than silently returning zero results.
+    #[tokio::test]
+    async fn non_json_search_body_is_a_decode_error() {
+        let err = parse_search_body("<html>bot challenge</html>")
+            .expect_err("a non-JSON body must not decode as an empty catalog");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not valid JSON"), "unexpected error: {msg}");
+    }
+
+    /// The decoder is liberal about the envelope key — `results`, `skills`,
+    /// `data`, `items`, `hits`, or a bare array all conform, so a mirror may pick
+    /// whichever it already emits.
+    #[test]
+    fn search_envelope_keys_are_interchangeable() {
+        let one = r#"[{"reference":"acme/x","name":"x","author":"acme","description":"d"}]"#;
+        let bare = parse_search_body(one).unwrap();
+        assert_eq!(bare.len(), 1);
+        for key in ["results", "skills", "data", "items", "hits"] {
+            let wrapped = format!("{{\"{key}\":{one}}}");
+            let got = parse_search_body(&wrapped)
+                .unwrap_or_else(|e| panic!("envelope key {key:?} must decode: {e}"));
+            assert_eq!(got.len(), 1, "envelope key {key:?} produced {got:?}");
+            assert_eq!(got[0].reference, "acme/x");
+        }
+    }
+}
