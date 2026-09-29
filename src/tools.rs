@@ -2127,6 +2127,25 @@ fn find_duplicate_running_work(session: &Session, task: &str) -> Option<String> 
     None
 }
 
+/// FIX D — the fan-out tier a nested coordinator stamps on the child it spawns
+/// (the recursion cap: coordinator → sub-coordinator → *this* tier).
+///
+/// Historically this was hard-coded to `"batch"`, which made the cap a DEAD END
+/// on subscription auth: the tool-less Batches API needs a metered
+/// `ANTHROPIC_API_KEY`, and a `CLAUDE_CODE_OAUTH_TOKEN` cannot reach it, so the
+/// grandchild's only sanctioned route out could only ever error. Pick `batch`
+/// only when that key is genuinely available; otherwise `interactive`, whose
+/// recursion risk is already bounded by the child's decremented
+/// `AISH_SPAWN_BUDGET` (the real fork-bomb guard). Pure → unit-tested.
+fn forced_child_tier(metered_key_available: bool) -> &'static str {
+    if metered_key_available {
+        "batch"
+    } else {
+        "interactive"
+    }
+}
+
+
 fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
     let task = call.args["task"].as_str().map(str::trim).unwrap_or("");
     if task.is_empty() {
@@ -2192,34 +2211,70 @@ OPENAI_API_KEY; OpenRouter needs OPENROUTER_API_KEY (env or ~/.aishrc)"
     // (interactive latency); "batch" keeps the cheap deferred Batches path; and
     // "auto" (the default) picks interactive — we never auto-route urgent work to
     // batch. Non-nested (top-level) calls always spawn a worker regardless.
-    let tier = call.args["tier"]
+    // FIX D — keep the ARG and the ENV sources distinguishable. A `tier:"batch"`
+    // the model asked for and a `batch` inherited from the recursion cap
+    // (`AISH_FANOUT_TIER`, stamped by our own parent) must be handled
+    // differently when the Batches API is unreachable: honour the explicit
+    // request with an honest error, but DEGRADE the inherited one.
+    let explicit_tier = call.args["tier"]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_ascii_lowercase)
-        .or_else(|| std::env::var("AISH_FANOUT_TIER").ok().map(|s| s.trim().to_ascii_lowercase()))
+        .map(str::to_ascii_lowercase);
+    let env_tier = std::env::var("AISH_FANOUT_TIER")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let tier = explicit_tier
+        .clone()
+        .or_else(|| env_tier.clone())
         .unwrap_or_else(|| "auto".to_string());
     let want_batch = matches!(tier.as_str(), "batch" | "deferred" | "cheap");
+    // True when the batch tier was INHERITED rather than requested. On
+    // subscription auth (`CLAUDE_CODE_OAUTH_TOKEN`, no metered key) the batch
+    // path can only ever error, so an inherited `batch` would make a depth-3
+    // fan-out structurally impossible — a hard failure caused purely by our own
+    // recursion cap. Degrade that case; never the explicit one.
+    let batch_forced_by_env = want_batch && explicit_tier.is_none();
+    // The metered key the tool-less Batches API needs. `~/.aishrc` exports win
+    // over the process env (same precedence the batch branch used). Resolved
+    // ONCE here because both the batch branch and the child's forced tier below
+    // need to know whether it exists.
+    let metered_api_key: Option<String> = session
+        .env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "ANTHROPIC_API_KEY")
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+        .filter(|v| !v.trim().is_empty());
+    let metered_key_available = metered_api_key.is_some();
 
-    if session.nested && want_batch {
+    // FIX D — an INHERITED `batch` tier with no metered key DEGRADES to an
+    // interactive sub-coordinator rather than erroring. Without this, a
+    // subscription-auth user's depth-3 fan-out could only ever fail: our own
+    // recursion cap stamps `AISH_FANOUT_TIER=batch` on the child, and the child's
+    // only route out is the Batches API it structurally cannot reach. Falling
+    // through to the worker-spawn path below is safe — `spawn_budget_gate` still
+    // enforces the depth cap, which is the real fork-bomb guard.
+    if session.nested && want_batch && batch_forced_by_env && !metered_key_available {
+        eprintln!(
+            "aish: nested fan-out tier was forced to `batch` by AISH_FANOUT_TIER (recursion cap), but \
+no metered ANTHROPIC_API_KEY is reachable — a Claude subscription token can't use the Batches API. \
+Degrading this fan-out to an interactive sub-coordinator; depth stays capped by AISH_SPAWN_BUDGET."
+        );
+    } else if session.nested && want_batch {
         // The tool-less Batches API needs a metered key; a subscription OAuth
-        // token can't reach it. Look in ~/.aishrc exports first, then the process
-        // env. If that's all we have, this nested fan-out can't run — say so
-        // plainly rather than failing opaquely later.
-        let api_key = session
-            .env
-            .iter()
-            .rev()
-            .find(|(k, _)| k == "ANTHROPIC_API_KEY")
-            .map(|(_, v)| v.clone())
-            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-            .filter(|v| !v.trim().is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "nested background fan-out uses the Anthropic Batches API, which needs a metered \
+        // token can't reach it. Resolved above (`~/.aishrc` exports, then the
+        // process env). Reaching here means the caller asked for batch
+        // EXPLICITLY, so a missing key is a real error — say so plainly rather
+        // than failing opaquely later.
+        let api_key = metered_api_key.ok_or_else(|| {
+            anyhow::anyhow!(
+                "nested background fan-out uses the Anthropic Batches API, which needs a metered \
 ANTHROPIC_API_KEY — a Claude subscription token (CLAUDE_CODE_OAUTH_TOKEN) can't reach it"
-                )
-            })?;
+            )
+        })?;
         let _id = crate::batch::spawn(
             &session.batch_jobs,
             task.to_string(),
@@ -2302,8 +2357,16 @@ sentence that you're on it and the answer will appear when ready."
     // Top-level calls leave the session env untouched.
     let mut child_env = session.env.clone();
     if session.nested {
+        // FIX D — the recursion cap no longer hard-codes `batch`. Stamping a tier
+        // the child cannot execute turned the cap into a dead end on
+        // subscription auth; `forced_child_tier` picks `batch` only when a
+        // metered key is actually reachable, else `interactive` (still bounded by
+        // the child's decremented AISH_SPAWN_BUDGET).
         child_env.retain(|(k, _)| k != "AISH_FANOUT_TIER");
-        child_env.push(("AISH_FANOUT_TIER".to_string(), "batch".to_string()));
+        child_env.push((
+            "AISH_FANOUT_TIER".to_string(),
+            forced_child_tier(metered_key_available).to_string(),
+        ));
     }
     let spec = crate::worker::WorkerSpec {
         exe,
@@ -4676,6 +4739,16 @@ fn char_ceil(s: &str, mut i: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    // FIX D — the recursion cap must never stamp a tier the child cannot reach.
+    // With a metered key the cheap batch path is still the right cap; without one
+    // (subscription auth) `batch` is unreachable, so the cap degrades to
+    // `interactive` and leans on AISH_SPAWN_BUDGET for depth safety instead.
+    #[test]
+    fn forced_child_tier_degrades_without_a_metered_key() {
+        assert_eq!(super::forced_child_tier(true), "batch");
+        assert_eq!(super::forced_child_tier(false), "interactive");
+    }
+
     use super::*;
 
     /// THE regression: `background_status` reported `done` for a LIVE worker,

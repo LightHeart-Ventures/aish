@@ -1636,6 +1636,16 @@ fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str, cwd: &std::path::
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
+    // FIX C — stamp the child's OWN run id, LAST so nothing in `spec.env` (which
+    // carries the parent's `~/.aishrc` exports and, on a nested spawn, the
+    // parent's inherited environment) can shadow it. Previously the child
+    // inherited the PARENT's `AISH_RUN_ID` through the process env even though
+    // its argv said `--run-id <own-id>`: `coordinator::run` only sets the var
+    // once the child is already up, so every read of the env rather than the arg
+    // — the `AISH_PARENT_RUN_ID` link above, `requested_by_worker` attribution —
+    // credited the child's work to its parent. Set after the loop, and after the
+    // parent-link stamp which deliberately reads OUR process env.
+    cmd.env("AISH_RUN_ID", run_id);
 
     // Read the knobs in the PARENT (env::var allocates — not allowed in the
     // post-fork child), then move plain integers into the pre_exec closure.
@@ -1957,6 +1967,39 @@ fn resolve_base_ref(src: &std::path::Path, base: &str) -> String {
 /// short bounded retry beats silently degrading to the shared cwd.
 const WORKTREE_ADD_MAX_ATTEMPTS: u32 = 5;
 
+/// FIX B — process-wide serialization for `git worktree add`.
+///
+/// Git cannot service concurrent `worktree add` calls against one repository:
+/// they contend on the source repo's `.git` lock. A coordinator that fans N
+/// tasks out fires N `create_worktree` calls from THIS process at once, so the
+/// dominant source of lock collisions was self-inflicted — and the loser of the
+/// race, after exhausting `WORKTREE_ADD_MAX_ATTEMPTS`, silently degraded to the
+/// SHARED cwd (see `isolation_failed`). Holding this mutex across the add makes
+/// intra-process adds strictly sequential; the retry loop inside
+/// `create_worktree` still absorbs CROSS-process collisions from another live
+/// coordinator, which a process-local mutex cannot see.
+///
+/// The critical section is short (one `git worktree add`, tens of ms) and the
+/// surrounding code was already blocking (it sleeps between retries), so this
+/// adds no new blocking class — only ordering.
+static WORKTREE_ADD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// FIX A — did an isolation request fail in the DANGEROUS way?
+///
+/// True when the caller asked for `isolate`, `cwd` really is a git repo, and yet
+/// no worktree materialised. That combination used to fall back to the shared
+/// `cwd` — and for a CHILD coordinator the shared cwd is its PARENT's worktree,
+/// so two nominally-isolated workers edited one checkout and committed onto the
+/// parent's branch. The degradation was only visible in the child's captured
+/// stderr, which nobody reads. Failing the spawn is strictly safer than
+/// silently losing isolation.
+///
+/// A non-repo `cwd` is NOT a failure (there is nothing to isolate, and sharing
+/// it is the only option), and `isolate: false` never was. Pure → unit-tested.
+fn isolation_failed(isolate: bool, got_worktree: bool, cwd_is_repo: bool) -> bool {
+    isolate && !got_worktree && cwd_is_repo
+}
+
 /// Exponential backoff before retry `n` (1-indexed): `10·2^(n-1)` ms →
 /// 10, 20, 40, 80, 160 ms for n = 1..=5. Pure → unit-tested. No new dependency:
 /// just `Duration` (already imported) + integer math.
@@ -2032,6 +2075,16 @@ fn create_worktree(src: &std::path::Path, id: &str, base: &str) -> Option<Worktr
         ensure_dir_0700(parent);
     }
     let start_point = resolve_base_ref(src, base);
+    // FIX B — hold the process-wide add lock for the remove+add sequence below.
+    // N parallel `create_worktree` calls from one coordinator were racing each
+    // other for the repo's `.git` lock; the loser exhausted its retries and fell
+    // back to the shared cwd. Serialising here removes that race at the source.
+    // The guard protects an EXTERNAL resource (git's lock), not in-memory
+    // invariants, so a poisoned mutex is recovered rather than propagated — a
+    // panic in some other add must not permanently disable isolation.
+    let _add_guard = WORKTREE_ADD_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // A stale dir from a crashed prior run would make `git worktree add` fail;
     // best-effort clear it first (only an empty/leftover one is expected here).
     let _ = std::process::Command::new("git")
@@ -3230,6 +3283,24 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, run_id: String, task:
     } else {
         None
     };
+    // FIX A — isolation was REQUESTED and the cwd is a repo, but no worktree
+    // exists: refuse the run instead of silently sharing the checkout. The old
+    // fallback handed the worker its PARENT's worktree, so "isolated" siblings
+    // edited the same files and committed onto the parent's branch — a data-loss
+    // failure mode that surfaced only in unread stderr. Failing loudly costs one
+    // re-dispatch; degrading silently costs the work.
+    if isolation_failed(spec.isolate, worktree.is_some(), is_git_repo(&spec.cwd)) {
+        job.set_failed(format!(
+            "refusing to run an isolated worker without a worktree: `git worktree add` failed for {} \
+after {} attempts. Sharing the launching checkout would let parallel coordinators clobber each \
+other's files and commit onto the wrong branch, so this run is failed instead. Re-dispatch it (run \
+`git worktree prune` first if stale worktrees have accumulated).",
+            spec.cwd.display(),
+            WORKTREE_ADD_MAX_ATTEMPTS,
+        ));
+        on_complete(&jobs, &job);
+        return;
+    }
     let run_cwd = worktree
         .as_ref()
         .map(|w| w.path.clone())
@@ -3730,6 +3801,23 @@ fn flush_results(jobs: &WorkerJobs) {
 
 #[cfg(test)]
 mod tests {
+    // FIX A — the dangerous-degradation truth table. Only one cell may fail the
+    // run: isolation asked for, repo present, no worktree. Every other cell is
+    // either a legitimate shared-cwd run or nothing to isolate at all.
+    #[test]
+    fn isolation_failure_is_only_the_silent_share_case() {
+        // isolate + repo + no worktree ⇒ the regression this guards.
+        assert!(super::isolation_failed(true, false, true));
+        // Worktree present ⇒ isolation held.
+        assert!(!super::isolation_failed(true, true, true));
+        // Not a repo ⇒ nothing to isolate; sharing cwd is the only option.
+        assert!(!super::isolation_failed(true, false, false));
+        assert!(!super::isolation_failed(true, true, false));
+        // Isolation never requested ⇒ shared cwd is the contract.
+        assert!(!super::isolation_failed(false, false, true));
+        assert!(!super::isolation_failed(false, false, false));
+    }
+
     use super::*;
 
     /// Build a bare in-memory `WorkerJob` for barrier tests — no subprocess, no
