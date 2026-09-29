@@ -2895,19 +2895,35 @@ impl WorkerJob {
 
 /// Mint a fresh worker id in the short, readable `w_########` form: a `w_`
 /// prefix plus 8 random base62 characters (a-z, A-Z, 0-9), e.g. `w_a7k3m2pQ`.
-///
-/// Why base62-8 instead of the old 32-hex-char UUID: these ids exist only to
-/// disambiguate the handful of concurrent background workers a single host
-/// spawns in a session, and they appear constantly in terminal output, logs,
-/// and the `background_status` table — so readability wins. 62^8 ≈ 2.18×10^14
-/// (~218 trillion) distinct values give ample collision resistance at those
-/// counts (even a few thousand live ids keep collision odds negligible) while
-/// being ~4× shorter on screen. The randomness is drawn from a UUIDv4's 122
-/// bits, so no extra RNG dependency is pulled in — this is dedup-grade
-/// uniqueness, not a security token. The id is an opaque string everywhere it's
-/// used (only ever compared / `starts_with`-matched, never parsed), so older
-/// `worker_<uuid>`-format ids keep displaying and matching correctly.
+/// Thin wrapper over [`new_prefixed_id`] — see there for the base62/122-bit
+/// rationale it shares with the goal-loop's `g_########` ids.
 fn new_worker_id() -> String {
+    new_prefixed_id("w_")
+}
+
+/// Mint a short, readable, table-friendly id: `prefix` + 8 random base62
+/// characters. ONE implementation shared by every run-id family (`w_########`
+/// workers, `g_########` goal-loop turns) so they all get identical uniqueness
+/// and identical one-glance readability.
+///
+/// Why base62-8 rather than a 32-hex-char UUID: these ids exist only to
+/// disambiguate the handful of concurrent runs a single host has in flight, and
+/// they appear constantly in terminal output, logs, and the
+/// `background_status` table — so readability wins. 62^8 ≈ 2.18×10^14 (~218
+/// trillion) values give ample collision resistance at those counts while being
+/// ~4× shorter on screen. The randomness is drawn from a UUIDv4's 122 bits, so
+/// no extra RNG dependency is pulled in — this is dedup-grade uniqueness, not a
+/// security token. Ids are opaque everywhere they're used (only ever compared /
+/// `starts_with`-matched, never parsed), so older `worker_<uuid>`-format ids
+/// keep displaying and matching correctly.
+///
+/// The separator in `prefix` MUST NOT be `-`: displayed ids are shortened with
+/// [`crate::batch::short_id`], which truncates at the first `-`. A `goal-<uuid>`
+/// style id therefore collapsed to the bare literal `goal` in
+/// `background_status` for EVERY goal turn, leaving `stop` with 47 rows sharing
+/// one unresolvable handle. Underscore-separated prefixes survive `short_id`
+/// intact and stay individually addressable.
+fn new_prefixed_id(prefix: &str) -> String {
     const ALPHABET: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     // Consume a UUIDv4's 122 random bits, peeling off one base62 digit at a
     // time. The modulo bias against 2^128 is astronomically small at 8 digits.
@@ -2917,7 +2933,7 @@ fn new_worker_id() -> String {
         suffix.push(ALPHABET[(n % 62) as usize] as char);
         n /= 62;
     }
-    format!("w_{suffix}")
+    format!("{prefix}{suffix}")
 }
 
 // ---------------------------------------------------------------------------
@@ -3410,13 +3426,51 @@ fn finalize_worktree(worktree: Option<&Worktree>) -> Option<String> {
     }
 }
 
-/// Run a single coordinator subprocess to completion and return its stdout (the
 /// The stderr-stream label the background `:goal` loop runs under. The REPL
 /// `:attach goal` flow sets the shared `attached` handle to this exact string
 /// so each goal turn streams its activity live (see `should_forward`). Exposed
 /// as the single source of truth so the attach sentinel can't drift from it.
 pub const GOAL_STREAM_LABEL: &str = "goal";
 
+/// Prefix of the DURABLE run id minted for each goal-loop turn (`g_########`,
+/// see [`new_goal_id`]) — the worker `w_########` scheme with a `g_` prefix.
+///
+/// Deliberately distinct from [`GOAL_STREAM_LABEL`]: two concerns were fused
+/// onto one string and the collision cost an operator their kill switch.
+///
+/// * [`GOAL_STREAM_LABEL`] (`goal`) is the STABLE, human-typeable stderr-stream
+///   handle — `:attach goal` only works because it is predictable and shared by
+///   every turn. It must never be randomized.
+/// * This prefix heads a UNIQUE-per-turn durable run id. `background_status`
+///   lists one row per turn and `stop`/`tell` resolve an operator-supplied id
+///   (or prefix) against those rows, so a non-unique id makes a runaway goal
+///   loop unstoppable.
+pub const GOAL_RUN_ID_PREFIX: &str = "g_";
+
+/// Mint the durable run id for one goal-loop turn: `g_` + 8 base62 chars (e.g.
+/// `g_aB3xK9pQ`) — the exact scheme background workers use for `w_########`,
+/// only re-prefixed. Unique per turn, so `stop g_aB3xK9pQ` (or an unambiguous
+/// prefix of it) resolves to exactly one run; the shared `g_` prefix keeps a
+/// wall of goal iterations instantly distinguishable from `w_` workers in
+/// `background_status`.
+pub fn new_goal_id() -> String {
+    new_prefixed_id(GOAL_RUN_ID_PREFIX)
+}
+
+/// The `Kind` column label for a durable coordinator run: goal-loop turns are
+/// called out as `goal` so an operator scanning `background_status` can tell at
+/// a glance that N rows are iterations of one goal rather than N unrelated
+/// coordinators. Legacy `goal-<uuid>` rows (pre-`g_` ids, still in old DBs)
+/// are recognized too.
+pub fn run_kind(run_id: &str) -> &'static str {
+    if run_id.starts_with(GOAL_RUN_ID_PREFIX) || run_id.starts_with("goal-") {
+        "goal"
+    } else {
+        "coordinator"
+    }
+}
+
+/// Run a single coordinator subprocess to completion and return its stdout (the
 /// final answer). Unlike `spawn`, it doesn't register a tracked job or
 /// auto-deliver — the caller consumes the output. Used by the goal loop for each
 /// work step.
@@ -3908,6 +3962,63 @@ mod tests {
         assert!(id2.starts_with("w_"));
         assert_eq!(id1.len(), 10); // "w_" + 8 chars
         assert_ne!(id1, id2);
+    }
+
+    // ── goal run ids: unique per turn, `g_` prefixed ────────────────────────
+    //
+    // REGRESSION (production): every goal-loop turn used to record the durable
+    // run id `goal-<uuid>`, which `batch::short_id` truncates at the first `-`
+    // — so `background_status` listed 47+ iterations ALL showing the literal id
+    // `goal`, and `stop goal` could not name a single one. An operator watching
+    // a runaway goal loop burn turns had no kill switch. These tests pin the
+    // two-concerns split: a UNIQUE durable run id per turn vs. the STABLE
+    // stderr-stream label used for `:attach goal`.
+    #[test]
+    fn goal_iterations_get_unique_run_ids() {
+        // Two consecutive goal-loop turns must NOT share a run id.
+        let a = new_goal_id();
+        let b = new_goal_id();
+        assert_ne!(a, b, "two goal iterations must get different run ids");
+        // Same scheme as workers, only re-prefixed: `g_` + 8 base62 chars.
+        for id in [&a, &b] {
+            let suffix = id
+                .strip_prefix(GOAL_RUN_ID_PREFIX)
+                .unwrap_or_else(|| panic!("goal id must carry the g_ prefix: {id}"));
+            assert_eq!(suffix.len(), 8, "suffix must be 8 chars: {id}");
+            assert!(
+                suffix.chars().all(|c| c.is_ascii_alphanumeric()),
+                "suffix must be alphanumeric: {id}"
+            );
+            assert_eq!(id.len(), 10, "g_ + 8 chars: {id}");
+        }
+        assert_eq!(GOAL_RUN_ID_PREFIX, "g_");
+    }
+
+    #[test]
+    fn goal_run_id_survives_short_id_display() {
+        // The defect's proximate cause: `short_id` truncates at the first `-`.
+        // A `-`-separated goal id collapsed to the bare label; the `g_` form
+        // must reach `background_status` INTACT, or `stop` loses its target.
+        let id = new_goal_id();
+        assert_eq!(
+            crate::batch::short_id(&id),
+            id.as_str(),
+            "the displayed goal id must be the full, addressable run id"
+        );
+        assert_eq!(crate::batch::short_id("goal-abc-def"), "goal"); // the old, broken shape
+        // The durable run id is NOT the stream label — that's the whole split.
+        assert_ne!(id.as_str(), GOAL_STREAM_LABEL);
+        assert!(!id.starts_with(GOAL_STREAM_LABEL));
+    }
+
+    #[test]
+    fn run_kind_labels_goal_rows() {
+        // `background_status` readability: 47 goal rows should read as `goal`,
+        // not as 47 unrelated coordinators.
+        assert_eq!(run_kind(&new_goal_id()), "goal");
+        assert_eq!(run_kind("goal-1a2b3c"), "goal"); // legacy rows in old DBs
+        assert_eq!(run_kind(&new_worker_id()), "coordinator");
+        assert_eq!(run_kind("worker_deadbeef"), "coordinator");
     }
 
     #[test]

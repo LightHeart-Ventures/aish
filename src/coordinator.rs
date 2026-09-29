@@ -1993,6 +1993,35 @@ fn worker_store_repo_key(dir: &std::path::Path) -> String {
         .unwrap_or_else(|| "repo".to_string())
 }
 
+/// Does the operator-supplied `query` address the run `run_id`? Exact match, or
+/// `query` is a PREFIX of the id so an operator can type `g_aB3` instead of the
+/// whole thing.
+///
+/// Single source of truth for `stop` / `tell` / `:stop` candidate resolution
+/// (they each used to inline this same closure). Callers are responsible for
+/// rejecting an ambiguous query — one that matches more than one run — which is
+/// exactly what a NON-UNIQUE run id makes unavoidable: when every goal-loop turn
+/// recorded the literal id `goal`, `stop goal` matched 47 rows and the operator
+/// had no way to name just one.
+pub fn id_matches(run_id: &str, query: &str) -> bool {
+    run_id == query || run_id.starts_with(query)
+}
+
+/// Resolve `query` against a set of run ids, returning every match. Exposed so
+/// the uniqueness invariant `stop` depends on is directly testable: a displayed
+/// goal run id must resolve to exactly ONE run. Test-only: the production
+/// `stop` / `tell` paths filter their own live candidate lists with
+/// [`id_matches`] (they carry a row payload, not a bare id).
+#[cfg(test)]
+pub fn resolve_run_ids<'a, I>(ids: I, query: &str) -> Vec<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    ids.into_iter()
+        .filter(|rid| id_matches(rid, query))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     /// The terminal-write retry schedule doubles and stays bounded, so a child
@@ -2753,5 +2782,51 @@ mod tests {
     fn stalled_row_tolerates_future_heartbeat() {
         let future = unix_to_sqlite(NOW + 3_600);
         assert!(!is_stalled_row("coordinating", Some(&future), NOW));
+    }
+
+    /// REGRESSION (production): `background_status` listed 47+ goal-loop turns
+    /// that ALL reported the literal run id `goal`, so `stop goal` matched every
+    /// row and could not name one — a runaway goal loop had no kill switch.
+    /// Unique per-turn ids restore it: each id, and any prefix long enough to be
+    /// unambiguous, must resolve to exactly ONE run.
+    #[test]
+    fn goal_run_ids_resolve_uniquely_for_stop() {
+        let ids: Vec<String> = (0..50).map(|_| crate::worker::new_goal_id()).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+
+        // Full id → exactly one run, every time.
+        for id in &refs {
+            let hits = super::resolve_run_ids(refs.iter().copied(), id);
+            assert_eq!(hits, vec![*id], "id {id} must resolve to exactly one run");
+        }
+
+        // A prefix is still addressable (operator ergonomics) and, at 8 random
+        // base62 chars, unique across a 50-turn loop.
+        let probe = refs[7];
+        let hits = super::resolve_run_ids(refs.iter().copied(), &probe[..6]);
+        assert_eq!(hits, vec![probe], "a 6-char prefix must select one run");
+
+        // And the shape of the OLD bug: a shared, non-unique id fans out.
+        let broken = vec!["goal", "goal", "goal"];
+        assert_eq!(
+            super::resolve_run_ids(broken, "goal").len(),
+            3,
+            "the pre-fix ids matched every row — that was the defect"
+        );
+        // The stable stream label must NOT collide with the new run ids, or
+        // `stop goal` would again sweep the whole loop.
+        assert!(
+            super::resolve_run_ids(refs.iter().copied(), crate::worker::GOAL_STREAM_LABEL)
+                .is_empty(),
+            "the attach label must address no durable run"
+        );
+    }
+
+    #[test]
+    fn id_matches_is_exact_or_prefix() {
+        assert!(super::id_matches("g_aB3xK9pQ", "g_aB3xK9pQ"));
+        assert!(super::id_matches("g_aB3xK9pQ", "g_aB3"));
+        assert!(!super::id_matches("g_aB3xK9pQ", "w_aB3"));
+        assert!(!super::id_matches("g_aB3", "g_aB3xK9pQ")); // query longer than id
     }
 }
