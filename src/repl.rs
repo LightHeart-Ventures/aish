@@ -6283,7 +6283,7 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
         println!("coordinator store unavailable — can't queue messages");
         return;
     };
-    let hit = |rid: &str| rid == id || rid.starts_with(id);
+    let hit = |rid: &str| crate::coordinator::id_matches(rid, id);
 
     // Candidates: (run_id, terminal?). This session's in-memory workers first —
     // their run_id is known even before the child has written its store row, so a
@@ -6432,7 +6432,7 @@ fn stop_coordinator(id: Option<&str>, any: bool, session: &mut Session) {
         println!("coordinator store unavailable — can't stand down a coordinator");
         return;
     };
-    let hit = |rid: &str| rid == id || rid.starts_with(id);
+    let hit = |rid: &str| crate::coordinator::id_matches(rid, id);
 
     // Candidates: (run_id, terminal?, owner, pid). This session's in-memory
     // workers first — their pid is known so we can interrupt the current turn —
@@ -11037,6 +11037,13 @@ mod tests {
         assert_eq!(GOAL_ATTACH_ID, "goal");
         // short_id leaves the bare sentinel intact for the ⇄ prompt badge.
         assert_eq!(crate::batch::short_id(GOAL_ATTACH_ID), "goal");
+        // The OTHER half of the split: the attach label is deliberately NOT the
+        // durable per-turn run id. It stays stable (so `:attach goal` keeps
+        // working) while each turn files a unique `g_########` run id that
+        // `stop` can target — see `worker::GOAL_RUN_ID_PREFIX`.
+        let run_id = crate::worker::new_goal_id();
+        assert_ne!(run_id.as_str(), GOAL_ATTACH_ID);
+        assert!(run_id.starts_with(crate::worker::GOAL_RUN_ID_PREFIX));
     }
 
     #[test]

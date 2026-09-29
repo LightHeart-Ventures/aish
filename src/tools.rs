@@ -2354,7 +2354,7 @@ fn tell(call: &ToolCall, session: &Session) -> Result<String> {
     let Some(store) = &session.coordinator_store else {
         anyhow::bail!("coordinator store unavailable — can't queue messages");
     };
-    let hit = |rid: &str| rid == id || rid.starts_with(id);
+    let hit = |rid: &str| crate::coordinator::id_matches(rid, id);
 
     // (run_id, terminal?). This session's in-memory workers first — their id is
     // known before the child writes its store row, so a message sent right after
@@ -2431,7 +2431,7 @@ fn stop(call: &ToolCall, session: &Session) -> Result<String> {
     let Some(store) = &session.coordinator_store else {
         anyhow::bail!("coordinator store unavailable — can't stand down a coordinator");
     };
-    let hit = |rid: &str| rid == id || rid.starts_with(id);
+    let hit = |rid: &str| crate::coordinator::id_matches(rid, id);
 
     // (run_id, terminal?, pid). This session's in-memory workers first — capture
     // the child pid so we can interrupt its current turn — then durable runs from
@@ -2739,8 +2739,9 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
         };
         full_tasks.push((crate::batch::short_id(&w.id).to_string(), w.task.clone()));
         out.push_str(&format!(
-            "| `{}` | coordinator | you | {} | {} | {} | {} | — |\n",
+            "| `{}` | {} | you | {} | {} | {} | {} | — |\n",
             crate::batch::short_id(&w.id),
+            crate::worker::run_kind(&w.id),
             status_cell,
             beat,
             since,
@@ -2803,9 +2804,13 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
                 let beat =
                     crate::style::fmt_heartbeat_age(r.heartbeat_at.as_deref(), terminal, now_epoch);
                 full_tasks.push((crate::batch::short_id(&r.run_id).to_string(), r.task.clone()));
+                // Kind: goal-loop turns are labelled `goal` (not `coordinator`)
+                // so a wall of iterations is recognizable at a glance — see
+                // `worker::run_kind`.
                 out.push_str(&format!(
-                    "| `{}` | coordinator | {} | {} | {} | {} | {} | {} |\n",
+                    "| `{}` | {} | {} | {} | {} | {} | {} | {} |\n",
                     crate::batch::short_id(&r.run_id),
+                    crate::worker::run_kind(&r.run_id),
                     owner,
                     phase_cell,
                     beat,

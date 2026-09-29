@@ -601,7 +601,13 @@ async fn run_goal_loop(
             i.turn_started = Some(Instant::now());
             i.phase = Step::Working;
         }
-        let run_id = format!("goal-{}", uuid::Uuid::new_v4());
+        // A UNIQUE durable run id per turn, in the short `g_########` form
+        // (see `worker::new_goal_id`). Uniqueness is what gives the operator
+        // a kill switch: each turn files its own `coordinator_runs` row, and
+        // `stop <id>` must resolve to exactly one of them. The stream label the
+        // turn's stderr is attached under stays the stable `goal` sentinel —
+        // two different concerns, deliberately not the same string.
+        let run_id = crate::worker::new_goal_id();
         let output = match crate::worker::run_once(&spec, &directive, &run_id).await {
             Ok(o) => {
                 // Productive turn — clear the failure streak so intermittent,
