@@ -586,6 +586,38 @@ fn fold_operator_messages(
     msgs.len()
 }
 
+/// Parse an operator `:tell` message as a live-stream (`:output`) directive.
+///
+/// Defect 1, mid-flight half: a headless coordinator has no REPL, so `:output on`
+/// can't be typed into it — but `tell` already reaches it durably at every round
+/// boundary. When a steer's ENTIRE body is an output directive we route it to the
+/// [`ControlSignal::OutputMode`] signal instead of the model's context, so an
+/// operator can open (or close) a stacked coordinator's stream WITHOUT restarting
+/// the run. Accepts `:output on`, `output off`, `worker-output on`, `:worker
+/// output 1`, … (leading `:` optional, case- and space-insensitive).
+///
+/// A bare `:output` with no argument is deliberately NOT a directive — for a
+/// coordinator "toggle" is ambiguous, and returning `None` just means the message
+/// is delivered to the model as an ordinary steer. Pure → unit-testable.
+pub(crate) fn parse_output_directive(msg: &str) -> Option<crate::worker::WorkerOutputMode> {
+    let lowered = msg
+        .trim()
+        .trim_start_matches(':')
+        .trim()
+        .to_ascii_lowercase();
+    let rest = lowered
+        .strip_prefix("worker-output")
+        .or_else(|| lowered.strip_prefix("worker output"))
+        .or_else(|| lowered.strip_prefix("worker_output"))
+        .or_else(|| lowered.strip_prefix("output"))?
+        .trim();
+    match rest {
+        "on" | "1" | "true" | "yes" => Some(crate::worker::WorkerOutputMode::On),
+        "off" | "0" | "false" | "no" => Some(crate::worker::WorkerOutputMode::Off),
+        _ => None,
+    }
+}
+
 /// Drive a coordinator run to a terminal state, persisting phase transitions to
 /// `store` so a restart resumes. This is the headless `--coordinator` body
 /// (called by `engine::run_coordinator`): it runs full-tool agentic rounds and,
@@ -611,6 +643,28 @@ pub async fn drive(
     // copy lives in the never-compacted system prompt, so the worker keeps its
     // assignment in front of it no matter how long it runs.
     session.task_anchor = Some(input.clone());
+
+    // ── Defect 1: seed the `:output` live-stream gate from the INHERITED env.
+    //
+    // A headless coordinator has no REPL, so `:output on` can never be typed
+    // into it — its `show_worker_output` Arc started hard-`false` and stayed
+    // there for the whole run. It still faithfully READ its sub-coordinator's
+    // stderr in `stream_stderr` and then dropped every line at the gate, so an
+    // operator with `:output on` at the TOP of the chain saw the child's rows but
+    // never the grandchild's. The parent now stamps `AISH_WORKER_OUTPUT` on spawn
+    // (`worker::worker_command` / the container `env_inline`); `Session::new`
+    // seeds from it, and we re-assert it HERE — where the run actually begins —
+    // so a Session built on another path (tests, `--resume`, an embedder) also
+    // honours the inherited choice. Only an explicit ON is applied: absent/`0`
+    // leaves the historical quiet default alone.
+    let inherited_output = crate::worker::WorkerOutputMode::from_env();
+    if inherited_output.is_on() && !session.worker_output_mode().is_on() {
+        session.set_worker_output_mode(inherited_output);
+        eprintln!(
+            "\x1b[2maish: worker-output inherited ON from parent ({}=1)\x1b[0m",
+            crate::worker::WORKER_OUTPUT_ENV
+        );
+    }
 
     // ── Operator interrupt (Ctrl-C forwarding). By default SIGINT terminates
     // the process; a coordinator must instead treat it as "interrupt the
@@ -943,7 +997,16 @@ plus `git status` instead — do not fail the run over it.\n\n{PHASE0_GUARD}\n\n
         }
         if let Some(s) = store {
             for m in s.drain_messages(run_id).unwrap_or_default() {
-                control.sender().steer(m);
+                // Defect 1 (mid-flight flip): a message whose WHOLE body is an
+                // output directive is a CONTROL signal, not context for the
+                // model. Route it to `OutputMode` so `tell <run> ":output on"`
+                // opens a stacked coordinator's stream without a restart —
+                // previously the only producer was the self-poll below, which in
+                // a headless run can never change.
+                let _delivered = match parse_output_directive(&m) {
+                    Some(mode) => control.sender().output_mode(mode),
+                    None => control.sender().steer(m),
+                };
             }
         }
         {
@@ -962,6 +1025,9 @@ plus `git status` instead — do not fail the run over it.\n\n{PHASE0_GUARD}\n\n
                 ControlSignal::Steer(m) => steers.push(m),
                 ControlSignal::OutputMode(mode) => {
                     session.set_worker_output_mode(mode);
+                    // Keep the self-poll baseline in step, or it would re-enqueue
+                    // this same change next round and log it twice.
+                    last_output_mode = mode;
                     eprintln!("\x1b[2maish: operator set worker-output {mode:?}\x1b[0m");
                 }
             }
@@ -2024,6 +2090,53 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// Defect 1 (mid-flight half): a headless coordinator has no REPL, so the
+    /// ONLY way to open its `:output` gate after launch is a `tell`. A steer whose
+    /// whole body is an output directive becomes a control signal; anything else
+    /// stays an ordinary steer that reaches the model.
+    #[test]
+    fn tell_output_directive_becomes_a_control_signal() {
+        use crate::worker::WorkerOutputMode::{Off, On};
+        for on in [
+            ":output on",
+            "output on",
+            "OUTPUT ON",
+            ":worker-output on",
+            "worker output 1",
+            "  :output  true  ",
+            ":output yes",
+        ] {
+            assert_eq!(
+                super::parse_output_directive(on),
+                Some(On),
+                "{on:?} should open the stream"
+            );
+        }
+        for off in [
+            ":output off",
+            "worker-output 0",
+            ":output false",
+            "output no",
+        ] {
+            assert_eq!(super::parse_output_directive(off), Some(Off), "{off:?}");
+        }
+        // NOT directives — these must reach the model as normal steers. A bare
+        // `:output` is ambiguous for a coordinator (nothing to toggle against).
+        for steer in [
+            ":output",
+            "output the report to a file",
+            "please turn on the output when you get a chance",
+            "",
+            ":stop",
+        ] {
+            assert_eq!(
+                super::parse_output_directive(steer),
+                None,
+                "{steer:?} must stay a steer"
+            );
+        }
+    }
+
     /// The terminal-write retry schedule doubles and stays bounded, so a child
     /// that loses the write race to a sibling gets ~1.5s of retries before the
     /// parent is left to reconcile its row as orphaned.

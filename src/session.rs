@@ -672,9 +672,17 @@ impl Session {
             goal: None,
             goals: Vec::new(),
             backend_kind: "claude".to_string(),
-            show_worker_output: Arc::new(AtomicBool::new(false)),
+            // Seed the `:output` gate from the INHERITED env (Defect 1). A
+            // headless coordinator has no REPL to run `:output on`, so a
+            // hard-`false` seed meant its gate could never open and it silently
+            // dropped every line it read from its own sub-coordinator. An
+            // interactive session normally has the var unset → `Off`, the
+            // historical default.
+            show_worker_output: Arc::new(AtomicBool::new(
+                crate::worker::WorkerOutputMode::from_env().is_on(),
+            )),
             worker_output_mode: Arc::new(AtomicU8::new(
-                crate::worker::WorkerOutputMode::default().as_u8(),
+                crate::worker::WorkerOutputMode::from_env().as_u8(),
             )),
             escalation: None,
             turn_audit: None,

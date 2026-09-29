@@ -2305,6 +2305,18 @@ sentence that you're on it and the answer will appear when ready."
         child_env.retain(|(k, _)| k != "AISH_FANOUT_TIER");
         child_env.push(("AISH_FANOUT_TIER".to_string(), "batch".to_string()));
     }
+    // ── Defect 1: carry the operator's `:output` choice ACROSS the process
+    // boundary. `show_output` below is an Arc shared only within THIS process —
+    // the spawned coordinator gets a fresh `Session` whose gate seeded hard-
+    // `false`, so it read its own sub-coordinator's stderr and dropped every
+    // line. Stamping the mode in the child's env lets `Session::new` /
+    // `coordinator::drive` seed the gate open, so activity forwards the whole
+    // way up a stacked chain (operator → coordinator → sub-coordinator).
+    child_env.retain(|(k, _)| k != crate::worker::WORKER_OUTPUT_ENV);
+    child_env.push((
+        crate::worker::WORKER_OUTPUT_ENV.to_string(),
+        session.worker_output_mode().as_env_value().to_string(),
+    ));
     let spec = crate::worker::WorkerSpec {
         exe,
         cwd: session.cwd.clone(),

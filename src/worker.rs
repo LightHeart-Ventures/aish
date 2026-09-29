@@ -76,6 +76,18 @@ pub const PULSE_FADE: Duration = Duration::from_millis(900);
 // Worker-output mode — the `:output on|off` live-stream toggle
 // ---------------------------------------------------------------------------
 
+/// Env var a parent stamps on every coordinator it spawns so the child INHERITS
+/// the operator's `:output` choice.
+///
+/// Defect 1 (stacked sub-coordinator output): the gate lived only in the parent
+/// process's `Session`, so a headless coordinator started with
+/// `show_worker_output = false` and NOTHING could ever flip it — it faithfully
+/// read its own sub-coordinator's stderr and then dropped every line at the gate.
+/// The operator with `:output on` at the top of the chain saw the child's lines
+/// but never the grandchild's. Propagating the mode through the process boundary
+/// is the fix; `OutputMode` control signals let it also be flipped mid-flight.
+pub const WORKER_OUTPUT_ENV: &str = "AISH_WORKER_OUTPUT";
+
 /// Binary state controlling whether a background coordinator's live activity is
 /// forwarded to the terminal (the `:output` toggle).
 ///
@@ -107,6 +119,40 @@ impl WorkerOutputMode {
         match v {
             1 => WorkerOutputMode::On,
             _ => WorkerOutputMode::Off,
+        }
+    }
+
+    /// True when the live stream is pinned ON.
+    pub fn is_on(self) -> bool {
+        matches!(self, WorkerOutputMode::On)
+    }
+
+    /// Decode the mode a PARENT stamped into this process's environment
+    /// ([`WORKER_OUTPUT_ENV`]). `1`/`on`/`true`/`yes` (any case) ⇒ `On`;
+    /// anything else — including an unset var — ⇒ `Off`, preserving the
+    /// historical quiet default for a normal interactive session.
+    pub fn from_env() -> Self {
+        match std::env::var(WORKER_OUTPUT_ENV) {
+            Ok(v) => Self::parse(&v),
+            Err(_) => WorkerOutputMode::Off,
+        }
+    }
+
+    /// Parse the env-var spelling. Kept separate from [`from_env`] so it is
+    /// unit-testable without mutating process state.
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "on" | "true" | "yes" => WorkerOutputMode::On,
+            _ => WorkerOutputMode::Off,
+        }
+    }
+
+    /// The env-var value to stamp on a spawned coordinator so it inherits this
+    /// mode (the write side of [`from_env`]).
+    pub fn as_env_value(self) -> &'static str {
+        match self {
+            WorkerOutputMode::Off => "0",
+            WorkerOutputMode::On => "1",
         }
     }
 }
@@ -192,7 +238,7 @@ fn lex_activity(raw: &str) -> ActivityEvent {
     }
     // 🗨 turn narration: the pulse fires on the sentinel even with empty text
     // (legacy `classify_event` semantics), so carry `text` as an Option.
-    if raw.trim_start().starts_with('🗨') {
+    if has_sentinel(raw, "🗨") {
         return ActivityEvent::Turn { text: strip_sentinel(raw, "🗨") };
     }
     if let Some(text) = strip_sentinel(raw, "📦") {
@@ -291,9 +337,135 @@ fn clean_activity_line(raw: &str) -> Option<String> {
 /// A coordinator stderr line carrying turn text (the `🗨` sentinel emitted by
 /// `engine::emit_narration`) or a batch-phase notice (`📦` from the coordinator
 /// loop). Returns the cleaned text after the sentinel, or `None`.
+///
+/// Defect 2 (stacked coordinators): a line may arrive already FRAMED as a pane
+/// row by an intermediate coordinator (`┃ [w_abc] 🗨 …`). The sentinel is then no
+/// longer at the start of the line, and a naive prefix test classifies the row as
+/// `Noise` — which is exactly how a grandchild's narration went missing. So scan
+/// for the sentinel BOTH at the head of the line and after stripping one pane
+/// gutter, letting depth-N framing NEST instead of erasing classification.
 fn strip_sentinel(raw: &str, mark: &str) -> Option<String> {
-    let rest = raw.trim_start().strip_prefix(mark)?.trim_start();
+    let head = raw.trim_start();
+    let rest = match head.strip_prefix(mark) {
+        Some(r) => r,
+        // Not at the head — retry once past the pane gutter a parent added.
+        None => strip_pane_gutter(head)?.strip_prefix(mark)?,
+    };
+    let rest = rest.trim_start();
     (!rest.is_empty()).then(|| rest.to_string())
+}
+
+/// True when THIS process is itself a background coordinator (i.e. anything it
+/// prints to stderr is read + lexed by a PARENT aish). Cached — the env is fixed
+/// for the process lifetime and this is consulted on a hot stderr-drain loop.
+fn in_coordinator() -> bool {
+    static NESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NESTED.get_or_init(|| std::env::var("AISH_COORDINATOR").is_ok())
+}
+
+/// The sentinel to re-stamp OUTSIDE the pane frame when re-emitting a child's
+/// line from inside a coordinator (Defect 2, write side).
+///
+/// [`ActivityEvent::forward_text`] rewrites a sentinel into its DISPLAY glyph
+/// (`🗨` → `🚀`, `📦` → `🐌`) and [`pane_row`] then prepends the `┃ [label]`
+/// gutter — so the re-emitted line carried NO sentinel at its head and the
+/// grandparent lexed it as `Noise` and dropped it. That is why a stacked
+/// sub-coordinator's narration never reached the operator. Re-stamping the
+/// sentinel OUTERMOST (`🗨 ┃ [label] 🚀 …`) keeps the row classifiable at every
+/// depth while leaving the rendered pane untouched. A tool RESULT needs no stamp:
+/// its 🔧/🛠️/🤝 glyph is matched anywhere in the line, so it already nests.
+fn nesting_sentinel(event: &ActivityEvent) -> Option<&'static str> {
+    match event {
+        ActivityEvent::Console(_) => Some("📣"),
+        ActivityEvent::Thinking(_) => Some("💭"),
+        ActivityEvent::Turn { .. } => Some("🗨"),
+        ActivityEvent::Batch(_) => Some("📦"),
+        ActivityEvent::ToolResult { .. } | ActivityEvent::ToolStart | ActivityEvent::Noise => None,
+    }
+}
+
+/// Apply [`nesting_sentinel`] to an already-framed pane row when this process is
+/// a coordinator; a top-level interactive session emits the row unchanged (the
+/// operator's terminal is the last hop — nothing downstream lexes it).
+///
+/// Only the FIRST line is stamped. Multi-line rows come from terminal wrapping,
+/// which only happens on a TTY — and a coordinator is never a TTY, so a nested
+/// row is always single-line.
+fn nest_row(event: &ActivityEvent, row: String) -> String {
+    match nesting_sentinel(event).filter(|_| in_coordinator()) {
+        Some(mark) => format!("{mark} {row}"),
+        None => row,
+    }
+}
+
+/// True when `mark` leads the line, either directly or once one pane gutter a
+/// parent coordinator added is stripped (Defect 2). Unlike [`strip_sentinel`] it
+/// does not require non-empty text after the sentinel — a bare `🗨` still means
+/// "a turn completed" (the pulse fires on the sentinel alone).
+fn has_sentinel(raw: &str, mark: &str) -> bool {
+    let head = raw.trim_start();
+    head.starts_with(mark) || strip_pane_gutter(head).is_some_and(|b| b.starts_with(mark))
+}
+
+/// Strip ONE pane-row gutter — the `┃` wall plus the `[label]` tag an
+/// intermediate coordinator prepends in [`pane_row`] — returning the row body.
+/// `None` when the line is not a pane row, or when anything other than chrome
+/// (ANSI escapes / whitespace) precedes the wall.
+///
+/// This is the read side of the Defect-2 fix: framing must be TRANSPARENT to the
+/// lexer so a re-framed child line stays classifiable by the grandparent.
+fn strip_pane_gutter(raw: &str) -> Option<&str> {
+    let (before, after) = raw.split_once(PANE_WALL)?;
+    // Only terminal chrome may precede the wall — real prose containing a `┃`
+    // must NOT be mistaken for a pane row.
+    if !before.chars().all(is_chrome) {
+        return None;
+    }
+    let after = skip_chrome(after);
+    // Optional `[label]` tag (itself usually wrapped in a dim ANSI pair).
+    let body = match after.strip_prefix('[') {
+        Some(r) => match r.split_once(']') {
+            Some((_label, rest)) => rest,
+            None => return None,
+        },
+        None => after,
+    };
+    Some(skip_chrome(body))
+}
+
+/// The box-drawing wall [`pane_row`] uses as a forwarded row's left border.
+const PANE_WALL: char = '┃';
+
+/// True for a character that is pure terminal chrome: whitespace or part of an
+/// ANSI CSI escape (`\x1b[2;36m`). Used to prove nothing but formatting precedes
+/// a pane wall.
+fn is_chrome(c: char) -> bool {
+    c.is_whitespace()
+        || c == '\x1b'
+        || c == '['
+        || c == ';'
+        || c == 'm'
+        || c.is_ascii_digit()
+}
+
+/// Skip leading ANSI escapes + whitespace, returning the first real character.
+fn skip_chrome(s: &str) -> &str {
+    let mut rest = s;
+    loop {
+        let trimmed = rest.trim_start();
+        let next = match trimmed.strip_prefix('\x1b') {
+            // A CSI sequence: `\x1b[` … terminated by an alphabetic byte.
+            Some(tail) => match tail.strip_prefix('[') {
+                Some(params) => match params.find(|c: char| c.is_ascii_alphabetic()) {
+                    Some(i) => &params[i + 1..],
+                    None => return trimmed,
+                },
+                None => return trimmed,
+            },
+            None => return trimmed,
+        };
+        rest = next;
+    }
 }
 
 /// A coordinator's `message_console` note: the `📣` sentinel line emitted by the
@@ -1294,7 +1466,13 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
             // single trailing newline (ending the note's own line), so the extra
             // leading `\n` gives the blank line ABOVE and the extra trailing `\n`
             // gives the blank line BELOW.
-            crate::tools::announce_raw(&format!("\n{}\n", console_row(label, note)));
+            // Defect 2: re-stamp the 📣 sentinel OUTSIDE the console frame when
+            // this process is itself a coordinator, so OUR parent still lexes the
+            // note as an always-surfaced console message instead of `Noise`.
+            crate::tools::announce_raw(&format!(
+                "\n{}\n",
+                nest_row(&event, console_row(label, note))
+            ));
             if tail.len() == STDERR_TAIL_LINES {
                 tail.pop_front();
             }
@@ -1351,8 +1529,14 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
             // replay. A line forwarded only because the global `:worker-output`
             // toggle is on (not attached) keeps the cyan `pane_row`.
             let live = attached_id.as_deref() == Some(label);
-            let render_row =
-                |t: &str| if live { pane_row_live(label, t) } else { pane_row(label, t) };
+            // Defect 2: when THIS process is a coordinator, the row we print is
+            // read by our own parent — re-stamp the event's sentinel outermost so
+            // framing nests (`🗨 ┃ [label] 🚀 …`) instead of erasing the
+            // classification and stranding a grandchild's activity.
+            let render_row = |t: &str| {
+                let row = if live { pane_row_live(label, t) } else { pane_row(label, t) };
+                nest_row(&event, row)
+            };
             if on {
                 // This worker's first forwarded line after an `:attach` replaces
                 // any attach-time "thinking…" placeholder spinner — stop + erase
@@ -4160,6 +4344,73 @@ mod tests {
         assert_eq!(clean_activity_line("coordinator run abc starting"), None);
         assert_eq!(clean_activity_line(""), None);
         assert_eq!(clean_activity_line("   \x1b[2m\x1b[0m  "), None);
+    }
+
+    #[test]
+    /// Defect 2 (READ side): a line already framed as a pane row by an
+    /// intermediate coordinator must still lex to its real event. Before the fix
+    /// the `┃ [label]` gutter pushed the sentinel off the head of the line and
+    /// every grandchild row classified as `Noise` — the silent drop.
+    fn framed_child_rows_still_lex() {
+        // A parent re-framed the child's line: gutter first, sentinel inside.
+        let framed = pane_row("w_child", "🗨 planning the migration");
+        assert_eq!(
+            lex_activity(&framed),
+            ActivityEvent::Turn { text: Some("planning the migration".to_string()) },
+            "a framed turn row must stay a Turn, not Noise: {framed:?}"
+        );
+        assert_eq!(lex_activity(&framed).pulse(), Some(Pulse::Turn));
+        // Same for the thinking / batch / console sentinels.
+        assert_eq!(
+            lex_activity(&pane_row("w_child", "💭 weighing options")),
+            ActivityEvent::Thinking("weighing options".to_string())
+        );
+        assert_eq!(
+            lex_activity(&pane_row("w_child", "📦 fanned 3 sub-task(s) out")),
+            ActivityEvent::Batch("fanned 3 sub-task(s) out".to_string())
+        );
+        assert_eq!(
+            lex_activity(&pane_row("w_child", "📣 heads up")),
+            ActivityEvent::Console("heads up".to_string())
+        );
+        // Prose that merely CONTAINS a wall is not a pane row — no misparse.
+        assert_eq!(lex_activity("the glyph ┃ 🗨 is a wall"), ActivityEvent::Noise);
+        // And an unframed line is unaffected (the historical path).
+        assert_eq!(
+            lex_activity("🗨 planning the migration"),
+            ActivityEvent::Turn { text: Some("planning the migration".to_string()) }
+        );
+    }
+
+    #[test]
+    /// Defect 2 (WRITE side): a coordinator re-emits a child row with the
+    /// sentinel OUTERMOST so its own parent can lex it. Round-trips through the
+    /// lexer at depth 2 — the exact path that used to lose the classification.
+    fn nested_reframing_round_trips_through_the_lexer() {
+        // Depth-1: what the child printed and the parent forwarded.
+        let event = lex_activity("🗨 planning the migration");
+        let text = event.forward_text().expect("a turn forwards its text");
+        let row = pane_row("w_child", &text);
+        // Un-nested (top-level session): rendered as-is, no stamp.
+        assert!(!row.starts_with('🗨'));
+        // Nested (this process is itself a coordinator): sentinel outermost.
+        let nested = format!("{} {row}", nesting_sentinel(&event).expect("turn ⇒ 🗨"));
+        assert!(nested.starts_with('🗨'), "sentinel must lead: {nested:?}");
+        // The GRANDPARENT lexes it back to a Turn — the drop is gone.
+        assert!(
+            matches!(lex_activity(&nested), ActivityEvent::Turn { .. }),
+            "depth-2 row must lex as a Turn: {nested:?}"
+        );
+        assert_eq!(lex_activity(&nested).pulse(), Some(Pulse::Turn));
+        // A tool RESULT needs no stamp: its glyph is matched anywhere in the
+        // line, so it already nests through re-framing.
+        let tool = lex_activity("\x1b[2m✓ 🔧 git status\x1b[0m");
+        assert_eq!(nesting_sentinel(&tool), None);
+        let tool_text = tool.forward_text().expect("a tool result forwards text");
+        assert!(matches!(
+            lex_activity(&pane_row("w_child", &tool_text)),
+            ActivityEvent::ToolResult { ok: true, .. }
+        ));
     }
 
     #[test]
