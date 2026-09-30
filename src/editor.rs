@@ -281,6 +281,13 @@ impl RustylineEditor {
                     guard.restore();
                     crate::tools::set_idle_prompt_active(false);
                     erase_prompt_line();
+                    // From here the operator owns a line buffer inside rustyline
+                    // and we no longer poll the resume wake. Mark the window so a
+                    // concurrently-finishing coordinator's TIOCSTI nudge is
+                    // DEFERRED instead of submitting their partial line
+                    // (GH#734 / ISS-409771). Cleared on drop, whatever readline
+                    // returns.
+                    let _edit = LineEditGuard::enter();
                     let res = self.rl.readline(prompt);
                     return Some(self.outcome(res));
                 }
@@ -506,6 +513,64 @@ fn background_pending() -> bool {
     BACKGROUND_PENDING.load(Ordering::Relaxed)
 }
 
+// ---------------------------------------------------------------------------
+// Mid-edit guard for the TIOCSTI nudge (GH#734 / ISS-409771).
+//
+// `RESUME_WAKE` only covers the idle poll window BEFORE the operator's first
+// keystroke: the moment a key arrives, `poll_until_wake_or_key` hands control to
+// rustyline for a full-fidelity edit and stops polling the wake. If a fanned-out
+// coordinator finishes during THAT window, the presenter's belt-and-suspenders
+// `nudge_terminal_return` injects a `\n` into the terminal's input queue — and
+// rustyline, holding the operator's half-typed line, treats that injected Enter
+// as a SUBMIT, sending the partial line truncated (e.g. half a `:dispatch`).
+//
+// So the nudge is deferred whenever a line edit is in flight. The armed resume
+// is NOT disturbed (`RESUME_WAKE` / `session::ResumeState` are untouched): it
+// simply drains on the operator's next real submit, which is exactly the
+// pre-existing fallback behaviour on kernels that gate TIOCSTI off. Deferring
+// can therefore only ever avoid damage — it never loses a resume.
+static LINE_EDIT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Editor -> nudge: mark whether the operator currently has a line in flight
+/// inside rustyline (set on the idle read's keystroke handoff, cleared when that
+/// read returns). Consulted by [`nudge_terminal_return`] so an auto-resume wake
+/// never submits a partially-typed line.
+pub fn set_line_edit_active(active: bool) {
+    LINE_EDIT_ACTIVE.store(active, Ordering::SeqCst);
+}
+
+/// True while the operator is mid-edit on a line they began typing.
+pub fn line_edit_active() -> bool {
+    LINE_EDIT_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// RAII marker for the keystroke-handoff window: sets [`set_line_edit_active`]
+/// on construction and clears it on drop, so the flag can never leak if the
+/// wrapped `readline` returns early (Ctrl-C/Ctrl-D/error) or unwinds.
+struct LineEditGuard;
+
+impl LineEditGuard {
+    fn enter() -> Self {
+        set_line_edit_active(true);
+        LineEditGuard
+    }
+}
+
+impl Drop for LineEditGuard {
+    fn drop(&mut self) {
+        set_line_edit_active(false);
+    }
+}
+
+/// Pure nudge decision, factored out for testability (same pattern as
+/// [`interrupt_outcome`]): inject the newline ONLY when stdin is an interactive
+/// tty AND no line edit is in flight. Anything else defers — a pipe/file has no
+/// input queue to inject into, and a mid-edit buffer would be submitted
+/// truncated (GH#734).
+fn should_nudge(is_tty: bool, line_edit_in_flight: bool) -> bool {
+    is_tty && !line_edit_in_flight
+}
+
 /// Poll stdin for readability up to `timeout_ms`. `Ok(true)` = a byte is ready,
 /// `Ok(false)` = timed out (or an EINTR from e.g. SIGWINCH — reported as a
 /// timeout so the caller simply loops), `Err` = a hard poll failure (caller
@@ -611,9 +676,13 @@ fn erase_prompt_line() {
 // injection hack.
 #[cfg(unix)]
 pub fn nudge_terminal_return() -> bool {
-    // Only meaningful when stdin is an interactive terminal; a pipe/file has no
-    // input queue to inject into and the ioctl would just EINVAL/ENOTTY.
-    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+    // Only meaningful when stdin is an interactive terminal (a pipe/file has no
+    // input queue to inject into and the ioctl would just EINVAL/ENOTTY), and
+    // only safe while NO line edit is in flight — injecting an Enter into a
+    // half-typed line submits it truncated (GH#734 / ISS-409771). Deferring
+    // leaves the armed resume intact; it drains on the next real submit.
+    let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+    if !should_nudge(is_tty, line_edit_active()) {
         return false;
     }
     let newline: libc::c_char = b'\n' as libc::c_char;
@@ -830,6 +899,79 @@ mod tests {
             !background_pending(),
             "set_background_pending(false) must revert to the plain blocking read"
         );
+    }
+
+    /// GH#734 / ISS-409771: the nudge must be DEFERRED while the operator has a
+    /// line in flight. `RESUME_WAKE` only protects the idle poll window before
+    /// the first keystroke; once the poll read hands off to rustyline the human
+    /// owns a buffer, and an injected Enter would submit it truncated. The pure
+    /// decision fn pins all four quadrants — the only case that injects is
+    /// "interactive tty AND no edit in flight".
+    #[test]
+    fn nudge_is_deferred_while_a_line_edit_is_in_flight() {
+        assert!(
+            should_nudge(true, false),
+            "an idle interactive tty with no edit in flight is the case the nudge exists for"
+        );
+        assert!(
+            !should_nudge(true, true),
+            "a line edit in flight must DEFER the nudge — injecting Enter would submit the operator's partial line"
+        );
+        assert!(
+            !should_nudge(false, false),
+            "no tty → nothing to inject into"
+        );
+        assert!(
+            !should_nudge(false, true),
+            "no tty and mid-edit → still deferred"
+        );
+    }
+
+    /// The mid-edit flag round-trips, and the RAII guard clears it on drop even
+    /// when the wrapped read returns early (Ctrl-C / EOF / error). A leaked flag
+    /// would permanently disable the hands-free nudge for the rest of the
+    /// session, so the drop contract is load-bearing.
+    #[test]
+    fn line_edit_guard_marks_and_clears_the_mid_edit_window() {
+        // Clean slate — statics are process-global.
+        set_line_edit_active(false);
+        assert!(!line_edit_active(), "flag starts clear");
+
+        {
+            let _edit = LineEditGuard::enter();
+            assert!(
+                line_edit_active(),
+                "the handoff guard must mark the mid-edit window"
+            );
+            assert!(
+                !nudge_terminal_return(),
+                "the nudge must no-op while a line edit is in flight"
+            );
+        }
+
+        assert!(
+            !line_edit_active(),
+            "the guard must clear the flag on drop so the nudge re-arms"
+        );
+    }
+
+    /// Deferring the nudge must NOT consume or clear the armed resume: the whole
+    /// point is that the resume survives and drains on the operator's next real
+    /// submit. Pins that the mid-edit window and the wake flag are independent.
+    #[test]
+    fn deferring_the_nudge_leaves_the_armed_resume_intact() {
+        let _ = take_resume_wake();
+        arm_resume_wake();
+
+        let _edit = LineEditGuard::enter();
+        assert!(!nudge_terminal_return(), "nudge deferred mid-edit");
+
+        assert!(
+            take_resume_wake(),
+            "the armed resume must still be pending after a deferred nudge"
+        );
+        drop(_edit);
+        let _ = take_resume_wake();
     }
 
     /// `set_cwd` re-points the editor's completion/highlighting at a new cwd —
