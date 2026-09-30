@@ -1388,20 +1388,30 @@ pub async fn run(
                 // compile and behave identically to before.
                 #[cfg(feature = "voice")]
                 {
-                    use crate::voice::{capture, model, resample, stt};
+                    use crate::voice::{capture, config, model, resample, stt};
                     use crossterm::event::{Event, KeyCode, KeyModifiers};
                     use std::io::Write as _;
 
-                    // Hard-coded silence-timeout; TASK-368 will wire this to the
-                    // `voice.silence_ms` config key (default 2 000 ms per SPR-068 §5).
-                    const VOICE_SILENCE_MS: u64 = 2_000;
+                    // TASK-368: load the `voice.*` keys from `~/.aish/config`.
+                    // `load()` never fails — a missing or malformed file falls
+                    // back to the documented defaults (model `tiny.en`, system
+                    // device, language `en`, autosubmit off, 2 000 ms silence),
+                    // so a typo'd key degrades gracefully instead of killing
+                    // dictation.  Every key below is consumed in this arm:
+                    //   silence_ms → step 6 timeout   device → steps 2 + 4
+                    //   model      → step 11          language → step 12
+                    //   autosubmit → step 14
+                    let vcfg = config::VoiceConfig::load();
 
                     // --- Step 1: show the recording indicator. ----------------
                     eprint!("\r\x1b[2m🎤 listening…  Ctrl-G: stop  Esc: cancel\x1b[0m\x1b[K");
                     let _ = std::io::stderr().flush();
 
                     // --- Step 2: query device rate (needed for resample). -----
-                    let src_rate = match capture::default_sample_rate() {
+                    // Resolved through `vcfg` so the rate always describes the
+                    // SAME device step 4 opens — mixing the default device's
+                    // rate with a named device resamples by the wrong ratio.
+                    let src_rate = match capture::sample_rate_with_config(&vcfg) {
                         Ok(r) => r,
                         Err(e) => {
                             eprint!("\r\x1b[K");
@@ -1416,8 +1426,11 @@ pub async fn run(
                         tokio::sync::oneshot::channel::<capture::StopAction>();
 
                     // --- Step 4: start audio capture on a blocking thread. ----
+                    // `_with_config` honours `voice.device`; an unknown device
+                    // name warns and falls back to the system default.
+                    let capture_cfg = vcfg.clone();
                     let capture_handle = tokio::task::spawn_blocking(move || {
-                        capture::record_until_stop(stop_rx)
+                        capture::record_until_stop_with_config(stop_rx, &capture_cfg)
                     });
 
                     // --- Step 5: read the stop key on a blocking thread. ------
@@ -1471,7 +1484,7 @@ pub async fn run(
                             .unwrap_or(capture::StopAction::Cancel)
                         }
                         _ = tokio::time::sleep(
-                            std::time::Duration::from_millis(VOICE_SILENCE_MS)
+                            std::time::Duration::from_millis(vcfg.silence_ms)
                         ) => {
                             // Signal the key reader thread to shut down cleanly.
                             // It will restore raw mode before exiting.
@@ -1515,7 +1528,7 @@ pub async fn run(
                     let _ = std::io::stderr().flush();
 
                     // --- Step 11: await model download (fast when cached). ----
-                    let model_path = match model::ensure_model("tiny.en").await {
+                    let model_path = match model::ensure_model(&vcfg.model).await {
                         Ok(p) => p,
                         Err(e) => {
                             eprint!("\r\x1b[K");
@@ -1528,13 +1541,15 @@ pub async fn run(
                     // --- Step 12: resample + transcribe in spawn_blocking. ----
                     // Both are CPU-bound; running on the blocking thread pool
                     // keeps the tokio worker thread free for other I/O.
+                    let lang = vcfg.language.clone();
                     let transcript_result =
                         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
                             let pcm = resample::to_whisper_pcm(&samples, src_rate)?;
                             if pcm.is_empty() {
                                 return Ok(String::new());
                             }
-                            let mut t = stt::Transcriber::new(&model_path);
+                            // `voice.language` → Whisper's language hint.
+                            let mut t = stt::Transcriber::new(&model_path).with_language(lang);
                             t.transcribe(&pcm)
                         })
                         .await;
@@ -1563,8 +1578,16 @@ pub async fn run(
 
                     // --- Step 14: insert into line buffer via read_line_with_initial.
                     // The user sees the transcript pre-filled in the prompt, can
-                    // edit it, and presses Enter to dispatch.  Never auto-submits
-                    // (design decision D3 from SPR-068 design doc).
+                    // edit it, and presses Enter to dispatch.  This review step
+                    // is the DEFAULT (design decision D3 from the SPR-068 design
+                    // doc) — `voice.autosubmit = true` explicitly opts out of it
+                    // and dispatches the transcript verbatim for hands-free use.
+                    // `text` is already trimmed and non-empty here.
+                    if vcfg.autosubmit {
+                        injected = Some(text);
+                        continue;
+                    }
+
                     let voice_outcome = editor.read_line_with_initial(&prompt, &text);
                     match voice_outcome {
                         ReadOutcome::Line(line) => {

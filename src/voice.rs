@@ -308,6 +308,33 @@ pub mod config {
             assert_eq!(cfg.silence_ms, 2_000);
         }
 
+        /// Contract test for the TASK-368 REPL wiring: a realistic config
+        /// setting ALL five `voice.*` keys must surface every one of them on
+        /// the struct. `src/repl.rs`'s `ReadOutcome::Voice` arm consumes
+        /// exactly these five fields (device + silence_ms for capture, model
+        /// for `ensure_model`, language for the Whisper hint, autosubmit for
+        /// the insert-vs-dispatch branch), so a regression that drops one of
+        /// them silently un-wires a documented key.
+        #[test]
+        fn parse_full_config_surfaces_every_wired_key() {
+            let cfg = VoiceConfig::parse(
+                "# aish config\n\
+                 voice.model = base.en\n\
+                 voice.device = Scarlett Solo\n\
+                 voice.language = fr\n\
+                 voice.autosubmit = true\n\
+                 voice.silence_ms = 1500\n\
+                 unrelated.key = ignored\n",
+            );
+            assert_eq!(cfg.model, "base.en");
+            assert_eq!(cfg.device.as_deref(), Some("Scarlett Solo"));
+            assert_eq!(cfg.language, "fr");
+            assert!(cfg.autosubmit);
+            assert_eq!(cfg.silence_ms, 1_500);
+            // Every field differs from the default — proves none is hard-coded.
+            assert_ne!(cfg, VoiceConfig::default());
+        }
+
         #[test]
         fn parse_invalid_autosubmit_falls_back_to_false() {
             let cfg = VoiceConfig::parse("voice.autosubmit = maybe\n");
@@ -423,6 +450,11 @@ pub mod capture {
     /// This function **blocks the calling thread** (it is designed to be run
     /// inside `tokio::task::spawn_blocking` by the REPL wiring, TASK-367).
     /// cpal's audio callback runs on a separate OS audio thread.
+    // Superseded by `record_until_stop_with_config` (TASK-368): the REPL now
+    // always resolves the device through `VoiceConfig`. Retained as the
+    // zero-config reference path and as the doc anchor the `_with_config`
+    // variants contrast against.
+    #[allow(dead_code)]
     pub fn record_until_stop(stop: StopSignal) -> anyhow::Result<Vec<f32>> {
         let host = cpal::default_host();
         let device = open_input_device(&host, None)?;
@@ -443,6 +475,9 @@ pub mod capture {
     /// # Errors
     /// Returns an error if there is no default input device or querying its
     /// configuration fails.
+    // Superseded by `default_sample_rate_with_config` (TASK-368) — see the
+    // note on `record_until_stop`.
+    #[allow(dead_code)]
     pub fn default_sample_rate() -> anyhow::Result<u32> {
         use cpal::traits::{DeviceTrait, HostTrait};
         let host = cpal::default_host();
@@ -450,6 +485,31 @@ pub mod capture {
             .default_input_device()
             .ok_or(CaptureError::NoDevice)
             .context("voice: no input device")?;
+        let config = device
+            .default_input_config()
+            .map_err(CaptureError::Device)
+            .context("voice: failed to query device config")?;
+        Ok(config.sample_rate())
+    }
+
+    /// Like [`default_sample_rate`] but honours `cfg.device`.
+    ///
+    /// The REPL hands this rate to [`super::resample::to_whisper_pcm`], so it
+    /// MUST describe the same device [`record_until_stop_with_config`] opens.
+    /// Querying the *default* device's rate while recording from a *named*
+    /// device resamples by the wrong ratio — the audio comes out sped up or
+    /// slowed down and Whisper returns garbage. Resolving both through the
+    /// same `cfg` keeps them in lockstep (TASK-368 wiring).
+    ///
+    /// Graceful degradation matches `open_input_device`: an unknown
+    /// `cfg.device` warns on stderr and falls back to the system default.
+    ///
+    /// # Errors
+    /// Returns an error only when no input device exists at all, or when
+    /// querying the resolved device's configuration fails.
+    pub fn sample_rate_with_config(cfg: &super::config::VoiceConfig) -> anyhow::Result<u32> {
+        let host = cpal::default_host();
+        let device = open_input_device(&host, cfg.device.as_deref())?;
         let config = device
             .default_input_config()
             .map_err(CaptureError::Device)
