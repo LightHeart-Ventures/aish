@@ -461,6 +461,48 @@ fn clamp_usize(raw: Option<String>, default: usize, min: usize, max: usize) -> u
 /// atum's `DEFAULT_HEARTBEAT_INTERVAL_MS`.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How many CONSECUTIVE failed heartbeat writes before we say something. One
+/// lost beat is harmless — the next is 30s away and `STALL_AFTER` is ~10 beats
+/// wide — but a RUN of them means the store is genuinely unwritable and this run
+/// is on a path to being reaped as stalled while perfectly healthy.
+const HEARTBEAT_FAILURE_LOG_AFTER: u32 = 2;
+
+/// Write one durable beat, tracking CONSECUTIVE failures so store contention is
+/// observable instead of silently swallowed (ISS-407772).
+///
+/// The old keeper wrote `let _ = store_hb.heartbeat(&run_id)`. With N workers
+/// fanned out onto one SQLite file, a beat that loses the write lock past
+/// `busy_timeout` was dropped with ZERO signal — making writer contention
+/// indistinguishable from a wedged coordinator, and leaving the operator with a
+/// run stamped "stalled: no heartbeat activity" and no way to tell which it was.
+/// Failures stay non-fatal (a beat is best-effort; never stall the keeper), but
+/// they are no longer invisible.
+fn beat_once(store: &CoordinatorStore, run_id: &str, consecutive_failures: &mut u32) {
+    match store.heartbeat(run_id) {
+        Ok(()) => {
+            if *consecutive_failures >= HEARTBEAT_FAILURE_LOG_AFTER {
+                eprintln!(
+                    "\x1b[2maish: heartbeat for {} recovered after {} consecutive failed writes\x1b[0m",
+                    crate::batch::short_id(run_id),
+                    *consecutive_failures
+                );
+            }
+            *consecutive_failures = 0;
+        }
+        Err(e) => {
+            *consecutive_failures = consecutive_failures.saturating_add(1);
+            if *consecutive_failures >= HEARTBEAT_FAILURE_LOG_AFTER {
+                eprintln!(
+                    "\x1b[33maish: heartbeat write for {} failed {}x in a row ({e}) — coordinator store contention; \
+                     this run may be reaped as stalled even though it is alive\x1b[0m",
+                    crate::batch::short_id(run_id),
+                    *consecutive_failures
+                );
+            }
+        }
+    }
+}
+
 /// Cancellation token for the heartbeat keeper thread spawned by [`drive`].
 /// Held on `drive`'s stack frame, so EVERY return path — normal completion,
 /// failure, checkpoint, circuit-break, or an early `?` — stops the beat without
@@ -766,13 +808,31 @@ pub async fn drive(
             // Short tick so cancellation is prompt; the durable WRITE still only
             // happens once per HEARTBEAT_INTERVAL.
             const TICK: Duration = Duration::from_millis(250);
-            let mut waited = Duration::ZERO;
+            let mut failures = 0u32;
+            // Beat IMMEDIATELY, before the first round runs. Until the keeper's
+            // first write lands, the row still carries its INSERT-time stamp — so
+            // a slow first round looked exactly like a worker that never started
+            // (ISS-407772), and `stall_kind` needs this first beat to tell the
+            // two apart.
+            beat_once(&store_hb, &run_id_hb, &mut failures);
+            let mut last_beat = std::time::Instant::now();
             while !stop_thread.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(TICK);
-                waited += TICK;
-                if waited >= HEARTBEAT_INTERVAL {
-                    waited = Duration::ZERO;
-                    let _ = store_hb.heartbeat(&run_id_hb);
+                // CLOCK-BASED, never a running SUM of nominal sleeps — this was
+                // the ISS-407772 root cause. `thread::sleep` guarantees only a
+                // LOWER bound: on a box saturated by a fan-out wave (N headless
+                // aish children plus their tool subprocesses) every 250ms tick
+                // returns late, so `waited += TICK` counted INTENDED time and the
+                // effective beat interval drifted without bound — 120 nominal
+                // ticks could span many minutes of wall clock. Worse, every
+                // co-spawned worker shares the same tick phase and the same load
+                // curve, so they drifted in LOCKSTEP and crossed STALL_AFTER
+                // together: that is how a whole wave got reaped inside the same
+                // second. Reading the monotonic clock makes the interval real for
+                // every beat and self-correcting after any stall.
+                if last_beat.elapsed() >= HEARTBEAT_INTERVAL {
+                    last_beat = std::time::Instant::now();
+                    beat_once(&store_hb, &run_id_hb, &mut failures);
                 }
             }
         });
@@ -1679,6 +1739,51 @@ fn is_stalled_row(phase: &str, heartbeat_at: Option<&str>, now: i64) -> bool {
     }
 }
 
+/// WHICH KIND of silence a stalled row represents (ISS-407772). The reaper used
+/// to collapse both into one message — "no heartbeat activity for 5+ minutes" —
+/// which is the single least actionable thing it could say, because the two cases
+/// have different causes and different recoveries:
+///   * `NeverStarted` — the run never emitted ONE durable beat, so it died during
+///     LAUNCH: worktree/index-lock contention, a rate-limited first upstream call,
+///     or a child that never reached `drive()`. Re-dispatching (ideally staggered)
+///     is the fix.
+///   * `WentSilent`  — it beat, then stopped: a genuine mid-flight hang or a wedged
+///     tool call. The transcript up to the hang is worth reading before retrying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallKind {
+    NeverStarted,
+    WentSilent,
+}
+
+impl StallKind {
+    fn label(self) -> &'static str {
+        match self {
+            StallKind::NeverStarted => {
+                "never emitted a heartbeat — it failed during launch (worktree contention, \
+                 a rate-limited first call, or a child that never started); re-dispatch it"
+            }
+            StallKind::WentSilent => {
+                "heartbeated, then went silent — a mid-flight hang; check its transcript \
+                 before re-dispatching"
+            }
+        }
+    }
+}
+
+/// Classify a stalled row. `heartbeat_at` is seeded by the INSERT's
+/// `DEFAULT current_timestamp` — evaluated to the SAME value as `created_at`
+/// within one statement — so a row whose beat still equals its creation stamp was
+/// never touched by the keeper thread and therefore never started. The keeper
+/// beats immediately on entering `drive()`, so this stays a tight signal. Pure →
+/// unit-tested.
+fn stall_kind(created_at: Option<&str>, heartbeat_at: Option<&str>) -> StallKind {
+    match (created_at, heartbeat_at) {
+        (_, None) => StallKind::NeverStarted,
+        (Some(created), Some(beat)) if created == beat => StallKind::NeverStarted,
+        _ => StallKind::WentSilent,
+    }
+}
+
 /// #129: detect and reap stalled coordinators — non-terminal runs that stopped
 /// beating (deadlocks / hangs that do NOT kill the OS process, which the
 /// pid-liveness orphan scan therefore misses). Returns the count reaped.
@@ -1716,12 +1821,20 @@ fn detect_and_reap_stalled_runs(store: &CoordinatorStore, digest: bool) -> usize
             continue; // process still alive — stale beat, not a dead run
         }
         let short_id = crate::batch::short_id(&row.run_id);
-        let reason = format!("stalled: no heartbeat activity for {mins}+ minutes");
+        // Say WHICH failure this was. A launch-time death and a mid-flight hang
+        // read identically in the row (both are just an old beat) but need
+        // different operator action — see `StallKind` (ISS-407772).
+        let kind = stall_kind(row.created_at.as_deref(), row.heartbeat_at.as_deref());
+        let reason = format!(
+            "stalled: no heartbeat activity for {mins}+ minutes — {}",
+            kind.label()
+        );
         if store.set_failed(&row.run_id, &reason).is_ok() {
             stalled_reaped += 1;
             if digest {
                 eprintln!(
-                    "\x1b[2maish: coordinator {short_id} stalled (no heartbeat activity for {mins}+ minutes) — marked failed\x1b[0m"
+                    "\x1b[2maish: coordinator {short_id} stalled after {mins}+ minutes — {} — marked failed\x1b[0m",
+                    kind.label()
                 );
             }
         }
@@ -2166,6 +2279,126 @@ where
 
 #[cfg(test)]
 mod tests {
+    // ── ISS-407772: a stalled row must say WHICH failure it was ──────────────
+    //
+    // Launch-time death and mid-flight hang are indistinguishable from the beat
+    // timestamp alone, but `heartbeat_at` is seeded to `created_at` by the INSERT
+    // and the keeper beats immediately on entering `drive()` — so equality means
+    // "the keeper never ran", i.e. it never started.
+    #[test]
+    fn stall_kind_separates_never_started_from_went_silent() {
+        use super::{stall_kind, StallKind};
+        let created = "2026-03-01 22:00:00";
+
+        // Beat still equals the insert stamp ⇒ the keeper never wrote ⇒ launch death.
+        assert_eq!(
+            stall_kind(Some(created), Some(created)),
+            StallKind::NeverStarted
+        );
+        // No beat at all ⇒ same conclusion, never reached the keeper.
+        assert_eq!(stall_kind(Some(created), None), StallKind::NeverStarted);
+        assert_eq!(stall_kind(None, None), StallKind::NeverStarted);
+
+        // Any beat LATER than creation ⇒ it ran, then went quiet: a real hang.
+        assert_eq!(
+            stall_kind(Some(created), Some("2026-03-01 22:00:01")),
+            StallKind::WentSilent
+        );
+        assert_eq!(
+            stall_kind(Some(created), Some("2026-03-01 22:47:13")),
+            StallKind::WentSilent
+        );
+        // Unknown creation stamp but a beat on record ⇒ it beat; don't claim it
+        // never started.
+        assert_eq!(
+            stall_kind(None, Some("2026-03-01 22:00:01")),
+            StallKind::WentSilent
+        );
+
+        // And the two must never render the same message — the whole point.
+        assert_ne!(
+            StallKind::NeverStarted.label(),
+            StallKind::WentSilent.label()
+        );
+        assert!(StallKind::NeverStarted.label().contains("launch"));
+    }
+
+    // ── ISS-407772 root cause: the keeper must measure ELAPSED time, not sum
+    // nominal sleeps ────────────────────────────────────────────────────────
+    //
+    // The distinction that matters is BOUNDEDNESS. Summing nominal ticks makes
+    // the real beat gap scale with however late the OS returns from each sleep —
+    // unbounded, and every co-spawned worker shares the same load curve, so they
+    // drift in LOCKSTEP and cross the reap threshold together. Reading the
+    // monotonic clock caps the gap at one interval plus one overrunning tick, no
+    // matter how badly the box is oversubscribed.
+    #[test]
+    fn heartbeat_interval_must_be_clock_based_not_a_sum_of_nominal_sleeps() {
+        use super::{HEARTBEAT_INTERVAL, STALL_AFTER};
+        const TICK_NOMINAL_MS: u64 = 250;
+
+        // OLD: `waited += TICK` counts INTENDED time, so a beat fires only after
+        // HEARTBEAT_INTERVAL worth of NOMINAL ticks — i.e. `overrun`x that in
+        // real time. NEW: the clock is read every tick, so the gap is
+        // HEARTBEAT_INTERVAL plus at most one late tick — independent of overrun.
+        let ticks_to_beat = HEARTBEAT_INTERVAL.as_millis() as u64 / TICK_NOMINAL_MS;
+        let old_gap = |overrun: u64| ticks_to_beat * TICK_NOMINAL_MS * overrun / 1_000;
+        let new_gap = |overrun: u64| {
+            HEARTBEAT_INTERVAL.as_secs() + (TICK_NOMINAL_MS * overrun).div_ceil(1_000)
+        };
+
+        // Under load, sleeps return late by a factor that grows with contention.
+        for overrun in [1, 2, 4, 8, 16, 64] {
+            // The accumulator's real gap is LINEAR in the overrun factor: nothing
+            // bounds it, which is the defect.
+            assert_eq!(old_gap(overrun), HEARTBEAT_INTERVAL.as_secs() * overrun);
+            // The clock-based gap stays inside the reap threshold at every factor.
+            assert!(
+                new_gap(overrun) < STALL_AFTER.as_secs(),
+                "clock-based beats must stay inside the stall threshold even at {overrun}x \
+                 sleep overrun ({}s vs {}s)",
+                new_gap(overrun),
+                STALL_AFTER.as_secs()
+            );
+        }
+
+        // At a heavy-but-ordinary fan-out overrun the OLD scheme blows past the
+        // reap threshold outright while the new one is still nowhere near it —
+        // that gap between the two is what reaped whole waves.
+        let heavy = STALL_AFTER.as_secs().div_ceil(HEARTBEAT_INTERVAL.as_secs()) + 1;
+        assert!(
+            old_gap(heavy) > STALL_AFTER.as_secs(),
+            "the nominal-sum accumulator must drift past STALL_AFTER at {heavy}x overrun \
+             ({}s real gap vs {}s threshold)",
+            old_gap(heavy),
+            STALL_AFTER.as_secs()
+        );
+        assert!(new_gap(heavy) < STALL_AFTER.as_secs());
+    }
+
+    // A beat is best-effort, but a RUN of failed writes is the contention signal
+    // the old `let _ = …` threw away. Success must clear the counter so a
+    // recovered store stops warning.
+    #[test]
+    fn heartbeat_write_success_clears_the_failure_counter() {
+        use super::beat_once;
+        let path = std::env::temp_dir()
+            .join(format!("aish_beat_once_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = crate::db::CoordinatorStore::open(&path).unwrap();
+        store.insert("run_beat", "task", "s", None).unwrap();
+
+        let mut failures = 7; // pretend the store was unwritable for a while
+        beat_once(&store, "run_beat", &mut failures);
+        assert_eq!(failures, 0, "a successful beat must reset the failure run");
+
+        // Repeated successes keep it at zero (no spurious warnings).
+        beat_once(&store, "run_beat", &mut failures);
+        assert_eq!(failures, 0);
+        assert!(super::HEARTBEAT_FAILURE_LOG_AFTER >= 2, "a single lost beat must stay quiet");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Defect 1 (mid-flight half): a headless coordinator has no REPL, so the
     /// ONLY way to open its `:output` gate after launch is a `tell`. A steer whose
     /// whole body is an output directive becomes a control signal; anything else

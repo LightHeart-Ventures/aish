@@ -583,6 +583,9 @@ async fn run_turn_inner(
                     );
                     session.context_used =
                         crate::context::estimate_history_tokens(&session.history);
+                    // Re-anchor the incremental estimator: the figure above
+                    // covers the WHOLE retained history. (ISS-409753)
+                    session.usage_mark = session.history.len();
                     if dropped > 0 || clamped > 0 {
                         eprintln!(
                             "\x1b[2maish: context overflow — dropped {dropped} message(s), \
@@ -602,6 +605,11 @@ clamped {clamped} tool result(s), retrying\x1b[0m"
             Some(u) => u.total(),
             None => crate::context::estimate_history_tokens(&session.history),
         };
+        // Anchor for the incremental prompt estimate: `context_used` now
+        // describes exactly the first `history.len()` messages, so the next
+        // rounds only have to size what gets appended after this point instead
+        // of re-scanning the whole transcript every iteration. (ISS-409753)
+        session.usage_mark = session.history.len();
         // Accumulate this round's token usage into the session totals that feed
         // the interactive activity-stream status line. Only real backend-reported
         // usage is summed (the estimate fallback above is a window gauge, not a
@@ -1245,13 +1253,18 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
         threshold_pct: crate::context::COMPACT_THRESHOLD_PCT,
         tool_call_ceiling: session.compact_tool_call_ceiling,
         token_ceiling: session.compact_token_ceiling,
+        msg_ceiling: session.compact_msg_ceiling,
     };
     // In-context tool calls = session total minus the watermark set at the last
     // compaction (the calls the retained transcript still carries). (TASK-321)
     let tool_calls_in_context = session
         .tool_calls_total
         .saturating_sub(session.tool_calls_at_last_compact);
-    let Some(trigger) = budget.trigger(session.context_used, tool_calls_in_context) else {
+    let Some(trigger) = budget.trigger(
+        session.context_used,
+        tool_calls_in_context,
+        session.history.len(),
+    ) else {
         return;
     };
     let Some(plan) =
@@ -1284,6 +1297,9 @@ fn commit_compaction(session: &mut Session, plan: &crate::context::Compaction) -
     crate::context::apply_compaction(&mut session.history, plan);
     // Exact next-turn usage isn't known yet; re-seat the figure from an estimate.
     session.context_used = crate::context::estimate_history_tokens(&session.history);
+    // …and re-anchor: the estimate above covers the post-compaction history in
+    // full, so the incremental path starts clean. (ISS-409753)
+    session.usage_mark = session.history.len();
     // Re-seat the tool-call watermark so the in-context count reflects only the
     // calls the retained transcript still carries. (TASK-321)
     session.tool_calls_at_last_compact = session
@@ -1322,7 +1338,17 @@ fn enforce_prompt_ceiling(
     let mut dropped_total = 0usize;
     let mut clamped_total = 0usize;
     loop {
-        let est = crate::context::estimate_prompt_tokens(system, tool_tokens, &session.history);
+        // O(appended messages), not O(whole history): anchor on the backend's
+        // last reported usage and size only what has landed since. Re-scanning
+        // the full transcript here ran on every iteration of the agentic loop —
+        // O(n) work against O(n) growth. (ISS-409753)
+        let est = crate::context::estimate_prompt_tokens_anchored(
+            session.context_used,
+            session.usage_mark,
+            system,
+            tool_tokens,
+            &session.history,
+        );
         if est < ceiling {
             break;
         }
@@ -1346,6 +1372,9 @@ fn enforce_prompt_ceiling(
         }
         clamped_total += n;
         session.context_used = crate::context::estimate_history_tokens(&session.history);
+        // Clamping mutated bodies in place, so the anchor must be re-taken from
+        // the freshly-measured history. (ISS-409753)
+        session.usage_mark = session.history.len();
     }
     if dropped_total > 0 || clamped_total > 0 {
         eprintln!(

@@ -293,6 +293,15 @@ pub struct Session {
     /// reported usage (or a char-based estimate). Drives auto-compaction and the
     /// `:context` readout. Starts at 0 (no turn taken yet). Session-local.
     pub context_used: usize,
+    /// How many leading `history` messages [`Session::context_used`] describes —
+    /// `history.len()` at the moment that figure was last re-seated (from
+    /// backend-reported usage, or from a full estimate after a compaction).
+    ///
+    /// Lets the pre-flight overflow guard size a new prompt by estimating only
+    /// `history[usage_mark..]` instead of re-scanning the whole transcript on
+    /// every iteration of the agentic loop. `0` ⇒ no anchor, full scan.
+    /// (ISS-409753)
+    pub usage_mark: usize,
     /// Cumulative prompt (input) tokens the model has been billed this session,
     /// summed from each turn's reported [`crate::context::Usage`]. Drives the
     /// interactive activity-stream status line (`tokens in: …`). Session-local.
@@ -333,6 +342,13 @@ pub struct Session {
     /// `AISH_COMPACT_TOKEN_BUDGET` (falling back to
     /// [`crate::context::COMPACT_TOKEN_CEILING`]). (TASK-321)
     pub compact_token_ceiling: usize,
+    /// Resolved in-context MESSAGE-count compaction ceiling for this session
+    /// (0 = lever off). The structural backstop that bounds `history.len()`
+    /// regardless of token estimates — the one lever still standing when the
+    /// window is huge, the token lever is off, and `AISH_COMPACT_TOOL_CALLS=off`
+    /// disabled the tool-call lever. Seeded from `AISH_COMPACT_MAX_MSGS`
+    /// (falling back to [`crate::context::COMPACT_MSG_CEILING`]). (ISS-409752)
+    pub compact_msg_ceiling: usize,
     /// Interactive background mode (on by default, persisted; toggle with `:batch`).
     /// When on, the agent gets the run_in_background/background_status tools and a
     /// system-prompt nudge to offload deferrable work to a full background
@@ -631,6 +647,7 @@ impl Session {
             session_allows: HashSet::new(),
             session_dir_allows: HashSet::new(),
             context_used: 0,
+            usage_mark: 0,
             tokens_in: 0,
             tokens_out: 0,
             cache_read_total: 0,
@@ -645,6 +662,10 @@ impl Session {
             compact_token_ceiling: crate::context::parse_ceiling(
                 std::env::var("AISH_COMPACT_TOKEN_BUDGET").ok().as_deref(),
                 crate::context::COMPACT_TOKEN_CEILING,
+            ),
+            compact_msg_ceiling: crate::context::parse_ceiling(
+                std::env::var("AISH_COMPACT_MAX_MSGS").ok().as_deref(),
+                crate::context::COMPACT_MSG_CEILING,
             ),
             batch_mode: true,
             batch_model: crate::batch::DEFAULT_BATCH_MODEL.to_string(),
@@ -781,6 +802,8 @@ impl Session {
         // seed_context uses to re-inject $LAST. Consumed one-shot on next turn.
         self.suppress_context_seed = true;
         self.context_used = 0;
+        // The anchor is an index into the history we just cleared. (ISS-409753)
+        self.usage_mark = 0;
         self.tokens_in = 0;
         self.tokens_out = 0;
         self.cache_read_total = 0;

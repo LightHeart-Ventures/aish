@@ -115,6 +115,32 @@ pub const COMPACT_TOOL_CALL_CEILING: usize = 50;
 /// to compact at a fixed token count regardless of window size. (TASK-321)
 pub const COMPACT_TOKEN_CEILING: usize = 0;
 
+/// Default ceiling on the number of *messages* retained in context before a
+/// compaction is forced — a structural backstop that is independent of every
+/// token estimate. (ISS-409752)
+///
+/// The other three levers all measure CONTENT: percentage of window, absolute
+/// tokens, and in-context tool calls. None of them bounds `session.history.len()`
+/// itself, so a long agentic turn made of many *small* rounds can grow the
+/// transcript without limit:
+///   * the %-window lever needs ~150k live tokens on a 200k model (and far more
+///     on a 1M-token window) before it fires;
+///   * the absolute token lever is OFF by default (`COMPACT_TOKEN_CEILING == 0`);
+///   * the tool-call lever is explicitly disablable via
+///     `AISH_COMPACT_TOOL_CALLS=off` — a documented, supported operator setting.
+///
+/// With a large window and the tool-call lever off, in-turn history growth had
+/// no ceiling at all: every round appended an assistant message plus its
+/// tool-result message and nothing ever reclaimed them, which is the unbounded
+/// `run_turn_inner` growth reported in ISS-409752. A message COUNT is O(1) to
+/// read, cannot be fooled by estimator error, and degrades gracefully — it only
+/// ever makes compaction fire *earlier*.
+///
+/// The default is deliberately well above [`KEEP_RECENT_MSGS`] so a normal
+/// interactive turn never trips it; it exists to catch runaway loops.
+/// Overridable via `AISH_COMPACT_MAX_MSGS` (`off`/`none`/`0` disables).
+pub const COMPACT_MSG_CEILING: usize = 120;
+
 /// Parse a compaction-ceiling override from an env value: `None`/empty → the
 /// compiled-in `default`; `off`/`none` (case-insensitive) → `0` (lever disabled);
 /// a valid non-negative integer → that value (`0` also disables); anything else
@@ -137,6 +163,9 @@ pub enum CompactTrigger {
     ToolCalls,
     /// Live token usage reached the absolute token ceiling.
     TokenBudget,
+    /// In-context message count reached the message ceiling. The structural
+    /// backstop: fires regardless of how small each message is. (ISS-409752)
+    MsgCount,
 }
 
 impl CompactTrigger {
@@ -146,6 +175,7 @@ impl CompactTrigger {
             Self::WindowPct => "context window",
             Self::ToolCalls => "tool-call cap",
             Self::TokenBudget => "token budget",
+            Self::MsgCount => "message cap",
         }
     }
 }
@@ -163,18 +193,33 @@ pub struct CompactBudget {
     pub tool_call_ceiling: usize,
     /// Absolute live-token ceiling before forcing a compaction; `0` = off.
     pub token_ceiling: usize,
+    /// Max messages retained in-context before forcing a compaction; `0` = off.
+    /// Structural backstop, independent of any token estimate. (ISS-409752)
+    pub msg_ceiling: usize,
 }
 
 impl CompactBudget {
     /// Decide whether — and why — to compact now. `used` is the running live
     /// token figure; `tool_calls_in_context` is how many tool calls the current
-    /// (uncompacted) transcript still carries. The tool-call cap is checked
-    /// first (the cheap, early lever that bounds cost before the window fills),
-    /// then the absolute token cap, then the percentage window. `None` ⇒ leave
-    /// history intact.
-    pub fn trigger(&self, used: usize, tool_calls_in_context: usize) -> Option<CompactTrigger> {
+    /// (uncompacted) transcript still carries; `msgs_in_context` is
+    /// `history.len()`. The tool-call cap is checked first (the cheap, early
+    /// lever that bounds cost before the window fills), then the structural
+    /// message cap, then the absolute token cap, then the percentage window.
+    /// `None` ⇒ leave history intact.
+    pub fn trigger(
+        &self,
+        used: usize,
+        tool_calls_in_context: usize,
+        msgs_in_context: usize,
+    ) -> Option<CompactTrigger> {
         if self.tool_call_ceiling > 0 && tool_calls_in_context >= self.tool_call_ceiling {
             return Some(CompactTrigger::ToolCalls);
+        }
+        // Structural backstop BEFORE the token levers: it is the one lever that
+        // still fires when every content-based estimate says "plenty of room"
+        // (huge window, token lever off, tool-call lever disabled). (ISS-409752)
+        if self.msg_ceiling > 0 && msgs_in_context >= self.msg_ceiling {
+            return Some(CompactTrigger::MsgCount);
         }
         if self.token_ceiling > 0 && used >= self.token_ceiling {
             return Some(CompactTrigger::TokenBudget);
@@ -212,13 +257,52 @@ pub fn estimate_history_tokens(history: &[Msg]) -> usize {
     for m in history {
         n += estimate_text_tokens(&m.text);
         for c in &m.tool_calls {
-            n += estimate_text_tokens(&c.name) + estimate_text_tokens(&c.args.to_string());
+            n += estimate_text_tokens(&c.name) + json_bytes(&c.args).div_ceil(4);
         }
         for r in &m.tool_results {
             n += estimate_text_tokens(&r.content);
         }
     }
     n
+}
+
+/// Serialized-JSON byte length of `v`, computed WITHOUT serializing it.
+///
+/// `Value::to_string()` allocates a fresh `String` for EVERY tool call in the
+/// retained transcript on EVERY estimate — and tool args routinely carry whole
+/// file bodies (`write_file`), so one estimate could copy megabytes, dozens of
+/// times per turn. Walking the tree and summing lengths is allocation-free and
+/// O(#nodes) instead of O(#bytes-copied). (ISS-409753)
+///
+/// Deliberately approximate, and biased to OVER-count (escape sequences are not
+/// expanded, numbers are charged a flat width) so the overflow guard can only
+/// become more conservative — never less.
+fn json_bytes(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Null => 4,
+        serde_json::Value::Bool(b) => {
+            if *b {
+                4
+            } else {
+                5
+            }
+        }
+        // Flat width rather than formatting the number: cheap and over-counts.
+        serde_json::Value::Number(_) => 8,
+        // +2 for the surrounding quotes.
+        serde_json::Value::String(s) => s.len() + 2,
+        // Brackets + the `,` separators between elements.
+        serde_json::Value::Array(a) => {
+            2 + a.len().saturating_sub(1) + a.iter().map(json_bytes).sum::<usize>()
+        }
+        // Braces + separators; each key costs its bytes plus `"":`.
+        serde_json::Value::Object(o) => {
+            2 + o.len().saturating_sub(1)
+                + o.iter()
+                    .map(|(k, val)| k.len() + 3 + json_bytes(val))
+                    .sum::<usize>()
+        }
+    }
 }
 
 /// Count the tool calls carried by a history slice — the assistant-side tool
@@ -286,6 +370,12 @@ pub fn plan_compaction(history: &[Msg], keep_recent: usize) -> Option<Compaction
 /// single summary message.
 pub fn apply_compaction(history: &mut Vec<Msg>, c: &Compaction) {
     history.splice(0..c.dropped, std::iter::once(c.summary_msg.clone()));
+    // Reclaim the Vec spine. `splice` shifts the retained tail down but leaves
+    // capacity at the run's high-water mark, so a turn that peaked at thousands
+    // of messages kept holding that allocation for the rest of the session even
+    // though compaction had dropped the contents. Shrinking here is what makes
+    // the compaction actually return memory to the allocator. (ISS-409752)
+    history.shrink_to_fit();
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +426,39 @@ pub fn prompt_ceiling(window: usize) -> usize {
 /// history. `tool_tokens` comes from [`crate::mcp::tool_defs_token_estimate`].
 pub fn estimate_prompt_tokens(system: &str, tool_tokens: usize, history: &[Msg]) -> usize {
     estimate_text_tokens(system) + tool_tokens + estimate_history_tokens(history)
+}
+
+/// Same estimate as [`estimate_prompt_tokens`], but ANCHORED on the token count
+/// the backend last reported so only the newly-appended tail has to be sized.
+///
+/// [`estimate_prompt_tokens`] re-scans the entire transcript, and the pre-flight
+/// guard calls it before every model call — so a tool-heavy turn re-scanned a
+/// growing history on each of its ~50 iterations (O(n) work on O(n) growth).
+/// `base` is the exact figure the backend reported for the prompt it last saw
+/// (`session.context_used`) and `mark` is `history.len()` at that instant, so
+/// everything below `mark` is already accounted for and only `history[mark..]`
+/// — normally one or two messages — needs estimating. (ISS-409753)
+///
+/// Anchoring is also MORE accurate than the pure estimate: the base is real
+/// tokenizer output rather than a ~4-bytes/token approximation.
+///
+/// Falls back to the full scan whenever the anchor is unusable: `base == 0` (no
+/// usage reported yet this session) or `mark > history.len()` (history was
+/// compacted or cleared without re-seating), so a stale mark can never silently
+/// under-count.
+pub fn estimate_prompt_tokens_anchored(
+    base: usize,
+    mark: usize,
+    system: &str,
+    tool_tokens: usize,
+    history: &[Msg],
+) -> usize {
+    if base == 0 || mark > history.len() {
+        return estimate_prompt_tokens(system, tool_tokens, history);
+    }
+    // `base` already covers the system prompt and tool schemas as the model saw
+    // them, so only the appended messages are added here.
+    base + estimate_history_tokens(&history[mark..])
 }
 
 /// True when a backend error is a context-window overflow rejection — the class
@@ -468,6 +591,78 @@ mod tests {
         assert_eq!(cjk.len(), 9);
         assert_eq!(estimate_text_tokens(cjk), 3);
         assert!(estimate_text_tokens(cjk) >= cjk.chars().count().div_ceil(4));
+    }
+
+    // ISS-409753: json_bytes must never UNDER-count a compact `to_string()`,
+    // otherwise the pre-flight overflow guard would let a prompt through.
+    #[test]
+    fn json_bytes_never_undercounts_serialized_form() {
+        let cases = [
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(false),
+            serde_json::json!(42),
+            serde_json::json!("hello"),
+            serde_json::json!({"path": "src/main.rs", "content": "fn main() {}"}),
+            serde_json::json!({"a": [1, 2, 3], "b": {"c": "d"}}),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ];
+        for v in &cases {
+            let actual = v.to_string().len();
+            assert!(
+                json_bytes(v) >= actual,
+                "json_bytes under-counted {v}: {} < {actual}",
+                json_bytes(v)
+            );
+        }
+    }
+
+    // A big string arg must cost ~its own length, not be skipped — the estimate
+    // still has to see `write_file`-scale payloads. (ISS-409753)
+    #[test]
+    fn json_bytes_accounts_for_large_string_payloads() {
+        let big = "x".repeat(100_000);
+        let v = serde_json::json!({"content": big});
+        assert!(json_bytes(&v) >= 100_000);
+    }
+
+    // ISS-409753: the anchored estimate must add ONLY the tail after `mark`.
+    #[test]
+    fn anchored_estimate_sizes_only_the_appended_tail() {
+        let history = vec![
+            Msg::user("a".repeat(4_000)),
+            Msg::user("b".repeat(400)),
+            Msg::user("c".repeat(400)),
+        ];
+        let tail = estimate_history_tokens(&history[1..]);
+        assert_eq!(
+            estimate_prompt_tokens_anchored(10_000, 1, "sys", 500, &history),
+            10_000 + tail,
+        );
+        // Nothing appended since the anchor ⇒ the base is the whole answer.
+        assert_eq!(
+            estimate_prompt_tokens_anchored(10_000, history.len(), "sys", 500, &history),
+            10_000,
+        );
+    }
+
+    // ISS-409753: an unusable anchor must degrade to the full scan, never to a
+    // silent under-count.
+    #[test]
+    fn anchored_estimate_falls_back_without_a_usable_anchor() {
+        let history = vec![Msg::user("a".repeat(4_000)), Msg::user("b".repeat(400))];
+        let full = estimate_prompt_tokens("sys", 500, &history);
+        // No usage reported yet.
+        assert_eq!(
+            estimate_prompt_tokens_anchored(0, 0, "sys", 500, &history),
+            full
+        );
+        // Stale mark pointing past the (since-compacted) history.
+        assert_eq!(
+            estimate_prompt_tokens_anchored(10_000, 99, "sys", 500, &history),
+            full
+        );
     }
 
     fn assistant_call(text: &str, tool: &str) -> Msg {
@@ -606,17 +801,18 @@ mod tests {
             threshold_pct: 75,
             tool_call_ceiling: 50,
             token_ceiling: 120_000,
+            msg_ceiling: 0,
         };
         // Nothing tripped.
-        assert_eq!(b.trigger(10_000, 3), None);
+        assert_eq!(b.trigger(10_000, 3, 0), None);
         // Tool-call cap fires first, before either token lever.
-        assert_eq!(b.trigger(10_000, 50), Some(CompactTrigger::ToolCalls));
+        assert_eq!(b.trigger(10_000, 50, 0), Some(CompactTrigger::ToolCalls));
         // Below the cap but over the absolute token ceiling.
-        assert_eq!(b.trigger(120_000, 10), Some(CompactTrigger::TokenBudget));
+        assert_eq!(b.trigger(120_000, 10, 0), Some(CompactTrigger::TokenBudget));
         // Below both absolute caps but at the % window (150k of 200k).
         let b2 = CompactBudget { token_ceiling: 0, ..b };
-        assert_eq!(b2.trigger(150_000, 10), Some(CompactTrigger::WindowPct));
-        assert_eq!(b2.trigger(149_999, 10), None);
+        assert_eq!(b2.trigger(150_000, 10, 0), Some(CompactTrigger::WindowPct));
+        assert_eq!(b2.trigger(149_999, 10, 0), None);
     }
 
     #[test]
@@ -627,13 +823,92 @@ mod tests {
             threshold_pct: 75,
             tool_call_ceiling: 0,
             token_ceiling: 0,
+            msg_ceiling: 0,
         };
         // Every lever off ⇒ never compacts, even with a huge transcript.
-        assert_eq!(b.trigger(10_000_000, 10_000), None);
+        assert_eq!(b.trigger(10_000_000, 10_000, 0), None);
         // Only the tool-call lever on.
         let b = CompactBudget { tool_call_ceiling: 40, ..b };
-        assert_eq!(b.trigger(10_000_000, 39), None);
-        assert_eq!(b.trigger(0, 40), Some(CompactTrigger::ToolCalls));
+        assert_eq!(b.trigger(10_000_000, 39, 0), None);
+        assert_eq!(b.trigger(0, 40, 0), Some(CompactTrigger::ToolCalls));
+    }
+
+    // ISS-409752: the message cap is the structural backstop. It must fire in
+    // exactly the configuration where every CONTENT-based lever is blind: a huge
+    // window nowhere near its percentage threshold, the absolute token lever off,
+    // and the tool-call lever explicitly disabled by the operator.
+    #[test]
+    fn msg_ceiling_fires_when_every_token_lever_is_blind() {
+        let b = CompactBudget {
+            window: 1_000_000,
+            threshold_pct: 75,
+            tool_call_ceiling: 0, // AISH_COMPACT_TOOL_CALLS=off
+            token_ceiling: 0,     // absolute token lever off (the default)
+            msg_ceiling: 120,
+        };
+        // Thousands of tiny rounds: only 10k tokens live, so the % window (750k)
+        // is nowhere near tripping — yet the transcript is 400 messages long.
+        // Before ISS-409752 this returned None forever and history grew without
+        // bound; the message cap is what now catches it.
+        assert_eq!(b.trigger(10_000, 0, 400), Some(CompactTrigger::MsgCount));
+        // At the ceiling exactly (inclusive, like the other levers).
+        assert_eq!(b.trigger(10_000, 0, 120), Some(CompactTrigger::MsgCount));
+        // One below ⇒ still nothing to do.
+        assert_eq!(b.trigger(10_000, 0, 119), None);
+    }
+
+    #[test]
+    fn msg_ceiling_is_disablable_and_yields_to_tool_call_cap() {
+        let b = CompactBudget {
+            window: 0,
+            threshold_pct: 75,
+            tool_call_ceiling: 0,
+            token_ceiling: 0,
+            msg_ceiling: 0, // lever off
+        };
+        // Every lever off ⇒ never compacts, however long the transcript.
+        assert_eq!(b.trigger(10_000_000, 10_000, 100_000), None);
+        // The tool-call cap still takes precedence over the message cap so the
+        // logged reason stays the cheapest-and-earliest lever that tripped.
+        let b = CompactBudget { tool_call_ceiling: 50, msg_ceiling: 10, ..b };
+        assert_eq!(b.trigger(0, 50, 999), Some(CompactTrigger::ToolCalls));
+        // Below the tool-call cap, the message cap reports itself.
+        assert_eq!(b.trigger(0, 49, 999), Some(CompactTrigger::MsgCount));
+    }
+
+    #[test]
+    fn msg_ceiling_env_override_parses_like_the_other_ceilings() {
+        assert_eq!(parse_ceiling(None, COMPACT_MSG_CEILING), COMPACT_MSG_CEILING);
+        assert_eq!(parse_ceiling(Some("off"), COMPACT_MSG_CEILING), 0);
+        assert_eq!(parse_ceiling(Some("64"), COMPACT_MSG_CEILING), 64);
+        // The default must sit well above the retained working set, or a normal
+        // turn would compact on every single round.
+        assert!(COMPACT_MSG_CEILING > KEEP_RECENT_MSGS * 2);
+    }
+
+    // ISS-409752: compaction must actually hand memory back, not just shift the
+    // retained tail down inside an over-sized allocation.
+    #[test]
+    fn apply_compaction_reclaims_vector_capacity() {
+        let mut h: Vec<Msg> = Vec::with_capacity(4096);
+        for i in 0..200 {
+            h.push(Msg::user(format!("u{i}")));
+            h.push(assistant_call(&format!("a{i}"), "read_file"));
+        }
+        let peak_cap = h.capacity();
+        assert!(peak_cap >= 400);
+        let c = plan_compaction(&h, KEEP_RECENT_MSGS).expect("long history compacts");
+        apply_compaction(&mut h, &c);
+        // Contents shrank to the summary + retained tail (the split walks down
+        // to the nearest Assistant boundary, so the tail can be one longer than
+        // `keep_recent`).
+        assert!(h.len() <= KEEP_RECENT_MSGS + 2, "len {}", h.len());
+        // … and the spine no longer holds the run's high-water allocation.
+        assert!(
+            h.capacity() < peak_cap,
+            "capacity {} should be below peak {peak_cap}",
+            h.capacity()
+        );
     }
 
     #[test]

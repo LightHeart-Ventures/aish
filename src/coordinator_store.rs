@@ -177,6 +177,61 @@ pub struct CoordinatorRegistryRow {
     pub owner_session: Option<String>,
 }
 
+// ── ISS-407771: work-package lease ledger types ─────────────────────────────
+
+/// One live claim on a work package in the lease ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkPackageLease {
+    /// Claim namespace. The goal loop uses `goal:<hash-of-condition>` so two
+    /// unrelated goals can't collide on a similarly-worded work package.
+    pub scope: String,
+    /// Normalized fingerprint of the work package (see [`work_package_key`]).
+    pub wp_key: String,
+    /// Run id holding the claim.
+    pub owner_run: String,
+    /// The work package's task text, verbatim — what the fan-out guard
+    /// fuzzy-matches a candidate dispatch against.
+    pub task: String,
+    /// Unix seconds at which the claim lapses.
+    pub expires_at: i64,
+}
+
+/// Default lease TTL: long enough to cover a real work package, short enough
+/// that a crashed owner never wedges the package for a whole session.
+pub const DEFAULT_WORK_PACKAGE_TTL_SECS: i64 = 45 * 60;
+
+/// Normalize a task string into a stable work-package key: lowercased, all
+/// non-alphanumerics collapsed to single spaces, trimmed, capped. Pure →
+/// unit-tested. Two dispatches whose text differs only in case, punctuation, or
+/// whitespace map to the SAME key and therefore contend for the same lease.
+pub fn work_package_key(task: &str) -> String {
+    let mut out = String::with_capacity(task.len());
+    let mut pending_space = false;
+    for ch in task.chars() {
+        if ch.is_alphanumeric() {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            for lower in ch.to_lowercase() {
+                out.push(lower);
+            }
+        } else {
+            pending_space = true;
+        }
+    }
+    out.chars().take(400).collect()
+}
+
+/// Unix seconds now (lease TTL arithmetic). Monotonicity isn't required — a
+/// lease only needs a coarse wall-clock deadline.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Durable store for background coordinator runs — the resumable equivalent of
 /// `BatchStore`, ported from atum_cli's batch-controller store. Kept in its own
 /// connection (the coordinator drives turns + batch waits off the main thread)
@@ -288,7 +343,29 @@ impl CoordinatorStore {
                  owner_session TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_coord_registry_session
-                 ON coordinator_registry (owner_session);",
+                 ON coordinator_registry (owner_session);
+             -- ISS-407771: durable WORK-PACKAGE LEASE ledger. The goal loop
+             -- respawns a FRESH coordinator process each turn, so turn N+1 has
+             -- no in-process memory of turn N's still-running children and
+             -- happily re-fanned the same work packages (duplicate PRs, doubled
+             -- spend). A lease is the cross-process memory: one row per
+             -- (scope, wp_key) claimed by an owning run, with a TTL so a crashed
+             -- owner can never wedge a work package forever. `released` is the
+             -- explicit hand-back; liveness ALSO requires the owner run to be
+             -- non-terminal in `coordinator_runs`, so a dead owner's claim is
+             -- reclaimable immediately rather than only at TTL.
+             CREATE TABLE IF NOT EXISTS work_package_leases (
+                 scope      TEXT NOT NULL,
+                 wp_key     TEXT NOT NULL,
+                 owner_run  TEXT NOT NULL,
+                 task       TEXT NOT NULL,
+                 claimed_at TEXT NOT NULL DEFAULT current_timestamp,
+                 expires_at INTEGER NOT NULL,
+                 released   INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (scope, wp_key)
+             );
+             CREATE INDEX IF NOT EXISTS idx_wp_leases_owner
+                 ON work_package_leases (owner_run);",
         )
         .context("coordinator_runs schema init failed")?;
         // Back-compat: add session_name to a table created before it existed.
@@ -553,6 +630,7 @@ impl CoordinatorStore {
              SET phase = 'done', result = ?2, heartbeat_at = current_timestamp WHERE run_id = ?1",
             (run_id, result),
         )?;
+        self.release_runs_packages(run_id);
         Ok(())
     }
 
@@ -562,6 +640,7 @@ impl CoordinatorStore {
              SET phase = 'failed', error = ?2, heartbeat_at = current_timestamp WHERE run_id = ?1",
             (run_id, error),
         )?;
+        self.release_runs_packages(run_id);
         Ok(())
     }
 
@@ -619,7 +698,11 @@ impl CoordinatorStore {
                 ],
             )?;
             Ok(())
-        })
+        })?;
+        if matches!(phase, "done" | "failed") {
+            self.release_runs_packages(run_id);
+        }
+        Ok(())
     }
 
     /// Every persisted run, oldest first — used at startup to surface completed
@@ -1028,6 +1111,142 @@ impl CoordinatorStore {
                 rusqlite::params![run_id, format!("-{minutes} minutes")],
             )
             .unwrap();
+    }
+
+    // ── ISS-407771: work-package lease ledger ────────────────────────────────
+
+    /// Claim the work package `task` under `scope` for `owner_run`, valid for
+    /// `ttl_secs`. Idempotent for the SAME owner (a re-claim just renews).
+    ///
+    /// Fails LOUDLY when a DIFFERENT run holds a LIVE claim — that error is the
+    /// whole point: it is what stops a goal's next turn (a fresh process) from
+    /// re-dispatching a work package an earlier wave still has in flight. A
+    /// claim is dead — and therefore silently reclaimable — when it was
+    /// released, when its TTL lapsed, or when its owner run is terminal
+    /// (`done`/`failed`) in `coordinator_runs`.
+    pub fn claim_work_package(
+        &self,
+        scope: &str,
+        task: &str,
+        owner_run: &str,
+        ttl_secs: i64,
+    ) -> Result<()> {
+        let key = work_package_key(task);
+        let now = unix_now();
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let existing: Option<(String, i64, i64)> = tx
+            .query_row(
+                "SELECT owner_run, expires_at, released FROM work_package_leases
+                 WHERE scope = ?1 AND wp_key = ?2",
+                rusqlite::params![scope, key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((holder, expires_at, released)) = existing {
+            if holder != owner_run && released == 0 && expires_at > now {
+                let holder_phase: Option<String> = tx
+                    .query_row(
+                        "SELECT phase FROM coordinator_runs WHERE run_id = ?1",
+                        rusqlite::params![holder],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let holder_live = !matches!(
+                    holder_phase.as_deref(),
+                    Some("done") | Some("failed")
+                );
+                if holder_live {
+                    anyhow::bail!(
+                        "work package already claimed by run `{holder}` (lease valid for another \
+{}s) — do NOT re-dispatch it: monitor that run, `tell` it, or `stop` it first",
+                        expires_at - now
+                    );
+                }
+            }
+        }
+        tx.execute(
+            "INSERT INTO work_package_leases (scope, wp_key, owner_run, task, expires_at, released)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)
+             ON CONFLICT(scope, wp_key) DO UPDATE SET
+                 owner_run  = excluded.owner_run,
+                 task       = excluded.task,
+                 claimed_at = current_timestamp,
+                 expires_at = excluded.expires_at,
+                 released   = 0",
+            rusqlite::params![scope, key, owner_run, task, now + ttl_secs.max(1)],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Hand a work package back early (the owner finished or gave up). Scoped to
+    /// the owner so a sibling can't release someone else's claim. Idempotent.
+    #[cfg(test)]
+    pub fn release_work_package(&self, scope: &str, task: &str, owner_run: &str) -> Result<()> {
+        let key = work_package_key(task);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE work_package_leases SET released = 1
+             WHERE scope = ?1 AND wp_key = ?2 AND owner_run = ?3",
+            rusqlite::params![scope, key, owner_run],
+        )?;
+        Ok(())
+    }
+
+    /// Release EVERY claim held by `owner_run`. Called at each terminal exit so
+    /// a finished run's packages free up immediately — and, critically, STAY
+    /// free once its `coordinator_runs` row is later purged by
+    /// `clear_finished`/`delete_runs` (the liveness JOIN alone would read a
+    /// missing owner row as "not terminal" and resurrect a dead lease).
+    /// Best-effort by design: never fail a run's finalization over the ledger.
+    pub fn release_runs_packages(&self, owner_run: &str) {
+        if let Ok(conn) = self.conn.lock() {
+            let _ = conn.execute(
+                "UPDATE work_package_leases SET released = 1 WHERE owner_run = ?1",
+                rusqlite::params![owner_run],
+            );
+        }
+    }
+
+    /// Every LIVE claim (optionally narrowed to one `scope`): not released, TTL
+    /// not lapsed, and owner run not terminal. This is the read the fan-out
+    /// guard and the goal directive both consult.
+    pub fn live_work_package_leases(&self, scope: Option<&str>) -> Result<Vec<WorkPackageLease>> {
+        let now = unix_now();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT l.scope, l.wp_key, l.owner_run, l.task, l.expires_at
+             FROM work_package_leases l
+             LEFT JOIN coordinator_runs r ON r.run_id = l.owner_run
+             WHERE l.released = 0
+               AND l.expires_at > ?1
+               AND (r.phase IS NULL OR r.phase NOT IN ('done', 'failed'))
+               AND (?2 IS NULL OR l.scope = ?2)
+             ORDER BY l.claimed_at",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![now, scope], |r| {
+            Ok(WorkPackageLease {
+                scope: r.get(0)?,
+                wp_key: r.get(1)?,
+                owner_run: r.get(2)?,
+                task: r.get(3)?,
+                expires_at: r.get(4)?,
+            })
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Test hook: force a lease's TTL into the past so the expiry branch is
+    /// exercisable without sleeping.
+    #[cfg(test)]
+    pub fn expire_lease_for_test(&self, scope: &str, task: &str) {
+        let key = work_package_key(task);
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE work_package_leases SET expires_at = 0 WHERE scope = ?1 AND wp_key = ?2",
+            rusqlite::params![scope, key],
+        );
     }
 
     /// TASK-289: register (or re-register) a live coordinator PROCESS in the
@@ -1768,6 +1987,105 @@ mod tests {
             r.result, None,
             "the child's uncommitted result must not persist"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── ISS-407771: work-package lease ledger ────────────────────────────────
+
+    #[test]
+    fn work_package_key_normalizes_case_punctuation_and_whitespace() {
+        // Cosmetic differences must NOT mint a second lease for the same package.
+        assert_eq!(
+            work_package_key("Fix the Auth  bug!"),
+            work_package_key("fix   the auth bug")
+        );
+        assert_eq!(work_package_key("fix-the-auth-bug"), "fix the auth bug");
+        assert_eq!(work_package_key("  "), "");
+        // Distinct work stays distinct.
+        assert_ne!(work_package_key("fix auth"), work_package_key("fix billing"));
+        // Bounded so a giant brief can't blow up the primary key.
+        assert!(work_package_key(&"a b ".repeat(500)).chars().count() <= 400);
+    }
+
+    #[test]
+    fn lease_blocks_a_second_owner_then_frees_on_release_expiry_and_owner_death() {
+        let path = std::env::temp_dir().join(format!("aish_wplease_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+        let scope = "goal:test";
+        let task = "implement the retry backoff in worker.rs";
+
+        // First claim wins.
+        store
+            .claim_work_package(scope, task, "run_a", DEFAULT_WORK_PACKAGE_TTL_SECS)
+            .unwrap();
+        // Re-claim by the SAME owner is idempotent (a renew, not a conflict).
+        store
+            .claim_work_package(scope, task, "run_a", DEFAULT_WORK_PACKAGE_TTL_SECS)
+            .unwrap();
+
+        // A DIFFERENT run is refused LOUDLY, and the message names the holder so
+        // the caller can steer/stop it instead of spawning a twin.
+        let err = store
+            .claim_work_package(scope, task, "run_b", DEFAULT_WORK_PACKAGE_TTL_SECS)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("run_a"), "conflict must name the holder: {err}");
+        assert!(err.contains("already claimed"), "{err}");
+
+        // Cosmetic re-wording maps to the same key → still refused.
+        assert!(store
+            .claim_work_package(scope, "Implement the RETRY backoff in worker.rs!", "run_b", 600)
+            .is_err());
+        // A different scope (another goal) does NOT contend.
+        store
+            .claim_work_package("goal:other", task, "run_b", 600)
+            .unwrap();
+
+        // Live listing: narrowed by scope, and only live rows.
+        let live = store.live_work_package_leases(Some(scope)).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].owner_run, "run_a");
+        assert_eq!(live[0].task, task);
+        assert_eq!(store.live_work_package_leases(None).unwrap().len(), 2);
+
+        // (1) Explicit release frees the package — and only the owner may.
+        store.release_work_package(scope, task, "run_b").unwrap(); // no-op
+        assert_eq!(store.live_work_package_leases(Some(scope)).unwrap().len(), 1);
+        store.release_work_package(scope, task, "run_a").unwrap();
+        assert!(store.live_work_package_leases(Some(scope)).unwrap().is_empty());
+        store
+            .claim_work_package(scope, task, "run_b", DEFAULT_WORK_PACKAGE_TTL_SECS)
+            .unwrap();
+
+        // (2) TTL lapse frees it — a crashed owner can't wedge the package.
+        store.expire_lease_for_test(scope, task);
+        assert!(store.live_work_package_leases(Some(scope)).unwrap().is_empty());
+        store
+            .claim_work_package(scope, task, "run_c", DEFAULT_WORK_PACKAGE_TTL_SECS)
+            .unwrap();
+        assert_eq!(store.live_work_package_leases(Some(scope)).unwrap().len(), 1);
+
+        // (3) A TERMINAL owner frees it immediately, without waiting out the TTL.
+        store.insert("run_c", task, "sess", None).unwrap();
+        store.set_phase("run_c", "done").unwrap();
+        assert!(
+            store.live_work_package_leases(Some(scope)).unwrap().is_empty(),
+            "a done owner's claim must be reclaimable at once"
+        );
+        store
+            .claim_work_package(scope, task, "run_d", DEFAULT_WORK_PACKAGE_TTL_SECS)
+            .unwrap();
+
+        // Survives a reopen — the ledger is the CROSS-PROCESS memory.
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        let live = reopened.live_work_package_leases(Some(scope)).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].owner_run, "run_d");
+        assert!(reopened
+            .claim_work_package(scope, task, "run_e", 600)
+            .is_err());
 
         let _ = std::fs::remove_file(&path);
     }
