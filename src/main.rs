@@ -52,6 +52,12 @@ mod rewrite;
 mod scope;
 mod script;
 mod session;
+// Shared skill-registry contract. Also re-exported from src/lib.rs so the
+// `skill-mirror` generator (tools/skill-mirror, TASK-694) validates and emits
+// with these exact rules instead of reimplementing them. Some items therefore
+// have no caller inside the binary — that's the point, not dead weight.
+#[allow(dead_code)]
+mod skill_contract;
 mod skill_match;
 mod skill_provider;
 mod skill_sources;
