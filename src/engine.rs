@@ -831,7 +831,7 @@ clamped {clamped} tool result(s), retrying\x1b[0m"
                     w.record_tool_call(&call.id, &call.name, &call.args);
                     w.record_tool_result(&call.id, &call.name, &result.content, result.is_error);
                 }
-                session.last_turn_tools.push((desc.clone(), result.clone()));
+                session.record_turn_tool(desc.clone(), result.clone());
                 results.push(result);
                 if matches!(repeat, crate::loopguard::RepeatAction::Break) {
                     loop_break = Some((desc.clone(), repeat_count));
@@ -888,7 +888,7 @@ clamped {clamped} tool result(s), retrying\x1b[0m"
                             .hooks
                             .fire_observe(crate::hooks::HookEvent::PermissionDenied, dp);
                     }
-                    session.last_turn_tools.push((desc.clone(), result.clone()));
+                    session.record_turn_tool(desc.clone(), result.clone());
                     results.push(result);
                     continue;
                 }
@@ -991,7 +991,7 @@ clamped {clamped} tool result(s), retrying\x1b[0m"
                 w.record_tool_call(&call.id, &call.name, &call.args);
                 w.record_tool_result(&call.id, &call.name, &result.content, result.is_error);
             }
-            session.last_turn_tools.push((desc, result.clone()));
+            session.record_turn_tool(desc, result.clone());
             results.push(result);
         }
         eprintln!(); // breathing room between tool activity and what follows
