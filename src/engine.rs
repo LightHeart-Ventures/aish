@@ -28,6 +28,13 @@ type SpinState = Arc<Mutex<Spin>>;
 // answer before the hard limit is ever reached.
 const MAX_ITERATIONS: usize = 50;
 
+/// How many times one turn may recover from a hard context-overflow rejection
+/// (`prompt is too long: N > 200000`) by shedding history and replaying the
+/// round. Bounded so a prompt that genuinely cannot be shrunk — a single
+/// oversized system prompt, say — still surfaces the backend's error instead of
+/// spinning.
+const MAX_OVERFLOW_RECOVERIES: usize = 3;
+
 /// Operator override for the serial-chain yield depth, read from
 /// `AISH_SERIAL_CHAIN_YIELD_DEPTH`. Defaults to
 /// [`crate::loopguard::SERIAL_CHAIN_YIELD_DEPTH`]; a parsed value is honoured
@@ -449,6 +456,10 @@ async fn run_turn_inner(
     // prompt stays byte-stable for cache reuse.
     let mut batch_guard = crate::loopguard::BatchGuard::default();
     let mut pending_batch_nudge: Option<String> = None;
+    // How many times this turn has recovered from a hard context-overflow
+    // rejection by shrinking history and replaying the round. Bounded so a
+    // genuinely unshrinkable prompt still surfaces the backend's error.
+    let mut overflow_recoveries = 0usize;
 
     // TASK-358: serial-chain depth yield. Tracks the current run of consecutive
     // single-tool-call rounds ACROSS iterations of this turn (unlike the
@@ -537,13 +548,52 @@ async fn run_turn_inner(
         // backend produces the next message (which may consume prior tool
         // results). It is stopped before any tool-execution animation begins,
         // so the two never run at once.
+        // Pre-flight overflow guard: the reactive levers in `maybe_compact` see
+        // only the PREVIOUS round's usage, so a round that appends a few large
+        // tool results can overshoot the window in one step. Size the prompt we
+        // are about to send and compact until it fits.
+        enforce_prompt_ceiling(backend, session, &effective_system, active_tools);
+
         emit_thinking(session);
         let spinner = Spinner::start();
         let turn = backend
             .complete(&effective_system, &session.history, active_tools)
             .await;
         drop(spinner);
-        let turn = turn?;
+        let turn = match turn {
+            Ok(t) => t,
+            Err(e) => {
+                // A context-overflow rejection is the one 400 that compaction
+                // can fix. The estimate that got us here was evidently low
+                // (tokenization is not 4 chars/token) — shed history hard and
+                // replay the round instead of killing the turn.
+                let rendered = format!("{e:#}");
+                if crate::context::is_context_overflow_error(&rendered)
+                    && overflow_recoveries < MAX_OVERFLOW_RECOVERIES
+                {
+                    overflow_recoveries += 1;
+                    let plan = crate::context::plan_compaction(
+                        &session.history,
+                        crate::context::MIN_KEEP_RECENT_MSGS,
+                    );
+                    let dropped = plan.map(|p| commit_compaction(session, &p)).unwrap_or(0);
+                    let clamped = crate::context::clamp_oversized_results(
+                        &mut session.history,
+                        crate::context::CLAMP_RESULT_TOKENS / overflow_recoveries,
+                    );
+                    session.context_used =
+                        crate::context::estimate_history_tokens(&session.history);
+                    if dropped > 0 || clamped > 0 {
+                        eprintln!(
+                            "\x1b[2maish: context overflow — dropped {dropped} message(s), \
+clamped {clamped} tool result(s), retrying\x1b[0m"
+                        );
+                        continue;
+                    }
+                }
+                return Err(e);
+            }
+        };
         let usage = turn.usage;
 
         // Update the running context figure from the backend's reported usage
@@ -1209,6 +1259,19 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
     else {
         return;
     };
+    let dropped = commit_compaction(session, &plan);
+    eprintln!(
+        "\x1b[2maish: {} tripped — compacted {dropped} earlier message(s) to memory\x1b[0m",
+        trigger.label()
+    );
+}
+
+/// Persist a planned compaction and apply it to the live session: offload the
+/// dropped transcript, splice in the summary, and re-seat the running context /
+/// tool-call figures. Returns how many messages were dropped. Shared by the
+/// reactive lever ([`maybe_compact`]) and the pre-flight guard
+/// ([`enforce_prompt_ceiling`]).
+fn commit_compaction(session: &mut Session, plan: &crate::context::Compaction) -> usize {
     // Offload the dropped transcript to the dedicated offloads table BEFORE
     // mutating history, so nothing is lost even if the process dies right after.
     // Stored OUT of `memories` so a routine recall of curated facts never drags
@@ -1218,7 +1281,7 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
         let _ = db.remember_offload(&plan.offload);
     }
     let dropped = plan.dropped;
-    crate::context::apply_compaction(&mut session.history, &plan);
+    crate::context::apply_compaction(&mut session.history, plan);
     // Exact next-turn usage isn't known yet; re-seat the figure from an estimate.
     session.context_used = crate::context::estimate_history_tokens(&session.history);
     // Re-seat the tool-call watermark so the in-context count reflects only the
@@ -1226,10 +1289,70 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
     session.tool_calls_at_last_compact = session
         .tool_calls_total
         .saturating_sub(crate::context::count_tool_calls(&session.history));
-    eprintln!(
-        "\x1b[2maish: {} tripped — compacted {dropped} earlier message(s) to memory\x1b[0m",
-        trigger.label()
-    );
+    dropped
+}
+
+/// Pre-flight overflow guard: size the prompt we are ABOUT to send and compact
+/// until it fits under the model's hard ceiling.
+///
+/// [`maybe_compact`] is reactive — it judges from the usage the backend reported
+/// for the PREVIOUS round — so one round that appends several large tool results
+/// can jump straight past the window and the request dies with
+/// `prompt is too long: 225423 tokens > 200000 maximum`. Worse, a short history
+/// of a few oversized messages has no safe split point, so the reactive path
+/// silently no-ops forever while every request 400s.
+///
+/// This runs immediately before every model call and escalates until the
+/// estimate fits: normal split (keep [`crate::context::KEEP_RECENT_MSGS`]) →
+/// emergency split (keep [`crate::context::MIN_KEEP_RECENT_MSGS`]) → clamp
+/// oversized tool-result bodies in the retained tail. Every step is bounded and
+/// makes strict progress, so the loop always terminates.
+fn enforce_prompt_ceiling(
+    backend: &Backend,
+    session: &mut Session,
+    system: &str,
+    active_tools: &[crate::backend::ToolDef],
+) {
+    let ceiling = crate::context::prompt_ceiling(backend.context_window());
+    if ceiling == 0 {
+        return;
+    }
+    let tool_tokens = crate::mcp::tool_defs_token_estimate(active_tools);
+    let mut keep = crate::context::KEEP_RECENT_MSGS;
+    let mut dropped_total = 0usize;
+    let mut clamped_total = 0usize;
+    loop {
+        let est = crate::context::estimate_prompt_tokens(system, tool_tokens, &session.history);
+        if est < ceiling {
+            break;
+        }
+        if let Some(plan) = crate::context::plan_compaction(&session.history, keep) {
+            dropped_total += commit_compaction(session, &plan);
+            continue;
+        }
+        // No safe split at this tail size — shrink the tail once, then fall
+        // through to clamping oversized bodies in what's left.
+        if keep > crate::context::MIN_KEEP_RECENT_MSGS {
+            keep = crate::context::MIN_KEEP_RECENT_MSGS;
+            continue;
+        }
+        let n = crate::context::clamp_oversized_results(
+            &mut session.history,
+            crate::context::CLAMP_RESULT_TOKENS,
+        );
+        if n == 0 {
+            // Nothing left to shed — let the backend answer rather than spin.
+            break;
+        }
+        clamped_total += n;
+        session.context_used = crate::context::estimate_history_tokens(&session.history);
+    }
+    if dropped_total > 0 || clamped_total > 0 {
+        eprintln!(
+            "\x1b[2maish: prompt over {ceiling} tokens — compacted {dropped_total} message(s), \
+clamped {clamped_total} oversized tool result(s)\x1b[0m"
+        );
+    }
 }
 
 /// Print the model's interim narration. In an interactive session it goes out

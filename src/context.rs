@@ -276,6 +276,94 @@ pub fn apply_compaction(history: &mut Vec<Msg>, c: &Compaction) {
     history.splice(0..c.dropped, std::iter::once(c.summary_msg.clone()));
 }
 
+// ---------------------------------------------------------------------------
+// Pre-flight overflow guard
+//
+// The three levers above are REACTIVE: they judge from the usage the backend
+// reported for the *previous* round. That is fine for gradual growth, but a
+// single round can append several large tool results and leap from "under
+// threshold" straight past the window — the next request then dies with
+//     claude api invalid_request_error (400): prompt is too long:
+//     225423 tokens > 200000 maximum
+// before any compaction has run. Worse, `plan_compaction` returns `None` for a
+// short-but-huge history (a handful of oversized messages), so the reactive
+// path can *silently no-op forever* while every request 400s.
+//
+// The guard below sizes the prompt that is ABOUT to be sent and compacts —
+// repeatedly, and with a shrinking retained tail — until it fits, clamping
+// oversized tool-result bodies as a last resort.
+// ---------------------------------------------------------------------------
+
+/// Hard pre-flight ceiling on the prompt, as a percentage of the model window.
+/// Below 100% to leave headroom for estimator error (~4 chars/token is an
+/// approximation) and for the reply, which shares the window with the prompt.
+pub const PROMPT_CEILING_PCT: usize = 85;
+
+/// Floor on how many recent messages an EMERGENCY compaction retains, used when
+/// keeping [`KEEP_RECENT_MSGS`] still leaves the prompt over the ceiling. Two is
+/// the smallest tail that can still carry a valid assistant → tool_result pair.
+pub const MIN_KEEP_RECENT_MSGS: usize = 2;
+
+/// Last-resort per-tool-result token cap. Applied in place to the retained tail
+/// when there is nothing left to drop but the prompt is still over the ceiling
+/// (e.g. one `read_file` of a giant file inside the working set).
+pub const CLAMP_RESULT_TOKENS: usize = 4_000;
+
+/// Marker appended to a tool result truncated by [`clamp_oversized_results`].
+/// Also the idempotency guard: an already-clamped body is left alone.
+pub const CLAMP_MARKER: &str =
+    "\n[…truncated by aish to fit the context window — re-run the tool with a narrower range]";
+
+/// Absolute token ceiling for a prompt against `window`. `0` when the window is
+/// unknown (lever disabled).
+pub fn prompt_ceiling(window: usize) -> usize {
+    window.saturating_mul(PROMPT_CEILING_PCT) / 100
+}
+
+/// Estimate of the full prompt a round will send: system + tool schemas +
+/// history. `tool_tokens` comes from [`crate::mcp::tool_defs_token_estimate`].
+pub fn estimate_prompt_tokens(system: &str, tool_tokens: usize, history: &[Msg]) -> usize {
+    estimate_text_tokens(system) + tool_tokens + estimate_history_tokens(history)
+}
+
+/// True when a backend error is a context-window overflow rejection — the class
+/// that compaction can actually fix, so the engine retries instead of failing
+/// the turn. Matches the wording used by Anthropic, OpenAI/OpenRouter and Grok.
+pub fn is_context_overflow_error(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("prompt is too long")
+        || e.contains("context length exceeded")
+        || e.contains("context_length_exceeded")
+        || e.contains("maximum context length")
+        || e.contains("exceeds the context window")
+        || e.contains("too many tokens")
+}
+
+/// Truncate any tool-result body longer than `max_tokens` (~4 chars/token) in
+/// place, appending [`CLAMP_MARKER`]. Idempotent: an already-clamped body is
+/// skipped, so repeated calls converge instead of looping. Returns how many
+/// bodies were clamped this call (`0` ⇒ no further progress is possible).
+pub fn clamp_oversized_results(history: &mut [Msg], max_tokens: usize) -> usize {
+    let max_chars = max_tokens.saturating_mul(4);
+    let marker_len = CLAMP_MARKER.chars().count();
+    if max_chars <= marker_len {
+        return 0;
+    }
+    let head_chars = max_chars - marker_len;
+    let mut clamped = 0;
+    for m in history.iter_mut() {
+        for r in m.tool_results.iter_mut() {
+            if r.content.ends_with(CLAMP_MARKER) || r.content.chars().count() <= max_chars {
+                continue;
+            }
+            let head: String = r.content.chars().take(head_chars).collect();
+            r.content = format!("{head}{CLAMP_MARKER}");
+            clamped += 1;
+        }
+    }
+    clamped
+}
+
 /// Role-tagged, flattened transcript of `msgs` for durable offload. Includes
 /// assistant text, the names of any tools it called, and tool-result bodies, so
 /// a later `recall` surfaces the substance of the dropped conversation.
@@ -365,6 +453,83 @@ mod tests {
     }
     fn tool_results(content: &str) -> Msg {
         Msg::tool_results(vec![ToolResult::text("t1", content, false)])
+    }
+
+    #[test]
+    fn prompt_ceiling_sits_below_the_window() {
+        // The reported failure: 225_423 tokens against a 200k window.
+        let c = prompt_ceiling(200_000);
+        assert!(c < 200_000, "ceiling must leave headroom: {c}");
+        assert!(c > 150_000, "ceiling must not compact more than needed: {c}");
+        assert!(225_423 >= c, "the reported overflow must trip the guard");
+        // Unknown window disables the lever rather than dividing by zero.
+        assert_eq!(prompt_ceiling(0), 0);
+    }
+
+    #[test]
+    fn prompt_estimate_counts_system_tools_and_history() {
+        let history = vec![tool_results(&"x".repeat(400))];
+        let est = estimate_prompt_tokens(&"s".repeat(40), 1_000, &history);
+        // 40 chars system (~10) + 1000 tool tokens + 400 chars result (~100).
+        assert_eq!(est, 10 + 1_000 + 100);
+        // Every component actually moves the number.
+        assert!(estimate_prompt_tokens("", 0, &history) < est);
+    }
+
+    #[test]
+    fn overflow_errors_are_recognized_across_providers() {
+        assert!(is_context_overflow_error(
+            "claude api invalid_request_error (400): prompt is too long: \
+225423 tokens > 200000 maximum"
+        ));
+        assert!(is_context_overflow_error(
+            "This model's maximum context length is 128000 tokens"
+        ));
+        assert!(is_context_overflow_error("context_length_exceeded"));
+        // Unrelated failures must NOT trigger a history-shedding retry.
+        assert!(!is_context_overflow_error(
+            "claude api authentication failed (401): invalid x-api-key"
+        ));
+        assert!(!is_context_overflow_error("network error (connection reset)"));
+    }
+
+    #[test]
+    fn clamping_bounds_oversized_results_and_is_idempotent() {
+        let mut history = vec![tool_results(&"y".repeat(100_000)), tool_results("small")];
+        let n = clamp_oversized_results(&mut history, 1_000);
+        assert_eq!(n, 1, "only the oversized body is clamped");
+        let len = history[0].tool_results[0].content.chars().count();
+        assert_eq!(len, 4_000, "clamped body fits the cap INCLUDING the marker");
+        assert!(history[0].tool_results[0].content.ends_with(CLAMP_MARKER));
+        assert_eq!(history[1].tool_results[0].content, "small");
+        // Idempotent: a second pass finds nothing to do, so the engine's
+        // shrink loop terminates instead of re-clamping forever.
+        assert_eq!(clamp_oversized_results(&mut history, 1_000), 0);
+    }
+
+    #[test]
+    fn emergency_split_rescues_a_history_too_short_for_the_normal_keep() {
+        // 4 messages: the normal lever (keep 12) finds no split and no-ops —
+        // which is exactly how a short-but-huge history 400s forever.
+        let history = vec![
+            Msg::user("go"),
+            assistant_call("working", "read_file"),
+            tool_results(&"z".repeat(900_000)),
+            assistant_call("more", "read_file"),
+        ];
+        assert!(plan_compaction(&history, KEEP_RECENT_MSGS).is_none());
+        // The emergency tail size finds the assistant boundary and sheds the head.
+        let plan = plan_compaction(&history, MIN_KEEP_RECENT_MSGS)
+            .expect("emergency split must find an assistant boundary");
+        assert!(plan.dropped > 0);
+        let mut h = history.clone();
+        apply_compaction(&mut h, &plan);
+        // The oversized body sits INSIDE the retained tail, so splitting alone
+        // cannot rescue this shape — the clamp backstop is what actually frees
+        // the window. Together they must get the history back under the window.
+        assert!(estimate_history_tokens(&h) > prompt_ceiling(200_000));
+        assert_eq!(clamp_oversized_results(&mut h, CLAMP_RESULT_TOKENS), 1);
+        assert!(estimate_history_tokens(&h) < prompt_ceiling(200_000));
     }
 
     #[test]
