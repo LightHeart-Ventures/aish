@@ -46,6 +46,15 @@ default** (FR-334 / SPR-068). Build it with `cargo build --features voice`
   don't opt in.
 - **Config** (`~/.aish/config`): `voice.model`, `voice.device`,
   `voice.language` (default `en`), `voice.autosubmit` (default `false`).
+- **Hosted STT fallback** (opt-in, `--features voice-api`). If the local pass
+  produces nothing usable, aish can retry once against OpenAI's hosted Whisper
+  (`/v1/audio/transcriptions`) instead of leaving you with an empty buffer.
+  It is **off by default** — no audio ever leaves the machine unless you set
+  `voice.enable_remote_stt = true` **and** provide `OPENAI_API_KEY`. The local
+  path is tried first and always wins, so the happy path still costs $0 and
+  stays offline. Tunables: `voice.openai_stt_timeout_ms` (default `5000`) and
+  `voice.stt_retry_attempts` (default `3`, exponential backoff 1s/2s/4s).
+  A hosted failure is never fatal — it logs one line and falls back to local.
 - **Interactive-only** — background coordinators have no TTY/mic, so voice is a
   foreground-REPL feature with no coordinator surface.
 

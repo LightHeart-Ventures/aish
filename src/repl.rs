@@ -1389,6 +1389,11 @@ pub async fn run(
                 #[cfg(feature = "voice")]
                 {
                     use crate::voice::{capture, config::VoiceConfig, model, resample, stt};
+                    // TASK-370: hosted-Whisper fallback, compiled only under
+                    // `--features voice-api` and only consulted when the user
+                    // opted in via `voice.enable_remote_stt = true`.
+                    #[cfg(feature = "voice-api")]
+                    use crate::voice::openai_stt;
                     use crossterm::event::{Event, KeyCode, KeyModifiers};
                     use std::io::Write as _;
 
@@ -1521,6 +1526,19 @@ pub async fn run(
                         }
                     };
 
+                    // --- Step 9b: keep a copy for the hosted-STT fallback. ----
+                    // `samples` is moved into the blocking transcribe task
+                    // below, so the TASK-370 fallback needs its own copy — but
+                    // only when the user actually opted in, so the default
+                    // path pays nothing.
+                    #[cfg(feature = "voice-api")]
+                    let remote_samples: Option<Vec<f32>> = if voice_cfg.enable_remote_stt {
+                        Some(samples.clone())
+                    } else {
+                        None
+                    };
+
+
                     // --- Step 10: show transcription spinner. -----------------
                     eprint!("\r\x1b[2m⌛ transcribing…\x1b[0m\x1b[K");
                     let _ = std::io::stderr().flush();
@@ -1559,16 +1577,61 @@ pub async fn run(
                     let _ = std::io::stderr().flush();
 
                     // --- Step 13: extract transcript text. -------------------
-                    let text = match transcript_result {
-                        Ok(Ok(t)) => t.trim().to_string(),
+                    // TASK-370: a local MISS — either an error or an empty
+                    // transcript — is the trigger for the optional hosted
+                    // fallback.  `None` here means "nothing usable from the
+                    // local pass"; with `voice-api` off (or the user not opted
+                    // in) the behaviour is byte-identical to local-only.
+                    let local_text: Option<String> = match transcript_result {
+                        Ok(Ok(t)) => Some(t.trim().to_string()),
                         Ok(Err(e)) => {
                             eprintln!("voice: {e:#}");
-                            continue;
+                            None
                         }
                         Err(e) => {
                             eprintln!("voice: transcribe task panicked: {e}");
-                            continue;
+                            None
                         }
+                    };
+
+                    // --- Step 13b: hosted-STT fallback (TASK-370). -----------
+                    // Consulted ONLY when local STT produced nothing usable and
+                    // `voice.enable_remote_stt = true`.  A hosted failure is
+                    // never fatal: we log it and keep the local result.
+                    #[cfg(feature = "voice-api")]
+                    let local_text = match local_text {
+                        // Local succeeded — the hosted path is not touched, so
+                        // an opted-in user still pays $0 on the happy path.
+                        Some(t) if !t.is_empty() => Some(t),
+                        miss => match remote_samples {
+                            Some(samples) => {
+                                eprint!("\r\x1b[2m☁ transcribing (hosted)…\x1b[0m\x1b[K");
+                                let _ = std::io::stderr().flush();
+                                let client = openai_stt::OpenAiStt::from_config(&voice_cfg);
+                                let remote = client.transcribe(&samples, src_rate).await;
+                                eprint!("\r\x1b[K");
+                                let _ = std::io::stderr().flush();
+                                match remote {
+                                    Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
+                                    Ok(_) => miss,
+                                    Err(e) => {
+                                        tracing::warn!("voice: hosted STT failed: {e}");
+                                        eprintln!(
+                                            "\x1b[2mvoice: hosted STT unavailable ({e}) \
+                                             — falling back to local\x1b[0m"
+                                        );
+                                        miss
+                                    }
+                                }
+                            }
+                            None => miss,
+                        },
+                    };
+
+                    // No usable transcript from either backend → back to Idle
+                    // without touching the line buffer (design decision D3).
+                    let Some(text) = local_text else {
+                        continue;
                     };
 
                     if text.is_empty() {

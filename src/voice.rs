@@ -37,6 +37,16 @@
 /// | `voice.language`   | `en`       | Whisper language hint passed to `params.set_language`|
 /// | `voice.autosubmit` | `false`    | If `true`, press Enter automatically after insert    |
 /// | `voice.silence_ms` | `2000`     | Silence-timeout (ms) that auto-stops Recording       |
+///
+/// TASK-370 (`voice-api` feature) adds the hosted-Whisper fallback keys.  They
+/// parse in every `voice` build so a config file is portable between builds,
+/// but are only *consumed* when compiled with `--features voice-api`:
+///
+/// | Key                           | Default | Meaning                                        |
+/// |-------------------------------|---------|------------------------------------------------|
+/// | `voice.enable_remote_stt`     | `false` | Opt in to hosted STT when local STT misses      |
+/// | `voice.openai_stt_timeout_ms` | `5000`  | Per-request timeout for the hosted call         |
+/// | `voice.stt_retry_attempts`    | `3`     | Total hosted attempts before local fallback     |
 pub mod config {
     use std::path::PathBuf;
 
@@ -61,6 +71,14 @@ pub mod config {
         /// Silence-timeout in milliseconds; recording stops when this
         /// elapses without audio above the noise floor.
         pub silence_ms: u64,
+        /// TASK-370: opt in to the hosted-Whisper fallback.  When `false`
+        /// (the default) no audio ever leaves the machine.
+        pub enable_remote_stt: bool,
+        /// TASK-370: per-request timeout (ms) for the hosted STT call.
+        pub openai_stt_timeout_ms: u64,
+        /// TASK-370: total hosted attempts (not retries) before giving up and
+        /// falling back to the local transcript.
+        pub stt_retry_attempts: u32,
     }
 
     impl Default for VoiceConfig {
@@ -71,6 +89,9 @@ pub mod config {
                 language: "en".to_string(),
                 autosubmit: false,
                 silence_ms: 2_000,
+                enable_remote_stt: false,
+                openai_stt_timeout_ms: 5_000,
+                stt_retry_attempts: 3,
             }
         }
     }
@@ -156,6 +177,37 @@ pub mod config {
                             eprintln!(
                                 "voice: warning: invalid voice.silence_ms \
                                  value {val:?} — using 2000"
+                            );
+                        }
+                    },
+                    // ── TASK-370: hosted-Whisper fallback keys ──────────────
+                    "voice.enable_remote_stt" => match val {
+                        "true" | "1" | "yes" => cfg.enable_remote_stt = true,
+                        "false" | "0" | "no" => cfg.enable_remote_stt = false,
+                        other => {
+                            eprintln!(
+                                "voice: warning: invalid voice.enable_remote_stt \
+                                 value {other:?} — using false"
+                            );
+                        }
+                    },
+                    "voice.openai_stt_timeout_ms" => match val.parse::<u64>() {
+                        // 0 would mean "no timeout" to reqwest, which is the
+                        // opposite of graceful — treat it as invalid.
+                        Ok(ms) if ms > 0 => cfg.openai_stt_timeout_ms = ms,
+                        _ => {
+                            eprintln!(
+                                "voice: warning: invalid voice.openai_stt_timeout_ms \
+                                 value {val:?} — using 5000"
+                            );
+                        }
+                    },
+                    "voice.stt_retry_attempts" => match val.parse::<u32>() {
+                        Ok(n) if n >= 1 => cfg.stt_retry_attempts = n,
+                        _ => {
+                            eprintln!(
+                                "voice: warning: invalid voice.stt_retry_attempts \
+                                 value {val:?} — using 3"
                             );
                         }
                     },
@@ -336,6 +388,89 @@ pub mod config {
         }
 
         #[test]
+        fn default_remote_stt_is_disabled() {
+            let cfg = VoiceConfig::default();
+            assert!(
+                !cfg.enable_remote_stt,
+                "hosted STT must be opt-in: no audio leaves the box by default"
+            );
+            assert_eq!(cfg.openai_stt_timeout_ms, 5_000);
+            assert_eq!(cfg.stt_retry_attempts, 3);
+        }
+
+        #[test]
+        fn parse_enable_remote_stt_true_variants() {
+            for val in ["true", "1", "yes"] {
+                let cfg = VoiceConfig::parse(&format!("voice.enable_remote_stt = {val}\n"));
+                assert!(cfg.enable_remote_stt, "expected true for {val:?}");
+            }
+        }
+
+        #[test]
+        fn parse_enable_remote_stt_false_variants() {
+            for val in ["false", "0", "no"] {
+                let cfg = VoiceConfig::parse(&format!("voice.enable_remote_stt = {val}\n"));
+                assert!(!cfg.enable_remote_stt, "expected false for {val:?}");
+            }
+        }
+
+        #[test]
+        fn parse_invalid_enable_remote_stt_falls_back_to_false() {
+            let cfg = VoiceConfig::parse("voice.enable_remote_stt = maybe\n");
+            assert!(!cfg.enable_remote_stt);
+        }
+
+        #[test]
+        fn parse_openai_stt_timeout_ms() {
+            let cfg = VoiceConfig::parse("voice.openai_stt_timeout_ms = 12000\n");
+            assert_eq!(cfg.openai_stt_timeout_ms, 12_000);
+        }
+
+        #[test]
+        fn parse_openai_stt_timeout_ms_rejects_zero_and_garbage() {
+            for val in ["0", "soon", "-5"] {
+                let cfg = VoiceConfig::parse(&format!("voice.openai_stt_timeout_ms = {val}\n"));
+                assert_eq!(cfg.openai_stt_timeout_ms, 5_000, "for {val:?}");
+            }
+        }
+
+        #[test]
+        fn parse_stt_retry_attempts() {
+            let cfg = VoiceConfig::parse("voice.stt_retry_attempts = 5\n");
+            assert_eq!(cfg.stt_retry_attempts, 5);
+        }
+
+        #[test]
+        fn parse_stt_retry_attempts_rejects_zero_and_garbage() {
+            for val in ["0", "lots"] {
+                let cfg = VoiceConfig::parse(&format!("voice.stt_retry_attempts = {val}\n"));
+                assert_eq!(cfg.stt_retry_attempts, 3, "for {val:?}");
+            }
+        }
+
+        /// Round-trip the hosted-STT keys through a real file, the way the
+        /// eng spec asks for: `~/.aish/config` → `VoiceConfig`.
+        #[test]
+        fn load_from_path_round_trips_remote_stt_keys() {
+            let dir = std::env::temp_dir().join("aish-test-voice-remote-stt");
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("config");
+            std::fs::write(
+                &path,
+                "voice.enable_remote_stt = true\n\
+                 voice.openai_stt_timeout_ms = 2500\n\
+                 voice.stt_retry_attempts = 4\n",
+            )
+            .expect("write tmp config");
+            let cfg = VoiceConfig::load_from_path(&path);
+            assert!(cfg.enable_remote_stt);
+            assert_eq!(cfg.openai_stt_timeout_ms, 2_500);
+            assert_eq!(cfg.stt_retry_attempts, 4);
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+
         fn parse_invalid_autosubmit_falls_back_to_false() {
             let cfg = VoiceConfig::parse("voice.autosubmit = maybe\n");
             assert!(!cfg.autosubmit);
@@ -1590,3 +1725,15 @@ pub mod model {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// TASK-370: hosted Whisper STT backend (stretch, `voice-api` feature)
+// ---------------------------------------------------------------------------
+
+/// Optional hosted-Whisper fallback (see [`openai_stt`]).
+///
+/// Gated behind `voice-api` so neither the default build nor a `voice`-only
+/// build compiles the HTTP client path.  Opt in at runtime with
+/// `voice.enable_remote_stt = true`.
+#[cfg(feature = "voice-api")]
+pub mod openai_stt;

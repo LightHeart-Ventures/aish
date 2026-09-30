@@ -120,6 +120,9 @@ any failure path.** Only a successful transcript splices text.
 | `voice.language` | `en` | Whisper language hint |
 | `voice.autosubmit` | `false` | if `true`, press Enter automatically after insert (off by design D3) |
 | `voice.silence_ms` | `2000` | silence-timeout that auto-stops Recording |
+| `voice.enable_remote_stt` | `false` | TASK-370: opt in to the hosted-Whisper fallback (`voice-api` builds only; needs `OPENAI_API_KEY`) |
+| `voice.openai_stt_timeout_ms` | `5000` | per-attempt HTTP timeout for the hosted fallback |
+| `voice.stt_retry_attempts` | `3` | hosted-fallback attempts before giving up (backoff 1s/2s/4s) |
 
 Unknown/missing keys fall back to defaults; a malformed value logs a warning and
 uses the default (never fails the prompt).
