@@ -100,12 +100,37 @@ stalls. A visible spinner/status covers the (sub-second → few-second) latency.
   above the prompt, line buffer untouched. Never panics the editor.
 - Non-`voice` builds: `Ctrl-G` stays unbound (default readline behavior).
 
-### 4.5 Phase 3 — `voice-api` (optional)
+### 4.5 Phase 3 — `voice-api` (implemented, TASK-370)
 
-Swap `stt::Transcriber` for an HTTP call to a hosted Whisper endpoint
-(OpenAI/Groq) using the existing `reqwest` client + `${profile:*}` credential
-refs. Same capture/resample front-end; no local model download. Chosen at
-runtime when `voice-api` is built and a key is configured.
+`src/voice/openai_stt.rs` adds a hosted Whisper backend behind the `voice-api`
+cargo feature, wired as a **fallback** rather than a swap: the local
+`stt::Transcriber` still runs first, and the hosted call is only attempted when
+the local pass returns an error or an empty transcript.
+
+- **Opt-in twice.** Compile with `--features voice-api` *and* set
+  `voice.enable_remote_stt = true`. Both default off, so no audio leaves the
+  machine for anyone who didn't explicitly ask for it.
+- **Credentials.** `OPENAI_API_KEY` from the environment (an explicit key can
+  be injected programmatically for tests). A missing key is a *fatal* error for
+  the hosted attempt — it is not retried, it logs once, and the local result
+  stands.
+- **Transport.** Same capture/resample front-end; `f32` samples are encoded to
+  a 16-bit PCM WAV in memory and POSTed as `multipart/form-data` to
+  `/v1/audio/transcriptions` (`whisper-1`) via the existing `reqwest` client.
+- **Retries.** `voice.stt_retry_attempts` (default 3) with exponential backoff
+  (1s/2s/4s, capped at 30s). Only `429` and `5xx` are retried; `4xx` is fatal.
+  Per-attempt timeout is `voice.openai_stt_timeout_ms` (default 5000).
+- **Never fatal.** Any hosted failure degrades to the local result (or to "no
+  transcript"), with the line buffer untouched — design decision D3 holds.
+- **Secret hygiene.** The API key is scrubbed from every error string before it
+  can reach a log line (`redact_key`), and the "no key configured" warning is
+  emitted at most once per process.
+
+| key | default | meaning |
+|---|---|---|
+| `voice.enable_remote_stt` | `false` | opt in to the hosted fallback |
+| `voice.openai_stt_timeout_ms` | `5000` | per-attempt HTTP timeout |
+| `voice.stt_retry_attempts` | `3` | attempts before giving up |
 
 ## 5. Risks / open questions
 
