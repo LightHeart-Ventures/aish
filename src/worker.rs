@@ -3445,12 +3445,86 @@ pub fn resume_in_place(jobs: &WorkerJobs, job: Arc<WorkerJob>, task: String, spe
 /// durable record, and per-worker transcript are thread-distinct). All
 /// operator-facing labels (`[{}]` announces, `:workers` row) stay keyed on the
 /// stable `job.id`.
+// ── Fan-out spawn stagger (ISS-407772) ──────────────────────────────────────
+//
+// A fan-out wave dispatches N workers from the SAME turn, so with no gate all N
+// arrive at the expensive, CONTENDED parts of launch inside the same few
+// milliseconds: `git worktree add` (which takes the repo-level `index.lock`), the
+// aish re-exec, the first coordinator-store INSERT, and the first upstream model
+// call. That thundering herd is what turns a wave into a correlated failure —
+// every worker hits the same lock convoy or the same rate limit, and a whole wave
+// dies at launch having never emitted one heartbeat.
+//
+// Fix: serialize LAUNCH INSTANTS through a process-global reservation gate that
+// guarantees at least `spawn_stagger_interval()` between consecutive launches. It
+// delays only WHEN a worker starts — no worker runs slower, nothing is serialized
+// after launch, and a lone (non-fan-out) spawn never waits because the gate starts
+// fully drained. Cheap insurance against a failure mode whose blast radius is an
+// entire wave.
+
+/// Default spacing between consecutive worker launches. Long enough to break up
+/// the `index.lock` convoy and de-phase the upstream first calls, short enough
+/// that a 5-worker wave is fully launched in ~3s.
+const DEFAULT_SPAWN_STAGGER_MS: u64 = 750;
+
+/// Env override for the per-launch stagger. `0` disables the gate entirely,
+/// restoring the pre-ISS-407772 burst behaviour (useful for A/B-ing the fix).
+pub const SPAWN_STAGGER_ENV: &str = "AISH_SPAWN_STAGGER_MS";
+
+fn spawn_stagger_interval() -> Duration {
+    Duration::from_millis(env_u64(SPAWN_STAGGER_ENV, DEFAULT_SPAWN_STAGGER_MS))
+}
+
+/// The instant the NEXT worker launch is allowed to proceed. `None` = gate is
+/// drained (no recent launch), so the next one goes immediately.
+static SPAWN_GATE: std::sync::OnceLock<Mutex<Option<std::time::Instant>>> =
+    std::sync::OnceLock::new();
+
+/// Pure slot arithmetic: when may a launch arriving at `now` proceed, given the
+/// instant reserved by the previous launch? A reservation already in the past is
+/// stale — the wave has drained, so go now. Unit-tested (no sleeping).
+fn next_launch_slot(prev_reserved: Option<std::time::Instant>, now: std::time::Instant) -> std::time::Instant {
+    match prev_reserved {
+        Some(reserved) if reserved > now => reserved,
+        _ => now,
+    }
+}
+
+/// Claim this worker's launch slot, waiting if a sibling just launched. The lock
+/// is released BEFORE the await (slot arithmetic only), so the gate is never held
+/// across a suspension point and one slow launch can't stall the queue.
+async fn stagger_spawn() {
+    let interval = spawn_stagger_interval();
+    if interval.is_zero() {
+        return;
+    }
+    let wait = {
+        let gate = SPAWN_GATE.get_or_init(|| Mutex::new(None));
+        let mut reserved = match gate.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(), // a poisoned gate must never block a launch
+        };
+        let now = std::time::Instant::now();
+        let slot = next_launch_slot(*reserved, now);
+        *reserved = Some(slot + interval);
+        slot.saturating_duration_since(now)
+    };
+    if !wait.is_zero() {
+        tokio::time::sleep(wait).await;
+    }
+}
+
 async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, run_id: String, task: String, spec: WorkerSpec) {
     // Bind the worker handle to THIS thread's durable identity before anything
     // can observe it. `background_status` resolves a live worker's heartbeat
     // through this id; leaving it pointed at the previous (terminal) thread is
     // what let a running worker render as `done`.
     job.set_run_id(&run_id);
+    // Space this launch off its siblings' (ISS-407772). A fan-out wave otherwise
+    // hits `git worktree add`'s index.lock, the re-exec, and the first upstream
+    // call all in the same instant — a correlated launch failure that kills the
+    // whole wave. Returns immediately for a lone spawn.
+    stagger_spawn().await;
     // Isolation: a writing/building coordinator gets its own git worktree
     // (branched from `spec.base` — a clean trunk baseline by default, or the
     // current HEAD on request) so parallel coordinators can't clobber the shared
@@ -3985,6 +4059,65 @@ fn flush_results(jobs: &WorkerJobs) {
 
 #[cfg(test)]
 mod tests {
+    // ── ISS-407772: fan-out launches must be SPACED, not bursted ─────────────
+    //
+    // Pure slot arithmetic, so this asserts the spacing guarantee without
+    // sleeping: N workers dispatched in the same instant must be handed
+    // strictly-increasing launch slots one interval apart, while a lone worker
+    // arriving at a drained gate launches immediately.
+    #[test]
+    fn fan_out_launch_slots_are_spaced_by_the_stagger_interval() {
+        use super::next_launch_slot;
+        use std::time::{Duration, Instant};
+        let interval = Duration::from_millis(750);
+        let t0 = Instant::now();
+
+        // A drained gate never delays a launch — the single-spawn path pays nothing.
+        assert_eq!(next_launch_slot(None, t0), t0);
+
+        // Five workers all arriving at t0 (one fan-out turn) get t0, +750ms, +1500ms…
+        let mut reserved = None;
+        let mut slots = Vec::new();
+        for _ in 0..5 {
+            let slot = next_launch_slot(reserved, t0);
+            reserved = Some(slot + interval);
+            slots.push(slot);
+        }
+        for (i, slot) in slots.iter().enumerate() {
+            assert_eq!(
+                *slot,
+                t0 + interval * i as u32,
+                "launch {i} must be staggered by exactly {i} intervals"
+            );
+        }
+        // Strictly increasing ⇒ no two workers share a launch instant, which is
+        // the property that breaks the index.lock convoy.
+        assert!(slots.windows(2).all(|w| w[1] > w[0]));
+
+        // A stale reservation (the wave already drained) must not delay a later
+        // arrival — the gate self-clears instead of accumulating debt.
+        let much_later = t0 + Duration::from_secs(60);
+        assert_eq!(next_launch_slot(Some(t0 + interval), much_later), much_later);
+    }
+
+    // The stagger must be overridable — and `0` must mean "off" so the burst
+    // behaviour can be restored without a rebuild.
+    #[test]
+    fn spawn_stagger_is_env_tunable_and_zero_disables_it() {
+        assert_eq!(super::SPAWN_STAGGER_ENV, "AISH_SPAWN_STAGGER_MS");
+        // Default is non-zero, i.e. the gate is ON out of the box.
+        unsafe { std::env::remove_var(super::SPAWN_STAGGER_ENV) };
+        assert!(!super::spawn_stagger_interval().is_zero());
+        unsafe { std::env::set_var(super::SPAWN_STAGGER_ENV, "0") };
+        assert!(super::spawn_stagger_interval().is_zero());
+        unsafe { std::env::set_var(super::SPAWN_STAGGER_ENV, "1500") };
+        assert_eq!(
+            super::spawn_stagger_interval(),
+            std::time::Duration::from_millis(1500)
+        );
+        unsafe { std::env::remove_var(super::SPAWN_STAGGER_ENV) };
+    }
+
     // FIX A — the dangerous-degradation truth table. Only one cell may fail the
     // run: isolation asked for, repo present, no worktree. Every other cell is
     // either a legitimate shared-cwd run or nothing to isolate at all.
