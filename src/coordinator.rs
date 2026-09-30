@@ -335,6 +335,17 @@ fn reap_failed_runs(store: &CoordinatorStore) -> usize {
     )
 }
 
+/// Is this `failed` row safe to prune? A SALVAGE row is stored in the `failed`
+/// phase but is NOT a failure: it is the only surviving pointer to real work
+/// preserved on a branch in an orphaned worktree. Age-based retention would
+/// silently delete that pointer (ISS-409757 impact #1), so salvage rows are
+/// excluded from the sweep and are retired only when their worktree is actually
+/// cleaned up. Typed discriminator — no `LIKE '%salvaged%'` on free text.
+fn is_prunable_failed(phase: &str, kind: Option<&str>) -> bool {
+    Phase::parse(phase) == Phase::Failed && kind != Some(crate::coordinator_store::SALVAGE_KIND)
+}
+
+/// Testable core of [`reap_failed_runs`]: load the store's `failed` rows, decide
 /// Testable core of [`reap_failed_runs`]: load the store's `failed` rows, decide
 /// the bounded-retention victims via [`failed_retention_plan`], and delete them.
 /// Parameterized on the knobs + `now_secs` so it's deterministic under test (no
@@ -351,7 +362,7 @@ fn reap_failed_runs_with(
     };
     let failed: Vec<(String, Option<i64>)> = rows
         .into_iter()
-        .filter(|r| Phase::parse(&r.phase) == Phase::Failed)
+        .filter(|r| is_prunable_failed(&r.phase, r.kind.as_deref()))
         .map(|r| {
             (
                 r.run_id,
@@ -768,7 +779,6 @@ pub async fn drive(
         HeartbeatGuard(stop)
     });
 
-
     // ── Pre-dispatch circuit breaker (loop guard, per the loop-exhaustion
     // review). If this exact task has already failed `max_failed_attempts()`
     // times, a fresh identical run is very unlikely to fare differently —
@@ -960,7 +970,14 @@ plus `git status` instead — do not fail the run over it.\n\n{PHASE0_GUARD}\n\n
             } else {
                 format!("{banner}\n\nLast progress before checkpoint:\n{last_synth}")
             };
-            persist_terminal(store, run_id, Phase::Checkpoint, Some(&result), None, session);
+            persist_terminal(
+                store,
+                run_id,
+                Phase::Checkpoint,
+                Some(&result),
+                None,
+                session,
+            );
             finalize_worker_store(run_id, "checkpoint", Some(&result));
             return Outcome {
                 phase: Phase::Checkpoint,
@@ -1052,7 +1069,10 @@ plus `git status` instead — do not fail the run over it.\n\n{PHASE0_GUARD}\n\n
             next_input = format!("{interjection}\n\n{next_input}");
             // Plain (no 🔧/🗨/📦 sentinel) so the parent's worker stream leaves it
             // in the failure tail without forwarding or pulsing the prompt badge.
-            eprintln!("✉ folded {} operator message(s) into this round", steers.len());
+            eprintln!(
+                "✉ folded {} operator message(s) into this round",
+                steers.len()
+            );
         }
 
         // ── stand-down: a parent raised the harsh `:stop` flag (harsher than a
@@ -1089,14 +1109,7 @@ final status plus your best partial result. After this turn you are terminated."
                     Ok(a) => a,
                     Err(e) => {
                         let error = format!("stand-down wrap-up turn failed: {e:#}");
-                        persist_terminal(
-                            store,
-                            run_id,
-                            Phase::Failed,
-                            None,
-                            Some(&error),
-                            session,
-                        );
+                        persist_terminal(store, run_id, Phase::Failed, None, Some(&error), session);
                         finalize_worker_store(run_id, "failed", None);
                         return Outcome {
                             phase: Phase::Failed,
@@ -1134,9 +1147,7 @@ final status plus your best partial result. After this turn you are terminated."
             .map(|s| s.checkpoint_requested(run_id).unwrap_or(false))
             .unwrap_or(false);
         if checkpointing {
-            eprintln!(
-                "⏸ checkpoint requested by parent — halting at round boundary (resumable)"
-            );
+            eprintln!("⏸ checkpoint requested by parent — halting at round boundary (resumable)");
             // Atomically persist the resumable `checkpoint` phase together with
             // the run's cumulative metrics in ONE store txn (TASK-285 pattern).
             // Checkpoint is non-terminal, but `persist_terminal`/`finish_run` is
@@ -1194,9 +1205,11 @@ final status plus your best partial result. After this turn you are terminated."
         // with a parseable banner on the first line of the answer. Decide a
         // recovery disposition rather than treating the (possibly partial) answer
         // as a finished result.
-        if let Some(exit) =
-            crate::loopguard::RoundExit::evaluate(&answer, auto_recoveries, crate::loopguard::MAX_AUTO_RECOVERIES)
-        {
+        if let Some(exit) = crate::loopguard::RoundExit::evaluate(
+            &answer,
+            auto_recoveries,
+            crate::loopguard::MAX_AUTO_RECOVERIES,
+        ) {
             // One evaluated `RoundExit` bundles the stop's reason AND its
             // disposition, so this single `match` decides the recovery action in
             // one place — the reason and the action can't drift across separate
@@ -1231,7 +1244,10 @@ final status plus your best partial result. After this turn you are terminated."
                     );
                     let (recovery_count, recovery_cap) = if is_serial_chain {
                         serial_chain_recoveries += 1;
-                        (serial_chain_recoveries, crate::loopguard::MAX_SERIAL_CHAIN_RECOVERIES)
+                        (
+                            serial_chain_recoveries,
+                            crate::loopguard::MAX_SERIAL_CHAIN_RECOVERIES,
+                        )
                     } else {
                         auto_recoveries += 1;
                         (auto_recoveries, crate::loopguard::MAX_AUTO_RECOVERIES)
@@ -1244,7 +1260,9 @@ final status plus your best partial result. After this turn you are terminated."
                     // If the serial-chain counter is itself exhausted, flag the
                     // operator — the coordinator is stuck in serial-only mode
                     // despite repeated nudges to batch.
-                    if is_serial_chain && serial_chain_recoveries >= crate::loopguard::MAX_SERIAL_CHAIN_RECOVERIES {
+                    if is_serial_chain
+                        && serial_chain_recoveries >= crate::loopguard::MAX_SERIAL_CHAIN_RECOVERIES
+                    {
                         let error = format!(
                             "flagged for operator after {serial_chain_recoveries} serial-chain-yield attempt(s): {}",
                             exit.reason.detail()
@@ -1259,9 +1277,9 @@ final status plus your best partial result. After this turn you are terminated."
                             rounds,
                         };
                     }
-                    next_input = exit
-                        .directive()
-                        .unwrap_or_else(|| "Continue the task from where you left off.".to_string());
+                    next_input = exit.directive().unwrap_or_else(|| {
+                        "Continue the task from where you left off.".to_string()
+                    });
                     continue;
                 }
                 // FlagOperator: auto-recovery is exhausted (or the stop isn't one
@@ -1492,27 +1510,33 @@ pub fn rehydrate(session: &mut Session) {
         .map(|rows| rows.into_iter().map(|r| r.run_id).collect())
         .unwrap_or_default();
     let salvaged = salvage_orphaned_worktrees(&session.cwd, &store, &known_after, digest);
+    // ISS-409757: the filesystem scan above can only see leaves under THIS repo's
+    // worktree root that still hold work. Cross-check the lifecycle LEDGER, which
+    // catches exactly the leaks that scan structurally cannot: trees created by a
+    // run in ANOTHER repo/checkout, and empty trees a failed teardown left behind.
+    let leaked = report_leaked_worktrees(&store, digest);
     // TASK-289: scan the durable coordinator registry — mark rows whose owning
     // process is dead as `orphaned` (parent-death recovery) and log any that
     // carried an in-flight batch job as resurrectable (full resume is TASK-291).
     let (regs_reaped, regs_resurrectable) = scan_coordinator_registry(&store, digest);
-    
+
     // #129: detect and reap stalled coordinators (coordinating/awaiting_batch but
     // no recent heartbeat activity). This catches the case where a coordinator
     // process hangs/deadlocks without crashing.
     let stalled_reaped = detect_and_reap_stalled_runs(&store, digest);
-    
+
     if digest
         && (surfaced > 0
             || reaped > 0
             || salvaged > 0
             || reaped_failed > 0
+            || leaked > 0
             || regs_reaped > 0
             || regs_resurrectable > 0
             || stalled_reaped > 0)
     {
         eprintln!(
-            "\x1b[2maish: reattached coordinator runs ({surfaced} delivered, {reaped} reaped, {salvaged} salvaged, {reaped_failed} failed-pruned, {regs_reaped} registry-orphaned, {regs_resurrectable} resurrectable, {stalled_reaped} stalled-reaped)\x1b[0m"
+            "\x1b[2maish: reattached coordinator runs ({surfaced} delivered, {reaped} reaped, {salvaged} salvaged, {leaked} leaked-worktrees, {reaped_failed} failed-pruned, {regs_reaped} registry-orphaned, {regs_resurrectable} resurrectable, {stalled_reaped} stalled-reaped)\x1b[0m"
         );
     }
 }
@@ -1685,7 +1709,10 @@ fn detect_and_reap_stalled_runs(store: &CoordinatorStore, digest: bool) -> usize
         if !is_stalled_row(&row.phase, row.heartbeat_at.as_deref(), now) {
             continue;
         }
-        if live_pids.get(&row.run_id).is_some_and(|&pid| pid_is_alive(pid)) {
+        if live_pids
+            .get(&row.run_id)
+            .is_some_and(|&pid| pid_is_alive(pid))
+        {
             continue; // process still alive — stale beat, not a dead run
         }
         let short_id = crate::batch::short_id(&row.run_id);
@@ -1756,6 +1783,55 @@ fn salvage_orphaned_worktrees(
     salvaged
 }
 
+/// Age (in hours) after which an OPEN `worktree_lifecycle` row is treated as a
+/// leak candidate. Set comfortably past `WORKER_TIMEOUT` so a long-but-healthy
+/// run is never reported as leaked — the ledger's value is that it stays quiet
+/// until a tree is genuinely abandoned.
+const WORKTREE_LEAK_AFTER_HOURS: i64 = 24;
+
+/// Startup cross-check of the worktree lifecycle ledger (ISS-409757).
+///
+/// `salvage_orphaned_worktrees` scans the FILESYSTEM under the current repo's
+/// worktree root and only notices leaves that still hold work. Two leak classes
+/// are invisible to it by construction: a tree created while the operator was in
+/// a DIFFERENT repo (different root, never scanned), and a tree whose teardown
+/// failed but which carries no changes (scanned, ignored as empty). Both stay on
+/// disk forever. The ledger records every tree at CREATE time, so any row still
+/// open long after its run is a leak candidate regardless of where it lives.
+///
+/// Rows whose path is gone are CLOSED (removed by hand, or by a sweep that
+/// couldn't reach the ledger) rather than reported forever. Rows whose path
+/// survives are REPORTED, labelled by whether the tree holds work — this
+/// function deliberately never deletes anything: removal is irreversible and an
+/// operator's unmerged branch is exactly what's at stake. Best-effort: a store
+/// read error reports 0 and never sinks startup. Returns the count reported.
+fn report_leaked_worktrees(store: &CoordinatorStore, announce: bool) -> usize {
+    let Ok(rows) = store.list_orphaned_worktrees(WORKTREE_LEAK_AFTER_HOURS) else {
+        return 0;
+    };
+    let mut reported = 0usize;
+    for (id, path, run_id) in rows {
+        let leaf = std::path::PathBuf::from(&path);
+        if !leaf.exists() {
+            let _ = store.record_worktree_cleaned_up(&id);
+            continue;
+        }
+        reported += 1;
+        if announce {
+            let verdict = if crate::worker::worktree_holds_work(&leaf) {
+                "HOLDS WORK — review/merge its branch before removing"
+            } else {
+                "no changes — safe to `git worktree remove`"
+            };
+            eprintln!(
+                "\x1b[2maish: leaked worktree {id} (run {run_id}) still on disk at {path} — {verdict}\x1b[0m"
+            );
+        }
+    }
+    reported
+}
+
+/// Count active (non-terminal) coordinator runs in the durable store whose
 /// Count active (non-terminal) coordinator runs in the durable store whose
 /// `run_id` is NOT already tracked in `in_memory_ids` (this session's in-process
 /// worker subprocesses, which `worker::running_count` already counts). This is
@@ -2212,8 +2288,7 @@ mod tests {
     /// `failed` with "stalled: no heartbeat activity for 5+ minutes".
     #[test]
     fn stall_reap_spares_runs_whose_process_is_still_alive() {
-        let path =
-            std::env::temp_dir().join(format!("aish_stallpid_{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!("aish_stallpid_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = CoordinatorStore::open(&path).unwrap();
 
@@ -2238,7 +2313,11 @@ mod tests {
 
         let rows = store.load_all().unwrap();
         let phase = |id: &str| rows.iter().find(|r| r.run_id == id).unwrap().phase.clone();
-        assert_eq!(phase("run_alive"), "coordinating", "live pid vetoes the reap");
+        assert_eq!(
+            phase("run_alive"),
+            "coordinating",
+            "live pid vetoes the reap"
+        );
         assert_eq!(phase("run_dead"), "failed", "no live process → reaped");
 
         let _ = std::fs::remove_file(&path);
@@ -2254,7 +2333,9 @@ mod tests {
         assert!(!super::proc_stat_is_zombie("1 (systemd) R 0 1 1"));
         // comm with embedded spaces + parens must not shift the state field.
         assert!(super::proc_stat_is_zombie("42 (next-server (v1)) Z 1 42 0"));
-        assert!(!super::proc_stat_is_zombie("42 (next-server (v1)) S 1 42 0"));
+        assert!(!super::proc_stat_is_zombie(
+            "42 (next-server (v1)) S 1 42 0"
+        ));
         // Garbage degrades to "not a zombie" rather than panicking.
         assert!(!super::proc_stat_is_zombie(""));
         assert!(!super::proc_stat_is_zombie("no parens here"));
@@ -2323,7 +2404,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-
     #[test]
     fn phase0_guard_directs_existence_check_before_build() {
         // TASK-355: the guard must tell a coordinator to verify the work isn't
@@ -2331,7 +2411,10 @@ mod tests {
         // then STOP with evidence instead of re-implementing shipped work.
         let g = PHASE0_GUARD;
         assert!(g.contains("PHASE-0 GUARD"), "labelled block header present");
-        assert!(g.contains(".repospec.json"), "reads the repospec features map");
+        assert!(
+            g.contains(".repospec.json"),
+            "reads the repospec features map"
+        );
         assert!(g.contains("grep"), "greps for the feature symbol");
         assert!(
             g.contains("gh pr list") || g.contains("git branch"),
@@ -2341,7 +2424,10 @@ mod tests {
             g.contains("background_status"),
             "checks for a peer coordinator already on the task"
         );
-        assert!(g.contains("STOP"), "instructs the model to STOP when work exists");
+        assert!(
+            g.contains("STOP"),
+            "instructs the model to STOP when work exists"
+        );
         assert!(
             g.contains("already shipped"),
             "reports the already-shipped conclusion with evidence"
@@ -2381,7 +2467,10 @@ mod tests {
             "Phase 2 must forbid tool calls"
         );
         // Reads batched in Phase 1 before writes; writes batched in Phase 3.
-        assert!(p.contains("ALL PARALLEL"), "phases mandate parallel batching");
+        assert!(
+            p.contains("ALL PARALLEL"),
+            "phases mandate parallel batching"
+        );
         assert!(
             p.contains("Front-load"),
             "Phase 1 front-loads every context read in one batch"
@@ -2392,7 +2481,10 @@ mod tests {
             "Phase 3 must trust writes without read-back verification"
         );
         // The call-reduction target is stated (87 → ~15–20).
-        assert!(p.contains("87") && p.contains("15"), "states the 87→~15 reduction target");
+        assert!(
+            p.contains("87") && p.contains("15"),
+            "states the 87→~15 reduction target"
+        );
     }
 
     #[test]
@@ -2401,7 +2493,10 @@ mod tests {
         // guard and the 5-phase pipeline just before the TASK. Guard against a
         // future edit dropping either directive from the wire.
         let template = format!("{PHASE0_GUARD}\n\n{PHASE_PIPELINE}");
-        assert!(template.contains("PHASE-0 GUARD"), "guard survives in the template");
+        assert!(
+            template.contains("PHASE-0 GUARD"),
+            "guard survives in the template"
+        );
         assert!(
             template.contains("--- PHASE 2: PLANNING ---"),
             "pipeline survives in the template"
@@ -2534,6 +2629,18 @@ mod tests {
         for s in ["", "maybe", "2", "onoff"] {
             assert_eq!(parse_flag(s), None, "{s:?} should be unrecognized");
         }
+    }
+
+    /// ISS-409757: retention may reap genuine failures but must never reap a
+    /// salvage marker — that row is the last pointer to recoverable work.
+    #[test]
+    fn salvage_rows_are_never_prunable_failures() {
+        let salvage = Some(crate::coordinator_store::SALVAGE_KIND);
+        assert!(is_prunable_failed("failed", None));
+        assert!(!is_prunable_failed("failed", salvage));
+        // Non-failed phases are out of scope either way.
+        assert!(!is_prunable_failed("done", None));
+        assert!(!is_prunable_failed("coordinating", salvage));
     }
 
     #[test]
@@ -2718,6 +2825,7 @@ mod tests {
             tokens_out: 0,
             turns: 0,
             tool_calls: 0,
+            kind: None,
         }
     }
 
@@ -2742,7 +2850,12 @@ mod tests {
             stale.as_deref()
         ));
         // Orphan: missing heartbeat is stale.
-        assert!(is_orphaned_row(Some("other"), "me", &Phase::Coordinating, None));
+        assert!(is_orphaned_row(
+            Some("other"),
+            "me",
+            &Phase::Coordinating,
+            None
+        ));
 
         // NOT orphan: it's mine (same session), even if stale.
         assert!(!is_orphaned_row(
@@ -2790,7 +2903,9 @@ mod tests {
         let store = CoordinatorStore::open(&path).unwrap();
         // Foreign, non-terminal — but its heartbeat is FRESH (insert stamps
         // current_timestamp), so it must NOT be reaped.
-        store.insert("foreign_fresh", "task", "other", None).unwrap();
+        store
+            .insert("foreign_fresh", "task", "other", None)
+            .unwrap();
         // This session's own non-terminal run — never reaped regardless.
         store.insert("mine", "task", "me", None).unwrap();
 

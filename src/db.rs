@@ -195,70 +195,14 @@ impl Db {
         Ok((mode, None, None))
     }
 
-    /// Record a worktree creation event (Fix #3: worktree lifecycle tracking).
-    #[allow(dead_code)]
-    pub fn record_worktree_created(
-        &self,
-        worktree_id: &str,
-        worktree_path: &std::path::Path,
-        run_id: &str,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO worktree_lifecycle (worktree_id, worktree_path, run_id)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![
-                worktree_id,
-                worktree_path.display().to_string(),
-                run_id
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Record a successful worktree cleanup event.
-    #[allow(dead_code)]
-    pub fn record_worktree_cleaned_up(&self, worktree_id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE worktree_lifecycle
-             SET cleaned_up_at = current_timestamp, cleanup_failed = 0
-             WHERE worktree_id = ?1 AND cleaned_up_at IS NULL",
-            rusqlite::params![worktree_id],
-        )?;
-        Ok(())
-    }
-
-    /// Record a failed cleanup attempt.
-    #[allow(dead_code)]
-    pub fn record_worktree_cleanup_failed(&self, worktree_id: &str, error: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE worktree_lifecycle
-             SET cleanup_failed = 1, cleanup_error = ?2
-             WHERE worktree_id = ?1 AND cleaned_up_at IS NULL",
-            rusqlite::params![worktree_id, error],
-        )?;
-        Ok(())
-    }
-
-    /// List orphaned worktrees (created but never cleaned up, run is old/gone).
-    /// This helps detect stale background coordinator worktrees that need manual cleanup.
-    #[allow(dead_code)]
-    pub fn list_orphaned_worktrees(&self, hours_old: i64) -> Result<Vec<(String, String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT worktree_id, worktree_path, run_id
-             FROM worktree_lifecycle
-             WHERE cleaned_up_at IS NULL
-             AND datetime(created_at) < datetime('now', ?1 || ' hours')
-             ORDER BY created_at ASC",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![format!("-{}", hours_old)], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-        })?;
-        let mut result = Vec::new();
-        for r in rows {
-            result.push(r?);
-        }
-        Ok(result)
-    }
+    // NOTE: the `worktree_lifecycle` ACCESSORS deliberately do not live here.
+    // The table is coordinator-run state, and the handle the worker + the
+    // startup salvage pass both already hold is `CoordinatorStore` (same
+    // `aish.db` file) — not `Db`, which nothing on the worktree path touches.
+    // They were dead code here (four `#[allow(dead_code)]` methods, zero
+    // callers) precisely because no caller could reach them; they now live on
+    // `CoordinatorStore` and are wired into `worker::create_worktree` /
+    // `remove_worktree` and `coordinator::salvage_orphaned_worktrees`.
 
     /// One-time, idempotent memory-store migrations (safe to run on every open):
     ///   1. **Quarantine offloads** — move any legacy `context-offload` rows out
@@ -280,9 +224,10 @@ impl Db {
                  SELECT ts, content FROM memories WHERE tags = ?1",
             [crate::memory::OFFLOAD_TAG],
         );
-        let _ = self
-            .conn
-            .execute("DELETE FROM memories WHERE tags = ?1", [crate::memory::OFFLOAD_TAG]);
+        let _ = self.conn.execute(
+            "DELETE FROM memories WHERE tags = ?1",
+            [crate::memory::OFFLOAD_TAG],
+        );
         // 2. Keyword index (best-effort — needs FTS5 in the SQLite build).
         let _ = self.conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(content, tags);",
@@ -327,9 +272,10 @@ impl Db {
     fn index_embedding(&self, id: i64, content: &str) {
         let v = crate::memory::embed(content);
         let blob = crate::memory::embed_to_blob(&v);
-        let _ = self
-            .conn
-            .execute("UPDATE memories SET embedding = ?2 WHERE id = ?1", (id, &blob));
+        let _ = self.conn.execute(
+            "UPDATE memories SET embedding = ?2 WHERE id = ?1",
+            (id, &blob),
+        );
         // Mirror into the vec0 index (text JSON is the format sqlite-vec accepts).
         let _ = self
             .conn
@@ -401,7 +347,10 @@ impl Db {
         );
         let _ = self.conn.execute(
             "INSERT INTO vec_memories(memory_id, embedding) VALUES (?1, ?2)",
-            (id, crate::memory::embed_to_json(&crate::memory::embed(content))),
+            (
+                id,
+                crate::memory::embed_to_json(&crate::memory::embed(content)),
+            ),
         );
         // Periodic self-organization: every ORGANIZE_EVERY writes, prune duplicate
         // memories so the store doesn't accumulate near-identical rows. Best-effort
@@ -549,7 +498,10 @@ impl Db {
                    AND (tags IS NULL OR tags != ?3)
                  ORDER BY id DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map((pattern, cap, crate::memory::OFFLOAD_TAG), MemoryHit::from_row)?;
+        let rows = stmt.query_map(
+            (pattern, cap, crate::memory::OFFLOAD_TAG),
+            MemoryHit::from_row,
+        )?;
         Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
@@ -644,7 +596,9 @@ impl Db {
     }
 
     /// Per-(tool, error-class) failure counts.
-    pub fn tool_telemetry_class_failures(&self) -> Result<Vec<crate::tool_telemetry::ClassFailure>> {
+    pub fn tool_telemetry_class_failures(
+        &self,
+    ) -> Result<Vec<crate::tool_telemetry::ClassFailure>> {
         let mut stmt = self.conn.prepare(
             "SELECT tool, coalesce(error_class, 'other'), count(*)
                  FROM tool_telemetry WHERE is_error = 1
@@ -848,12 +802,11 @@ impl Db {
     /// (upsert). Callers should `goal.touch()` before saving mutated records so
     /// `updated_at` reflects the change.
     pub fn upsert_goal(&self, goal: &crate::goal::Goal) -> Result<()> {
-        let milestones = serde_json::to_string(&goal.milestones)
-            .context("serialize goal.milestones")?;
-        let blockers =
-            serde_json::to_string(&goal.blockers).context("serialize goal.blockers")?;
-        let linked = serde_json::to_string(&goal.linked_tasks)
-            .context("serialize goal.linked_tasks")?;
+        let milestones =
+            serde_json::to_string(&goal.milestones).context("serialize goal.milestones")?;
+        let blockers = serde_json::to_string(&goal.blockers).context("serialize goal.blockers")?;
+        let linked =
+            serde_json::to_string(&goal.linked_tasks).context("serialize goal.linked_tasks")?;
         self.conn
             .execute(
                 "INSERT INTO goals
@@ -1004,7 +957,8 @@ impl MemoryHit {
     /// The `[ts] (tags) content` line the model sees, content truncated to the
     /// recall hit cap so no single fact can balloon a tool result.
     fn render(&self) -> String {
-        let content = crate::memory::truncate_hit(&self.content, crate::memory::RECALL_HIT_MAX_CHARS);
+        let content =
+            crate::memory::truncate_hit(&self.content, crate::memory::RECALL_HIT_MAX_CHARS);
         if self.tags.is_empty() {
             format!("[{}] {content}", self.ts)
         } else {
@@ -1206,7 +1160,8 @@ impl BatchStore {
 // (schema, migrations, queries) sits behind one module with typed accessors.
 // Re-exported here so existing `crate::db::…` call sites keep compiling
 // unchanged.
-#[allow(unused_imports)] // `RunResult` is public store API; used only as an inferred return type today.
+#[allow(unused_imports)]
+// `RunResult` is public store API; used only as an inferred return type today.
 pub use crate::coordinator_store::{CoordinatorRow, CoordinatorStore, RunResult};
 
 /// Durable ring buffer for the `:activity` tray (recoverable history). Every
@@ -1404,21 +1359,21 @@ impl AlertStore {
     }
 
     /// Row → `Alert`; a row whose `kind_json` won't parse is skipped (`None`).
-    fn alert_from_row(
-        r: &rusqlite::Row<'_>,
-    ) -> rusqlite::Result<Option<crate::alert::Alert>> {
+    fn alert_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<crate::alert::Alert>> {
         let id: i64 = r.get(0)?;
         let condition: String = r.get(1)?;
         let kind_json: String = r.get(2)?;
         let audible: i64 = r.get(3)?;
         let last_checked: i64 = r.get(4)?;
-        Ok(crate::alert::AlertKind::from_json(&kind_json).map(|kind| crate::alert::Alert {
-            id,
-            condition,
-            kind,
-            audible: audible != 0,
-            last_checked,
-        }))
+        Ok(
+            crate::alert::AlertKind::from_json(&kind_json).map(|kind| crate::alert::Alert {
+                id,
+                condition,
+                kind,
+                audible: audible != 0,
+                last_checked,
+            }),
+        )
     }
 
     /// Record that a native alert was just evaluated (throttles re-polling).
@@ -1495,7 +1450,10 @@ impl AlertStore {
     pub fn cancel_all_alerts(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let n = conn
-            .execute("UPDATE alerts SET state='cancelled' WHERE state='armed'", [])
+            .execute(
+                "UPDATE alerts SET state='cancelled' WHERE state='armed'",
+                [],
+            )
             .context("cancel all alerts failed")?;
         Ok(n)
     }
@@ -1534,17 +1492,14 @@ impl AlertStore {
     pub fn condition_of(&self, id: i64) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         let out = conn
-            .query_row(
-                "SELECT condition FROM alerts WHERE id = ?1",
-                [id],
-                |r| r.get::<_, String>(0),
-            )
+            .query_row("SELECT condition FROM alerts WHERE id = ?1", [id], |r| {
+                r.get::<_, String>(0)
+            })
             .optional()
             .context("condition_of failed")?;
         Ok(out)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1617,7 +1572,7 @@ mod tests {
     /// one flow (TASK-283 AC#2).
     #[test]
     fn goal_rollup_and_routing_over_persisted_tree() {
-        use crate::goal::{route_next, subtree_percent, subtree_progress, Goal, GoalStatus};
+        use crate::goal::{Goal, GoalStatus, route_next, subtree_percent, subtree_progress};
         let db = temp_db("goals_rollup_routing");
 
         // root(0/1) ─┬─ ready(0/2)         ← actionable
@@ -1660,7 +1615,10 @@ mod tests {
         let reloaded = db.all_goals().unwrap();
         let b = reloaded.iter().find(|g| g.title == "blocked").unwrap();
         assert_eq!(b.open_blockers(), 0);
-        assert!(b.is_actionable(), "unblocked goal is actionable after reload");
+        assert!(
+            b.is_actionable(),
+            "unblocked goal is actionable after reload"
+        );
     }
 
     /// Forward schema migration: a legacy aish.db that predates the `goals`
@@ -1670,8 +1628,10 @@ mod tests {
     #[test]
     fn legacy_db_without_goals_table_migrates_forward() {
         use crate::goal::Goal;
-        let path = std::env::temp_dir()
-            .join(format!("aish_test_legacy_migrate_{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "aish_test_legacy_migrate_{}.db",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
 
         // Seed a "legacy" DB: only the history table, no goals schema at all.
@@ -1715,7 +1675,10 @@ mod tests {
         // Goals table now exists and is usable.
         let g = Goal::new("post-migration goal");
         db.upsert_goal(&g).unwrap();
-        assert_eq!(db.get_goal(&g.id).unwrap().unwrap().title, "post-migration goal");
+        assert_eq!(
+            db.get_goal(&g.id).unwrap().unwrap().title,
+            "post-migration goal"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1933,7 +1896,11 @@ mod tests {
         db.remember(&big, None).unwrap();
         let hits = db.recall("alpha", 5).unwrap();
         assert_eq!(hits.len(), 1);
-        assert!(hits[0].contains("KB elided"), "expected elision marker: {}", hits[0]);
+        assert!(
+            hits[0].contains("KB elided"),
+            "expected elision marker: {}",
+            hits[0]
+        );
         assert!(
             hits[0].chars().count() < big.chars().count(),
             "hit should be capped well under the original"
@@ -1977,7 +1944,9 @@ mod tests {
             .unwrap();
         // Newer row, shares only the token "rust".
         db.remember("rust is a programming language", None).unwrap();
-        let hits = db.recall("rust compiler optimizes release builds", 5).unwrap();
+        let hits = db
+            .recall("rust compiler optimizes release builds", 5)
+            .unwrap();
         assert!(!hits.is_empty());
         assert!(
             hits[0].contains("optimizes release builds"),
@@ -1996,8 +1965,7 @@ mod tests {
 
     #[test]
     fn legacy_offload_rows_migrate_out_of_memories_on_open() {
-        let path =
-            std::env::temp_dir().join(format!("aish_migrate_{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!("aish_migrate_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let db = Db::open(&path).unwrap();
         // Simulate the pre-migration state: an offload transcript living in
@@ -2005,7 +1973,10 @@ mod tests {
         db.conn
             .execute(
                 "INSERT INTO memories (content, tags) VALUES (?1, ?2)",
-                ("[context-offload] legacy transcript body", "context-offload"),
+                (
+                    "[context-offload] legacy transcript body",
+                    "context-offload",
+                ),
             )
             .unwrap();
         db.remember("a real curated fact", None).unwrap();
@@ -2014,17 +1985,19 @@ mod tests {
         let db2 = Db::open(&path).unwrap();
         // The legacy offload is gone from curated memories…
         assert_eq!(db2.memory_count().unwrap(), 1);
-        assert!(db2
-            .recall("legacy", 10)
-            .unwrap()
-            .iter()
-            .all(|h| !h.contains("legacy transcript")));
+        assert!(
+            db2.recall("legacy", 10)
+                .unwrap()
+                .iter()
+                .all(|h| !h.contains("legacy transcript"))
+        );
         // …and now lives in the offloads table.
-        assert!(db2
-            .recall_offloads(10)
-            .unwrap()
-            .iter()
-            .any(|o| o.contains("legacy transcript body")));
+        assert!(
+            db2.recall_offloads(10)
+                .unwrap()
+                .iter()
+                .any(|o| o.contains("legacy transcript body"))
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2078,5 +2051,4 @@ mod tests {
         assert!(!db.is_allowed("git").unwrap());
         assert_eq!(names(&db), vec!["npm"]);
     }
-
 }

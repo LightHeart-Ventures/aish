@@ -300,6 +300,7 @@ mod tests {
         CoordinatorRow {
             run_id: "r".into(),
             task: "t".into(),
+            kind: None,
             phase: phase.into(),
             result: None,
             error: None,

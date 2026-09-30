@@ -226,10 +226,16 @@ fn lex_activity(raw: &str) -> ActivityEvent {
     // alongside it is a RESULT (outcome); a bare glyph is the START line.
     if has_tool_glyph(raw) {
         if raw.contains('✓') {
-            return ActivityEvent::ToolResult { ok: true, text: clean_activity_line(raw) };
+            return ActivityEvent::ToolResult {
+                ok: true,
+                text: clean_activity_line(raw),
+            };
         }
         if raw.contains('✗') {
-            return ActivityEvent::ToolResult { ok: false, text: clean_activity_line(raw) };
+            return ActivityEvent::ToolResult {
+                ok: false,
+                text: clean_activity_line(raw),
+            };
         }
         return ActivityEvent::ToolStart;
     }
@@ -239,7 +245,9 @@ fn lex_activity(raw: &str) -> ActivityEvent {
     // 🗨 turn narration: the pulse fires on the sentinel even with empty text
     // (legacy `classify_event` semantics), so carry `text` as an Option.
     if has_sentinel(raw, "🗨") {
-        return ActivityEvent::Turn { text: strip_sentinel(raw, "🗨") };
+        return ActivityEvent::Turn {
+            text: strip_sentinel(raw, "🗨"),
+        };
     }
     if let Some(text) = strip_sentinel(raw, "📦") {
         return ActivityEvent::Batch(text);
@@ -277,7 +285,6 @@ impl ActivityEvent {
         }
     }
 }
-
 
 /// Classify ONE raw coordinator-stderr line into a prompt-badge pulse event, or
 /// `None` when it carries no event. Pure, so it's unit-testable without a pipe.
@@ -440,12 +447,7 @@ const PANE_WALL: char = '┃';
 /// ANSI CSI escape (`\x1b[2;36m`). Used to prove nothing but formatting precedes
 /// a pane wall.
 fn is_chrome(c: char) -> bool {
-    c.is_whitespace()
-        || c == '\x1b'
-        || c == '['
-        || c == ';'
-        || c == 'm'
-        || c.is_ascii_digit()
+    c.is_whitespace() || c == '\x1b' || c == '[' || c == ';' || c == 'm' || c.is_ascii_digit()
 }
 
 /// Skip leading ANSI escapes + whitespace, returning the first real character.
@@ -989,10 +991,7 @@ fn pane_row_cols(label: &str, text: &str, cols: usize, border: &str) -> String {
     // Continuation rows: border + pad so the message column lines up under the
     // opening row's first message letter (┃ is 1 col, then indent-1 spaces).
     let cont = format!("{border}{}", " ".repeat(indent.saturating_sub(1)));
-    let mut out = format!(
-        "{border} \x1b[2m[{label}]\x1b[0m {prefix}{}",
-        chunks[0]
-    );
+    let mut out = format!("{border} \x1b[2m[{label}]\x1b[0m {prefix}{}", chunks[0]);
     for chunk in &chunks[1..] {
         out.push('\n');
         out.push_str(&cont);
@@ -1028,7 +1027,10 @@ pub fn pane_replay_header(short: &str) -> String {
 /// \x1b[0m`). Framed as a normal pane row so it still carries the cyan border +
 /// `[label]` gutter. Pure — unit-tested.
 pub fn pane_input_row(label: &str, task: &str) -> String {
-    pane_row(label, &format!("\x1b[1m💬 task: {}\x1b[0m", task_headline(task)))
+    pane_row(
+        label,
+        &format!("\x1b[1m💬 task: {}\x1b[0m", task_headline(task)),
+    )
 }
 
 /// Reduce a coordinator's (possibly huge, machine-facing) task string to a short
@@ -1351,8 +1353,7 @@ impl ThinkingSpinner {
                     // static line rather than a frozen braille frame `⠋` that
                     // merely looks stuck. A trailing blank line sets it apart from
                     // the next forwarded row / the redrawn prompt below it.
-                    let body =
-                        format!("{NARRATION_ALIGN_PAD}💭 \x1b[2;36mthinking…\x1b[0m");
+                    let body = format!("{NARRATION_ALIGN_PAD}💭 \x1b[2;36mthinking…\x1b[0m");
                     let row = if live {
                         pane_row_live(&label, &body)
                     } else {
@@ -1534,7 +1535,11 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
             // framing nests (`🗨 ┃ [label] 🚀 …`) instead of erasing the
             // classification and stranding a grandchild's activity.
             let render_row = |t: &str| {
-                let row = if live { pane_row_live(label, t) } else { pane_row(label, t) };
+                let row = if live {
+                    pane_row_live(label, t)
+                } else {
+                    pane_row(label, t)
+                };
                 nest_row(&event, row)
             };
             if on {
@@ -1560,11 +1565,8 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                         // Hand the spinner the SAME forward-gate handles the stream
                         // loop reads, so it can self-erase the moment the user
                         // Shift-Tabs / detaches away mid-think (see ThinkingSpinner).
-                        thinking = ThinkingSpinner::start(
-                            label,
-                            show_output.clone(),
-                            attached.clone(),
-                        );
+                        thinking =
+                            ThinkingSpinner::start(label, show_output.clone(), attached.clone());
                         if thinking.is_none() {
                             // Off a TTY there's no animation: emit a single static
                             // row so piped parents still see the notice (once per
@@ -1789,7 +1791,10 @@ fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str, cwd: &std::path::
         // levels deep before `spawn_budget_gate` refuses. Single source of truth
         // for the host vehicle; the container vehicle stamps the identical value
         // via `env_inline` (see run_worker's container branch).
-        .env(SPAWN_BUDGET_ENV, child_spawn_budget(spawn_budget()).to_string())
+        .env(
+            SPAWN_BUDGET_ENV,
+            child_spawn_budget(spawn_budget()).to_string(),
+        )
         // Tie the work to the LAUNCHING session: the child adopts this id so its
         // durable records attribute to the session that asked for the work.
         .env("AISH_LAUNCH_SESSION_ID", &spec.launch_session_id)
@@ -2245,7 +2250,20 @@ where
 /// are exhausted do we fall back to the shared cwd. stderr is captured on each
 /// failure to log the cause (and distinguish a lock collision from a fatal
 /// error). No new dependencies — `Duration` + `std::thread::sleep` only.
-fn create_worktree(src: &std::path::Path, id: &str, base: &str) -> Option<Worktree> {
+///
+/// `store`, when present, is the coordinator store to OPEN a `worktree_lifecycle`
+/// ledger row against on success. The ledger — not the filesystem — is what makes
+/// a leaked tree findable later: the startup scan only sees dirty-or-ahead trees
+/// under the CURRENT repo-key, so an empty-but-stale tree (or one under another
+/// repo) is invisible to it. Recording is best-effort: a ledger write failure
+/// must never cost the caller its isolation, so the error is reported and the
+/// worktree is still returned.
+fn create_worktree(
+    src: &std::path::Path,
+    id: &str,
+    base: &str,
+    store: Option<&crate::coordinator_store::CoordinatorStore>,
+) -> Option<Worktree> {
     if !is_git_repo(src) {
         return None;
     }
@@ -2266,9 +2284,7 @@ fn create_worktree(src: &std::path::Path, id: &str, base: &str) -> Option<Worktr
     // The guard protects an EXTERNAL resource (git's lock), not in-memory
     // invariants, so a poisoned mutex is recovered rather than propagated — a
     // panic in some other add must not permanently disable isolation.
-    let _add_guard = WORKTREE_ADD_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _add_guard = WORKTREE_ADD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // A stale dir from a crashed prior run would make `git worktree add` fail;
     // best-effort clear it first (only an empty/leftover one is expected here).
     let _ = std::process::Command::new("git")
@@ -2339,6 +2355,16 @@ fn create_worktree(src: &std::path::Path, id: &str, base: &str) -> Option<Worktr
             );
         }
         return None;
+    }
+    // Open the lifecycle ledger row NOW — before any work happens — so a parent
+    // killed mid-run still leaves a durable record of the tree it created.
+    if let Some(store) = store {
+        if let Err(e) = store.record_worktree_created(id, &path, id) {
+            eprintln!(
+                "aish: could not record worktree {} in the lifecycle ledger: {e}",
+                path.display(),
+            );
+        }
     }
     // Pin the base commit for clean-up accounting (tip == base_sha ⇒ no commits).
     let base_sha = git_head(&path).unwrap_or_default();
@@ -2609,17 +2635,48 @@ pub fn work_bearing_worktrees(src: &std::path::Path) -> Vec<OrphanWork> {
     out
 }
 
+/// The ledger key for a worktree: its leaf dir name (`w_########`), which is the
+/// `id` [`create_worktree`] was called with. Derived from the path rather than
+/// stored on [`Worktree`] so there's no second copy that can drift from the
+/// layout that produced it.
+fn worktree_id_of(wt: &Worktree) -> String {
+    wt.path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// True when a worktree leaf on disk holds work an operator would care about:
+/// uncommitted/untracked changes (excluding the coordinator's own `.atum/`
+/// telemetry) or commits ahead of its base. A git error reads as "holds work" —
+/// never report a tree as empty when we cannot prove it is.
+pub fn worktree_holds_work(leaf: &std::path::Path) -> bool {
+    let dirty = match git_out(leaf, &["status", "--porcelain", "--", ":(exclude).atum"]) {
+        Some(s) => !s.trim().is_empty(),
+        None => true,
+    };
+    dirty || worktree_commits_ahead(leaf)
+}
+
 /// Remove a worktree and delete its branch — used when the worker made no
 /// changes, so nothing is left behind. Best-effort.
-fn remove_worktree(wt: &Worktree) {
-    let _ = std::process::Command::new("git")
+///
+/// `store`, when present, CLOSES the tree's `worktree_lifecycle` ledger row so
+/// the startup leak report stops listing it. The removal's success is CHECKED
+/// rather than assumed: if the dir survives, the row is left OPEN and stamped
+/// with the reason instead — a failed cleanup is precisely the leak the ledger
+/// exists to keep reporting, and closing the row here would hide it forever.
+fn remove_worktree(wt: &Worktree, store: Option<&crate::coordinator_store::CoordinatorStore>) {
+    let removed = std::process::Command::new("git")
         .arg("-C")
         .arg(&wt.src)
         .args(["worktree", "remove", "--force"])
         .arg(&wt.path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
     let _ = std::process::Command::new("git")
         .arg("-C")
         .arg(&wt.src)
@@ -2627,6 +2684,20 @@ fn remove_worktree(wt: &Worktree) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+    if let Some(store) = store {
+        let id = worktree_id_of(wt);
+        let outcome = if removed && !wt.path.exists() {
+            store.record_worktree_cleaned_up(&id)
+        } else {
+            store.record_worktree_cleanup_failed(
+                &id,
+                &format!("git worktree remove left {} on disk", wt.path.display()),
+            )
+        };
+        if let Err(e) = outcome {
+            eprintln!("aish: could not update the worktree lifecycle ledger for {id}: {e}");
+        }
+    }
 }
 
 /// Turn a finished child's `ExitStatus` into a human failure note. SIGKILL
@@ -3426,7 +3497,12 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
 /// the operator now continues the SAME worker, with each resume tracked as a new
 /// thread under the covers. Returns `(worker_id, thread_number)`. Caller must
 /// ensure the worker is terminal (only finished runs are resumed).
-pub fn resume_in_place(jobs: &WorkerJobs, job: Arc<WorkerJob>, task: String, spec: WorkerSpec) -> (String, u32) {
+pub fn resume_in_place(
+    jobs: &WorkerJobs,
+    job: Arc<WorkerJob>,
+    task: String,
+    spec: WorkerSpec,
+) -> (String, u32) {
     let thread = job.reset_for_resume();
     // A fresh coordinator run id for this thread — distinct from the worker's
     // visible id, so the child's durable record and per-worker transcript don't
@@ -3445,7 +3521,13 @@ pub fn resume_in_place(jobs: &WorkerJobs, job: Arc<WorkerJob>, task: String, spe
 /// durable record, and per-worker transcript are thread-distinct). All
 /// operator-facing labels (`[{}]` announces, `:workers` row) stay keyed on the
 /// stable `job.id`.
-async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, run_id: String, task: String, spec: WorkerSpec) {
+async fn run_worker(
+    jobs: WorkerJobs,
+    job: Arc<WorkerJob>,
+    run_id: String,
+    task: String,
+    spec: WorkerSpec,
+) {
     // Bind the worker handle to THIS thread's durable identity before anything
     // can observe it. `background_status` resolves a live worker's heartbeat
     // through this id; leaving it pointed at the previous (terminal) thread is
@@ -3463,7 +3545,12 @@ async fn run_worker(jobs: WorkerJobs, job: Arc<WorkerJob>, run_id: String, task:
         // leaf is just the id: two sessions / two checkouts share the `{repo-key}`
         // parent dir but never collide on the leaf. Lives under `~/.aish/worktrees`
         // (off the OS-reaped temp dir — ISS-2046), swept on startup if abandoned.
-        create_worktree(&spec.cwd, &run_id, &spec.base)
+        create_worktree(
+            &spec.cwd,
+            &run_id,
+            &spec.base,
+            spec.coordinator_store.as_ref(),
+        )
     } else {
         None
     };
@@ -3523,7 +3610,7 @@ other's files and commit onto the wrong branch, so this run is failed instead. R
         Ok(c) => c,
         Err(e) => {
             if let Some(wt) = &worktree {
-                remove_worktree(wt);
+                remove_worktree(wt, spec.coordinator_store.as_ref());
             }
             job.set_failed(format!("couldn't launch worker subprocess: {e}"));
             on_complete(&jobs, &job);
@@ -3579,7 +3666,7 @@ other's files and commit onto the wrong branch, so this run is failed instead. R
     // Finalize the worktree (if any): a clean one (no changes, no new commits) is
     // removed so nothing is left behind; one with work is kept and its branch
     // surfaced so the parent can review/merge it. Returns the kept branch, if any.
-    let kept_branch = finalize_worktree(worktree.as_ref());
+    let kept_branch = finalize_worktree(worktree.as_ref(), spec.coordinator_store.as_ref());
     if let Some(branch) = &kept_branch {
         job.set_branch(branch.clone());
     }
@@ -3671,10 +3758,18 @@ from the parent repo; not auto-merged.)",
 /// commits ahead, remove it + its branch (nothing left behind) and return
 /// `None`. If it has work, leave it intact and return the branch name so the
 /// parent can review/merge it (never auto-merged).
-fn finalize_worktree(worktree: Option<&Worktree>) -> Option<String> {
+///
+/// `store` is threaded through to [`remove_worktree`] so the teardown closes the
+/// tree's lifecycle ledger row. A KEPT worktree deliberately leaves its row
+/// OPEN: the branch is real work handed back to the operator, and the open row
+/// is what lets startup rediscover it if the parent dies before it's merged.
+fn finalize_worktree(
+    worktree: Option<&Worktree>,
+    store: Option<&crate::coordinator_store::CoordinatorStore>,
+) -> Option<String> {
     let wt = worktree?;
     if worktree_is_clean(wt) {
-        remove_worktree(wt);
+        remove_worktree(wt, store);
         None
     } else {
         Some(wt.branch.clone())
@@ -3963,7 +4058,7 @@ pub fn pulse_badge(running: usize, terminal: Option<bool>) -> String {
     }
     // Nothing live: flash the most-recent terminal verdict.
     match terminal {
-        Some(true) => "\x1b[32m✓\x1b[0m ".to_string(),  // green — done
+        Some(true) => "\x1b[32m✓\x1b[0m ".to_string(), // green — done
         Some(false) => "\x1b[31m✗\x1b[0m ".to_string(), // red — completed but failed
         None => String::new(),
     }
@@ -3985,6 +4080,21 @@ fn flush_results(jobs: &WorkerJobs) {
 
 #[cfg(test)]
 mod tests {
+    /// ISS-409757: the ledger key is DERIVED from the worktree path rather than
+    /// carried on the struct, so it can never drift from the layout that made
+    /// the tree. If this breaks, cleanup closes the wrong row (or none) and the
+    /// leak report goes stale — assert the leaf, not the parent chain.
+    #[test]
+    fn worktree_ledger_key_is_the_leaf_dir() {
+        let wt = super::Worktree {
+            path: std::path::PathBuf::from("/Users/x/.aish/worktrees/Org--repo/w_TysP41oZ"),
+            branch: "aish/w_TysP41oZ".into(),
+            src: std::path::PathBuf::from("/Users/x/repo"),
+            base_sha: "deadbeef".into(),
+        };
+        assert_eq!(super::worktree_id_of(&wt), "w_TysP41oZ");
+    }
+
     // FIX A — the dangerous-degradation truth table. Only one cell may fail the
     // run: isolation asked for, repo present, no worktree. Every other cell is
     // either a legitimate shared-cwd run or nothing to isolate at all.
@@ -4099,7 +4209,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aish-reconcile-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let store = crate::db::CoordinatorStore::open(&dir.join("aish.db")).unwrap();
-        store.insert("w_stale", "resolve conflict for #444", "sess", None).unwrap();
+        store
+            .insert("w_stale", "resolve conflict for #444", "sess", None)
+            .unwrap();
         let before = store.result_for_run("w_stale").unwrap().unwrap();
         assert_eq!(before.phase, "coordinating");
         assert!(phase_needs_reconcile(&before.phase));
@@ -4331,9 +4443,9 @@ mod tests {
                 displayed: false,
                 branch: None,
                 transcript: TranscriptRing::default(),
-            backfill_spinner: None,
-            started: SystemTime::now(),
-            finished: None,
+                backfill_spinner: None,
+                started: SystemTime::now(),
+                finished: None,
             }),
         });
         assert!(job.fetch().contains("still running"));
@@ -4356,9 +4468,9 @@ mod tests {
                 displayed: false,
                 branch: None,
                 transcript: TranscriptRing::default(),
-            backfill_spinner: None,
-            started: SystemTime::now(),
-            finished: None,
+                backfill_spinner: None,
+                started: SystemTime::now(),
+                finished: None,
             }),
         });
         job.set_failed("boom".into());
@@ -4444,7 +4556,9 @@ mod tests {
         let framed = pane_row("w_child", "🗨 planning the migration");
         assert_eq!(
             lex_activity(&framed),
-            ActivityEvent::Turn { text: Some("planning the migration".to_string()) },
+            ActivityEvent::Turn {
+                text: Some("planning the migration".to_string())
+            },
             "a framed turn row must stay a Turn, not Noise: {framed:?}"
         );
         assert_eq!(lex_activity(&framed).pulse(), Some(Pulse::Turn));
@@ -4462,11 +4576,16 @@ mod tests {
             ActivityEvent::Console("heads up".to_string())
         );
         // Prose that merely CONTAINS a wall is not a pane row — no misparse.
-        assert_eq!(lex_activity("the glyph ┃ 🗨 is a wall"), ActivityEvent::Noise);
+        assert_eq!(
+            lex_activity("the glyph ┃ 🗨 is a wall"),
+            ActivityEvent::Noise
+        );
         // And an unframed line is unaffected (the historical path).
         assert_eq!(
             lex_activity("🗨 planning the migration"),
-            ActivityEvent::Turn { text: Some("planning the migration".to_string()) }
+            ActivityEvent::Turn {
+                text: Some("planning the migration".to_string())
+            }
         );
     }
 
@@ -4611,7 +4730,10 @@ mod tests {
         assert_eq!(console_message("💭 thinking…"), None);
         assert_eq!(console_message("🗨 planning the migration"), None);
         assert_eq!(console_message("📦 fanned 3 sub-task(s) out"), None);
-        assert_eq!(console_message("\x1b[2m  ✓ 🔧 read /etc/hosts\x1b[0m"), None);
+        assert_eq!(
+            console_message("\x1b[2m  ✓ 🔧 read /etc/hosts\x1b[0m"),
+            None
+        );
         assert_eq!(console_message("📣"), None); // bare sentinel, no text
         assert_eq!(console_message(""), None);
     }
@@ -4736,7 +4858,11 @@ mod tests {
         );
         // No row exceeds the terminal width.
         for l in &lines {
-            assert!(vis_cols(l) <= 60, "row within width: {l:?} ({})", vis_cols(l));
+            assert!(
+                vis_cols(l) <= 60,
+                "row within width: {l:?} ({})",
+                vis_cols(l)
+            );
         }
     }
 
@@ -4757,7 +4883,10 @@ mod tests {
         // ("w_a7k3m2pQ" gutter = 15; cols = 30 ⇒ avail = 15 < MIN_WRAP_COLS.)
         let body = "\x1b[2;36mthinking… a very long status that would otherwise wrap across the terminal width here\x1b[0m";
         let row = pane_row_cols("w_a7k3m2pQ", body, 30, PANE_BORDER);
-        assert!(!row.contains('\n'), "too narrow to hang-indent → single line");
+        assert!(
+            !row.contains('\n'),
+            "too narrow to hang-indent → single line"
+        );
     }
 
     #[test]
@@ -4775,7 +4904,11 @@ mod tests {
         assert!(lines.len() >= 2, "ANSI message should wrap: {row:?}");
         for l in &lines {
             assert!(l.starts_with(PANE_BORDER), "row keeps the border: {l:?}");
-            assert!(vis_cols(l) <= 50, "row within width: {l:?} ({})", vis_cols(l));
+            assert!(
+                vis_cols(l) <= 50,
+                "row within width: {l:?} ({})",
+                vis_cols(l)
+            );
         }
         // Continuation hangs under the first message letter: "🚀 " = 3 cols after
         // the 15-col gutter ⇒ indent 18 ⇒ "┃" + 17 spaces.
@@ -4832,7 +4965,11 @@ mod tests {
         assert_eq!(vis_cols("\u{1F6E0}\u{FE0F}"), 2, "🛠️ is 2 cols");
         assert_eq!(vis_cols("\u{2699}\u{FE0F}"), 2, "⚙️ is 2 cols");
         // The exact tool-result prefix from the bug report: "✓ 🛠️ ".
-        assert_eq!(vis_cols("\u{2713} \u{1F6E0}\u{FE0F} "), 5, "✓ 🛠️  prefix is 5 cols");
+        assert_eq!(
+            vis_cols("\u{2713} \u{1F6E0}\u{FE0F} "),
+            5,
+            "✓ 🛠️  prefix is 5 cols"
+        );
         // A bare rocket (already width-2, no selector) is unchanged.
         assert_eq!(vis_cols("\u{1F680}"), 2, "🚀 is 2 cols");
     }
@@ -4929,7 +5066,10 @@ mod tests {
             row.contains("[w_a7k3m2pQ]"),
             "gutter carries the worker id: {row}"
         );
-        assert!(row.contains('💬'), "input row carries the speech glyph: {row}");
+        assert!(
+            row.contains('💬'),
+            "input row carries the speech glyph: {row}"
+        );
         assert!(row.contains("\x1b[1m"), "input row is bold: {row}");
         assert!(
             row.contains("review the design doc"),
@@ -4981,7 +5121,10 @@ mod tests {
 
     #[test]
     fn task_headline_passes_plain_tasks_through() {
-        assert_eq!(task_headline("review the design doc"), "review the design doc");
+        assert_eq!(
+            task_headline("review the design doc"),
+            "review the design doc"
+        );
         // Whitespace/newlines collapse to single spaces.
         assert_eq!(task_headline("do  a\n\nand b"), "do a and b");
     }
@@ -4992,7 +5135,10 @@ mod tests {
         let task = "just do the thing\n=== End context ===";
         let h = task_headline(task);
         assert!(!h.is_empty(), "never blank: {h:?}");
-        assert!(h.contains("just do the thing"), "falls back to full task: {h}");
+        assert!(
+            h.contains("just do the thing"),
+            "falls back to full task: {h}"
+        );
     }
 
     #[test]
@@ -5032,7 +5178,10 @@ mod tests {
         let text = "\x1b[1m💬 task: line one\nline two\x1b[0m";
         let folded = fold_pane_controls(text);
         assert!(folded.contains("\x1b[1m"), "SGR open preserved: {folded:?}");
-        assert!(folded.contains("\x1b[0m"), "SGR reset preserved: {folded:?}");
+        assert!(
+            folded.contains("\x1b[0m"),
+            "SGR reset preserved: {folded:?}"
+        );
         assert!(!folded.contains('\n'), "newline folded away: {folded:?}");
         assert!(
             folded.contains("line one line two"),
@@ -5055,9 +5204,9 @@ mod tests {
                 displayed: false,
                 branch: None,
                 transcript: TranscriptRing::default(),
-            backfill_spinner: None,
-            started: SystemTime::now(),
-            finished: None,
+                backfill_spinner: None,
+                started: SystemTime::now(),
+                finished: None,
             }),
         });
         // Record well past the line cap; the oldest rows are evicted.
@@ -5066,11 +5215,7 @@ mod tests {
             job.record_activity("", &format!("line {n}"));
         }
         let rows = job.transcript_rows();
-        assert!(
-            rows.len() <= MAX_LINES,
-            "line cap enforced: {}",
-            rows.len()
-        );
+        assert!(rows.len() <= MAX_LINES, "line cap enforced: {}", rows.len());
         // The newest line is retained; the very first is gone.
         let newest = format!("line {}", MAX_LINES + 49);
         assert!(rows.last().unwrap().1.contains(&newest), "newest row kept");
@@ -5262,7 +5407,10 @@ mod tests {
             MIN_WORKER_MEM_MB
         );
         // At or above the floor the operator's value is honoured exactly.
-        assert_eq!(effective_worker_mem_mb(MIN_WORKER_MEM_MB), MIN_WORKER_MEM_MB);
+        assert_eq!(
+            effective_worker_mem_mb(MIN_WORKER_MEM_MB),
+            MIN_WORKER_MEM_MB
+        );
         assert_eq!(
             effective_worker_mem_mb(DEFAULT_WORKER_MEM_MB),
             DEFAULT_WORKER_MEM_MB
