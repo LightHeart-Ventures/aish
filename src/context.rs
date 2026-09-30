@@ -212,13 +212,52 @@ pub fn estimate_history_tokens(history: &[Msg]) -> usize {
     for m in history {
         n += estimate_text_tokens(&m.text);
         for c in &m.tool_calls {
-            n += estimate_text_tokens(&c.name) + estimate_text_tokens(&c.args.to_string());
+            n += estimate_text_tokens(&c.name) + json_bytes(&c.args).div_ceil(4);
         }
         for r in &m.tool_results {
             n += estimate_text_tokens(&r.content);
         }
     }
     n
+}
+
+/// Serialized-JSON byte length of `v`, computed WITHOUT serializing it.
+///
+/// `Value::to_string()` allocates a fresh `String` for EVERY tool call in the
+/// retained transcript on EVERY estimate — and tool args routinely carry whole
+/// file bodies (`write_file`), so one estimate could copy megabytes, dozens of
+/// times per turn. Walking the tree and summing lengths is allocation-free and
+/// O(#nodes) instead of O(#bytes-copied). (ISS-409753)
+///
+/// Deliberately approximate, and biased to OVER-count (escape sequences are not
+/// expanded, numbers are charged a flat width) so the overflow guard can only
+/// become more conservative — never less.
+fn json_bytes(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Null => 4,
+        serde_json::Value::Bool(b) => {
+            if *b {
+                4
+            } else {
+                5
+            }
+        }
+        // Flat width rather than formatting the number: cheap and over-counts.
+        serde_json::Value::Number(_) => 8,
+        // +2 for the surrounding quotes.
+        serde_json::Value::String(s) => s.len() + 2,
+        // Brackets + the `,` separators between elements.
+        serde_json::Value::Array(a) => {
+            2 + a.len().saturating_sub(1) + a.iter().map(json_bytes).sum::<usize>()
+        }
+        // Braces + separators; each key costs its bytes plus `"":`.
+        serde_json::Value::Object(o) => {
+            2 + o.len().saturating_sub(1)
+                + o.iter()
+                    .map(|(k, val)| k.len() + 3 + json_bytes(val))
+                    .sum::<usize>()
+        }
+    }
 }
 
 /// Count the tool calls carried by a history slice — the assistant-side tool
@@ -336,6 +375,39 @@ pub fn prompt_ceiling(window: usize) -> usize {
 /// history. `tool_tokens` comes from [`crate::mcp::tool_defs_token_estimate`].
 pub fn estimate_prompt_tokens(system: &str, tool_tokens: usize, history: &[Msg]) -> usize {
     estimate_text_tokens(system) + tool_tokens + estimate_history_tokens(history)
+}
+
+/// Same estimate as [`estimate_prompt_tokens`], but ANCHORED on the token count
+/// the backend last reported so only the newly-appended tail has to be sized.
+///
+/// [`estimate_prompt_tokens`] re-scans the entire transcript, and the pre-flight
+/// guard calls it before every model call — so a tool-heavy turn re-scanned a
+/// growing history on each of its ~50 iterations (O(n) work on O(n) growth).
+/// `base` is the exact figure the backend reported for the prompt it last saw
+/// (`session.context_used`) and `mark` is `history.len()` at that instant, so
+/// everything below `mark` is already accounted for and only `history[mark..]`
+/// — normally one or two messages — needs estimating. (ISS-409753)
+///
+/// Anchoring is also MORE accurate than the pure estimate: the base is real
+/// tokenizer output rather than a ~4-bytes/token approximation.
+///
+/// Falls back to the full scan whenever the anchor is unusable: `base == 0` (no
+/// usage reported yet this session) or `mark > history.len()` (history was
+/// compacted or cleared without re-seating), so a stale mark can never silently
+/// under-count.
+pub fn estimate_prompt_tokens_anchored(
+    base: usize,
+    mark: usize,
+    system: &str,
+    tool_tokens: usize,
+    history: &[Msg],
+) -> usize {
+    if base == 0 || mark > history.len() {
+        return estimate_prompt_tokens(system, tool_tokens, history);
+    }
+    // `base` already covers the system prompt and tool schemas as the model saw
+    // them, so only the appended messages are added here.
+    base + estimate_history_tokens(&history[mark..])
 }
 
 /// True when a backend error is a context-window overflow rejection — the class
@@ -468,6 +540,78 @@ mod tests {
         assert_eq!(cjk.len(), 9);
         assert_eq!(estimate_text_tokens(cjk), 3);
         assert!(estimate_text_tokens(cjk) >= cjk.chars().count().div_ceil(4));
+    }
+
+    // ISS-409753: json_bytes must never UNDER-count a compact `to_string()`,
+    // otherwise the pre-flight overflow guard would let a prompt through.
+    #[test]
+    fn json_bytes_never_undercounts_serialized_form() {
+        let cases = [
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(false),
+            serde_json::json!(42),
+            serde_json::json!("hello"),
+            serde_json::json!({"path": "src/main.rs", "content": "fn main() {}"}),
+            serde_json::json!({"a": [1, 2, 3], "b": {"c": "d"}}),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ];
+        for v in &cases {
+            let actual = v.to_string().len();
+            assert!(
+                json_bytes(v) >= actual,
+                "json_bytes under-counted {v}: {} < {actual}",
+                json_bytes(v)
+            );
+        }
+    }
+
+    // A big string arg must cost ~its own length, not be skipped — the estimate
+    // still has to see `write_file`-scale payloads. (ISS-409753)
+    #[test]
+    fn json_bytes_accounts_for_large_string_payloads() {
+        let big = "x".repeat(100_000);
+        let v = serde_json::json!({"content": big});
+        assert!(json_bytes(&v) >= 100_000);
+    }
+
+    // ISS-409753: the anchored estimate must add ONLY the tail after `mark`.
+    #[test]
+    fn anchored_estimate_sizes_only_the_appended_tail() {
+        let history = vec![
+            Msg::user("a".repeat(4_000)),
+            Msg::user("b".repeat(400)),
+            Msg::user("c".repeat(400)),
+        ];
+        let tail = estimate_history_tokens(&history[1..]);
+        assert_eq!(
+            estimate_prompt_tokens_anchored(10_000, 1, "sys", 500, &history),
+            10_000 + tail,
+        );
+        // Nothing appended since the anchor ⇒ the base is the whole answer.
+        assert_eq!(
+            estimate_prompt_tokens_anchored(10_000, history.len(), "sys", 500, &history),
+            10_000,
+        );
+    }
+
+    // ISS-409753: an unusable anchor must degrade to the full scan, never to a
+    // silent under-count.
+    #[test]
+    fn anchored_estimate_falls_back_without_a_usable_anchor() {
+        let history = vec![Msg::user("a".repeat(4_000)), Msg::user("b".repeat(400))];
+        let full = estimate_prompt_tokens("sys", 500, &history);
+        // No usage reported yet.
+        assert_eq!(
+            estimate_prompt_tokens_anchored(0, 0, "sys", 500, &history),
+            full
+        );
+        // Stale mark pointing past the (since-compacted) history.
+        assert_eq!(
+            estimate_prompt_tokens_anchored(10_000, 99, "sys", 500, &history),
+            full
+        );
     }
 
     fn assistant_call(text: &str, tool: &str) -> Msg {

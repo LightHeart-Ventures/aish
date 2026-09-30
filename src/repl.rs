@@ -6650,6 +6650,9 @@ fn handle_compact(backend: &Backend, session: &mut Session) {
             let dropped = plan.dropped;
             crate::context::apply_compaction(&mut session.history, &plan);
             session.context_used = crate::context::estimate_history_tokens(&session.history);
+            // Keep the incremental-estimate anchor in step with the figure we
+            // just re-seated from a full scan. (ISS-409753)
+            session.usage_mark = session.history.len();
             let window = backend.context_window();
             let pct = if window > 0 {
                 session.context_used * 100 / window
