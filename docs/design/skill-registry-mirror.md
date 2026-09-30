@@ -1,6 +1,6 @@
 # Skill Registry Mirror — open, unauthenticated (design)
 
-**Status:** proposed
+**Status:** accepted
 **Sprint:** SPR — "Skill Registry Mirror — Open Drop-in Registry"
 **Decision:** ship with **no auth**. The mirror is a public, read-only,
 cacheable static catalog. Abuse control is *cost* control (edge cache + rate
@@ -28,9 +28,9 @@ drop-in iff it satisfies these:
 | # | Client code | Request | Response |
 |---|---|---|---|
 | 1 | `search_url_with_base` (`:784`) | `GET {base}/api/v1/search?q=<urlenc>&limit=50` | JSON: bare array **or** object keyed `results` \| `skills` \| `data` \| `items` \| `hits` |
-| 2 | `raw_url` (`:225`) | `GET {base}/{owner}/{name}/raw[?version=<v>]` | `text/plain` raw `SKILL.md` (YAML frontmatter + body) |
-| 3 | `check_url` (`:238`) | — | **https only**; `http://` allowed *only* for `localhost` / `127.0.0.1` |
-| 4 | `parse_search_body` (`:836`) | — | unparsable rows are skipped; dedupe by `reference`; `[]` is valid |
+| 2 | `raw_url` (`:248`, via `raw_url_on` `:224`) | `GET {base}/{owner}/{name}/raw[?version=<v>]` | `text/plain` raw `SKILL.md` (YAML frontmatter + body) |
+| 3 | `check_url` (`:254`) | — | **https only**; `http://` allowed *only* for `localhost` / `127.0.0.1` |
+| 4 | `parse_search_body` (`:837`) | — | unparsable rows are skipped; dedupe by `reference`; `[]` is valid |
 
 `SearchResult` row shape:
 
@@ -46,7 +46,7 @@ drop-in iff it satisfies these:
 ```
 
 A `file://…/index.json` base is ALSO supported by the client (read + filtered
-in-process, `search_with_base` `:868`) — that is how the offline embedded index
+in-process, `search_with_base` `:867`) — that is how the offline embedded index
 works, and it is what the integration tests will exercise.
 
 **Consequence:** the mirror needs *zero* client changes to be usable:
@@ -56,6 +56,42 @@ export AISH_SKILL_REGISTRY=https://skills.example.dev
 :skill search rust
 :skill add acme/git-helper
 ```
+
+### 2.1 Search base ≠ fetch base (`skills_registry` vs `fetch_origin`)
+
+The client resolves **two independent bases**. A full drop-in must satisfy both:
+
+| Purpose | Resolver | Honors a `file://` override? | Fallback when unset |
+|---|---|---|---|
+| `:skill search` (catalog) | `skills_registry` (`:83`) → `search_with_base` (`:867`) | **yes** — read + filtered in-process | local embedded `file://…/registry/skills.json` |
+| `:skill add` (one skill's bytes) | `fetch_origin` (`:240`) → `raw_url` (`:248`) | **no** — a `file://` override is ignored | `https://skill.fish` |
+
+`fetch_origin` diverges deliberately: the file index is a *catalog*, not a
+per-skill file server, so reusing it as a fetch base yields the bogus path
+`file://…/skills.json/{owner}/{name}/raw` (ENOTDIR). Only an `http(s)` override
+is honored for fetch — this is asserted by
+`fetch_origin_ignores_file_override_uses_skillfish` (`:1837`).
+
+**Consequence for the mirror:** pointing `AISH_SKILL_REGISTRY` at an `https://`
+mirror switches *both* search and fetch to it, so the mirror MUST serve
+`/api/v1/search` **and** `/{owner}/{name}/raw`. Serving only the index leaves
+`:skill add` pinned to skill.fish — i.e. still challenged — while search
+appears to work.
+
+### 2.2 Error-case contract
+
+How the client treats non-happy-path responses. The mirror must not violate
+these:
+
+| Case | Mirror MUST return | Client behavior | Why it matters |
+|---|---|---|---|
+| Search matches nothing | `200` + `[]` (or `{"results":[]}`) | `parse_search_body` → empty list → "no results" | A `404` is an **error**, not an empty result: it surfaces as a *failed search*, not "nothing found" |
+| Rows with unknown/garbage fields | `200` + best-effort rows | unparsable rows skipped; dedupe by `reference` | A partial catalog degrades instead of failing |
+| `raw` for an unknown skill | `404` | `fetch` bails with the HTTP status | Correct — a missing skill IS an error |
+| **Any** response | **never** `429` + `x-vercel-mitigated: challenge` | `is_vercel_challenge` (`:285`) fires → prints challenge guidance and aborts | That exact pairing is the *only* signal the client uses; emitting it makes the mirror indistinguishable from the failure it exists to route around |
+| Cost-guardrail throttle | `503`, or `429` **without** `x-vercel-mitigated` | bails with the bare HTTP status | Keeps the diagnostic honest |
+| Any other non-2xx on search | any status | bails with `HTTP {status}` | — |
+
 
 ## 3. Architecture
 
