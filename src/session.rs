@@ -798,6 +798,39 @@ impl Session {
         self.reconcile_active_goal();
     }
 
+    /// Upper bound on how many `(desc, result)` pairs [`Self::last_turn_tools`]
+    /// retains. (ISS-409752)
+    ///
+    /// That buffer exists for exactly one consumer: the interactive Ctrl-O
+    /// reveal (`engine::reveal_last_turn` / `collapse_last_turn`), which
+    /// retroactively expands the tool output of the turn that just finished. It
+    /// is cleared once per turn — but a single agentic turn can execute hundreds
+    /// of calls, and each push stores a FULL clone of the tool result body.
+    ///
+    /// Critically, this buffer is invisible to history compaction: the engine
+    /// can compact `history` down to a dozen messages and still be holding every
+    /// byte of every tool result the turn ever produced over here. That made it
+    /// the one genuinely unbounded, non-reclaimable accumulator inside
+    /// `run_turn_inner` — the unbounded growth the ticket describes. Capping it
+    /// bounds the turn's peak footprint while keeping the reveal useful: nobody
+    /// scrolls back through 500 tool bodies, and the most RECENT calls are the
+    /// ones the reveal is for, so the cap drops from the front.
+    pub const LAST_TURN_TOOLS_CAP: usize = 40;
+
+    /// Record one tool call + result for the retroactive Ctrl-O reveal, evicting
+    /// the oldest entries once [`Self::LAST_TURN_TOOLS_CAP`] is exceeded.
+    ///
+    /// The single write path for [`Self::last_turn_tools`] — the engine must not
+    /// `push` directly, or the bound is silently lost. Keeps the newest entries
+    /// (a reveal shows the tail of the turn), so eviction is FIFO from the
+    /// front. Bounded by count rather than bytes: one oversized result is
+    /// already clamped upstream by the context guard, whereas the unbounded axis
+    /// here is the call COUNT of a long agentic turn.
+    pub fn record_turn_tool(&mut self, desc: String, result: ToolResult) {
+        self.last_turn_tools.push((desc, result));
+        cap_turn_tools(&mut self.last_turn_tools, Self::LAST_TURN_TOOLS_CAP);
+    }
+
     /// One-line status of the active loop (bare `:loop` / `:loop status`).
     pub fn loop_status(&self) -> String {
         match &self.loop_state {
@@ -1477,6 +1510,22 @@ its explicit stop condition — reach the stop condition and end the run.";
 /// sane.
 const LAST_OUTPUT_LIMIT: usize = 4000;
 
+/// Evict the oldest entries from a turn-tool reveal buffer until at most `cap`
+/// remain. Pure (no `Session`) so the bound is unit-testable. (ISS-409752)
+///
+/// FIFO from the front: the Ctrl-O reveal shows what the turn most recently did,
+/// so the TAIL is the useful half. `shrink_to_fit` follows the drain because a
+/// `Vec` never returns capacity on its own — without it a turn that peaked at
+/// 500 calls would keep that allocation reserved for the rest of the session,
+/// which is the very retention this cap exists to stop.
+fn cap_turn_tools(buf: &mut Vec<(String, ToolResult)>, cap: usize) {
+    let len = buf.len();
+    if len > cap {
+        buf.drain(..len - cap);
+        buf.shrink_to_fit();
+    }
+}
+
 /// Truncation policy for last-output addressing: keep the leading
 /// `LAST_OUTPUT_LIMIT` bytes (snapped to a char boundary) and append an ellipsis
 /// marker when anything was dropped. Short outputs pass through unchanged.
@@ -1519,6 +1568,41 @@ fn host_info() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_entry(n: usize) -> (String, ToolResult) {
+        (
+            format!("tool_{n}"),
+            ToolResult::text(format!("id{n}"), "x".repeat(64), false),
+        )
+    }
+
+    /// ISS-409752: the reveal buffer is the one accumulator compaction can't
+    /// reach, so its bound is what keeps a long agentic turn's footprint flat.
+    #[test]
+    fn cap_turn_tools_evicts_oldest_beyond_cap() {
+        let mut buf: Vec<(String, ToolResult)> = (0..500).map(tool_entry).collect();
+        cap_turn_tools(&mut buf, Session::LAST_TURN_TOOLS_CAP);
+
+        assert_eq!(buf.len(), Session::LAST_TURN_TOOLS_CAP);
+        // FIFO: the TAIL survives — a reveal shows what the turn just did.
+        assert_eq!(buf.last().unwrap().0, "tool_499");
+        assert_eq!(
+            buf.first().unwrap().0,
+            format!("tool_{}", 500 - Session::LAST_TURN_TOOLS_CAP)
+        );
+        // Capacity is released, not merely logically shortened.
+        assert!(buf.capacity() < 500);
+    }
+
+    /// Under the cap the buffer is untouched — no eviction, order preserved.
+    #[test]
+    fn cap_turn_tools_is_a_noop_under_the_cap() {
+        let mut buf: Vec<(String, ToolResult)> = (0..3).map(tool_entry).collect();
+        cap_turn_tools(&mut buf, Session::LAST_TURN_TOOLS_CAP);
+        assert_eq!(buf.len(), 3);
+        assert_eq!(buf[0].0, "tool_0");
+        assert_eq!(buf[2].0, "tool_2");
+    }
 
     #[test]
     fn truncate_last_passes_short_output_through() {

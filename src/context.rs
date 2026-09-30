@@ -186,10 +186,22 @@ impl CompactBudget {
     }
 }
 
-/// Rough token estimate for a string (~4 chars/token). The fallback when a
+/// Rough token estimate for a string (~4 bytes/token). The fallback when a
 /// backend doesn't report [`Usage`].
+///
+/// Deliberately measures BYTES (`str::len`, O(1)) rather than chars
+/// (`chars().count()`, O(n)). [`enforce_prompt_ceiling`] re-estimates the WHOLE
+/// history before every model call, so a char-based scan walked every byte of
+/// every retained tool result on every round — O(total transcript bytes) per
+/// iteration, tens of megabytes of UTF-8 decoding across a tool-heavy turn.
+/// Byte length is a field read, collapsing that to O(#messages). (ISS-409753)
+///
+/// Byte count is also the SAFER proxy: it is never lower than the char count,
+/// so the overflow guard can only become more conservative, and for multibyte
+/// text (CJK, emoji) real BPE tokenizers emit far more tokens per *char* than
+/// 1/4 — `chars()/4` badly under-counts there, `len()/4` does not.
 pub fn estimate_text_tokens(s: &str) -> usize {
-    s.chars().count().div_ceil(4)
+    s.len().div_ceil(4)
 }
 
 /// Estimate of the tokens a whole history occupies — text plus tool-call and
@@ -437,6 +449,26 @@ mod tests {
     use super::*;
     use crate::backend::{Msg, ToolCall, ToolResult};
     use serde_json::json;
+
+    /// ISS-409753: the estimator must measure BYTES, not chars. It is re-run over
+    /// the whole history before every model call, so O(1) `len()` is the point —
+    /// and byte length must never UNDER-count, or the overflow guard under-fires.
+    #[test]
+    fn estimate_text_tokens_is_byte_based_and_never_undercounts() {
+        assert_eq!(estimate_text_tokens(""), 0);
+        assert_eq!(estimate_text_tokens("abcd"), 1);
+        // div_ceil: a partial token still costs a token.
+        assert_eq!(estimate_text_tokens("abcde"), 2);
+
+        // Multibyte must count its full UTF-8 width. "日本語" is 3 chars / 9 bytes:
+        // the old chars-based estimate said 1 token, bytes says 3. Real BPE emits
+        // ~3 here, so byte length is both cheaper AND the closer proxy.
+        let cjk = "日本語";
+        assert_eq!(cjk.chars().count(), 3);
+        assert_eq!(cjk.len(), 9);
+        assert_eq!(estimate_text_tokens(cjk), 3);
+        assert!(estimate_text_tokens(cjk) >= cjk.chars().count().div_ceil(4));
+    }
 
     fn assistant_call(text: &str, tool: &str) -> Msg {
         Msg {
