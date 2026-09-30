@@ -1405,7 +1405,10 @@ pub async fn run(
                     let _ = std::io::stderr().flush();
 
                     // --- Step 2: query device rate (needed for resample). -----
-                    let src_rate = match capture::default_sample_rate() {
+                    // Resolved through `voice_cfg` so the rate always describes the
+                    // SAME device step 4 opens — mixing the default device's
+                    // rate with a named device resamples by the wrong ratio.
+                    let src_rate = match capture::sample_rate_with_config(&voice_cfg) {
                         Ok(r) => r,
                         Err(e) => {
                             eprint!("\r\x1b[K");
