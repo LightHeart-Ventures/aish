@@ -147,7 +147,7 @@ See **"MCP Configuration"** section below for details.
 |----------|---------|---------|---------|
 | `RUST_LOG` | Rust tracing level | `info` | `debug` \| `trace` \| `warn` |
 | `AISH_JOURNAL_PATH` | Path to background run journal | `~/.atum/run-*.jsonl` | `/var/log/aish/runs/` |
-| `AISH_DB_PATH` | SQLite coordinator database | `~/.aish/aish.db` | `/tmp/aish.db` |
+| `AISH_DB_PATH` | SQLite coordinator database | `~/.aish/database/aish.db` | `/tmp/aish.db` |
 
 **Example: Debug mode**
 
@@ -429,7 +429,7 @@ On next `:reload`, the changes take effect.
 
 4. Check coordinator database:
    ```sh
-   sqlite3 ~/.aish/aish.db "SELECT * FROM runs WHERE status='running';"
+   sqlite3 ~/.aish/database/aish.db "SELECT * FROM coordinator_runs WHERE phase='coordinating';"
    ```
 
 5. Adjust timeout if needed:
@@ -445,7 +445,7 @@ On next `:reload`, the changes take effect.
 
 1. `~/.aishrc` — per-user API key & preferences
 2. `~/.aish/aish.config` — per-user session settings
-3. `~/.aish/aish.db` — per-user run journal (auto-isolated by home directory)
+3. `~/.aish/database/aish.db` — per-user run journal (auto-isolated by home directory)
 
 **Shared/optional:**
 
@@ -530,7 +530,7 @@ aish --version | grep local
 export AISH_COORDINATOR_TIMEOUT="7200"
 
 # Check if coordinator is stuck
-sqlite3 ~/.aish/aish.db "SELECT id, status, started_at FROM runs ORDER BY started_at DESC LIMIT 5;"
+sqlite3 ~/.aish/database/aish.db "SELECT run_id, phase, created_at FROM coordinator_runs ORDER BY created_at DESC LIMIT 5;"
 
 # Kill a stuck run (if necessary)
 # aish :stop <run-id>
