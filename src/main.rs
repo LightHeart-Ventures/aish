@@ -58,6 +58,7 @@ mod skill_sources;
 mod skills;
 mod spawn_broker;
 mod spawn_broker_host;
+mod spawn_broker_policy;
 mod spawn_broker_registry;
 
 mod schedule;

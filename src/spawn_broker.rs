@@ -41,6 +41,32 @@
 //! session/worker internals) so it is trivially unit-testable and the wiring
 //! into `worker.rs`/`container.rs` stays a thin adapter.
 //!
+//! # Security posture of the transport
+//!
+//! The spool is a filesystem interface, so this module owns the two guarantees a
+//! filesystem can give; everything the *payload* asserts is validated one layer
+//! up in [`crate::spawn_broker_policy`].
+//!
+//! 1. **Confidentiality of the payload.** A request carries the user's task
+//!    prompt, which routinely contains material the operator would not want
+//!    readable by every local account. The spool directory is created `0700` and
+//!    every request file `0600` ([`harden_dir`] / [`harden_file`]) — including the
+//!    `tmp` file *before* the rename, so there is no window in which a
+//!    half-written request is world-readable. Process umask is therefore not
+//!    load-bearing.
+//! 2. **Bounded reads.** [`claim`] refuses a request file larger than
+//!    [`MAX_REQUEST_BYTES`] instead of allocating it, so a hostile (or broken)
+//!    writer cannot make the host read an arbitrarily large blob into memory on
+//!    every poll tick.
+//!
+//! What this layer does NOT do: it does not authenticate the *content* of a
+//! request. The arrival path is the requester's identity (each worker gets its own
+//! state volume, so it can only write into its own spool) and
+//! [`crate::spawn_broker_policy`] binds that path-derived identity, validates
+//! every field, rate-limits the requester, and writes the audit record. Never
+//! launch a sibling from a [`SpawnRequest`] that has not been through that policy
+//! layer.
+//!
 //! # Wiring status
 //!
 //! This is the transport + protocol foundation (spool write/list/claim, the
@@ -80,6 +106,20 @@ pub const SPOOL_SUBDIR: &str = "spawn-requests";
 /// incompatible field change so the host can reject/upgrade stale records.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Owner-only mode for spool payloads and the audit log. A spawn request carries
+/// the user's task prompt; it must not be readable by other local accounts.
+pub const SPOOL_FILE_MODE: u32 = 0o600;
+
+/// Owner-only mode for the spool directory itself (no group/world traverse, so
+/// filenames don't leak either).
+pub const SPOOL_DIR_MODE: u32 = 0o700;
+
+/// Hard ceiling on a single spool file. A request is a small JSON record; this
+/// cap keeps a hostile/broken writer from making the host allocate an unbounded
+/// buffer on a poll tick. Well above any legitimate request (the policy layer's
+/// task cap is 64 KiB).
+pub const MAX_REQUEST_BYTES: u64 = 256 * 1024;
+
 const REQUEST_PREFIX: &str = "spawn-req-";
 const REQUEST_EXT: &str = "json";
 const CLAIMED_EXT: &str = "claimed";
@@ -101,10 +141,37 @@ pub fn current_budget() -> u32 {
         .unwrap_or(DEFAULT_SPAWN_BUDGET)
 }
 
+/// Restrict a directory to owner-only (`0700`). No-op on non-unix.
+pub fn harden_dir(path: &Path) -> io::Result<()> {
+    set_mode(path, SPOOL_DIR_MODE)
+}
+
+/// Restrict a file to owner-only (`0600`). No-op on non-unix.
+pub fn harden_file(path: &Path) -> io::Result<()> {
+    set_mode(path, SPOOL_FILE_MODE)
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
 /// The non-secret payload a nested worker emits to ask the host to launch a
 /// sibling coordinator on its behalf. Carries everything the host needs to
 /// rebuild the argv via `worker::coordinator_argv` EXCEPT credentials — the host
 /// injects those from its own env. Serializes to a single spool file.
+///
+/// **Every field is self-asserted by the requester.** Nothing here is trustworthy
+/// until [`crate::spawn_broker_policy::RequestPolicy::validate`] has passed it —
+/// in particular `spawn_budget` (a forged value would defeat the fork-bomb
+/// backstop) and `requested_by_worker` (the host derives the real requester from
+/// the spool path instead).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnRequest {
     /// On-disk schema version (see [`SCHEMA_VERSION`]).
@@ -127,14 +194,18 @@ pub struct SpawnRequest {
     /// Git ref the isolated worktree branches from (`"main"` | `"head"`).
     pub base: String,
     /// Remaining spawn budget AT THE REQUESTER. The host stamps the sibling with
-    /// `budget - 1` and refuses when this is `0` (see [`sibling_budget`]).
+    /// `budget - 1` and refuses when this is `0` (see [`sibling_budget`]). Capped
+    /// by the policy layer's budget ceiling — a self-asserted value larger than
+    /// the host's own budget is a rejected escalation attempt, not a grant.
     pub spawn_budget: u32,
     /// The launching interactive session's id — threaded so the sibling's
     /// durable `coordinator_runs` row is attributed to the originating session
     /// and the requester can read the sibling back via `coordinator_store`.
     pub launch_session_id: String,
     /// The worker id that emitted this request (for audit / parent linkage).
-    /// `None` when emitted directly by an interactive session.
+    /// `None` when emitted directly by an interactive session. **Advisory only** —
+    /// the host overwrites this with the identity it derives from the arrival
+    /// path, and rejects a payload that claims a different worker.
     pub requested_by_worker: Option<String>,
     /// Unix epoch seconds when the request was written (ordering / staleness).
     pub created_at_unix: u64,
@@ -166,7 +237,7 @@ impl SpawnRequest {
             base: base.into(),
             spawn_budget,
             launch_session_id: launch_session_id.into(),
-            requested_by_worker: requested_by_worker.into(),
+            requested_by_worker,
             created_at_unix: now_unix(),
         }
     }
@@ -183,16 +254,23 @@ pub fn request_filename(request_id: &str) -> String {
 }
 
 /// Write a spawn request into the spool atomically (tmp file + rename), creating
-/// the spool directory if needed. Returns the final path. The atomic rename
-/// guarantees the host never observes a half-written request.
+/// the spool directory if needed. Returns the final path.
+///
+/// The atomic rename guarantees the host never observes a half-written request.
+/// The directory is clamped to `0700` and the tmp file to `0600` **before** the
+/// rename, so the payload is never momentarily world-readable regardless of the
+/// process umask.
 pub fn write_request(state_root: &Path, req: &SpawnRequest) -> io::Result<PathBuf> {
     let dir = spool_dir(state_root);
     fs::create_dir_all(&dir)?;
+    harden_dir(&dir)?;
     let final_path = dir.join(request_filename(&req.request_id));
     let tmp_path = dir.join(format!(".{}.tmp", request_filename(&req.request_id)));
     let json = serde_json::to_vec_pretty(req)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     fs::write(&tmp_path, &json)?;
+    // Clamp BEFORE the rename so the visible request is never group/world readable.
+    harden_file(&tmp_path)?;
     fs::rename(&tmp_path, &final_path)?;
     Ok(final_path)
 }
@@ -225,6 +303,11 @@ pub fn list_pending(state_root: &Path) -> io::Result<Vec<PathBuf>> {
 /// claimer wins, so a crash-restart of the host poller never double-spawns the
 /// same request. Returns the parsed request on success, `Ok(None)` if the file
 /// was already claimed/removed by a racing claimer.
+///
+/// A claimed file larger than [`MAX_REQUEST_BYTES`] is refused with
+/// [`io::ErrorKind::InvalidData`] **without being read**, so an oversized blob
+/// costs the host a `stat`, not an allocation. The caller (the host accept loop)
+/// turns that error into a recorded rejection and moves on to the next request.
 pub fn claim(pending_path: &Path) -> io::Result<Option<SpawnRequest>> {
     let claimed_path = claimed_path_for(pending_path);
     match fs::rename(pending_path, &claimed_path) {
@@ -232,6 +315,13 @@ pub fn claim(pending_path: &Path) -> io::Result<Option<SpawnRequest>> {
         // Someone else claimed it first (or it vanished) — not our request.
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
+    }
+    let len = fs::metadata(&claimed_path)?.len();
+    if len > MAX_REQUEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("spawn request is {len} bytes (max {MAX_REQUEST_BYTES})"),
+        ));
     }
     let bytes = fs::read(&claimed_path)?;
     let req: SpawnRequest = serde_json::from_slice(&bytes)
@@ -250,8 +340,14 @@ fn claimed_path_for(pending_path: &Path) -> PathBuf {
 /// Returns `None` (REFUSE — the fork-bomb backstop) when the requester's budget
 /// is exhausted (`0`); otherwise `Some(budget - 1)`. Enforced at the host accept
 /// loop so the flat topology keeps the same guarantee the fork-site gate gave.
+///
+/// This only decrements what it is given; the *ceiling* on that input is the
+/// policy layer's job ([`crate::spawn_broker_policy::RequestPolicy`]), since the
+/// requester chose the number.
 pub fn sibling_budget(requester_budget: u32) -> Option<u32> {
-    requester_budget.checked_sub(1).filter(|_| requester_budget > 0)
+    requester_budget
+        .checked_sub(1)
+        .filter(|_| requester_budget > 0)
 }
 
 /// Remove a claimed request file once its sibling has been launched (best
@@ -265,7 +361,9 @@ pub fn discard_claimed(pending_path: &Path) -> io::Result<()> {
     }
 }
 
-fn now_unix() -> u64 {
+/// Current wall clock in unix epoch seconds (`0` if the clock is before the
+/// epoch). Shared with the policy layer so validation and stamping agree.
+pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -321,7 +419,10 @@ mod tests {
         assert!(list_pending(&root).unwrap().is_empty());
         let path = write_request(&root, &sample("one")).unwrap();
         assert!(path.exists());
-        assert_eq!(path.file_name().unwrap().to_string_lossy(), "spawn-req-one.json");
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            "spawn-req-one.json"
+        );
         let pending = list_pending(&root).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0], path);
@@ -380,5 +481,58 @@ mod tests {
     fn current_budget_parses_env_or_defaults() {
         // Default when unset is exercised indirectly; here assert the constant.
         assert_eq!(DEFAULT_SPAWN_BUDGET, 3);
+    }
+
+    #[test]
+    fn claim_refuses_an_oversized_request_without_reading_it() {
+        let root = temp_root();
+        let dir = spool_dir(&root);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(request_filename("huge"));
+        // One byte over the cap, and not even valid JSON — the size check must
+        // fire first, so the error is about the size, not the parse.
+        fs::write(&path, vec![b'x'; (MAX_REQUEST_BYTES + 1) as usize]).unwrap();
+        let err = claim(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("max"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn claim_surfaces_malformed_json_as_invalid_data() {
+        let root = temp_root();
+        let dir = spool_dir(&root);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(request_filename("bad"));
+        fs::write(&path, b"{ not json").unwrap();
+        let err = claim(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spool_dir_and_request_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root();
+        let path = write_request(&root, &sample("perms")).unwrap();
+        let fmode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(fmode, 0o600, "request payload must not be world-readable");
+        let dmode = fs::metadata(spool_dir(&root)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dmode, 0o700, "spool dir must not be world-traversable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_request_tightens_a_preexisting_loose_spool_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root();
+        let dir = spool_dir(&root);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        write_request(&root, &sample("tighten")).unwrap();
+        let dmode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dmode, 0o700,
+            "a pre-existing 0777 spool dir must be clamped"
+        );
     }
 }
