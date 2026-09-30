@@ -59,6 +59,41 @@ pub struct McpHost {
     skipped: Vec<String>,
 }
 
+/// Outcome of one `:mcp reload` pass, bucketed per server so the caller can
+/// print an itemised summary instead of a bare count (ISS-409772).
+#[derive(Debug, Default)]
+pub struct ReloadReport {
+    /// Declared in `.mcp.json` but not connected before — connected this pass.
+    pub added: Vec<String>,
+    /// Already-connected servers whose RESOLVED config changed, so they were
+    /// restarted. `(name, reason)` where reason is `config changed` (the file
+    /// text moved) or `env changed` (same text, different resolved `${…}`).
+    pub reconnected: Vec<(String, &'static str)>,
+    /// Connected servers whose resolved config is identical — left untouched.
+    pub unchanged: Vec<String>,
+    /// Servers that failed to (re)start this pass, with the error text.
+    pub failed: Vec<(String, String)>,
+    /// Selector names that appear in no `.mcp.json`.
+    pub unknown: Vec<String>,
+}
+
+impl ReloadReport {
+    /// True when the pass touched nothing at all — no declared servers matched.
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty()
+            && self.reconnected.is_empty()
+            && self.unchanged.is_empty()
+            && self.failed.is_empty()
+            && self.unknown.is_empty()
+    }
+
+    /// True when nothing actually changed (every matched server was already
+    /// up to date).
+    pub fn no_changes(&self) -> bool {
+        self.added.is_empty() && self.reconnected.is_empty() && self.failed.is_empty()
+    }
+}
+
 /// One server's state for the `:mcp` listing.
 /// Before/after measurement of an MCP tool-schema payload when a per-run/
 /// per-mode allowlist trims it (TASK-323). Observational only — the token
@@ -154,6 +189,12 @@ struct McpServer {
     name: String,
     /// Raw config spec — kept so `:mcp reconnect` can restart the server.
     spec: Value,
+    /// Canonical fingerprint of the spec AFTER `${…}` resolution, taken at
+    /// connect time. `:mcp reload` re-computes it from the current file + the
+    /// current env/credentials and restarts the server when it differs — that's
+    /// what catches a rotated secret whose `.mcp.json` text never changed
+    /// (ISS-409772).
+    fingerprint: String,
     transport: Transport,
     next_id: u64,
     tools: Vec<McpTool>,
@@ -181,8 +222,38 @@ impl McpHost {
     /// bad entry never aborts the scan.
     async fn connect_missing(&mut self) -> Vec<String> {
         let mut added: Vec<String> = Vec::new();
-        let paths = self.config_paths.clone();
-        for path in &paths {
+        for (name, spec) in self.declared_servers() {
+            if self.servers.iter().any(|s| s.name == name) {
+                continue; // already connected (earlier path / a prior pass) wins
+            }
+            match McpServer::start(&name, &spec).await {
+                Ok(s) => {
+                    // No per-server startup line — it duplicated the
+                    // `mcp: ready — N servers connected` summary and cluttered
+                    // the header. `:mcp reload` reports newly-connected servers
+                    // from the returned `added` names instead.
+                    self.servers.push(s);
+                    added.push(name);
+                }
+                Err(e) => {
+                    // Collect rather than print: the caller surfaces these on
+                    // the SecondStatusLine "statusline alert" + `:activity`
+                    // tray (interactive), or flushes them to stderr (one-shot).
+                    self.skipped.push(format!("mcp server {name} skipped: {e:#}"));
+                }
+            }
+        }
+        added
+    }
+
+    /// Every server DECLARED across the config paths, in precedence order with
+    /// earlier paths winning a name collision (project config precedes user
+    /// config). A path that's missing or holds invalid JSON is skipped with a
+    /// warning — one bad file never aborts the scan. Shared by `connect_missing`
+    /// and `reload_report` so both see exactly the same view of the config.
+    fn declared_servers(&self) -> Vec<(String, Value)> {
+        let mut out: Vec<(String, Value)> = Vec::new();
+        for path in &self.config_paths {
             let Ok(text) = std::fs::read_to_string(path) else {
                 continue;
             };
@@ -200,35 +271,90 @@ impl McpHost {
                 continue;
             };
             for (name, spec) in servers {
-                if self.servers.iter().any(|s| s.name == *name) || added.contains(name) {
-                    continue; // already connected (earlier path / a prior pass) wins
+                if out.iter().any(|(n, _)| n == name) {
+                    continue;
                 }
-                match McpServer::start(name, spec).await {
+                out.push((name.clone(), spec.clone()));
+            }
+        }
+        out
+    }
+
+    /// Re-read the `.mcp.json` config paths and connect any servers added to them
+    /// since startup (or the last reload). Add-only: existing servers are left
+    /// as-is. Returns the names connected. Use [`McpHost::reload_report`] for the
+    /// full `:mcp reload` pass that also restarts servers whose config changed.
+    pub async fn reload(&mut self) -> Vec<String> {
+        self.connect_missing().await
+    }
+
+    /// Full `:mcp reload` pass (ISS-409772). For every server declared in the
+    /// config paths — optionally narrowed to `only`:
+    ///
+    /// * not connected → connect it (`added`)
+    /// * connected, resolved config differs → restart it from the NEW spec
+    ///   (`reconnected`, tagged `config changed` when the file text moved or
+    ///   `env changed` when only the resolved `${…}` values did)
+    /// * connected, resolved config identical → leave it alone (`unchanged`)
+    ///
+    /// Names in `only` that appear in no config land in `unknown`. A server that
+    /// fails to (re)start is reported in `failed` AND pushed to the skipped-notice
+    /// list; on a failed RESTART the previous live connection is deliberately kept
+    /// rather than dropped, so a bad edit degrades to "still running the old
+    /// config" instead of "server gone".
+    pub async fn reload_report(&mut self, only: &[String]) -> ReloadReport {
+        let mut report = ReloadReport::default();
+        let declared = self.declared_servers();
+
+        for name in only {
+            if !declared.iter().any(|(n, _)| n == name) {
+                report.unknown.push(name.clone());
+            }
+        }
+
+        for (name, spec) in declared {
+            if !only.is_empty() && !only.iter().any(|n| n == &name) {
+                continue;
+            }
+            match self.servers.iter().position(|s| s.name == name) {
+                // Newly declared since the last pass — connect it.
+                None => match McpServer::start(&name, &spec).await {
                     Ok(s) => {
-                        // No per-server startup line — it duplicated the
-                        // `mcp: ready — N servers connected` summary and cluttered
-                        // the header. `:mcp reload` reports newly-connected servers
-                        // from the returned `added` names instead.
                         self.servers.push(s);
-                        added.push(name.clone());
+                        report.added.push(name);
                     }
                     Err(e) => {
-                        // Collect rather than print: the caller surfaces these on
-                        // the SecondStatusLine "statusline alert" + `:activity`
-                        // tray (interactive), or flushes them to stderr (one-shot).
                         self.skipped.push(format!("mcp server {name} skipped: {e:#}"));
+                        report.failed.push((name, format!("{e:#}")));
+                    }
+                },
+                Some(idx) => {
+                    // Compare the RESOLVED spec, not the raw text: that's what
+                    // makes a rotated ${profile:…}/${env:…} value count as a
+                    // change even when `.mcp.json` is byte-identical.
+                    if resolved_fingerprint(&spec) == self.servers[idx].fingerprint {
+                        report.unchanged.push(name);
+                        continue;
+                    }
+                    let reason = if self.servers[idx].spec == spec {
+                        "env changed"
+                    } else {
+                        "config changed"
+                    };
+                    match McpServer::start(&name, &spec).await {
+                        Ok(s) => {
+                            self.servers[idx] = s; // old child killed on drop
+                            report.reconnected.push((name, reason));
+                        }
+                        Err(e) => {
+                            self.skipped.push(format!("mcp server {name} skipped: {e:#}"));
+                            report.failed.push((name, format!("{e:#}")));
+                        }
                     }
                 }
             }
         }
-        added
-    }
-
-    /// Re-read the `.mcp.json` config paths and connect any servers added to them
-    /// since startup (or the last reload). Existing servers are left as-is — use
-    /// `:mcp reconnect` to restart a changed one. Returns the names connected.
-    pub async fn reload(&mut self) -> Vec<String> {
-        self.connect_missing().await
+        report
     }
 
     /// Tool definitions for every connected server, namespaced.
@@ -623,6 +749,67 @@ fn resolve_vars(spec: &Value) -> Result<HashMap<String, String>> {
     }
 }
 
+/// Deep-interpolate every string in a spec tree with the resolved variable map.
+/// Used only for change detection — the transports interpolate their own fields.
+fn interpolate_value(v: &Value, vars: &HashMap<String, String>) -> Value {
+    match v {
+        Value::String(s) => Value::String(interpolate(s, vars)),
+        Value::Array(a) => Value::Array(a.iter().map(|x| interpolate_value(x, vars)).collect()),
+        Value::Object(o) => Value::Object(
+            o.iter()
+                .map(|(k, x)| (k.clone(), interpolate_value(x, vars)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Append a key-order-independent rendering of `v` to `out`. Object keys are
+/// sorted so the result is stable regardless of serde_json's map backing.
+fn canonicalize(v: &Value, out: &mut String) {
+    match v {
+        Value::Object(o) => {
+            let mut keys: Vec<&String> = o.keys().collect();
+            keys.sort();
+            out.push('{');
+            for k in keys {
+                out.push_str(k);
+                out.push('=');
+                canonicalize(&o[k], out);
+                out.push(';');
+            }
+            out.push('}');
+        }
+        Value::Array(a) => {
+            out.push('[');
+            for x in a {
+                canonicalize(x, out);
+                out.push(';');
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+/// Fingerprint a server spec as it would actually be USED — i.e. after
+/// `${NAME}` / `${env:VAR}` / `${profile:KEY}` resolution against the current
+/// process environment and credentials file.
+///
+/// This is the load-bearing piece of `:mcp reload`'s change detection
+/// (ISS-409772): comparing raw `.mcp.json` text only catches an edited config,
+/// so a rotated token or a re-exported env var — byte-identical config, different
+/// effective connection — would silently keep the stale server. Fingerprinting
+/// the RESOLVED spec catches both. A missing credentials profile degrades to an
+/// empty var map rather than erroring: fingerprinting must never fail, it just
+/// reports "this resolves differently than it did at connect time".
+pub(crate) fn resolved_fingerprint(spec: &Value) -> String {
+    let vars = resolve_vars(spec).unwrap_or_default();
+    let mut out = String::new();
+    canonicalize(&interpolate_value(spec, &vars), &mut out);
+    out
+}
+
 /// Resolve `${NAME}` placeholders from a credentials profile (INI section),
 /// falling back to the process environment. Also honors the explicit
 /// `${env:VAR}` and `${profile:KEY}` forms (Phase 0.5.3). Unresolvable names are
@@ -707,6 +894,7 @@ impl McpServer {
         let mut server = Self {
             name: name.to_string(),
             spec: spec.clone(),
+            fingerprint: resolved_fingerprint(spec),
             transport,
             next_id: 0,
             tools: Vec::new(),
@@ -1252,6 +1440,69 @@ for line in sys.stdin:
             interpolate("${env:AISH_DEFINITELY_UNSET_XYZ}", &vars),
             "${env:AISH_DEFINITELY_UNSET_XYZ}"
         );
+    }
+
+    /// ISS-409772: `:mcp reload` change detection keys off a fingerprint of the
+    /// RESOLVED spec, so all three gap classes are distinguishable.
+    #[test]
+    fn resolved_fingerprint_detects_config_and_env_changes() {
+        let ev = format!("AISH_FP_TEST_{}", std::process::id());
+        let spec = json!({
+            "command": "server",
+            "args": ["--token", format!("${{env:{ev}}}")],
+        });
+
+        // Stable for an identical spec + identical environment.
+        unsafe { std::env::set_var(&ev, "v1") };
+        let first = resolved_fingerprint(&spec);
+        assert_eq!(first, resolved_fingerprint(&spec));
+
+        // Gap 2: config text is byte-identical but the resolved env value moved
+        // (rotated token) — the fingerprint MUST change, otherwise reload is a
+        // no-op and the stale connection persists.
+        unsafe { std::env::set_var(&ev, "v2") };
+        let rotated = resolved_fingerprint(&spec);
+        assert_ne!(first, rotated, "rotated env value must change fingerprint");
+
+        // Gap 1: an edited existing entry (new args) also changes it.
+        let edited = json!({
+            "command": "server",
+            "args": ["--token", format!("${{env:{ev}}}"), "--verbose"],
+        });
+        assert_ne!(rotated, resolved_fingerprint(&edited));
+
+        // Key ORDER is not a change — the fingerprint is canonicalized.
+        let reordered = json!({
+            "args": ["--token", format!("${{env:{ev}}}")],
+            "command": "server",
+        });
+        assert_eq!(rotated, resolved_fingerprint(&reordered));
+
+        unsafe { std::env::remove_var(&ev) };
+    }
+
+    /// A missing credentials profile must not make fingerprinting fail — it
+    /// degrades to "resolves differently than at connect time".
+    #[test]
+    fn resolved_fingerprint_survives_missing_profile() {
+        let fp = resolved_fingerprint(&json!({
+            "url": "https://h/${TENANT}/mcp",
+            "credentials": {"file": "/nonexistent/creds", "profile": "x"}
+        }));
+        assert!(fp.contains("${TENANT}"), "unresolved ref left verbatim: {fp}");
+    }
+
+    #[test]
+    fn reload_report_buckets() {
+        let mut r = ReloadReport::default();
+        assert!(r.is_empty() && r.no_changes());
+
+        r.unchanged.push("a".into());
+        assert!(!r.is_empty());
+        assert!(r.no_changes(), "unchanged-only is not a change");
+
+        r.reconnected.push(("b".into(), "env changed"));
+        assert!(!r.no_changes());
     }
 
     #[test]

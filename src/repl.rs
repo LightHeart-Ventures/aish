@@ -7690,7 +7690,7 @@ async fn handle_colon(
                  :backend <claude|grok|openai|openrouter|local>  switch backend\n\
                  :mcp [list|status]                  list connected MCP servers\n\
                  :mcp reconnect [name|all]           restart MCP server(s)\n\
-                 :mcp reload                          connect servers newly added to .mcp.json (no restart)\n\
+                 :mcp reload [name…]                 re-scan .mcp.json: add new + reconnect changed (config or env)\n\
                  :mcp add <name> <command|url> [args] connect + save an MCP server (~/.aish/.mcp.json)\n\
                  :mcp remove <name>                  disconnect + unsave an MCP server\n\
                  :mcp tools [name]                   list MCP tools\n\
@@ -9165,21 +9165,54 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
                 }
             }
         }
-        Some((&"reload", _)) => {
-            // Re-scan .mcp.json and connect anything newly added there, without a
-            // restart. New servers' tools join the model's tool set on the next
-            // turn; their MCP-published skills appear in the system prompt only
-            // after a restart.
-            let added = session.mcp.reload().await;
-            if added.is_empty() {
-                println!("no new MCP servers in .mcp.json (all already connected)");
-            } else {
-                println!(
-                    "connected {} new server{}: {}",
-                    added.len(),
-                    if added.len() == 1 { "" } else { "s" },
-                    added.join(", ")
+        Some((&"reload", rest)) => {
+            // Re-scan .mcp.json: connect anything newly added AND restart any
+            // already-connected server whose RESOLVED config changed — an edited
+            // entry (command/args/url/image) or a rotated ${profile:…}/${env:…}
+            // value whose config text never moved (ISS-409772). `:mcp reload
+            // <name…>` scopes the pass to the named server(s).
+            //
+            // New servers' tools join the model's tool set on the next turn;
+            // their MCP-published skills appear in the system prompt only after
+            // a restart.
+            let only: Vec<String> = rest.iter().map(|s| s.to_string()).collect();
+            let report = session.mcp.reload_report(&only).await;
+            for name in &report.added {
+                println!("  {name}: connected");
+            }
+            for (name, why) in &report.reconnected {
+                println!("  {name}: reconnected ({why})");
+            }
+            for name in &report.unchanged {
+                println!("  {name}: unchanged");
+            }
+            // A failed RESTART keeps the previous connection live — say so, so the
+            // user doesn't assume the server went away.
+            for (name, err) in &report.failed {
+                println!("  {name}: failed — {err}");
+            }
+            for name in &report.unknown {
+                println!("  {name}: not declared in .mcp.json");
+            }
+            if !report.no_changes() {
+                let mut line = format!(
+                    "reload: {} added, {} reconnected, {} unchanged",
+                    report.added.len(),
+                    report.reconnected.len(),
+                    report.unchanged.len()
                 );
+                if !report.failed.is_empty() {
+                    line.push_str(&format!(", {} failed", report.failed.len()));
+                }
+                println!("{line}");
+            } else if !report.unchanged.is_empty() {
+                println!(
+                    "{} MCP server{} up to date — nothing to do",
+                    report.unchanged.len(),
+                    if report.unchanged.len() == 1 { "" } else { "s" }
+                );
+            } else if report.is_empty() {
+                println!("no MCP servers declared in .mcp.json");
             }
             // Any server that failed THIS reload pass gets the same statusline
             // alert treatment as startup (drained, so only new failures show).
