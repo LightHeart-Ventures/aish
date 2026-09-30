@@ -2123,6 +2123,26 @@ fn find_duplicate_running_work(session: &Session, task: &str) -> Option<String> 
                 }
             }
         }
+        // (c) ISS-407771 — the durable WORK-PACKAGE LEASE ledger. Rows (a)/(b)
+        // only see runs this process can enumerate as live; a lease is the
+        // cross-PROCESS claim a goal turn files on every work package an earlier
+        // wave still owns. Checking it here is what makes a re-dispatch of an
+        // already-claimed package fail LOUDLY — naming the holder — instead of
+        // silently spawning a twin that races it.
+        if let Ok(leases) = store.live_work_package_leases(None) {
+            for l in leases {
+                if tasks_are_duplicate(&l.task, task) {
+                    return Some(format!(
+                        "this work package is LEASED by run `{}` (work-package ledger, scope {}) — \
+                         already claimed: \"{}\". Don't re-dispatch it: monitor with \
+                         background_status, `tell` it, or `stop` it first",
+                        crate::batch::short_id(&l.owner_run),
+                        l.scope,
+                        truncate_task(&l.task),
+                    ));
+                }
+            }
+        }
     }
     None
 }

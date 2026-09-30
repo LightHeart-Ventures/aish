@@ -505,6 +505,110 @@ pub(crate) fn compose_guidance(verifier: Option<&str>, steers: &[String]) -> Opt
     }
 }
 
+// ── ISS-407771: cross-turn work-package continuity ──────────────────────────
+//
+// The goal loop respawns a FRESH coordinator process every turn. Nothing
+// in-process survives, so turn N+1 has no memory of the work packages turn N
+// fanned out — and it would happily re-dispatch them (duplicate PRs, doubled
+// spend, racing workers on the same files). The durable `coordinator_runs`
+// forest plus the `work_package_leases` ledger are that missing memory: before
+// composing a turn's directive we read which descendants of earlier turns are
+// STILL RUNNING, claim a lease per package, and hand the generator an explicit
+// do-not-re-dispatch list.
+
+/// Stable claim namespace for one goal's work packages, so two unrelated goals
+/// can't contend over similarly-worded packages. Pure → unit-tested.
+pub(crate) fn goal_scope_key(condition: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    condition.trim().to_lowercase().hash(&mut h);
+    format!("goal:{:016x}", h.finish())
+}
+
+/// Every still-running descendant of `ancestors` in the persisted run forest,
+/// walked transitively via `parent_run_id` (a turn's worker can itself fan out,
+/// so a grandchild counts). Terminal rows (`done`/`failed`) and the ancestors
+/// themselves are excluded. Pure over the row snapshot → unit-tested.
+pub(crate) fn live_descendant_runs(
+    rows: &[crate::coordinator_store::CoordinatorRow],
+    ancestors: &[String],
+) -> Vec<(String, String)> {
+    use std::collections::HashSet;
+    let mut family: HashSet<&str> = ancestors.iter().map(String::as_str).collect();
+    // Fixed-point walk: each pass adopts rows whose parent is already in the
+    // family. Bounded by row count, so a cyclic/corrupt parent chain can't spin.
+    for _ in 0..=rows.len() {
+        let mut grew = false;
+        for r in rows {
+            if let Some(parent) = r.parent_run_id.as_deref() {
+                if family.contains(parent) && !family.contains(r.run_id.as_str()) {
+                    family.insert(r.run_id.as_str());
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    let ancestor_set: HashSet<&str> = ancestors.iter().map(String::as_str).collect();
+    rows.iter()
+        .filter(|r| {
+            family.contains(r.run_id.as_str())
+                && !ancestor_set.contains(r.run_id.as_str())
+                && !matches!(r.phase.as_str(), "done" | "failed")
+        })
+        .map(|r| (r.run_id.clone(), r.task.clone()))
+        .collect()
+}
+
+/// Render the do-not-re-dispatch ledger appended to the next turn's guidance.
+/// `None` when nothing is in flight, so a clean turn's directive stays clean.
+/// Pure → unit-tested.
+pub(crate) fn render_inflight_directive(inflight: &[(String, String)]) -> Option<String> {
+    if inflight.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "WORK ALREADY IN FLIGHT from an earlier turn of this goal — these work \
+         packages are LEASED by live background runs. Do NOT re-dispatch, \
+         re-plan, or duplicate them; treat them as owned. Check them with \
+         background_status, steer with `tell`, or `stop` one if it has gone \
+         wrong — and spend this turn on the REMAINING work only:\n",
+    );
+    for (run_id, task) in inflight {
+        let one_line = task.split_whitespace().collect::<Vec<_>>().join(" ");
+        let brief: String = one_line.chars().take(160).collect();
+        out.push_str(&format!("  - run `{run_id}` owns: {brief}\n"));
+    }
+    Some(out.trim_end().to_string())
+}
+
+/// IO half: read the durable run forest, claim a lease per live descendant work
+/// package, and render the directive block. Best-effort — a store/DB hiccup
+/// degrades to "no ledger this turn" rather than stalling the goal.
+fn inflight_directive(scope: &str, ancestors: &[String]) -> Option<String> {
+    if ancestors.is_empty() {
+        return None;
+    }
+    let store =
+        crate::coordinator_store::CoordinatorStore::open(&crate::db_paths::main_db_path()).ok()?;
+    let rows = store.load_all().ok()?;
+    let inflight = live_descendant_runs(&rows, ancestors);
+    for (run_id, task) in &inflight {
+        // Re-claim is idempotent for the same owner (it renews the TTL), and a
+        // conflicting claim by a DIFFERENT run is exactly the signal we want to
+        // keep: the package stays listed as owned either way.
+        let _ = store.claim_work_package(
+            scope,
+            task,
+            run_id,
+            crate::coordinator_store::DEFAULT_WORK_PACKAGE_TTL_SECS,
+        );
+    }
+    render_inflight_directive(&inflight)
+}
+
 /// Terminal outcome of a goal pursuit, surfaced on the `GoalEnd` hook payload.
 struct GoalOutcome {
     /// Wire status: `"achieved"` | `"failed"` | `"cleared"`.
@@ -552,6 +656,11 @@ async fn run_goal_loop(
     // Consecutive abnormal-worker-turn recoveries spent so far (reset by any
     // productive turn). Bounds the REVIEW-ANALYZE-REPLAN loop below.
     let mut recoveries: usize = 0;
+    // ISS-407771 — every worker run id this pursuit has spawned. Each turn runs
+    // in a FRESH process, so this in-loop list plus the durable run forest is
+    // how turn N+1 learns which work packages turn N still has in flight.
+    let mut prior_run_ids: Vec<String> = Vec::new();
+    let scope_key = goal_scope_key(&goal.condition);
 
     loop {
         // Stop checks between turns.
@@ -592,7 +701,24 @@ async fn run_goal_loop(
                 steers.len()
             ));
         }
-        let effective = compose_guidance(guidance.as_deref(), &steers);
+        // ISS-407771 — cross-turn continuity. Before the generator plans, read
+        // which work packages EARLIER turns still have in flight (the durable
+        // run forest), lease them, and append a do-not-re-dispatch ledger to
+        // this turn's guidance. Without it the fresh process re-fans packages a
+        // live wave already owns.
+        let inflight = inflight_directive(&scope_key, &prior_run_ids);
+        if let Some(block) = inflight.as_deref() {
+            let owned = block.lines().count().saturating_sub(1);
+            goal.note(&format!(
+                "turn {turn}: {owned} work package(s) still in flight from earlier turns — \
+                 leased, and excluded from this turn's plan"
+            ));
+        }
+        let effective = match (compose_guidance(guidance.as_deref(), &steers), inflight) {
+            (Some(g), Some(block)) => Some(format!("{g}\n\n{block}")),
+            (None, Some(block)) => Some(block),
+            (g, None) => g,
+        };
         // Generator: a full-tool worker pursues the goal with the latest guidance.
         let directive = goal_directive(&goal.condition, effective.as_deref());
         goal.note_quiet(&format!("turn {turn}: working…"));
@@ -608,6 +734,10 @@ async fn run_goal_loop(
         // turn's stderr is attached under stays the stable `goal` sentinel —
         // two different concerns, deliberately not the same string.
         let run_id = crate::worker::new_goal_id();
+        // Remember it BEFORE the turn runs: this turn's own children must be
+        // visible to the NEXT turn's in-flight sweep even if this turn dies
+        // abnormally (the children outlive it).
+        prior_run_ids.push(run_id.clone());
         let output = match crate::worker::run_once(&spec, &directive, &run_id).await {
             Ok(o) => {
                 // Productive turn — clear the failure streak so intermittent,
@@ -1416,6 +1546,86 @@ pub fn route_next(goals: &[Goal]) -> Option<&Goal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ISS-407771: cross-turn work-package continuity ───────────────────────
+
+    use crate::coordinator_store::CoordinatorRow;
+
+    fn row(run_id: &str, parent: Option<&str>, phase: &str, task: &str) -> CoordinatorRow {
+        CoordinatorRow {
+            run_id: run_id.to_string(),
+            task: task.to_string(),
+            phase: phase.to_string(),
+            result: None,
+            error: None,
+            session_id: None,
+            session_name: None,
+            parent_run_id: parent.map(str::to_string),
+            created_at: None,
+            heartbeat_at: None,
+            tokens_in: 0,
+            tokens_out: 0,
+            turns: 0,
+            tool_calls: 0,
+        }
+    }
+
+    #[test]
+    fn goal_scope_key_is_stable_and_discriminates_goals() {
+        // Same goal text (modulo case/edge whitespace) → same namespace across
+        // processes, so turn N+1 contends with turn N's leases.
+        assert_eq!(goal_scope_key("Ship the CI fix "), goal_scope_key("ship the ci fix"));
+        assert_ne!(goal_scope_key("ship the ci fix"), goal_scope_key("ship the docs fix"));
+        assert!(goal_scope_key("anything").starts_with("goal:"));
+    }
+
+    #[test]
+    fn live_descendant_runs_walks_transitively_and_drops_terminal_rows() {
+        let rows = vec![
+            row("turn1", None, "done", "turn 1 coordinator"),
+            row("w1", Some("turn1"), "coordinating", "fix the retry backoff"),
+            row("w2", Some("turn1"), "done", "already finished package"),
+            row("g1", Some("w1"), "awaiting_batch", "grandchild package"),
+            row("other", None, "coordinating", "unrelated run"),
+            row("orphan", Some("nope"), "coordinating", "not in the family"),
+        ];
+        let live = live_descendant_runs(&rows, &["turn1".to_string()]);
+        let ids: Vec<&str> = live.iter().map(|(id, _)| id.as_str()).collect();
+        // Transitive (grandchild included), terminal excluded, ancestors
+        // excluded, unrelated runs excluded.
+        assert_eq!(ids, vec!["w1", "g1"]);
+        assert_eq!(live[0].1, "fix the retry backoff");
+        // No ancestors → nothing claimed.
+        assert!(live_descendant_runs(&rows, &[]).is_empty());
+    }
+
+    #[test]
+    fn live_descendant_runs_terminates_on_a_cyclic_parent_chain() {
+        // A corrupt/cyclic forest must not spin the fixed-point walk.
+        let rows = vec![
+            row("a", Some("b"), "coordinating", "a"),
+            row("b", Some("a"), "coordinating", "b"),
+            row("c", Some("a"), "coordinating", "c"),
+        ];
+        let live = live_descendant_runs(&rows, &["a".to_string()]);
+        let mut ids: Vec<&str> = live.iter().map(|(id, _)| id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["b", "c"]);
+    }
+
+    #[test]
+    fn render_inflight_directive_is_none_when_clean_and_names_owners_otherwise() {
+        assert!(render_inflight_directive(&[]).is_none());
+        let d = render_inflight_directive(&[
+            ("run_a".into(), "fix   the\nretry backoff".into()),
+            ("run_b".into(), "write the docs".into()),
+        ])
+        .unwrap();
+        assert!(d.contains("Do NOT re-dispatch"), "{d}");
+        assert!(d.contains("run `run_a` owns: fix the retry backoff"), "{d}");
+        assert!(d.contains("run `run_b` owns: write the docs"), "{d}");
+        assert!(!d.ends_with('\n'));
+    }
 
     #[test]
     fn delivery_blob_is_left_aligned_and_line_terminated() {
