@@ -333,6 +333,13 @@ pub struct Session {
     /// `AISH_COMPACT_TOKEN_BUDGET` (falling back to
     /// [`crate::context::COMPACT_TOKEN_CEILING`]). (TASK-321)
     pub compact_token_ceiling: usize,
+    /// Resolved in-context MESSAGE-count compaction ceiling for this session
+    /// (0 = lever off). The structural backstop that bounds `history.len()`
+    /// regardless of token estimates — the one lever still standing when the
+    /// window is huge, the token lever is off, and `AISH_COMPACT_TOOL_CALLS=off`
+    /// disabled the tool-call lever. Seeded from `AISH_COMPACT_MAX_MSGS`
+    /// (falling back to [`crate::context::COMPACT_MSG_CEILING`]). (ISS-409752)
+    pub compact_msg_ceiling: usize,
     /// Interactive background mode (on by default, persisted; toggle with `:batch`).
     /// When on, the agent gets the run_in_background/background_status tools and a
     /// system-prompt nudge to offload deferrable work to a full background
@@ -645,6 +652,10 @@ impl Session {
             compact_token_ceiling: crate::context::parse_ceiling(
                 std::env::var("AISH_COMPACT_TOKEN_BUDGET").ok().as_deref(),
                 crate::context::COMPACT_TOKEN_CEILING,
+            ),
+            compact_msg_ceiling: crate::context::parse_ceiling(
+                std::env::var("AISH_COMPACT_MAX_MSGS").ok().as_deref(),
+                crate::context::COMPACT_MSG_CEILING,
             ),
             batch_mode: true,
             batch_model: crate::batch::DEFAULT_BATCH_MODEL.to_string(),
