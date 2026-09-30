@@ -48,6 +48,13 @@ impl CostSummary {
     }
 }
 
+/// `kind` marker for a row RE-DERIVED from a surviving worktree by the startup
+/// salvage pass rather than written by a real run. Such a row is stored with
+/// `phase = 'failed'` (it is terminal and un-resumable) but is NOT a genuine
+/// agent failure, so readers that count/report failures need a discriminator
+/// that isn't "does the task text start with `(salvaged …)`". Written by
+/// [`CoordinatorStore::insert_salvaged`], read via [`CoordinatorRow::kind`].
+pub const SALVAGE_KIND: &str = "salvage";
 
 pub struct CoordinatorRow {
     pub run_id: String,
@@ -85,6 +92,11 @@ pub struct CoordinatorRow {
     pub turns: u64,
     /// Count of tool calls executed across the run.
     pub tool_calls: u64,
+    /// Row provenance: `None` for a normal run, `Some(`[`SALVAGE_KIND`]`)` for a
+    /// row re-derived from a surviving worktree by the startup salvage pass.
+    /// Lets downstream readers tell a salvaged row from a real failure without
+    /// string-matching the synthesized task text.
+    pub kind: Option<String>,
 }
 
 /// Cumulative cost/effort counters for a run, persisted ATOMICALLY with the
@@ -124,7 +136,10 @@ impl RunResult {
     #[allow(dead_code)] // Public accessor kept for API parity; no call site today.
     pub fn rendered(&self) -> String {
         match self.phase.as_str() {
-            "done" => self.result.clone().unwrap_or_else(|| "(empty result)".into()),
+            "done" => self
+                .result
+                .clone()
+                .unwrap_or_else(|| "(empty result)".into()),
             "failed" => format!(
                 "run {} failed: {}",
                 self.run_id,
@@ -262,6 +277,27 @@ impl CoordinatorStore {
                  -- be resumed manually later. 0 = run normally, 1 = pause.
                  checkpoint   INTEGER NOT NULL DEFAULT 0
              );
+             -- Worktree lifecycle ledger. One OPEN row per isolated worker
+             -- worktree from the moment `git worktree add` succeeds; closed when
+             -- the tree + branch are removed. This is the ONLY record that
+             -- outlives the process that created the tree, so it's what lets
+             -- startup find a leaked worktree that the work-bearing filesystem
+             -- scan cannot see: an EMPTY-but-stale tree (nothing to salvage, so
+             -- no dirty/ahead signal) and a tree under a DIFFERENT repo-key than
+             -- the session's cwd. Declared here as well as in `Db` because
+             -- either store may be the first to open the shared `aish.db`.
+             CREATE TABLE IF NOT EXISTS worktree_lifecycle (
+                 id            INTEGER PRIMARY KEY,
+                 worktree_id   TEXT NOT NULL,
+                 worktree_path TEXT NOT NULL,
+                 run_id        TEXT NOT NULL,
+                 created_at    TEXT NOT NULL DEFAULT current_timestamp,
+                 cleaned_up_at TEXT,
+                 cleanup_failed INTEGER NOT NULL DEFAULT 0,
+                 cleanup_error TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_worktree_run ON worktree_lifecycle (run_id);
+             CREATE INDEX IF NOT EXISTS idx_worktree_cleaned ON worktree_lifecycle (cleaned_up_at);
              -- Operator → coordinator mailbox (the :tell / SendMessage channel).
              -- A row is a clarification/instruction queued for an in-flight run;
              -- the coordinator drains (and deletes) its messages at each round
@@ -362,7 +398,9 @@ impl CoordinatorStore {
         // migration is idempotent, and existing rows read back 0.
         for col in ["tokens_in", "tokens_out", "turns", "tool_calls"] {
             let _ = conn.execute(
-                &format!("ALTER TABLE coordinator_runs ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"),
+                &format!(
+                    "ALTER TABLE coordinator_runs ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"
+                ),
                 [],
             );
         }
@@ -433,6 +471,11 @@ impl CoordinatorStore {
             "ALTER TABLE coordinator_runs ADD COLUMN parent_run_id TEXT",
             [],
         );
+        // Row-provenance discriminator (see `SALVAGE_KIND`). Additive
+        // `ADD COLUMN`, swallowed once present, so idempotent; pre-existing rows
+        // read back NULL, i.e. "a normal run", which is the correct default for
+        // every row written before the salvage pass started stamping this.
+        let _ = conn.execute("ALTER TABLE coordinator_runs ADD COLUMN kind TEXT", []);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -479,13 +522,85 @@ impl CoordinatorStore {
     /// up in `:workers` / `background_status` again. Idempotent (ON CONFLICT DO
     /// NOTHING) so a re-derive on the next startup can't duplicate it. `error`
     /// carries the recoverable branch/path. (coordinator-lifecycle bug.)
+    /// Stamped `kind = `[`SALVAGE_KIND`] so a reader can tell this re-derived row
+    /// from a genuine agent failure without string-matching the task prefix.
     pub fn insert_salvaged(&self, run_id: &str, task: &str, error: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO coordinator_runs (run_id, task, phase, error) \
-             VALUES (?1, ?2, 'failed', ?3) ON CONFLICT(run_id) DO NOTHING",
-            (run_id, task, error),
+            "INSERT INTO coordinator_runs (run_id, task, phase, error, kind) \
+             VALUES (?1, ?2, 'failed', ?3, ?4) ON CONFLICT(run_id) DO NOTHING",
+            (run_id, task, error, SALVAGE_KIND),
         )?;
         Ok(())
+    }
+
+    // --- worktree lifecycle ledger -------------------------------------------
+    // The OPEN/CLOSE ledger for isolated worker worktrees. A worktree's own
+    // existence on disk is NOT a sufficient record: the work-bearing filesystem
+    // scan at startup can only see trees under the CURRENT repo-key that are
+    // dirty-or-ahead, so an empty-but-stale tree, or one belonging to another
+    // repo, leaks silently forever. These rows outlive the process that made
+    // the tree and are scoped by nothing but age, so they close both blind spots.
+
+    /// Open a ledger row: worktree `worktree_id` was materialised at
+    /// `worktree_path` for run `run_id`. Called the moment `git worktree add`
+    /// succeeds, BEFORE any work happens, so a parent killed mid-run still
+    /// leaves the tree discoverable.
+    pub fn record_worktree_created(
+        &self,
+        worktree_id: &str,
+        worktree_path: &Path,
+        run_id: &str,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO worktree_lifecycle (worktree_id, worktree_path, run_id) \
+             VALUES (?1, ?2, ?3)",
+            (worktree_id, worktree_path.display().to_string(), run_id),
+        )?;
+        Ok(())
+    }
+
+    /// Close the ledger row — the tree (and its branch) are gone. Scoped to
+    /// still-open rows, so a repeated cleanup is an idempotent no-op rather than
+    /// a timestamp rewrite.
+    pub fn record_worktree_cleaned_up(&self, worktree_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE worktree_lifecycle \
+             SET cleaned_up_at = current_timestamp, cleanup_failed = 0 \
+             WHERE worktree_id = ?1 AND cleaned_up_at IS NULL",
+            (worktree_id,),
+        )?;
+        Ok(())
+    }
+
+    /// Record a cleanup ATTEMPT that failed. The row stays OPEN on purpose — a
+    /// failed removal is exactly the leak [`Self::list_orphaned_worktrees`] must
+    /// keep reporting — with `cleanup_error` carrying the reason for the operator.
+    pub fn record_worktree_cleanup_failed(&self, worktree_id: &str, error: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE worktree_lifecycle \
+             SET cleanup_failed = 1, cleanup_error = ?2 \
+             WHERE worktree_id = ?1 AND cleaned_up_at IS NULL",
+            (worktree_id, error),
+        )?;
+        Ok(())
+    }
+
+    /// Ledger rows still OPEN (created, never cleaned up) and older than
+    /// `hours_old`, as `(worktree_id, worktree_path, run_id)`, oldest first.
+    /// These are the leak candidates the filesystem scan cannot produce.
+    pub fn list_orphaned_worktrees(&self, hours_old: i64) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT worktree_id, worktree_path, run_id \
+             FROM worktree_lifecycle \
+             WHERE cleaned_up_at IS NULL \
+               AND datetime(created_at) < datetime('now', ?1 || ' hours') \
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map((format!("-{hours_old}"),), |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
     /// Advance the run's phase marker (and bump the heartbeat, since a phase
@@ -538,10 +653,7 @@ impl CoordinatorStore {
     /// the atomic seam behind the coordinator's turn-state writes: a
     /// multi-statement mutation (terminal phase + metrics) either lands whole or
     /// not at all, so a mid-write failure never yields a torn, un-resumable row.
-    pub fn transact<T>(
-        &self,
-        f: impl FnOnce(&Transaction) -> Result<T>,
-    ) -> Result<T> {
+    pub fn transact<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let out = f(&tx)?;
@@ -607,7 +719,7 @@ impl CoordinatorStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT run_id, task, phase, result, error, session_id, session_name, created_at, heartbeat_at, \
-                    tokens_in, tokens_out, turns, tool_calls, parent_run_id
+                    tokens_in, tokens_out, turns, tool_calls, parent_run_id, kind
              FROM coordinator_runs ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -626,6 +738,7 @@ impl CoordinatorStore {
                 turns: r.get(11)?,
                 tool_calls: r.get(12)?,
                 parent_run_id: r.get(13)?,
+                kind: r.get(14)?,
             })
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect())
@@ -694,7 +807,6 @@ impl CoordinatorStore {
         .map(|count| count as usize)
         .map_err(Into::into)
     }
-
 
     /// Count prior terminal-`failed` runs whose `task` text matches `task`
     /// exactly. This backs the coordinator's pre-dispatch circuit breaker
@@ -881,7 +993,11 @@ impl CoordinatorStore {
             .conn
             .lock()
             .unwrap()
-            .query_row("SELECT run_id FROM run_aliases WHERE alias = ?1", [alias], |r| r.get(0))
+            .query_row(
+                "SELECT run_id FROM run_aliases WHERE alias = ?1",
+                [alias],
+                |r| r.get(0),
+            )
             .optional()?)
     }
 
@@ -1156,7 +1272,14 @@ impl CoordinatorStore {
                  batch_job_id  = excluded.batch_job_id,
                  phase         = excluded.phase,
                  owner_session = excluded.owner_session",
-            (coord_id, generation, pid, batch_job_id, phase, owner_session),
+            (
+                coord_id,
+                generation,
+                pid,
+                batch_job_id,
+                phase,
+                owner_session,
+            ),
         )?;
         Ok(())
     }
@@ -1201,6 +1324,66 @@ impl CoordinatorStore {
 mod tests {
     use super::*;
 
+    /// ISS-409757: the lifecycle ledger is the only record that survives both
+    /// blind spots of the filesystem scan, so it must (a) stay QUIET for a
+    /// healthy in-flight tree, (b) report an aged-out row, (c) stay OPEN after a
+    /// FAILED cleanup — the leak we must keep seeing — and (d) close on success.
+    #[test]
+    fn worktree_ledger_reports_leaks_and_survives_failed_cleanup() {
+        let path = std::env::temp_dir().join(format!("aish_wt_ledger_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+
+        store
+            .record_worktree_created("w_keep", Path::new("/tmp/w_keep"), "run_keep")
+            .unwrap();
+        store
+            .record_worktree_created("w_gone", Path::new("/tmp/w_gone"), "run_gone")
+            .unwrap();
+        store
+            .record_worktree_created("w_fresh", Path::new("/tmp/w_fresh"), "run_fresh")
+            .unwrap();
+        // Age out the first two; `w_fresh` stands in for a healthy running job.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE worktree_lifecycle SET created_at = datetime('now', '-48 hours') \
+                 WHERE worktree_id IN ('w_keep', 'w_gone')",
+                (),
+            )
+            .unwrap();
+
+        // A live run's tree is never reported — false leaks train operators to
+        // ignore the report, which would cost more than the leak itself.
+        let leaks = store.list_orphaned_worktrees(24).unwrap();
+        assert_eq!(
+            leaks.len(),
+            2,
+            "aged rows reported, fresh row not: {leaks:?}"
+        );
+        assert!(!leaks.iter().any(|(id, ..)| id == "w_fresh"));
+
+        // A successful teardown closes the row for good.
+        store.record_worktree_cleaned_up("w_gone").unwrap();
+        // A FAILED teardown does NOT — the dir is still on disk.
+        store
+            .record_worktree_cleanup_failed("w_keep", "git worktree remove left it on disk")
+            .unwrap();
+
+        let leaks = store.list_orphaned_worktrees(24).unwrap();
+        assert_eq!(leaks.len(), 1);
+        assert_eq!(leaks[0].0, "w_keep");
+        assert_eq!(leaks[0].1, "/tmp/w_keep");
+        assert_eq!(leaks[0].2, "run_keep");
+
+        // The ledger's whole purpose is outliving the process that wrote it.
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        assert_eq!(reopened.list_orphaned_worktrees(24).unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn coordinator_store_records_run_metrics() {
         let path =
@@ -1227,7 +1410,12 @@ mod tests {
                 "done",
                 Some("done"),
                 None,
-                RunMetrics { tokens_in: 12_345, tokens_out: 6_789, turns: 7, tool_calls: 42 },
+                RunMetrics {
+                    tokens_in: 12_345,
+                    tokens_out: 6_789,
+                    turns: 7,
+                    tool_calls: 42,
+                },
             )
             .unwrap();
 
@@ -1262,7 +1450,10 @@ mod tests {
         store.bind_alias("w_a", "run_a", Some("#75")).unwrap();
         // Immutable: a second bind for the same alias is a no-op (AC1).
         store.bind_alias("w_a", "run_OTHER", Some("#999")).unwrap();
-        assert_eq!(store.resolve_alias("w_a").unwrap().as_deref(), Some("run_a"));
+        assert_eq!(
+            store.resolve_alias("w_a").unwrap().as_deref(),
+            Some("run_a")
+        );
 
         store.set_done("run_a", "PR #75 opened").unwrap();
         let r = store.result_for_alias("w_a").unwrap().unwrap();
@@ -1271,7 +1462,12 @@ mod tests {
         assert_eq!(r.result.as_deref(), Some("PR #75 opened"));
         // An unbound alias falls back to a literal run_id lookup.
         assert_eq!(
-            store.result_for_alias("run_a").unwrap().unwrap().result.as_deref(),
+            store
+                .result_for_alias("run_a")
+                .unwrap()
+                .unwrap()
+                .result
+                .as_deref(),
             Some("PR #75 opened")
         );
         // An unknown alias resolves to nothing (not someone else's result).
@@ -1285,8 +1481,7 @@ mod tests {
         // `:result <alias>` returns its OWN run's data — no shared slot a racing
         // completion can overwrite.
         use std::thread;
-        let path =
-            std::env::temp_dir().join(format!("aish_alias_conc_{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!("aish_alias_conc_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = CoordinatorStore::open(&path).unwrap();
 
@@ -1310,7 +1505,10 @@ mod tests {
         for i in 0..N {
             let r = store.result_for_alias(&format!("w_{i}")).unwrap().unwrap();
             assert_eq!(r.run_id, format!("run_{i}"));
-            assert_eq!(r.result.as_deref(), Some(format!("PR #{} done", 100 + i).as_str()));
+            assert_eq!(
+                r.result.as_deref(),
+                Some(format!("PR #{} done", 100 + i).as_str())
+            );
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -1328,8 +1526,12 @@ mod tests {
         let store = CoordinatorStore::open(&path).unwrap();
 
         store.insert("run_hung", "long build", "s", None).unwrap();
-        store.insert("run_paused", "paused work", "s", None).unwrap();
-        store.insert("run_fresh", "just started", "s", None).unwrap();
+        store
+            .insert("run_paused", "paused work", "s", None)
+            .unwrap();
+        store
+            .insert("run_fresh", "just started", "s", None)
+            .unwrap();
         store.set_phase("run_paused", "checkpoint").unwrap();
 
         // Backdate two beats well past the 5-minute stall threshold. `run_fresh`
@@ -1568,7 +1770,14 @@ mod tests {
             .register_run("c1", 0, 4242, None, "coordinating", Some("sess-a"))
             .unwrap();
         store
-            .register_run("c2", 0, 4243, Some("batch_zzz"), "awaiting_batch", Some("sess-a"))
+            .register_run(
+                "c2",
+                0,
+                4243,
+                Some("batch_zzz"),
+                "awaiting_batch",
+                Some("sess-a"),
+            )
             .unwrap();
 
         let live = store.get_live_runs().unwrap();
@@ -1584,7 +1793,14 @@ mod tests {
         // Re-register c1 (resurrected process): upsert bumps generation + pid,
         // does NOT create a duplicate row.
         store
-            .register_run("c1", 1, 5555, Some("batch_new"), "awaiting_batch", Some("sess-b"))
+            .register_run(
+                "c1",
+                1,
+                5555,
+                Some("batch_new"),
+                "awaiting_batch",
+                Some("sess-b"),
+            )
             .unwrap();
         let live = store.get_live_runs().unwrap();
         assert_eq!(live.len(), 2, "re-register must upsert, not duplicate");
@@ -1616,15 +1832,19 @@ mod tests {
     /// atomic unit and survives a restart — the `done` and `failed` shapes.
     #[test]
     fn finish_run_persists_phase_and_metrics_atomically() {
-        let path =
-            std::env::temp_dir().join(format!("aish_t285_finish_{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!("aish_t285_finish_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = CoordinatorStore::open(&path).unwrap();
 
         store.insert("run_done", "ship it", "s", None).unwrap();
         store.insert("run_fail", "ship it", "s", None).unwrap();
 
-        let m = RunMetrics { tokens_in: 100, tokens_out: 55, turns: 4, tool_calls: 9 };
+        let m = RunMetrics {
+            tokens_in: 100,
+            tokens_out: 55,
+            turns: 4,
+            tool_calls: 9,
+        };
         store
             .finish_run("run_done", "done", Some("delivered"), None, m)
             .unwrap();
@@ -1640,13 +1860,19 @@ mod tests {
         assert_eq!(d.phase, "done");
         assert_eq!(d.result.as_deref(), Some("delivered"));
         assert_eq!(d.error, None);
-        assert_eq!((d.tokens_in, d.tokens_out, d.turns, d.tool_calls), (100, 55, 4, 9));
+        assert_eq!(
+            (d.tokens_in, d.tokens_out, d.turns, d.tool_calls),
+            (100, 55, 4, 9)
+        );
 
         let f = rows.iter().find(|r| r.run_id == "run_fail").unwrap();
         assert_eq!(f.phase, "failed");
         assert_eq!(f.error.as_deref(), Some("kaboom"));
         assert_eq!(f.result, None);
-        assert_eq!((f.tokens_in, f.tokens_out, f.turns, f.tool_calls), (100, 55, 4, 9));
+        assert_eq!(
+            (f.tokens_in, f.tokens_out, f.turns, f.tool_calls),
+            (100, 55, 4, 9)
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1682,7 +1908,10 @@ mod tests {
         for s in [&store, &CoordinatorStore::open(&path).unwrap()] {
             let rows = s.load_all().unwrap();
             let r = rows.iter().find(|r| r.run_id == "run_tx").unwrap();
-            assert_eq!(r.phase, "coordinating", "phase must roll back — row stays resumable");
+            assert_eq!(
+                r.phase, "coordinating",
+                "phase must roll back — row stays resumable"
+            );
             assert_eq!(r.result, None, "result must roll back");
             assert_eq!(r.tokens_in, 0, "metrics must roll back");
         }
@@ -1716,8 +1945,7 @@ mod tests {
             std::process::exit(0);
         }
 
-        let path =
-            std::env::temp_dir().join(format!("aish_t285_kill_{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!("aish_t285_kill_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = CoordinatorStore::open(&path).unwrap();
         store.insert("run_kill", "long task", "s", None).unwrap();
@@ -1731,7 +1959,10 @@ mod tests {
             // Unique substring filter — matches ONLY this test regardless of the
             // crate's module-path prefix (no `--exact`, which would need the full
             // `…::tests::…` path). The env guard above makes the child leg run.
-            .args(["sigkill_mid_transaction_leaves_row_resumable", "--test-threads=1"])
+            .args([
+                "sigkill_mid_transaction_leaves_row_resumable",
+                "--test-threads=1",
+            ])
             .env("AISH_T285_KILL_DB", &path)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1752,7 +1983,10 @@ mod tests {
             r.phase, "coordinating",
             "a SIGKILL'd mid-write must roll back — the run stays resumable"
         );
-        assert_eq!(r.result, None, "the child's uncommitted result must not persist");
+        assert_eq!(
+            r.result, None,
+            "the child's uncommitted result must not persist"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

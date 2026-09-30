@@ -1567,6 +1567,7 @@ mod tests {
             tokens_out: 0,
             turns: 0,
             tool_calls: 0,
+            kind: None,
         }
     }
 
