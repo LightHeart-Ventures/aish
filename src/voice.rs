@@ -423,6 +423,11 @@ pub mod capture {
     /// This function **blocks the calling thread** (it is designed to be run
     /// inside `tokio::task::spawn_blocking` by the REPL wiring, TASK-367).
     /// cpal's audio callback runs on a separate OS audio thread.
+    /// TASK-368 note: the REPL now always calls
+    /// [`record_until_stop_with_config`] so `voice.device` is honoured. This
+    /// zero-config entry point is retained as the documented default-device
+    /// API (see the module docs above) and for direct/test use.
+    #[allow(dead_code)]
     pub fn record_until_stop(stop: StopSignal) -> anyhow::Result<Vec<f32>> {
         let host = cpal::default_host();
         let device = open_input_device(&host, None)?;

@@ -1388,13 +1388,17 @@ pub async fn run(
                 // compile and behave identically to before.
                 #[cfg(feature = "voice")]
                 {
-                    use crate::voice::{capture, model, resample, stt};
+                    use crate::voice::{capture, config::VoiceConfig, model, resample, stt};
                     use crossterm::event::{Event, KeyCode, KeyModifiers};
                     use std::io::Write as _;
 
-                    // Hard-coded silence-timeout; TASK-368 will wire this to the
-                    // `voice.silence_ms` config key (default 2 000 ms per SPR-068 §5).
-                    const VOICE_SILENCE_MS: u64 = 2_000;
+                    // TASK-368: load `~/.aish/config` once per dictation turn so an
+                    // operator edit takes effect without restarting the shell.
+                    // `load()` is infallible — a missing/malformed file degrades to
+                    // documented defaults (model=tiny.en, language=en,
+                    // silence_ms=2000, autosubmit=false, device=system default).
+                    let voice_cfg = VoiceConfig::load();
+                    let voice_silence_ms = voice_cfg.silence_ms;
 
                     // --- Step 1: show the recording indicator. ----------------
                     eprint!("\r\x1b[2m🎤 listening…  Ctrl-G: stop  Esc: cancel\x1b[0m\x1b[K");
@@ -1416,8 +1420,12 @@ pub async fn run(
                         tokio::sync::oneshot::channel::<capture::StopAction>();
 
                     // --- Step 4: start audio capture on a blocking thread. ----
+                    // TASK-368: honour `voice.device`. `record_until_stop_with_config`
+                    // falls back to the system default (with a stderr warning) when
+                    // the named device is absent — never a hard failure.
+                    let capture_cfg = voice_cfg.clone();
                     let capture_handle = tokio::task::spawn_blocking(move || {
-                        capture::record_until_stop(stop_rx)
+                        capture::record_until_stop_with_config(stop_rx, &capture_cfg)
                     });
 
                     // --- Step 5: read the stop key on a blocking thread. ------
@@ -1471,7 +1479,7 @@ pub async fn run(
                             .unwrap_or(capture::StopAction::Cancel)
                         }
                         _ = tokio::time::sleep(
-                            std::time::Duration::from_millis(VOICE_SILENCE_MS)
+                            std::time::Duration::from_millis(voice_silence_ms)
                         ) => {
                             // Signal the key reader thread to shut down cleanly.
                             // It will restore raw mode before exiting.
@@ -1515,7 +1523,8 @@ pub async fn run(
                     let _ = std::io::stderr().flush();
 
                     // --- Step 11: await model download (fast when cached). ----
-                    let model_path = match model::ensure_model("tiny.en").await {
+                    // TASK-368: honour `voice.model` (default `tiny.en`).
+                    let model_path = match model::ensure_model(&voice_cfg.model).await {
                         Ok(p) => p,
                         Err(e) => {
                             eprint!("\r\x1b[K");
@@ -1528,13 +1537,17 @@ pub async fn run(
                     // --- Step 12: resample + transcribe in spawn_blocking. ----
                     // Both are CPU-bound; running on the blocking thread pool
                     // keeps the tokio worker thread free for other I/O.
+                    // TASK-368: honour `voice.language` as the Whisper decode hint
+                    // (empty string → Whisper auto-detect).
+                    let stt_language = voice_cfg.language.clone();
                     let transcript_result =
                         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
                             let pcm = resample::to_whisper_pcm(&samples, src_rate)?;
                             if pcm.is_empty() {
                                 return Ok(String::new());
                             }
-                            let mut t = stt::Transcriber::new(&model_path);
+                            let mut t = stt::Transcriber::new(&model_path)
+                                .with_language(stt_language);
                             t.transcribe(&pcm)
                         })
                         .await;
@@ -1561,10 +1574,21 @@ pub async fn run(
                         continue;
                     }
 
-                    // --- Step 14: insert into line buffer via read_line_with_initial.
+                    // --- Step 14a: autosubmit path (TASK-368). ----------------
+                    // `voice.autosubmit = true` dispatches the transcript straight
+                    // through the normal routing path — no confirmation prompt.
+                    // Opt-in only; the default (`false`) keeps design decision D3
+                    // (review-before-send) intact.
+                    if voice_cfg.autosubmit {
+                        println!("\x1b[2m🎤\x1b[0m {text}");
+                        injected = Some(text);
+                        continue;
+                    }
+
+                    // --- Step 14b: insert into line buffer via read_line_with_initial.
                     // The user sees the transcript pre-filled in the prompt, can
-                    // edit it, and presses Enter to dispatch.  Never auto-submits
-                    // (design decision D3 from SPR-068 design doc).
+                    // edit it, and presses Enter to dispatch.  Default path — never
+                    // auto-submits (design decision D3 from SPR-068 design doc).
                     let voice_outcome = editor.read_line_with_initial(&prompt, &text);
                     match voice_outcome {
                         ReadOutcome::Line(line) => {
