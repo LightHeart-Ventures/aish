@@ -115,6 +115,32 @@ pub const COMPACT_TOOL_CALL_CEILING: usize = 50;
 /// to compact at a fixed token count regardless of window size. (TASK-321)
 pub const COMPACT_TOKEN_CEILING: usize = 0;
 
+/// Default ceiling on the number of *messages* retained in context before a
+/// compaction is forced — a structural backstop that is independent of every
+/// token estimate. (ISS-409752)
+///
+/// The other three levers all measure CONTENT: percentage of window, absolute
+/// tokens, and in-context tool calls. None of them bounds `session.history.len()`
+/// itself, so a long agentic turn made of many *small* rounds can grow the
+/// transcript without limit:
+///   * the %-window lever needs ~150k live tokens on a 200k model (and far more
+///     on a 1M-token window) before it fires;
+///   * the absolute token lever is OFF by default (`COMPACT_TOKEN_CEILING == 0`);
+///   * the tool-call lever is explicitly disablable via
+///     `AISH_COMPACT_TOOL_CALLS=off` — a documented, supported operator setting.
+///
+/// With a large window and the tool-call lever off, in-turn history growth had
+/// no ceiling at all: every round appended an assistant message plus its
+/// tool-result message and nothing ever reclaimed them, which is the unbounded
+/// `run_turn_inner` growth reported in ISS-409752. A message COUNT is O(1) to
+/// read, cannot be fooled by estimator error, and degrades gracefully — it only
+/// ever makes compaction fire *earlier*.
+///
+/// The default is deliberately well above [`KEEP_RECENT_MSGS`] so a normal
+/// interactive turn never trips it; it exists to catch runaway loops.
+/// Overridable via `AISH_COMPACT_MAX_MSGS` (`off`/`none`/`0` disables).
+pub const COMPACT_MSG_CEILING: usize = 120;
+
 /// Parse a compaction-ceiling override from an env value: `None`/empty → the
 /// compiled-in `default`; `off`/`none` (case-insensitive) → `0` (lever disabled);
 /// a valid non-negative integer → that value (`0` also disables); anything else
@@ -137,6 +163,9 @@ pub enum CompactTrigger {
     ToolCalls,
     /// Live token usage reached the absolute token ceiling.
     TokenBudget,
+    /// In-context message count reached the message ceiling. The structural
+    /// backstop: fires regardless of how small each message is. (ISS-409752)
+    MsgCount,
 }
 
 impl CompactTrigger {
@@ -146,6 +175,7 @@ impl CompactTrigger {
             Self::WindowPct => "context window",
             Self::ToolCalls => "tool-call cap",
             Self::TokenBudget => "token budget",
+            Self::MsgCount => "message cap",
         }
     }
 }
@@ -163,18 +193,33 @@ pub struct CompactBudget {
     pub tool_call_ceiling: usize,
     /// Absolute live-token ceiling before forcing a compaction; `0` = off.
     pub token_ceiling: usize,
+    /// Max messages retained in-context before forcing a compaction; `0` = off.
+    /// Structural backstop, independent of any token estimate. (ISS-409752)
+    pub msg_ceiling: usize,
 }
 
 impl CompactBudget {
     /// Decide whether — and why — to compact now. `used` is the running live
     /// token figure; `tool_calls_in_context` is how many tool calls the current
-    /// (uncompacted) transcript still carries. The tool-call cap is checked
-    /// first (the cheap, early lever that bounds cost before the window fills),
-    /// then the absolute token cap, then the percentage window. `None` ⇒ leave
-    /// history intact.
-    pub fn trigger(&self, used: usize, tool_calls_in_context: usize) -> Option<CompactTrigger> {
+    /// (uncompacted) transcript still carries; `msgs_in_context` is
+    /// `history.len()`. The tool-call cap is checked first (the cheap, early
+    /// lever that bounds cost before the window fills), then the structural
+    /// message cap, then the absolute token cap, then the percentage window.
+    /// `None` ⇒ leave history intact.
+    pub fn trigger(
+        &self,
+        used: usize,
+        tool_calls_in_context: usize,
+        msgs_in_context: usize,
+    ) -> Option<CompactTrigger> {
         if self.tool_call_ceiling > 0 && tool_calls_in_context >= self.tool_call_ceiling {
             return Some(CompactTrigger::ToolCalls);
+        }
+        // Structural backstop BEFORE the token levers: it is the one lever that
+        // still fires when every content-based estimate says "plenty of room"
+        // (huge window, token lever off, tool-call lever disabled). (ISS-409752)
+        if self.msg_ceiling > 0 && msgs_in_context >= self.msg_ceiling {
+            return Some(CompactTrigger::MsgCount);
         }
         if self.token_ceiling > 0 && used >= self.token_ceiling {
             return Some(CompactTrigger::TokenBudget);
@@ -286,6 +331,12 @@ pub fn plan_compaction(history: &[Msg], keep_recent: usize) -> Option<Compaction
 /// single summary message.
 pub fn apply_compaction(history: &mut Vec<Msg>, c: &Compaction) {
     history.splice(0..c.dropped, std::iter::once(c.summary_msg.clone()));
+    // Reclaim the Vec spine. `splice` shifts the retained tail down but leaves
+    // capacity at the run's high-water mark, so a turn that peaked at thousands
+    // of messages kept holding that allocation for the rest of the session even
+    // though compaction had dropped the contents. Shrinking here is what makes
+    // the compaction actually return memory to the allocator. (ISS-409752)
+    history.shrink_to_fit();
 }
 
 // ---------------------------------------------------------------------------
@@ -606,17 +657,18 @@ mod tests {
             threshold_pct: 75,
             tool_call_ceiling: 50,
             token_ceiling: 120_000,
+            msg_ceiling: 0,
         };
         // Nothing tripped.
-        assert_eq!(b.trigger(10_000, 3), None);
+        assert_eq!(b.trigger(10_000, 3, 0), None);
         // Tool-call cap fires first, before either token lever.
-        assert_eq!(b.trigger(10_000, 50), Some(CompactTrigger::ToolCalls));
+        assert_eq!(b.trigger(10_000, 50, 0), Some(CompactTrigger::ToolCalls));
         // Below the cap but over the absolute token ceiling.
-        assert_eq!(b.trigger(120_000, 10), Some(CompactTrigger::TokenBudget));
+        assert_eq!(b.trigger(120_000, 10, 0), Some(CompactTrigger::TokenBudget));
         // Below both absolute caps but at the % window (150k of 200k).
         let b2 = CompactBudget { token_ceiling: 0, ..b };
-        assert_eq!(b2.trigger(150_000, 10), Some(CompactTrigger::WindowPct));
-        assert_eq!(b2.trigger(149_999, 10), None);
+        assert_eq!(b2.trigger(150_000, 10, 0), Some(CompactTrigger::WindowPct));
+        assert_eq!(b2.trigger(149_999, 10, 0), None);
     }
 
     #[test]
@@ -627,13 +679,92 @@ mod tests {
             threshold_pct: 75,
             tool_call_ceiling: 0,
             token_ceiling: 0,
+            msg_ceiling: 0,
         };
         // Every lever off ⇒ never compacts, even with a huge transcript.
-        assert_eq!(b.trigger(10_000_000, 10_000), None);
+        assert_eq!(b.trigger(10_000_000, 10_000, 0), None);
         // Only the tool-call lever on.
         let b = CompactBudget { tool_call_ceiling: 40, ..b };
-        assert_eq!(b.trigger(10_000_000, 39), None);
-        assert_eq!(b.trigger(0, 40), Some(CompactTrigger::ToolCalls));
+        assert_eq!(b.trigger(10_000_000, 39, 0), None);
+        assert_eq!(b.trigger(0, 40, 0), Some(CompactTrigger::ToolCalls));
+    }
+
+    // ISS-409752: the message cap is the structural backstop. It must fire in
+    // exactly the configuration where every CONTENT-based lever is blind: a huge
+    // window nowhere near its percentage threshold, the absolute token lever off,
+    // and the tool-call lever explicitly disabled by the operator.
+    #[test]
+    fn msg_ceiling_fires_when_every_token_lever_is_blind() {
+        let b = CompactBudget {
+            window: 1_000_000,
+            threshold_pct: 75,
+            tool_call_ceiling: 0, // AISH_COMPACT_TOOL_CALLS=off
+            token_ceiling: 0,     // absolute token lever off (the default)
+            msg_ceiling: 120,
+        };
+        // Thousands of tiny rounds: only 10k tokens live, so the % window (750k)
+        // is nowhere near tripping — yet the transcript is 400 messages long.
+        // Before ISS-409752 this returned None forever and history grew without
+        // bound; the message cap is what now catches it.
+        assert_eq!(b.trigger(10_000, 0, 400), Some(CompactTrigger::MsgCount));
+        // At the ceiling exactly (inclusive, like the other levers).
+        assert_eq!(b.trigger(10_000, 0, 120), Some(CompactTrigger::MsgCount));
+        // One below ⇒ still nothing to do.
+        assert_eq!(b.trigger(10_000, 0, 119), None);
+    }
+
+    #[test]
+    fn msg_ceiling_is_disablable_and_yields_to_tool_call_cap() {
+        let b = CompactBudget {
+            window: 0,
+            threshold_pct: 75,
+            tool_call_ceiling: 0,
+            token_ceiling: 0,
+            msg_ceiling: 0, // lever off
+        };
+        // Every lever off ⇒ never compacts, however long the transcript.
+        assert_eq!(b.trigger(10_000_000, 10_000, 100_000), None);
+        // The tool-call cap still takes precedence over the message cap so the
+        // logged reason stays the cheapest-and-earliest lever that tripped.
+        let b = CompactBudget { tool_call_ceiling: 50, msg_ceiling: 10, ..b };
+        assert_eq!(b.trigger(0, 50, 999), Some(CompactTrigger::ToolCalls));
+        // Below the tool-call cap, the message cap reports itself.
+        assert_eq!(b.trigger(0, 49, 999), Some(CompactTrigger::MsgCount));
+    }
+
+    #[test]
+    fn msg_ceiling_env_override_parses_like_the_other_ceilings() {
+        assert_eq!(parse_ceiling(None, COMPACT_MSG_CEILING), COMPACT_MSG_CEILING);
+        assert_eq!(parse_ceiling(Some("off"), COMPACT_MSG_CEILING), 0);
+        assert_eq!(parse_ceiling(Some("64"), COMPACT_MSG_CEILING), 64);
+        // The default must sit well above the retained working set, or a normal
+        // turn would compact on every single round.
+        assert!(COMPACT_MSG_CEILING > KEEP_RECENT_MSGS * 2);
+    }
+
+    // ISS-409752: compaction must actually hand memory back, not just shift the
+    // retained tail down inside an over-sized allocation.
+    #[test]
+    fn apply_compaction_reclaims_vector_capacity() {
+        let mut h: Vec<Msg> = Vec::with_capacity(4096);
+        for i in 0..200 {
+            h.push(Msg::user(format!("u{i}")));
+            h.push(assistant_call(&format!("a{i}"), "read_file"));
+        }
+        let peak_cap = h.capacity();
+        assert!(peak_cap >= 400);
+        let c = plan_compaction(&h, KEEP_RECENT_MSGS).expect("long history compacts");
+        apply_compaction(&mut h, &c);
+        // Contents shrank to the summary + retained tail (the split walks down
+        // to the nearest Assistant boundary, so the tail can be one longer than
+        // `keep_recent`).
+        assert!(h.len() <= KEEP_RECENT_MSGS + 2, "len {}", h.len());
+        // … and the spine no longer holds the run's high-water allocation.
+        assert!(
+            h.capacity() < peak_cap,
+            "capacity {} should be below peak {peak_cap}",
+            h.capacity()
+        );
     }
 
     #[test]

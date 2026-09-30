@@ -1245,13 +1245,18 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
         threshold_pct: crate::context::COMPACT_THRESHOLD_PCT,
         tool_call_ceiling: session.compact_tool_call_ceiling,
         token_ceiling: session.compact_token_ceiling,
+        msg_ceiling: session.compact_msg_ceiling,
     };
     // In-context tool calls = session total minus the watermark set at the last
     // compaction (the calls the retained transcript still carries). (TASK-321)
     let tool_calls_in_context = session
         .tool_calls_total
         .saturating_sub(session.tool_calls_at_last_compact);
-    let Some(trigger) = budget.trigger(session.context_used, tool_calls_in_context) else {
+    let Some(trigger) = budget.trigger(
+        session.context_used,
+        tool_calls_in_context,
+        session.history.len(),
+    ) else {
         return;
     };
     let Some(plan) =
