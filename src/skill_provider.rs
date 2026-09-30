@@ -3194,4 +3194,63 @@ mod mirror_conformance {
             assert_eq!(got[0].reference, "acme/x");
         }
     }
+
+    /// **Source parity** (the last half of the contract): a `file://` index and
+    /// an http(s) mirror serving the *same* catalog are interchangeable. The
+    /// client filters a `file://` base in-process (`filter_local`) but delegates
+    /// `?q=` to the server for an http base — two different code paths that must
+    /// agree row-for-row, or "stage the catalog locally, then publish it" would
+    /// silently change behavior at publish time.
+    #[tokio::test]
+    async fn file_index_search_matches_http_mirror() {
+        let base = base_for(serve_mirror().await);
+
+        // Same catalog the loopback mirror serves, written out as a file:// index.
+        let dir = std::env::temp_dir().join(format!(
+            "aish-mirror-file-idx-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let index = dir.join("index.json");
+        std::fs::write(
+            &index,
+            serde_json::json!({ "results": catalog() }).to_string(),
+        )
+        .unwrap();
+        let file_base = format!("file://{}", index.display());
+
+        let refs = |v: &[SearchResult]| {
+            v.iter()
+                .map(|r| r.reference.clone())
+                .collect::<Vec<String>>()
+        };
+
+        for q in ["", "git", "acme", "terraform", "definitely-no-such-skill"] {
+            let over_http = search_with_base(&base, q)
+                .await
+                .unwrap_or_else(|e| panic!("http mirror must search for {q:?}: {e}"));
+            let over_file = search_with_base(&file_base, q)
+                .await
+                .unwrap_or_else(|e| panic!("file:// index must search for {q:?}: {e}"));
+            assert_eq!(
+                refs(&over_file),
+                refs(&over_http),
+                "file:// index and http mirror disagreed for query {q:?}"
+            );
+        }
+
+        // Parity holds for the bare-array envelope too — a mirror and a staged
+        // index may legitimately pick different envelopes.
+        let bare = dir.join("bare.json");
+        std::fs::write(&bare, serde_json::json!(catalog()).to_string()).unwrap();
+        let bare_hits = search_with_base(&format!("file://{}", bare.display()), "acme")
+            .await
+            .unwrap();
+        let http_hits = search_with_base(&base, "acme").await.unwrap();
+        assert_eq!(refs(&bare_hits), refs(&http_hits));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
