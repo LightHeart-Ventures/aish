@@ -66,6 +66,44 @@ pub struct MidturnCfg {
     /// capture work regardless. Set false whenever a footer region exists (the
     /// footer path is cleaner and race-free).
     pub inline: bool,
+    /// Live mirror of the in-progress (NOT yet submitted) line, refreshed on
+    /// every keystroke so the REPL can RESCUE it when the turn ends mid-word.
+    ///
+    /// Without this the reader thread's [`LineBuf`] is a thread local that dies
+    /// with the thread at turn teardown ([`TurnKeyWatch::drop`]), and the footer
+    /// echo is wiped by `clear_midturn_input` — so a half-typed line was silently
+    /// destroyed the instant aish finished thinking (or a background worker's
+    /// result landed and ended the turn): the reported "my typing gets cut off"
+    /// bug. Only Enter-terminated lines survived, via `line_tx`.
+    ///
+    /// The REPL holds a clone, reads it once the reader thread has stopped, and
+    /// pre-fills the next prompt with it (`read_line_with_initial`), so the
+    /// operator keeps typing exactly where they left off. Cleared on submit.
+    pub partial: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+/// Mirror the in-progress mid-turn line into the shared carry-over slot. Called
+/// on every keystroke from the reader thread; a poisoned lock is ignored (the
+/// rescue is best-effort and must never wedge the reader).
+fn publish_partial(slot: &std::sync::Mutex<String>, text: &str) {
+    if let Ok(mut g) = slot.lock() {
+        g.clear();
+        g.push_str(text);
+    }
+}
+
+/// Decide whether a leftover mid-turn partial is worth carrying into the next
+/// prompt. `Some(text)` — **verbatim**, so a trailing space the operator typed is
+/// preserved and the cursor lands exactly where they left off — whenever the
+/// buffer holds anything other than whitespace; `None` for an empty or
+/// whitespace-only buffer, which would only push a junk prefill into the editor.
+/// Pure, so the rescue rule is unit-tested without a tty.
+pub fn carry_over_partial(partial: &str) -> Option<String> {
+    if partial.trim().is_empty() {
+        None
+    } else {
+        Some(partial.to_string())
+    }
 }
 
 /// Paint the mid-turn prompt + in-progress line, routing to the footer message
@@ -301,9 +339,18 @@ fn reader_loop(
             for key in parser.decode(chunk) {
                 match linebuf.apply(key) {
                     Action::None => {
-                        paint_midturn(cfg, &linebuf.as_string());
+                        let text = linebuf.as_string();
+                        // Mirror the live buffer so a turn that ends mid-word can
+                        // hand this text back to the next prompt instead of
+                        // dropping it with the reader thread.
+                        publish_partial(&cfg.partial, &text);
+                        paint_midturn(cfg, &text);
                     }
                     Action::Submit(line) => {
+                        // Submitted lines travel on `line_tx`; the carry-over slot
+                        // must go empty so the completed line is never ALSO
+                        // pre-filled into the next prompt (duplicate input).
+                        publish_partial(&cfg.partial, "");
                         let _ = cfg.line_tx.send(line);
                         // Line consumed → return to the bare prompt affordance
                         // (still mid-turn); the cached status message is restored
@@ -479,7 +526,42 @@ impl Drop for PromptPause {
 
 #[cfg(test)]
 mod tests {
-    use super::scan_csi_z;
+    use super::{carry_over_partial, publish_partial, scan_csi_z};
+
+    // A half-typed line is rescued VERBATIM — including the trailing space the
+    // operator had just typed — so the pre-filled prompt puts the cursor exactly
+    // where the turn boundary interrupted them.
+    #[test]
+    fn partial_line_is_carried_over_verbatim() {
+        assert_eq!(
+            carry_over_partial("cargo test --lib "),
+            Some("cargo test --lib ".to_string())
+        );
+    }
+
+    // Nothing typed (or only whitespace) ⇒ no prefill: pushing a blank/space
+    // buffer into the next prompt would be noise, not a rescue.
+    #[test]
+    fn empty_or_whitespace_partial_is_not_carried_over() {
+        assert_eq!(carry_over_partial(""), None);
+        assert_eq!(carry_over_partial("   "), None);
+        assert_eq!(carry_over_partial("\t \n"), None);
+    }
+
+    // The mirror is last-write-wins and CLEARS on an empty publish, which is what
+    // `Action::Submit` does — so a line that already went out on `line_tx` can
+    // never be pre-filled a second time (duplicate-input guard).
+    #[test]
+    fn publish_partial_overwrites_and_clears() {
+        let slot = std::sync::Mutex::new(String::new());
+        publish_partial(&slot, "git st");
+        assert_eq!(&*slot.lock().unwrap(), "git st");
+        publish_partial(&slot, "git status");
+        assert_eq!(&*slot.lock().unwrap(), "git status");
+        publish_partial(&slot, "");
+        assert_eq!(&*slot.lock().unwrap(), "");
+        assert_eq!(carry_over_partial(&slot.lock().unwrap()), None);
+    }
 
     // A complete `ESC [ Z` in one chunk from the ground state → one Shift-Tab,
     // parser returns to ground.

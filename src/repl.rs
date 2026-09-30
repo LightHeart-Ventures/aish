@@ -420,6 +420,16 @@ pub async fn run(
     // the in-flight turn is never mutated.)
     let mut typeahead: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
+    // Mid-turn partial-line RESCUE. Type-ahead above only covers lines the
+    // operator finished with Enter. A line they were still typing when the turn
+    // ended (aish finished thinking, or a background worker's result closed the
+    // turn) used to die with the keywatch reader thread — the "my typing gets cut
+    // off" bug. The reader now mirrors its live buffer into a shared slot; at
+    // teardown we park the leftover here and pre-fill the NEXT prompt with it, so
+    // a turn boundary never truncates what the human was typing. Latest partial
+    // wins if one is somehow still pending.
+    let mut prefill: Option<String> = None;
+
     // Background-result presenter. When interactive, finished batch/worker jobs
     // queue their results (present::enable_deferred) and this task prints them
     // ABOVE the prompt via rustyline's ExternalPrinter — but only at a pause in
@@ -847,7 +857,13 @@ pub async fn run(
                     crate::editor::set_background_pending(
                         outstanding_workers > 0 || attached_to_worker,
                     );
-                    editor.read_line(&prompt)
+                    // Pre-fill with any mid-turn text the operator had typed but
+                    // not submitted when the last turn ended, so their in-progress
+                    // line survives the turn boundary instead of being cut off.
+                    match prefill.take() {
+                        Some(text) => editor.read_line_with_initial(&prompt, &text),
+                        None => editor.read_line(&prompt),
+                    }
                 }
                 },
             },
@@ -1206,10 +1222,15 @@ pub async fn run(
                     let (mt_line_tx, mut mt_line_rx) =
                         tokio::sync::mpsc::unbounded_channel::<String>();
                     let midturn_prompt = "\x1b[2m❯\x1b[0m ".to_string();
+                    // Shared carry-over slot for the line the operator is typing
+                    // but hasn't submitted — read back at teardown so a turn that
+                    // ends mid-word hands the text to the next prompt.
+                    let mt_partial = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
                     let midturn = midturn_on.then(|| crate::keywatch::MidturnCfg {
                         line_tx: mt_line_tx,
                         prompt: midturn_prompt.clone(),
                         inline: midturn_inline,
+                        partial: mt_partial.clone(),
                     });
                     let mut keywatch =
                         crate::keywatch::TurnKeyWatch::install(Some(on_shift_tab), midturn);
@@ -1258,8 +1279,23 @@ pub async fn run(
                     // in submission order, for the REPL to run next. Clear the
                     // footer echo now that the turn (and its capture) is ending
                     // (the guard's Drop also clears it — this is belt-and-braces).
+                    // Stop the reader FIRST: Drop joins the thread and restores
+                    // cooked termios, so (a) the partial mirror read below cannot
+                    // race a final keystroke, and (b) the tty is sane before the
+                    // next prompt read.
+                    drop(keywatch);
                     while let Ok(l) = mt_line_rx.try_recv() {
                         typeahead.push_back(l);
+                    }
+                    // Rescue a half-typed line. The operator was mid-word when the
+                    // turn finished — carry it into the next prompt (pre-filled,
+                    // cursor at end) instead of dropping it on the floor.
+                    if let Some(text) = mt_partial
+                        .lock()
+                        .ok()
+                        .and_then(|g| crate::keywatch::carry_over_partial(&g))
+                    {
+                        prefill = Some(text);
                     }
                     crate::terminal::clear_midturn_input();
                 }
