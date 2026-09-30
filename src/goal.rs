@@ -69,11 +69,67 @@ const JUDGE_REASON_CAP: usize = 240;
 /// retry absorbs the transient truncated/empty reply without stalling the loop.
 const JUDGE_ATTEMPTS: usize = 2;
 
+// ── ISS-407770: bounded pursuit of an unsatisfiable goal ────────────────────
+//
+// A verifier can be handed a completion condition NO agent can ever satisfy —
+// the remaining milestones are human-gated / policy-prohibited, or the oracle
+// asks for evidence the policy layer forbids producing. The old loop read that
+// as a plain "not met", fed the same rejection forward, and re-dispatched a full
+// coordinator wave on a fixed cadence until the 25-turn backstop: unbounded
+// token burn with zero possible forward progress. Three guards close that:
+// a human-gate verdict is TERMINAL, identical consecutive rejections are
+// detected as no-progress and stop the loop, and the pause between unmet turns
+// grows exponentially instead of staying flat.
+
+/// Cap on CONSECUTIVE unmet turns that produced the SAME verdict reason. The
+/// third identical rejection is the no-progress signal: the pursuit stops as
+/// `blocked` and the operator is told, rather than respawning another wave.
+const MAX_NO_PROGRESS_ATTEMPTS: usize = 3;
+
+/// First pause after an unmet turn. Doubles per REPEATED rejection (30s → 60s →
+/// …); a verdict whose reason CHANGED is evidence of progress and resets it to
+/// the base, so a healthy multi-turn pursuit pays almost nothing for the guard.
+const BACKOFF_BASE_SECS: u64 = 30;
+
+/// Ceiling on the exponential backoff, so a long pursuit can't sleep forever.
+const BACKOFF_MAX_SECS: u64 = 15 * 60;
+
+/// Reason fragments that mean "no agent can finish this — a human must act".
+/// Matched case-insensitively against the verdict reason as a BACKSTOP for a
+/// judge that doesn't emit the explicit `blocked_on_human` flag (older prompt,
+/// a model that ignores the schema). Kept deliberately narrow: a false positive
+/// stops a live goal, so each marker names human/policy gating outright.
+const HUMAN_GATE_MARKERS: &[&str] = &[
+    "blocked_on_human",
+    "blocked on human",
+    "human-gated",
+    "human gated",
+    "requires human",
+    "requires a human",
+    "needs a human",
+    "human approval",
+    "manual approval",
+    "operator approval",
+    "policy-blocked",
+    "policy blocked",
+    "prohibited by policy",
+    "forbidden by policy",
+    "runbook forbids",
+    "cannot be done by an agent",
+    "cannot be completed by an agent",
+    "not permitted for agents",
+];
+
 #[derive(Clone, Copy, PartialEq)]
 enum Status {
     Active,
     Achieved,
     Failed,
+    /// Terminal (ISS-407770): the goal cannot be advanced by an agent — the
+    /// remaining work is human-gated/policy-blocked, or the verifier returned
+    /// the same rejection [`MAX_NO_PROGRESS_ATTEMPTS`] times running. Distinct
+    /// from `Failed`: nothing malfunctioned, the goal is waiting on a human.
+    Blocked,
     Cleared,
 }
 
@@ -226,6 +282,7 @@ impl GoalLoop {
             let state = match i.status {
                 Status::Achieved => "achieved",
                 Status::Failed => "failed",
+                Status::Blocked => "blocked",
                 Status::Cleared => "cleared",
                 Status::Active => unreachable!(),
             };
@@ -278,7 +335,6 @@ impl GoalLoop {
         rows.push(self.status_line());
         rows
     }
-
 
     fn set(&self, status: Status, reason: Option<String>) {
         let mut i = self.inner.lock().unwrap();
@@ -384,8 +440,7 @@ pub fn spawn(
 /// The reverse-parser strips this ENTIRE prefix, so keeping the reporting
 /// instructions here (before the condition) leaves the recovered condition clean
 /// and the `:workers` grouping key stable.
-const GOAL_DIRECTIVE_PREFIX: &str =
-    "Work toward this goal, then report what you did and the evidence.\n\n\
+const GOAL_DIRECTIVE_PREFIX: &str = "Work toward this goal, then report what you did and the evidence.\n\n\
 Plan before you build. On your FIRST turn (and whenever no plan exists yet), do this BEFORE writing any code or opening any change:\n\
 1. Deconstruct the goal and restate it in your own words in 60 characters or less.\n\
 2. Identify the constraints and limits — time, budget, access, and the tools/permissions the work needs.\n\
@@ -661,6 +716,9 @@ async fn run_goal_loop(
     // how turn N+1 learns which work packages turn N still has in flight.
     let mut prior_run_ids: Vec<String> = Vec::new();
     let scope_key = goal_scope_key(&goal.condition);
+    // ISS-407770 — consecutive-identical-rejection counter driving both the
+    // no-progress short-circuit and the exponential backoff between attempts.
+    let mut stall = StallTracker::default();
 
     loop {
         // Stop checks between turns.
@@ -677,8 +735,7 @@ async fn run_goal_loop(
                 i.status = Status::Failed;
                 let turns = i.turns;
                 drop(i);
-                let reason =
-                    format!("hit the {MAX_TURNS}-turn backstop without meeting the goal");
+                let reason = format!("hit the {MAX_TURNS}-turn backstop without meeting the goal");
                 goal.note(&format!("stopped — {reason}"));
                 return GoalOutcome {
                     status: "failed",
@@ -788,33 +845,208 @@ async fn run_goal_loop(
         // Verifier: the batch model judges whether the output demonstrates the goal.
         goal.note_quiet(&format!("turn {turn}: checking…"));
         goal.inner.lock().unwrap().phase = Step::Checking;
-        let (met, reason, verified) = match judge(&cred, &model, &goal.condition, &output).await {
-            Ok((met, reason)) => (met, reason, true),
+        let (verdict, verified) = match judge(&cred, &model, &goal.condition, &output).await {
+            Ok(v) => (v, true),
             // Couldn't verify — keep going but record why; don't silently stop.
-            Err(e) => (false, format!("could not verify this turn: {e}"), false),
+            Err(e) => (
+                Verdict::unmet(format!("could not verify this turn: {e}")),
+                false,
+            ),
         };
+        let reason = verdict.reason.clone();
         goal.fire_hook(crate::hooks::HookEvent::GoalTurnEnd, |p| {
             p.with("turn", turn as u64)
-                .with("met", met)
+                .with("met", verdict.met)
+                .with("blocked_on_human", verdict.blocked_on_human)
                 .with("reason", reason.clone())
         });
-        if met {
-            goal.set(Status::Achieved, Some(reason.clone()));
-            deliver(goal, turn, &reason, &output);
-            return GoalOutcome {
-                status: "achieved",
-                turns: turn,
-                reason: Some(reason),
-            };
+        // ISS-407770: one decision point — deliver, stop terminally, or retry
+        // after an exponential pause. `next_action` is pure and unit-tested.
+        match next_action(&verdict, verified, &mut stall) {
+            TurnAction::Deliver => {
+                goal.set(Status::Achieved, Some(reason.clone()));
+                deliver(goal, turn, &reason, &output);
+                return GoalOutcome {
+                    status: "achieved",
+                    turns: turn,
+                    reason: Some(reason),
+                };
+            }
+            // Unsatisfiable-by-an-agent, or the same rejection N turns running.
+            // Re-dispatching cannot help, so stop and hand it to the operator
+            // rather than burn another coordinator wave every few minutes.
+            TurnAction::Stop { status, reason } => {
+                goal.set(Status::Blocked, Some(reason.clone()));
+                goal.note(&format!("stopped — {reason} — operator action required"));
+                return GoalOutcome {
+                    status,
+                    turns: turn,
+                    reason: Some(reason),
+                };
+            }
+            TurnAction::Retry { backoff } => {
+                goal.set(Status::Active, Some(reason.clone()));
+                // Only a REAL verdict steers the next turn. A verifier
+                // malfunction says nothing about the work, so folding "could
+                // not verify this turn: …" into the directive just sends the
+                // worker chasing the judge's bug instead of the goal — keep the
+                // last genuine guidance instead.
+                if verified {
+                    guidance = Some(reason);
+                }
+                if !backoff.is_zero() {
+                    goal.note_quiet(&format!(
+                        "turn {turn}: not met — backing off {} before the next attempt",
+                        fmt_duration(backoff)
+                    ));
+                    goal.inner.lock().unwrap().phase = Step::Idle;
+                    tokio::time::sleep(backoff).await;
+                }
+            }
         }
-        goal.set(Status::Active, Some(reason.clone()));
-        // Only a REAL verdict steers the next turn. A verifier malfunction says
-        // nothing about the work, so folding "could not verify this turn: …"
-        // into the directive just sends the worker chasing the judge's bug
-        // instead of the goal — keep the last genuine guidance instead.
-        if verified {
-            guidance = Some(reason);
+    }
+}
+
+/// A verifier verdict. `blocked_on_human` is the third state ISS-407770 added:
+/// the goal is NOT met and no agent can meet it — the remaining work is
+/// human-gated or policy-prohibited — so the loop must stop and hand the goal
+/// back to the operator instead of re-dispatching another wave forever.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Verdict {
+    pub met: bool,
+    pub blocked_on_human: bool,
+    pub reason: String,
+}
+
+impl Verdict {
+    /// An unmet, unblocked verdict — used for a verifier malfunction, which
+    /// says nothing about whether the goal is reachable.
+    fn unmet(reason: impl Into<String>) -> Self {
+        Verdict {
+            met: false,
+            blocked_on_human: false,
+            reason: reason.into(),
         }
+    }
+}
+
+/// Does this rejection describe work a human — not an agent — has to do?
+/// Backstop for a judge that omits the explicit `blocked_on_human` flag. Pure —
+/// unit-tested.
+pub(crate) fn is_human_gated(reason: &str) -> bool {
+    let low = reason.to_lowercase();
+    HUMAN_GATE_MARKERS.iter().any(|m| low.contains(m))
+}
+
+/// Normalize a verdict reason into a comparison key for no-progress detection:
+/// case-folded, whitespace-collapsed, trailing punctuation dropped. Two turns
+/// whose rejections differ only in casing/spacing are the SAME rejection — the
+/// loop must not read that as movement. Pure — unit-tested.
+pub(crate) fn progress_key(reason: &str) -> String {
+    reason
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(['.', '!', ' '])
+        .to_string()
+}
+
+/// Exponential pause before the next attempt: `BACKOFF_BASE_SECS * 2^(n-1)`,
+/// clamped to [`BACKOFF_MAX_SECS`]. `n` is how many consecutive turns have now
+/// produced the same rejection (1 = fresh reason). Pure — unit-tested.
+pub(crate) fn backoff_delay(repeats: usize) -> Duration {
+    let exp = u32::try_from(repeats.saturating_sub(1))
+        .unwrap_or(u32::MAX)
+        .min(20);
+    let secs = BACKOFF_BASE_SECS
+        .saturating_mul(1u64 << exp)
+        .min(BACKOFF_MAX_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Consecutive-identical-rejection counter. One per pursuit; lives across turns
+/// in [`run_goal_loop`].
+#[derive(Default)]
+pub(crate) struct StallTracker {
+    last_key: Option<String>,
+    repeats: usize,
+}
+
+impl StallTracker {
+    /// Record an unmet verdict. Returns how many CONSECUTIVE turns have now
+    /// produced this same reason — 1 means the reason changed, i.e. the work
+    /// moved, so the streak (and the backoff) resets.
+    pub(crate) fn observe(&mut self, reason: &str) -> usize {
+        let key = progress_key(reason);
+        if self.last_key.as_deref() == Some(key.as_str()) {
+            self.repeats += 1;
+        } else {
+            self.last_key = Some(key);
+            self.repeats = 1;
+        }
+        self.repeats
+    }
+}
+
+/// What the loop does with a verdict.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TurnAction {
+    /// Goal demonstrably met — deliver the output and stop.
+    Deliver,
+    /// Terminal stop. `status` is the `GoalEnd` wire status.
+    Stop {
+        status: &'static str,
+        reason: String,
+    },
+    /// Keep pursuing, after sleeping `backoff`.
+    Retry { backoff: Duration },
+}
+
+/// Decide the loop's next move from a verdict (ISS-407770). Pure, so the
+/// unsatisfiable-goal regression is testable without a network or a worker:
+///
+/// * met → deliver;
+/// * unverifiable → retry (a judge malfunction is not evidence about the goal,
+///   and must not count toward the no-progress streak);
+/// * human-gated → TERMINAL `blocked_on_human`, never another attempt;
+/// * the same rejection [`MAX_NO_PROGRESS_ATTEMPTS`] turns running → TERMINAL
+///   `blocked` (no-progress);
+/// * otherwise retry after an exponentially-growing pause.
+pub(crate) fn next_action(
+    verdict: &Verdict,
+    verified: bool,
+    stall: &mut StallTracker,
+) -> TurnAction {
+    if verdict.met {
+        return TurnAction::Deliver;
+    }
+    if !verified {
+        return TurnAction::Retry {
+            backoff: backoff_delay(1),
+        };
+    }
+    if verdict.blocked_on_human || is_human_gated(&verdict.reason) {
+        return TurnAction::Stop {
+            status: "blocked_on_human",
+            reason: format!(
+                "blocked on human — no agent can meet this goal: {}",
+                verdict.reason
+            ),
+        };
+    }
+    let repeats = stall.observe(&verdict.reason);
+    if repeats >= MAX_NO_PROGRESS_ATTEMPTS {
+        return TurnAction::Stop {
+            status: "blocked",
+            reason: format!(
+                "no progress — the verifier returned the same rejection {repeats} turns running: {}",
+                verdict.reason
+            ),
+        };
+    }
+    TurnAction::Retry {
+        backoff: backoff_delay(repeats),
     }
 }
 
@@ -827,7 +1059,7 @@ async fn judge(
     model: &str,
     condition: &str,
     work: &str,
-) -> Result<(bool, String), String> {
+) -> Result<Verdict, String> {
     let mut last = String::from("judge never ran");
     for _ in 0..JUDGE_ATTEMPTS {
         match judge_once(cred, model, condition, work).await {
@@ -839,13 +1071,13 @@ async fn judge(
 }
 
 /// Ask the verifier (batch model) whether the goal is demonstrably met. Returns
-/// `(met, reason)`. A strict judge: evidence in the output, not mere claims.
+/// a [`Verdict`]. A strict judge: evidence in the output, not mere claims.
 async fn judge_once(
     cred: &crate::backend::claude::Credential,
     model: &str,
     condition: &str,
     work: &str,
-) -> Result<(bool, String), String> {
+) -> Result<Verdict, String> {
     let work = if work.chars().count() > JUDGE_INPUT_CAP {
         let head: String = work.chars().take(JUDGE_INPUT_CAP).collect();
         format!("{head}\n…(truncated)")
@@ -862,7 +1094,12 @@ async fn judge_once(
     results, file contents, exit codes), never what is merely asserted without proof. If the goal \
     states a turn/time bound, honor it. Reply with ONLY a JSON object on a single line, no prose, \
     no preamble, no code fences, and keep the reason under 200 characters: \
-    {\"met\": true|false, \"reason\": \"<one sentence>\"}.",
+    {\"met\": true|false, \"blocked_on_human\": true|false, \"reason\": \"<one sentence>\"}. \
+    Set \"blocked_on_human\" to true when the goal is not met AND the work that remains cannot be \
+    done by an agent at all — it is gated on a human: a policy or runbook forbids the agent from \
+    performing it, it needs manual/operator approval, or it requires a live irreversible action the \
+    agent is not permitted to take. A goal that is merely unfinished, failing, or not yet proven is \
+    NOT blocked_on_human — set false. Never report blocked_on_human together with met:true.",
         ),
         "messages": [{
             "role": "user",
@@ -915,12 +1152,17 @@ async fn judge_once(
     parse_verdict(text)
 }
 
-/// Parse the judge's reply into `(met, reason)`. Strict JSON first, then a
+/// Parse the judge's reply into a [`Verdict`]. Strict JSON first, then a
 /// `{…}` slice lifted out of surrounding prose, then [`salvage_verdict`] for a
 /// reply cut off mid-JSON. A truncated verdict still carries its `met` bit, so
-/// recovering it beats discarding a turn's work over a missing quote. Pure —
-/// unit-tested.
-fn parse_verdict(text: &str) -> Result<(bool, String), String> {
+/// recovering it beats discarding a turn's work over a missing quote.
+///
+/// `blocked_on_human` comes from the judge's own flag (either spelling) and,
+/// failing that, from [`is_human_gated`] over the reason text — so a judge on an
+/// older prompt that just writes "WP-07..14 gated, human approval required"
+/// still terminates the pursuit instead of feeding it back as a plain `not_met`
+/// (ISS-407770). Pure — unit-tested.
+fn parse_verdict(text: &str) -> Result<Verdict, String> {
     let parsed = serde_json::from_str::<Value>(text).ok().or_else(|| {
         match (text.find('{'), text.rfind('}')) {
             (Some(s), Some(e)) if e > s => serde_json::from_str::<Value>(&text[s..=e]).ok(),
@@ -929,8 +1171,17 @@ fn parse_verdict(text: &str) -> Result<(bool, String), String> {
     });
     if let Some(v) = parsed {
         let met = v["met"].as_bool().unwrap_or(false);
-        let reason = v["reason"].as_str().unwrap_or("(no reason given)");
-        return Ok((met, cap_reason(reason)));
+        let reason = cap_reason(v["reason"].as_str().unwrap_or("(no reason given)"));
+        let flagged = v["blocked_on_human"]
+            .as_bool()
+            .or_else(|| v["blocked"].as_bool())
+            .unwrap_or(false);
+        return Ok(Verdict {
+            met,
+            // A met goal is never "blocked": completion outranks a stray flag.
+            blocked_on_human: !met && (flagged || is_human_gated(&reason)),
+            reason,
+        });
     }
     salvage_verdict(text).ok_or_else(|| format!("couldn't parse judge verdict (got: {text})"))
 }
@@ -939,7 +1190,7 @@ fn parse_verdict(text: &str) -> Result<(bool, String), String> {
 /// boolean, then whatever of `reason` survived. Targets the dominant failure
 /// mode — the reply ends mid-string, so the closing quote and brace never
 /// arrive and strict JSON has nothing to work with. Pure — unit-tested.
-fn salvage_verdict(text: &str) -> Option<(bool, String)> {
+fn salvage_verdict(text: &str) -> Option<Verdict> {
     let met_at = text.find("\"met\"")?;
     let tail = &text[met_at + 5..];
     let met = match (tail.find("true"), tail.find("false")) {
@@ -972,10 +1223,23 @@ fn salvage_verdict(text: &str) -> Option<(bool, String)> {
         })
         .unwrap_or_default();
     let body = cap_reason(&body);
-    Some(if body.is_empty() {
-        (met, "(verdict truncated; no reason recovered)".to_string())
+    let flagged = text.find("\"blocked_on_human\"").is_some_and(|i| {
+        let tail = &text[i + 18..];
+        match (tail.find("true"), tail.find("false")) {
+            (Some(t), Some(f)) => t < f,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    });
+    let reason = if body.is_empty() {
+        "(verdict truncated; no reason recovered)".to_string()
     } else {
-        (met, format!("{body} [recovered from a truncated verdict]"))
+        format!("{body} [recovered from a truncated verdict]")
+    };
+    Some(Verdict {
+        met,
+        blocked_on_human: !met && (flagged || is_human_gated(&reason)),
+        reason,
     })
 }
 
@@ -1460,7 +1724,10 @@ pub fn subtree_progress(root_id: &str, all: &[Goal]) -> (usize, usize) {
             let (d, t) = g.milestone_progress();
             done += d;
             total += t;
-            for child in all.iter().filter(|c| c.parent_id.as_deref() == Some(id.as_str())) {
+            for child in all
+                .iter()
+                .filter(|c| c.parent_id.as_deref() == Some(id.as_str()))
+            {
                 stack.push(child.id.clone());
             }
         }
@@ -1527,7 +1794,10 @@ impl NextWork<'_> {
                 }
             }
             NextWork::Milestone(m) => {
-                format!("milestone \u{201c}{}\u{201d}", truncate_ellipsis(&m.title, 60))
+                format!(
+                    "milestone \u{201c}{}\u{201d}",
+                    truncate_ellipsis(&m.title, 60)
+                )
             }
         }
     }
@@ -1541,7 +1811,6 @@ impl NextWork<'_> {
 pub fn route_next(goals: &[Goal]) -> Option<&Goal> {
     goals.iter().find(|g| g.is_actionable())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1575,8 +1844,14 @@ mod tests {
     fn goal_scope_key_is_stable_and_discriminates_goals() {
         // Same goal text (modulo case/edge whitespace) → same namespace across
         // processes, so turn N+1 contends with turn N's leases.
-        assert_eq!(goal_scope_key("Ship the CI fix "), goal_scope_key("ship the ci fix"));
-        assert_ne!(goal_scope_key("ship the ci fix"), goal_scope_key("ship the docs fix"));
+        assert_eq!(
+            goal_scope_key("Ship the CI fix "),
+            goal_scope_key("ship the ci fix")
+        );
+        assert_ne!(
+            goal_scope_key("ship the ci fix"),
+            goal_scope_key("ship the docs fix")
+        );
         assert!(goal_scope_key("anything").starts_with("goal:"));
     }
 
@@ -1640,17 +1915,19 @@ mod tests {
 
     #[test]
     fn parse_verdict_accepts_bare_json() {
-        let (met, reason) = parse_verdict(r#"{"met": true, "reason": "tests pass"}"#).unwrap();
-        assert!(met);
-        assert_eq!(reason, "tests pass");
+        let v = parse_verdict(r#"{"met": true, "reason": "tests pass"}"#).unwrap();
+        assert!(v.met);
+        assert!(!v.blocked_on_human);
+        assert_eq!(v.reason, "tests pass");
     }
 
     #[test]
     fn parse_verdict_tolerates_surrounding_prose_and_fences() {
-        let (met, reason) =
+        let v =
             parse_verdict("```json\n{\"met\": false, \"reason\": \"no PR opened\"}\n```").unwrap();
-        assert!(!met);
-        assert_eq!(reason, "no PR opened");
+        assert!(!v.met);
+        assert!(!v.blocked_on_human);
+        assert_eq!(v.reason, "no PR opened");
     }
 
     // The reported bug: the reply ends mid-string, so serde reports
@@ -1658,25 +1935,197 @@ mod tests {
     #[test]
     fn parse_verdict_salvages_a_truncated_reason() {
         let truncated = r#"{"met": false, "reason": "the worker committed but left the"#;
-        let (met, reason) = parse_verdict(truncated).unwrap();
-        assert!(!met);
-        assert!(reason.starts_with("the worker committed but left the"));
-        assert!(reason.contains("truncated"));
+        let v = parse_verdict(truncated).unwrap();
+        assert!(!v.met);
+        assert!(v.reason.starts_with("the worker committed but left the"));
+        assert!(v.reason.contains("truncated"));
     }
 
     #[test]
     fn parse_verdict_salvages_met_true_when_cut_before_reason() {
-        let (met, reason) = parse_verdict(r#"{"met": true, "rea"#).unwrap();
-        assert!(met);
-        assert!(reason.contains("truncated"));
+        let v = parse_verdict(r#"{"met": true, "rea"#).unwrap();
+        assert!(v.met);
+        assert!(v.reason.contains("truncated"));
     }
 
     #[test]
     fn parse_verdict_salvage_unescapes_quotes_in_a_truncated_reason() {
-        let (met, reason) =
-            parse_verdict(r#"{"met": false, "reason": "card is \"open\" and not"#).unwrap();
-        assert!(!met);
-        assert!(reason.starts_with(r#"card is "open" and not"#));
+        let v = parse_verdict(r#"{"met": false, "reason": "card is \"open\" and not"#).unwrap();
+        assert!(!v.met);
+        assert!(v.reason.starts_with(r#"card is "open" and not"#));
+    }
+
+    #[test]
+    fn blocked_flag_is_read_from_json() {
+        let v = parse_verdict(
+            r#"{"met": false, "blocked_on_human": true, "reason": "needs a release sign-off"}"#,
+        )
+        .unwrap();
+        assert!(!v.met);
+        assert!(v.blocked_on_human);
+    }
+
+    // A judge on the OLD prompt emits no flag — the marker scan is the backstop
+    // that still terminates the pursuit.
+    #[test]
+    fn block_is_inferred_from_the_reason_text() {
+        let v = parse_verdict(r#"{"met": false, "reason": "WP-07..14 require human approval"}"#)
+            .unwrap();
+        assert!(v.blocked_on_human);
+    }
+
+    #[test]
+    fn met_and_blocked_are_never_reported_together() {
+        let v = parse_verdict(
+            r#"{"met": true, "blocked_on_human": true, "reason": "done, approval granted"}"#,
+        )
+        .unwrap();
+        assert!(v.met);
+        assert!(!v.blocked_on_human, "completion outranks a stray flag");
+    }
+
+    #[test]
+    fn salvage_carries_the_block_through_a_truncation() {
+        let v =
+            salvage_verdict(r#"{"met": false, "blocked_on_human": true, "reason": "needs a hum"#)
+                .unwrap();
+        assert!(!v.met);
+        assert!(v.blocked_on_human);
+    }
+
+    #[test]
+    fn is_human_gated_stays_narrow() {
+        assert!(is_human_gated("this requires human approval before merge"));
+        assert!(is_human_gated("Manual Approval needed"));
+        assert!(is_human_gated("the runbook forbids an agent doing this"));
+        // Ordinary unmet verdicts must NOT trip the gate — a false positive
+        // kills a live goal.
+        assert!(!is_human_gated("tests still failing on the new branch"));
+        assert!(!is_human_gated("no PR opened yet"));
+        assert!(!is_human_gated("the human asked for a fix"));
+    }
+
+    #[test]
+    fn next_action_delivers_a_met_goal() {
+        let mut stall = StallTracker::default();
+        let v = Verdict {
+            met: true,
+            blocked_on_human: false,
+            reason: "done".into(),
+        };
+        assert_eq!(next_action(&v, true, &mut stall), TurnAction::Deliver);
+    }
+
+    #[test]
+    fn next_action_stops_terminally_on_a_human_gate() {
+        let mut stall = StallTracker::default();
+        let v = Verdict {
+            met: false,
+            blocked_on_human: true,
+            reason: "remaining work needs operator approval".into(),
+        };
+        match next_action(&v, true, &mut stall) {
+            TurnAction::Stop { status, reason } => {
+                assert_eq!(status, "blocked_on_human");
+                assert!(reason.contains("operator approval"));
+            }
+            other => panic!("expected a terminal stop, got {other:?}"),
+        }
+    }
+
+    // The reported bug: the same rejection every turn, re-dispatching a full
+    // coordinator wave until the 25-turn backstop. The third identical verdict
+    // now ends the pursuit.
+    #[test]
+    fn next_action_stops_after_three_identical_rejections() {
+        let mut stall = StallTracker::default();
+        let v = Verdict {
+            met: false,
+            blocked_on_human: false,
+            reason: "PR is still open".into(),
+        };
+        assert!(matches!(
+            next_action(&v, true, &mut stall),
+            TurnAction::Retry { .. }
+        ));
+        assert!(matches!(
+            next_action(&v, true, &mut stall),
+            TurnAction::Retry { .. }
+        ));
+        match next_action(&v, true, &mut stall) {
+            TurnAction::Stop { status, reason } => {
+                assert_eq!(status, "blocked");
+                assert!(reason.contains("no progress"));
+            }
+            other => panic!("expected a no-progress stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_changed_reason_resets_the_streak_and_the_backoff() {
+        let mut stall = StallTracker::default();
+        let stuck = Verdict {
+            met: false,
+            blocked_on_human: false,
+            reason: "PR is still open".into(),
+        };
+        let moved = Verdict {
+            met: false,
+            blocked_on_human: false,
+            reason: "PR merged; changelog still missing".into(),
+        };
+        assert_eq!(
+            next_action(&stuck, true, &mut stall),
+            TurnAction::Retry {
+                backoff: Duration::from_secs(BACKOFF_BASE_SECS)
+            }
+        );
+        assert_eq!(
+            next_action(&stuck, true, &mut stall),
+            TurnAction::Retry {
+                backoff: Duration::from_secs(BACKOFF_BASE_SECS * 2)
+            }
+        );
+        // Progress → back to the base pause and the streak restarts, so a
+        // healthy pursuit is never starved by the guard.
+        assert_eq!(
+            next_action(&moved, true, &mut stall),
+            TurnAction::Retry {
+                backoff: Duration::from_secs(BACKOFF_BASE_SECS)
+            }
+        );
+    }
+
+    #[test]
+    fn an_unverifiable_turn_never_counts_as_no_progress() {
+        let mut stall = StallTracker::default();
+        let broken = Verdict::unmet("could not verify this turn: judge api error: 529");
+        for _ in 0..6 {
+            assert!(
+                matches!(
+                    next_action(&broken, false, &mut stall),
+                    TurnAction::Retry { .. }
+                ),
+                "a judge malfunction says nothing about the goal"
+            );
+        }
+    }
+
+    #[test]
+    fn progress_key_ignores_casing_and_spacing() {
+        assert_eq!(
+            progress_key("  PR is   Still Open.  "),
+            progress_key("pr is still open")
+        );
+        assert_ne!(progress_key("pr is still open"), progress_key("pr merged"));
+    }
+
+    #[test]
+    fn backoff_grows_then_clamps() {
+        assert_eq!(backoff_delay(1), Duration::from_secs(BACKOFF_BASE_SECS));
+        assert_eq!(backoff_delay(2), Duration::from_secs(BACKOFF_BASE_SECS * 2));
+        assert_eq!(backoff_delay(3), Duration::from_secs(BACKOFF_BASE_SECS * 4));
+        assert_eq!(backoff_delay(99), Duration::from_secs(BACKOFF_MAX_SECS));
     }
 
     #[test]
@@ -1688,9 +2137,8 @@ mod tests {
     #[test]
     fn salvage_picks_the_boolean_nearest_the_met_key() {
         // "false" appears later in the reason — it must not flip the verdict.
-        let (met, _) =
-            salvage_verdict(r#"{"met": true, "reason": "no false positives in the"#).unwrap();
-        assert!(met);
+        let v = salvage_verdict(r#"{"met": true, "reason": "no false positives in the"#).unwrap();
+        assert!(v.met);
     }
 
     #[test]
@@ -1771,33 +2219,35 @@ mod tests {
     fn compose_guidance_steer_only_is_priority_block() {
         let out = compose_guidance(None, &["prefer sqlite over postgres".to_string()]).unwrap();
         assert!(out.contains("operator steered this goal"), "framed: {out}");
-        assert!(out.contains("prefer sqlite over postgres"), "carries msg: {out}");
-        assert!(!out.contains("prior verifier note"), "no verifier tail: {out}");
+        assert!(
+            out.contains("prefer sqlite over postgres"),
+            "carries msg: {out}"
+        );
+        assert!(
+            !out.contains("prior verifier note"),
+            "no verifier tail: {out}"
+        );
     }
 
     // Steer + verifier: both carried, steer FIRST (human course-correction
     // outranks the machine judge's last critique), verifier demoted to a tail.
     #[test]
     fn compose_guidance_steer_and_verifier_orders_steer_first() {
-        let out = compose_guidance(
-            Some("add tests"),
-            &["ship it as a draft PR".to_string()],
-        )
-        .unwrap();
+        let out =
+            compose_guidance(Some("add tests"), &["ship it as a draft PR".to_string()]).unwrap();
         let steer_at = out.find("ship it as a draft PR").unwrap();
         let verifier_at = out.find("add tests").unwrap();
         assert!(steer_at < verifier_at, "steer precedes verifier: {out}");
-        assert!(out.contains("prior verifier note"), "verifier demoted: {out}");
+        assert!(
+            out.contains("prior verifier note"),
+            "verifier demoted: {out}"
+        );
     }
 
     // Multiple steers are joined FIFO into one directive.
     #[test]
     fn compose_guidance_joins_multiple_steers() {
-        let out = compose_guidance(
-            None,
-            &["first".to_string(), "second".to_string()],
-        )
-        .unwrap();
+        let out = compose_guidance(None, &["first".to_string(), "second".to_string()]).unwrap();
         assert!(out.contains("first | second"), "FIFO join: {out}");
     }
 
@@ -2080,7 +2530,10 @@ mod domain_tests {
         let g = Goal::new("x".repeat(120));
         let s = g.prompt_summary();
         assert!(s.contains('…'), "long title must be ellipsized: {s}");
-        assert!(!s.contains(&"x".repeat(120)), "full long title must not appear");
+        assert!(
+            !s.contains(&"x".repeat(120)),
+            "full long title must not appear"
+        );
     }
 
     #[test]
@@ -2133,19 +2586,28 @@ mod domain_tests {
         g.add_milestone("m1");
         g.link_task(TaskRef::new("TASK-1"));
         g.set_status(GoalStatus::Paused);
-        assert!(g.next_aligned_work().is_none(), "paused goal routes nothing");
+        assert!(
+            g.next_aligned_work().is_none(),
+            "paused goal routes nothing"
+        );
 
         // Blocked goal → no routing even while Active.
         let mut g = Goal::new("G");
         g.add_milestone("m1");
         g.add_blocker("waiting on review");
-        assert!(g.next_aligned_work().is_none(), "blocked goal routes nothing");
+        assert!(
+            g.next_aligned_work().is_none(),
+            "blocked goal routes nothing"
+        );
 
         // Fully complete goal → no routing.
         let mut g = Goal::new("G");
         g.add_milestone("m1");
         g.milestones[0].done = true;
-        assert!(g.next_aligned_work().is_none(), "complete goal routes nothing");
+        assert!(
+            g.next_aligned_work().is_none(),
+            "complete goal routes nothing"
+        );
 
         // Empty active goal (nothing tracked) → nothing to pick up.
         let g = Goal::new("G");
@@ -2243,7 +2705,10 @@ mod domain_tests {
     fn is_actionable_gates_on_status_blockers_and_completion() {
         let mut g = Goal::new("work");
         g.add_milestone("m");
-        assert!(g.is_actionable(), "active + unblocked + incomplete ⇒ actionable");
+        assert!(
+            g.is_actionable(),
+            "active + unblocked + incomplete ⇒ actionable"
+        );
 
         g.add_blocker("waiting");
         assert!(!g.is_actionable(), "open blocker ⇒ not actionable");
@@ -2346,7 +2811,10 @@ mod domain_tests {
         goal.link_task(TaskRef::new("TASK-280"));
         goal.link_task(TaskRef::new("TASK-281"));
         let workers = vec![
-            ("w_abc123".to_string(), "implement TASK-280 board sync".to_string()),
+            (
+                "w_abc123".to_string(),
+                "implement TASK-280 board sync".to_string(),
+            ),
             ("w_def456".to_string(), "TASK-281 render tree".to_string()),
         ];
         let tree = render_goal_hierarchy(&goal, &workers).expect("hierarchy for a linked goal");
@@ -2362,7 +2830,10 @@ mod domain_tests {
         solo.link_task(TaskRef::new("TASK-999"));
         let tree2 = render_goal_hierarchy(&solo, &[]).expect("hierarchy with no workers");
         assert!(tree2.contains("[1 child]"), "got: {tree2}");
-        assert!(tree2.contains("TASK-999 (no active worker)"), "got: {tree2}");
+        assert!(
+            tree2.contains("TASK-999 (no active worker)"),
+            "got: {tree2}"
+        );
 
         // No linked tasks → nothing to nest.
         assert!(render_goal_hierarchy(&Goal::new("empty"), &[]).is_none());
@@ -2412,7 +2883,10 @@ mod domain_tests {
                    toward batching independent calls";
         let g = recovery_guidance(err);
         // Carries the raw error so the model can review/analyze the real cause.
-        assert!(g.contains("single-call rounds"), "guidance must quote the error");
+        assert!(
+            g.contains("single-call rounds"),
+            "guidance must quote the error"
+        );
         // Recognizes the batching flag and gives the concrete re-plan.
         assert!(
             g.to_lowercase().contains("independent tool call"),
@@ -2420,7 +2894,8 @@ mod domain_tests {
         );
         // Framed as an interruption to recover from, not a fresh goal.
         assert!(
-            g.to_lowercase().contains("not because the goal is impossible")
+            g.to_lowercase()
+                .contains("not because the goal is impossible")
                 || g.to_lowercase().contains("do not restart"),
             "guidance must tell the agent to resume, not restart"
         );
@@ -2433,7 +2908,10 @@ mod domain_tests {
         let g = recovery_guidance(
             "goal worker was killed by the OS (signal 9) — most likely out of memory",
         );
-        assert!(g.to_lowercase().contains("review"), "still asks the agent to review");
+        assert!(
+            g.to_lowercase().contains("review"),
+            "still asks the agent to review"
+        );
         assert!(
             !g.to_lowercase().contains("independent tool call"),
             "unrelated failures must not get the batching instruction"
@@ -2460,7 +2938,8 @@ mod domain_tests {
             "directive should instruct the worker to use message_console"
         );
         assert!(
-            d.to_lowercase().contains("summary of what you did this turn"),
+            d.to_lowercase()
+                .contains("summary of what you did this turn"),
             "directive should ask for a per-turn work-completed summary"
         );
         let low = d.to_lowercase();
@@ -2509,7 +2988,6 @@ mod domain_tests {
             Some("ship the fix")
         );
     }
-
 
     // The per-turn directive must also encode the plan-first + task-lifecycle
     // discipline: deconstruct/restate, constraints, measurable success, dependency
