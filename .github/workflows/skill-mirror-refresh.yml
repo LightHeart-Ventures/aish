@@ -1,0 +1,253 @@
+name: Skill Mirror Refresh
+
+# TASK-698 — rebuild the self-hosted skill registry nightly and publish it.
+#
+# ingest (crawl allowlisted GitHub repos)
+#   -> generate (validate + emit index.json and the raw object tree)
+#   -> guard    (refuse to publish a catalog that shrank suspiciously)
+#   -> publish  (upload to a staged prefix, smoke-check, flip)
+#
+# The guard is the point of the whole job. A nightly that cheerfully publishes
+# whatever it managed to crawl will, on the night GitHub is unhealthy, replace a
+# 300-row catalog with a 3-row one and report success. `skill-mirror guard`
+# compares the fresh row count against the LIVE one and fails closed — including
+# when it cannot read the live catalog at all. See tools/skill-mirror/src/guard.rs.
+
+on:
+  schedule:
+    # 07:17 UTC — deliberately off the top of the hour. Every cron on GitHub
+    # fires at :00 and the resulting herd delays runs by tens of minutes.
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run ingest+generate+guard but publish nothing'
+        type: boolean
+        default: false
+      force:
+        description: 'Override a SOFT (50-90%) shrink block. Cannot override <50% or a fail-closed guard.'
+        type: boolean
+        default: false
+
+concurrency:
+  group: skill-mirror-refresh
+  # Never interrupt a publish mid-flight: a cancelled job between the staged
+  # upload and the flip leaves a half-written catalog. Queue instead.
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write        # the failure-tracking issue (step: "Report a failure")
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  # Where the published catalog lives today. Overridable per-repo without a
+  # code change; the default is the production mirror.
+  LIVE_INDEX_URL: ${{ vars.SKILL_MIRROR_LIVE_URL || 'https://skills.aish.sh/index.json' }}
+  R2_BUCKET: ${{ vars.SKILL_MIRROR_BUCKET || 'aish-skills' }}
+  # Belt-and-braces absolute floor, used alongside the ratio guard. Matters
+  # only for the bootstrap runs, when there is no live catalog to compare to.
+  MIN_ROWS: ${{ vars.SKILL_MIRROR_MIN_ROWS || '1' }}
+
+jobs:
+  refresh:
+    name: rebuild + publish the skill catalog
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-skill-mirror-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-skill-mirror-
+            ${{ runner.os }}-cargo-
+
+      # The crawl state (ETags + stars per repo) is what makes the nightly
+      # cheap: unchanged repos come back 304 and cost one request each. Losing
+      # it to cache eviction costs one expensive run, then self-heals — hence a
+      # date-keyed entry with a prefix restore-key rather than anything clever.
+      - name: Restore ingest state
+        uses: actions/cache@v5
+        with:
+          path: work/ingest-state.json
+          key: skill-mirror-state-${{ github.run_id }}
+          restore-keys: |
+            skill-mirror-state-
+
+      - name: Build skill-mirror
+        run: cargo build --release --locked -p skill-mirror
+
+      - name: Ingest allowlisted repos
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p work
+          ./target/release/skill-mirror ingest \
+            --allowlist tools/skill-mirror/allowlist.toml \
+            --out work/src \
+            --state work/ingest-state.json \
+            2>&1 | tee work/ingest.log
+
+      - name: Generate the catalog
+        run: |
+          ./target/release/skill-mirror generate \
+            --input work/src \
+            --out work/out \
+            --min-rows "${MIN_ROWS}" \
+            2>&1 | tee work/generate.log
+
+      # Fails the job (non-zero exit) on any blocked verdict, BEFORE a single
+      # byte is uploaded. `force` is only honoured for the soft band; the
+      # binary enforces that, not this YAML.
+      - name: Shrink guard
+        id: guard
+        run: |
+          ./target/release/skill-mirror guard \
+            --index work/out/index.json \
+            --live-url "${LIVE_INDEX_URL}" \
+            --min-rows "${MIN_ROWS}" \
+            ${{ inputs.force && '--force' || '' }} \
+            2>&1 | tee work/guard.log
+          echo "verdict=$(grep -m1 '^guard:' work/guard.log || echo 'guard: (no verdict line)')" >> "$GITHUB_OUTPUT"
+
+      - name: Detect R2 credentials
+        id: creds
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          if [ -n "${R2_ACCOUNT_ID}" ] && [ -n "${R2_ACCESS_KEY_ID}" ] && [ -n "${R2_SECRET_ACCESS_KEY}" ]; then
+            echo "have_r2=true" >> "$GITHUB_OUTPUT"
+          else
+            # Not a failure: the catalog still built and passed the guard. The
+            # job summary says plainly that nothing was published, so a
+            # credential-less repo cannot *look* like it is mirroring.
+            echo "have_r2=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::R2 credentials are not configured — build + guard only, nothing published."
+          fi
+
+      # Staged upload, then smoke-check, then flip. The flip is a copy from the
+      # staged prefix onto the live prefix, never a delete-then-upload of live:
+      # a failure mid-delete would take the catalog offline. (With a Worker in
+      # front, the cheaper flip is a pointer update to staged/<run_id>/ — swap
+      # this step for that once the Worker owns the routing.)
+      - name: Publish (staged -> smoke-check -> flip)
+        if: steps.creds.outputs.have_r2 == 'true' && inputs.dry_run != true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          STAGED: staged/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          aws s3 sync work/out "s3://${R2_BUCKET}/${STAGED}/" \
+            --endpoint-url "${R2_ENDPOINT}" --only-show-errors
+
+          # Smoke-check what actually landed, not what we think we uploaded.
+          aws s3 cp "s3://${R2_BUCKET}/${STAGED}/index.json" work/staged-index.json \
+            --endpoint-url "${R2_ENDPOINT}" --only-show-errors
+          local_rows=$(python3 -c 'import json,sys; print(len(json.load(open("work/out/index.json"))))')
+          staged_rows=$(python3 -c 'import json,sys; print(len(json.load(open("work/staged-index.json"))))')
+          if [ "${local_rows}" != "${staged_rows}" ]; then
+            echo "::error::staged index has ${staged_rows} rows, expected ${local_rows} — not flipping"
+            exit 1
+          fi
+
+          aws s3 sync "s3://${R2_BUCKET}/${STAGED}/" "s3://${R2_BUCKET}/live/" \
+            --endpoint-url "${R2_ENDPOINT}" --delete --only-show-errors
+          echo "published ${local_rows} rows to s3://${R2_BUCKET}/live/"
+
+      - name: Garbage-collect staged prefixes older than 7 days
+        if: steps.creds.outputs.have_r2 == 'true' && inputs.dry_run != true
+        continue-on-error: true   # housekeeping must never fail a good publish
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          set -uo pipefail
+          cutoff=$(date -u -d '7 days ago' +%Y-%m-%d)
+          aws s3api list-objects-v2 --bucket "${R2_BUCKET}" --prefix 'staged/' \
+            --endpoint-url "${R2_ENDPOINT}" --query 'Contents[].[Key,LastModified]' --output text \
+          | while read -r key modified; do
+              [ -z "${key:-}" ] && continue
+              if [[ "${modified%%T*}" < "${cutoff}" ]]; then
+                aws s3 rm "s3://${R2_BUCKET}/${key}" --endpoint-url "${R2_ENDPOINT}" --only-show-errors
+              fi
+            done
+
+      # One table that answers "was last night healthy?" without opening logs.
+      - name: Job summary
+        if: always()
+        run: |
+          rows=$(python3 -c 'import json; print(len(json.load(open("work/out/index.json"))))' 2>/dev/null || echo 'n/a')
+          skipped=$(grep -c 'WARN skipping' work/generate.log 2>/dev/null || echo 0)
+          crawled=$(grep -c 'crawl ' work/ingest.log 2>/dev/null || echo 'n/a')
+          not_modified=$(grep -c '304' work/ingest.log 2>/dev/null || echo 0)
+          published='no (dry run or no credentials)'
+          if [ "${{ steps.creds.outputs.have_r2 }}" = "true" ] && [ "${{ inputs.dry_run }}" != "true" ]; then
+            published="yes -> s3://${R2_BUCKET}/live/"
+          fi
+          {
+            echo '## Skill mirror refresh'
+            echo
+            echo '| metric | value |'
+            echo '|---|---|'
+            echo "| repos crawled | ${crawled} |"
+            echo "| unchanged (304) | ${not_modified} |"
+            echo "| skills skipped in validation | ${skipped} |"
+            echo "| rows emitted | ${rows} |"
+            echo "| guard | ${{ steps.guard.outputs.verdict || 'did not run' }} |"
+            echo "| published | ${published} |"
+            echo "| live catalog | ${LIVE_INDEX_URL} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skill-mirror-${{ github.run_id }}
+          path: |
+            work/out/index.json
+            work/ingest.log
+            work/generate.log
+            work/guard.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      # A nightly that dies silently is worse than no nightly. One tracking
+      # issue, deduped by title, commented on each subsequent failure.
+      - name: Report a failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: 'skill-mirror nightly refresh is failing'
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          existing=$(gh issue list --state open --search "\"${TITLE}\" in:title" --json number --jq '.[0].number' || echo '')
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body "Nightly refresh failed again: ${RUN_URL}"
+          else
+            gh issue create --title "${TITLE}" \
+              --body "The nightly skill-mirror refresh failed: ${RUN_URL}
+
+          The published catalog is unchanged (the guard and the staged-then-flip publish both fail closed), so this is a freshness problem, not an outage." \
+              --label bug || true
+          fi
