@@ -1,0 +1,20 @@
+# Provider plugins and module caches -- re-downloaded by `terraform init`.
+.terraform/
+
+# State must live in the remote backend, never in git.
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Local variable files can contain account ids / bucket names.
+*.tfvars
+*.tfvars.json
+!example.tfvars
+
+# Plan artifacts.
+*.tfplan
+crash.log
+crash.*.log
+
+# NOTE: .terraform.lock.hcl IS intentionally committed -- it pins provider
+# versions so every operator and CI run resolves the same hashicorp/aws build.
