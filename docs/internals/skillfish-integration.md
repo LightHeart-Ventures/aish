@@ -28,7 +28,13 @@ ref ──parse──▶ SkillRef ──raw_url──▶ HTTPS GET ──validat
 1. **Reference** — a full URL `https://skill.fish/<owner>/<name>[@<version>]`
    or the shorthand `<owner>/<name>[@<version>]`.
 2. **Discovery** — the registry origin defaults to `https://skill.fish` and is
-   overridable with `AISH_SKILL_REGISTRY` (self-hosted mirrors, testing).
+   overridable with `AISH_SKILL_REGISTRY` (self-hosted mirrors, testing). An
+   **alternative source** is the public aish skill mirror at
+   `https://skills.aish.sh` — a read-only, unauthenticated mirror of public
+   GitHub `SKILL.md` files (see
+   [skill-registry-mirror](../design/skill-registry-mirror.md)); point
+   `AISH_SKILL_REGISTRY` at it and both search and fetch use it instead of
+   skill.fish.
 3. **Fetch** — `GET {registry}/{owner}/{name}/raw[?version=…]` returns the raw
    `SKILL.md`. The request carries an `aish/<version>` user-agent and a 20s
    timeout.
@@ -96,7 +102,8 @@ pairing (`is_vercel_challenge`) and, rather than surfacing an opaque status
 code, prints actionable guidance with three paths forward:
 
 - `aish --skill-fetch <owner/name>` — fetch a known skill directly.
-- `export AISH_SKILL_REGISTRY=<url>` — point aish at a custom mirror.
+- `export AISH_SKILL_REGISTRY=https://skills.aish.sh` — use the public aish
+  skill mirror (or any other custom/self-hosted mirror URL).
 - open <https://skill.fish> — browse/search in a browser as a last resort.
 
 ## Implementation map
