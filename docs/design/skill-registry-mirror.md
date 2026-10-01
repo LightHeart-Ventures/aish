@@ -5,6 +5,14 @@
 **Decision:** ship with **no auth**. The mirror is a public, read-only,
 cacheable static catalog. Abuse control is *cost* control (edge cache + rate
 limit), not identity.
+**Live mirror:** `https://skills.aish.sh`
+**Hosting (ratified 2026-09-30):** **AWS S3 + CloudFront** — S3 is the object
+store for `index.json` and the `{owner}/{name}/raw` objects, CloudFront is the
+edge/cache in front of it. The alternative (Cloudflare R2 + Worker) was
+considered and not taken; the rest of this document's "R2 / Worker" wording is
+historical and the AWS pair is the shipped choice.
+**Client guidance:** `vercel_challenge_message()` names this host in a
+paste-ready `export` line (TASK-701). That is a message change only — see §6.
 
 ---
 
@@ -52,7 +60,7 @@ works, and it is what the integration tests will exercise.
 **Consequence:** the mirror needs *zero* client changes to be usable:
 
 ```bash
-export AISH_SKILL_REGISTRY=https://skills.example.dev
+export AISH_SKILL_REGISTRY=https://skills.aish.sh
 :skill search rust
 :skill add acme/git-helper
 ```
@@ -102,10 +110,10 @@ these:
   (allowlist +            (frontmatter      │
    code search)            parse)           │ publish
                                             ▼
-                              object store (R2 / S3)
+                              object store (AWS S3)
                                             │
                                             ▼
-                              edge (Worker / CloudFront)
+                              edge (AWS CloudFront)
                     ┌───────────────────────┴───────────────────────┐
                     │  GET /api/v1/search?q=&limit=  → ranked rows   │
                     │  GET /{owner}/{name}/raw       → SKILL.md      │
@@ -162,11 +170,26 @@ These are **cost** controls, not access controls:
 | Bandwidth/request budget alarm | provider billing | fail loud, not expensive |
 | `limit` clamped server-side (max 100) | search fn | bounds response size |
 
-## 6. Client-side follow-on (optional, in-sprint stretch)
+## 6. Client-side follow-on — shipped (TASK-701)
 
-When `is_vercel_challenge` fires and `AISH_SKILL_REGISTRY` is unset, the error
-message can name the public mirror as a ready-to-paste `export`. This is a
-message change only — no default network behavior change, no auto-failover.
+When `is_vercel_challenge` fires, the error message names the public mirror as a
+ready-to-paste `export`:
+
+```
+• export AISH_SKILL_REGISTRY=https://skills.aish.sh   use the public aish skill mirror
+```
+
+This is a **message + docs change only**. Explicitly unchanged:
+
+- `registry()` / `skills_registry()` precedence — an explicit
+  `AISH_SKILL_REGISTRY` override still wins, and with no override search still
+  reads the curated offline embedded index.
+- `fetch_origin()` — still falls back to `https://skill.fish` when the override
+  is a `file://` base.
+- **No auto-failover.** Naming the mirror is guidance; nothing redirects a
+  user's fetches to a new origin because an upstream returned 429. The
+  GitHub-bypass bullets stay FIRST in the message because they work today
+  without us running anything.
 
 ## 7. Test strategy
 
@@ -188,4 +211,5 @@ Plus a `file://index.json` case (already covered by the existing default path).
 | Frontmatter parse rules the ingest must mirror | `src/skills.rs::parse_frontmatter` |
 | Vercel challenge detection + guidance text | `src/skill_provider.rs::vercel_challenge_message` |
 | Existing plugin source this complements | `plugins/npx-skillfish/` |
-| Mirror generator + edge fn + IaC | `tools/skill-mirror/` (new) |
+| Mirror generator + edge fn + IaC | `tools/skill-mirror/` (new) — Terraform for the S3 + CloudFront pair lands with TASK-696; the mirror is reproducible from these two, which is the honest answer to "why should I trust your mirror" |
+| User-facing "Using the skill mirror" section | `README.md` |

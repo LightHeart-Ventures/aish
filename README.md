@@ -273,6 +273,40 @@ Ctrl-C aborts the current turn; during TTY hand-off (interactive programs like
 `vim`, `ssh`) it interrupts the foreground child, exactly like a shell.
 `→`/`Ctrl-F` accept history ghost-text suggestions.
 
+## Using the skill mirror
+
+`:skill search` / `:skill add` talk to a skills **registry**. The default
+upstream, [skill.fish](https://skill.fish), sits behind Vercel bot protection
+and sometimes answers automated clients with `HTTP 429 +
+x-vercel-mitigated: challenge` instead of a payload. When that happens aish
+prints actionable guidance — fetching a skill straight from GitHub is never
+challenged, so that path is listed first — and one of the options is the public
+**aish skill mirror**:
+
+```bash
+export AISH_SKILL_REGISTRY=https://skills.aish.sh
+```
+
+What it is:
+
+- **Public, read-only, unauthenticated.** No API keys, no accounts, no write
+  path. It serves `GET /api/v1/search?q=…` and `GET /{owner}/{name}/raw`.
+- **A mirror of public GitHub `SKILL.md` files.** Nothing private, nothing
+  rewritten — the raw bytes of files that are already public, with their YAML
+  frontmatter parsed by the same rules aish uses locally.
+- **Opt-in.** Setting `AISH_SKILL_REGISTRY` is the only thing that points aish
+  at it. With no override, search still reads the curated offline embedded
+  index, fetches still default to `https://skill.fish`, and aish never fails
+  over to the mirror on its own.
+- **Self-hostable.** The mirror is reproducible from `tools/skill-mirror/`
+  (generator + edge function) plus its Terraform (TASK-696); hosting is AWS S3
+  + CloudFront. If you would rather not trust ours, run your own and point
+  `AISH_SKILL_REGISTRY` at it.
+
+Design notes and the full wire contract live in
+[docs/design/skill-registry-mirror.md](docs/design/skill-registry-mirror.md).
+
+## Webhook Integration
 ## Webhook Integration
 
 aish can connect to an external webhook broker to receive real-time events

@@ -690,7 +690,7 @@ fn vercel_challenge_message() -> String {
      • :skill add github:<owner>/<repo>[/path/to/skill]                          from a repo (or sub-path)\n  \
      • :skill add https://github.com/<owner>/<repo>/tree/<ref>/<path>            paste a repo/dir URL\n  \
      • :skill add https://raw.githubusercontent.com/<owner>/<repo>/<ref>/.../SKILL.md   paste a raw URL\n  \
-     • export AISH_SKILL_REGISTRY=<url>   point aish at a self-hosted registry mirror\n  \
+     • export AISH_SKILL_REGISTRY=https://skills.aish.sh   use the public aish skill mirror\n  \
      • open https://skill.fish           browse in a browser, then copy the skill's GitHub link"
         .to_string()
 }
@@ -1971,6 +1971,9 @@ mod tests {
         assert!(msg.contains("github:"), "got: {msg}");
         assert!(msg.contains("AISH_SKILL_REGISTRY"), "got: {msg}");
         assert!(msg.contains("https://skill.fish"), "got: {msg}");
+        // The mirror is named concretely (paste-ready), not hypothetically, so the
+        // guidance cannot silently regress back to "<url>" (TASK-701).
+        assert!(msg.contains("skills.aish.sh"), "got: {msg}");
     }
 
     // A plain 429 without the Vercel header takes the generic HTTP error path.
