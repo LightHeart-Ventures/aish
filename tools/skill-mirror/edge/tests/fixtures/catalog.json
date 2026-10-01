@@ -1,0 +1,66 @@
+[
+  {
+    "name": "rust",
+    "author": "ferris",
+    "description": "Idiomatic Rust patterns and cargo workflows.",
+    "version": "1.0.0",
+    "reference": "ferris/rust",
+    "stars": 12
+  },
+  {
+    "name": "rust-testing",
+    "author": "ferris",
+    "description": "Unit, integration and property-based testing for Rust.",
+    "version": "0.3.1",
+    "reference": "ferris/rust-testing",
+    "stars": 9000
+  },
+  {
+    "name": "cargo-rust-audit",
+    "author": "secbot",
+    "description": "Audit cargo dependencies for CVEs.",
+    "version": "2.1.0",
+    "reference": "secbot/cargo-rust-audit",
+    "stars": 300
+  },
+  {
+    "name": "very-popular-thing",
+    "author": "rustaceans",
+    "description": "Wildly popular but only an author match for rust.",
+    "version": "9.9.9",
+    "reference": "rustaceans/very-popular-thing",
+    "stars": 99999
+  },
+  {
+    "name": "terraform",
+    "author": "hashi",
+    "description": "Plan and apply infrastructure, including rust-built providers.",
+    "version": "1.5.0",
+    "reference": "hashi/terraform",
+    "stars": 4200
+  },
+  {
+    "name": "python",
+    "author": "guido",
+    "description": "Typed Python, uv and ruff.",
+    "version": "3.12.0",
+    "reference": "guido/python",
+    "stars": 50000
+  },
+  {
+    "name": "observability",
+    "author": "otel",
+    "description": "Traces, metrics and logs with OpenTelemetry.",
+    "version": "0.9.0",
+    "reference": "otel/observability",
+    "stars": 0
+  },
+  {
+    "name": "sqlite",
+    "author": "dwh",
+    "description": "Query and maintain SQLite databases.",
+    "version": "3.45.0",
+    "reference": "dwh/sqlite",
+    "stars": 7
+  }
+]
