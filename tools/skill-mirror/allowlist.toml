@@ -1,0 +1,39 @@
+# skill-mirror ingest allowlist
+#
+# Every repository `skill-mirror ingest` is permitted to crawl. Ingest performs
+# NO discovery of its own: if a repo is not in this file, its skills cannot
+# reach the mirror. Adding a source is therefore a reviewable pull request, and
+# the nightly job's GitHub API budget is bounded by a number a human chose.
+#
+# Review checklist for a new entry:
+#   1. The repo really publishes `SKILL.md` files (exact case) — check the tree.
+#   2. Its license permits mirroring the file verbatim.
+#   3. The frontmatter `name:` values are not already claimed by a repo under
+#      the same owner (duplicates resolve by stars; see ingest::pick_winners).
+#   4. Prefer `path = "…"` on a large monorepo so the crawl stays cheap.
+#
+# Two spellings:
+#   seeds = ["owner/repo", …]   compact; crawls the default branch, whole repo
+#   [[repo]] tables             when you need `ref` (pin) or `path` (subtree)
+#
+# Growing the list: candidates come from a periodic GitHub code-search sweep for
+# `filename:SKILL.md`, triaged by hand into this file. The sweep is deliberately
+# NOT part of ingest — automated discovery is exactly the thing this allowlist
+# exists to prevent.
+
+seeds = [
+  # Anthropic's official skill collection (document, artifact, and MCP skills).
+  "anthropics/skills",
+  # obra/superpowers — a widely mirrored community collection.
+  "obra/superpowers",
+]
+
+[[repo]]
+owner = "hyperb1iss"
+repo = "hyperskills"
+notes = "Design/TUI skill collection; already a documented aish skill source."
+
+[[repo]]
+owner = "garrytan"
+repo = "gstack"
+notes = "Plan/spec/ship skill set shipped as an aish plugin."

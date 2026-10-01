@@ -23,8 +23,12 @@
 //!     `--min-rows`, exits non-zero *before* writing anything, so a broken
 //!     ingest can never silently publish a shrunken registry over a good one.
 
+mod allowlist;
 mod catalog;
 mod emit;
+mod github;
+mod ingest;
+mod state;
 mod validate;
 
 use clap::{Parser, Subcommand};
@@ -35,7 +39,7 @@ use std::process::ExitCode;
 #[command(
     name = "skill-mirror",
     version,
-    about = "Generate an aish skill-registry mirror (index.json + per-skill raw objects)"
+    about = "Build an aish skill-registry mirror: ingest allowlisted GitHub repos, then generate index.json + per-skill raw objects"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -46,6 +50,8 @@ struct Cli {
 enum Command {
     /// Scan a SKILL.md tree and emit index.json + the raw object tree.
     Generate(GenerateArgs),
+    /// Crawl allowlisted GitHub repos into a SKILL.md tree (`generate`'s input).
+    Ingest(ingest::IngestArgs),
 }
 
 #[derive(clap::Args)]
@@ -72,13 +78,35 @@ struct GenerateArgs {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Generate(args) => match generate(args) {
-            Ok(code) => code,
-            Err(e) => {
-                eprintln!("skill-mirror: error: {e:#}");
-                ExitCode::FAILURE
-            }
-        },
+        Command::Generate(args) => report(generate(args)),
+        // `generate` is pure filesystem work and stays sync; only the crawl
+        // needs an async runtime, so it is built on demand rather than
+        // wrapping main in #[tokio::main].
+        Command::Ingest(args) => {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("skill-mirror: error: building the async runtime: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            report(rt.block_on(ingest::run(args)))
+        }
+    }
+}
+
+/// Collapse a subcommand result into a process exit code, with the error chain
+/// on stderr so a nightly job's log says *why* it failed.
+fn report(result: anyhow::Result<ExitCode>) -> ExitCode {
+    match result {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("skill-mirror: error: {e:#}");
+            ExitCode::FAILURE
+        }
     }
 }
 
