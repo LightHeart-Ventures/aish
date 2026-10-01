@@ -1,5 +1,13 @@
 [workspace]
-members = [".", "crates/webhook-receiver", "crates/aish-webhook-client", "crates/git-discover"]
+members = [
+    ".",
+    "crates/webhook-receiver",
+    "crates/aish-webhook-client",
+    "crates/git-discover",
+    # TASK-694 — build-time skill-registry mirror catalog generator. Links the
+    # aish lib so it validates SKILL.md files with the client's real rules.
+    "tools/skill-mirror",
+]
 resolver = "2"
 
 [package]

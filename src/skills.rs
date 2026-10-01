@@ -86,20 +86,11 @@ pub fn load_catalog(skills_dir: &Path) -> Vec<Skill> {
 /// Pull `name:` and `description:` out of a `---`-fenced frontmatter block.
 /// Single-line values only — that's what the convention uses in practice.
 /// Shared with the skill.fish importer, which validates fetched SKILL.md files.
-pub fn parse_frontmatter(text: &str) -> Option<(String, String)> {
-    let rest = text.strip_prefix("---")?;
-    let end = rest.find("\n---")?;
-    let mut name = None;
-    let mut description = None;
-    for line in rest[..end].lines() {
-        if let Some(v) = line.strip_prefix("name:") {
-            name = Some(v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("description:") {
-            description = Some(v.trim().to_string());
-        }
-    }
-    Some((name?, description?))
-}
+/// Single source of truth lives in [`crate::skill_contract`] so the out-of-tree
+/// mirror generator (`tools/skill-mirror`) applies byte-identical rules —
+/// see TASK-694. This re-export keeps every existing `skills::parse_frontmatter`
+/// call site working unchanged.
+pub use crate::skill_contract::parse_frontmatter;
 
 /// Return the inner text of a `---`-fenced frontmatter block (between the
 /// opening `---` and the terminating `\n---`), or `None` when absent.

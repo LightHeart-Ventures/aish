@@ -1,0 +1,21 @@
+[package]
+name = "skill-mirror"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Build-time generator for a self-hosted aish skill-registry mirror: SKILL.md set -> index.json + per-skill raw objects (TASK-694)"
+
+[[bin]]
+name = "skill-mirror"
+path = "src/main.rs"
+
+[dependencies]
+# The load-bearing dependency: validation MUST use the client's real rules
+# (parse_frontmatter / validate_segment / sanitize_dir_segment) and emit the
+# client's real row type, so a skill this generator publishes is always one the
+# client can install. See src/skill_contract.rs in the aish crate.
+aish = { path = "../.." }
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+serde_json = "1.0.150"
