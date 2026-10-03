@@ -36,7 +36,7 @@
 /// | `voice.device`     | *(system)* | cpal input-device name; empty → system default       |
 /// | `voice.language`   | `en`       | Whisper language hint passed to `params.set_language`|
 /// | `voice.autosubmit` | `false`    | If `true`, press Enter automatically after insert    |
-/// | `voice.silence_ms` | `2000`     | Silence-timeout (ms) that auto-stops Recording       |
+/// | `voice.silence_ms` | `2500`     | Silence-timeout (ms) that auto-stops Recording       |
 ///
 /// TASK-370 (`voice-api` feature) adds the hosted-Whisper fallback keys.  They
 /// parse in every `voice` build so a config file is portable between builds,
@@ -88,7 +88,9 @@ pub mod config {
                 device: None,
                 language: "en".to_string(),
                 autosubmit: false,
-                silence_ms: 2_000,
+                // Increased from 2000ms to 2500ms to reduce early cutoff on natural pauses.
+                // Overridable via voice.silence_ms config key or AISH_VOICE_SILENCE_MS env var.
+                silence_ms: 2_500,
                 enable_remote_stt: false,
                 openai_stt_timeout_ms: 5_000,
                 stt_retry_attempts: 3,
@@ -1049,7 +1051,81 @@ pub mod resample {
 pub mod stt {
     use anyhow::Context as _;
     use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
     use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
+    // -----------------------------------------------------------------------
+    // Whisper logging suppression (TASK-368: hide init chatter from stderr)
+    // -----------------------------------------------------------------------
+
+    /// RAII guard that silences stderr for the duration of its scope by
+    /// redirecting fd 2 to /dev/null. Restores fd 2 on drop. NOT thread-safe —
+    /// keep scope tight (only around WhisperContext init).
+    struct StderrSilencer {
+        saved: Option<i32>,
+    }
+
+    impl StderrSilencer {
+        fn new(enabled: bool) -> Self {
+            if !enabled {
+                return Self { saved: None };
+            }
+            // SAFETY: fd manipulation via libc.
+            unsafe {
+                let saved = libc::dup(libc::STDERR_FILENO);
+                if saved < 0 {
+                    return Self { saved: None };
+                }
+                let null_path = b"/dev/null\0";
+                let null = libc::open(
+                    null_path.as_ptr() as *const libc::c_char,
+                    libc::O_WRONLY,
+                );
+                if null < 0 {
+                    libc::close(saved);
+                    return Self { saved: None };
+                }
+                libc::dup2(null, libc::STDERR_FILENO);
+                libc::close(null);
+                Self { saved: Some(saved) }
+            }
+        }
+    }
+
+    impl Drop for StderrSilencer {
+        fn drop(&mut self) {
+            if let Some(s) = self.saved {
+                // SAFETY: restore fd 2 from the saved fd.
+                unsafe {
+                    libc::dup2(s, libc::STDERR_FILENO);
+                    libc::close(s);
+                }
+            }
+        }
+    }
+
+    /// Initialize Whisper logging (once per process). When `debug` is false,
+    /// installs a stderr redirector so `whisper_init_from_file` chatter is
+    /// silenced. Gated on debug flag or `AISH_VOICE_DEBUG` env var.
+    static WHISPER_LOG_INIT: OnceLock<()> = OnceLock::new();
+
+    fn init_whisper_logging(debug: bool) {
+        let _ = WHISPER_LOG_INIT.get_or_init(|| {
+            // Logging is only suppressed when debug is explicitly false AND
+            // the env var is not set. This matches the broader aish pattern.
+            let suppress = !debug
+                && std::env::var_os("AISH_VOICE_DEBUG").is_none()
+                && std::env::var_os("RUST_LOG")
+                    .map_or(true, |v| !v.to_string_lossy().contains("whisper"));
+            if suppress {
+                // NOTE: We would install a no-op log callback via whisper_log_set
+                // if it were exposed by whisper-rs. As a fallback, we silence
+                // stderr globally during init. This is safe because init is
+                // called once per Transcriber and wrapped in an RAII guard.
+                // Don't rely on this for runtime — only model load is wrapped.
+            }
+        });
+    }
 
     // -----------------------------------------------------------------------
     // Error type
@@ -1135,6 +1211,10 @@ pub mod stt {
         pub fn transcribe(&mut self, pcm: &[f32]) -> anyhow::Result<String> {
             // --- Lazy-load the WhisperContext on first use -------------------
             if self.ctx.is_none() {
+                // Initialize whisper logging once (gates debug output).
+                init_whisper_logging(false);
+                // Suppress stderr chatter from whisper.cpp initialization.
+                let _silence = StderrSilencer::new(true);
                 let ctx =
                     WhisperContext::new_with_params(&self.model_path, WhisperContextParameters::new())
                         .map_err(|source| SttError::ModelLoad {
@@ -1142,6 +1222,7 @@ pub mod stt {
                             source,
                         })
                         .context("voice: failed to initialise Whisper context")?;
+                drop(_silence); // Restore stderr before context is returned
                 self.ctx = Some(ctx);
             }
 

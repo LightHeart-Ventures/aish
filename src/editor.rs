@@ -35,8 +35,8 @@ pub enum ReadOutcome {
     /// Shift-Tab: cycle the interactive session through the running
     /// coordinators (interactive → first worker → … → back to interactive).
     ShiftTab,
-    /// Ctrl-G: voice dictation key (feature = "voice"). When the user presses
-    /// Ctrl-G the line editor is exited and the REPL runs the voice
+    /// Ctrl-S: voice dictation key (feature = "voice"). When the user presses
+    /// Ctrl-S the line editor is exited and the REPL runs the voice
     /// capture → transcribe → insert pipeline (TASK-367). Present
     /// unconditionally so REPL `match` arms compile with `--no-default-features`;
     /// the binding that raises it is gated behind `#[cfg(feature = "voice")]`.
@@ -170,14 +170,15 @@ impl RustylineEditor {
             EventHandler::Conditional(Box::new(AcceptHint)),
         );
 
-        // Ctrl-G voice dictation — bind the key and init the flag only when the
+        // Ctrl-S voice dictation — bind the key and init the flag only when the
         // `voice` feature is compiled in; neither exists in default/CI builds.
+        // NOTE: Ctrl-S is XOFF (flow control); ensure IXON is cleared in tty setup.
         #[cfg(feature = "voice")]
         let voice_flag = {
             let flag = Arc::new(AtomicBool::new(false));
             rl.bind_sequence(
-                KeyEvent::ctrl('G'),
-                EventHandler::Conditional(Box::new(CtrlGVoice {
+                KeyEvent::ctrl('S'),
+                EventHandler::Conditional(Box::new(CtrlSVoice {
                     pending: flag.clone(),
                 })),
             );
@@ -430,18 +431,18 @@ impl ConditionalEventHandler for ShiftTabCycle {
     }
 }
 
-/// Ctrl-G voice dictation key handler (feature = "voice"): raise the voice flag
+/// Ctrl-S voice dictation key handler (feature = "voice"): raise the voice flag
 /// and exit the line editor so the REPL can run the capture → transcribe →
 /// insert pipeline (TASK-367). Returns `Cmd::Interrupt` to discard the current
 /// draft line; `RustylineEditor::read_line` drains the flag and reports
 /// [`ReadOutcome::Voice`].
 #[cfg(feature = "voice")]
-struct CtrlGVoice {
+struct CtrlSVoice {
     pending: Arc<AtomicBool>,
 }
 
 #[cfg(feature = "voice")]
-impl ConditionalEventHandler for CtrlGVoice {
+impl ConditionalEventHandler for CtrlSVoice {
     fn handle(&self, _: &Event, _: RepeatCount, _: bool, _: &EventContext) -> Option<Cmd> {
         self.pending.store(true, Ordering::SeqCst);
         Some(Cmd::Interrupt)
