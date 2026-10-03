@@ -191,10 +191,12 @@ fn set_termios(t: &libc::termios) {
 
 /// Derive cbreak attrs from cooked: ICANON + ECHO off (unbuffered, silent) while
 /// keeping ISIG on so Ctrl-C still generates SIGINT. VMIN=1/VTIME=0 so a `read`
-/// after a readable `poll` returns promptly.
+/// after a readable `poll` returns promptly. Also clear IXON/IXOFF (flow control)
+/// so Ctrl-S/Ctrl-Q reach the application (needed for voice input on Ctrl-S).
 fn cbreak_from(cooked: &libc::termios) -> libc::termios {
     let mut raw = *cooked;
     raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+    raw.c_iflag &= !(libc::IXON | libc::IXOFF);
     raw.c_cc[libc::VMIN] = 1;
     raw.c_cc[libc::VTIME] = 0;
     raw
