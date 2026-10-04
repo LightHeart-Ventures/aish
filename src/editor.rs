@@ -78,6 +78,32 @@ pub trait LineEditor {
     /// Hand out the above-the-prompt printer. Returns `Some` at most once and
     /// only when the terminal supports it; `None` means inline printing.
     fn take_printer(&mut self) -> Option<Box<dyn LinePrinter>>;
+
+    // -- voice mode (FR-334 follow-up) --------------------------------------
+    // The editor owns the Ctrl-S keybinding, so it also owns the voice-mode
+    // ON/OFF bit. Ctrl-S no longer means "capture one utterance"; it toggles a
+    // listening mode the REPL's voice loop polls. The state lives behind a
+    // shared handle ([`crate::voice_activation::VoiceMode`]) so the editor and
+    // that loop read the same bit instead of two copies that can desync.
+    //
+    // Default impls keep every other `LineEditor` (mocks, future reedline
+    // backend) compiling and voice-less: mode is always OFF and never toggles.
+
+    /// Flip voice mode and return the NEW state (`true` == now listening).
+    #[cfg_attr(not(feature = "voice"), allow(dead_code))]
+    fn toggle_voice_mode(&mut self) -> bool {
+        false
+    }
+    /// Is voice mode currently ON? Used for prompt/state reporting.
+    #[allow(dead_code)] // symmetry with toggle/handle; read by prompt reporting
+    fn voice_mode_on(&self) -> bool {
+        false
+    }
+    /// A handle on the shared voice-mode flag, for the REPL's listen loop.
+    #[cfg_attr(not(feature = "voice"), allow(dead_code))]
+    fn voice_mode(&self) -> crate::voice_activation::VoiceMode {
+        crate::voice_activation::VoiceMode::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +131,11 @@ pub struct RustylineEditor {
     /// (`--no-default-features --locked`) sees no dead-code warnings.
     #[cfg(feature = "voice")]
     voice_flag: Arc<AtomicBool>,
+    /// Voice-mode ON/OFF state, toggled by Ctrl-S and read by the REPL's
+    /// voice listen loop through a shared handle. UNGATED on purpose: the flag
+    /// is dependency-free, the trait methods that expose it are always
+    /// compiled, and a non-voice build simply never turns it on.
+    voice_mode: crate::voice_activation::VoiceMode,
 }
 
 impl RustylineEditor {
@@ -192,6 +223,7 @@ impl RustylineEditor {
             shift_tab,
             #[cfg(feature = "voice")]
             voice_flag,
+            voice_mode: crate::voice_activation::VoiceMode::new(),
         })
     }
 
@@ -322,6 +354,18 @@ impl RustylineEditor {
 }
 
 impl LineEditor for RustylineEditor {
+    fn toggle_voice_mode(&mut self) -> bool {
+        self.voice_mode.toggle()
+    }
+
+    fn voice_mode_on(&self) -> bool {
+        self.voice_mode.is_on()
+    }
+
+    fn voice_mode(&self) -> crate::voice_activation::VoiceMode {
+        self.voice_mode.clone()
+    }
+
     fn set_cwd(&mut self, cwd: &Path) {
         if let Some(h) = self.rl.helper_mut() {
             h.set_cwd(cwd);
@@ -763,7 +807,10 @@ mod tests {
         );
         // Neither flag is a plain Ctrl-C clear-line.
         assert!(
-            matches!(interrupt_outcome(false, false, false), ReadOutcome::Interrupted),
+            matches!(
+                interrupt_outcome(false, false, false),
+                ReadOutcome::Interrupted
+            ),
             "a clear triple is a plain Ctrl-C clear-line"
         );
     }
@@ -873,10 +920,7 @@ mod tests {
         let _ = take_resume_wake();
 
         // Not armed → drain is false.
-        assert!(
-            !take_resume_wake(),
-            "a cleared wake must read false"
-        );
+        assert!(!take_resume_wake(), "a cleared wake must read false");
 
         // Arm → first drain sees it, second drain is already clear.
         arm_resume_wake();
