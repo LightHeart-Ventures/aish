@@ -4,6 +4,12 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.49.1] - 2025-01-22
+
+### Fixed
+- **Voice config wiring**: honour all five voice.* config keys in the REPL dictation path (TASK-368, PR #859)
+- **Whisper initialization stderr**: suppress Whisper model loading diagnostic output to keep stderr clean (TASK-368)
+
 ## [0.49.0] - 2026-09-30
 
 ### Fixed
