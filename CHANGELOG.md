@@ -4,6 +4,11 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.49.3] - 2026-10-04
+
+### Fixed
+- **Voice improvements**: suppress Whisper initialization stderr, increase silence detection threshold to 2500ms for better silence handling (TASK-368).
+
 ## [0.49.0] - 2026-09-30
 
 ### Fixed
