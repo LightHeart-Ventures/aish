@@ -55,7 +55,11 @@ use crate::midturn_input::{Action, KeyParser, LineBuf};
 /// to run as the next command once the current turn finishes. Absent ⇒ the
 /// reader keeps its legacy Shift-Tab-only `scan_csi_z` behaviour, byte-for-byte.
 pub struct MidturnCfg {
-    /// Submitted lines, drained by the REPL as type-ahead after the turn.
+    /// Submitted lines, drained by the REPL as type-ahead after the turn. Each
+    /// submission also leaves a visible "queued" receipt in the text output area
+    /// (see [`crate::terminal::print_midturn_queued`]) — the footer echo is wiped
+    /// on Enter, so that row is the operator's only confirmation their command
+    /// was accepted rather than swallowed.
     pub line_tx: mpsc::UnboundedSender<String>,
     /// Styled prompt sigil painted before the typed text in the footer row.
     pub prompt: String,
@@ -283,6 +287,10 @@ fn reader_loop(
     // Shift-Tab-only `scan_csi_z` scan below, unchanged.
     let mut parser = KeyParser::new();
     let mut linebuf = LineBuf::new();
+    // How many lines the operator has submitted during THIS turn, so each queued
+    // receipt can show its 1-based position in the pending queue (they are drained
+    // and run in submission order once the turn ends).
+    let mut queued_count: usize = 0;
     loop {
         if g.stop.load(Ordering::Acquire) {
             break;
@@ -353,6 +361,13 @@ fn reader_loop(
                         // must go empty so the completed line is never ALSO
                         // pre-filled into the next prompt (duplicate input).
                         publish_partial(&cfg.partial, "");
+                        // Announce the line as QUEUED in the text output area
+                        // BEFORE handing it off (the send moves `line`). Without
+                        // this the footer echo is simply wiped below and the
+                        // operator sees NOTHING — their command looks dropped even
+                        // though it will run as soon as the turn ends.
+                        queued_count += 1;
+                        crate::terminal::print_midturn_queued(&line, queued_count);
                         let _ = cfg.line_tx.send(line);
                         // Line consumed → return to the bare prompt affordance
                         // (still mid-turn); the cached status message is restored
