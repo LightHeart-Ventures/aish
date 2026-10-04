@@ -4,6 +4,12 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.49.4] - 2026-10-04
+
+### Fixed
+- **Voice initialization spam**: silence both stdout and stderr during Whisper context initialization to prevent debug output pollution.
+- **Voice silence_ms test alignment**: updated test to match the 2500ms silence detection threshold.
+
 ## [0.49.3] - 2026-10-04
 
 ### Fixed
