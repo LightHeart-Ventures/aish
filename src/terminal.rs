@@ -147,6 +147,81 @@ pub fn set_midturn_inline(styled_prompt: &str, text: &str) {
     note_footer_activity();
 }
 
+/// Build the line that announces a mid-turn submitted command as QUEUED, for
+/// emission into the **text output area** (the scrolling body above the footer).
+///
+/// The footer's message row only ever shows the line the operator is CURRENTLY
+/// typing — on Enter that echo is wiped ([`set_midturn_input`] with empty text),
+/// so without this the operator got no confirmation at all that their command
+/// was accepted while aish was busy. It looked dropped. This renders a durable
+/// receipt into scrollback instead:
+///
+/// ```text
+/// ⏳ queued → ls -la
+/// ⏳ queued #2 → git status
+/// ```
+///
+/// `position` is the 1-based submission index within the current turn (queued
+/// lines are drained and run in submission order once the turn ends); it is
+/// omitted for the first line and shown as `#N` thereafter, so the operator can
+/// see how deep the queue is. `utf8`/`color_on` mirror [`separator_line`] so a
+/// non-UTF-8 locale or `NO_COLOR` degrades cleanly. The body is clipped to
+/// `cols` visible columns via [`clip_visible`] so a long paste can never wrap
+/// and scroll the body twice.
+///
+/// Leading `\r\x1b[2K` (same convention as [`midturn_inline_seq`]) homes the
+/// cursor and erases the row before painting, and the trailing `\r\n` scrolls
+/// the body by exactly one row — the footer lives OUTSIDE the scroll region, so
+/// it is untouched. Pure builder, so the format is unit-tested without a tty.
+pub fn midturn_queued_seq(
+    text: &str,
+    position: usize,
+    cols: u16,
+    utf8: bool,
+    color_on: bool,
+) -> String {
+    let sigil = if utf8 { "⏳" } else { "[q]" };
+    let arrow = if utf8 { "→" } else { "->" };
+    let pos = if position > 1 {
+        format!(" #{position}")
+    } else {
+        String::new()
+    };
+    let body = if color_on {
+        format!("\x1b[2m{sigil} queued{pos} {arrow}\x1b[0m {text}")
+    } else {
+        format!("{sigil} queued{pos} {arrow} {text}")
+    };
+    let clipped = clip_visible(&body, cols.max(1) as usize);
+    format!("\r\x1b[2K{clipped}\x1b[0m\r\n")
+}
+
+/// Emit the "queued" receipt for a mid-turn submitted line into the text output
+/// area. Called from the keywatch reader thread the instant a line is submitted,
+/// BEFORE it is handed to the REPL's type-ahead channel.
+///
+/// Best-effort, exactly like [`set_midturn_inline`]: this writes to stdout from
+/// the reader thread, so it can in principle interleave with the engine's output
+/// writes on the main thread (the leading erase-line can clip a partially-written
+/// row, e.g. a spinner, which repaints on its next tick). That race is accepted
+/// for the same reason the inline affordance accepts it — a visible receipt beats
+/// a silently-swallowed command — and it is strictly safer than the inline path
+/// because this one ONLY ever appends a fully-terminated row.
+pub fn print_midturn_queued(text: &str, position: usize) {
+    let cols = term_size().map(|(_, c)| c).unwrap_or(80);
+    let seq = midturn_queued_seq(
+        text,
+        position,
+        cols,
+        utf8_locale(),
+        crate::style::colors_enabled(),
+    );
+    let mut out = std::io::stdout();
+    let _ = write!(out, "{seq}");
+    let _ = out.flush();
+    note_footer_activity();
+}
+
 /// Erase an inline mid-turn prompt affordance at turn teardown (carriage-return
 /// + erase-line). Pairs with [`set_midturn_inline`]; a no-op-looking write that
 /// keeps the flag-gated inline path from leaving a stale `❯` on the row.
@@ -1528,6 +1603,65 @@ mod tests {
         // cached status message keeps showing through the footer effective view.
         clear_midturn_input();
         assert_eq!(effective_status_msg("coordinating…"), "coordinating…");
+    }
+
+    #[test]
+    fn midturn_queued_seq_announces_queue_position_and_clips() {
+        // A line submitted mid-turn must leave a DURABLE receipt in the text
+        // output area — the footer echo is wiped on Enter, so this row is the
+        // only thing telling the operator their command was accepted and will
+        // run after the turn. Locks in the format, the queue-depth marker, the
+        // ASCII/no-color degradations, and the no-wrap clip.
+        let wide = 80u16;
+
+        // First submission: no "#N" marker (queue depth of one needs no number).
+        assert_eq!(
+            midturn_queued_seq("ls -la", 1, wide, true, false),
+            "\r\x1b[2K⏳ queued → ls -la\x1b[0m\r\n"
+        );
+
+        // Second and later: the 1-based position is surfaced so the operator can
+        // see how deep the queue has grown while aish stayed busy.
+        assert_eq!(
+            midturn_queued_seq("git status", 2, wide, true, false),
+            "\r\x1b[2K⏳ queued #2 → git status\x1b[0m\r\n"
+        );
+
+        // Colour on → the label is dimmed, the operator's own text is NOT (so it
+        // reads as their input, not as chrome).
+        assert_eq!(
+            midturn_queued_seq("ls", 1, wide, true, true),
+            "\r\x1b[2K\x1b[2m⏳ queued →\x1b[0m ls\x1b[0m\r\n"
+        );
+
+        // Non-UTF-8 locale → ASCII sigil + arrow, no mojibake.
+        assert_eq!(
+            midturn_queued_seq("ls", 3, wide, false, false),
+            "\r\x1b[2K[q] queued #3 -> ls\x1b[0m\r\n"
+        );
+
+        // Long input is clipped to the terminal width so it can never wrap and
+        // scroll the body by two rows (which would desync the footer region).
+        let long = "x".repeat(200);
+        let out = midturn_queued_seq(&long, 1, 20, true, false);
+        let visible = out
+            .trim_start_matches("\r\x1b[2K")
+            .trim_end_matches("\r\n")
+            .trim_end_matches("\x1b[0m");
+        // Budget is in DISPLAY COLUMNS, not chars: the hourglass is double-width,
+        // so the "⏳ queued → " label costs 12 columns (2+1+6+1+1+1) and only 8 of
+        // the 20 remain for the operator's text.
+        let label_cols = unicode_width::UnicodeWidthStr::width("⏳ queued → ");
+        assert_eq!(label_cols, 12, "label width is the clip budget we subtract");
+        assert_eq!(
+            visible.chars().filter(|c| *c == 'x').count(),
+            20 - label_cols,
+            "body is clipped to exactly `cols` visible columns"
+        );
+        assert!(out.ends_with("\r\n"), "row is newline-terminated");
+
+        // A zero-width terminal must not panic (cols.max(1) floor).
+        let _ = midturn_queued_seq("ls", 1, 0, true, true);
     }
 
     #[test]

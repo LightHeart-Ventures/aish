@@ -380,9 +380,7 @@ pub async fn run(
                 )
             );
         }
-        println!(
-            "\x1b[2m:help for commands — :workers to monitor background tasks\x1b[0m"
-        );
+        println!("\x1b[2m:help for commands — :workers to monitor background tasks\x1b[0m");
     }
 
     // Startup notices (store/init warnings, hook-load failures, etc.) collected
@@ -741,7 +739,7 @@ pub async fn run(
             "{attach}{badge}{goal_badge}\x1b[36m{}\x1b[0m ❯ ",
             short_cwd(&session)
         );
-        
+
         // Consume an accepted-rewrite line first, then an active `:loop`
         // iteration, before falling back to the editor. A loop iteration is fed
         // to the model inline via the `?` route escape so it runs as an agentic
@@ -770,101 +768,99 @@ pub async fn run(
                     ReadOutcome::Line(format!("?{body}"))
                 }
                 None => match session.next_loop_tick() {
-                crate::session::LoopTick::Run { index, total, body } => {
-                    println!("\x1b[2m↻ loop {index}/{total}\x1b[0m");
-                    ReadOutcome::Line(format!("?{body}"))
-                }
-                crate::session::LoopTick::Done { total } => {
-                    println!(
-                        "\x1b[2m✓ loop complete ({total} iteration{})\x1b[0m",
-                        if total == 1 { "" } else { "s" }
-                    );
-                    continue;
-                }
-                crate::session::LoopTick::Idle => {
-                    // Refresh the live statusline (updated date/time + model).
-                    // Interactive terminals only.
-                    //
-                    // Footer mode: the statusline + coordinator status live in the
-                    // pinned bottom rows. Re-draw them here (cheap, idempotent) so
-                    // the clock and attach state stay current above each prompt,
-                    // and re-establish the scroll region first if a SIGWINCH fired.
-                    //
-                    // Inline mode (short terminal / non-footer): print the
-                    // statusline directly above the prompt. The startup block
-                    // already printed it, so skip the very first refresh to avoid a
-                    // duplicated header (see `suppress_statusline_once`).
-                    if unsafe { libc::isatty(1) } == 1 {
-                        if footer_active {
-                            if let Some(t) = term.as_mut() {
-                                if resized.swap(false, Ordering::SeqCst) {
-                                    t.handle_resize();
+                    crate::session::LoopTick::Run { index, total, body } => {
+                        println!("\x1b[2m↻ loop {index}/{total}\x1b[0m");
+                        ReadOutcome::Line(format!("?{body}"))
+                    }
+                    crate::session::LoopTick::Done { total } => {
+                        println!(
+                            "\x1b[2m✓ loop complete ({total} iteration{})\x1b[0m",
+                            if total == 1 { "" } else { "s" }
+                        );
+                        continue;
+                    }
+                    crate::session::LoopTick::Idle => {
+                        // Refresh the live statusline (updated date/time + model).
+                        // Interactive terminals only.
+                        //
+                        // Footer mode: the statusline + coordinator status live in the
+                        // pinned bottom rows. Re-draw them here (cheap, idempotent) so
+                        // the clock and attach state stay current above each prompt,
+                        // and re-establish the scroll region first if a SIGWINCH fired.
+                        //
+                        // Inline mode (short terminal / non-footer): print the
+                        // statusline directly above the prompt. The startup block
+                        // already printed it, so skip the very first refresh to avoid a
+                        // duplicated header (see `suppress_statusline_once`).
+                        if unsafe { libc::isatty(1) } == 1 {
+                            if footer_active {
+                                if let Some(t) = term.as_mut() {
+                                    if resized.swap(false, Ordering::SeqCst) {
+                                        t.handle_resize();
+                                    }
+                                    let statusline = crate::style::statusline(
+                                        crate::update::current_version(),
+                                        &backend.describe(),
+                                        &crate::engine::statusline_stats(&session),
+                                    );
+                                    t.draw_footer(
+                                        &coordinator_status_message(&session),
+                                        &statusline,
+                                    );
                                 }
-                                let statusline = crate::style::statusline(
-                                    crate::update::current_version(),
-                                    &backend.describe(),
-                                    &crate::engine::statusline_stats(&session),
-                                );
-                                t.draw_footer(
-                                    &coordinator_status_message(&session),
-                                    &statusline,
+                            } else if suppress_statusline_once {
+                                suppress_statusline_once = false;
+                            } else {
+                                println!(
+                                    "{}",
+                                    crate::style::statusline(
+                                        crate::update::current_version(),
+                                        &backend.describe(),
+                                        &crate::engine::statusline_stats(&session),
+                                    )
                                 );
                             }
-                        } else if suppress_statusline_once {
-                            suppress_statusline_once = false;
-                        } else {
-                            println!(
-                                "{}",
-                                crate::style::statusline(
-                                    crate::update::current_version(),
-                                    &backend.describe(),
-                                    &crate::engine::statusline_stats(&session),
-                                )
-                            );
+                        }
+                        // Gate the editor's interruptible poll path: if this
+                        // session has outstanding fanned-out workers, the idle read
+                        // must be woken hands-free the instant the last one finishes
+                        // and the presenter arms a resume (arm_resume_wake). Compute
+                        // the live outstanding count HERE — not from the 400ms
+                        // presenter tick — so the gate is correct the moment we
+                        // block, closing the dispatch→first-tick race.
+                        let outstanding_workers = session
+                            .worker_jobs
+                            .lock()
+                            .map(|jobs| {
+                                jobs.iter()
+                                    .filter(|w| !matches!(w.status().as_str(), "done" | "failed"))
+                                    .count()
+                            })
+                            .unwrap_or(0);
+                        // Gate #2 (worker-resume review): also take the poll path
+                        // whenever this session is ATTACHED to a worker — even a
+                        // FINISHED one under review (outstanding_workers == 0). In
+                        // review mode the presenter still streams rows above the
+                        // prompt; the poll loop's dirty-repaint (take_idle_prompt_dirty)
+                        // keeps the prompt line alive, whereas the plain rustyline read
+                        // gets its prompt clobbered by those writes. `attached` is
+                        // Some(worker_id) exactly in that resume/review window.
+                        let attached_to_worker = session
+                            .attached
+                            .lock()
+                            .map(|a| a.is_some())
+                            .unwrap_or(false);
+                        crate::editor::set_background_pending(
+                            outstanding_workers > 0 || attached_to_worker,
+                        );
+                        // Pre-fill with any mid-turn text the operator had typed but
+                        // not submitted when the last turn ended, so their in-progress
+                        // line survives the turn boundary instead of being cut off.
+                        match prefill.take() {
+                            Some(text) => editor.read_line_with_initial(&prompt, &text),
+                            None => editor.read_line(&prompt),
                         }
                     }
-                    // Gate the editor's interruptible poll path: if this
-                    // session has outstanding fanned-out workers, the idle read
-                    // must be woken hands-free the instant the last one finishes
-                    // and the presenter arms a resume (arm_resume_wake). Compute
-                    // the live outstanding count HERE — not from the 400ms
-                    // presenter tick — so the gate is correct the moment we
-                    // block, closing the dispatch→first-tick race.
-                    let outstanding_workers = session
-                        .worker_jobs
-                        .lock()
-                        .map(|jobs| {
-                            jobs.iter()
-                                .filter(|w| {
-                                    !matches!(w.status().as_str(), "done" | "failed")
-                                })
-                                .count()
-                        })
-                        .unwrap_or(0);
-                    // Gate #2 (worker-resume review): also take the poll path
-                    // whenever this session is ATTACHED to a worker — even a
-                    // FINISHED one under review (outstanding_workers == 0). In
-                    // review mode the presenter still streams rows above the
-                    // prompt; the poll loop's dirty-repaint (take_idle_prompt_dirty)
-                    // keeps the prompt line alive, whereas the plain rustyline read
-                    // gets its prompt clobbered by those writes. `attached` is
-                    // Some(worker_id) exactly in that resume/review window.
-                    let attached_to_worker = session
-                        .attached
-                        .lock()
-                        .map(|a| a.is_some())
-                        .unwrap_or(false);
-                    crate::editor::set_background_pending(
-                        outstanding_workers > 0 || attached_to_worker,
-                    );
-                    // Pre-fill with any mid-turn text the operator had typed but
-                    // not submitted when the last turn ended, so their in-progress
-                    // line survives the turn boundary instead of being cut off.
-                    match prefill.take() {
-                        Some(text) => editor.read_line_with_initial(&prompt, &text),
-                        None => editor.read_line(&prompt),
-                    }
-                }
                 },
             },
         };
@@ -921,7 +917,10 @@ pub async fn run(
                         // to the prompt cleanly.
                         crate::stream_cancel::with_cancel(
                             crate::rewrite::rewrite_to_command_streaming(
-                                &backend, &session, &intent, &mut on_text,
+                                &backend,
+                                &session,
+                                &intent,
+                                &mut on_text,
                             ),
                         )
                         .await
@@ -1000,7 +999,10 @@ pub async fn run(
                         // watcher — a new keystroke drops the future cleanly.
                         crate::stream_cancel::with_cancel(
                             crate::suggest::suggest_next_command_streaming(
-                                &backend, &session, &hint, &mut on_text,
+                                &backend,
+                                &session,
+                                &hint,
+                                &mut on_text,
                             ),
                         )
                         .await
@@ -1163,142 +1165,144 @@ pub async fn run(
                 'resume: loop {
                     reply = None;
                     pre_len = session.history.len();
-                {
-                    // Clone the attach-cursor handles up front so a mid-turn
-                    // Shift-Tab can cycle the operator's view WITHOUT touching
-                    // `&mut session` (the running turn borrows it exclusively).
-                    let cyc_workers = session.worker_jobs.clone();
-                    let cyc_attached = session.attached.clone();
-                    let cyc_review = session.attach_review_announced.clone();
-                    let mut confirm = confirm_tty;
-                    // Put stdin in cbreak for the turn so Shift-Tab is seen while
-                    // the model thinks / is mid tool-call. The RAII guard restores
-                    // cooked mode on drop; `confirm_tty` coordinates via the
-                    // keywatch gate so y/N prompts still echo + line-edit, and the
-                    // reader parks itself during `run_interactive` TTY hand-offs.
-                    // Hand the reader thread a direct Shift-Tab action bound to
-                    // cloned attach-cursor handles. It fires on the reader thread
-                    // itself, so cycling works even during a blocking/CPU-bound
-                    // stretch of the turn (heavy escalate/tool work) that never
-                    // yields to let `select!` drain the channel — the class of
-                    // "Shift-Tab does nothing while thinking/escalating/long tool
-                    // run" the channel-only path missed.
-                    let cb_workers = cyc_workers.clone();
-                    let cb_attached = cyc_attached.clone();
-                    let cb_review = cyc_review.clone();
-                    // TASK-299: clone the goal handle so a mid-turn Shift-Tab can
-                    // include the active `:goal` in the rotation (checked live at
-                    // press time — goal state can change during the turn).
-                    let cb_goal = session.goal.clone();
-                    let on_shift_tab: crate::keywatch::ShiftTabFn =
-                        std::sync::Arc::new(move || {
-                            let goal_active =
-                                cb_goal.as_ref().is_some_and(|g| g.is_active());
-                            cycle_worker_live(
-                                &cb_workers,
-                                &cb_attached,
-                                &cb_review,
-                                goal_active,
-                            );
-                        });
-                    // Mid-turn type-ahead is normally enabled only when the pinned
-                    // footer is active (so the typed line can be echoed into its
-                    // message row). Gate #1: on a short / non-footer terminal there
-                    // IS no message row, so opt into an INLINE affordance
-                    // (`\r\x1b[2K❯ …` above the stream) with AISH_MIDTURN_INLINE=1.
-                    // Escape hatch: AISH_MIDTURN_INPUT=0 disables mid-turn capture
-                    // entirely (legacy Shift-Tab-only reader).
-                    let midturn_input_enabled = std::env::var("AISH_MIDTURN_INPUT")
-                        .map(|v| v != "0")
-                        .unwrap_or(true);
-                    let midturn_inline_requested = std::env::var("AISH_MIDTURN_INLINE")
-                        .map(|v| v != "0" && !v.is_empty())
-                        .unwrap_or(false);
-                    // Inline only kicks in when there's no footer to paint into;
-                    // with a footer the (race-free) footer path always wins.
-                    let midturn_inline = midturn_inline_requested && !footer_active;
-                    let midturn_on =
-                        midturn_input_enabled && (footer_active || midturn_inline);
-                    let (mt_line_tx, mut mt_line_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<String>();
-                    let midturn_prompt = "\x1b[2m❯\x1b[0m ".to_string();
-                    // Shared carry-over slot for the line the operator is typing
-                    // but hasn't submitted — read back at teardown so a turn that
-                    // ends mid-word hands the text to the next prompt.
-                    let mt_partial = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-                    let midturn = midturn_on.then(|| crate::keywatch::MidturnCfg {
-                        line_tx: mt_line_tx,
-                        prompt: midturn_prompt.clone(),
-                        inline: midturn_inline,
-                        partial: mt_partial.clone(),
-                    });
-                    let mut keywatch =
-                        crate::keywatch::TurnKeyWatch::install(Some(on_shift_tab), midturn);
-                    // Prime the prompt sigil the moment the turn starts, so the
-                    // operator can SEE there is a prompt to type into (and Shift-Tab
-                    // to cycle workers) DURING thinking / tool-calls — not only after
-                    // the first keystroke. Route to the footer message row or the
-                    // inline path per gate. Cleared on turn teardown (keywatch guard).
-                    if midturn_on {
-                        if midturn_inline {
-                            crate::terminal::set_midturn_inline(&midturn_prompt, "");
-                        } else {
-                            crate::terminal::set_midturn_input(&midturn_prompt, "");
-                        }
-                    }
-                    let turn =
-                        engine::run_turn(&backend, &mut session, next_input.clone(), &mut confirm);
-                    tokio::pin!(turn);
-                    loop {
-                        tokio::select! {
-                            res = &mut turn => {
-                                match res {
-                                    Ok(text) => reply = Some(text),
-                                    Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e:#}"),
-                                }
-                                break;
-                            }
-                            _ = tokio::signal::ctrl_c() => {
-                                aborted = true;
-                                break;
-                            }
-                            Some(k) = keywatch.recv() => match k {
-                                // Shift-Tab pressed mid-turn. The reader thread's
-                                // direct callback (installed above) already ran
-                                // `cycle_worker_live`, so this branch just drains
-                                // the mirrored channel event to keep the receiver
-                                // empty — cycling here too would double-advance the
-                                // attach cursor. Kept so the branch stays wired for
-                                // any future mid-turn key that needs `&mut turn`
-                                // ownership the reader thread can't take.
-                                crate::keywatch::TurnKey::ShiftTab => {}
-                            },
-                        }
-                    }
-                    // Drain any type-ahead the operator queued during the turn,
-                    // in submission order, for the REPL to run next. Clear the
-                    // footer echo now that the turn (and its capture) is ending
-                    // (the guard's Drop also clears it — this is belt-and-braces).
-                    // Stop the reader FIRST: Drop joins the thread and restores
-                    // cooked termios, so (a) the partial mirror read below cannot
-                    // race a final keystroke, and (b) the tty is sane before the
-                    // next prompt read.
-                    drop(keywatch);
-                    while let Ok(l) = mt_line_rx.try_recv() {
-                        typeahead.push_back(l);
-                    }
-                    // Rescue a half-typed line. The operator was mid-word when the
-                    // turn finished — carry it into the next prompt (pre-filled,
-                    // cursor at end) instead of dropping it on the floor.
-                    if let Some(text) = mt_partial
-                        .lock()
-                        .ok()
-                        .and_then(|g| crate::keywatch::carry_over_partial(&g))
                     {
-                        prefill = Some(text);
+                        // Clone the attach-cursor handles up front so a mid-turn
+                        // Shift-Tab can cycle the operator's view WITHOUT touching
+                        // `&mut session` (the running turn borrows it exclusively).
+                        let cyc_workers = session.worker_jobs.clone();
+                        let cyc_attached = session.attached.clone();
+                        let cyc_review = session.attach_review_announced.clone();
+                        let mut confirm = confirm_tty;
+                        // Put stdin in cbreak for the turn so Shift-Tab is seen while
+                        // the model thinks / is mid tool-call. The RAII guard restores
+                        // cooked mode on drop; `confirm_tty` coordinates via the
+                        // keywatch gate so y/N prompts still echo + line-edit, and the
+                        // reader parks itself during `run_interactive` TTY hand-offs.
+                        // Hand the reader thread a direct Shift-Tab action bound to
+                        // cloned attach-cursor handles. It fires on the reader thread
+                        // itself, so cycling works even during a blocking/CPU-bound
+                        // stretch of the turn (heavy escalate/tool work) that never
+                        // yields to let `select!` drain the channel — the class of
+                        // "Shift-Tab does nothing while thinking/escalating/long tool
+                        // run" the channel-only path missed.
+                        let cb_workers = cyc_workers.clone();
+                        let cb_attached = cyc_attached.clone();
+                        let cb_review = cyc_review.clone();
+                        // TASK-299: clone the goal handle so a mid-turn Shift-Tab can
+                        // include the active `:goal` in the rotation (checked live at
+                        // press time — goal state can change during the turn).
+                        let cb_goal = session.goal.clone();
+                        let on_shift_tab: crate::keywatch::ShiftTabFn =
+                            std::sync::Arc::new(move || {
+                                let goal_active = cb_goal.as_ref().is_some_and(|g| g.is_active());
+                                cycle_worker_live(
+                                    &cb_workers,
+                                    &cb_attached,
+                                    &cb_review,
+                                    goal_active,
+                                );
+                            });
+                        // Mid-turn type-ahead is normally enabled only when the pinned
+                        // footer is active (so the typed line can be echoed into its
+                        // message row). Gate #1: on a short / non-footer terminal there
+                        // IS no message row, so opt into an INLINE affordance
+                        // (`\r\x1b[2K❯ …` above the stream) with AISH_MIDTURN_INLINE=1.
+                        // Escape hatch: AISH_MIDTURN_INPUT=0 disables mid-turn capture
+                        // entirely (legacy Shift-Tab-only reader).
+                        let midturn_input_enabled = std::env::var("AISH_MIDTURN_INPUT")
+                            .map(|v| v != "0")
+                            .unwrap_or(true);
+                        let midturn_inline_requested = std::env::var("AISH_MIDTURN_INLINE")
+                            .map(|v| v != "0" && !v.is_empty())
+                            .unwrap_or(false);
+                        // Inline only kicks in when there's no footer to paint into;
+                        // with a footer the (race-free) footer path always wins.
+                        let midturn_inline = midturn_inline_requested && !footer_active;
+                        let midturn_on = midturn_input_enabled && (footer_active || midturn_inline);
+                        let (mt_line_tx, mut mt_line_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<String>();
+                        let midturn_prompt = "\x1b[2m❯\x1b[0m ".to_string();
+                        // Shared carry-over slot for the line the operator is typing
+                        // but hasn't submitted — read back at teardown so a turn that
+                        // ends mid-word hands the text to the next prompt.
+                        let mt_partial = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+                        let midturn = midturn_on.then(|| crate::keywatch::MidturnCfg {
+                            line_tx: mt_line_tx,
+                            prompt: midturn_prompt.clone(),
+                            inline: midturn_inline,
+                            partial: mt_partial.clone(),
+                        });
+                        let mut keywatch =
+                            crate::keywatch::TurnKeyWatch::install(Some(on_shift_tab), midturn);
+                        // Prime the prompt sigil the moment the turn starts, so the
+                        // operator can SEE there is a prompt to type into (and Shift-Tab
+                        // to cycle workers) DURING thinking / tool-calls — not only after
+                        // the first keystroke. Route to the footer message row or the
+                        // inline path per gate. Cleared on turn teardown (keywatch guard).
+                        if midturn_on {
+                            if midturn_inline {
+                                crate::terminal::set_midturn_inline(&midturn_prompt, "");
+                            } else {
+                                crate::terminal::set_midturn_input(&midturn_prompt, "");
+                            }
+                        }
+                        let turn = engine::run_turn(
+                            &backend,
+                            &mut session,
+                            next_input.clone(),
+                            &mut confirm,
+                        );
+                        tokio::pin!(turn);
+                        loop {
+                            tokio::select! {
+                                res = &mut turn => {
+                                    match res {
+                                        Ok(text) => reply = Some(text),
+                                        Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e:#}"),
+                                    }
+                                    break;
+                                }
+                                _ = tokio::signal::ctrl_c() => {
+                                    aborted = true;
+                                    break;
+                                }
+                                Some(k) = keywatch.recv() => match k {
+                                    // Shift-Tab pressed mid-turn. The reader thread's
+                                    // direct callback (installed above) already ran
+                                    // `cycle_worker_live`, so this branch just drains
+                                    // the mirrored channel event to keep the receiver
+                                    // empty — cycling here too would double-advance the
+                                    // attach cursor. Kept so the branch stays wired for
+                                    // any future mid-turn key that needs `&mut turn`
+                                    // ownership the reader thread can't take.
+                                    crate::keywatch::TurnKey::ShiftTab => {}
+                                },
+                            }
+                        }
+                        // Drain any type-ahead the operator queued during the turn,
+                        // in submission order, for the REPL to run next. Clear the
+                        // footer echo now that the turn (and its capture) is ending
+                        // (the guard's Drop also clears it — this is belt-and-braces).
+                        // Stop the reader FIRST: Drop joins the thread and restores
+                        // cooked termios, so (a) the partial mirror read below cannot
+                        // race a final keystroke, and (b) the tty is sane before the
+                        // next prompt read.
+                        drop(keywatch);
+                        while let Ok(l) = mt_line_rx.try_recv() {
+                            typeahead.push_back(l);
+                        }
+                        // Rescue a half-typed line. The operator was mid-word when the
+                        // turn finished — carry it into the next prompt (pre-filled,
+                        // cursor at end) instead of dropping it on the floor.
+                        if let Some(text) = mt_partial
+                            .lock()
+                            .ok()
+                            .and_then(|g| crate::keywatch::carry_over_partial(&g))
+                        {
+                            prefill = Some(text);
+                        }
+                        crate::terminal::clear_midturn_input();
                     }
-                    crate::terminal::clear_midturn_input();
-                }
                     if aborted {
                         // A half-finished turn can leave a dangling tool_use with
                         // no tool_result — the next request would 400. Roll back
@@ -1405,282 +1409,446 @@ pub async fn run(
                     let voice_cfg = VoiceConfig::load();
                     let voice_silence_ms = voice_cfg.silence_ms;
 
-                    // --- Step 1: show the recording indicator. ----------------
-                    eprint!("\r\x1b[2m🎤 listening…  Ctrl-G: stop  Esc: cancel\x1b[0m\x1b[K");
-                    let _ = std::io::stderr().flush();
-
-                    // --- Step 2: query device rate (needed for resample). -----
-                    // Resolved through `voice_cfg` so the rate always describes the
-                    // SAME device step 4 opens — mixing the default device's
-                    // rate with a named device resamples by the wrong ratio.
-                    let src_rate = match capture::sample_rate_with_config(&voice_cfg) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            eprint!("\r\x1b[K");
-                            let _ = std::io::stderr().flush();
-                            eprintln!("voice: {e:#}");
-                            continue;
-                        }
-                    };
-
-                    // --- Step 3: create the stop channel. ---------------------
-                    let (stop_tx, stop_rx) =
-                        tokio::sync::oneshot::channel::<capture::StopAction>();
-
-                    // --- Step 4: start audio capture on a blocking thread. ----
-                    // TASK-368: honour `voice.device`. `record_until_stop_with_config`
-                    // falls back to the system default (with a stderr warning) when
-                    // the named device is absent — never a hard failure.
-                    let capture_cfg = voice_cfg.clone();
-                    let capture_handle = tokio::task::spawn_blocking(move || {
-                        capture::record_until_stop_with_config(stop_rx, &capture_cfg)
-                    });
-
-                    // --- Step 5: read the stop key on a blocking thread. ------
-                    // Uses poll() with a shutdown flag to avoid leaving an orphaned
-                    // thread blocked in event::read() that would steal user keystrokes
-                    // if the silence timeout fires first.
-                    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let shutdown_for_thread = std::sync::Arc::clone(&shutdown);
-
-                    let key_handle =
-                        tokio::task::spawn_blocking(move || -> anyhow::Result<capture::StopAction> {
-                            crossterm::terminal::enable_raw_mode()?;
-                            let result = loop {
-                                if shutdown_for_thread.load(std::sync::atomic::Ordering::Relaxed) {
-                                    break capture::StopAction::Stop;
-                                }
-                                match crossterm::event::poll(std::time::Duration::from_millis(50)) {
-                                    Ok(true) => {
-                                        if let Ok(Event::Key(key)) = crossterm::event::read() {
-                                            match (key.code, key.modifiers.contains(KeyModifiers::CONTROL)) {
-                                                (KeyCode::Char('g'), true) => {
-                                                    break capture::StopAction::Stop;
-                                                }
-                                                (KeyCode::Esc, _) => {
-                                                    break capture::StopAction::Cancel;
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                    }
-                                    Ok(false) => {
-                                        // poll timeout; loop to check shutdown flag
-                                    }
-                                    Err(_) => {
-                                        // poll error; exit cleanly
-                                        break capture::StopAction::Cancel;
-                                    }
-                                }
-                            };
-                            let _ = crossterm::terminal::disable_raw_mode();
-                            Ok(result)
-                        });
-
-                    // --- Step 6: race key vs silence-timeout. -----------------
-                    let stop_action = tokio::select! {
-                        res = key_handle => {
-                            res.unwrap_or_else(|e| {
-                                tracing::warn!("voice: key reader task panicked: {e}");
-                                Ok(capture::StopAction::Cancel)
-                            })
-                            .unwrap_or(capture::StopAction::Cancel)
-                        }
-                        _ = tokio::time::sleep(
-                            std::time::Duration::from_millis(voice_silence_ms)
-                        ) => {
-                            // Signal the key reader thread to shut down cleanly.
-                            // It will restore raw mode before exiting.
-                            shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-                            capture::StopAction::Stop
-                        }
-                    };
-
-                    // --- Step 7: send the stop signal, clear indicator. -------
-                    let _ = stop_tx.send(stop_action);
-                    eprint!("\r\x1b[K");
-                    let _ = std::io::stderr().flush();
-
-                    // --- Step 8: user cancelled → drop capture, re-prompt. ---
-                    if stop_action == capture::StopAction::Cancel {
-                        drop(capture_handle);
+                    // ── Ctrl-S: voice-mode TOGGLE ──────────────────────────
+                    // Ctrl-S no longer captures a single utterance — it flips a
+                    // persistent listening mode whose bit lives on the editor
+                    // (so the prompt and any other reader can see it). OFF →
+                    // announce and go back to the prompt; ON → fall into the
+                    // listen loop below and keep capturing until the operator
+                    // toggles off, a command is accepted, or the idle guard trips.
+                    let voice_mode = editor.voice_mode();
+                    let activation_word = voice_cfg.activation_word.clone();
+                    if !editor.toggle_voice_mode() {
+                        println!(
+                            "{}",
+                            crate::voice_activation::banner(false, &activation_word)
+                        );
                         continue;
                     }
+                    println!(
+                        "{}",
+                        crate::voice_activation::banner(true, &activation_word)
+                    );
 
-                    // --- Step 9: await capture result. ------------------------
-                    let samples = match capture_handle.await {
-                        Ok(Ok(s)) => s,
-                        Ok(Err(e)) => {
-                            use capture::CaptureError;
-                            if e.downcast_ref::<CaptureError>()
-                                .map_or(false, |ce| matches!(ce, CaptureError::Cancelled))
-                            {
-                                continue; // clean cancel via channel
-                            }
-                            eprintln!("voice: {e:#}");
-                            continue;
+                    // Consecutive captures that produced no command. Bounds any
+                    // pathological spin (dead mic, a room that never goes quiet)
+                    // instead of burning the CPU until someone notices.
+                    let mut idle_rounds: u32 = 0;
+
+                    'listen: loop {
+                        if !voice_mode.is_on() {
+                            break 'listen;
                         }
-                        Err(e) => {
-                            eprintln!("voice: capture task panicked: {e}");
-                            continue;
+                        if crate::voice_activation::should_auto_disable(idle_rounds) {
+                            voice_mode.turn_off();
+                            println!(
+                                "\x1b[2mvoice: nothing heard in {idle_rounds} captures — \
+                                 voice mode off\x1b[0m"
+                            );
+                            break 'listen;
                         }
-                    };
+                        idle_rounds += 1;
 
-                    // --- Step 9b: keep a copy for the hosted-STT fallback. ----
-                    // `samples` is moved into the blocking transcribe task
-                    // below, so the TASK-370 fallback needs its own copy — but
-                    // only when the user actually opted in, so the default
-                    // path pays nothing.
-                    #[cfg(feature = "voice-api")]
-                    let remote_samples: Option<Vec<f32>> = if voice_cfg.enable_remote_stt {
-                        Some(samples.clone())
-                    } else {
-                        None
-                    };
+                        // --- Step 1: show the recording indicator. ----------------
+                        eprint!("\r\x1b[2m🎤 listening…  Ctrl-G: stop  Esc: cancel\x1b[0m\x1b[K");
+                        let _ = std::io::stderr().flush();
 
-
-                    // --- Step 10: show transcription spinner. -----------------
-                    eprint!("\r\x1b[2m⌛ transcribing…\x1b[0m\x1b[K");
-                    let _ = std::io::stderr().flush();
-
-                    // --- Step 11: await model download (fast when cached). ----
-                    // TASK-368: honour `voice.model` (default `tiny.en`).
-                    let model_path = match model::ensure_model(&voice_cfg.model).await {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprint!("\r\x1b[K");
-                            let _ = std::io::stderr().flush();
-                            eprintln!("voice: {e:#}");
-                            continue;
-                        }
-                    };
-
-                    // --- Step 12: resample + transcribe in spawn_blocking. ----
-                    // Both are CPU-bound; running on the blocking thread pool
-                    // keeps the tokio worker thread free for other I/O.
-                    // TASK-368: honour `voice.language` as the Whisper decode hint
-                    // (empty string → Whisper auto-detect).
-                    let stt_language = voice_cfg.language.clone();
-                    let transcript_result =
-                        tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-                            let pcm = resample::to_whisper_pcm(&samples, src_rate)?;
-                            if pcm.is_empty() {
-                                return Ok(String::new());
-                            }
-                            let mut t = stt::Transcriber::new(&model_path)
-                                .with_language(stt_language);
-                            t.transcribe(&pcm)
-                        })
-                        .await;
-
-                    eprint!("\r\x1b[K");
-                    let _ = std::io::stderr().flush();
-
-                    // --- Step 13: extract transcript text. -------------------
-                    // TASK-370: a local MISS — either an error or an empty
-                    // transcript — is the trigger for the optional hosted
-                    // fallback.  `None` here means "nothing usable from the
-                    // local pass"; with `voice-api` off (or the user not opted
-                    // in) the behaviour is byte-identical to local-only.
-                    let local_text: Option<String> = match transcript_result {
-                        Ok(Ok(t)) => Some(t.trim().to_string()),
-                        Ok(Err(e)) => {
-                            eprintln!("voice: {e:#}");
-                            None
-                        }
-                        Err(e) => {
-                            eprintln!("voice: transcribe task panicked: {e}");
-                            None
-                        }
-                    };
-
-                    // --- Step 13b: hosted-STT fallback (TASK-370). -----------
-                    // Consulted ONLY when local STT produced nothing usable and
-                    // `voice.enable_remote_stt = true`.  A hosted failure is
-                    // never fatal: we log it and keep the local result.
-                    #[cfg(feature = "voice-api")]
-                    let local_text = match local_text {
-                        // Local succeeded — the hosted path is not touched, so
-                        // an opted-in user still pays $0 on the happy path.
-                        Some(t) if !t.is_empty() => Some(t),
-                        miss => match remote_samples {
-                            Some(samples) => {
-                                eprint!("\r\x1b[2m☁ transcribing (hosted)…\x1b[0m\x1b[K");
-                                let _ = std::io::stderr().flush();
-                                let client = openai_stt::OpenAiStt::from_config(&voice_cfg);
-                                let remote = client.transcribe(&samples, src_rate).await;
+                        // --- Step 2: query device rate (needed for resample). -----
+                        // Resolved through `voice_cfg` so the rate always describes the
+                        // SAME device step 4 opens — mixing the default device's
+                        // rate with a named device resamples by the wrong ratio.
+                        let src_rate = match capture::sample_rate_with_config(&voice_cfg) {
+                            Ok(r) => r,
+                            Err(e) => {
                                 eprint!("\r\x1b[K");
                                 let _ = std::io::stderr().flush();
-                                match remote {
-                                    Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
-                                    Ok(_) => miss,
-                                    Err(e) => {
-                                        tracing::warn!("voice: hosted STT failed: {e}");
-                                        eprintln!(
-                                            "\x1b[2mvoice: hosted STT unavailable ({e}) \
+                                eprintln!("voice: {e:#}");
+                                // Hard failure (no device, no model, capture died):
+                                // leave voice mode instead of re-arming into the same
+                                // error twenty times over.
+                                voice_mode.turn_off();
+                                break 'listen;
+                            }
+                        };
+
+                        // --- Step 3: create the stop channel. ---------------------
+                        let (stop_tx, stop_rx) =
+                            tokio::sync::oneshot::channel::<capture::StopAction>();
+
+                        // --- Step 4: start audio capture on a blocking thread. ----
+                        // TASK-368: honour `voice.device`. `record_until_stop_with_config`
+                        // falls back to the system default (with a stderr warning) when
+                        // the named device is absent — never a hard failure.
+                        let capture_cfg = voice_cfg.clone();
+                        let capture_handle = tokio::task::spawn_blocking(move || {
+                            capture::record_until_stop_with_config(stop_rx, &capture_cfg)
+                        });
+
+                        // --- Step 5: read the stop key on a blocking thread. ------
+                        // Uses poll() with a shutdown flag to avoid leaving an orphaned
+                        // thread blocked in event::read() that would steal user keystrokes
+                        // if the silence timeout fires first.
+                        let shutdown =
+                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let shutdown_for_thread = std::sync::Arc::clone(&shutdown);
+
+                        let key_handle = tokio::task::spawn_blocking(
+                            move || -> anyhow::Result<capture::StopAction> {
+                                crossterm::terminal::enable_raw_mode()?;
+                                let result = loop {
+                                    if shutdown_for_thread
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        break capture::StopAction::Stop;
+                                    }
+                                    match crossterm::event::poll(std::time::Duration::from_millis(
+                                        50,
+                                    )) {
+                                        Ok(true) => {
+                                            if let Ok(Event::Key(key)) = crossterm::event::read() {
+                                                match (
+                                                    key.code,
+                                                    key.modifiers.contains(KeyModifiers::CONTROL),
+                                                ) {
+                                                    (KeyCode::Char('g'), true) => {
+                                                        break capture::StopAction::Stop;
+                                                    }
+                                                    (KeyCode::Esc, _) => {
+                                                        break capture::StopAction::Cancel;
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+                                        Ok(false) => {
+                                            // poll timeout; loop to check shutdown flag
+                                        }
+                                        Err(_) => {
+                                            // poll error; exit cleanly
+                                            break capture::StopAction::Cancel;
+                                        }
+                                    }
+                                };
+                                let _ = crossterm::terminal::disable_raw_mode();
+                                Ok(result)
+                            },
+                        );
+
+                        // --- Step 6: race key vs silence-timeout. -----------------
+                        let stop_action = tokio::select! {
+                            res = key_handle => {
+                                res.unwrap_or_else(|e| {
+                                    tracing::warn!("voice: key reader task panicked: {e}");
+                                    Ok(capture::StopAction::Cancel)
+                                })
+                                .unwrap_or(capture::StopAction::Cancel)
+                            }
+                            _ = tokio::time::sleep(
+                                std::time::Duration::from_millis(voice_silence_ms)
+                            ) => {
+                                // Signal the key reader thread to shut down cleanly.
+                                // It will restore raw mode before exiting.
+                                shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+                                capture::StopAction::Stop
+                            }
+                        };
+
+                        // --- Step 7: send the stop signal, clear indicator. -------
+                        let _ = stop_tx.send(stop_action);
+                        eprint!("\r\x1b[K");
+                        let _ = std::io::stderr().flush();
+
+                        // --- Step 8: user cancelled → drop capture, re-prompt. ---
+                        if stop_action == capture::StopAction::Cancel {
+                            drop(capture_handle);
+                            // Esc is the operator's "stop listening" key: cancel this
+                            // utterance AND leave voice mode, otherwise the loop would
+                            // re-arm the mic immediately with no way out.
+                            voice_mode.turn_off();
+                            println!(
+                                "{}",
+                                crate::voice_activation::banner(false, &activation_word)
+                            );
+                            break 'listen;
+                        }
+
+                        // --- Step 9: await capture result. ------------------------
+                        let samples = match capture_handle.await {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(e)) => {
+                                use capture::CaptureError;
+                                if e.downcast_ref::<CaptureError>()
+                                    .map_or(false, |ce| matches!(ce, CaptureError::Cancelled))
+                                {
+                                    continue; // clean cancel via channel
+                                }
+                                eprintln!("voice: {e:#}");
+                                // Hard failure (no device, no model, capture died):
+                                // leave voice mode instead of re-arming into the same
+                                // error twenty times over.
+                                voice_mode.turn_off();
+                                break 'listen;
+                            }
+                            Err(e) => {
+                                eprintln!("voice: capture task panicked: {e}");
+                                continue;
+                            }
+                        };
+
+                        // --- Step 9b: keep a copy for the hosted-STT fallback. ----
+                        // `samples` is moved into the blocking transcribe task
+                        // below, so the TASK-370 fallback needs its own copy — but
+                        // only when the user actually opted in, so the default
+                        // path pays nothing.
+                        #[cfg(feature = "voice-api")]
+                        let remote_samples: Option<Vec<f32>> = if voice_cfg.enable_remote_stt {
+                            Some(samples.clone())
+                        } else {
+                            None
+                        };
+
+                        // --- Step 10: show transcription spinner. -----------------
+                        eprint!("\r\x1b[2m⌛ transcribing…\x1b[0m\x1b[K");
+                        let _ = std::io::stderr().flush();
+
+                        // --- Step 11: await model download (fast when cached). ----
+                        // TASK-368: honour `voice.model` (default `tiny.en`).
+                        let model_path = match model::ensure_model(&voice_cfg.model).await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprint!("\r\x1b[K");
+                                let _ = std::io::stderr().flush();
+                                eprintln!("voice: {e:#}");
+                                // Hard failure (no device, no model, capture died):
+                                // leave voice mode instead of re-arming into the same
+                                // error twenty times over.
+                                voice_mode.turn_off();
+                                break 'listen;
+                            }
+                        };
+
+                        // --- Step 12: resample + transcribe in spawn_blocking. ----
+                        // Both are CPU-bound; running on the blocking thread pool
+                        // keeps the tokio worker thread free for other I/O.
+                        // TASK-368: honour `voice.language` as the Whisper decode hint
+                        // (empty string → Whisper auto-detect).
+                        let stt_language = voice_cfg.language.clone();
+                        let transcript_result =
+                            tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                                let pcm = resample::to_whisper_pcm(&samples, src_rate)?;
+                                if pcm.is_empty() {
+                                    return Ok(String::new());
+                                }
+                                let mut t =
+                                    stt::Transcriber::new(&model_path).with_language(stt_language);
+                                t.transcribe(&pcm)
+                            })
+                            .await;
+
+                        eprint!("\r\x1b[K");
+                        let _ = std::io::stderr().flush();
+
+                        // --- Step 13: extract transcript text. -------------------
+                        // TASK-370: a local MISS — either an error or an empty
+                        // transcript — is the trigger for the optional hosted
+                        // fallback.  `None` here means "nothing usable from the
+                        // local pass"; with `voice-api` off (or the user not opted
+                        // in) the behaviour is byte-identical to local-only.
+                        let local_text: Option<String> = match transcript_result {
+                            Ok(Ok(t)) => Some(t.trim().to_string()),
+                            Ok(Err(e)) => {
+                                eprintln!("voice: {e:#}");
+                                None
+                            }
+                            Err(e) => {
+                                eprintln!("voice: transcribe task panicked: {e}");
+                                None
+                            }
+                        };
+
+                        // --- Step 13b: hosted-STT fallback (TASK-370). -----------
+                        // Consulted ONLY when local STT produced nothing usable and
+                        // `voice.enable_remote_stt = true`.  A hosted failure is
+                        // never fatal: we log it and keep the local result.
+                        #[cfg(feature = "voice-api")]
+                        let local_text = match local_text {
+                            // Local succeeded — the hosted path is not touched, so
+                            // an opted-in user still pays $0 on the happy path.
+                            Some(t) if !t.is_empty() => Some(t),
+                            miss => match remote_samples {
+                                Some(samples) => {
+                                    eprint!("\r\x1b[2m☁ transcribing (hosted)…\x1b[0m\x1b[K");
+                                    let _ = std::io::stderr().flush();
+                                    let client = openai_stt::OpenAiStt::from_config(&voice_cfg);
+                                    let remote = client.transcribe(&samples, src_rate).await;
+                                    eprint!("\r\x1b[K");
+                                    let _ = std::io::stderr().flush();
+                                    match remote {
+                                        Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
+                                        Ok(_) => miss,
+                                        Err(e) => {
+                                            tracing::warn!("voice: hosted STT failed: {e}");
+                                            eprintln!(
+                                                "\x1b[2mvoice: hosted STT unavailable ({e}) \
                                              — falling back to local\x1b[0m"
-                                        );
-                                        miss
+                                            );
+                                            miss
+                                        }
                                     }
                                 }
+                                None => miss,
+                            },
+                        };
+
+                        // No usable transcript from either backend → back to Idle
+                        // without touching the line buffer (design decision D3).
+                        let Some(text) = local_text else {
+                            continue;
+                        };
+
+                        if text.is_empty() {
+                            // Silence-only capture — no-op hint, back to Idle.
+                            eprintln!("\x1b[2mvoice: (no speech detected)\x1b[0m");
+                            continue;
+                        }
+
+                        // --- Step 14: activation word gate ----------------------
+                        // Voice mode hears the whole ROOM, so a transcript is not a
+                        // command until it addresses the shell. `match_activation`
+                        // makes that call; anything not addressed to us is shown
+                        // dimmed (proof the mic works) and executes nothing.
+                        let spoken = match crate::voice_activation::match_activation(
+                            &text,
+                            &activation_word,
+                        ) {
+                            crate::voice_activation::Activation::Command(cmd) => cmd,
+                            crate::voice_activation::Activation::Bare => {
+                                println!("\x1b[2m🎤 {activation_word}? — say a command\x1b[0m");
+                                continue;
                             }
-                            None => miss,
-                        },
-                    };
+                            crate::voice_activation::Activation::Ignored => {
+                                println!("\x1b[2m🎤 (ignored) {text}\x1b[0m");
+                                continue;
+                            }
+                        };
 
-                    // No usable transcript from either backend → back to Idle
-                    // without touching the line buffer (design decision D3).
-                    let Some(text) = local_text else {
-                        continue;
-                    };
+                        // A real command — reset the idle guard.
+                        idle_rounds = 0;
+                        println!("\x1b[2m🎤\x1b[0m {spoken}");
 
-                    if text.is_empty() {
-                        // Silence-only capture — no-op hint, back to Idle.
-                        eprintln!("\x1b[2mvoice: (no speech detected)\x1b[0m");
-                        continue;
-                    }
+                        // --- Step 15: LLM verification --------------------------
+                        // A tiny local STT model mangles IDENTIFIERS while keeping the
+                        // sentence grammatical ("git push origin main" → "get push
+                        // origin mane"). Running that blind is how a voice shell
+                        // deletes something, so the candidate goes through the
+                        // interactive model for repair before the operator sees it.
+                        let label = "verifying…";
+                        let mut vpreview = crate::stream_render::LivePreview::new(
+                            label,
+                            crate::stream_render::preview_width(5 + label.chars().count()),
+                        );
+                        print!("{}", crate::stream_render::frame(label, ""));
+                        std::io::stdout().flush().ok();
+                        let verified = {
+                            let mut on_text = |t: &str| {
+                                if let Some(fr) = vpreview.push(t) {
+                                    print!("{fr}");
+                                    std::io::stdout().flush().ok();
+                                }
+                            };
+                            crate::stream_cancel::with_cancel(
+                                crate::voice::verify::verify_transcript(
+                                    &backend,
+                                    &session,
+                                    &spoken,
+                                    &mut on_text,
+                                ),
+                            )
+                            .await
+                        };
+                        print!("{}", crate::stream_render::CLEAR_LINE);
+                        std::io::stdout().flush().ok();
 
-                    // --- Step 14a: autosubmit path (TASK-368). ----------------
-                    // `voice.autosubmit = true` dispatches the transcript straight
-                    // through the normal routing path — no confirmation prompt.
-                    // Opt-in only; the default (`false`) keeps design decision D3
-                    // (review-before-send) intact.
-                    if voice_cfg.autosubmit {
-                        println!("\x1b[2m🎤\x1b[0m {text}");
-                        injected = Some(text);
-                        continue;
-                    }
+                        // Degrade to the RAW transcript when verification is
+                        // cancelled, errors, or comes back unusable — showing the
+                        // operator what we heard beats dropping their utterance.
+                        let candidate = match verified {
+                            crate::stream_cancel::StreamOutcome::Cancelled => {
+                                println!("\x1b[33m^C\x1b[0m verification cancelled");
+                                spoken.clone()
+                            }
+                            crate::stream_cancel::StreamOutcome::Done(Ok(Some(c))) => c,
+                            crate::stream_cancel::StreamOutcome::Done(Ok(None)) => {
+                                println!(
+                                    "\x1b[2m  couldn't make that out — showing the raw transcript\x1b[0m"
+                                );
+                                spoken.clone()
+                            }
+                            crate::stream_cancel::StreamOutcome::Done(Err(e)) => {
+                                eprintln!("\x1b[31maish:\x1b[0m voice verification failed: {e:#}");
+                                spoken.clone()
+                            }
+                        };
 
-                    // --- Step 14b: insert into line buffer via read_line_with_initial.
-                    // The user sees the transcript pre-filled in the prompt, can
-                    // edit it, and presses Enter to dispatch.  Default path — never
-                    // auto-submits (design decision D3 from SPR-068 design doc).
-                    let voice_outcome = editor.read_line_with_initial(&prompt, &text);
-                    match voice_outcome {
-                        ReadOutcome::Line(line) => {
-                            let line = line.trim().to_string();
-                            if !line.is_empty() {
-                                // Route through the normal dispatch path (history,
-                                // routing, AI turn) exactly as if typed.
+                        // --- Step 16: operator confirmation --------------------
+                        // Enter runs it, edits are honoured, Ctrl-C discards. Nothing
+                        // executes unconfirmed (design decision D3) — `voice.autosubmit`
+                        // is deliberately NOT honoured here: an open mic plus
+                        // auto-dispatch is the one combination that can run a
+                        // mis-transcription with no human in the loop.
+                        println!(
+                            "\x1b[2m  verify — Enter to run, edit it, or Ctrl-C to discard:\x1b[0m"
+                        );
+                        match editor.read_line_with_initial(&prompt, &candidate) {
+                            ReadOutcome::Line(line) => {
+                                let line = line.trim().to_string();
+                                if line.is_empty() {
+                                    continue;
+                                }
+                                // Accepted. Leave voice mode so the dispatched command
+                                // owns the terminal and a hot mic can't stack a second
+                                // command behind it; Ctrl-S re-arms.
+                                voice_mode.turn_off();
                                 injected = Some(line);
+                                break 'listen;
+                            }
+                            ReadOutcome::Interrupted => {
+                                // Discarded this one, still listening — "say it again".
+                                println!("\x1b[33m^C\x1b[0m discarded — still listening");
+                                continue;
+                            }
+                            ReadOutcome::Voice => {
+                                // Ctrl-S while confirming means "stop listening".
+                                voice_mode.turn_off();
+                                println!(
+                                    "{}",
+                                    crate::voice_activation::banner(false, &activation_word)
+                                );
+                                break 'listen;
+                            }
+                            ReadOutcome::CtrlO => {
+                                toggle_raw_output(&mut session);
+                                continue;
+                            }
+                            ReadOutcome::ShiftTab => {
+                                if cycle_worker(&mut session) {
+                                    needs_gap = true;
+                                }
+                                continue;
+                            }
+                            // Ctrl-D while confirming leaves voice mode rather than
+                            // exiting the shell: the operator is cancelling the
+                            // utterance, not ending the session.
+                            ReadOutcome::Eof => {
+                                voice_mode.turn_off();
+                                break 'listen;
+                            }
+                            ReadOutcome::Error(e) => {
+                                eprintln!("aish: readline error: {e}");
+                                voice_mode.turn_off();
+                                break 'listen;
                             }
                         }
-                        ReadOutcome::Voice => {
-                            // Ctrl-G pressed while editing the pre-filled transcript
-                            // — discard the pre-fill and loop; the outer Voice arm
-                            // will fire again on the next iteration.
-                        }
-                        ReadOutcome::Interrupted => {
-                            // Ctrl-C while editing — cancel; buffer untouched.
-                        }
-                        ReadOutcome::CtrlO => toggle_raw_output(&mut session),
-                        ReadOutcome::ShiftTab => {
-                            if cycle_worker(&mut session) {
-                                needs_gap = true;
-                            }
-                        }
-                        ReadOutcome::Eof => break,
-                        ReadOutcome::Error(e) => eprintln!("aish: readline error: {e}"),
                     }
                     continue;
                 }
@@ -1698,7 +1866,7 @@ pub async fn run(
                 interrupt_attached_worker(&session);
                 continue;
             }
-            ReadOutcome::Eof => break,            // Ctrl-D: exit
+            ReadOutcome::Eof => break, // Ctrl-D: exit
             ReadOutcome::Error(e) => {
                 eprintln!("aish: readline error: {e}");
                 break;
@@ -1915,7 +2083,6 @@ fn statusline_segments(
     out
 }
 
-
 fn coordinator_status_message(session: &Session) -> String {
     let attached = session.attached.lock().unwrap().clone();
     // Same ordering as `cycle_worker`: newest coordinator first (spawn order
@@ -2093,7 +2260,7 @@ fn coordinator_status_line(
     workers: &[(String, bool, String)],
     color_on: bool,
 ) -> String {
-    use crate::style::{paint_with, Color};
+    use crate::style::{Color, paint_with};
     let n = workers.len();
     match attached {
         // Detached: back at the interactive prompt. Show the cycle hint on the
@@ -2239,7 +2406,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
         "attach",
         "watch + steer a coordinator, or `goal` to watch the goal",
     ),
-    ("backend", "switch backend (claude|grok|openai|openrouter|local)"),
+    (
+        "backend",
+        "switch backend (claude|grok|openai|openrouter|local)",
+    ),
     ("batch", "background batch mode (on|off|status)"),
     (
         "close",
@@ -2266,7 +2436,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("loop", "re-run a prompt N times inline (status|stop)"),
     ("mcp", "manage MCP servers"),
     ("memories", "stored memories / organize"),
-    ("metrics", "coordinator pulse event counts (broadcast subscriber)"),
+    (
+        "metrics",
+        "coordinator pulse event counts (broadcast subscriber)",
+    ),
     ("mode", "set confirmation level"),
     ("model", "switch model (opus|sonnet|haiku)"),
     ("model-detect", "pick the best local model for this machine"),
@@ -2274,7 +2447,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("output", "stream coordinators' activity (on|off)"),
     ("plugin", "plugin provenance (list|info <id>)"),
     ("quit", "exit aish"),
-    ("reasoning", "show reasoning-quality telemetry (escalate vs guess)"),
+    (
+        "reasoning",
+        "show reasoning-quality telemetry (escalate vs guess)",
+    ),
     (
         "remember",
         "capture a rich, context-enriched memory from a short note",
@@ -3137,10 +3313,9 @@ const NUMERIC_ARG_COMMANDS: &[&str] = &[
 /// ("now", "all", "clean") and the ambiguous lead words themselves ("who",
 /// "what"). Surface-form stopgap; superseded by model route preview (S5/S6).
 const ENGLISH_FUNCTION_WORDS: &[&str] = &[
-    "a", "an", "the", "for", "to", "of", "that", "this", "these", "those", "is",
-    "are", "was", "were", "did", "does", "so", "please", "about", "into",
-    "from", "with", "and", "then", "than", "why", "how", "when", "where",
-    "which", "your", "our", "its",
+    "a", "an", "the", "for", "to", "of", "that", "this", "these", "those", "is", "are", "was",
+    "were", "did", "does", "so", "please", "about", "into", "from", "with", "and", "then", "than",
+    "why", "how", "when", "where", "which", "your", "our", "its",
 ];
 
 fn looks_like_prose(line: &str, words: &[String]) -> bool {
@@ -3189,7 +3364,8 @@ fn looks_like_prose(line: &str, words: &[String]) -> bool {
     // function word ("for"/"the"/"did"/"is"/…), read it as narration → model.
     // This routes the reported line to the AI while keeping real multi-arg
     // calls like `make clean_all install` (no function word) dispatching direct.
-    let is_cmd_syntax = |w: &str| w.starts_with('-') || w.contains(['/', '.', ':', '~', '*', '?', '[']);
+    let is_cmd_syntax =
+        |w: &str| w.starts_with('-') || w.contains(['/', '.', ':', '~', '*', '?', '[']);
     let has_cmd_syntax = trimmed.iter().any(|w| is_cmd_syntax(w));
     let has_function_word = trimmed
         .iter()
@@ -3585,7 +3761,9 @@ fn builtin_pwd(session: &Session) {
 fn builtin_login(name: Option<&str>) {
     let Some(name) = name else {
         eprintln!("login: usage: login <plugin-id>");
-        eprintln!("  routes to the plugin declaring \"provides\": {{ \"login\": \"<plugin-id>\" }}");
+        eprintln!(
+            "  routes to the plugin declaring \"provides\": {{ \"login\": \"<plugin-id>\" }}"
+        );
         return;
     };
     let plugins_dir = crate::plugins::default_plugins_dir();
@@ -3604,7 +3782,11 @@ fn builtin_login(name: Option<&str>) {
                 "  reference it as ${{profile:{name}}} in this plugin's .mcp.json, \
                  or read $AISH_PROFILE_{} in its lifecycle hooks",
                 name.chars()
-                    .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+                    .map(|c| if c.is_ascii_alphanumeric() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        '_'
+                    })
                     .collect::<String>()
             );
         }
@@ -4150,9 +4332,9 @@ fn duplicate_dispatch<'a>(
     if window.is_zero() {
         return None;
     }
-    recent.get(&task_hash(task)).and_then(|(id, when)| {
-        (now.duration_since(*when) < window).then_some(id.as_str())
-    })
+    recent
+        .get(&task_hash(task))
+        .and_then(|(id, when)| (now.duration_since(*when) < window).then_some(id.as_str()))
 }
 
 /// TASK-280: goal-aware next-task routing for a task-less `:dispatch`. When the
@@ -4194,9 +4376,11 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
     }
     let no_credential = match session.backend_kind.as_str() {
         "grok" => !crate::backend::grok::credential_available(&session.env),
-        "openai" | "openrouter" => !crate::backend::openai::provider_for_kind(&session.backend_kind)
-            .map(|p| crate::backend::openai::credential_available(p, &session.env))
-            .unwrap_or(false),
+        "openai" | "openrouter" => {
+            !crate::backend::openai::provider_for_kind(&session.backend_kind)
+                .map(|p| crate::backend::openai::credential_available(p, &session.env))
+                .unwrap_or(false)
+        }
         _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
     };
     if no_credential {
@@ -4311,7 +4495,12 @@ fn print_escalation_banner(short: &str) {
     }
     // Liftoff frames: a flat arrow tilts upward, then curls into the final
     // curve-up emoji — reads as the escalated work taking off.
-    const FRAMES: &[&str] = &["\u{2192}", "\u{2197}", "\u{2b06}\u{fe0f}", "\u{2934}\u{fe0f}"];
+    const FRAMES: &[&str] = &[
+        "\u{2192}",
+        "\u{2197}",
+        "\u{2b06}\u{fe0f}",
+        "\u{2934}\u{fe0f}",
+    ];
     let mut out = std::io::stdout();
     for frame in FRAMES {
         let _ = write!(out, "\r\x1b[2K\x1b[1;33m{frame}{body}");
@@ -4322,7 +4511,6 @@ fn print_escalation_banner(short: &str) {
     let _ = writeln!(out);
     let _ = out.flush();
 }
-
 
 fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
     let Dispatched { id, message } = dispatch_coordinator(task, session);
@@ -4376,7 +4564,13 @@ fn collect_worker_rows(session: &Session) -> Vec<crate::workers_modal::WorkerRow
             s
         }
     };
-    let mut in_mem: Vec<_> = session.worker_jobs.lock().unwrap().iter().cloned().collect();
+    let mut in_mem: Vec<_> = session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect();
     in_mem.sort_by(|a, b| b.started_epoch().cmp(&a.started_epoch())); // newest-first
     let mut rows: Vec<crate::workers_modal::WorkerRow> = in_mem
         .iter()
@@ -4420,7 +4614,11 @@ fn collect_worker_rows(session: &Session) -> Vec<crate::workers_modal::WorkerRow
                         continue;
                     };
                     if visible.contains(parent) && !visible.contains(&r.run_id) {
-                        rows.push(durable_worker_row(r, session.session_id.as_str(), now_epoch));
+                        rows.push(durable_worker_row(
+                            r,
+                            session.session_id.as_str(),
+                            now_epoch,
+                        ));
                         visible.insert(r.run_id.clone());
                         added = true;
                     }
@@ -4456,7 +4654,11 @@ fn durable_worker_row(
     let label = r
         .session_name
         .clone()
-        .or_else(|| r.session_id.as_deref().map(|s| crate::batch::short_id(s).to_string()))
+        .or_else(|| {
+            r.session_id
+                .as_deref()
+                .map(|s| crate::batch::short_id(s).to_string())
+        })
         .unwrap_or_else(|| "—".into());
     let session_label = if is_me { format!("{label} *") } else { label };
     let result_cell = match (r.result.as_deref(), r.error.as_deref()) {
@@ -4475,10 +4677,15 @@ fn durable_worker_row(
         }
         _ => "—".to_string(),
     };
-    let started = r.created_at.as_deref().and_then(crate::style::parse_sqlite_utc);
+    let started = r
+        .created_at
+        .as_deref()
+        .and_then(crate::style::parse_sqlite_utc);
     let terminal = matches!(r.phase.as_str(), "done" | "failed" | "checkpoint");
     let finished = if terminal {
-        r.heartbeat_at.as_deref().and_then(crate::style::parse_sqlite_utc)
+        r.heartbeat_at
+            .as_deref()
+            .and_then(crate::style::parse_sqlite_utc)
     } else {
         None
     };
@@ -4821,7 +5028,6 @@ fn backfill_interactive(session: &Session) -> bool {
     true
 }
 
-
 /// Print a finished coordinator's final result inside the attach pane, so an
 /// operator who `:attach`es a done/failed worker sees the work they're about to
 /// continue from. A no-op when the worker isn't in this session.
@@ -4856,16 +5062,15 @@ fn attached_result_lines(run_id: &str, jobs: &crate::worker::WorkerJobs) -> Vec<
     let Some(job) = job else {
         return Vec::new();
     };
-    let rendered =
-        crate::md::render_stdout_within(job.fetch().trim(), crate::worker::pane_content_cols(run_id));
+    let rendered = crate::md::render_stdout_within(
+        job.fetch().trim(),
+        crate::worker::pane_content_cols(run_id),
+    );
     let mut out = Vec::new();
     let mut lines = rendered.split('\n');
     match lines.next() {
         Some(first) => {
-            out.push(crate::worker::pane_row(
-                run_id,
-                &format!("·result {first}"),
-            ));
+            out.push(crate::worker::pane_row(run_id, &format!("·result {first}")));
             for line in lines {
                 out.push(crate::worker::pane_row(run_id, line));
             }
@@ -5231,7 +5436,6 @@ fn steer_active_goal(message: &str, session: &mut Session) {
     }
 }
 
-
 fn send_to_attached(run_id: &str, message: &str, session: &mut Session) {
     let message = message.trim();
     if message.is_empty() {
@@ -5340,9 +5544,11 @@ fn resume_coordinator(prev_run_id: &str, message: &str, session: &mut Session) {
     };
     let no_credential = match session.backend_kind.as_str() {
         "grok" => !crate::backend::grok::credential_available(&session.env),
-        "openai" | "openrouter" => !crate::backend::openai::provider_for_kind(&session.backend_kind)
-            .map(|p| crate::backend::openai::credential_available(p, &session.env))
-            .unwrap_or(false),
+        "openai" | "openrouter" => {
+            !crate::backend::openai::provider_for_kind(&session.backend_kind)
+                .map(|p| crate::backend::openai::credential_available(p, &session.env))
+                .unwrap_or(false)
+        }
         _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
     };
     if no_credential {
@@ -5691,7 +5897,11 @@ fn cycle_worker_live(
     // nothing to attach to AND we're not currently attached. If the goal
     // completed mid-turn while attached (goal_active now false, no workers), fall
     // through so the index-0 branch releases the stuck attach.
-    if cycle_is_noop(workers_v.len(), goal_active, attached.lock().unwrap().is_some()) {
+    if cycle_is_noop(
+        workers_v.len(),
+        goal_active,
+        attached.lock().unwrap().is_some(),
+    ) {
         // No coordinators, no active goal, and not attached — take no action (no
         // hint, no redraw), matching the idle-prompt `cycle_worker` no-op.
         return;
@@ -5927,7 +6137,9 @@ fn goal_ago(secs: i64) -> String {
 /// deliberately loose (no chrono dependency); a non-date trailing word simply
 /// stays part of the milestone name.
 fn looks_like_date(tok: &str) -> bool {
-    let ok_chars = tok.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '/');
+    let ok_chars = tok
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '-' || c == '/');
     let has_sep = tok.contains('-') || tok.contains('/');
     let has_digit = tok.chars().any(|c| c.is_ascii_digit());
     ok_chars && has_sep && has_digit && tok.len() >= 3
@@ -6011,7 +6223,11 @@ fn goal_status_dashboard(session: &mut Session) -> String {
         let (m_done, m_total) = g.milestone_progress();
         let (t_done, t_total) = g.linked_task_progress();
         let pct = g.progress_percent();
-        let star = if is_current { "  \x1b[33m★ current\x1b[0m" } else { "" };
+        let star = if is_current {
+            "  \x1b[33m★ current\x1b[0m"
+        } else {
+            ""
+        };
 
         // ── Goal statement ────────────────────────────────────────────────
         let _ = writeln!(
@@ -6200,7 +6416,10 @@ fn goal_command(session: &mut Session, sub: &str, args: &str) -> String {
             // First token is the key; any remainder is a cached human title.
             let mut it = args.splitn(2, char::is_whitespace);
             let key = it.next().unwrap_or("").to_string();
-            let title = it.next().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+            let title = it
+                .next()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty());
             let Some(mut g) = session.current_goal().cloned() else {
                 return "no current goal — `:goal new <title>` or `:goal show <id>` first".into();
             };
@@ -6296,7 +6515,11 @@ fn goal_command(session: &mut Session, sub: &str, args: &str) -> String {
                 };
             };
             if g.status == GoalStatus::Completed {
-                return format!("already complete: \x1b[2m{}\x1b[0m {}", goal_short(&g.id), g.title);
+                return format!(
+                    "already complete: \x1b[2m{}\x1b[0m {}",
+                    goal_short(&g.id),
+                    g.title
+                );
             }
             g.set_status(GoalStatus::Completed);
             let (short, title) = (goal_short(&g.id).to_string(), g.title.clone());
@@ -6307,7 +6530,6 @@ fn goal_command(session: &mut Session, sub: &str, args: &str) -> String {
         other => format!("unknown :goal subcommand `{other}`"),
     }
 }
-
 
 /// A durable coordinator row's phase is "live" (it can still fold in a queued
 /// `:tell`) only while non-terminal. Unknown / legacy / MISSING phase strings
@@ -6501,9 +6723,11 @@ fn spawn_alert_coordinator(session: &mut Session, id: i64, description: &str) ->
     // A coordinator needs a credential for the active backend and our own exe.
     let no_credential = match session.backend_kind.as_str() {
         "grok" => !crate::backend::grok::credential_available(&session.env),
-        "openai" | "openrouter" => !crate::backend::openai::provider_for_kind(&session.backend_kind)
-            .map(|p| crate::backend::openai::credential_available(p, &session.env))
-            .unwrap_or(false),
+        "openai" | "openrouter" => {
+            !crate::backend::openai::provider_for_kind(&session.backend_kind)
+                .map(|p| crate::backend::openai::credential_available(p, &session.env))
+                .unwrap_or(false)
+        }
         _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
     };
     if no_credential {
@@ -6545,7 +6769,6 @@ instead of firing.\n\nCondition: {description}"
     let _ = crate::worker::spawn(&session.worker_jobs, task, spec);
     true
 }
-
 
 fn stop_coordinator(id: Option<&str>, any: bool, session: &mut Session) {
     let Some(id) = id else {
@@ -6706,7 +6929,11 @@ fn handle_config(backend: &Backend, session: &Session) {
         "  background      {} · model {} · force-batches {}",
         if session.batch_mode { "on" } else { "off" },
         session.batch_model,
-        if session.batch_force_batches { "on" } else { "off" }
+        if session.batch_force_batches {
+            "on"
+        } else {
+            "off"
+        }
     );
     println!(
         "  raw tool output {}",
@@ -6929,7 +7156,11 @@ fn handle_plugin(args: Vec<&str>, session: &Session) {
             for p in &plugins {
                 let m = &p.manifest;
                 let name = if m.name.is_empty() { &m.id } else { &m.name };
-                let ver = if m.version.is_empty() { "-" } else { &m.version };
+                let ver = if m.version.is_empty() {
+                    "-"
+                } else {
+                    &m.version
+                };
                 let state = if m.is_enabled() { "" } else { " (disabled)" };
                 println!("  {:<20} {name} v{ver}{state}", m.id);
             }
@@ -7018,13 +7249,16 @@ fn handle_plugin_memory(args: &[&str]) {
 
         // ---- display a whole namespace: `<id> <namespace>` -----------------
         [id, ns] if !verbs.contains(ns) => {
-            match mem.display_namespace(id, match crate::plugin_memory::MemoryNamespace::parse(ns) {
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("\x1b[31maish:\x1b[0m {e}");
-                    return;
-                }
-            }) {
+            match mem.display_namespace(
+                id,
+                match crate::plugin_memory::MemoryNamespace::parse(ns) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("\x1b[31maish:\x1b[0m {e}");
+                        return;
+                    }
+                },
+            ) {
                 Ok(v) => {
                     let redacted = crate::plugin_memory::MemoryNamespace::parse(ns)
                         .map(|n| n.is_secret())
@@ -7111,7 +7345,6 @@ fn handle_tokens(session: &Session) {
     }
 }
 
-
 fn handle_telemetry(args: Vec<&str>, session: &mut Session) {
     // `:telemetry skill-match <task>` — TASK-335 debug transparency: run the
     // same semantic scorer used per-turn (crate::skill_match::skill_match) and
@@ -7119,7 +7352,10 @@ fn handle_telemetry(args: Vec<&str>, session: &mut Session) {
     // relevance, intent→category boost, applies-to repo multiplier, unwanted-for
     // suppression). Lets a new agent understand skill ranking without the env
     // var (AISH_SKILL_MATCH_DEBUG) or reading the code.
-    if matches!(args.first().copied(), Some("skill-match" | "skill-matching")) {
+    if matches!(
+        args.first().copied(),
+        Some("skill-match" | "skill-matching")
+    ) {
         let task = args[1..].join(" ");
         if task.trim().is_empty() {
             println!("usage: :telemetry skill-match <task text>");
@@ -7328,7 +7564,11 @@ fn skill_fanout_sources(plugins_dir: &Path) -> Vec<FanoutSource> {
             can_add: has_script_add,
         });
     }
-    out.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.label.cmp(&b.label)));
+    out.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| a.label.cmp(&b.label))
+    });
     out
 }
 
@@ -7394,7 +7634,10 @@ async fn skill_add(reference: &str, session: &mut Session) -> Result<()> {
             }
             Ok(_) => { /* empty result → try the next-priority source */ }
             Err(e) => {
-                println!("\x1b[2m{} could not resolve {reference}: {e}\x1b[0m", fs.label);
+                println!(
+                    "\x1b[2m{} could not resolve {reference}: {e}\x1b[0m",
+                    fs.label
+                );
             }
         }
     }
@@ -7509,7 +7752,11 @@ async fn skill_sources_list() {
             (
                 s.label.clone(),
                 s.priority.to_string(),
-                if s.can_search { "yes".into() } else { "-".into() },
+                if s.can_search {
+                    "yes".into()
+                } else {
+                    "-".into()
+                },
                 if s.can_add { "yes".into() } else { "-".into() },
                 if s.handles.is_empty() {
                     "-".into()
@@ -7649,8 +7896,7 @@ fn skill_remove(name: &str, session: &mut Session) -> Result<()> {
 /// single source of truth and unit-testable. The Started column is a relative
 /// "ago" label; Runtime is the elapsed-so-far (running) or total (terminal) span
 /// (see `crate::style::time_cells`).
-const WORKERS_TABLE_HEADER: &str =
-    "| Worker | Session | Status | Started | Runtime | Doing | Result |\n|---|---|---|---|---|---|---|\n";
+const WORKERS_TABLE_HEADER: &str = "| Worker | Session | Status | Started | Runtime | Doing | Result |\n|---|---|---|---|---|---|---|\n";
 
 /// Returns true when the REPL should exit.
 /// Is the active backend the local llama.cpp backend? (Always false without the
@@ -7952,10 +8198,8 @@ async fn handle_colon(
             // selector that sets AISH_WORKER_RUNTIME for the NEXT coordinator
             // launched from this session — it does NOT retroactively move
             // already-running workers (they keep the vehicle they started with).
-            let podman_avail =
-                crate::container::runtime_on_path(crate::container::Runtime::Podman);
-            let docker_avail =
-                crate::container::runtime_on_path(crate::container::Runtime::Docker);
+            let podman_avail = crate::container::runtime_on_path(crate::container::Runtime::Podman);
+            let docker_avail = crate::container::runtime_on_path(crate::container::Runtime::Docker);
             let yn = |b: bool| {
                 if b {
                     "\x1b[32m✓ on PATH\x1b[0m"
@@ -8042,16 +8286,19 @@ async fn handle_colon(
                 ),
                 Some(store) if arg == "clear" => match store.clear() {
                     Ok(n) => {
-                        println!("cleared {n} activity entr{}", if n == 1 { "y" } else { "ies" })
+                        println!(
+                            "cleared {n} activity entr{}",
+                            if n == 1 { "y" } else { "ies" }
+                        )
                     }
                     Err(e) => println!("activity clear failed: {e:#}"),
                 },
                 Some(store) => {
                     let limit: i64 = arg.parse().unwrap_or(20).clamp(1, 200);
                     match store.recent(limit) {
-                        Ok(rows) if rows.is_empty() => println!(
-                            "no activity yet — fired :alerts and notable events land here"
-                        ),
+                        Ok(rows) if rows.is_empty() => {
+                            println!("no activity yet — fired :alerts and notable events land here")
+                        }
                         Ok(rows) => {
                             let color = crate::style::colors_enabled();
                             let now = std::time::SystemTime::now()
@@ -8062,13 +8309,10 @@ async fn handle_colon(
                             for (_id, ts, sev, short, _detail, source) in rows {
                                 let s = crate::style::Severity::from_tag(&sev);
                                 let badge = crate::style::severity_badge(&short, s, color);
-                                let age =
-                                    crate::style::fmt_duration((now - ts).max(0) as u64);
+                                let age = crate::style::fmt_duration((now - ts).max(0) as u64);
                                 println!("{age:>7} ago  {badge}  \x1b[2m({source})\x1b[0m");
                             }
-                            println!(
-                                "\x1b[2m:activity <n> to show N  ·  :activity clear\x1b[0m"
-                            );
+                            println!("\x1b[2m:activity <n> to show N  ·  :activity clear\x1b[0m");
                         }
                         Err(e) => println!("activity list failed: {e:#}"),
                     }
@@ -8100,8 +8344,7 @@ async fn handle_colon(
             // reuses those exact paths rather than reimplementing them.
             {
                 use std::io::IsTerminal as _;
-                let tty =
-                    std::io::stdout().is_terminal() && unsafe { libc::isatty(0) == 1 };
+                let tty = std::io::stdout().is_terminal() && unsafe { libc::isatty(0) == 1 };
                 let live = collect_worker_rows(session);
                 if !show_all && tty && !crate::keywatch::installed() && !live.is_empty() {
                     let mut sel = 0usize;
@@ -8165,16 +8408,19 @@ async fn handle_colon(
             let mut seen = std::collections::HashSet::new();
             // In-memory coordinators launched by THIS session (live status).
             // Sort newest-first by start time.
-            let mut in_mem: Vec<_> = session.worker_jobs.lock().unwrap().iter().cloned().collect();
+            let mut in_mem: Vec<_> = session
+                .worker_jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect();
             in_mem.sort_by(|a, b| b.started_epoch().cmp(&a.started_epoch()));
             for w in in_mem.iter() {
                 any = true;
                 seen.insert(w.id.clone());
-                let (started_cell, runtime_cell) = crate::style::time_cells(
-                    w.started_epoch(),
-                    w.finished_epoch(),
-                    now_epoch,
-                );
+                let (started_cell, runtime_cell) =
+                    crate::style::time_cells(w.started_epoch(), w.finished_epoch(), now_epoch);
                 // A resumed worker (≥1 in-place resume) carries a `↻N` thread
                 // marker on its id so the operator can see it's the SAME worker
                 // continued as a new thread, not a fresh spawn.
@@ -8215,14 +8461,25 @@ async fn handle_colon(
                 crate::coordinator::reap_stalled_runs_live(store);
                 if let Ok(rows) = store.load_all() {
                     // Sort newest-first by creation time.
-                    let mut durable: Vec<&_> = rows.iter().filter(|r| {
-                        !seen.contains(&r.run_id)
-                            && (show_all
-                                || r.session_id.as_deref() == Some(session.session_id.as_str()))
-                    }).collect();
+                    let mut durable: Vec<&_> = rows
+                        .iter()
+                        .filter(|r| {
+                            !seen.contains(&r.run_id)
+                                && (show_all
+                                    || r.session_id.as_deref() == Some(session.session_id.as_str()))
+                        })
+                        .collect();
                     durable.sort_by(|a, b| {
-                        let a_ts = a.created_at.as_deref().and_then(crate::style::parse_sqlite_utc).unwrap_or(0);
-                        let b_ts = b.created_at.as_deref().and_then(crate::style::parse_sqlite_utc).unwrap_or(0);
+                        let a_ts = a
+                            .created_at
+                            .as_deref()
+                            .and_then(crate::style::parse_sqlite_utc)
+                            .unwrap_or(0);
+                        let b_ts = b
+                            .created_at
+                            .as_deref()
+                            .and_then(crate::style::parse_sqlite_utc)
+                            .unwrap_or(0);
                         b_ts.cmp(&a_ts)
                     });
                     // TASK-302: the goal loop mints a fresh `goal-<uuid>` run per
@@ -8362,7 +8619,11 @@ async fn handle_colon(
                 return false;
             }
             let show_all = matches!(sub, Some("all"));
-            let scope = if show_all { "all sessions" } else { "this session" };
+            let scope = if show_all {
+                "all sessions"
+            } else {
+                "this session"
+            };
             match &session.coordinator_store {
                 Some(store) => match store.load_all() {
                     Ok(rows) => {
@@ -8370,8 +8631,7 @@ async fn handle_colon(
                             .iter()
                             .filter(|r| {
                                 show_all
-                                    || r.session_id.as_deref()
-                                        == Some(session.session_id.as_str())
+                                    || r.session_id.as_deref() == Some(session.session_id.as_str())
                             })
                             .collect();
                         let st = crate::dispatch_stats::summarize(&refs);
@@ -8499,9 +8759,7 @@ async fn handle_colon(
                     println!("{}", session.schedule.clear(num));
                 }
             } else if session.nested {
-                println!(
-                    "can't :schedule from inside a coordinator (no nested coordinators)"
-                );
+                println!("can't :schedule from inside a coordinator (no nested coordinators)");
             } else {
                 match std::env::current_exe() {
                     Ok(exe) => {
@@ -8595,7 +8853,12 @@ async fn handle_colon(
                 ),
                 // Bare `:alert` / `:alert list [all]` — show armed (and, with
                 // `all`, done/cancelled) monitors.
-                Some(store) if rest.is_empty() || lower == "list" || lower == "list all" || lower == "ls" => {
+                Some(store)
+                    if rest.is_empty()
+                        || lower == "list"
+                        || lower == "list all"
+                        || lower == "ls" =>
+                {
                     let include_all = lower == "list all";
                     match store.list_alerts(include_all) {
                         Ok(rows) if rows.is_empty() => println!(
@@ -8612,9 +8875,7 @@ async fn handle_colon(
                     }
                 }
                 // `:alert clear|cancel [<id>|all]`.
-                Some(store)
-                    if lower.starts_with("clear") || lower.starts_with("cancel") =>
-                {
+                Some(store) if lower.starts_with("clear") || lower.starts_with("cancel") => {
                     let arg = lower
                         .strip_prefix("clear")
                         .or_else(|| lower.strip_prefix("cancel"))
@@ -8647,7 +8908,9 @@ async fn handle_colon(
                         (true, rest.as_str())
                     };
                     if cond.is_empty() {
-                        println!("usage: :alert <condition>   e.g. :alert notify me when /tmp/build.done appears");
+                        println!(
+                            "usage: :alert <condition>   e.g. :alert notify me when /tmp/build.done appears"
+                        );
                     } else {
                         let kind = crate::alert::parse_condition(cond);
                         match store.insert_alert(cond, &kind, audible, Some(&session.session_id)) {
@@ -8697,9 +8960,7 @@ async fn handle_colon(
                 // shaped token; otherwise fall through to the pursuit loop so
                 // the whole phrase becomes the goal (bug: was "no goal matching
                 // the remaining tasks…").
-                "show" | "complete"
-                    if goal_tail.is_empty() || looks_like_goal_ref(goal_tail) =>
-                {
+                "show" | "complete" if goal_tail.is_empty() || looks_like_goal_ref(goal_tail) => {
                     println!("{}", goal_command(session, goal_head, goal_tail))
                 }
                 // Bare `:goal`: the live loop's status if one is running, else a
@@ -8881,9 +9142,9 @@ async fn handle_colon(
                             crate::hwdetect::apply_env(&sel);
                             println!("{}", crate::hwdetect::short_line(&sel));
                         }
-                        Err(e) => eprintln!(
-                            "\x1b[33maish:\x1b[0m local model detection failed: {e:#}"
-                        ),
+                        Err(e) => {
+                            eprintln!("\x1b[33maish:\x1b[0m local model detection failed: {e:#}")
+                        }
                     }
                     match Backend::new_local() {
                         Ok(b) => {
@@ -9068,7 +9329,11 @@ async fn handle_update(
     // The startup-cached pending update was checked against the env channel, so
     // it only applies when no explicit channel was asked for (or it matches).
     let cache_ok = requested.is_none() || requested == Some(crate::update::channel());
-    let cached = if cache_ok { pending_update.take() } else { None };
+    let cached = if cache_ok {
+        pending_update.take()
+    } else {
+        None
+    };
     let info = match cached {
         Some(info) => info,
         None => {
@@ -9173,8 +9438,13 @@ async fn handle_codebase(args: Vec<&str>, session: &mut Session) {
             .unwrap_or_else(|| serde_json::json!({ "mcpServers": {} }))
     };
     let bin = cbm::binary_path(&home);
-    let connected =
-        |session: &Session| session.mcp.server_names().iter().any(|n| n == cbm::SERVER_NAME);
+    let connected = |session: &Session| {
+        session
+            .mcp
+            .server_names()
+            .iter()
+            .any(|n| n == cbm::SERVER_NAME)
+    };
 
     match args.first().copied() {
         None | Some("status") => {
@@ -9192,7 +9462,10 @@ async fn handle_codebase(args: Vec<&str>, session: &mut Session) {
                     "  binary absent — tools stay dormant until `:codebase install` provisions it (graceful absence)."
                 );
             } else if !enrolled {
-                println!("  run `:codebase install` to enroll the {} server.", cbm::LICENSE);
+                println!(
+                    "  run `:codebase install` to enroll the {} server.",
+                    cbm::LICENSE
+                );
             }
         }
         Some("install") => {
@@ -9213,10 +9486,18 @@ async fn handle_codebase(args: Vec<&str>, session: &mut Session) {
             }
             match outcome {
                 cbm::MergeOutcome::Added => {
-                    println!("registered '{}' ({}) in {}", cbm::SERVER_NAME, cbm::LICENSE, cfg.display())
+                    println!(
+                        "registered '{}' ({}) in {}",
+                        cbm::SERVER_NAME,
+                        cbm::LICENSE,
+                        cfg.display()
+                    )
                 }
                 cbm::MergeOutcome::Unchanged => {
-                    println!("'{}' already registered — idempotent no-op", cbm::SERVER_NAME)
+                    println!(
+                        "'{}' already registered — idempotent no-op",
+                        cbm::SERVER_NAME
+                    )
                 }
                 cbm::MergeOutcome::Updated => {
                     println!("updated '{}' entry in {}", cbm::SERVER_NAME, cfg.display())
@@ -9239,7 +9520,10 @@ async fn handle_codebase(args: Vec<&str>, session: &mut Session) {
             if cbm::binary_present(&bin) && !connected(session) {
                 let added = session.mcp.reload().await;
                 if added.iter().any(|n| n == cbm::SERVER_NAME) {
-                    println!("  connected — codebase-memory tools now advertised (`:mcp tools {}`)", cbm::SERVER_NAME);
+                    println!(
+                        "  connected — codebase-memory tools now advertised (`:mcp tools {}`)",
+                        cbm::SERVER_NAME
+                    );
                 }
             }
         }
@@ -9626,7 +9910,9 @@ fn handle_startup_digest(sub: Option<&str>, session: &mut Session) {
             }
         }
         Some(other) => {
-            println!("unknown :startup-digest subcommand '{other}' — usage: :startup-digest [on|off|status]")
+            println!(
+                "unknown :startup-digest subcommand '{other}' — usage: :startup-digest [on|off|status]"
+            )
         }
     }
 }
@@ -9689,11 +9975,11 @@ mod tests {
     fn statusline_segments_skips_stale_and_missing_dir() {
         use std::time::{Duration, SystemTime};
         // Missing dir → empty, no panic.
-        let missing =
-            std::env::temp_dir().join(format!("aish_seg_missing_{}", std::process::id()));
+        let missing = std::env::temp_dir().join(format!("aish_seg_missing_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
-        assert!(statusline_segments(&missing, SystemTime::now(), Duration::from_secs(3600))
-            .is_empty());
+        assert!(
+            statusline_segments(&missing, SystemTime::now(), Duration::from_secs(3600)).is_empty()
+        );
         // Stale file → skipped (now is 5s past mtime, stale_after = 0).
         let dir = std::env::temp_dir().join(format!(
             "aish_seg_stale_{}_{}",
@@ -9808,7 +10094,10 @@ mod tests {
         let prev = std::env::var("AISH_DISPATCH_DEDUP_SECS").ok();
 
         unsafe { std::env::remove_var("AISH_DISPATCH_DEDUP_SECS") };
-        assert_eq!(dispatch_dedup_window(), Duration::from_secs(DISPATCH_DEDUP_SECS));
+        assert_eq!(
+            dispatch_dedup_window(),
+            Duration::from_secs(DISPATCH_DEDUP_SECS)
+        );
 
         unsafe { std::env::set_var("AISH_DISPATCH_DEDUP_SECS", "12") };
         assert_eq!(dispatch_dedup_window(), Duration::from_secs(12));
@@ -10569,7 +10858,14 @@ mod tests {
         // commands starting with 'm': mcp, memories, metrics, mode, model, model-detect.
         assert_eq!(
             names("m"),
-            vec!["mcp", "memories", "metrics", "mode", "model", "model-detect"]
+            vec![
+                "mcp",
+                "memories",
+                "metrics",
+                "mode",
+                "model",
+                "model-detect"
+            ]
         );
         // typing m -> o -> d -> e -> l narrows down to model/model-detect
         assert_eq!(names("mo"), vec!["mode", "model", "model-detect"]);
@@ -10860,7 +11156,10 @@ mod tests {
         let flash = Some("⚠ New PR opened in LightHeart-Ventures/ai…".to_string());
         let row = recent_message_row(baseline.clone(), flash);
         assert_eq!(row, "⚠ New PR opened in LightHeart-Ventures/ai…");
-        assert!(!row.contains("detached"), "flash must not stack the hint: {row}");
+        assert!(
+            !row.contains("detached"),
+            "flash must not stack the hint: {row}"
+        );
         // No flash → the live baseline hint shows through unchanged.
         assert_eq!(recent_message_row(baseline.clone(), None), baseline);
         // Empty/whitespace flash is treated as absent (falls back to baseline).
@@ -10873,7 +11172,10 @@ mod tests {
     #[test]
     fn decorate_name_shows_badges_even_when_unnamed() {
         // Named session + badges → "name <badges>".
-        assert_eq!(decorate_name(Some("proj"), "⏰"), Some("proj ⏰".to_string()));
+        assert_eq!(
+            decorate_name(Some("proj"), "⏰"),
+            Some("proj ⏰".to_string())
+        );
         // Named, no badges → just the name.
         assert_eq!(decorate_name(Some("proj"), ""), Some("proj".to_string()));
         // UNNAMED but an alert is armed → the ⏰ badge still shows (the fix).
@@ -10899,8 +11201,14 @@ mod tests {
         assert!(s.contains("attached to"));
         // The "(i/n · Shift-Tab to cycle, :detach to stop)" hint was dropped from
         // the live-attached statusline.
-        assert!(!s.contains("Shift-Tab to cycle"), "unexpected status line: {s}");
-        assert!(!s.contains(":detach to stop"), "unexpected status line: {s}");
+        assert!(
+            !s.contains("Shift-Tab to cycle"),
+            "unexpected status line: {s}"
+        );
+        assert!(
+            !s.contains(":detach to stop"),
+            "unexpected status line: {s}"
+        );
     }
 
     #[test]
@@ -10911,7 +11219,10 @@ mod tests {
             s.contains("attached to w_a - fix the release workflow"),
             "unexpected status line: {s}"
         );
-        assert!(!s.contains("Shift-Tab to cycle"), "unexpected status line: {s}");
+        assert!(
+            !s.contains("Shift-Tab to cycle"),
+            "unexpected status line: {s}"
+        );
     }
 
     #[test]
@@ -11115,19 +11426,14 @@ mod tests {
     #[test]
     fn resolve_tell_target_routes_by_liveness_and_ownership() {
         let me = "sess-a";
-        let live = |rid: &str, owner: Option<&str>| {
-            (rid.to_string(), false, owner.map(str::to_string))
-        };
-        let dead = |rid: &str, owner: Option<&str>| {
-            (rid.to_string(), true, owner.map(str::to_string))
-        };
+        let live =
+            |rid: &str, owner: Option<&str>| (rid.to_string(), false, owner.map(str::to_string));
+        let dead =
+            |rid: &str, owner: Option<&str>| (rid.to_string(), true, owner.map(str::to_string));
 
         // AC3: :tell to a non-existent run-id fails gracefully (NotFound), never
         // a silent no-op or a raw DB error.
-        assert_eq!(
-            resolve_tell_target(&[], me, false),
-            TellTarget::NotFound
-        );
+        assert_eq!(resolve_tell_target(&[], me, false), TellTarget::NotFound);
 
         // A live, owned coordinator is ready to receive the message.
         assert_eq!(
@@ -11155,11 +11461,7 @@ mod tests {
 
         // An ambiguous prefix that matches several owned coordinators lists them.
         assert_eq!(
-            resolve_tell_target(
-                &[live("w_a", Some(me)), live("w_b", Some(me))],
-                me,
-                false
-            ),
+            resolve_tell_target(&[live("w_a", Some(me)), live("w_b", Some(me))], me, false),
             TellTarget::Ambiguous(vec!["w_a".to_string(), "w_b".to_string()])
         );
     }
@@ -11254,10 +11556,14 @@ mod tests {
         assert!(out.contains("Recent conversation context"), "{out}");
         assert!(out.contains("borrow error"), "{out}");
         assert!(out.contains("double mutable borrow"), "{out}");
-        assert!(out.contains("Operator:") && out.contains("Assistant:"), "{out}");
+        assert!(
+            out.contains("Operator:") && out.contains("Assistant:"),
+            "{out}"
+        );
         // …and the operator's actual instruction is the trailing, load-bearing line.
         assert!(
-            out.trim_end().ends_with("build a fix for this and open a PR"),
+            out.trim_end()
+                .ends_with("build a fix for this and open a PR"),
             "{out}"
         );
     }
@@ -11266,7 +11572,10 @@ mod tests {
     fn enrich_task_with_context_noop_when_no_history() {
         // A cold prompt (or history with no visible text) offloads exactly as
         // before — the raw line is returned unchanged, no digest wrapper.
-        assert_eq!(enrich_task_with_context("fix the thing", &[]), "fix the thing");
+        assert_eq!(
+            enrich_task_with_context("fix the thing", &[]),
+            "fix the thing"
+        );
         let carriers = vec![crate::backend::Msg::tool_results(vec![])];
         assert_eq!(
             enrich_task_with_context("refactor it", &carriers),
@@ -11889,7 +12198,10 @@ mod tests {
         goal_command(&mut s, "new", "Finish");
         let done = goal_command(&mut s, "complete", "");
         assert!(done.contains("goal completed"), "got: {done}");
-        assert_eq!(s.current_goal().unwrap().status, crate::goal::GoalStatus::Completed);
+        assert_eq!(
+            s.current_goal().unwrap().status,
+            crate::goal::GoalStatus::Completed
+        );
         let again = goal_command(&mut s, "complete", "");
         assert!(again.contains("already complete"), "got: {again}");
     }

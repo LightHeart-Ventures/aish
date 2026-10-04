@@ -82,6 +82,11 @@ mod webhook;
 mod worker;
 mod worker_store;
 mod workers_modal;
+// Voice ACTIVATION-word matching + voice-mode toggle state. Ungated on purpose
+// (dependency-free decision logic — see the module docs): the default CI build
+// must compile and test it even though the audio pipeline below is gated.
+mod voice_activation;
+
 // FR-334 / SPR-068 voice input pipeline — compiled only when `--features voice`.
 // Default and CI builds (`--no-default-features --locked`) never see this file.
 #[cfg(feature = "voice")]
