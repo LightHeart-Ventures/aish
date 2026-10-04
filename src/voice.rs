@@ -37,6 +37,7 @@
 /// | `voice.language`   | `en`       | Whisper language hint passed to `params.set_language`|
 /// | `voice.autosubmit` | `false`    | If `true`, press Enter automatically after insert    |
 /// | `voice.silence_ms` | `2500`     | Silence-timeout (ms) that auto-stops Recording       |
+/// | `voice.activation_word` | `aish` | Word that must START an utterance for it to run  |
 ///
 /// TASK-370 (`voice-api` feature) adds the hosted-Whisper fallback keys.  They
 /// parse in every `voice` build so a config file is portable between builds,
@@ -71,6 +72,13 @@ pub mod config {
         /// Silence-timeout in milliseconds; recording stops when this
         /// elapses without audio above the noise floor.
         pub silence_ms: u64,
+        /// Word that must START an utterance for it to be treated as a
+        /// command while voice mode is ON — see [`crate::voice_activation`].
+        /// Matching is case-insensitive and tolerant of Whisper hyphenating
+        /// the word. Never empty: an empty config value is refused and the
+        /// default is kept, because an empty word would turn every overheard
+        /// sentence into a command.
+        pub activation_word: String,
         /// TASK-370: opt in to the hosted-Whisper fallback.  When `false`
         /// (the default) no audio ever leaves the machine.
         pub enable_remote_stt: bool,
@@ -91,6 +99,7 @@ pub mod config {
                 // Increased from 2000ms to 2500ms to reduce early cutoff on natural pauses.
                 // Overridable via voice.silence_ms config key or AISH_VOICE_SILENCE_MS env var.
                 silence_ms: 2_500,
+                activation_word: crate::voice_activation::DEFAULT_ACTIVATION_WORD.to_string(),
                 enable_remote_stt: false,
                 openai_stt_timeout_ms: 5_000,
                 stt_retry_attempts: 3,
@@ -178,10 +187,22 @@ pub mod config {
                         Err(_) => {
                             eprintln!(
                                 "voice: warning: invalid voice.silence_ms \
-                                 value {val:?} — using 2000"
+                                 value {val:?} — using 2500"
                             );
                         }
                     },
+                    "voice.activation_word" => {
+                        let word = val.trim();
+                        if word.is_empty() {
+                            eprintln!(
+                                "voice: warning: voice.activation_word is empty \
+                                 — using default {:?}",
+                                crate::voice_activation::DEFAULT_ACTIVATION_WORD
+                            );
+                        } else {
+                            cfg.activation_word = word.to_string();
+                        }
+                    }
                     // ── TASK-370: hosted-Whisper fallback keys ──────────────
                     "voice.enable_remote_stt" => match val {
                         "true" | "1" | "yes" => cfg.enable_remote_stt = true,
@@ -256,8 +277,8 @@ pub mod config {
         }
 
         #[test]
-        fn default_silence_ms_is_2000() {
-            assert_eq!(VoiceConfig::default().silence_ms, 2_000);
+        fn default_silence_ms_is_2500() {
+            assert_eq!(VoiceConfig::default().silence_ms, 2_500);
         }
 
         // ── parse: happy paths ──────────────────────────────────────────────
@@ -349,8 +370,7 @@ pub mod config {
 
         #[test]
         fn parse_skips_lines_without_equals() {
-            let cfg =
-                VoiceConfig::parse("this is not a key-value pair\nvoice.silence_ms = 500\n");
+            let cfg = VoiceConfig::parse("this is not a key-value pair\nvoice.silence_ms = 500\n");
             assert_eq!(cfg.silence_ms, 500);
         }
 
@@ -359,7 +379,7 @@ pub mod config {
         #[test]
         fn parse_invalid_silence_ms_falls_back_to_default() {
             let cfg = VoiceConfig::parse("voice.silence_ms = not_a_number\n");
-            assert_eq!(cfg.silence_ms, 2_000);
+            assert_eq!(cfg.silence_ms, 2_500);
         }
 
         /// Contract test for the TASK-368 REPL wiring: a realistic config
@@ -494,8 +514,7 @@ pub mod config {
 
         #[test]
         fn load_from_nonexistent_path_gives_defaults() {
-            let cfg =
-                VoiceConfig::load_from_path(std::path::Path::new("/nonexistent/voice.cfg"));
+            let cfg = VoiceConfig::load_from_path(std::path::Path::new("/nonexistent/voice.cfg"));
             assert_eq!(cfg, VoiceConfig::default());
         }
 
@@ -504,11 +523,8 @@ pub mod config {
             let dir = std::env::temp_dir().join("aish-test-voice-config");
             let _ = std::fs::create_dir_all(&dir);
             let path = dir.join("config");
-            std::fs::write(
-                &path,
-                "voice.model = base.en\nvoice.silence_ms = 4000\n",
-            )
-            .expect("write tmp config");
+            std::fs::write(&path, "voice.model = base.en\nvoice.silence_ms = 4000\n")
+                .expect("write tmp config");
             let cfg = VoiceConfig::load_from_path(&path);
             assert_eq!(cfg.model, "base.en");
             assert_eq!(cfg.silence_ms, 4_000);
@@ -719,10 +735,7 @@ pub mod capture {
     /// Extracted so both [`record_until_stop`] and
     /// [`record_until_stop_with_config`] share the same polling logic without
     /// duplication.
-    fn record_with_device(
-        device: &cpal::Device,
-        mut stop: StopSignal,
-    ) -> anyhow::Result<Vec<f32>> {
+    fn record_with_device(device: &cpal::Device, mut stop: StopSignal) -> anyhow::Result<Vec<f32>> {
         let supported_config = device
             .default_input_config()
             .map_err(CaptureError::Device)
@@ -807,11 +820,9 @@ pub mod capture {
                             let mut guard = buf.lock().unwrap();
                             // Downmix interleaved N-channel frames to mono f32.
                             for frame in data.chunks(channels) {
-                                let mono: f32 = frame
-                                    .iter()
-                                    .map(|&s| f32::from_sample(s))
-                                    .sum::<f32>()
-                                    / channels as f32;
+                                let mono: f32 =
+                                    frame.iter().map(|&s| f32::from_sample(s)).sum::<f32>()
+                                        / channels as f32;
                                 guard.push(mono);
                             }
                         },
@@ -952,9 +963,14 @@ pub mod resample {
         // chunk_size=1024 keeps the anti-aliasing delay low; process_all() handles
         // the whole clip in one call so the chunk boundary details are invisible
         // to the caller.
-        let mut resampler =
-            Fft::<f32>::new(src_rate as usize, WHISPER_RATE as usize, 1024, 1, FixedSync::Both)
-                .context("voice: failed to create FFT resampler")?;
+        let mut resampler = Fft::<f32>::new(
+            src_rate as usize,
+            WHISPER_RATE as usize,
+            1024,
+            1,
+            FixedSync::Both,
+        )
+        .context("voice: failed to create FFT resampler")?;
 
         let resampled = resampler
             .process_all(&input_buf, samples.len(), None)
@@ -1077,10 +1093,7 @@ pub mod stt {
                     return Self { saved: None };
                 }
                 let null_path = b"/dev/null\0";
-                let null = libc::open(
-                    null_path.as_ptr() as *const libc::c_char,
-                    libc::O_WRONLY,
-                );
+                let null = libc::open(null_path.as_ptr() as *const libc::c_char, libc::O_WRONLY);
                 if null < 0 {
                     libc::close(saved);
                     return Self { saved: None };
@@ -1215,13 +1228,15 @@ pub mod stt {
                 init_whisper_logging(false);
                 // Suppress stderr chatter from whisper.cpp initialization.
                 let _silence = StderrSilencer::new(true);
-                let ctx =
-                    WhisperContext::new_with_params(&self.model_path, WhisperContextParameters::new())
-                        .map_err(|source| SttError::ModelLoad {
-                            path: self.model_path.clone(),
-                            source,
-                        })
-                        .context("voice: failed to initialise Whisper context")?;
+                let ctx = WhisperContext::new_with_params(
+                    &self.model_path,
+                    WhisperContextParameters::new(),
+                )
+                .map_err(|source| SttError::ModelLoad {
+                    path: self.model_path.clone(),
+                    source,
+                })
+                .context("voice: failed to initialise Whisper context")?;
                 drop(_silence); // Restore stderr before context is returned
                 self.ctx = Some(ctx);
             }
@@ -1289,7 +1304,10 @@ pub mod stt {
         #[test]
         fn new_does_not_load_model() {
             let t = Transcriber::new("/nonexistent/ggml-tiny.en.bin");
-            assert!(t.ctx.is_none(), "context must not be loaded at construction");
+            assert!(
+                t.ctx.is_none(),
+                "context must not be loaded at construction"
+            );
         }
 
         /// `transcribe` must return an error (not panic) when the model file
@@ -1336,7 +1354,7 @@ pub mod stt {
 /// Download is consent-gated at the REPL level (TASK-366/367); this function
 /// only caches and verifies.
 pub mod model {
-    use anyhow::{anyhow, Context, Result};
+    use anyhow::{Context, Result, anyhow};
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::time::Instant;
@@ -1358,18 +1376,54 @@ pub mod model {
     /// Sizes are approximate (rounded down ~5%) so a legitimate partial CDN
     /// chunk redelivery is never wrongly rejected.
     const KNOWN_MODELS: &[ModelSpec] = &[
-        ModelSpec { name: "tiny",      min_size:  73_000_000 },
-        ModelSpec { name: "tiny.en",   min_size:  73_000_000 },
-        ModelSpec { name: "base",      min_size: 140_000_000 },
-        ModelSpec { name: "base.en",   min_size: 140_000_000 },
-        ModelSpec { name: "small",     min_size: 460_000_000 },
-        ModelSpec { name: "small.en",  min_size: 460_000_000 },
-        ModelSpec { name: "medium",    min_size: 1_430_000_000 },
-        ModelSpec { name: "medium.en", min_size: 1_430_000_000 },
-        ModelSpec { name: "large-v1",  min_size: 2_870_000_000 },
-        ModelSpec { name: "large-v2",  min_size: 2_870_000_000 },
-        ModelSpec { name: "large-v3",  min_size: 2_870_000_000 },
-        ModelSpec { name: "large",     min_size: 2_870_000_000 },
+        ModelSpec {
+            name: "tiny",
+            min_size: 73_000_000,
+        },
+        ModelSpec {
+            name: "tiny.en",
+            min_size: 73_000_000,
+        },
+        ModelSpec {
+            name: "base",
+            min_size: 140_000_000,
+        },
+        ModelSpec {
+            name: "base.en",
+            min_size: 140_000_000,
+        },
+        ModelSpec {
+            name: "small",
+            min_size: 460_000_000,
+        },
+        ModelSpec {
+            name: "small.en",
+            min_size: 460_000_000,
+        },
+        ModelSpec {
+            name: "medium",
+            min_size: 1_430_000_000,
+        },
+        ModelSpec {
+            name: "medium.en",
+            min_size: 1_430_000_000,
+        },
+        ModelSpec {
+            name: "large-v1",
+            min_size: 2_870_000_000,
+        },
+        ModelSpec {
+            name: "large-v2",
+            min_size: 2_870_000_000,
+        },
+        ModelSpec {
+            name: "large-v3",
+            min_size: 2_870_000_000,
+        },
+        ModelSpec {
+            name: "large",
+            min_size: 2_870_000_000,
+        },
     ];
 
     // -----------------------------------------------------------------------
@@ -1411,9 +1465,8 @@ pub mod model {
 
         // Ensure the cache directory exists.
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("voice: creating model cache dir {}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("voice: creating model cache dir {}", parent.display()))?;
         }
 
         // Stream the model from the canonical Hugging Face mirror.
@@ -1483,9 +1536,7 @@ pub mod model {
             return Err(anyhow!("voice: model name must not contain '/': {name:?}"));
         }
         if name.contains("..") {
-            return Err(anyhow!(
-                "voice: model name must not contain '..': {name:?}"
-            ));
+            return Err(anyhow!("voice: model name must not contain '..': {name:?}"));
         }
         Ok(())
     }
@@ -1623,10 +1674,7 @@ pub mod model {
                     fmt_bytes(t),
                 );
             }
-            _ => eprint!(
-                "\r\x1b[2m  {label}: {}\x1b[0m\x1b[K",
-                fmt_bytes(downloaded)
-            ),
+            _ => eprint!("\r\x1b[2m  {label}: {}\x1b[0m\x1b[K", fmt_bytes(downloaded)),
         }
         let _ = std::io::stderr().flush();
     }
@@ -1683,10 +1731,7 @@ pub mod model {
         #[test]
         fn whisper_url_strips_trailing_slash_on_base() {
             let url = whisper_url("https://huggingface.co/", "base.en");
-            assert!(
-                !url.contains("//ggerganov"),
-                "double slash in URL: {url}"
-            );
+            assert!(!url.contains("//ggerganov"), "double slash in URL: {url}");
         }
 
         #[test]
@@ -1701,9 +1746,8 @@ pub mod model {
         #[test]
         fn validate_name_accepts_known_models() {
             for spec in KNOWN_MODELS {
-                validate_name(spec.name).unwrap_or_else(|e| {
-                    panic!("rejected valid model name {:?}: {e}", spec.name)
-                });
+                validate_name(spec.name)
+                    .unwrap_or_else(|e| panic!("rejected valid model name {:?}: {e}", spec.name));
             }
         }
 
@@ -1782,11 +1826,7 @@ pub mod model {
         #[test]
         fn known_models_have_nonzero_min_sizes() {
             for spec in KNOWN_MODELS {
-                assert!(
-                    spec.min_size > 0,
-                    "model {:?} has zero min_size",
-                    spec.name
-                );
+                assert!(spec.min_size > 0, "model {:?} has zero min_size", spec.name);
             }
         }
 
@@ -1818,3 +1858,216 @@ pub mod model {
 /// `voice.enable_remote_stt = true`.
 #[cfg(feature = "voice-api")]
 pub mod openai_stt;
+
+// ---------------------------------------------------------------------------
+// Activation word + voice-mode toggle state
+// ---------------------------------------------------------------------------
+
+/// Activation-word matching and voice-mode ON/OFF state.
+///
+/// Re-exported from the **ungated** [`crate::voice_activation`] module so voice
+/// builds have one obvious path (`voice::activation::match_activation`). The
+/// implementation deliberately lives outside this feature-gated module: it has
+/// no native dependencies, and keeping it ungated means the default CI gate
+/// (`cargo test --no-default-features --locked`) compiles and tests the
+/// decision logic that is most likely to be wrong.
+#[allow(unused_imports)]
+pub(crate) use crate::voice_activation as activation;
+
+// ---------------------------------------------------------------------------
+// LLM verification of a transcribed command
+// ---------------------------------------------------------------------------
+
+/// Prompting + reply-parsing for the **verify-before-run** step.
+///
+/// Speech recognition on a tiny local model is lossy in a specific, dangerous
+/// way: it mangles *identifiers* while leaving the sentence grammatical
+/// ("git push origin main" → "get push origin mane"). Running that blind is how
+/// a voice shell deletes something. So between transcription and execution we
+/// put the candidate through the interactive model, then show the operator the
+/// result for confirmation.
+///
+/// This module is pure string work — prompt in, candidate out — so it is
+/// testable without a model or a microphone. The actual model call and the
+/// confirmation UI live in `crate::voice_session`.
+pub mod verify {
+    /// Upper bound on transcript characters sent to the model. A runaway STT
+    /// hallucination shouldn't become a runaway prompt.
+    pub const MAX_TRANSCRIPT_CHARS: usize = 600;
+
+    /// Build the clarification prompt for a transcribed utterance.
+    ///
+    /// The instructions are deliberately narrow: the model is a *transcription
+    /// repairer*, not an assistant. It must not answer the request, explain
+    /// itself, or invent flags — only reconstruct what the operator most
+    /// plausibly said. Anything chattier defeats the purpose, because the
+    /// operator is about to press Enter on the output.
+    pub fn prompt(transcript: &str, cwd: &str) -> String {
+        let clipped: String = transcript.chars().take(MAX_TRANSCRIPT_CHARS).collect();
+        format!(
+            "Please verify this transcribed command.\n\n\
+             The text below came from speech-to-text, so it may contain \
+             homophone errors in command names, paths, flags, or branch names \
+             (for example \"get\" for \"git\", \"mane\" for \"main\", \
+             \"dash dash\" for \"--\").\n\n\
+             Transcript: {clipped:?}\n\
+             Working directory: {cwd}\n\n\
+             Reply with ONE line: the corrected shell command or natural-language \
+             request, exactly as it should be run. No code fences, no quotes, no \
+             explanation, no commentary. If the transcript is already correct, \
+             repeat it verbatim. If it is too garbled to be a plausible command, \
+             reply with the single word UNCLEAR."
+        )
+    }
+
+    /// Reduce a model reply to a single candidate command line.
+    ///
+    /// Models decorate output even when told not to, so strip the usual
+    /// wrappers: code fences, a `$`/`aish>` prompt, surrounding backticks or
+    /// quotes. Returns `None` when the reply is empty or `UNCLEAR`, which the
+    /// caller surfaces as "couldn't make that out" instead of running anything.
+    pub fn parse_reply(reply: &str) -> Option<String> {
+        let line = reply
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("```"))?;
+
+        let line = line
+            .trim_start_matches("$ ")
+            .trim_start_matches("aish> ")
+            .trim_start_matches("aish>")
+            .trim();
+        let line = line.trim_matches('`').trim();
+        // Only unwrap quotes when they wrap the WHOLE line — a command can
+        // legitimately contain quotes ("git commit -m 'fix'").
+        let line = if line.len() >= 2
+            && ((line.starts_with('"') && line.ends_with('"'))
+                || (line.starts_with('\'') && line.ends_with('\'')))
+        {
+            line[1..line.len() - 1].trim()
+        } else {
+            line
+        };
+
+        if line.is_empty() || line.eq_ignore_ascii_case("unclear") {
+            return None;
+        }
+        Some(line.to_string())
+    }
+
+    /// System prompt for the verification pass. Pinned next to `prompt()` so the
+    /// two halves of the instruction can't drift apart.
+    pub const VERIFY_SYSTEM: &str = "You repair speech-to-text transcriptions of shell commands. \
+You are NOT an assistant: never answer the request, never explain, never add flags or arguments \
+that were not spoken. Reconstruct the single line the operator most plausibly said, fixing \
+homophones in command names, paths, flags, and branch names. Output ONLY that one line — no \
+prose, no markdown, no code fences, no leading `$`. If the transcript is already a plausible \
+command, repeat it verbatim. If it is too garbled to reconstruct, output exactly: UNCLEAR";
+
+    /// Run a transcript through the interactive model for homophone repair,
+    /// streaming the reply to `on_text` so the operator watches it assemble.
+    ///
+    /// Returns the repaired candidate, or `None` when the model answers
+    /// `UNCLEAR` / returns nothing usable. The caller is expected to fall back
+    /// to the raw transcript in that case and ALWAYS to confirm before running
+    /// — this function never executes anything.
+    pub async fn verify_transcript(
+        backend: &crate::backend::Backend,
+        session: &crate::session::Session,
+        transcript: &str,
+        on_text: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<Option<String>> {
+        let user = prompt(transcript, &session.cwd.display().to_string());
+        let mut sink = |delta: crate::backend::StreamDelta<'_>| {
+            if let crate::backend::StreamDelta::Text(t) = delta {
+                on_text(t);
+            }
+        };
+        let turn = backend
+            .complete_streaming(
+                VERIFY_SYSTEM,
+                &[crate::backend::Msg::user(user)],
+                &[],
+                &mut sink,
+            )
+            .await?;
+        Ok(parse_reply(&turn.text))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn prompt_contains_the_verification_ask_and_context() {
+            let p = prompt("get push origin mane", "/tmp/repo");
+            assert!(
+                p.contains("Please verify this transcribed command"),
+                "prompt must open with the verification ask: {p}"
+            );
+            assert!(
+                p.contains("get push origin mane"),
+                "prompt must carry the transcript"
+            );
+            assert!(p.contains("/tmp/repo"), "prompt must carry the cwd");
+            assert!(
+                p.contains("ONE line"),
+                "prompt must constrain the reply shape"
+            );
+        }
+
+        #[test]
+        fn prompt_clips_a_runaway_transcript() {
+            let huge = "la ".repeat(2_000);
+            let p = prompt(&huge, "/tmp");
+            assert!(
+                p.len() < huge.len(),
+                "a runaway transcript must be clipped, not forwarded whole"
+            );
+        }
+
+        #[test]
+        fn parse_reply_takes_the_command_line() {
+            assert_eq!(
+                parse_reply("git push origin main").as_deref(),
+                Some("git push origin main")
+            );
+            assert_eq!(
+                parse_reply("  git status  \n").as_deref(),
+                Some("git status")
+            );
+        }
+
+        #[test]
+        fn parse_reply_strips_model_decoration() {
+            assert_eq!(
+                parse_reply("```sh\ngit push origin main\n```").as_deref(),
+                Some("git push origin main")
+            );
+            assert_eq!(parse_reply("$ git status").as_deref(), Some("git status"));
+            assert_eq!(
+                parse_reply("aish> git status").as_deref(),
+                Some("git status")
+            );
+            assert_eq!(parse_reply("`git status`").as_deref(), Some("git status"));
+            assert_eq!(parse_reply("\"git status\"").as_deref(), Some("git status"));
+        }
+
+        #[test]
+        fn parse_reply_keeps_inner_quotes() {
+            assert_eq!(
+                parse_reply("git commit -m 'fix the thing'").as_deref(),
+                Some("git commit -m 'fix the thing'")
+            );
+        }
+
+        #[test]
+        fn parse_reply_rejects_empty_and_unclear() {
+            assert_eq!(parse_reply(""), None);
+            assert_eq!(parse_reply("   \n\n  "), None);
+            assert_eq!(parse_reply("UNCLEAR"), None);
+            assert_eq!(parse_reply("unclear"), None);
+            assert_eq!(parse_reply("```\n```"), None);
+        }
+    }
+}
