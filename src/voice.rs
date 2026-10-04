@@ -1058,45 +1058,75 @@ pub mod stt {
     // Whisper logging suppression (TASK-368: hide init chatter from stderr)
     // -----------------------------------------------------------------------
 
-    /// RAII guard that silences stderr for the duration of its scope by
-    /// redirecting fd 2 to /dev/null. Restores fd 2 on drop. NOT thread-safe —
+    /// RAII guard that silences stdout and stderr for the duration of its scope by
+    /// redirecting fd 1 and fd 2 to /dev/null. Restores both on drop. NOT thread-safe —
     /// keep scope tight (only around WhisperContext init).
-    struct StderrSilencer {
-        saved: Option<i32>,
+    struct OutputSilencer {
+        stdout_saved: Option<i32>,
+        stderr_saved: Option<i32>,
     }
 
-    impl StderrSilencer {
+    impl OutputSilencer {
         fn new(enabled: bool) -> Self {
             if !enabled {
-                return Self { saved: None };
+                return Self {
+                    stdout_saved: None,
+                    stderr_saved: None,
+                };
             }
             // SAFETY: fd manipulation via libc.
             unsafe {
-                let saved = libc::dup(libc::STDERR_FILENO);
-                if saved < 0 {
-                    return Self { saved: None };
-                }
                 let null_path = b"/dev/null\0";
                 let null = libc::open(
                     null_path.as_ptr() as *const libc::c_char,
                     libc::O_WRONLY,
                 );
                 if null < 0 {
-                    libc::close(saved);
-                    return Self { saved: None };
+                    return Self {
+                        stdout_saved: None,
+                        stderr_saved: None,
+                    };
                 }
-                libc::dup2(null, libc::STDERR_FILENO);
+
+                // Save and redirect stdout (fd 1)
+                let stdout_saved = libc::dup(libc::STDOUT_FILENO);
+                if stdout_saved >= 0 {
+                    libc::dup2(null, libc::STDOUT_FILENO);
+                }
+
+                // Save and redirect stderr (fd 2)
+                let stderr_saved = libc::dup(libc::STDERR_FILENO);
+                if stderr_saved >= 0 {
+                    libc::dup2(null, libc::STDERR_FILENO);
+                }
+
                 libc::close(null);
-                Self { saved: Some(saved) }
+
+                Self {
+                    stdout_saved: if stdout_saved >= 0 {
+                        Some(stdout_saved)
+                    } else {
+                        None
+                    },
+                    stderr_saved: if stderr_saved >= 0 {
+                        Some(stderr_saved)
+                    } else {
+                        None
+                    },
+                }
             }
         }
     }
 
-    impl Drop for StderrSilencer {
+    impl Drop for OutputSilencer {
         fn drop(&mut self) {
-            if let Some(s) = self.saved {
-                // SAFETY: restore fd 2 from the saved fd.
-                unsafe {
+            // SAFETY: restore fds 1 and 2 from the saved fds.
+            unsafe {
+                if let Some(s) = self.stdout_saved {
+                    libc::dup2(s, libc::STDOUT_FILENO);
+                    libc::close(s);
+                }
+                if let Some(s) = self.stderr_saved {
                     libc::dup2(s, libc::STDERR_FILENO);
                     libc::close(s);
                 }
@@ -1213,8 +1243,8 @@ pub mod stt {
             if self.ctx.is_none() {
                 // Initialize whisper logging once (gates debug output).
                 init_whisper_logging(false);
-                // Suppress stderr chatter from whisper.cpp initialization.
-                let _silence = StderrSilencer::new(true);
+                // Suppress stdout/stderr chatter from whisper.cpp initialization.
+                let _silence = OutputSilencer::new(true);
                 let ctx =
                     WhisperContext::new_with_params(&self.model_path, WhisperContextParameters::new())
                         .map_err(|source| SttError::ModelLoad {
@@ -1222,7 +1252,7 @@ pub mod stt {
                             source,
                         })
                         .context("voice: failed to initialise Whisper context")?;
-                drop(_silence); // Restore stderr before context is returned
+                drop(_silence); // Restore stdout/stderr before context is returned
                 self.ctx = Some(ctx);
             }
 
