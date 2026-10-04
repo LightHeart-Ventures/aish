@@ -256,8 +256,8 @@ pub mod config {
         }
 
         #[test]
-        fn default_silence_ms_is_2000() {
-            assert_eq!(VoiceConfig::default().silence_ms, 2_000);
+        fn default_silence_ms_is_2500() {
+            assert_eq!(VoiceConfig::default().silence_ms, 2_500);
         }
 
         // ── parse: happy paths ──────────────────────────────────────────────
@@ -359,7 +359,7 @@ pub mod config {
         #[test]
         fn parse_invalid_silence_ms_falls_back_to_default() {
             let cfg = VoiceConfig::parse("voice.silence_ms = not_a_number\n");
-            assert_eq!(cfg.silence_ms, 2_000);
+            assert_eq!(cfg.silence_ms, 2_500);
         }
 
         /// Contract test for the TASK-368 REPL wiring: a realistic config
