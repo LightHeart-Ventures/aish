@@ -620,7 +620,13 @@ pub(crate) fn live_descendant_runs(
 /// Render the do-not-re-dispatch ledger appended to the next turn's guidance.
 /// `None` when nothing is in flight, so a clean turn's directive stays clean.
 /// Pure → unit-tested.
-pub(crate) fn render_inflight_directive(inflight: &[(String, String)]) -> Option<String> {
+/// TASK-808: each entry is `(run_id, task, node_id)`. When the run was resolved
+/// to a plan node the line NAMES that node — the directive then tells the next
+/// turn which plan node is owned, not just which words were dispatched. Entries
+/// with no node resolve to the pre-TASK-808 line, byte for byte.
+pub(crate) fn render_inflight_directive(
+    inflight: &[(String, String, Option<String>)],
+) -> Option<String> {
     if inflight.is_empty() {
         return None;
     }
@@ -631,12 +637,70 @@ pub(crate) fn render_inflight_directive(inflight: &[(String, String)]) -> Option
          background_status, steer with `tell`, or `stop` one if it has gone \
          wrong — and spend this turn on the REMAINING work only:\n",
     );
-    for (run_id, task) in inflight {
+    for (run_id, task, node_id) in inflight {
         let one_line = task.split_whitespace().collect::<Vec<_>>().join(" ");
         let brief: String = one_line.chars().take(160).collect();
-        out.push_str(&format!("  - run `{run_id}` owns: {brief}\n"));
+        match node_id {
+            Some(node) => out.push_str(&format!(
+                "  - run `{run_id}` owns plan node `{node}`: {brief}\n"
+            )),
+            None => out.push_str(&format!("  - run `{run_id}` owns: {brief}\n")),
+        }
     }
     Some(out.trim_end().to_string())
+}
+
+/// TASK-808: resolve a live run to the plan node it is executing, so its lease
+/// can be keyed on that node's stable id instead of a fuzzy hash of its brief.
+///
+/// Resolution order, first hit wins, nodes scanned in declaration order:
+///   1. a node whose `id` appears as a whole token in the RUN ID — dispatches
+///      that encode the node slug in the run id identify themselves exactly;
+///   2. a node whose `id` appears as a whole token in the run's TASK BRIEF;
+///   3. `None` — the run predates the plan, or belongs to no node, and keeps
+///      the text-keyed lease.
+///
+/// Whole-token matching matters: a bare substring test would let node `api`
+/// claim a run about `api-gateway`. Pure → unit-tested.
+pub(crate) fn run_to_plan_node<'g>(
+    graph: &'g crate::plan::PlanGraph,
+    run_id: &str,
+    task: &str,
+) -> Option<&'g crate::plan::PlanNode> {
+    graph
+        .nodes
+        .iter()
+        .find(|n| contains_id_token(run_id, &n.id))
+        .or_else(|| graph.nodes.iter().find(|n| contains_id_token(task, &n.id)))
+}
+
+/// Whether `id` occurs in `haystack` delimited by non-identifier characters.
+/// Node ids are `[a-z0-9-]` only, so the delimiter test is "neither
+/// alphanumeric nor `-`". Case-insensitive on the haystack, since a brief may
+/// capitalize a node id that is lowercase by construction.
+fn contains_id_token(haystack: &str, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    let hay = haystack.to_lowercase();
+    let mut from = 0usize;
+    while let Some(rel) = hay[from..].find(id) {
+        let start = from + rel;
+        let end = start + id.len();
+        let before_ok = match hay[..start].chars().next_back() {
+            Some(c) => !c.is_alphanumeric() && c != '-',
+            None => true,
+        };
+        let after_ok = match hay[end..].chars().next() {
+            Some(c) => !c.is_alphanumeric() && c != '-',
+            None => true,
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
 }
 
 /// IO half: read the durable run forest, claim a lease per live descendant work
@@ -650,18 +714,39 @@ fn inflight_directive(scope: &str, ancestors: &[String]) -> Option<String> {
         crate::coordinator_store::CoordinatorStore::open(&crate::db_paths::main_db_path()).ok()?;
     let rows = store.load_all().ok()?;
     let inflight = live_descendant_runs(&rows, ancestors);
+    // TASK-808: when a plan graph is stored for this scope, key each lease on
+    // the plan NODE the run is executing rather than on the fuzzy hash of its
+    // brief. No graph (not yet planned, or a poisoned row that reads as absent)
+    // → every package falls back to the text key, i.e. the pre-TASK-808
+    // behaviour unchanged.
+    let graph = store.load_plan_graph(scope).ok().flatten();
+    let mut rendered: Vec<(String, String, Option<String>)> = Vec::with_capacity(inflight.len());
     for (run_id, task) in &inflight {
+        let node_id = graph
+            .as_ref()
+            .and_then(|g| run_to_plan_node(g, run_id, task))
+            .map(|n| n.id.clone());
         // Re-claim is idempotent for the same owner (it renews the TTL), and a
         // conflicting claim by a DIFFERENT run is exactly the signal we want to
         // keep: the package stays listed as owned either way.
-        let _ = store.claim_work_package(
-            scope,
-            task,
-            run_id,
-            crate::coordinator_store::DEFAULT_WORK_PACKAGE_TTL_SECS,
-        );
+        let _ = match node_id.as_deref() {
+            Some(node) => store.claim_plan_node(
+                scope,
+                node,
+                task,
+                run_id,
+                crate::coordinator_store::DEFAULT_WORK_PACKAGE_TTL_SECS,
+            ),
+            None => store.claim_work_package(
+                scope,
+                task,
+                run_id,
+                crate::coordinator_store::DEFAULT_WORK_PACKAGE_TTL_SECS,
+            ),
+        };
+        rendered.push((run_id.clone(), task.clone(), node_id));
     }
-    render_inflight_directive(&inflight)
+    render_inflight_directive(&rendered)
 }
 
 /// Terminal outcome of a goal pursuit, surfaced on the `GoalEnd` hook payload.
@@ -1893,14 +1978,56 @@ mod tests {
     fn render_inflight_directive_is_none_when_clean_and_names_owners_otherwise() {
         assert!(render_inflight_directive(&[]).is_none());
         let d = render_inflight_directive(&[
-            ("run_a".into(), "fix   the\nretry backoff".into()),
-            ("run_b".into(), "write the docs".into()),
+            ("run_a".into(), "fix   the\nretry backoff".into(), None),
+            (
+                "run_b".into(),
+                "write the docs".into(),
+                Some("docs-cli".into()),
+            ),
         ])
         .unwrap();
         assert!(d.contains("Do NOT re-dispatch"), "{d}");
+        // No node resolved → the pre-TASK-808 line, byte for byte.
         assert!(d.contains("run `run_a` owns: fix the retry backoff"), "{d}");
-        assert!(d.contains("run `run_b` owns: write the docs"), "{d}");
+        // TASK-808: a resolved node is NAMED, so the next turn knows which plan
+        // node is owned rather than only which words were dispatched.
+        assert!(
+            d.contains("run `run_b` owns plan node `docs-cli`: write the docs"),
+            "{d}"
+        );
         assert!(!d.ends_with('\n'));
+    }
+
+    /// TASK-808: run-id match beats brief match, matching is whole-token only
+    /// (a bare substring would let node `api` steal `api-gateway`'s run), and an
+    /// unmatched run resolves to `None` so it keeps the text-keyed lease.
+    #[test]
+    fn run_to_plan_node_prefers_run_id_then_brief_then_none() {
+        let node = |id: &str| crate::plan::PlanNode {
+            id: id.into(),
+            intent: format!("do {id}"),
+            files: vec![],
+            depends_on: vec![],
+            acceptance: vec![],
+            est_calls: 0,
+        };
+        let graph = crate::plan::PlanGraph {
+            scope_key: "goal:abc".into(),
+            nodes: vec![node("api"), node("api-gateway"), node("docs")],
+            created_at: 0,
+        };
+
+        // (1) The run id wins over anything in the brief.
+        let hit = run_to_plan_node(&graph, "w_docs_1", "touch the api surface").unwrap();
+        assert_eq!(hit.id, "docs");
+        // (2) Brief match when the run id carries no node slug. Case-insensitive.
+        let hit = run_to_plan_node(&graph, "w_7f3a", "Rework the API handler").unwrap();
+        assert_eq!(hit.id, "api");
+        // Whole-token only: `api` must not claim a brief about `api-gateway`.
+        let hit = run_to_plan_node(&graph, "w_7f3a", "rework the api-gateway listener").unwrap();
+        assert_eq!(hit.id, "api-gateway", "a bare substring must not win");
+        // (3) Nothing matches → None.
+        assert!(run_to_plan_node(&graph, "w_7f3a", "unrelated chore").is_none());
     }
 
     #[test]

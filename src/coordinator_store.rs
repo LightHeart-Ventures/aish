@@ -225,6 +225,24 @@ pub fn work_package_key(task: &str) -> String {
     out.chars().take(400).collect()
 }
 
+/// TASK-808: lease key for a PLAN NODE's work package.
+///
+/// Returns `node:<scope_key>/<node_id>`, which cannot collide with any
+/// [`work_package_key`] output (that function strips `:` and `/` along with
+/// every other non-alphanumeric), so node-keyed and text-keyed leases coexist
+/// in the one ledger without a schema change.
+///
+/// Why this exists: the text key is a fuzzy hash of a brief. Two plan nodes
+/// phrased identically ("update the docs") collapse onto ONE key and contend
+/// for a single lease, so the second node is refused as a duplicate even though
+/// it is distinct work; conversely a re-worded re-dispatch of the SAME node
+/// misses its own lease. A plan node id is the stable identity the plan graph
+/// already guarantees is unique within a scope — keying on it makes the lease
+/// exact in both directions. Pure → unit-tested.
+pub fn plan_node_lease_key(scope_key: &str, node_id: &str) -> String {
+    format!("node:{scope_key}/{node_id}")
+}
+
 /// Unix seconds now (lease TTL arithmetic). Monotonicity isn't required — a
 /// lease only needs a coarse wall-clock deadline.
 fn unix_now() -> i64 {
@@ -1152,7 +1170,49 @@ impl CoordinatorStore {
         owner_run: &str,
         ttl_secs: i64,
     ) -> Result<()> {
-        let key = work_package_key(task);
+        self.claim_keyed(scope, &work_package_key(task), task, owner_run, ttl_secs)
+    }
+
+    /// TASK-808: claim the work package for PLAN NODE `node_id` under
+    /// `scope_key`, keyed on the node id instead of a fuzzy hash of `task`.
+    ///
+    /// Same semantics as [`Self::claim_work_package`] — idempotent renewal for
+    /// the same owner, loud refusal while a DIFFERENT run holds a live claim,
+    /// reclaimable once released / lapsed / owner-terminal — but the identity is
+    /// now exact: two nodes with identical briefs no longer contend, and a
+    /// re-worded re-dispatch of one node still hits its own lease.
+    ///
+    /// `task` is still stored on the row: it is the brief the fan-out guard
+    /// fuzzy-matches against and what the in-flight directive renders, so the
+    /// node id identifies the lease while the text stays human-readable.
+    pub fn claim_plan_node(
+        &self,
+        scope_key: &str,
+        node_id: &str,
+        task: &str,
+        owner_run: &str,
+        ttl_secs: i64,
+    ) -> Result<()> {
+        self.claim_keyed(
+            scope_key,
+            &plan_node_lease_key(scope_key, node_id),
+            task,
+            owner_run,
+            ttl_secs,
+        )
+    }
+
+    /// Shared lease body for both key flavours — the conflict check and the
+    /// upsert live here ONCE so a text-keyed and a node-keyed claim can never
+    /// drift in their liveness or renewal rules.
+    fn claim_keyed(
+        &self,
+        scope: &str,
+        key: &str,
+        task: &str,
+        owner_run: &str,
+        ttl_secs: i64,
+    ) -> Result<()> {
         let now = unix_now();
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
@@ -1202,7 +1262,24 @@ impl CoordinatorStore {
     /// the owner so a sibling can't release someone else's claim. Idempotent.
     #[cfg(test)]
     pub fn release_work_package(&self, scope: &str, task: &str, owner_run: &str) -> Result<()> {
-        let key = work_package_key(task);
+        self.release_keyed(scope, &work_package_key(task), owner_run)
+    }
+
+    /// TASK-808: hand a PLAN NODE's package back early. Owner-scoped (a sibling
+    /// cannot release someone else's claim) and idempotent, exactly like
+    /// [`Self::release_work_package`].
+    #[allow(dead_code)]
+    pub fn release_plan_node(&self, scope_key: &str, node_id: &str, owner_run: &str) -> Result<()> {
+        self.release_keyed(
+            scope_key,
+            &plan_node_lease_key(scope_key, node_id),
+            owner_run,
+        )
+    }
+
+    /// Shared release body for both key flavours.
+    #[allow(dead_code)]
+    fn release_keyed(&self, scope: &str, key: &str, owner_run: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE work_package_leases SET released = 1
@@ -1259,7 +1336,17 @@ impl CoordinatorStore {
     /// exercisable without sleeping.
     #[cfg(test)]
     pub fn expire_lease_for_test(&self, scope: &str, task: &str) {
-        let key = work_package_key(task);
+        self.expire_key_for_test(scope, &work_package_key(task));
+    }
+
+    /// TASK-808 test hook: same forced expiry, addressed by plan node id.
+    #[cfg(test)]
+    pub fn expire_plan_node_lease_for_test(&self, scope_key: &str, node_id: &str) {
+        self.expire_key_for_test(scope_key, &plan_node_lease_key(scope_key, node_id));
+    }
+
+    #[cfg(test)]
+    fn expire_key_for_test(&self, scope: &str, key: &str) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
             "UPDATE work_package_leases SET expires_at = 0 WHERE scope = ?1 AND wp_key = ?2",
@@ -2497,6 +2584,147 @@ mod tests {
 
         // Idempotent: clearing an already-cleared scope is not an error.
         store.clear_plan_graph("goal:alpha").unwrap();
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── TASK-808: plan-node-keyed work-package leases ────────────────────────
+
+    /// The node key is scope-qualified and stable, and cannot collide with a
+    /// text key — `work_package_key` strips `:` and `/` along with every other
+    /// non-alphanumeric, so the two namespaces are provably disjoint.
+    #[test]
+    fn plan_node_lease_key_is_scope_qualified_and_disjoint_from_text_keys() {
+        assert_eq!(
+            plan_node_lease_key("goal:abc", "parse-flags"),
+            "node:goal:abc/parse-flags"
+        );
+        // Stable across calls.
+        assert_eq!(
+            plan_node_lease_key("goal:abc", "a"),
+            plan_node_lease_key("goal:abc", "a")
+        );
+        // The same node id under a different scope is a DIFFERENT lease.
+        assert_ne!(
+            plan_node_lease_key("goal:abc", "a"),
+            plan_node_lease_key("goal:def", "a")
+        );
+        // No text key can ever equal a node key.
+        let text = work_package_key("node:goal:abc/parse-flags");
+        assert!(!text.contains(':') && !text.contains('/'), "{text}");
+        assert_ne!(text, plan_node_lease_key("goal:abc", "parse-flags"));
+    }
+
+    /// The whole point of the card. Two plan nodes whose briefs are
+    /// word-for-word identical are DISTINCT leases, so both can be in flight at
+    /// once (the text key would have collapsed them into one and refused the
+    /// second as a duplicate); and a node's lease is still hit by a RE-WORDED
+    /// re-dispatch of that same node (the text key would have missed it).
+    #[test]
+    fn node_keyed_leases_separate_identical_briefs_and_survive_rewording() {
+        let (store, path) = plan_store("nodelease");
+        let scope = "goal:deadbeef";
+        let brief = "update the docs";
+
+        store
+            .claim_plan_node(scope, "docs-api", brief, "run_a", 600)
+            .unwrap();
+        store
+            .claim_plan_node(scope, "docs-cli", brief, "run_b", 600)
+            .unwrap();
+        assert_eq!(
+            store.live_work_package_leases(Some(scope)).unwrap().len(),
+            2,
+            "identical briefs on distinct nodes must not contend"
+        );
+
+        // Same owner, same node → idempotent renewal, not a conflict.
+        store
+            .claim_plan_node(scope, "docs-api", brief, "run_a", 600)
+            .unwrap();
+        // Re-worded brief for the SAME node still lands on that node's lease.
+        let err = store
+            .claim_plan_node(
+                scope,
+                "docs-api",
+                "Refresh the API documentation!",
+                "run_c",
+                600,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("run_a"),
+            "conflict must name the holder: {err}"
+        );
+        assert!(err.contains("already claimed"), "{err}");
+
+        // Release is owner-scoped and frees only that node.
+        store.release_plan_node(scope, "docs-api", "run_c").unwrap(); // no-op
+        assert_eq!(
+            store.live_work_package_leases(Some(scope)).unwrap().len(),
+            2
+        );
+        store.release_plan_node(scope, "docs-api", "run_a").unwrap();
+        let live = store.live_work_package_leases(Some(scope)).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].owner_run, "run_b", "docs-cli must be untouched");
+        // Freed → re-claimable by anyone.
+        store
+            .claim_plan_node(scope, "docs-api", brief, "run_c", 600)
+            .unwrap();
+
+        // A TTL lapse frees one node without touching its sibling.
+        store.expire_plan_node_lease_for_test(scope, "docs-api");
+        let live = store.live_work_package_leases(Some(scope)).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].owner_run, "run_b");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Node-keyed and text-keyed leases share the ONE ledger (no schema
+    /// change), and a node lease is cross-process durable — which is the only
+    /// reason the lease exists at all.
+    #[test]
+    fn node_and_text_keyed_leases_coexist_and_survive_a_reopen() {
+        let (store, path) = plan_store("coexist");
+        let scope = "goal:cafe";
+        let brief = "update the docs";
+
+        store
+            .claim_work_package(scope, brief, "run_text", 600)
+            .unwrap();
+        store
+            .claim_plan_node(scope, "docs-api", brief, "run_node", 600)
+            .unwrap();
+        assert_eq!(
+            store.live_work_package_leases(Some(scope)).unwrap().len(),
+            2,
+            "an identical brief keyed both ways is two independent leases"
+        );
+
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .live_work_package_leases(Some(scope))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            reopened
+                .claim_plan_node(scope, "docs-api", brief, "run_other", 600)
+                .is_err(),
+            "a node lease must still be honoured by a fresh process"
+        );
+
+        // A terminal owner frees its node lease at once, without a TTL wait.
+        reopened.insert("run_node", brief, "sess", None).unwrap();
+        reopened.set_phase("run_node", "done").unwrap();
+        let live = reopened.live_work_package_leases(Some(scope)).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].owner_run, "run_text");
 
         let _ = std::fs::remove_file(&path);
     }
