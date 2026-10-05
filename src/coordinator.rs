@@ -138,11 +138,16 @@ calls.\n\
 need in ONE batch — glob_expand, list_dir, git status, grep_files, and ranged read_file of every \
 already-known path fired together in a single turn. Do not read one file, think, then read the \
 next; independent reads have no dependency and MUST batch. The only serial exception is \
-grep-then-read of the SAME file (you need the line number first).\n\
---- PHASE 2: PLANNING --- (0 calls, REASONING ONLY) Decide the smallest correct change and the \
-exact list of files to touch using ONLY the context from Phase 1. You are FORBIDDEN from making ANY \
-tool call in this phase — no reads, no greps, no status checks. If you find you need another read, \
-that read belonged in Phase 1; note it and fold it into the Phase 3 batch, do not spend a planning \
+grep-then-read of the SAME file (you need the line number first). Close Phase 1 by stating the \
+DELTA (`ask - state`): the specific things the ask REQUIRES that the current state does not yet \
+provide, plus what is explicitly OUT OF SCOPE. This is the artifact Phase 2 plans against — the \
+Phase-0 guard only answered \"already shipped?\", this answers \"what exactly is left?\".\n\
+--- PHASE 2: PLANNING --- (0 calls, REASONING ONLY) From the Phase 1 delta, emit a PLAN GRAPH — not a \
+bare file list: for each unit of work a node `{ id (lowercase-kebab slug), intent, files[], \
+depends_on[], acceptance[] }`. `depends_on` names the node ids that must land first; two nodes \
+touching the same file are NOT independent and must be merged into one node or chained. You are \
+FORBIDDEN from making ANY tool call in this phase — no reads, no greps, no status checks. If you \
+need another read, it belonged in Phase 1 — fold it into the Phase 3 batch, do not spend a planning \
 turn on it.\n\
 --- PHASE 3: ACTIONS --- (5–10 calls, ALL PARALLEL) Fire every independent write in ONE batch — \
 write_file / edit_file to different files, plus independent commands — together. TRUST your writes: \
@@ -152,6 +157,27 @@ write whose content depends on a value you have not yet read.\n\
 --- PHASE 4: VALIDATION --- (1–2 calls, SERIAL) Run the canonical gate once (for aish: \
 `cargo test --no-default-features --locked`) and confirm green, then open/finish the PR. One check, \
 not a re-inspection of every file you just wrote.";
+
+/// TASK-807: fan-out is DERIVED from the Phase-2 plan graph's ready-set, not a
+/// discretionary judgement call. This replaces the old
+/// "RE-EVALUATE THE PLAN AFTER TRIAGE — don't over-decompose" directive, which
+/// suppressed the SYMPTOM (an 87-call runaway from unstructured fan-out) rather
+/// than the CAUSE (Phase 2 emitted a bare file list, so fan-out had nothing to
+/// key off and had to guess). The dependency graph replaces that suppression
+/// with a structural guard: dispatch iff >=2 nodes are ready AND their `files`
+/// sets are pairwise disjoint. This is the prompt twin of
+/// `PlanGraph::fan_out_candidates` (TASK-802) — both state the SAME condition.
+/// Held as a `const` so the rule is unit-testable without driving a whole run.
+const FAN_OUT_DERIVED: &str = "FAN-OUT IS DERIVED, NOT DISCRETIONARY: Before you fan work out with \
+`run_in_background`, compute `ready` = the Phase-2 plan-graph nodes whose `depends_on` are ALL \
+done. If `ready.len() >= 2` AND those nodes' `files` sets are pairwise disjoint, dispatch one \
+worker per ready node. Otherwise execute solo in this turn. NEVER dispatch a node with an unmet \
+dependency, and never two nodes touching the same file. (The old \"don't over-decompose\" directive \
+existed because unstructured fan-out once produced an 87-call runaway; the dependency graph \
+replaces that discretionary suppression with a structural guard.) If triage collapses the \
+remaining work to a single root cause the ready-set collapses to one node and you run solo by \
+construction — and if a now-redundant fan-out is ALREADY in flight, use `tell` to narrow or cancel \
+the pointless peers rather than letting redundant work run.";
 
 /// TASK-406 + TASK-410: advertise the codebase-memory MCP code-intelligence
 /// tools to the coordinator as FIRST-CLASS discovery, so a single structural
@@ -971,14 +997,7 @@ fact you already have, STOP and change approach. After about 3 failed attempts a
 sub-problem, do NOT keep retrying the same way — either try a materially different approach or \
 stop and report explicitly: say \"I'm blocked because <specific reason>\", list what you tried \
 and what you observed, and give your best partial result. A clearly-stated blocker is a \
-successful outcome; an endless retry loop is a failure.\n\nRE-EVALUATE THE PLAN AFTER TRIAGE — don't over-decompose: \
-Before you fan work out with `run_in_background`, re-check the plan against what triage just learned. If initial \
-triage narrowed or COLLAPSED the suspected causes to a single root cause, do NOT dispatch the parallel fan-out you \
-pre-planned — the independent-looking angles are now redundant. Root cause found → stop parallelizing: handle it \
-solo, or narrow the fan-out to only the sub-problems that are still genuinely independent and where parallelism \
-yields marginal new information. Only fan out when sub-problems are truly independent. If a redundant fan-out is \
-ALREADY in flight when triage has since collapsed the problem, use `tell` to narrow or cancel the now-pointless \
-peers rather than letting redundant work run.\n\nCOORDINATING WITH OTHER AGENTS — the `:tell` channel: an [Operator interjection] you receive mid-run arrived through this channel — the human (or another agent) steering you; treat it as updated instructions. You can steer ANOTHER in-flight coordinator the same way: call the `tell` tool with its run id (find ids with background_status) and a message, and it is folded into that coordinator's next round. Use it to hand off a finding, correct a peer's course, or narrow its scope.\n\nWRAPPING UP — open a draft PR for \
+successful outcome; an endless retry loop is a failure.\n\n{FAN_OUT_DERIVED}\n\nCOORDINATING WITH OTHER AGENTS — the `:tell` channel: an [Operator interjection] you receive mid-run arrived through this channel — the human (or another agent) steering you; treat it as updated instructions. You can steer ANOTHER in-flight coordinator the same way: call the `tell` tool with its run id (find ids with background_status) and a message, and it is folded into that coordinator's next round. Use it to hand off a finding, correct a peer's course, or narrow its scope.\n\nWRAPPING UP — open a draft PR for \
 PR-worthy work: When you finish, if you created or changed files that are meant to land (a fix, \
 feature, refactor, or docs) — as opposed to a read-only investigation, question, or analysis that \
 produced no committable changes — do NOT leave the work uncommitted or stranded on a local branch. \
@@ -2721,6 +2740,104 @@ mod tests {
     }
 
     #[test]
+    fn phase1_closes_on_a_delta_and_phase2_emits_a_plan_graph() {
+        // TASK-806: Phase 1 must EXIT by stating the delta (`ask - state`),
+        // including what is explicitly out of scope — the artifact Phase 2
+        // plans against. PHASE0_GUARD only answers "already shipped?".
+        // TASK-805: Phase 2 must emit a PLAN GRAPH (nodes with depends_on), not
+        // the bare file list it used to stop at — a file list is exactly where
+        // dependency information was being discarded.
+        let p = PHASE_PIPELINE;
+        assert!(
+            p.contains("DELTA") && p.contains("ask - state"),
+            "Phase 1 must close by stating the delta"
+        );
+        assert!(
+            p.contains("OUT OF SCOPE"),
+            "the delta must name what is out of scope"
+        );
+        assert!(
+            p.contains("what exactly is left?"),
+            "delta step must distinguish itself from the Phase-0 'already shipped?' question"
+        );
+        // The delta wording maps onto DeltaArtifact { ask_summary,
+        // state_summary, delta_items, out_of_scope } (TASK-801) so TASK-803 can
+        // persist exactly what the prompt asks for.
+        assert!(p.contains("PLAN GRAPH"), "Phase 2 must emit a plan graph");
+        for field in [
+            "id (lowercase-kebab slug)",
+            "intent",
+            "files[]",
+            "depends_on[]",
+            "acceptance[]",
+        ] {
+            assert!(p.contains(field), "plan-graph node missing field: {field}");
+        }
+        assert!(
+            p.contains("NOT independent"),
+            "same-file nodes must be merged or chained, never parallel"
+        );
+        // The old file-list-only wording is GONE — that was the exact point
+        // where dependency information got discarded.
+        assert!(
+            !p.contains("exact list of files to touch"),
+            "Phase 2 must no longer stop at a bare file list"
+        );
+        // ...but the zero-tool-call hard rule survives the rewrite.
+        assert!(
+            p.contains("(0 calls, REASONING ONLY)") && p.contains("FORBIDDEN from making ANY"),
+            "Phase 2 must still make ZERO tool calls"
+        );
+    }
+
+    #[test]
+    fn fan_out_is_derived_from_the_ready_set_not_discretionary() {
+        // TASK-807: the old "RE-EVALUATE THE PLAN AFTER TRIAGE — don't
+        // over-decompose" directive was a DISCRETIONARY suppression of the
+        // symptom (an 87-call runaway from unstructured fan-out). It is
+        // replaced by a STRUCTURAL guard derived from the Phase-2 plan graph,
+        // stating the SAME condition as PlanGraph::fan_out_candidates
+        // (TASK-802): >=2 ready nodes AND pairwise-disjoint file sets.
+        let f = FAN_OUT_DERIVED;
+        assert!(
+            f.contains("FAN-OUT IS DERIVED, NOT DISCRETIONARY"),
+            "fan-out rule must be stated as derived, not a judgement call"
+        );
+        assert!(
+            f.contains("`depends_on` are ALL"),
+            "ready-set is defined by satisfied dependencies"
+        );
+        assert!(
+            f.contains("`ready.len() >= 2`") && f.contains("pairwise disjoint"),
+            "must state the >=2-ready AND pairwise-disjoint-files condition"
+        );
+        assert!(
+            f.contains("Otherwise execute solo"),
+            "the else branch is solo execution, not a guess"
+        );
+        assert!(
+            f.contains("NEVER dispatch a node with an unmet"),
+            "unmet dependencies must never be dispatched"
+        );
+        // The motivating incident stays on the record.
+        assert!(
+            f.contains("87-call runaway"),
+            "the 87-call runaway must remain documented as the motivating incident"
+        );
+        // The discretionary directive itself is retired (the phrase survives
+        // ONLY as the quoted historical reference in the parenthetical).
+        assert!(
+            !f.contains("RE-EVALUATE THE PLAN AFTER TRIAGE"),
+            "the discretionary anti-decompose directive must be retired"
+        );
+        // Peer coordination survives the rewrite.
+        assert!(
+            f.contains("`tell`"),
+            "collapsed fan-out must still narrow or cancel peers in flight"
+        );
+    }
+
+    #[test]
     fn assembled_coordinator_prompt_carries_both_guard_and_pipeline() {
         // The runtime prompt template (see `drive`) prepends BOTH the Phase-0
         // guard and the 5-phase pipeline just before the TASK. Guard against a
@@ -2734,6 +2851,11 @@ mod tests {
             template.contains("--- PHASE 2: PLANNING ---"),
             "pipeline survives in the template"
         );
+        // TASK-807: FAN_OUT_DERIVED rides the per-turn directive block, NOT
+        // this preamble — it is covered by
+        // `fan_out_is_derived_from_the_ready_set_not_discretionary` instead of
+        // being asserted here, so this test keeps asserting only what the real
+        // assembly actually prepends.
     }
 
     #[test]
