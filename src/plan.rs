@@ -50,6 +50,69 @@ pub struct PlanNode {
     pub est_calls: u32,
 }
 
+/// The persisted result of the Phase 1 → Phase 2 subtraction `ask - state`.
+///
+/// TASK-803. The coordinator's single most important derivation — what the ask
+/// requires MINUS what already exists — used to live only in context, computed
+/// inside one model turn and erased by the next compaction. The resumed turn
+/// then re-derived it from a SHORTER view of the world and could legitimately
+/// reach a different answer: different scope, different exclusions.
+///
+/// Writing it down makes step 3 of the five-step loop (review-ask →
+/// review-state → **identify-delta** → plan-with-deps → fan-out) a real object
+/// that steps 4 and 5 consume, stably, across turns. The artifact is a
+/// *summary* of remaining work and not a transcript dump — it is re-injected
+/// into every resumed turn, so it has to fit comfortably back into a compacted
+/// context.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeltaArtifact {
+    /// Scope this delta belongs to — the same partitioning key the plan graph
+    /// and the work-package ledger use.
+    pub scope_key: String,
+    /// Short restatement of the ask. Short on purpose: re-injected every
+    /// resume, so verbosity here is paid for on every turn.
+    pub ask_summary: String,
+    /// What Phase 1 DISCOVERY actually found on disk / board / CI.
+    pub state_summary: String,
+    /// What the ask requires that state does not yet provide. Phase 2 plans
+    /// against THIS, rather than re-deriving it.
+    #[serde(default)]
+    pub delta_items: Vec<String>,
+    /// Explicitly excluded work, recorded so a later turn cannot quietly
+    /// re-admit it after the reasoning that ruled it out has been compacted
+    /// away.
+    #[serde(default)]
+    pub out_of_scope: Vec<String>,
+    /// Unix epoch seconds the delta was computed.
+    pub created_at: i64,
+}
+
+impl DeltaArtifact {
+    /// Reject a delta that cannot be acted on: a delta with no `scope_key` has
+    /// nowhere to be stored, one with no `ask_summary` restates nothing, and
+    /// one with zero `delta_items` asserts "nothing remains" — which is a
+    /// finished goal, not a plan input.
+    pub fn validate(&self) -> Result<(), PlanError> {
+        if self.scope_key.trim().is_empty() {
+            return Err(PlanError::EmptyDeltaField("scope_key"));
+        }
+        if self.ask_summary.trim().is_empty() {
+            return Err(PlanError::EmptyDeltaField("ask_summary"));
+        }
+        if self.delta_items.is_empty() {
+            return Err(PlanError::EmptyDeltaField("delta_items"));
+        }
+        Ok(())
+    }
+
+    /// Age in seconds against `now`, for staleness decisions on resume. Clamped
+    /// at zero so a clock that stepped backwards reads as "just computed"
+    /// rather than as a negative age a caller might compare the wrong way.
+    pub fn age_secs(&self, now: i64) -> i64 {
+        (now - self.created_at).max(0)
+    }
+}
+
 /// A graph of [`PlanNode`]s scoped to a single coordinator scope key.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanGraph {
@@ -75,6 +138,8 @@ pub enum PlanError {
     /// The id does not match `^[a-z0-9][a-z0-9-]{0,47}$`, or a node depends on
     /// itself.
     InvalidId(NodeId),
+    /// A required [`DeltaArtifact`] field is empty. Carries the field name.
+    EmptyDeltaField(&'static str),
 }
 
 impl std::fmt::Display for PlanError {
@@ -92,6 +157,9 @@ impl std::fmt::Display for PlanError {
                 f,
                 "invalid plan node id '{id}' (expected ^[a-z0-9][a-z0-9-]{{0,47}}$ and no self-dependency)"
             ),
+            PlanError::EmptyDeltaField(field) => {
+                write!(f, "delta artifact field '{field}' must not be empty")
+            }
         }
     }
 }
@@ -287,6 +355,87 @@ mod tests {
 
     fn linear() -> PlanGraph {
         graph(vec![node("a", &[]), node("b", &["a"]), node("c", &["b"])])
+    }
+
+    // ── TASK-803: delta artifact ─────────────────────────────────────────────
+
+    fn delta() -> DeltaArtifact {
+        DeltaArtifact {
+            scope_key: "scope/test".to_string(),
+            ask_summary: "ship the delta artifact".to_string(),
+            state_summary: "plan graph persists; delta is context-only".to_string(),
+            delta_items: vec!["add the delta_artifact table".to_string()],
+            out_of_scope: vec!["rewriting the fan-out guard".to_string()],
+            created_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn valid_delta_artifact_passes_validation() {
+        assert_eq!(delta().validate(), Ok(()));
+    }
+
+    /// The three fields a delta cannot be acted on without: nowhere to store
+    /// it, nothing restated, or "nothing remains" — which is a finished goal,
+    /// not a plan input.
+    #[test]
+    fn delta_artifact_rejects_empty_required_fields() {
+        let mut d = delta();
+        d.scope_key = "  ".to_string();
+        assert_eq!(d.validate(), Err(PlanError::EmptyDeltaField("scope_key")));
+
+        let mut d = delta();
+        d.ask_summary = String::new();
+        assert_eq!(d.validate(), Err(PlanError::EmptyDeltaField("ask_summary")));
+
+        let mut d = delta();
+        d.delta_items.clear();
+        assert_eq!(d.validate(), Err(PlanError::EmptyDeltaField("delta_items")));
+    }
+
+    /// `out_of_scope` is explicitly optional: a delta that excluded nothing is
+    /// still a usable delta.
+    #[test]
+    fn delta_artifact_allows_empty_out_of_scope() {
+        let mut d = delta();
+        d.out_of_scope.clear();
+        assert_eq!(d.validate(), Ok(()));
+    }
+
+    /// Age drives the staleness call on resume, and a backwards clock step must
+    /// read as "just computed" rather than as a negative a caller could compare
+    /// the wrong way round.
+    #[test]
+    fn delta_artifact_age_is_clamped_at_zero() {
+        let d = delta();
+        assert_eq!(d.age_secs(1_700_000_000), 0);
+        assert_eq!(d.age_secs(1_700_000_090), 90);
+        assert_eq!(d.age_secs(1_699_999_000), 0, "a backwards clock reads as 0");
+    }
+
+    /// The artifact is persisted as a json blob, so absent optional fields must
+    /// decode rather than fail the load.
+    #[test]
+    fn delta_artifact_json_round_trips_and_defaults_optional_fields() {
+        let d = delta();
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(serde_json::from_str::<DeltaArtifact>(&json).unwrap(), d);
+
+        let minimal: DeltaArtifact = serde_json::from_str(
+            r#"{"scope_key":"s","ask_summary":"a","state_summary":"b","created_at":7}"#,
+        )
+        .unwrap();
+        assert!(minimal.delta_items.is_empty());
+        assert!(minimal.out_of_scope.is_empty());
+        assert_eq!(minimal.created_at, 7);
+    }
+
+    #[test]
+    fn empty_delta_field_error_names_the_field() {
+        assert_eq!(
+            PlanError::EmptyDeltaField("delta_items").to_string(),
+            "delta artifact field 'delta_items' must not be empty"
+        );
     }
 
     fn diamond() -> PlanGraph {

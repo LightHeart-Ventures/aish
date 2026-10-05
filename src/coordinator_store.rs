@@ -12,7 +12,7 @@
 //! connections safe. The store is `Clone` so the running coordinator and the
 //! REPL both hold a handle.
 
-use crate::plan::{NodeId, PlanGraph};
+use crate::plan::{DeltaArtifact, NodeId, PlanGraph};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use std::collections::HashSet;
@@ -386,6 +386,19 @@ impl CoordinatorStore {
                  node_id   TEXT NOT NULL,
                  done_at   INTEGER NOT NULL,
                  PRIMARY KEY (scope_key, node_id)
+             );
+             -- TASK-803: the Phase-1-exit DELTA ARTIFACT — the stored result of
+             -- `ask - state` (see plan-dag-design.md §2). One per scope, so a
+             -- re-run of Phase 1 UPSERTS rather than appending a second,
+             -- disagreeing subtraction. `created_at` is when the delta was
+             -- first computed for the scope (staleness is measured from it);
+             -- `updated_at` moves on every re-derivation, so a reader can tell
+             -- a fresh re-plan from an artifact nobody has touched in hours.
+             CREATE TABLE IF NOT EXISTS delta_artifact (
+                 scope_key  TEXT PRIMARY KEY,
+                 json       TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
              );",
         )
         .context("coordinator_runs schema init failed")?;
@@ -1440,6 +1453,80 @@ impl CoordinatorStore {
             )?;
             Ok(())
         })
+    }
+
+    // ── TASK-803: Phase-1-exit delta-artifact persistence ────────────────────
+    //
+    // `ask - state` is the coordinator's load-bearing derivation and it used to
+    // exist only in context, so compaction erased it and the next turn
+    // re-derived it from a shorter view of the world — disagreeing about scope
+    // and silently re-admitting work an earlier turn had ruled out. These three
+    // methods give it a durable home keyed by the same scope the plan graph and
+    // the work-package ledger use. The reader is `goal::delta_directive`.
+
+    /// Upsert the delta for `delta.scope_key`. ONE delta per scope: re-running
+    /// Phase 1 REPLACES the stored subtraction instead of appending a second,
+    /// disagreeing one (PRD R2). `created_at` is preserved from the existing
+    /// row on update — staleness is measured from when the scope's delta was
+    /// FIRST computed — while `updated_at` records this re-derivation.
+    #[allow(dead_code)]
+    pub fn save_delta_artifact(&self, delta: &DeltaArtifact) -> Result<()> {
+        let json = serde_json::to_string(delta).context("serialize delta artifact")?;
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO delta_artifact (scope_key, json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(scope_key) DO UPDATE SET
+                 json       = excluded.json,
+                 updated_at = excluded.updated_at",
+            rusqlite::params![delta.scope_key, json, delta.created_at],
+        )?;
+        Ok(())
+    }
+
+    /// The stored delta for `scope_key`, or `None` when none is stored.
+    ///
+    /// "No delta yet" is the normal first-turn state (PRD R5), and a row whose
+    /// `json` no longer deserializes is treated the SAME way — logged at `warn`,
+    /// returned as `Ok(None)`. Degrading to "no delta block this turn" costs a
+    /// re-derivation; an `Err` here would wedge the goal on every later round
+    /// with no way for it to recover itself (PRD R7).
+    #[allow(dead_code)]
+    pub fn load_delta_artifact(&self, scope_key: &str) -> Result<Option<DeltaArtifact>> {
+        let json: Option<String> = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT json FROM delta_artifact WHERE scope_key = ?1",
+                rusqlite::params![scope_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        match serde_json::from_str(&json) {
+            Ok(delta) => Ok(Some(delta)),
+            Err(e) => {
+                tracing::warn!(
+                    "delta_artifact: undeserializable row for scope={scope_key}, \
+                     treating as absent: {e}"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Drop the delta for `scope_key` (goal cleared, scope retired). A single
+    /// row, so no transaction is needed — and idempotent, since deleting an
+    /// absent row is not an error.
+    #[allow(dead_code)]
+    pub fn clear_delta_artifact(&self, scope_key: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM delta_artifact WHERE scope_key = ?1",
+            rusqlite::params![scope_key],
+        )?;
+        Ok(())
     }
 }
 
@@ -2497,6 +2584,182 @@ mod tests {
 
         // Idempotent: clearing an already-cleared scope is not an error.
         store.clear_plan_graph("goal:alpha").unwrap();
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── TASK-803: delta-artifact persistence ─────────────────────────────────
+
+    /// A fresh store on its own temp db, mirroring [`plan_store`] — the delta
+    /// tests must not contend with the plan tests or a developer's real db.
+    fn delta_store(tag: &str) -> (CoordinatorStore, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("aish_delta_{tag}_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+        (store, path)
+    }
+
+    /// A fully-populated delta, so the round-trip proves the blob carries every
+    /// field — including `out_of_scope`, the one whose whole purpose is to
+    /// survive the compaction that erased the reasoning behind it.
+    fn delta(scope_key: &str) -> DeltaArtifact {
+        DeltaArtifact {
+            scope_key: scope_key.to_string(),
+            ask_summary: "ship the delta artifact".to_string(),
+            state_summary: "plan graph persists; delta is context-only".to_string(),
+            delta_items: vec![
+                "add the delta_artifact table".to_string(),
+                "re-inject the delta on resume".to_string(),
+            ],
+            out_of_scope: vec!["rewriting the fan-out guard".to_string()],
+            created_at: 1_700_000_000,
+        }
+    }
+
+    /// The point of the table: `ask - state` survives the turn that derived it,
+    /// byte-identically, so the resumed turn plans against the SAME subtraction
+    /// instead of re-deriving a different one from a compacted context.
+    #[test]
+    fn delta_artifact_round_trips_every_field() {
+        let (store, path) = delta_store("roundtrip");
+        let d = delta("goal:alpha");
+        d.validate().unwrap();
+        store.save_delta_artifact(&d).unwrap();
+
+        // Re-opened handle: this is the cross-process read the goal loop does.
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        let loaded = reopened.load_delta_artifact("goal:alpha").unwrap().unwrap();
+        assert_eq!(loaded, d, "delta must round-trip identically");
+        assert_eq!(loaded.delta_items.len(), 2);
+        assert_eq!(loaded.out_of_scope, ["rewriting the fan-out guard"]);
+        assert_eq!(loaded.created_at, 1_700_000_000);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// "No delta yet" is the normal first-turn state, not an error.
+    #[test]
+    fn load_delta_artifact_is_none_for_unknown_scope() {
+        let (store, path) = delta_store("unknown");
+        assert!(
+            store
+                .load_delta_artifact("goal:never-derived")
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Re-running Phase 1 REPLACES the subtraction rather than accumulating a
+    /// second, disagreeing one — and `created_at` stays pinned to the FIRST
+    /// derivation, because staleness is measured from when the scope's delta was
+    /// first computed, not from the latest touch.
+    #[test]
+    fn re_saving_delta_artifact_replaces_it_and_keeps_created_at() {
+        let (store, path) = delta_store("upsert");
+        store.save_delta_artifact(&delta("goal:alpha")).unwrap();
+
+        let mut revised = delta("goal:alpha");
+        revised.delta_items = vec!["only the table remains".to_string()];
+        revised.created_at = 1_700_009_999;
+        store.save_delta_artifact(&revised).unwrap();
+
+        let loaded = store.load_delta_artifact("goal:alpha").unwrap().unwrap();
+        assert_eq!(
+            loaded.delta_items,
+            ["only the table remains"],
+            "the later derivation wins"
+        );
+
+        let (created, updated): (i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT created_at, updated_at FROM delta_artifact WHERE scope_key = ?1",
+                rusqlite::params!["goal:alpha"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(created, 1_700_000_000, "first derivation is the age anchor");
+        assert_eq!(updated, 1_700_009_999, "re-derivation moves updated_at");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Sibling scopes in one db must never read each other's subtraction.
+    #[test]
+    fn delta_artifact_scopes_are_isolated() {
+        let (store, path) = delta_store("scopes");
+        let alpha = delta("goal:alpha");
+        let mut beta = delta("goal:beta");
+        beta.ask_summary = "something else entirely".to_string();
+        store.save_delta_artifact(&alpha).unwrap();
+        store.save_delta_artifact(&beta).unwrap();
+
+        assert_eq!(
+            store.load_delta_artifact("goal:alpha").unwrap().unwrap(),
+            alpha
+        );
+        assert_eq!(
+            store.load_delta_artifact("goal:beta").unwrap().unwrap(),
+            beta
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A poisoned row (shape drift, torn write) reads as ABSENT. Worst case is
+    /// one re-derivation; an `Err` here would wedge the goal on every later
+    /// round with no way for it to recover itself.
+    #[test]
+    fn corrupt_delta_artifact_row_reads_as_absent() {
+        let (store, path) = delta_store("corrupt");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO delta_artifact (scope_key, json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?3)",
+                rusqlite::params!["goal:poisoned", "{not valid json", 1_700_000_000i64],
+            )
+            .unwrap();
+
+        let loaded = store.load_delta_artifact("goal:poisoned");
+        assert!(loaded.is_ok(), "a poisoned row must never hard-fail a turn");
+        assert!(loaded.unwrap().is_none(), "it reads as absent");
+
+        // And the scope is still writable — a re-derivation heals it.
+        store.save_delta_artifact(&delta("goal:poisoned")).unwrap();
+        assert!(
+            store
+                .load_delta_artifact("goal:poisoned")
+                .unwrap()
+                .is_some()
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Retiring a scope drops its delta and touches nothing else.
+    #[test]
+    fn clear_delta_artifact_removes_that_scope_only() {
+        let (store, path) = delta_store("clear");
+        store.save_delta_artifact(&delta("goal:alpha")).unwrap();
+        store.save_delta_artifact(&delta("goal:beta")).unwrap();
+
+        store.clear_delta_artifact("goal:alpha").unwrap();
+
+        assert!(store.load_delta_artifact("goal:alpha").unwrap().is_none());
+        assert!(
+            store.load_delta_artifact("goal:beta").unwrap().is_some(),
+            "clearing alpha must not touch beta"
+        );
+
+        // Idempotent: clearing an already-cleared scope is not an error.
+        store.clear_delta_artifact("goal:alpha").unwrap();
 
         let _ = std::fs::remove_file(&path);
     }

@@ -664,6 +664,57 @@ fn inflight_directive(scope: &str, ancestors: &[String]) -> Option<String> {
     render_inflight_directive(&inflight)
 }
 
+/// Render the persisted Phase-1 delta back into the resumed turn's guidance.
+///
+/// TASK-803. Without this the stored artifact is write-only: the whole point is
+/// that turn N+1 plans against the SAME `ask - state` subtraction turn N
+/// derived, instead of re-deriving a different one from a context that has since
+/// been compacted. `out_of_scope` is re-stated explicitly because that is the
+/// half a shorter context quietly re-admits. Pure → unit-tested.
+pub(crate) fn render_delta_directive(delta: &crate::plan::DeltaArtifact, now: i64) -> String {
+    let mut out = format!(
+        "DELTA ALREADY SETTLED for this goal — Phase 1 of an earlier turn \
+         computed `ask - state` ({}s ago). Do NOT re-derive it and do NOT \
+         re-admit excluded work; plan Phase 2 against the items below. Revise \
+         it only if you find it demonstrably WRONG, and say so when you do.\n  \
+         ask:   {}\n  state: {}\n",
+        delta.age_secs(now),
+        delta.ask_summary.trim(),
+        delta.state_summary.trim(),
+    );
+    out.push_str("  remaining:\n");
+    for item in &delta.delta_items {
+        out.push_str(&format!("    - {item}\n"));
+    }
+    if !delta.out_of_scope.is_empty() {
+        out.push_str("  out of scope (do NOT re-admit):\n");
+        for item in &delta.out_of_scope {
+            out.push_str(&format!("    - {item}\n"));
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// IO half: load the scope's stored delta and render it. Best-effort — an
+/// absent artifact (the normal first turn) or a store hiccup degrades to "no
+/// delta block this turn", which costs one re-derivation rather than stalling
+/// the goal.
+fn delta_directive(scope: &str) -> Option<String> {
+    let store =
+        crate::coordinator_store::CoordinatorStore::open(&crate::db_paths::main_db_path()).ok()?;
+    let delta = store.load_delta_artifact(scope).ok()??;
+    Some(render_delta_directive(&delta, unix_now()))
+}
+
+/// Unix epoch seconds, for the delta's age. A clock before the epoch is not a
+/// case worth propagating as an error.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
+}
+
 /// Terminal outcome of a goal pursuit, surfaced on the `GoalEnd` hook payload.
 struct GoalOutcome {
     /// Wire status: `"achieved"` | `"failed"` | `"cleared"`.
@@ -771,10 +822,35 @@ async fn run_goal_loop(
                  leased, and excluded from this turn's plan"
             ));
         }
-        let effective = match (compose_guidance(guidance.as_deref(), &steers), inflight) {
-            (Some(g), Some(block)) => Some(format!("{g}\n\n{block}")),
-            (None, Some(block)) => Some(block),
-            (g, None) => g,
+        // TASK-803 — cross-turn continuity for the OTHER half: what an earlier
+        // turn decided still REMAINS. Re-injected ahead of the in-flight ledger,
+        // so the turn reads "here is the remaining work" before "here is the
+        // slice of it already owned".
+        let delta = delta_directive(&scope_key);
+        if let Some(block) = delta.as_deref() {
+            let items = block
+                .lines()
+                .filter(|l| l.trim_start().starts_with("- "))
+                .count();
+            goal.note(&format!(
+                "turn {turn}: reusing the stored Phase-1 delta ({items} item(s)) — \
+                 not re-deriving it"
+            ));
+        }
+        let effective = {
+            let blocks: Vec<String> = [
+                compose_guidance(guidance.as_deref(), &steers),
+                delta,
+                inflight,
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if blocks.is_empty() {
+                None
+            } else {
+                Some(blocks.join("\n\n"))
+            }
         };
         // Generator: a full-tool worker pursues the goal with the latest guidance.
         let directive = goal_directive(&goal.condition, effective.as_deref());
@@ -1901,6 +1977,67 @@ mod tests {
         assert!(d.contains("run `run_a` owns: fix the retry backoff"), "{d}");
         assert!(d.contains("run `run_b` owns: write the docs"), "{d}");
         assert!(!d.ends_with('\n'));
+    }
+
+    // ── TASK-803: delta-artifact re-injection ────────────────────────────────
+
+    fn test_delta() -> crate::plan::DeltaArtifact {
+        crate::plan::DeltaArtifact {
+            scope_key: "goal:alpha".to_string(),
+            ask_summary: "  ship the delta artifact  ".to_string(),
+            state_summary: "plan graph persists".to_string(),
+            delta_items: vec![
+                "add the table".to_string(),
+                "re-inject on resume".to_string(),
+            ],
+            out_of_scope: vec!["rewrite the fan-out guard".to_string()],
+            created_at: 1_700_000_000,
+        }
+    }
+
+    /// The artifact has to come back as an INSTRUCTION not to re-derive, with
+    /// every delta item and — critically — the exclusions a shorter context
+    /// would otherwise quietly re-admit.
+    #[test]
+    fn render_delta_directive_restates_items_exclusions_and_age() {
+        let d = render_delta_directive(&test_delta(), 1_700_000_090);
+        assert!(d.contains("DELTA ALREADY SETTLED"), "{d}");
+        assert!(d.contains("(90s ago)"), "{d}");
+        assert!(d.contains("Do NOT re-derive it"), "{d}");
+        assert!(
+            d.contains("ask:   ship the delta artifact\n"),
+            "trimmed: {d}"
+        );
+        assert!(d.contains("state: plan graph persists"), "{d}");
+        assert!(d.contains("  remaining:\n"), "{d}");
+        assert!(d.contains("    - add the table"), "{d}");
+        assert!(d.contains("    - re-inject on resume"), "{d}");
+        assert!(d.contains("out of scope (do NOT re-admit):"), "{d}");
+        assert!(d.contains("    - rewrite the fan-out guard"), "{d}");
+        assert!(!d.ends_with('\n'));
+    }
+
+    /// The directive and the Phase-1-exit coordinator prompt have to speak ONE
+    /// vocabulary, or the model is told to produce "DELTA / `ask - state` / OUT
+    /// OF SCOPE" and handed back a block that names them something else. Pin
+    /// the three tokens so prompt and storage cannot drift apart silently.
+    #[test]
+    fn render_delta_directive_uses_the_canonical_phase_boundary_vocabulary() {
+        let d = render_delta_directive(&test_delta(), 1_700_000_000);
+        assert!(d.contains("DELTA"), "{d}");
+        assert!(d.contains("`ask - state`"), "{d}");
+        assert!(d.to_lowercase().contains("out of scope"), "{d}");
+    }
+
+    /// No exclusions recorded → no exclusion section, so a clean delta's block
+    /// stays clean (same discipline as `render_inflight_directive`).
+    #[test]
+    fn render_delta_directive_omits_empty_out_of_scope() {
+        let mut d = test_delta();
+        d.out_of_scope.clear();
+        let rendered = render_delta_directive(&d, 1_700_000_000);
+        assert!(!rendered.contains("out of scope ("), "{rendered}");
+        assert!(rendered.contains("    - add the table"), "{rendered}");
     }
 
     #[test]
