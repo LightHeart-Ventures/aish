@@ -740,7 +740,11 @@ mod tests {
         assert_eq!(m["role"], "tool");
         assert_eq!(m["tool_call_id"], "call_1");
         assert_eq!(m["content"], "verbatim output"); // content verbatim
-        assert_eq!(m.len(), 3, "string-only tool message carries no extra key: {m:?}");
+        assert_eq!(
+            m.len(),
+            3,
+            "string-only tool message carries no extra key: {m:?}"
+        );
         assert!(m.get("structured").is_none());
         assert!(m.get("payload").is_none());
     }

@@ -76,9 +76,12 @@ async fn receive_webhook(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     // Verify signature if provided
     let signature_valid = if let Some(sig_header) = headers.get("X-Webhook-Signature") {
-        let sig = sig_header
-            .to_str()
-            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid signature header".to_string()))?;
+        let sig = sig_header.to_str().map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Invalid signature header".to_string(),
+            )
+        })?;
         verify_signature(&state.secret, &body, sig)
     } else {
         warn!("Webhook received from {} without signature", source);
@@ -109,7 +112,10 @@ async fn receive_webhook(
     .await
     .map_err(|e| {
         error!("Failed to insert webhook: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to store webhook".to_string())
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to store webhook".to_string(),
+        )
     })?;
 
     info!(
@@ -149,7 +155,10 @@ async fn list_webhooks(
     .await
     .map_err(|e| {
         error!("Failed to fetch webhooks: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to fetch webhooks".to_string())
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to fetch webhooks".to_string(),
+        )
     })?;
 
     let count = rows.len() as i64;
@@ -177,7 +186,10 @@ async fn get_webhook(
     .await
     .map_err(|e| {
         error!("Failed to fetch webhook: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to fetch webhook".to_string())
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to fetch webhook".to_string(),
+        )
     })?
     .ok_or((StatusCode::NOT_FOUND, "Webhook not found".to_string()))?;
 
@@ -186,8 +198,8 @@ async fn get_webhook(
 
 // Verify HMAC signature
 fn verify_signature(secret: &str, body: &str, signature: &str) -> bool {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(body.as_bytes());
 
     let expected = mac.finalize();
@@ -223,8 +235,8 @@ async fn main() -> Result<()> {
 
     // Load config
     dotenv::dotenv().ok();
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite:webhooks.db".to_string());
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:webhooks.db".to_string());
     let secret = std::env::var("WEBHOOK_SECRET")
         .unwrap_or_else(|_| "dev-secret-change-in-production".to_string());
     let port = std::env::var("PORT")
@@ -236,8 +248,7 @@ async fn main() -> Result<()> {
     // Create database pool and migrate
     // create_if_missing so a fresh Fly volume (empty /data) bootstraps the DB
     // file instead of erroring with "unable to open database file".
-    let connect_options = SqliteConnectOptions::from_str(&database_url)?
-        .create_if_missing(true);
+    let connect_options = SqliteConnectOptions::from_str(&database_url)?.create_if_missing(true);
     let pool = SqlitePool::connect_with(connect_options).await?;
     sqlx::query(
         r#"
@@ -255,22 +266,15 @@ async fn main() -> Result<()> {
     .execute(&pool)
     .await?;
 
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_source ON webhooks(source)",
-    )
-    .execute(&pool)
-    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_source ON webhooks(source)")
+        .execute(&pool)
+        .await?;
 
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_received_at ON webhooks(received_at DESC)",
-    )
-    .execute(&pool)
-    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_received_at ON webhooks(received_at DESC)")
+        .execute(&pool)
+        .await?;
 
-    let state = Arc::new(AppState {
-        db: pool,
-        secret,
-    });
+    let state = Arc::new(AppState { db: pool, secret });
 
     // Build router
     let app = Router::new()

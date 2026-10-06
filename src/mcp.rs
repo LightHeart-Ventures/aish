@@ -134,7 +134,6 @@ pub fn tool_defs_token_estimate(defs: &[crate::backend::ToolDef]) -> usize {
     bytes / 4
 }
 
-
 pub struct McpStatus {
     pub name: String,
     pub kind: &'static str, // "stdio" | "http"
@@ -239,7 +238,8 @@ impl McpHost {
                     // Collect rather than print: the caller surfaces these on
                     // the SecondStatusLine "statusline alert" + `:activity`
                     // tray (interactive), or flushes them to stderr (one-shot).
-                    self.skipped.push(format!("mcp server {name} skipped: {e:#}"));
+                    self.skipped
+                        .push(format!("mcp server {name} skipped: {e:#}"));
                 }
             }
         }
@@ -324,7 +324,8 @@ impl McpHost {
                         report.added.push(name);
                     }
                     Err(e) => {
-                        self.skipped.push(format!("mcp server {name} skipped: {e:#}"));
+                        self.skipped
+                            .push(format!("mcp server {name} skipped: {e:#}"));
                         report.failed.push((name, format!("{e:#}")));
                     }
                 },
@@ -347,7 +348,8 @@ impl McpHost {
                             report.reconnected.push((name, reason));
                         }
                         Err(e) => {
-                            self.skipped.push(format!("mcp server {name} skipped: {e:#}"));
+                            self.skipped
+                                .push(format!("mcp server {name} skipped: {e:#}"));
                             report.failed.push((name, format!("{e:#}")));
                         }
                     }
@@ -675,9 +677,7 @@ impl McpHost {
 
         // On stdio broken-pipe (dead child process), reconnect once and retry.
         let result = if first.as_ref().err().map_or(false, is_broken_pipe) {
-            eprintln!(
-                "\x1b[33maish:\x1b[0m mcp:{server_name} disconnected — reconnecting…"
-            );
+            eprintln!("\x1b[33maish:\x1b[0m mcp:{server_name} disconnected — reconnecting…");
             self.reconnect(server_name)
                 .await
                 .with_context(|| format!("mcp:{server_name} reconnect failed"))?;
@@ -1430,10 +1430,7 @@ for line in sys.stdin:
         // ${env:VAR} pulls from the process environment.
         let ev = format!("AISH_TEST_MCP_{}", std::process::id());
         unsafe { std::env::set_var(&ev, "env-val") };
-        assert_eq!(
-            interpolate(&format!("${{env:{ev}}}"), &vars),
-            "env-val"
-        );
+        assert_eq!(interpolate(&format!("${{env:{ev}}}"), &vars), "env-val");
         unsafe { std::env::remove_var(&ev) };
         // Unset env var → verbatim.
         assert_eq!(
@@ -1489,7 +1486,10 @@ for line in sys.stdin:
             "url": "https://h/${TENANT}/mcp",
             "credentials": {"file": "/nonexistent/creds", "profile": "x"}
         }));
-        assert!(fp.contains("${TENANT}"), "unresolved ref left verbatim: {fp}");
+        assert!(
+            fp.contains("${TENANT}"),
+            "unresolved ref left verbatim: {fp}"
+        );
     }
 
     #[test]
@@ -1508,15 +1508,19 @@ for line in sys.stdin:
     #[test]
     fn resolve_vars_empty_without_credentials_block() {
         // No credentials block → empty map, no error.
-        assert!(resolve_vars(&json!({"url": "https://h/mcp"}))
-            .unwrap()
-            .is_empty());
+        assert!(
+            resolve_vars(&json!({"url": "https://h/mcp"}))
+                .unwrap()
+                .is_empty()
+        );
         // A credentials block pointing at a missing profile fails loudly.
-        assert!(resolve_vars(&json!({
-            "url": "https://h/mcp",
-            "credentials": {"file": "/nonexistent/creds", "profile": "x"}
-        }))
-        .is_err());
+        assert!(
+            resolve_vars(&json!({
+                "url": "https://h/mcp",
+                "credentials": {"file": "/nonexistent/creds", "profile": "x"}
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1531,10 +1535,9 @@ for line in sys.stdin:
     }
 }
 
-
 #[cfg(test)]
 mod task323_tool_scope_tests {
-    use super::{tool_defs_token_estimate, ToolScopeMeasure};
+    use super::{ToolScopeMeasure, tool_defs_token_estimate};
     use crate::backend::ToolDef;
     use serde_json::json;
 
@@ -1579,11 +1582,7 @@ mod task323_tool_scope_tests {
 
     #[test]
     fn allowlist_trims_and_measures_reduction() {
-        let all = vec![
-            def("mcp__a__one"),
-            def("mcp__a__two"),
-            def("mcp__b__three"),
-        ];
+        let all = vec![def("mcp__a__one"), def("mcp__a__two"), def("mcp__b__three")];
         let allow = vec!["mcp__a__one".to_string()];
         let (scoped, m) = scope(all, Some(&allow));
         assert_eq!(scoped.len(), 1);

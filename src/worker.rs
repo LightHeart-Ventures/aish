@@ -3559,7 +3559,10 @@ static SPAWN_GATE: std::sync::OnceLock<Mutex<Option<std::time::Instant>>> =
 /// Pure slot arithmetic: when may a launch arriving at `now` proceed, given the
 /// instant reserved by the previous launch? A reservation already in the past is
 /// stale — the wave has drained, so go now. Unit-tested (no sleeping).
-fn next_launch_slot(prev_reserved: Option<std::time::Instant>, now: std::time::Instant) -> std::time::Instant {
+fn next_launch_slot(
+    prev_reserved: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> std::time::Instant {
     match prev_reserved {
         Some(reserved) if reserved > now => reserved,
         _ => now,
@@ -4207,7 +4210,10 @@ mod tests {
         // A stale reservation (the wave already drained) must not delay a later
         // arrival — the gate self-clears instead of accumulating debt.
         let much_later = t0 + Duration::from_secs(60);
-        assert_eq!(next_launch_slot(Some(t0 + interval), much_later), much_later);
+        assert_eq!(
+            next_launch_slot(Some(t0 + interval), much_later),
+            much_later
+        );
     }
 
     // The stagger must be overridable — and `0` must mean "off" so the burst

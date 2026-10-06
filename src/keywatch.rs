@@ -257,11 +257,7 @@ fn scan_csi_z(mut state: u8, bytes: &[u8]) -> (u8, usize) {
                 if b == b'Z' {
                     hits += 1;
                 }
-                if b == 0x1b {
-                    1
-                } else {
-                    0
-                }
+                if b == 0x1b { 1 } else { 0 }
             }
         };
     }

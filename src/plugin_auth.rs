@@ -34,7 +34,7 @@
 //! Secret values live only in the 0600 credentials file and in the spawned
 //! process environment — never in `plugin.json`, `.mcp.json`, or the conversation.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -201,9 +201,8 @@ pub fn run_plugin_handler(
                 std::thread::sleep(std::time::Duration::from_millis(20 * attempt));
             }
             Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("failed to run plugin handler {}", script.display())
-                });
+                return Err(e)
+                    .with_context(|| format!("failed to run plugin handler {}", script.display()));
             }
         }
     };
@@ -214,7 +213,10 @@ pub fn run_plugin_handler(
             .code()
             .map(|c| c.to_string())
             .unwrap_or_else(|| "signal".into());
-        bail!("plugin handler {} exited with status {code}", script.display());
+        bail!(
+            "plugin handler {} exited with status {code}",
+            script.display()
+        );
     }
 
     String::from_utf8(output.stdout).context("plugin handler stdout was not valid UTF-8")
@@ -235,9 +237,12 @@ pub fn parse_handler_output(stdout: &str) -> Result<BTreeMap<String, String>> {
     }
     let value: Value =
         serde_json::from_str(trimmed).context("login handler output is not valid JSON")?;
-    let obj = value
-        .as_object()
-        .ok_or_else(|| anyhow!("login handler output must be a JSON object, got {}", kind(&value)))?;
+    let obj = value.as_object().ok_or_else(|| {
+        anyhow!(
+            "login handler output must be a JSON object, got {}",
+            kind(&value)
+        )
+    })?;
     if obj.is_empty() {
         bail!("login handler returned an empty JSON object (no credential fields)");
     }
@@ -421,9 +426,10 @@ mod tests {
 
     #[test]
     fn coerces_number_and_bool_and_drops_null() {
-        let out =
-            parse_handler_output(r#"{"access_token":"t","expires_in":3600,"mfa":true,"scope":null}"#)
-                .unwrap();
+        let out = parse_handler_output(
+            r#"{"access_token":"t","expires_in":3600,"mfa":true,"scope":null}"#,
+        )
+        .unwrap();
         assert_eq!(out.get("expires_in").unwrap(), "3600");
         assert_eq!(out.get("mfa").unwrap(), "true");
         assert!(!out.contains_key("scope"), "null fields are dropped");
@@ -456,8 +462,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("credentials");
 
-        persist_credentials_at(&path, "mycompany", &map(&[("access_token", "tok"), ("x", "1")]))
-            .unwrap();
+        persist_credentials_at(
+            &path,
+            "mycompany",
+            &map(&[("access_token", "tok"), ("x", "1")]),
+        )
+        .unwrap();
 
         // Section + fields present, readable by the shared INI loader.
         let vars = crate::mcp::load_profile(&path.to_string_lossy(), "profile:mycompany");
@@ -497,8 +507,14 @@ mod tests {
 
     #[test]
     fn env_key_sanitizes_and_uppercases() {
-        assert_eq!(env_key("mycompany", "access_token"), "AISH_PROFILE_MYCOMPANY_ACCESS_TOKEN");
-        assert_eq!(env_key("my-co.io", "refresh-token"), "AISH_PROFILE_MY_CO_IO_REFRESH_TOKEN");
+        assert_eq!(
+            env_key("mycompany", "access_token"),
+            "AISH_PROFILE_MYCOMPANY_ACCESS_TOKEN"
+        );
+        assert_eq!(
+            env_key("my-co.io", "refresh-token"),
+            "AISH_PROFILE_MY_CO_IO_REFRESH_TOKEN"
+        );
     }
 
     // A persisted profile is readable by a plugin's lifecycle hooks: `${profile:
@@ -521,8 +537,14 @@ mod tests {
         assert_eq!(
             env,
             vec![
-                ("AISH_PROFILE_MYCOMPANY_ACCESS_TOKEN".to_string(), "tok".to_string()),
-                ("AISH_PROFILE_MYCOMPANY_EXPIRES_IN".to_string(), "3600".to_string()),
+                (
+                    "AISH_PROFILE_MYCOMPANY_ACCESS_TOKEN".to_string(),
+                    "tok".to_string()
+                ),
+                (
+                    "AISH_PROFILE_MYCOMPANY_EXPIRES_IN".to_string(),
+                    "3600".to_string()
+                ),
             ]
         );
         // A profile with no persisted credentials yields no env.
@@ -640,9 +662,16 @@ mod tests {
         let cred = plugins.join("credentials");
 
         let err = login_at("nobody", &plugins, None, &cred).unwrap_err();
-        assert!(err.to_string().contains("no plugin provides `login nobody`"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("no plugin provides `login nobody`"),
+            "{err}"
+        );
         // Nothing persisted on the rejection path.
-        assert!(!cred.exists(), "unknown-plugin routing must not write credentials");
+        assert!(
+            !cred.exists(),
+            "unknown-plugin routing must not write credentials"
+        );
         let _ = std::fs::remove_dir_all(&plugins);
     }
 
@@ -679,7 +708,10 @@ mod tests {
         assert_eq!(vars.get("access_token").unwrap(), "acme-tok");
         assert_eq!(
             profile_env_at(&cred, "acme"),
-            vec![("AISH_PROFILE_ACME_ACCESS_TOKEN".to_string(), "acme-tok".to_string())]
+            vec![(
+                "AISH_PROFILE_ACME_ACCESS_TOKEN".to_string(),
+                "acme-tok".to_string()
+            )]
         );
         let _ = std::fs::remove_dir_all(&base);
     }

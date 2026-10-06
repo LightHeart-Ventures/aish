@@ -389,11 +389,7 @@ async fn run_turn_inner(
             // are generic; the repo spec is project-specific and should win. The
             // fs check lives here (not in the pure, unit-tested `hint`) since it
             // depends on `session.cwd`.
-            let note = if session
-                .cwd
-                .join(crate::skill_match::REPOSPEC_FILE)
-                .exists()
-            {
+            let note = if session.cwd.join(crate::skill_match::REPOSPEC_FILE).exists() {
                 format!("{note}\n{}", crate::skill_match::repospec_reminder())
             } else {
                 note
@@ -527,10 +523,9 @@ async fn run_turn_inner(
         let effective_system = {
             let budget = match phase {
                 crate::loopguard::BudgetPhase::Normal => String::new(),
-                other => crate::loopguard::budget_suffix(
-                    other,
-                    MAX_ITERATIONS.saturating_sub(iteration),
-                ),
+                other => {
+                    crate::loopguard::budget_suffix(other, MAX_ITERATIONS.saturating_sub(iteration))
+                }
             };
             // One-shot batch nudge from a prior round's drip-feed streak (AC2).
             let nudge = pending_batch_nudge.take().unwrap_or_default();
@@ -620,8 +615,7 @@ clamped {clamped} tool result(s), retrying\x1b[0m"
             // TASK-320: track cache read/write volume so the status line and
             // `:context` can report a session-level cache hit rate. Purely
             // observational — these never affect context-window math.
-            session.cache_read_total =
-                session.cache_read_total.saturating_add(u.cache_read_tokens);
+            session.cache_read_total = session.cache_read_total.saturating_add(u.cache_read_tokens);
             session.cache_creation_total = session
                 .cache_creation_total
                 .saturating_add(u.cache_creation_tokens);
@@ -1036,17 +1030,18 @@ clamped {clamped} tool result(s), retrying\x1b[0m"
             // or a stuck pattern. The advisor reads the turn-audit (if available).
             let turns_audit = build_turns_audit_from_history(&session.history);
             let advice = crate::advisor::SerialYieldAdvisor::evaluate(&turns_audit);
-            
+
             eprintln!(
                 "\x1b[2m  → advisor: {} — {}\x1b[0m",
                 match advice.classification {
-                    crate::advisor::YieldClassification::BatchingOpportunity => "batching-opportunity",
+                    crate::advisor::YieldClassification::BatchingOpportunity =>
+                        "batching-opportunity",
                     crate::advisor::YieldClassification::StuckPattern => "stuck-pattern",
                     crate::advisor::YieldClassification::Unknown => "unknown",
                 },
                 advice.summary
             );
-            
+
             // Interactive (non-coordinator) binding-nudge path. An interactive
             // session has NO durable goal loop to catch the yield banner and
             // resume, so a plain return would just print the advisory to the
@@ -1093,7 +1088,7 @@ rounds) to re-plan toward batching independent calls."
             } else {
                 turn.text.clone()
             };
-            
+
             // Carry the advisor's directive to the resumer by appending it to the
             // banner text. For a COORDINATOR this is what the durable goal loop
             // reads (via recovery_guidance) to re-plan toward batching on the next
@@ -1105,7 +1100,7 @@ rounds) to re-plan toward batching independent calls."
                 partial.push('\n');
                 partial.push_str(directive);
             }
-            
+
             // TASK-358 AC2: when a stuck pattern is detected, escalate to operator.
             // The advisor has classified this as StuckPattern (not a batching
             // opportunity), meaning the model is stuck in a non-productive loop.
@@ -1116,9 +1111,7 @@ rounds) to re-plan toward batching independent calls."
                 advice.classification,
                 crate::advisor::YieldClassification::StuckPattern
             ) {
-                eprintln!(
-                    "\x1b[91m  → ESCALATING stuck pattern to operator\x1b[0m"
-                );
+                eprintln!("\x1b[91m  → ESCALATING stuck pattern to operator\x1b[0m");
                 // Log the turn count and pattern summary for operator review.
                 // Future: emit via atum notification API for real-time alerts.
                 eprintln!(
@@ -1127,7 +1120,7 @@ rounds) to re-plan toward batching independent calls."
                     advice.summary
                 );
             }
-            
+
             return Ok(crate::loopguard::with_banner(&reason, &partial));
         }
 
@@ -1996,7 +1989,10 @@ fn print_raw_result(result: &ToolResult) {
 pub fn reveal_last_turn(session: &Session) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (desc, result) in &session.last_turn_tools {
-        out.push(format!("\x1b[2m  {}\x1b[0m", tool_result_line(desc, result.is_error)));
+        out.push(format!(
+            "\x1b[2m  {}\x1b[0m",
+            tool_result_line(desc, result.is_error)
+        ));
         for line in raw_body(result).lines() {
             out.push(format!("\x1b[2m     {line}\x1b[0m"));
         }
@@ -2012,7 +2008,10 @@ pub fn reveal_last_turn(session: &Session) -> Vec<String> {
 pub fn collapse_last_turn(session: &Session) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (desc, result) in &session.last_turn_tools {
-        out.push(format!("\x1b[2m  {}\x1b[0m", tool_result_line(desc, result.is_error)));
+        out.push(format!(
+            "\x1b[2m  {}\x1b[0m",
+            tool_result_line(desc, result.is_error)
+        ));
         let count = raw_body(result).lines().count();
         if count > 0 {
             let noun = if count == 1 { "line" } else { "lines" };
@@ -2065,13 +2064,12 @@ fn physical_rows(formatted_line: &str, cols: usize) -> usize {
 fn build_turns_audit_from_history(history: &[Msg]) -> Vec<(usize, Vec<String>, Vec<String>)> {
     let mut turns = Vec::new();
     let mut round = 1;
-    
+
     // Walk backwards through history, collecting assistant messages with tool calls.
     for msg in history.iter().rev().take(40) {
         if msg.role == Role::Assistant && !msg.tool_calls.is_empty() {
-            let tool_names: Vec<String> = 
-                msg.tool_calls.iter().map(|c| c.name.clone()).collect();
-            
+            let tool_names: Vec<String> = msg.tool_calls.iter().map(|c| c.name.clone()).collect();
+
             // Extract file paths from tool arguments (heuristic: look for
             // "path", "file_path", "pattern" fields that look like file paths).
             let mut file_paths = Vec::new();
@@ -2079,7 +2077,7 @@ fn build_turns_audit_from_history(history: &[Msg]) -> Vec<(usize, Vec<String>, V
                 if let Some(args) = call.args.as_object() {
                     for (key, val) in args {
                         if (key.contains("path") || key.contains("file") || key == "pattern")
-                            && val.is_string() 
+                            && val.is_string()
                         {
                             if let Some(s) = val.as_str() {
                                 if !s.is_empty() && s.len() < 200 {
@@ -2090,12 +2088,12 @@ fn build_turns_audit_from_history(history: &[Msg]) -> Vec<(usize, Vec<String>, V
                     }
                 }
             }
-            
+
             turns.push((round, tool_names, file_paths));
             round += 1;
         }
     }
-    
+
     // Reverse to get chronological order.
     turns.reverse();
     turns
@@ -2216,8 +2214,16 @@ mod tests {
         ));
         let pdir = root.join(plugin_id);
         std::fs::create_dir_all(pdir.join("schemas")).unwrap();
-        std::fs::write(pdir.join("plugin.json"), format!("{{\"id\":\"{plugin_id}\"}}")).unwrap();
-        std::fs::write(pdir.join("schemas").join(format!("{schema_name}.json")), schema).unwrap();
+        std::fs::write(
+            pdir.join("plugin.json"),
+            format!("{{\"id\":\"{plugin_id}\"}}"),
+        )
+        .unwrap();
+        std::fs::write(
+            pdir.join("schemas").join(format!("{schema_name}.json")),
+            schema,
+        )
+        .unwrap();
         root
     }
 
@@ -2227,8 +2233,9 @@ mod tests {
     #[test]
     fn schema_validation_passes_transparently() {
         let root = schema_fixture("plug", "item", OBJ_SCHEMA);
-        let mut r = ToolResult::structured("t", "name=ok", serde_json::json!({"name": "ok"}), false)
-            .with_output_schema("plug", "item");
+        let mut r =
+            ToolResult::structured("t", "name=ok", serde_json::json!({"name": "ok"}), false)
+                .with_output_schema("plug", "item");
         validate_output_schema_in(&root, &mut r);
         // Conforms → no violation recorded, model sees exactly the payload JSON.
         assert!(r.schema_violation.is_none());
@@ -2251,7 +2258,10 @@ mod tests {
             "model told of the violation: {model}"
         );
         // Fail-open: the original payload is still present after the banner.
-        assert!(model.contains(r#"{"name":1}"#), "payload not blocked: {model}");
+        assert!(
+            model.contains(r#"{"name":1}"#),
+            "payload not blocked: {model}"
+        );
         assert!(r.structured.is_some());
     }
 
@@ -2259,8 +2269,7 @@ mod tests {
     fn no_output_schema_declaration_is_zero_cost_noop() {
         // The common case: a structured result with NO declared schema. The
         // top-level hook must return before touching the plugin loader.
-        let mut r =
-            ToolResult::structured("t", "x", serde_json::json!({"anything": true}), false);
+        let mut r = ToolResult::structured("t", "x", serde_json::json!({"anything": true}), false);
         validate_output_schema(&mut r);
         assert!(r.schema_violation.is_none());
         assert!(r.output_schema.is_none());
@@ -2270,12 +2279,16 @@ mod tests {
     fn unknown_plugin_fails_open_with_note() {
         // Schema declared against a plugin that isn't present → UnknownSchema,
         // logged fail-open, never blocking.
-        let empty = std::env::temp_dir().join(format!("aish_schema_enf_empty_{}", std::process::id()));
+        let empty =
+            std::env::temp_dir().join(format!("aish_schema_enf_empty_{}", std::process::id()));
         std::fs::create_dir_all(&empty).unwrap();
         let mut r = ToolResult::structured("t", "x", serde_json::json!({"name": "ok"}), false)
             .with_output_schema("ghost", "item");
         validate_output_schema_in(&empty, &mut r);
-        assert!(r.schema_violation.is_some(), "unknown schema is noted, not silent");
+        assert!(
+            r.schema_violation.is_some(),
+            "unknown schema is noted, not silent"
+        );
         assert!(r.structured.is_some(), "payload still flows");
     }
 
@@ -2423,7 +2436,10 @@ mod tests {
             d("append_file", json!({"path": "log.txt", "content": "hi"})),
             "append log.txt (2 bytes)"
         );
-        assert_eq!(d("copy_file", json!({"src": "a", "dst": "b"})), "copy a → b");
+        assert_eq!(
+            d("copy_file", json!({"src": "a", "dst": "b"})),
+            "copy a → b"
+        );
         assert_eq!(
             d("rename_file", json!({"src": "a", "dst": "b"})),
             "rename a → b"

@@ -481,9 +481,7 @@ impl HookSet {
                 ]
             })
             .collect();
-        rows.sort_by(|a, b| {
-            a[0].cmp(&b[0]).then(a[3].cmp(&b[3])).then(a[1].cmp(&b[1]))
-        });
+        rows.sort_by(|a, b| a[0].cmp(&b[0]).then(a[3].cmp(&b[3])).then(a[1].cmp(&b[1])));
         let mut widths = headers.map(str::len);
         for row in &rows {
             for (i, cell) in row.iter().enumerate() {
@@ -842,7 +840,8 @@ impl HookSet {
         for hook in matched {
             let decision = match &hook.action {
                 Action::Rule { deny_if } => eval_rule(deny_if.as_deref(), &payload),
-                Action::Command { required, .. } => match dispatch_capture(&hook.action, &body).await
+                Action::Command { required, .. } => match dispatch_capture(&hook.action, &body)
+                    .await
                 {
                     Ok((true, _)) => Decision::Allow,
                     Ok((false, reason)) => Decision::Deny(
@@ -958,7 +957,9 @@ fn eval_rule(expr: Option<&str>, payload: &HookPayload) -> Decision {
         "path_contains" => blocked(field("path").is_some_and(|v| v.contains(arg.as_str()))),
         "path_glob" => blocked(field("path").is_some_and(|v| glob_match(&arg, v))),
         "mode_is" => blocked(field("mode") == Some(arg.as_str())),
-        other => Decision::Deny(format!("unknown hook rule predicate (fail-closed): {other}")),
+        other => Decision::Deny(format!(
+            "unknown hook rule predicate (fail-closed): {other}"
+        )),
     }
 }
 
@@ -1521,7 +1522,10 @@ mod tests {
             Some(("program_is", "git".to_string()))
         );
         // Empty arg is a valid string.
-        assert_eq!(parse_predicate("tool_is('')"), Some(("tool_is", String::new())));
+        assert_eq!(
+            parse_predicate("tool_is('')"),
+            Some(("tool_is", String::new()))
+        );
         // Malformed shapes → None (caller fails these closed).
         assert_eq!(parse_predicate("no_parens"), None);
         assert_eq!(parse_predicate("missing_close('x'"), None);
@@ -1550,7 +1554,10 @@ mod tests {
         assert!(eval_rule(Some("path_glob('*.secret')"), &p).is_deny());
         // Predicates that do not match → allow.
         assert_eq!(eval_rule(Some("program_is('rm')"), &p), Decision::Allow);
-        assert_eq!(eval_rule(Some("path_contains('nope')"), &p), Decision::Allow);
+        assert_eq!(
+            eval_rule(Some("path_contains('nope')"), &p),
+            Decision::Allow
+        );
         // Absent field → cannot be satisfied → allow.
         assert_eq!(eval_rule(Some("mode_is('yolo')"), &p), Decision::Allow);
     }
@@ -1630,10 +1637,12 @@ mod tests {
         let deny_set = set_from_json(
             r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "command", "program": "false", "timeout_ms": 2000 } } ] }"#,
         );
-        assert!(deny_set
-            .evaluate(HookEvent::PreToolUse, payload(HookEvent::PreToolUse))
-            .await
-            .is_deny());
+        assert!(
+            deny_set
+                .evaluate(HookEvent::PreToolUse, payload(HookEvent::PreToolUse))
+                .await
+                .is_deny()
+        );
         let allow_set = set_from_json(
             r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "command", "program": "true", "timeout_ms": 2000 } } ] }"#,
         );
@@ -1669,10 +1678,12 @@ mod tests {
         let required = set_from_json(
             r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "command", "program": "/nonexistent/aish-hook-x", "required": true } } ] }"#,
         );
-        assert!(required
-            .evaluate(HookEvent::PreToolUse, payload(HookEvent::PreToolUse))
-            .await
-            .is_deny());
+        assert!(
+            required
+                .evaluate(HookEvent::PreToolUse, payload(HookEvent::PreToolUse))
+                .await
+                .is_deny()
+        );
         // …an optional one fails OPEN (allow).
         let optional = set_from_json(
             r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "command", "program": "/nonexistent/aish-hook-x", "required": false } } ] }"#,
@@ -1695,10 +1706,11 @@ mod tests {
                  { "event": "PreToolUse", "action": { "type": "rule", "deny_if": "always" } }
                ] }"#,
         );
-        assert!(set
-            .evaluate(HookEvent::PreToolUse, payload(HookEvent::PreToolUse))
-            .await
-            .is_deny());
+        assert!(
+            set.evaluate(HookEvent::PreToolUse, payload(HookEvent::PreToolUse))
+                .await
+                .is_deny()
+        );
     }
 
     #[tokio::test]
@@ -1810,7 +1822,10 @@ mod tests {
             (HookSource::Plugin("sec".into()), plugin),
         ]);
         let demoted = set.hooks().iter().find(|h| h.source.is_plugin()).unwrap();
-        assert!(demoted.observe_only, "plugin entry must be demoted to observe");
+        assert!(
+            demoted.observe_only,
+            "plugin entry must be demoted to observe"
+        );
         let d = set
             .evaluate(HookEvent::PreToolUse, payload(HookEvent::PreToolUse))
             .await;
@@ -1862,7 +1877,10 @@ mod tests {
             }],
         );
         assert_eq!(set.len(), 1);
-        assert_eq!(set.hooks()[0].source, HookSource::Plugin("demo".to_string()));
+        assert_eq!(
+            set.hooks()[0].source,
+            HookSource::Plugin("demo".to_string())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -264,7 +264,9 @@ impl OpenAiBackend {
                     let (status, parsed) = match super::read_status_and_json(r).await {
                         Ok(p) => p,
                         Err(e) if !last => {
-                            eprintln!("\x1b[2m  network error reading body ({e}), retrying…\x1b[0m");
+                            eprintln!(
+                                "\x1b[2m  network error reading body ({e}), retrying…\x1b[0m"
+                            );
                             tokio::time::sleep(delay).await;
                             delay = (delay * 2).min(MAX_DELAY);
                             continue;

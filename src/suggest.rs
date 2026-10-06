@@ -163,7 +163,6 @@ pub async fn suggest_next_command_streaming(
     Ok(sanitize_candidate(&turn.text))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

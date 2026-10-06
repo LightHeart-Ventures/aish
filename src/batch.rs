@@ -56,7 +56,6 @@ pub fn metered_key_in(env: &[(String, String)]) -> Option<String> {
 
 /// `metered_key_in` with the process environment as the fallback source.
 
-
 /// The one-line explanation every caller prints when the batch tier was wanted
 /// but is unreachable: the work still runs — on `batch_model` (Opus by default)
 /// via an interactive coordinator — just at interactive price instead of ~50% off.

@@ -209,12 +209,20 @@ mod tests {
         let mut cur = LiveCursor::default();
         ring.push("", "one");
         ring.push("", "two");
-        let first: Vec<String> = ring.read_live(&mut cur).into_iter().map(|(_, t)| t).collect();
+        let first: Vec<String> = ring
+            .read_live(&mut cur)
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
         assert_eq!(first, vec!["one", "two"]);
         // Caught up — nothing new until the next push.
         assert!(ring.read_live(&mut cur).is_empty());
         ring.push("", "three");
-        let second: Vec<String> = ring.read_live(&mut cur).into_iter().map(|(_, t)| t).collect();
+        let second: Vec<String> = ring
+            .read_live(&mut cur)
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
         assert_eq!(second, vec!["three"]);
     }
 
@@ -241,8 +249,15 @@ mod tests {
         // and a fresh live cursor draining now yields the identical rows.
         let backfill: Vec<String> = ring.backfill_tail().into_iter().map(|(_, t)| t).collect();
         let mut fresh = LiveCursor::default();
-        let drained: Vec<String> = ring.read_live(&mut fresh).into_iter().map(|(_, t)| t).collect();
-        assert_eq!(backfill, drained, "backfill tail == fresh live drain (no drift)");
+        let drained: Vec<String> = ring
+            .read_live(&mut fresh)
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(
+            backfill, drained,
+            "backfill tail == fresh live drain (no drift)"
+        );
         assert_eq!(backfill, stored, "unbounded ring retained every row");
     }
 
@@ -259,7 +274,11 @@ mod tests {
         assert!(seq > pos, "seqs never reused after clear: {seq} > {pos}");
         // A fresh cursor after a resume drains only post-clear entries.
         let mut cur = LiveCursor::default();
-        let rows: Vec<String> = ring.read_live(&mut cur).into_iter().map(|(_, t)| t).collect();
+        let rows: Vec<String> = ring
+            .read_live(&mut cur)
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
         assert_eq!(rows, vec!["c"]);
     }
 }

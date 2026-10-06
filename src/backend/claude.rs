@@ -361,9 +361,7 @@ auto-resume.\n"
             let rc = crate::rc::load();
             if let Some(fresh) = reloaded_oauth_swap(&current, &rc.env) {
                 *self.cred.write().unwrap() = fresh;
-                eprintln!(
-                    "\x1b[2m  fresh OAuth token detected — resuming work…\x1b[0m"
-                );
+                eprintln!("\x1b[2m  fresh OAuth token detected — resuming work…\x1b[0m");
                 return true;
             }
         }
@@ -385,13 +383,7 @@ auto-resume.\n"
     /// only by the `stream` flag, so keeping one builder means the model,
     /// token cap, system shaping, tool schemas, prompt caching, and adaptive-
     /// thinking policy can never drift between them.
-    fn build_body(
-        &self,
-        system: &str,
-        history: &[Msg],
-        tools: &[ToolDef],
-        stream: bool,
-    ) -> Value {
+    fn build_body(&self, system: &str, history: &[Msg], tools: &[ToolDef], stream: bool) -> Value {
         let mut messages = render_messages(history);
         let mut tool_defs: Vec<Value> = tools
             .iter()
@@ -635,11 +627,7 @@ ride-out budget: {msg}"
     /// 200 response is streaming, decoding is handed to
     /// [`consume_stream`](Self::consume_stream); a mid-stream error there is
     /// returned as-is (see `complete_streaming` for why we don't replay).
-    async fn stream_with_retry(
-        &self,
-        body: &Value,
-        sink: super::StreamSink<'_>,
-    ) -> Result<Value> {
+    async fn stream_with_retry(&self, body: &Value, sink: super::StreamSink<'_>) -> Result<Value> {
         const MAX_ATTEMPTS: u32 = 8;
         const MAX_DELAY: Duration = Duration::from_secs(60);
         const RATE_LIMIT_MAX_DELAY: Duration = Duration::from_secs(90);
@@ -801,11 +789,7 @@ impl SseDecoder {
     }
 
     /// Feed a chunk of raw stream bytes, invoking `f` once per complete event.
-    fn push(
-        &mut self,
-        bytes: &[u8],
-        f: &mut dyn FnMut(Value) -> Result<()>,
-    ) -> Result<()> {
+    fn push(&mut self, bytes: &[u8], f: &mut dyn FnMut(Value) -> Result<()>) -> Result<()> {
         self.buf.extend_from_slice(bytes);
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.buf.drain(..=pos).collect();
@@ -852,8 +836,15 @@ impl SseDecoder {
 /// One in-progress content block as the stream builds it up.
 enum StreamBlock {
     Text(String),
-    Thinking { thinking: String, signature: String },
-    ToolUse { id: String, name: String, json: String },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        json: String,
+    },
 }
 
 /// Folds the Anthropic streaming event sequence back into the same response
@@ -962,7 +953,8 @@ impl StreamAccumulator {
                     }
                     "input_json_delta" => {
                         if let Some(pj) = delta["partial_json"].as_str() {
-                            if let Some(StreamBlock::ToolUse { json, .. }) = self.blocks.get_mut(idx)
+                            if let Some(StreamBlock::ToolUse { json, .. }) =
+                                self.blocks.get_mut(idx)
                             {
                                 json.push_str(pj);
                             }
@@ -1274,11 +1266,7 @@ fn render_messages(history: &[Msg]) -> Vec<Value> {
                 let content = match msg.raw.clone() {
                     Some(raw) => {
                         let cleaned = strip_empty_text_blocks(raw);
-                        if cleaned
-                            .as_array()
-                            .map(|a| a.is_empty())
-                            .unwrap_or(false)
-                        {
+                        if cleaned.as_array().map(|a| a.is_empty()).unwrap_or(false) {
                             rebuild()
                         } else {
                             cleaned
@@ -1566,7 +1554,11 @@ mod tests {
         assert_eq!(ok["content"], "verbatim output"); // content verbatim
         assert_eq!(ok["is_error"], false); // is_error honoured
         // EXACTLY the four canonical keys — no payload/structured sibling.
-        assert_eq!(ok.len(), 4, "string-only block carries no extra key: {ok:?}");
+        assert_eq!(
+            ok.len(),
+            4,
+            "string-only block carries no extra key: {ok:?}"
+        );
         assert!(ok.get("structured").is_none());
         assert!(ok.get("payload").is_none());
 
@@ -1955,7 +1947,10 @@ mod tests {
             json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":32000}}),
         ];
         let (_got, turn) = drive(&events);
-        assert!(turn.tool_calls.is_empty(), "truncated tool call not executed");
+        assert!(
+            turn.tool_calls.is_empty(),
+            "truncated tool call not executed"
+        );
         assert!(turn.truncated_tool_call);
         assert!(turn.text.contains("cut off mid-tool-call"));
     }
@@ -1987,14 +1982,20 @@ data: {\"type\":\"content_block_delta\"}\n\
         // Whole blob in one push.
         assert_eq!(
             collect(&[bytes]),
-            vec!["message_start".to_string(), "content_block_delta".to_string()]
+            vec![
+                "message_start".to_string(),
+                "content_block_delta".to_string()
+            ]
         );
         // Split at three awkward interior offsets (mid-line each).
         for cut in [10usize, 33, 60] {
             let (a, b) = bytes.split_at(cut.min(bytes.len()));
             assert_eq!(
                 collect(&[a, b]),
-                vec!["message_start".to_string(), "content_block_delta".to_string()],
+                vec![
+                    "message_start".to_string(),
+                    "content_block_delta".to_string()
+                ],
                 "framing must survive a chunk boundary at byte {cut}"
             );
         }

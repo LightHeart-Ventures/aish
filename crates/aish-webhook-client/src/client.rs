@@ -295,7 +295,9 @@ mod tests {
                 }
                 other => panic!("expected auth text, got {other:?}"),
             }
-            handle.push_text(r#"{"type":"auth_ok","session_token":"tok-9","client_id":"c-assigned"}"#);
+            handle.push_text(
+                r#"{"type":"auth_ok","session_token":"tok-9","client_id":"c-assigned"}"#,
+            );
             handle
         });
 
@@ -338,7 +340,9 @@ mod tests {
             h3.push_text(r#"{"type":"auth_ok"}"#);
             // heartbeat then a webhook
             h3.push(WsMessage::Ping(vec![1, 2, 3]));
-            h3.push_text(r#"{"id":"d1","event_type":"pull_request","payload":{"action":"opened"}}"#);
+            h3.push_text(
+                r#"{"id":"d1","event_type":"pull_request","payload":{"action":"opened"}}"#,
+            );
             h3
         });
         client.connect(mock3).await.unwrap();
@@ -386,13 +390,12 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_retries_until_success() {
-        let mut client = BrokerClient::new(cfg())
-            .with_backoff(ExponentialBackoff::new(
-                Duration::from_millis(1),
-                Duration::from_millis(2),
-                2.0,
-                false,
-            ));
+        let mut client = BrokerClient::new(cfg()).with_backoff(ExponentialBackoff::new(
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            2.0,
+            false,
+        ));
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let a2 = attempts.clone();
         // Factory fails twice, then hands back a transport that will auth-ok.
@@ -414,7 +417,10 @@ mod tests {
                 }
             }
         };
-        client.reconnect_with_backoff(factory, Some(5)).await.unwrap();
+        client
+            .reconnect_with_backoff(factory, Some(5))
+            .await
+            .unwrap();
         assert!(client.is_connected());
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
     }

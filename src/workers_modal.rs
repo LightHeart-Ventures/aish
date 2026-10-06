@@ -461,9 +461,10 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
 
     let n = lines.len();
     let mut out = String::new();
-    if let (true, Some(total)) =
-        (crate::terminal::footer_active(), crate::terminal::screen_rows())
-    {
+    if let (true, Some(total)) = (
+        crate::terminal::footer_active(),
+        crate::terminal::screen_rows(),
+    ) {
         // Last scrolling body row = row directly above the footer rule.
         let body_bottom = total.saturating_sub(crate::terminal::FOOTER_ROWS).max(1);
         let avail = body_bottom as usize;
@@ -477,9 +478,7 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
         // A shorter repaint (a worker closed) leaves stale rows above the new
         // top — clear them so the tray shrinks cleanly from the top.
         if prev_lines > vn as usize {
-            let prev_top = body_bottom
-                .saturating_sub(prev_lines as u16 - 1)
-                .max(1);
+            let prev_top = body_bottom.saturating_sub(prev_lines as u16 - 1).max(1);
             for row in prev_top..top {
                 out.push_str(&format!("\x1b[{row};1H\x1b[2K"));
             }
@@ -535,7 +534,10 @@ fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}…",
+            s.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
     }
 }
 

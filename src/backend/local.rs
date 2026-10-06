@@ -10,7 +10,7 @@
 //! - `AISH_LOCAL_N_GPU_LAYERS`: Number of layers to offload to GPU (default: 0, CPU-only)
 
 #[cfg(feature = "local")]
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 
 use anyhow::Result;
 #[cfg(feature = "local")]
@@ -18,7 +18,7 @@ use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, LlamaModel},
+    model::{LlamaModel, params::LlamaModelParams},
     sampling::LlamaSampler,
 };
 #[cfg(feature = "local")]
@@ -59,8 +59,7 @@ impl LocalBackend {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
-        let backend =
-            LlamaBackend::init().context("failed to initialize llama.cpp backend")?;
+        let backend = LlamaBackend::init().context("failed to initialize llama.cpp backend")?;
 
         Ok(Self {
             pinned_path,
@@ -102,8 +101,7 @@ impl LocalBackend {
                 let path = self.resolve_path().await?;
                 eprintln!("\x1b[2m  loading model from {}…\x1b[0m", path.display());
 
-                let model_params = LlamaModelParams::default()
-                    .with_n_gpu_layers(self.n_gpu_layers);
+                let model_params = LlamaModelParams::default().with_n_gpu_layers(self.n_gpu_layers);
 
                 let model = LlamaModel::load_from_file(&self.backend, &path, &model_params)
                     .map_err(|e| anyhow!("failed to load local model: {e}"))?;
@@ -114,7 +112,12 @@ impl LocalBackend {
             .await
     }
 
-    pub async fn complete(&self, system: &str, history: &[Msg], _tools: &[ToolDef]) -> Result<Turn> {
+    pub async fn complete(
+        &self,
+        system: &str,
+        history: &[Msg],
+        _tools: &[ToolDef],
+    ) -> Result<Turn> {
         let model = self.model().await?;
 
         // Build the prompt from system + history.
@@ -139,19 +142,22 @@ impl LocalBackend {
         let tokens = vocab.tokenize(prompt.as_bytes(), true, true);
 
         // Create context and batch.
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(Some(NonZeroU32::new(4096).unwrap()));
-        let mut ctx = model.new_context(&self.backend, ctx_params)
+        let ctx_params =
+            LlamaContextParams::default().with_n_ctx(Some(NonZeroU32::new(4096).unwrap()));
+        let mut ctx = model
+            .new_context(&self.backend, ctx_params)
             .context("failed to create inference context")?;
 
         let mut batch = LlamaBatch::new(512, 1);
         let last_token_idx = (tokens.len() - 1) as i32;
         for (i, &token) in tokens.iter().enumerate() {
-            batch.add(token, i as i32, &[0], i as i32 == last_token_idx)
+            batch
+                .add(token, i as i32, &[0], i as i32 == last_token_idx)
                 .context("failed to add token to batch")?;
         }
 
-        ctx.decode(&mut batch).context("failed to decode initial batch")?;
+        ctx.decode(&mut batch)
+            .context("failed to decode initial batch")?;
 
         // Generate output tokens with greedy sampling.
         let mut sampler = LlamaSampler::greedy();
@@ -180,7 +186,8 @@ impl LocalBackend {
 
             // Prepare next batch.
             batch.clear();
-            batch.add(next_token, n_cur, &[0], true)
+            batch
+                .add(next_token, n_cur, &[0], true)
                 .context("failed to add next token to batch")?;
             n_cur += 1;
 
@@ -211,7 +218,12 @@ impl LocalBackend {
         unreachable!()
     }
 
-    pub async fn complete(&self, _system: &str, _history: &[Msg], _tools: &[ToolDef]) -> Result<Turn> {
+    pub async fn complete(
+        &self,
+        _system: &str,
+        _history: &[Msg],
+        _tools: &[ToolDef],
+    ) -> Result<Turn> {
         unreachable!()
     }
 }

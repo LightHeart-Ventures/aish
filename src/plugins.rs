@@ -258,7 +258,6 @@ impl PluginManifest {
         self.provides.as_ref().and_then(|p| p.statusline.as_ref())
     }
 
-
     /// True when the manifest relies on the deprecated `provides.hooks` alias —
     /// i.e. `hooks` is populated and the canonical `lifecycle_hooks` is not.
     /// Drives the one-release deprecation warning emitted at [`discover`] time.
@@ -308,7 +307,9 @@ impl Plugin {
     // engine tool-return hook invokes on every schema-declaring result.
     pub fn validate(&self, schema_name: &str, value: &Value) -> Result<(), SchemaValidationError> {
         match self.schema(schema_name) {
-            None => Err(SchemaValidationError::UnknownSchema(schema_name.to_string())),
+            None => Err(SchemaValidationError::UnknownSchema(
+                schema_name.to_string(),
+            )),
             Some(s) => {
                 let violations = validate_json_schema(&s.schema, value);
                 if violations.is_empty() {
@@ -345,7 +346,10 @@ impl std::fmt::Display for ConfigError {
         match self {
             ConfigError::Malformed(e) => write!(f, "malformed config.json: {e}"),
             ConfigError::MissingEnv { key, var } => {
-                write!(f, "config key `{key}` references unset environment variable `{var}`")
+                write!(
+                    f,
+                    "config key `{key}` references unset environment variable `{var}`"
+                )
             }
             ConfigError::MissingRequired(k) => write!(f, "required config key `{k}` is missing"),
             ConfigError::TypeMismatch { key, expected, got } => {
@@ -875,7 +879,11 @@ pub struct SchemaViolation {
 
 impl std::fmt::Display for SchemaViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let at = if self.path.is_empty() { "(root)" } else { &self.path };
+        let at = if self.path.is_empty() {
+            "(root)"
+        } else {
+            &self.path
+        };
         write!(f, "{at}: {}", self.message)
     }
 }
@@ -935,13 +943,24 @@ fn validate_at(path: &str, schema: &Value, instance: &Value, out: &mut Vec<Schem
     // enum
     if let Some(Value::Array(allowed)) = schema.get("enum") {
         if !allowed.iter().any(|a| a == instance) {
-            push(out, path, &format!("value not in enum {}", compact(&Value::Array(allowed.clone()))));
+            push(
+                out,
+                path,
+                &format!(
+                    "value not in enum {}",
+                    compact(&Value::Array(allowed.clone()))
+                ),
+            );
         }
     }
     // const
     if let Some(expected) = schema.get("const") {
         if expected != instance {
-            push(out, path, &format!("value must equal const {}", compact(expected)));
+            push(
+                out,
+                path,
+                &format!("value must equal const {}", compact(expected)),
+            );
         }
     }
 
@@ -959,7 +978,11 @@ fn validate_at(path: &str, schema: &Value, instance: &Value, out: &mut Vec<Schem
             push(
                 out,
                 path,
-                &format!("expected type {}, got {}", compact(t), json_type_name(instance)),
+                &format!(
+                    "expected type {}, got {}",
+                    compact(t),
+                    json_type_name(instance)
+                ),
             );
         }
     }
@@ -1005,7 +1028,11 @@ fn validate_object(
             for k in map.keys() {
                 let known = props.map(|p| p.contains_key(k)).unwrap_or(false);
                 if !known {
-                    push(out, path, &format!("additional property `{k}` is not allowed"));
+                    push(
+                        out,
+                        path,
+                        &format!("additional property `{k}` is not allowed"),
+                    );
                 }
             }
         }
@@ -1025,12 +1052,20 @@ fn validate_object(
 fn validate_array(path: &str, schema: &Value, arr: &[Value], out: &mut Vec<SchemaViolation>) {
     if let Some(min) = schema.get("minItems").and_then(|v| v.as_u64()) {
         if (arr.len() as u64) < min {
-            push(out, path, &format!("array has {} item(s), minItems is {min}", arr.len()));
+            push(
+                out,
+                path,
+                &format!("array has {} item(s), minItems is {min}", arr.len()),
+            );
         }
     }
     if let Some(max) = schema.get("maxItems").and_then(|v| v.as_u64()) {
         if (arr.len() as u64) > max {
-            push(out, path, &format!("array has {} item(s), maxItems is {max}", arr.len()));
+            push(
+                out,
+                path,
+                &format!("array has {} item(s), maxItems is {max}", arr.len()),
+            );
         }
     }
     // items: single schema applied to every element.
@@ -1048,12 +1083,20 @@ fn validate_string(path: &str, schema: &Value, s: &str, out: &mut Vec<SchemaViol
     let len = s.chars().count() as u64;
     if let Some(min) = schema.get("minLength").and_then(|v| v.as_u64()) {
         if len < min {
-            push(out, path, &format!("string length {len} is below minLength {min}"));
+            push(
+                out,
+                path,
+                &format!("string length {len} is below minLength {min}"),
+            );
         }
     }
     if let Some(max) = schema.get("maxLength").and_then(|v| v.as_u64()) {
         if len > max {
-            push(out, path, &format!("string length {len} exceeds maxLength {max}"));
+            push(
+                out,
+                path,
+                &format!("string length {len} exceeds maxLength {max}"),
+            );
         }
     }
     if let Some(pat) = schema.get("pattern").and_then(|v| v.as_str()) {
@@ -1065,7 +1108,11 @@ fn validate_string(path: &str, schema: &Value, s: &str, out: &mut Vec<SchemaViol
             }
             // An invalid pattern in the schema is the author's bug, not the
             // instance's — report it against the path so it's visible.
-            Err(_) => push(out, path, &format!("schema has invalid regex pattern `{pat}`")),
+            Err(_) => push(
+                out,
+                path,
+                &format!("schema has invalid regex pattern `{pat}`"),
+            ),
         }
     }
 }
@@ -1085,12 +1132,20 @@ fn validate_number(path: &str, schema: &Value, instance: &Value, out: &mut Vec<S
     }
     if let Some(exmin) = schema.get("exclusiveMinimum").and_then(|v| v.as_f64()) {
         if n <= exmin {
-            push(out, path, &format!("{n} must be > exclusiveMinimum {exmin}"));
+            push(
+                out,
+                path,
+                &format!("{n} must be > exclusiveMinimum {exmin}"),
+            );
         }
     }
     if let Some(exmax) = schema.get("exclusiveMaximum").and_then(|v| v.as_f64()) {
         if n >= exmax {
-            push(out, path, &format!("{n} must be < exclusiveMaximum {exmax}"));
+            push(
+                out,
+                path,
+                &format!("{n} must be < exclusiveMaximum {exmax}"),
+            );
         }
     }
 }
@@ -1130,7 +1185,9 @@ pub fn validate_against_plugin_schema(
     let plugins = discover(plugins_dir);
     match plugins.iter().find(|p| p.manifest.id == plugin_id) {
         Some(p) => p.validate(schema_name, value),
-        None => Err(SchemaValidationError::UnknownSchema(schema_name.to_string())),
+        None => Err(SchemaValidationError::UnknownSchema(
+            schema_name.to_string(),
+        )),
     }
 }
 
@@ -1156,7 +1213,11 @@ pub fn format_plugin_schemas(dir: &Path, id: &str) -> Option<String> {
             .schema
             .get("required")
             .and_then(|r| r.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let props: Vec<String> = s
             .schema
@@ -1352,7 +1413,11 @@ fn strip_one_quote_layer(v: &str) -> String {
 /// with `AISH_IN_HOOK=1` set and the current session env layered on. Returns the
 /// captured stdout on a clean exit; `None` when the script is absent, cannot be
 /// spawned, times out, or exits non-zero (a broken hook never blocks startup).
-fn run_lifecycle_hook(plugin_dir: &Path, hook: &str, session_env: &[(String, String)]) -> Option<String> {
+fn run_lifecycle_hook(
+    plugin_dir: &Path,
+    hook: &str,
+    session_env: &[(String, String)],
+) -> Option<String> {
     let script = plugin_dir.join("hooks").join(format!("{hook}.sh"));
     if !script.is_file() {
         return None;
@@ -1405,11 +1470,7 @@ fn run_lifecycle_hook(plugin_dir: &Path, hook: &str, session_env: &[(String, Str
 /// each hook AND used as a precedence floor: a hook may not override a key that
 /// already exists there — **user/existing env wins over plugin-injected env** —
 /// so operator-set values are authoritative. Such a clash is dropped + warned.
-pub fn collect_lifecycle_env(
-    dir: &Path,
-    hook: &str,
-    session_env: &[(String, String)],
-) -> HookEnv {
+pub fn collect_lifecycle_env(dir: &Path, hook: &str, session_env: &[(String, String)]) -> HookEnv {
     collect_lifecycle_env_at(
         dir,
         hook,
@@ -1526,14 +1587,34 @@ pub fn format_plugin_info(dir: &Path, id: &str) -> Option<String> {
     };
 
     out.push_str(&format!("plugin `{}`\n", m.id));
-    field(&mut out, "name", if m.name.is_empty() { &m.id } else { &m.name });
-    field(&mut out, "version", if m.version.is_empty() { "-" } else { &m.version });
+    field(
+        &mut out,
+        "name",
+        if m.name.is_empty() { &m.id } else { &m.name },
+    );
+    field(
+        &mut out,
+        "version",
+        if m.version.is_empty() {
+            "-"
+        } else {
+            &m.version
+        },
+    );
     field(
         &mut out,
         "description",
-        if m.description.is_empty() { "-" } else { &m.description },
+        if m.description.is_empty() {
+            "-"
+        } else {
+            &m.description
+        },
     );
-    field(&mut out, "enabled", if m.is_enabled() { "yes" } else { "no" });
+    field(
+        &mut out,
+        "enabled",
+        if m.is_enabled() { "yes" } else { "no" },
+    );
     field(&mut out, "dir", &plugin.dir.display().to_string());
     field(&mut out, "login", m.login_command().unwrap_or("-"));
 
@@ -1976,8 +2057,9 @@ mod tests {
     fn provides_canonical_key_takes_precedence_over_deprecated_alias() {
         // When both are present, the canonical `lifecycle_hooks` wins and the
         // manifest is NOT treated as using the deprecated alias.
-        let m =
-            manifest(r#"{"id":"p","provides":{"lifecycle_hooks":["on_shutdown"],"hooks":["on_init"]}}"#);
+        let m = manifest(
+            r#"{"id":"p","provides":{"lifecycle_hooks":["on_shutdown"],"hooks":["on_init"]}}"#,
+        );
         assert_eq!(m.lifecycle_hooks(), &["on_shutdown"]);
         assert!(!m.uses_deprecated_hooks_key());
     }
@@ -2079,7 +2161,11 @@ mod tests {
             Some(("s", "d")),
         );
         let sources = discover_skill_sources(&tmp);
-        assert_eq!(sources.len(), 1, "only the skill_source plugin is collected");
+        assert_eq!(
+            sources.len(),
+            1,
+            "only the skill_source plugin is collected"
+        );
         assert_eq!(sources[0].plugin_id, "fish");
         // id defaults to the owning plugin id when the block omits it.
         assert_eq!(sources[0].id, "fish");
@@ -2213,8 +2299,7 @@ mod tests {
             "p",
             r#"{"mcpServers":{"github":{"command":"plugin-gh"}}}"#,
         );
-        let (servers, collisions) =
-            collect_plugin_mcp_servers(&tmp, &["github".to_string()]);
+        let (servers, collisions) = collect_plugin_mcp_servers(&tmp, &["github".to_string()]);
         assert!(servers.is_empty());
         assert_eq!(collisions.len(), 1);
         assert_eq!(collisions[0].winner, "config");
@@ -2227,11 +2312,7 @@ mod tests {
         write_plugin(&tmp, "bad", r#"{"id":"bad"}"#, None);
         write_plugin_mcp(&tmp, "bad", "{ not json");
         write_plugin(&tmp, "good", r#"{"id":"good"}"#, None);
-        write_plugin_mcp(
-            &tmp,
-            "good",
-            r#"{"mcpServers":{"ok":{"command":"ok"}}}"#,
-        );
+        write_plugin_mcp(&tmp, "good", r#"{"mcpServers":{"ok":{"command":"ok"}}}"#);
         let (servers, collisions) = collect_plugin_mcp_servers(&tmp, &[]);
         // The malformed file is silently skipped; the good plugin still merges.
         assert_eq!(servers.len(), 1);
@@ -2427,26 +2508,36 @@ mod tests {
         write_plugin(&tmp, "zzz", r#"{"id":"zzz"}"#, None);
         write_hook(&tmp, "zzz", "on_init", "#!/bin/sh\necho SHARED=from_zzz\n");
         let env = collect_lifecycle_env(&tmp, "on_init", &[]);
-        assert_eq!(env.vars, vec![("SHARED".to_string(), "from_aaa".to_string())]);
-        assert!(env
-            .warnings
-            .iter()
-            .any(|w| w.contains("zzz") && w.contains("first-plugin-wins")));
+        assert_eq!(
+            env.vars,
+            vec![("SHARED".to_string(), "from_aaa".to_string())]
+        );
+        assert!(
+            env.warnings
+                .iter()
+                .any(|w| w.contains("zzz") && w.contains("first-plugin-wins"))
+        );
     }
 
     #[test]
     fn collect_user_env_wins_over_plugin() {
         let tmp = tempdir();
         write_plugin(&tmp, "p", r#"{"id":"p"}"#, None);
-        write_hook(&tmp, "p", "on_init", "#!/bin/sh\necho PATH=hacked\necho NEW=ok\n");
+        write_hook(
+            &tmp,
+            "p",
+            "on_init",
+            "#!/bin/sh\necho PATH=hacked\necho NEW=ok\n",
+        );
         let ambient = vec![("PATH".to_string(), "/usr/bin".to_string())];
         let env = collect_lifecycle_env(&tmp, "on_init", &ambient);
         // PATH already set by user ⇒ dropped; NEW is fresh ⇒ kept.
         assert_eq!(env.vars, vec![("NEW".to_string(), "ok".to_string())]);
-        assert!(env
-            .warnings
-            .iter()
-            .any(|w| w.contains("PATH") && w.contains("user env wins")));
+        assert!(
+            env.warnings
+                .iter()
+                .any(|w| w.contains("PATH") && w.contains("user env wins"))
+        );
     }
 
     #[test]
@@ -2490,7 +2581,11 @@ mod tests {
             "on_init",
             "#!/bin/sh\necho HOOK_SAW_REGION=$AISH_PROFILE_ACME_REGION\n",
         );
-        let cred = write_credentials(&tmp, "acme", &[("region", "us-east-1"), ("access_token", "s3cr3t")]);
+        let cred = write_credentials(
+            &tmp,
+            "acme",
+            &[("region", "us-east-1"), ("access_token", "s3cr3t")],
+        );
 
         let env = collect_lifecycle_env_at(&tmp, "on_init", &[], &cred);
         // The hook received AISH_PROFILE_ACME_REGION and echoed it back.
@@ -2520,10 +2615,7 @@ mod tests {
         let env = collect_lifecycle_env_at(&tmp, "on_init", &[], &cred);
         // Nothing merged — the credential-like key was rejected + warned.
         assert!(env.vars.is_empty());
-        assert!(env
-            .warnings
-            .iter()
-            .any(|w| w.contains("credential-like")));
+        assert!(env.warnings.iter().any(|w| w.contains("credential-like")));
     }
 
     /// A plugin only ever sees ITS OWN profile — never another plugin's.
@@ -2591,16 +2683,24 @@ mod tests {
             "additionalProperties": false
         });
         // Valid.
-        assert!(validate_json_schema(&schema, &serde_json::json!({"name":"a","count":2})).is_empty());
-        // Missing required + wrong type + extra prop → 3 violations.
-        let v = validate_json_schema(
-            &schema,
-            &serde_json::json!({"count":"nope","extra":1}),
+        assert!(
+            validate_json_schema(&schema, &serde_json::json!({"name":"a","count":2})).is_empty()
         );
+        // Missing required + wrong type + extra prop → 3 violations.
+        let v = validate_json_schema(&schema, &serde_json::json!({"count":"nope","extra":1}));
         assert_eq!(v.len(), 3, "violations: {v:?}");
-        assert!(v.iter().any(|x| x.message.contains("missing required property `name`")));
-        assert!(v.iter().any(|x| x.path == "/count" && x.message.contains("expected type")));
-        assert!(v.iter().any(|x| x.message.contains("additional property `extra`")));
+        assert!(
+            v.iter()
+                .any(|x| x.message.contains("missing required property `name`"))
+        );
+        assert!(
+            v.iter()
+                .any(|x| x.path == "/count" && x.message.contains("expected type"))
+        );
+        assert!(
+            v.iter()
+                .any(|x| x.message.contains("additional property `extra`"))
+        );
     }
 
     #[test]
@@ -2613,19 +2713,30 @@ mod tests {
                 "score":  { "type": "number", "minimum": 0, "maximum": 100 }
             }
         });
-        assert!(validate_json_schema(
-            &schema,
-            &serde_json::json!({"status":"open","kind":"issue","score":50})
-        )
-        .is_empty());
+        assert!(
+            validate_json_schema(
+                &schema,
+                &serde_json::json!({"status":"open","kind":"issue","score":50})
+            )
+            .is_empty()
+        );
         let v = validate_json_schema(
             &schema,
             &serde_json::json!({"status":"weird","kind":"bug","score":150}),
         );
         assert_eq!(v.len(), 3, "violations: {v:?}");
-        assert!(v.iter().any(|x| x.path == "/status" && x.message.contains("enum")));
-        assert!(v.iter().any(|x| x.path == "/kind" && x.message.contains("const")));
-        assert!(v.iter().any(|x| x.path == "/score" && x.message.contains("maximum")));
+        assert!(
+            v.iter()
+                .any(|x| x.path == "/status" && x.message.contains("enum"))
+        );
+        assert!(
+            v.iter()
+                .any(|x| x.path == "/kind" && x.message.contains("const"))
+        );
+        assert!(
+            v.iter()
+                .any(|x| x.path == "/score" && x.message.contains("maximum"))
+        );
     }
 
     #[test]
@@ -2640,7 +2751,9 @@ mod tests {
                 }
             }
         });
-        assert!(validate_json_schema(&schema, &serde_json::json!({"tags":["ok","fine"]})).is_empty());
+        assert!(
+            validate_json_schema(&schema, &serde_json::json!({"tags":["ok","fine"]})).is_empty()
+        );
         let v = validate_json_schema(&schema, &serde_json::json!({"tags":["OK9"]}));
         assert_eq!(v.len(), 1, "violations: {v:?}");
         assert_eq!(v[0].path, "/tags/0");
@@ -2671,7 +2784,10 @@ mod tests {
         let plugins = discover(&tmp);
         let p = plugins.iter().find(|p| p.manifest.id == "p").unwrap();
         assert_eq!(p.schemas.len(), 1);
-        assert!(p.validate("issue", &serde_json::json!({"title":"x"})).is_ok());
+        assert!(
+            p.validate("issue", &serde_json::json!({"title":"x"}))
+                .is_ok()
+        );
         assert!(matches!(
             p.validate("issue", &serde_json::json!({})),
             Err(SchemaValidationError::Failed(_))
@@ -2687,7 +2803,10 @@ mod tests {
         let tmp = tempdir();
         write_plugin(&tmp, "p", r#"{"id":"p"}"#, None);
         write_schema(&tmp, "p", "ping", r#"{"type":"object","required":["ok"]}"#);
-        assert!(validate_against_plugin_schema(&tmp, "p", "ping", &serde_json::json!({"ok":true})).is_ok());
+        assert!(
+            validate_against_plugin_schema(&tmp, "p", "ping", &serde_json::json!({"ok":true}))
+                .is_ok()
+        );
         assert!(matches!(
             validate_against_plugin_schema(&tmp, "p", "ping", &serde_json::json!({})),
             Err(SchemaValidationError::Failed(_))
@@ -2714,7 +2833,10 @@ mod tests {
         assert!(info.contains("issue"));
 
         let detail = format_plugin_schemas(&tmp, "p").unwrap();
-        assert!(detail.contains("issue (type \"object\")"), "detail: {detail}");
+        assert!(
+            detail.contains("issue (type \"object\")"),
+            "detail: {detail}"
+        );
         assert!(detail.contains("properties: body, title"));
         assert!(detail.contains("required:   title"));
 

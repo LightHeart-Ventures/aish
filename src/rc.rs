@@ -127,10 +127,7 @@ fn parse_into(text: &str, rc: &mut Rc) {
 /// `eprintln!` skips are now returned as coded [`crate::diag::AishDiagnostic`]
 /// values so a caller (or a test) decides whether/how to surface them. Good
 /// lines still parse regardless of how many bad ones precede them (AC#5).
-pub(crate) fn parse_into_diagnosed(
-    text: &str,
-    rc: &mut Rc,
-) -> Vec<crate::diag::AishDiagnostic> {
+pub(crate) fn parse_into_diagnosed(text: &str, rc: &mut Rc) -> Vec<crate::diag::AishDiagnostic> {
     let mut diags = Vec::new();
     for (idx, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -409,7 +406,11 @@ pub enum FileMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Redir {
     /// `<`, `>`, `>>`, `n>`, `n>>` — connect `fd` to `path`.
-    File { fd: i32, mode: FileMode, path: String },
+    File {
+        fd: i32,
+        mode: FileMode,
+        path: String,
+    },
     /// `&>`, `&>>`, `>&file` — connect both stdout and stderr to `path`.
     Both { append: bool, path: String },
     /// `n>&m` / `n<&m` — make `fd` a duplicate of fd `from` (e.g. `2>&1`).
@@ -513,17 +514,15 @@ pub fn tokenize_redir(
             '<' | '>' => {
                 // A run of digits immediately before the operator is an explicit
                 // fd (`2>`); otherwise the pending word is a normal argv word.
-                let explicit_fd = if in_word
-                    && !cur.is_empty()
-                    && cur.chars().all(|d| d.is_ascii_digit())
-                {
-                    let fd: i32 = cur.parse().unwrap_or(-1);
-                    cur.clear();
-                    in_word = false;
-                    Some(fd)
-                } else {
-                    None
-                };
+                let explicit_fd =
+                    if in_word && !cur.is_empty() && cur.chars().all(|d| d.is_ascii_digit()) {
+                        let fd: i32 = cur.parse().unwrap_or(-1);
+                        cur.clear();
+                        in_word = false;
+                        Some(fd)
+                    } else {
+                        None
+                    };
                 if explicit_fd.is_none() {
                     flush_word!();
                 }
@@ -531,7 +530,8 @@ pub fn tokenize_redir(
                     // A prior redirection never got its target (`> >`).
                     return Err(D::empty_stage(line, i));
                 }
-                if let Some(r) = parse_redir_op(c, explicit_fd, &mut chars, line, i, &mut pending)? {
+                if let Some(r) = parse_redir_op(c, explicit_fd, &mut chars, line, i, &mut pending)?
+                {
                     redirs.push(r);
                 }
             }
@@ -671,7 +671,6 @@ fn parse_dup_or_both(
         }
     }
 }
-
 
 /// Result of reading a `$…` reference after the `$` has been consumed.
 enum Dollar {

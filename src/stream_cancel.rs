@@ -35,8 +35,8 @@
 //! never fires and streaming behaves exactly as it did before S8.3.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -258,8 +258,9 @@ mod tests {
         let mut w = CancelWatch::install();
         assert!(!w.active, "must be inert without a tty");
         // cancelled() is Pending forever — a short timeout must elapse.
-        let timed_out =
-            tokio::time::timeout(Duration::from_millis(50), w.cancelled()).await.is_err();
+        let timed_out = tokio::time::timeout(Duration::from_millis(50), w.cancelled())
+            .await
+            .is_err();
         assert!(timed_out, "inert cancel future must never resolve");
     }
 

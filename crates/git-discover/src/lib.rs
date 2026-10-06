@@ -123,10 +123,7 @@ impl RepoInfo {
     /// A one-line human summary, e.g.
     /// `LightHeart-Ventures/aish on aish/w_x (trunk main) — dirty`.
     pub fn summary(&self) -> String {
-        let ident = self
-            .slug
-            .clone()
-            .unwrap_or_else(|| self.repo_key.clone());
+        let ident = self.slug.clone().unwrap_or_else(|| self.repo_key.clone());
         let branch = match (&self.branch, self.detached) {
             (Some(b), _) => format!("on {b}"),
             (None, true) => "detached HEAD".to_string(),
@@ -137,7 +134,11 @@ impl RepoInfo {
         } else {
             format!("trunk {}", self.trunk)
         };
-        let dirt = if self.dirty { " — dirty" } else { " — clean" };
+        let dirt = if self.dirty {
+            " — dirty"
+        } else {
+            " — clean"
+        };
         let wt = if self.is_linked_worktree {
             " [linked worktree]"
         } else {
@@ -157,7 +158,9 @@ pub fn discover(dir: &Path) -> Option<RepoInfo> {
     if !is_git_repo(dir) {
         return None;
     }
-    let root = toplevel(dir).map(PathBuf::from).unwrap_or_else(|| dir.to_path_buf());
+    let root = toplevel(dir)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dir.to_path_buf());
     let remote_url = origin_url(dir);
     let remote = remote_url.as_deref().and_then(parse_remote);
     let (host, owner, repo, slug) = match &remote {
@@ -436,7 +439,10 @@ pub fn is_dirty(dir: &Path) -> bool {
 /// git dir against the shared common git dir. False on any error.
 pub fn is_linked_worktree(dir: &Path) -> bool {
     let git_dir = git_out(dir, &["rev-parse", "--absolute-git-dir"]);
-    let common = git_out(dir, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    let common = git_out(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
     match (git_dir, common) {
         (Some(g), Some(c)) => !g.is_empty() && !c.is_empty() && g != c,
         _ => false,
@@ -462,7 +468,10 @@ mod tests {
                 "https://github.com/owner/repo",
                 ("github.com", "owner", "repo"),
             ),
-            ("git@github.com:owner/repo.git", ("github.com", "owner", "repo")),
+            (
+                "git@github.com:owner/repo.git",
+                ("github.com", "owner", "repo"),
+            ),
             (
                 "ssh://git@github.com/owner/repo.git",
                 ("github.com", "owner", "repo"),

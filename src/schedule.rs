@@ -576,7 +576,10 @@ fn next_fire_after(sched: &Schedule, after: SystemTime) -> SystemTime {
         Schedule::Once => after, // never re-armed
         Schedule::Every(d) => after + *d,
         Schedule::Cron(c) => {
-            let base = after.duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            let base = after
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
             // Truncate to the minute, start from the next minute.
             let mut cand = (base / 60) * 60 + 60;
             let limit = cand + 366 * 24 * 60 * 60; // search up to ~1 year

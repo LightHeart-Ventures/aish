@@ -129,11 +129,7 @@ impl MemoryNamespace {
     /// The unix file mode this namespace's file must have. `0600` (owner
     /// read/write only) for the secret `auth` namespace; `0644` otherwise.
     pub fn file_mode(&self) -> u32 {
-        if self.is_secret() {
-            0o600
-        } else {
-            0o644
-        }
+        if self.is_secret() { 0o600 } else { 0o644 }
     }
 }
 
@@ -165,7 +161,10 @@ pub enum MemoryError {
     /// memory root — `..`, an absolute path, or a separator. Hard-rejected.
     PathTraversal(String),
     /// A cross-plugin / cross-namespace access was denied by [`can_access`].
-    AccessDenied { plugin_id: String, namespace: String },
+    AccessDenied {
+        plugin_id: String,
+        namespace: String,
+    },
 }
 
 impl fmt::Display for MemoryError {
@@ -177,7 +176,10 @@ impl fmt::Display for MemoryError {
             MemoryError::PermissionDenied(e) => write!(f, "permission denied: {e}"),
             MemoryError::Io(e) => write!(f, "i/o error: {e}"),
             MemoryError::Malformed { namespace, detail } => {
-                write!(f, "malformed memory file for namespace `{namespace}`: {detail}")
+                write!(
+                    f,
+                    "malformed memory file for namespace `{namespace}`: {detail}"
+                )
             }
             MemoryError::Validation(e) => write!(f, "invalid memory operation: {e}"),
             MemoryError::InvalidNamespace(n) => write!(
@@ -187,8 +189,14 @@ impl fmt::Display for MemoryError {
             MemoryError::PathTraversal(id) => {
                 write!(f, "illegal plugin id `{id}` (path traversal rejected)")
             }
-            MemoryError::AccessDenied { plugin_id, namespace } => {
-                write!(f, "plugin `{plugin_id}` may not access namespace `{namespace}`")
+            MemoryError::AccessDenied {
+                plugin_id,
+                namespace,
+            } => {
+                write!(
+                    f,
+                    "plugin `{plugin_id}` may not access namespace `{namespace}`"
+                )
             }
         }
     }
@@ -430,8 +438,8 @@ impl PluginMemory {
             }
             Some(Value::Array(_)) => {
                 // Re-fetch mutably and push.
-                let slot = get_path_mut(&mut root, &path)
-                    .expect("path existed on immutable read above");
+                let slot =
+                    get_path_mut(&mut root, &path).expect("path existed on immutable read above");
                 if let Value::Array(arr) = slot {
                     arr.push(value);
                 }
@@ -695,8 +703,14 @@ mod unit_tests {
 
     #[test]
     fn namespace_parse_and_props() {
-        assert_eq!(MemoryNamespace::parse("AUTH").unwrap(), MemoryNamespace::Auth);
-        assert_eq!(MemoryNamespace::parse(" cache ").unwrap(), MemoryNamespace::Cache);
+        assert_eq!(
+            MemoryNamespace::parse("AUTH").unwrap(),
+            MemoryNamespace::Auth
+        );
+        assert_eq!(
+            MemoryNamespace::parse(" cache ").unwrap(),
+            MemoryNamespace::Cache
+        );
         assert!(MemoryNamespace::parse("bogus").is_err());
         assert!(MemoryNamespace::Auth.is_secret());
         assert!(!MemoryNamespace::Prefs.is_secret());
@@ -748,7 +762,12 @@ mod unit_tests {
     #[test]
     fn nested_set_get_delete() {
         let mut root = Value::Object(Map::new());
-        set_path(&mut root, &["webhooks", "github", "id"], serde_json::json!("12345")).unwrap();
+        set_path(
+            &mut root,
+            &["webhooks", "github", "id"],
+            serde_json::json!("12345"),
+        )
+        .unwrap();
         assert_eq!(
             get_path(&root, &["webhooks", "github", "id"]),
             Some(&serde_json::json!("12345"))

@@ -43,7 +43,7 @@
 //! in the order they were sent.
 
 use crate::worker::WorkerOutputMode;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// A single normalized operator-control signal on the unified channel.
 ///
@@ -179,7 +179,9 @@ mod tests {
 
     #[test]
     fn priority_ranks_interrupt_over_steer_over_output_mode() {
-        assert!(ControlSignal::Interrupt.priority() < ControlSignal::Steer(String::new()).priority());
+        assert!(
+            ControlSignal::Interrupt.priority() < ControlSignal::Steer(String::new()).priority()
+        );
         assert!(
             ControlSignal::Steer(String::new()).priority()
                 < ControlSignal::OutputMode(WorkerOutputMode::Off).priority()

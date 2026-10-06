@@ -1190,8 +1190,14 @@ mod tests {
     #[test]
     fn batch_guard_nudges_after_three_lone_reads() {
         let mut g = BatchGuard::default();
-        assert!(g.record(&["read_file"]).is_none(), "1st lone read: no nudge");
-        assert!(g.record(&["grep_files"]).is_none(), "2nd lone read: no nudge");
+        assert!(
+            g.record(&["read_file"]).is_none(),
+            "1st lone read: no nudge"
+        );
+        assert!(
+            g.record(&["grep_files"]).is_none(),
+            "2nd lone read: no nudge"
+        );
         let nudge = g.record(&["list_dir"]).expect("3rd lone read trips nudge");
         assert!(nudge.contains("[BATCH"));
         // At most once per streak — the 4th lone read stays silent.
@@ -1222,7 +1228,10 @@ mod tests {
         assert!(g.record(&["run_program"]).is_none());
         assert!(g.record(&["read_file"]).is_none(), "streak restarted");
         assert!(g.record(&["read_file"]).is_none());
-        assert!(g.record(&["read_file"]).is_some(), "nudge after fresh streak");
+        assert!(
+            g.record(&["read_file"]).is_some(),
+            "nudge after fresh streak"
+        );
     }
 
     #[test]
@@ -1331,17 +1340,14 @@ mod tests {
         // A deep serial chain is a recoverable stop → Resume (auto-continue),
         // and once auto-recoveries are spent it flags the operator.
         let max = MAX_AUTO_RECOVERIES;
-        assert_eq!(
-            classify_disposition(&reason, 0, max),
-            Disposition::Resume
-        );
+        assert_eq!(classify_disposition(&reason, 0, max), Disposition::Resume);
         assert_eq!(
             classify_disposition(&reason, max, max),
             Disposition::FlagOperator
         );
         // End-to-end through RoundExit: resume with the auto-resume directive.
-        let exit = RoundExit::evaluate(&with_banner(&reason, "partial"), 0, max)
-            .expect("abnormal → Some");
+        let exit =
+            RoundExit::evaluate(&with_banner(&reason, "partial"), 0, max).expect("abnormal → Some");
         assert_eq!(exit.disposition, Disposition::Resume);
         assert!(exit.directive().unwrap().contains("[auto-resume]"));
     }
@@ -1422,8 +1428,8 @@ mod tests {
             Disposition::FlagOperator
         );
         // End-to-end through RoundExit: resume with the auto-resume directive.
-        let exit = RoundExit::evaluate(&with_banner(&reason, "partial"), 0, max)
-            .expect("abnormal → Some");
+        let exit =
+            RoundExit::evaluate(&with_banner(&reason, "partial"), 0, max).expect("abnormal → Some");
         assert_eq!(exit.disposition, Disposition::Resume);
         assert!(exit.directive().unwrap().contains("[auto-resume]"));
     }

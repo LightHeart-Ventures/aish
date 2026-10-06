@@ -667,13 +667,25 @@ mod tests {
     fn illegal_edges_are_rejected() {
         let m = TransitionTable::canonical();
         // Can't complete straight from spawn (must Start first).
-        assert!(m.next(LifecycleState::Spawned, LifecycleEvent::Complete).is_none());
+        assert!(
+            m.next(LifecycleState::Spawned, LifecycleEvent::Complete)
+                .is_none()
+        );
         // Can't recover a run that never soft-failed.
-        assert!(m.next(LifecycleState::Running, LifecycleEvent::Recover).is_none());
+        assert!(
+            m.next(LifecycleState::Running, LifecycleEvent::Recover)
+                .is_none()
+        );
         // Can't flag from plain running (only from soft-failed).
-        assert!(m.next(LifecycleState::Running, LifecycleEvent::Flag).is_none());
+        assert!(
+            m.next(LifecycleState::Running, LifecycleEvent::Flag)
+                .is_none()
+        );
         // A recovered soft-fail can't be recovered again without re-failing.
-        assert!(m.next(LifecycleState::SoftFailed, LifecycleEvent::Complete).is_none());
+        assert!(
+            m.next(LifecycleState::SoftFailed, LifecycleEvent::Complete)
+                .is_none()
+        );
     }
 
     #[test]
@@ -683,10 +695,7 @@ mod tests {
             assert!(term.is_terminal());
             assert!(m.outgoing(term).is_empty());
             for ev in LifecycleEvent::ALL {
-                assert!(
-                    m.next(term, ev).is_none(),
-                    "terminal {term} accepted {ev}"
-                );
+                assert!(m.next(term, ev).is_none(), "terminal {term} accepted {ev}");
             }
         }
     }
@@ -703,7 +712,10 @@ mod tests {
         }
         for st in m.states() {
             if !st.is_terminal() {
-                assert!(!m.outgoing(*st).is_empty(), "non-terminal {st} is a dead end");
+                assert!(
+                    !m.outgoing(*st).is_empty(),
+                    "non-terminal {st} is a dead end"
+                );
             }
             if *st != LifecycleState::Spawned {
                 assert!(targets.contains(st), "{st} is unreachable");
@@ -752,14 +764,26 @@ mod tests {
     #[test]
     fn phase_bridge_is_total_and_correct() {
         use crate::coordinator::Phase;
-        assert_eq!(LifecycleState::from_phase(Phase::Coordinating), LifecycleState::Running);
+        assert_eq!(
+            LifecycleState::from_phase(Phase::Coordinating),
+            LifecycleState::Running
+        );
         assert_eq!(
             LifecycleState::from_phase(Phase::AwaitingBatch),
             LifecycleState::AwaitingBatch
         );
-        assert_eq!(LifecycleState::from_phase(Phase::Checkpoint), LifecycleState::Checkpoint);
-        assert_eq!(LifecycleState::from_phase(Phase::Done), LifecycleState::Done);
-        assert_eq!(LifecycleState::from_phase(Phase::Failed), LifecycleState::Failed);
+        assert_eq!(
+            LifecycleState::from_phase(Phase::Checkpoint),
+            LifecycleState::Checkpoint
+        );
+        assert_eq!(
+            LifecycleState::from_phase(Phase::Done),
+            LifecycleState::Done
+        );
+        assert_eq!(
+            LifecycleState::from_phase(Phase::Failed),
+            LifecycleState::Failed
+        );
     }
 
     #[test]
@@ -768,7 +792,10 @@ mod tests {
             LifecycleState::from_worker_status("running"),
             Some(LifecycleState::Running)
         );
-        assert_eq!(LifecycleState::from_worker_status("done"), Some(LifecycleState::Done));
+        assert_eq!(
+            LifecycleState::from_worker_status("done"),
+            Some(LifecycleState::Done)
+        );
         assert_eq!(
             LifecycleState::from_worker_status("failed"),
             Some(LifecycleState::Failed)

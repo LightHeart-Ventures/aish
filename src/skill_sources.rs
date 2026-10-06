@@ -20,8 +20,8 @@
 // per-item allows.
 #![allow(dead_code)]
 
-use anyhow::{Context, Result, bail};
 use crate::skill_provider::SearchResult;
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -50,9 +50,7 @@ pub enum SkillSource {
     Builtin,
     /// Script: runs `search.sh` or `add.sh` in a plugin's directory via
     /// `run_plugin_handler` with a curated env (design §3.1).
-    Script {
-        plugin_dir: PathBuf,
-    },
+    Script { plugin_dir: PathBuf },
 }
 
 impl SkillSource {
@@ -124,8 +122,7 @@ impl SkillSource {
                     // AISH_PLUGIN_ID, AISH_SKILLS_DIR, AISH_CREDENTIALS_FILE would be set by caller.
                 ];
 
-                let output =
-                    crate::plugin_auth::run_plugin_handler(&script, plugin_dir, &env)?;
+                let output = crate::plugin_auth::run_plugin_handler(&script, plugin_dir, &env)?;
                 parse_add_result(&output, reference)
             }
         }
@@ -170,18 +167,14 @@ fn parse_add_result(output: &str, reference: &str) -> Result<Vec<SkillMetadata>>
 
     // Try JSON object (single skill).
     if trimmed.starts_with('{') {
-        let metadata: SkillMetadata = serde_json::from_str(trimmed)
-            .context("failed to parse add handler JSON object")?;
+        let metadata: SkillMetadata =
+            serde_json::from_str(trimmed).context("failed to parse add handler JSON object")?;
         return Ok(vec![metadata]);
     }
 
     // Otherwise, treat as raw SKILL.md text and synthesize metadata.
     // Extract the skill name from the reference (e.g. "owner/skill-name" → "skill-name").
-    let skill_name = reference
-        .split('/')
-        .last()
-        .unwrap_or(reference)
-        .to_string();
+    let skill_name = reference.split('/').last().unwrap_or(reference).to_string();
 
     Ok(vec![SkillMetadata {
         path: skill_name,
@@ -360,7 +353,11 @@ mod tests {
         // add.sh emits a raw SKILL.md → synthesized into a single SkillMetadata,
         // with the path derived from the reference's trailing segment.
         let dir = unique_tmp_dir("skillsrc_add_ok");
-        write_handler(&dir, "add.sh", "#!/bin/sh\nprintf '# Demo Skill\\n\\nbody\\n'\n");
+        write_handler(
+            &dir,
+            "add.sh",
+            "#!/bin/sh\nprintf '# Demo Skill\\n\\nbody\\n'\n",
+        );
         let src = SkillSource::Script {
             plugin_dir: dir.clone(),
         };

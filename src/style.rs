@@ -585,7 +585,12 @@ pub fn visible_cols(s: &str) -> usize {
 /// `:rename`) is right-justified on the RIGHT, in bold magenta (the accent it
 /// carried as the prompt `[name]` prefix). When there's no name the `left` is returned
 /// unchanged. Pure — width/color are supplied so it's unit-testable.
-pub fn second_statusline_at(left: &str, name: Option<&str>, width: usize, color_on: bool) -> String {
+pub fn second_statusline_at(
+    left: &str,
+    name: Option<&str>,
+    width: usize,
+    color_on: bool,
+) -> String {
     let name = match name {
         Some(n) if !n.is_empty() => n,
         _ => return left.to_string(),
@@ -660,10 +665,19 @@ mod tests {
         // Fresh: under the 15-min stale threshold → ♥ + single-unit age.
         assert_eq!(fmt_heartbeat_age(Some(beat), false, base + 10), "♥ 10s");
         assert_eq!(fmt_heartbeat_age(Some(beat), false, base + 5 * 60), "♥ 5m");
-        assert_eq!(fmt_heartbeat_age(Some(beat), false, base + 14 * 60), "♥ 14m");
+        assert_eq!(
+            fmt_heartbeat_age(Some(beat), false, base + 14 * 60),
+            "♥ 14m"
+        );
         // Stale: beat older than HEARTBEAT_STALE_AFTER_SECS → ⚠.
-        assert_eq!(fmt_heartbeat_age(Some(beat), false, base + 20 * 60), "⚠ 20m");
-        assert_eq!(fmt_heartbeat_age(Some(beat), false, base + 3 * 3600), "⚠ 3h");
+        assert_eq!(
+            fmt_heartbeat_age(Some(beat), false, base + 20 * 60),
+            "⚠ 20m"
+        );
+        assert_eq!(
+            fmt_heartbeat_age(Some(beat), false, base + 3 * 3600),
+            "⚠ 3h"
+        );
         // Terminal rows, missing/unparseable beats, and clock skew degrade safely.
         // Terminal rows report the real age of their last beat ("finished 20m
         // ago"), NOT a blank. A blank made the Beat column silently re-state
@@ -727,9 +741,11 @@ mod tests {
         assert_eq!(runtime, "1m 30s"); // 90s total, regardless of now
         assert!(started.ends_with("ago"));
         // No start → both placeholders.
-        assert_eq!(time_cells(None, None, 9999), ("—".to_string(), "—".to_string()));
+        assert_eq!(
+            time_cells(None, None, 9999),
+            ("—".to_string(), "—".to_string())
+        );
     }
-
 
     #[test]
     fn fmt_datetime_utc_known_instants() {
@@ -890,8 +906,14 @@ mod tests {
 Watch for this condition and call the `set_alert` tool with alert_id=7 …";
         assert_eq!(job_activity_emoji(alert_task), "⏰");
         // Any of the anchors alone is enough.
-        assert_eq!(job_activity_emoji("call set_alert when the PR merges"), "⏰");
-        assert_eq!(job_activity_emoji("watch for an operator alert condition"), "⏰");
+        assert_eq!(
+            job_activity_emoji("call set_alert when the PR merges"),
+            "⏰"
+        );
+        assert_eq!(
+            job_activity_emoji("watch for an operator alert condition"),
+            "⏰"
+        );
         // Goal-loop turns carry the GOAL_DIRECTIVE_PREFIX opening → bullseye.
         assert_eq!(
             job_activity_emoji("Work toward this goal, then report what you did …"),
@@ -899,7 +921,10 @@ Watch for this condition and call the `set_alert` tool with alert_id=7 …";
         );
         assert_eq!(job_activity_emoji("work toward this goal"), "🎯");
         // Ordinary background work falls back to the generic worker robot.
-        assert_eq!(job_activity_emoji("fix the failing CI on branch feat/x"), "🤖");
+        assert_eq!(
+            job_activity_emoji("fix the failing CI on branch feat/x"),
+            "🤖"
+        );
         assert_eq!(job_activity_emoji("refactor the coordinator store"), "🤖");
         assert_eq!(job_activity_emoji(""), "🤖");
     }

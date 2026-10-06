@@ -118,7 +118,6 @@ pub async fn rewrite_to_command_streaming(
     Ok(sanitize_candidate(&turn.text))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

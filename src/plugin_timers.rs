@@ -175,10 +175,7 @@ async fn run_once(
     }
 
     if !out.status.success() {
-        log(&format!(
-            "{plugin_id}: timer exit {:?}",
-            out.status.code()
-        ));
+        log(&format!("{plugin_id}: timer exit {:?}", out.status.code()));
     }
 }
 
@@ -260,8 +257,14 @@ mod tests {
         let timers = m.timers();
         assert_eq!(timers.len(), 2);
         assert_eq!(timers[0].command, "refresh.sh");
-        assert_eq!(parse_every(&timers[0].every), Some(Duration::from_secs(600)));
-        assert_eq!(timers[0].cache.as_deref(), Some("state/statusline/demo.txt"));
+        assert_eq!(
+            parse_every(&timers[0].every),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            timers[0].cache.as_deref(),
+            Some("state/statusline/demo.txt")
+        );
         assert_eq!(timers[1].args, vec!["-u".to_string()]);
         assert!(timers[1].cache.is_none());
     }

@@ -109,7 +109,8 @@ impl JsonlAuditSink {
 
     /// The on-disk path a given plugin's records land in.
     pub fn path_for(&self, plugin_id: &str) -> PathBuf {
-        self.dir.join(format!("{}.jsonl", sanitize_plugin_id(plugin_id)))
+        self.dir
+            .join(format!("{}.jsonl", sanitize_plugin_id(plugin_id)))
     }
 }
 
@@ -119,7 +120,13 @@ impl JsonlAuditSink {
 fn sanitize_plugin_id(id: &str) -> String {
     let cleaned: String = id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
         "unknown".to_string()
@@ -222,7 +229,11 @@ impl MemoryAuditSink {
     }
 
     pub fn len(&self) -> usize {
-        self.ring.lock().expect("audit mutex poisoned").entries.len()
+        self.ring
+            .lock()
+            .expect("audit mutex poisoned")
+            .entries
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -247,7 +258,10 @@ impl AuditSink for MemoryAuditSink {
         // it is exactly what an on-disk/JSONL realization of this trail costs.
         let size = serde_json::to_string(rec).map(|s| s.len()).unwrap_or(0);
         let mut ring = self.ring.lock().expect("audit mutex poisoned");
-        ring.entries.push_back(MemEntry { rec: rec.clone(), size });
+        ring.entries.push_back(MemEntry {
+            rec: rec.clone(),
+            size,
+        });
         ring.bytes = ring.bytes.saturating_add(size);
         // Evict oldest-first while over either cap, but always keep the record
         // we just pushed (len > 1 guard on the byte cap).
@@ -276,7 +290,11 @@ mod tests {
             event_type: "pull_request".to_string(),
             matched: true,
             executed,
-            exit_code: if executed { Some(if success { 0 } else { 1 }) } else { None },
+            exit_code: if executed {
+                Some(if success { 0 } else { 1 })
+            } else {
+                None
+            },
             success,
             stdout: String::new(),
             stderr: String::new(),
@@ -308,12 +326,20 @@ mod tests {
     #[tokio::test]
     async fn memory_sink_captures_records() {
         let sink = MemoryAuditSink::new();
-        sink.record(&AuditRecord::from_outcome("d1", "t", &outcome("a", true, true)))
-            .await
-            .unwrap();
-        sink.record(&AuditRecord::from_outcome("d1", "t", &outcome("b", true, false)))
-            .await
-            .unwrap();
+        sink.record(&AuditRecord::from_outcome(
+            "d1",
+            "t",
+            &outcome("a", true, true),
+        ))
+        .await
+        .unwrap();
+        sink.record(&AuditRecord::from_outcome(
+            "d1",
+            "t",
+            &outcome("b", true, false),
+        ))
+        .await
+        .unwrap();
         let recs = sink.records();
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].plugin_id, "a");
@@ -376,12 +402,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let sink = JsonlAuditSink::new(&dir);
 
-        sink.record(&AuditRecord::from_outcome("d1", "t", &outcome("gh", true, true)))
-            .await
-            .unwrap();
-        sink.record(&AuditRecord::from_outcome("d2", "t", &outcome("gh", true, false)))
-            .await
-            .unwrap();
+        sink.record(&AuditRecord::from_outcome(
+            "d1",
+            "t",
+            &outcome("gh", true, true),
+        ))
+        .await
+        .unwrap();
+        sink.record(&AuditRecord::from_outcome(
+            "d2",
+            "t",
+            &outcome("gh", true, false),
+        ))
+        .await
+        .unwrap();
 
         let path = sink.path_for("gh");
         let body = std::fs::read_to_string(&path).unwrap();

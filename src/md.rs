@@ -89,7 +89,10 @@ pub fn render(text: &str, base: &str) -> String {
         // its own line → a dim full-width rule. Checked before the bullet branch
         // so `- - -` reads as a rule, not a bullet.
         if is_hrule(trimmed) {
-            out.push(format!("{indent}\x1b[2m{}\x1b[22m{base}", "─".repeat(hrule_width(indent))));
+            out.push(format!(
+                "{indent}\x1b[2m{}\x1b[22m{base}",
+                "─".repeat(hrule_width(indent))
+            ));
             i += 1;
             continue;
         }
@@ -152,8 +155,7 @@ fn is_hrule(trimmed: &str) -> bool {
         Some(c @ ('-' | '*' | '_')) => c,
         _ => return false,
     };
-    t.chars().filter(|&c| c == marker).count() >= 3
-        && t.chars().all(|c| c == marker || c == ' ')
+    t.chars().filter(|&c| c == marker).count() >= 3 && t.chars().all(|c| c == marker || c == ' ')
 }
 
 /// Display width for a horizontal rule: the terminal width (capped so a piped,
@@ -472,7 +474,6 @@ pub fn render_stdout_within(text: &str, max_cols: usize) -> String {
     }
 }
 
-
 /// Inline spans: `code`, **bold**, *italic*, ~~strike~~, [text](url). Underscore
 /// emphasis is skipped on purpose — it would mangle snake_case identifiers.
 fn inline(s: &str, base: &str) -> String {
@@ -568,8 +569,8 @@ fn render_link(rest: &str, base: &str, out: &mut String) -> Option<usize> {
 mod tests {
     use super::render;
     use super::{
-        fit_widths, render_pane, render_within, visible_width, wrap_cell, DEFAULT_PANE_COLS,
-        PANE_GUTTER_COLS,
+        DEFAULT_PANE_COLS, PANE_GUTTER_COLS, fit_widths, render_pane, render_within, visible_width,
+        wrap_cell,
     };
 
     // Serializes every test that mutates the process-global `COLUMNS` env var.
@@ -627,7 +628,10 @@ mod tests {
         let out = render(md, "");
         let lines: Vec<&str> = out.lines().collect();
         // framed (top + header + mid + ≥2 wrapped body lines + bottom)
-        assert!(lines.len() >= 6, "expected wrapped+framed rows, got {lines:#?}");
+        assert!(
+            lines.len() >= 6,
+            "expected wrapped+framed rows, got {lines:#?}"
+        );
         unsafe { std::env::remove_var("COLUMNS") };
     }
 
@@ -687,10 +691,7 @@ mod tests {
     #[test]
     fn strikethrough_and_links() {
         // ~~strike~~ → SGR 9/29, with inner inline markup still honored.
-        assert_eq!(
-            render("~~gone~~ now", ""),
-            "\x1b[9mgone\x1b[29m now"
-        );
+        assert_eq!(render("~~gone~~ now", ""), "\x1b[9mgone\x1b[29m now");
         // [label](url): cyan label + dim (url) when they differ.
         assert_eq!(
             render("see [docs](https://x.io)", ""),
@@ -745,10 +746,7 @@ mod tests {
     #[test]
     fn blockquote() {
         // `> text` → dim gutter + inline-rendered content.
-        assert_eq!(
-            render("> heads up", ""),
-            "\x1b[2m▎\x1b[22m heads up"
-        );
+        assert_eq!(render("> heads up", ""), "\x1b[2m▎\x1b[22m heads up");
         // Nested `> > ` → two gutters; inner markup still renders.
         assert_eq!(
             render("> > **bang**", ""),
