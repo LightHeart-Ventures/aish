@@ -9796,6 +9796,16 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
                 "batch mode on — the agent can offload deferrable work to background batches on {} (takes effect next turn)",
                 session.batch_model
             );
+            // Detect reachability HERE, the moment the operator flips the switch,
+            // instead of letting the first offload fail opaquely: the Batches API
+            // is metered and a subscription token can't reach it. Batch work still
+            // runs — it falls back to the batch model on an interactive coordinator.
+            if !crate::batch::available(&session.env) {
+                println!(
+                    "\x1b[2mnote: {}\x1b[0m",
+                    crate::batch::unavailable_fallback_note(&session.batch_model)
+                );
+            }
         }
         Some("off") => {
             session.batch_mode = false;
@@ -9836,9 +9846,14 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
         }
         None | Some("status") => {
             println!(
-                "batch mode: {} · model: {}",
+                "batch mode: {} · model: {} · batches api: {}",
                 if session.batch_mode { "on" } else { "off" },
-                session.batch_model
+                session.batch_model,
+                if crate::batch::available(&session.env) {
+                    "reachable"
+                } else {
+                    "unreachable — falls back to an interactive coordinator"
+                }
             );
             let jobs = session.batch_jobs.lock().unwrap();
             if jobs.is_empty() {
