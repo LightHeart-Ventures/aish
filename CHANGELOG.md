@@ -4,6 +4,16 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.51.0] - 2026-10-07
+
+### Added
+- **OSC 8 hyperlink terminal support** (PR #886): markdown URLs now render as clickable terminal hyperlinks via OSC 8 escape sequences when the terminal supports them; non-supporting terminals fall back to plain text with the URL visible
+- **Escalation banner UI** (PR #887): animated escalation banner pinned above the statusline showing live worker status and pending operator asks, with visual severity indicators
+- **Reasoning telemetry instrumentation**: escalate(), batch runs, and coordinator turnarounds now emit structured reasoning events for observability and decision-tree analysis
+
+### Fixed
+- **Voice configuration wiring** (PR #885): all five voice.* config keys now honored in the REPL dictation path; Whisper initialization stderr suppressed for cleaner output
+
 ## [0.50.2] - 2026-10-06
 
 ### Fixed
