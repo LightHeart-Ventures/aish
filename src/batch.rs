@@ -29,6 +29,55 @@ const POLL_WALL_CLOCK_CAP: Duration = Duration::from_secs(6 * 60 * 60); // 6h, m
 /// Overridable at runtime via `:batch model <opus|sonnet|haiku|full-id>`.
 pub const DEFAULT_BATCH_MODEL: &str = "claude-opus-5";
 
+// ── Batch-API availability detection ────────────────────────────────────────
+//
+// The Message Batches API is METERED: it needs an `ANTHROPIC_API_KEY`. A Claude
+// Max/Pro subscription token (`CLAUDE_CODE_OAUTH_TOKEN`) cannot reach it, so a
+// batch offload on subscription auth can only ever error. Every caller that
+// wants the batch tier resolves availability through HERE — one detection site
+// in the code, recomputed from the live credentials on each call, rather than a
+// decision made once and cached on the session (a cached answer goes stale the
+// moment an operator exports a key into `~/.aishrc`).
+//
+// Precedence matches the rest of aish: `~/.aishrc` exports (threaded on the
+// session as `env`) win over the process environment, and a blank value counts
+// as absent. The pure half (`metered_key_in`) is unit-tested without touching
+// the process env.
+
+/// The metered key as seen in an explicit env slice (session env / `~/.aishrc`
+/// exports). Last export wins; blank is absent. Pure — no process env access.
+pub fn metered_key_in(env: &[(String, String)]) -> Option<String> {
+    env.iter()
+        .rev()
+        .find(|(k, _)| k == "ANTHROPIC_API_KEY")
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.trim().is_empty())
+}
+
+/// `metered_key_in` with the process environment as the fallback source.
+pub fn metered_key(env: &[(String, String)]) -> Option<String> {
+    metered_key_in(env).or_else(|| {
+        std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    })
+}
+
+/// Whether the Batches API is reachable with the credentials on hand.
+pub fn available(env: &[(String, String)]) -> bool {
+    metered_key(env).is_some()
+}
+
+/// The one-line explanation every caller prints when the batch tier was wanted
+/// but is unreachable: the work still runs — on `batch_model` (Opus by default)
+/// via an interactive coordinator — just at interactive price instead of ~50% off.
+pub fn unavailable_fallback_note(batch_model: &str) -> String {
+    format!(
+        "the Anthropic Batches API needs a metered ANTHROPIC_API_KEY (a Claude subscription \
+token can't reach it) — batch work falls back to {batch_model} on an interactive coordinator"
+    )
+}
+
 /// A background batch job, tracked for the life of the session. Shared between
 /// the REPL (which lists/fetches it) and the poll task (which mutates it).
 pub struct BatchJob {
@@ -728,6 +777,50 @@ fn render_results(results: &[BatchResult]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metered_key_in_reads_the_session_env() {
+        let env = vec![(
+            "ANTHROPIC_API_KEY".to_string(),
+            "sk-ant-metered".to_string(),
+        )];
+        assert_eq!(metered_key_in(&env).as_deref(), Some("sk-ant-metered"));
+    }
+
+    #[test]
+    fn metered_key_in_treats_blank_as_absent() {
+        let env = vec![("ANTHROPIC_API_KEY".to_string(), "   ".to_string())];
+        assert_eq!(metered_key_in(&env), None);
+        assert_eq!(metered_key_in(&[]), None);
+    }
+
+    #[test]
+    fn metered_key_in_ignores_a_subscription_token() {
+        // A Claude Max/Pro OAuth token CANNOT reach the Batches API, so it must
+        // never be mistaken for a metered key.
+        let env = vec![(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            "sk-ant-oat-subscription".to_string(),
+        )];
+        assert_eq!(metered_key_in(&env), None);
+    }
+
+    #[test]
+    fn metered_key_in_takes_the_last_export() {
+        // `~/.aishrc` is replayed in order — a later export wins.
+        let env = vec![
+            ("ANTHROPIC_API_KEY".to_string(), "old".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "new".to_string()),
+        ];
+        assert_eq!(metered_key_in(&env).as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn fallback_note_names_the_model_the_work_lands_on() {
+        let note = unavailable_fallback_note(DEFAULT_BATCH_MODEL);
+        assert!(note.contains("ANTHROPIC_API_KEY"), "{note}");
+        assert!(note.contains(DEFAULT_BATCH_MODEL), "{note}");
+    }
 
     #[test]
     fn flatten_succeeded_joins_text_blocks() {

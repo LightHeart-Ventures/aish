@@ -2271,6 +2271,7 @@ OPENAI_API_KEY; OpenRouter needs OPENROUTER_API_KEY (env or ~/.aishrc)"
     // only route out is the Batches API it structurally cannot reach. Falling
     // through to the worker-spawn path below is safe — `spawn_budget_gate` still
     // enforces the depth cap, which is the real fork-bomb guard.
+<<<<<<< HEAD
     if session.nested && want_batch && batch_forced_by_env && !batch_cap.available() {
         eprintln!(
             "aish: nested fan-out tier was forced to `batch` by AISH_FANOUT_TIER (recursion cap), \
@@ -2290,6 +2291,7 @@ tier:\"interactive\" (or omit `tier`) to use a sub-coordinator instead",
                 batch_cap.reason()
             )
         })?;
+
         let _id = crate::batch::spawn(
             &session.batch_jobs,
             task.to_string(),
