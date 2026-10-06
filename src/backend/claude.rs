@@ -1164,7 +1164,9 @@ same oversized call.]",
         // high 90s. Emitted dim so it sits quietly alongside the retry/status
         // lines that already use eprintln + \x1b[2m.
         let total_input = uncached + cache_read + cache_creation;
-        if total_input > 0 {
+        // Suppressed on a quiet-summary turn (auto-resume): that turn renders as
+        // a single animated line, and this dim telemetry would scroll over it.
+        if total_input > 0 && !crate::engine::quiet_summary() {
             let hit_pct = (cache_read as f64 / total_input as f64) * 100.0;
             eprintln!(
                 "\x1b[2m  cache: {cache_read} read + {cache_creation} write + {uncached} uncached \

@@ -2,6 +2,7 @@ use crate::backend::{Backend, Msg, OutputSchemaRef, Role, ToolResult};
 use crate::session::Session;
 use crate::tools::{self, Confirm};
 use anyhow::Result;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 /// Animation state for a running tool, shared between the spinner task and the
@@ -18,6 +19,78 @@ enum Spin {
     Stopped,
 }
 type SpinState = Arc<Mutex<Spin>>;
+
+/// Quiet-summary mode. While armed, an interactive turn renders as ONE animated
+/// line — an animated emoji plus "Reviewing and summarizing result" — instead of
+/// the usual play-by-play (thinking spinner, interim narration, per-tool ✓/✗
+/// lines, collapsed-output summaries, cache telemetry). The REPL arms it for the
+/// hands-free auto-resume turn that reads finished background workers: the human
+/// asked for the RESULT, not a transcript of the shell re-reading its own job
+/// output. The final answer still prints normally, so nothing the user actually
+/// wanted is suppressed.
+static QUIET_SUMMARY: AtomicBool = AtomicBool::new(false);
+
+/// Whether quiet-summary rendering is armed. Every suppression site in the turn
+/// pipeline consults this (including [`crate::backend`] cache telemetry).
+pub fn quiet_summary() -> bool {
+    QUIET_SUMMARY.load(AtomicOrdering::Relaxed)
+}
+
+/// Frames for the quiet-summary line: a magnifier flipping orientation reads as
+/// "looking something over" at a glance, and both frames are the same width so
+/// the in-place `\r`+erase redraw never jitters the label beside it.
+const QUIET_FRAMES: [&str; 2] = ["🔍", "🔎"];
+
+/// Label beside the animated emoji. Singular, present-tense: one turn, in
+/// flight.
+const QUIET_LABEL: &str = "Reviewing and summarizing result";
+
+/// Cadence of the quiet-summary animation. Deliberately slower than the 80ms
+/// braille spinners — a two-frame emoji flip at 80ms reads as a strobe.
+const QUIET_FRAME_MS: u64 = 350;
+
+/// RAII guard for quiet-summary mode: [`QuietSummary::start`] arms the
+/// suppression flag and spawns the animated line; `Drop` aborts the animation,
+/// erases the line, restores the cursor, and disarms the flag — so an early
+/// return, a `?`, or a Ctrl-C abort can never leave the terminal
+/// cursor-hidden or the flag stuck on for later turns.
+pub struct QuietSummary(Option<tokio::task::JoinHandle<()>>);
+
+impl QuietSummary {
+    /// Arm quiet rendering for the turn about to run.
+    pub fn start() -> Self {
+        QUIET_SUMMARY.store(true, AtomicOrdering::SeqCst);
+        if !stderr_is_tty() {
+            // Piped/headless: nothing to animate, but say it once so a log
+            // isn't silent for the whole turn.
+            eprintln!("\x1b[2m{} {QUIET_LABEL}\x1b[0m", QUIET_FRAMES[0]);
+            return Self(None);
+        }
+        eprint!("\x1b[?25l"); // hide the cursor for the duration; restored on drop
+        Self(Some(tokio::spawn(async {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(QUIET_FRAME_MS));
+            let mut i = 0usize;
+            loop {
+                tick.tick().await;
+                eprint!(
+                    "\r\x1b[2K{} \x1b[2m{QUIET_LABEL}\x1b[0m",
+                    QUIET_FRAMES[i % QUIET_FRAMES.len()]
+                );
+                i = i.wrapping_add(1);
+            }
+        })))
+    }
+}
+
+impl Drop for QuietSummary {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            h.abort();
+            eprint!("\r\x1b[2K\x1b[?25h"); // erase the line, restore the cursor
+        }
+        QUIET_SUMMARY.store(false, AtomicOrdering::SeqCst);
+    }
+}
 
 // Per-turn tool-call iteration backstop. Generous enough that a legitimate
 // multi-file task (read several files, edit them, build, test, fix) completes
@@ -1384,6 +1457,16 @@ clamped {clamped_total} oversized tool result(s)\x1b[0m"
 /// A coordinator turn is always a standard (Messages API) model call, hence the
 /// `[standard]` label the parent attaches; batch fan-out is announced separately.
 fn emit_narration(session: &mut Session, text: &str) {
+    // Quiet-summary turn (the hands-free auto-resume read): the single animated
+    // line stands in for the model's play-by-play, so interim narration isn't
+    // printed — only the final answer the REPL prints. Still recorded to the
+    // worker transcript so a replay keeps full fidelity.
+    if quiet_summary() {
+        if let Some(w) = session.worker_transcript.as_mut() {
+            w.record_message("assistant", "narration", text);
+        }
+        return;
+    }
     // In a coordinator each rendered line is re-framed by the parent as a pane
     // row (`┃ [label] …`); render tables/rules narrow enough to survive that
     // gutter so the parent's terminal doesn't hard-wrap the box. Interactively
@@ -1433,7 +1516,10 @@ fn emit_thinking(session: &Session) {
 /// coordinators stay clean), and skipped when `raw_tool_output` is on (the full
 /// result is already being printed verbatim).
 fn emit_activity_stream(session: &Session, result: &ToolResult) {
-    if !stderr_is_tty() || session.raw_tool_output {
+    // `quiet_summary()`: the auto-resume turn collapses to one animated line —
+    // collapsed-output summaries and the running token/tool status would scroll
+    // right over it.
+    if !stderr_is_tty() || session.raw_tool_output || quiet_summary() {
         return;
     }
     let cols = stderr_cols();
@@ -1594,6 +1680,11 @@ impl Spinner {
         if !stderr_is_tty() {
             return Self(None);
         }
+        if quiet_summary() {
+            // Quiet-summary turn: the single "Reviewing and summarizing result"
+            // line owns stderr — a thinking spinner would fight it for the row.
+            return Self(None);
+        }
         eprint!("\x1b[?25l"); // hide the cursor while thinking; restored on drop
         Self(Some(tokio::spawn(async {
             const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1683,6 +1774,15 @@ fn animates(tool_name: &str) -> bool {
 
 impl ToolSpinner {
     fn start(desc: &str, animate: bool) -> Self {
+        if quiet_summary() {
+            // Quiet-summary turn: no per-tool lines at all, animated or static.
+            // `finish` short-circuits on the same flag, so no ✓/✗ line either.
+            return Self {
+                state: Arc::new(Mutex::new(Spin::Stopped)),
+                task: None,
+                animated: false,
+            };
+        }
         if !animate || !stderr_is_tty() {
             // Piped/headless or non-animating tool: emit the plain static line
             // once, no animation. The glyph is already part of `desc`.
@@ -1744,6 +1844,14 @@ impl ToolSpinner {
     /// spinning line is erased and replaced in place; piped, the static line was
     /// already printed at `start`, so we only print the result for animated runs.
     fn finish(mut self, desc: &str, is_error: bool) {
+        if quiet_summary() {
+            // Quiet-summary turn: `start` never drew anything, so there is
+            // nothing to replace and no result line to print.
+            if let Some(t) = self.task.take() {
+                t.abort();
+            }
+            return;
+        }
         stop_spinner(&self.state);
         if let Some(t) = self.task.take() {
             t.abort();
@@ -2199,6 +2307,34 @@ fn validate_output_schema_in(plugins_dir: &std::path::Path, result: &mut ToolRes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- quiet-summary rendering (auto-resume turns) ----------------------
+
+    /// The guard arms the suppression flag for the turn and disarms it on drop —
+    /// including on an early return / abort, which is the whole point of the
+    /// RAII shape (a stuck flag would mute every later turn).
+    #[test]
+    fn quiet_summary_guard_arms_then_disarms() {
+        assert!(!quiet_summary(), "flag must start disarmed");
+        {
+            let _q = QuietSummary::start();
+            assert!(quiet_summary(), "guard must arm the flag");
+        }
+        assert!(!quiet_summary(), "Drop must disarm the flag");
+    }
+
+    /// The operator-visible copy is the contract here ("Reviewing and
+    /// summarizing result" + an animated emoji), so pin it: a typo or a
+    /// single-frame regression would silently kill the animation.
+    #[test]
+    fn quiet_summary_copy_and_frames_are_stable() {
+        assert_eq!(QUIET_LABEL, "Reviewing and summarizing result");
+        assert!(
+            QUIET_FRAMES.len() >= 2,
+            "need >= 2 frames to actually animate"
+        );
+        assert!(QUIET_FRAMES.iter().all(|f| !f.trim().is_empty()));
+    }
 
     // ---- Phase 3.4: output-schema runtime-enforcement hook ----------------
 

@@ -744,6 +744,10 @@ pub async fn run(
         // iteration, before falling back to the editor. A loop iteration is fed
         // to the model inline via the `?` route escape so it runs as an agentic
         // turn — never shell-dispatched or auto-offloaded to a coordinator.
+        // Armed only by the auto-resume drain below: that turn is hands-free
+        // (nobody typed it), so it renders as a single animated "Reviewing and
+        // summarizing result" line instead of the full play-by-play.
+        let mut quiet_summary_turn = false;
         let outcome = match injected.take().or_else(|| typeahead.pop_front()) {
             Some(l) => ReadOutcome::Line(l),
             // Auto-resume drain: when the last fanned-out coordinator of this
@@ -764,7 +768,11 @@ pub async fn run(
             // no-op and the resume still drains on the user's next keypress.
             None => match session.take_resume_tick() {
                 Some(body) => {
-                    println!("\x1b[2m⤵ auto-resume — reading finished background workers\x1b[0m");
+                    // No banner: the turn itself renders as one animated
+                    // "Reviewing and summarizing result" line (quiet-summary
+                    // mode, armed at the `run_turn` site below), which says the
+                    // same thing without the play-by-play underneath it.
+                    quiet_summary_turn = true;
                     ReadOutcome::Line(format!("?{body}"))
                 }
                 None => match session.next_loop_tick() {
@@ -1246,6 +1254,11 @@ pub async fn run(
                                 crate::terminal::set_midturn_input(&midturn_prompt, "");
                             }
                         }
+                        // Hands-free auto-resume turn: collapse thinking
+                        // spinner, narration, tool lines and cache telemetry
+                        // into ONE animated line. Dropped right after the turn
+                        // (below) so the reply prints on a clean row.
+                        let quiet = quiet_summary_turn.then(engine::QuietSummary::start);
                         let turn = engine::run_turn(
                             &backend,
                             &mut session,
@@ -1287,6 +1300,10 @@ pub async fn run(
                         // cooked termios, so (a) the partial mirror read below cannot
                         // race a final keystroke, and (b) the tty is sane before the
                         // next prompt read.
+                        // Stop the quiet-summary animation (if armed) before the
+                        // keywatch teardown so the erase lands while we still
+                        // own stderr, and the final answer prints clean.
+                        drop(quiet);
                         drop(keywatch);
                         while let Ok(l) = mt_line_rx.try_recv() {
                             typeahead.push_back(l);
