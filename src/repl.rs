@@ -1229,6 +1229,18 @@ pub async fn run(
                         let midturn_on = midturn_input_enabled && (footer_active || midturn_inline);
                         let (mt_line_tx, mut mt_line_rx) =
                             tokio::sync::mpsc::unbounded_channel::<String>();
+                        // Second mid-turn channel: local-only colon commands that
+                        // must run NOW rather than wait for the turn to end (see
+                        // `midturn_input::runs_immediately`). Queuing a `:dispatch`
+                        // typed while aish was thinking deferred it until the turn
+                        // it was meant to run ALONGSIDE had already finished —
+                        // which defeats the entire reason to dispatch.
+                        let (mt_now_tx, mut mt_now_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<String>();
+                        // Snapshot the dispatch-relevant slice of `Session` BEFORE
+                        // `run_turn` takes `&mut session` — that borrow is the only
+                        // thing that ever made a mid-turn `:dispatch` impossible.
+                        let mt_ctx = ops_ctx(&session);
                         let midturn_prompt = "\x1b[2m❯\x1b[0m ".to_string();
                         // Shared carry-over slot for the line the operator is typing
                         // but hasn't submitted — read back at teardown so a turn that
@@ -1236,6 +1248,7 @@ pub async fn run(
                         let mt_partial = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
                         let midturn = midturn_on.then(|| crate::keywatch::MidturnCfg {
                             line_tx: mt_line_tx,
+                            now_tx: mt_now_tx,
                             prompt: midturn_prompt.clone(),
                             inline: midturn_inline,
                             partial: mt_partial.clone(),
@@ -1278,6 +1291,15 @@ pub async fn run(
                                 _ = tokio::signal::ctrl_c() => {
                                     aborted = true;
                                     break;
+                                }
+                                // A local-only colon command submitted mid-turn.
+                                // Runs HERE, concurrently with the in-flight
+                                // turn, off the `OpsCtx` snapshot — never
+                                // touching `session`, which `turn` holds.
+                                Some(line) = mt_now_rx.recv() => {
+                                    if let Some(msg) = run_midturn_command(&line, &mt_ctx) {
+                                        println!("{msg}");
+                                    }
                                 }
                                 Some(k) = keywatch.recv() => match k {
                                     // Shift-Tab pressed mid-turn. The reader thread's
@@ -4326,7 +4348,7 @@ fn mentions_work_signal(line: &str) -> bool {
 /// was actually spawned. A guard failure (empty task, nested, no credential,
 /// missing binary) carries `id: None` so the caller prints the message and does
 /// NOT attach.
-struct Dispatched {
+pub(crate) struct Dispatched {
     /// `Some(run_id)` when a coordinator was spawned (the id to auto-attach to);
     /// `None` on any guard / spawn failure.
     id: Option<String>,
@@ -4408,31 +4430,98 @@ fn goal_next_work_suggestion(session: &Session) -> Option<String> {
     ))
 }
 
+/// The slice of [`Session`] that launching a background coordinator actually
+/// needs — every field is a clone or a shared `Arc` handle, so it can be
+/// snapshotted BEFORE a model turn takes `&mut Session` and still be used while
+/// that turn is in flight.
+///
+/// This is what makes a MID-TURN `:dispatch` possible. Before, every line typed
+/// while aish was thinking was queued as type-ahead and only run once the turn
+/// ended ([`crate::keywatch`] → `line_tx` → the REPL's type-ahead drain) — which
+/// is right for prose (injecting it would malform the in-flight model stream)
+/// but defeats the entire point of `:dispatch`, whose whole job is to start work
+/// ALONGSIDE the current turn. `handle_colon`'s dispatch arm never touches the
+/// model stream; the only thing stopping it from running immediately was that it
+/// took `&mut Session`, which the turn holds. `OpsCtx` removes that constraint.
+#[derive(Clone)]
+pub(crate) struct OpsCtx {
+    pub nested: bool,
+    pub cwd: std::path::PathBuf,
+    pub backend_kind: String,
+    pub batch_model: String,
+    pub env: Vec<(String, String)>,
+    pub session_id: String,
+    pub name: Option<String>,
+    pub show_worker_output: Arc<std::sync::atomic::AtomicBool>,
+    pub attached: Arc<Mutex<Option<String>>>,
+    pub coordinator_store: Option<crate::db::CoordinatorStore>,
+    pub worker_jobs: crate::worker::WorkerJobs,
+    pub recent_dispatches: Arc<Mutex<std::collections::HashMap<u64, (String, std::time::Instant)>>>,
+    /// Handle to the REPL's tokio runtime. [`crate::worker::spawn`] calls
+    /// `tokio::spawn`, which panics outside a runtime context — and the mid-turn
+    /// caller is a plain OS thread (the keywatch reader), not a tokio worker. The
+    /// mid-turn path `enter()`s this handle before spawning.
+    ///
+    /// `None` only when the snapshot was taken outside a runtime (unit tests
+    /// exercising the guard paths, which return before any spawn); entering is
+    /// then skipped rather than panicking at snapshot time.
+    pub rt: Option<tokio::runtime::Handle>,
+}
+
+/// Snapshot the dispatch-relevant slice of `session`. Cheap: clones of small
+/// values plus `Arc` bumps.
+pub(crate) fn ops_ctx(session: &Session) -> OpsCtx {
+    OpsCtx {
+        nested: session.nested,
+        cwd: session.cwd.clone(),
+        backend_kind: session.backend_kind.clone(),
+        batch_model: session.batch_model.clone(),
+        env: session.env.clone(),
+        session_id: session.session_id.clone(),
+        name: session.name.clone(),
+        show_worker_output: session.show_worker_output.clone(),
+        attached: session.attached.clone(),
+        coordinator_store: session.coordinator_store.clone(),
+        worker_jobs: session.worker_jobs.clone(),
+        recent_dispatches: session.recent_dispatches.clone(),
+        rt: tokio::runtime::Handle::try_current().ok(),
+    }
+}
+
 fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
-    let task = task.trim();
-    if task.is_empty() {
+    if task.trim().is_empty() {
         // TASK-280: with a live actionable goal, route toward its next aligned
         // task instead of printing bare usage. No active goal → usage unchanged.
+        // Goal state lives on `Session` proper, so this stays on the `&mut`
+        // path; the ctx form below handles everything else.
         if let Some(suggestion) = goal_next_work_suggestion(session) {
             return Dispatched::message_only(suggestion);
         }
+    }
+    dispatch_coordinator_ctx(task, &ops_ctx(session))
+}
+
+/// Launch a background coordinator from a [`OpsCtx`] snapshot — the real
+/// implementation, callable WITHOUT `&mut Session` and therefore also valid
+/// mid-turn (see [`run_midturn_command`]).
+pub(crate) fn dispatch_coordinator_ctx(task: &str, ctx: &OpsCtx) -> Dispatched {
+    let task = task.trim();
+    if task.is_empty() {
         return Dispatched::message_only(
             "usage: :dispatch <task>   — launch a background coordinator for <task>",
         );
     }
-    if session.nested {
+    if ctx.nested {
         return Dispatched::message_only(
             "can't dispatch from inside a coordinator (no nested coordinators)",
         );
     }
-    let no_credential = match session.backend_kind.as_str() {
-        "grok" => !crate::backend::grok::credential_available(&session.env),
-        "openai" | "openrouter" => {
-            !crate::backend::openai::provider_for_kind(&session.backend_kind)
-                .map(|p| crate::backend::openai::credential_available(p, &session.env))
-                .unwrap_or(false)
-        }
-        _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
+    let no_credential = match ctx.backend_kind.as_str() {
+        "grok" => !crate::backend::grok::credential_available(&ctx.env),
+        "openai" | "openrouter" => !crate::backend::openai::provider_for_kind(&ctx.backend_kind)
+            .map(|p| crate::backend::openai::credential_available(p, &ctx.env))
+            .unwrap_or(false),
+        _ => crate::backend::claude::Credential::resolve(&ctx.env).is_err(),
     };
     if no_credential {
         return Dispatched::message_only(
@@ -4453,11 +4542,12 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
     let window = dispatch_dedup_window();
     // Prune aged-out entries so the map stays tiny and a re-dispatch after the
     // window naturally succeeds.
-    session
-        .recent_dispatches
-        .retain(|_, (_, when)| now.duration_since(*when) < window);
-    if let Some(run_id) = duplicate_dispatch(&session.recent_dispatches, task, now, window) {
-        return Dispatched::message_only(format!("task already running (run_id: {run_id})"));
+    {
+        let mut recent = ctx.recent_dispatches.lock().unwrap();
+        recent.retain(|_, (_, when)| now.duration_since(*when) < window);
+        if let Some(run_id) = duplicate_dispatch(&recent, task, now, window) {
+            return Dispatched::message_only(format!("task already running (run_id: {run_id})"));
+        }
     }
     match std::env::current_exe() {
         Ok(exe) => {
@@ -4470,29 +4560,33 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
             // `fix/shift-tab-replay-history` instead of its own branch). Isolation
             // is free for a no-change run: the worktree auto-removes on completion,
             // and a job that does commit leaves its branch reported for review.
-            let isolate = crate::worker::is_git_repo(&session.cwd);
+            let isolate = crate::worker::is_git_repo(&ctx.cwd);
             let spec = crate::worker::WorkerSpec {
                 exe,
-                cwd: session.cwd.clone(),
-                backend: session.backend_kind.clone(),
-                model: crate::worker::coordinator_model(
-                    &session.backend_kind,
-                    &session.batch_model,
-                ),
-                env: session.env.clone(),
+                cwd: ctx.cwd.clone(),
+                backend: ctx.backend_kind.clone(),
+                model: crate::worker::coordinator_model(&ctx.backend_kind, &ctx.batch_model),
+                env: ctx.env.clone(),
                 isolate,
                 base: "main".to_string(),
-                launch_session_id: session.session_id.clone(),
-                launch_session_name: session.name.clone(),
-                show_output: session.show_worker_output.clone(),
-                attached: session.attached.clone(),
-                coordinator_store: session.coordinator_store.clone(),
+                launch_session_id: ctx.session_id.clone(),
+                launch_session_name: ctx.name.clone(),
+                show_output: ctx.show_worker_output.clone(),
+                attached: ctx.attached.clone(),
+                coordinator_store: ctx.coordinator_store.clone(),
             };
-            let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
+            // `worker::spawn` calls `tokio::spawn`, which panics outside a
+            // runtime context — and a MID-TURN `:dispatch` runs on the keywatch
+            // reader (a plain OS thread). Entering the REPL's runtime handle is a
+            // free no-op on the normal path and the whole reason the mid-turn
+            // path works at all.
+            let _rt = ctx.rt.as_ref().map(|h| h.enter());
+            let id = crate::worker::spawn(&ctx.worker_jobs, task.to_string(), spec);
             // TASK-290: record this launch so an identical dispatch inside the
             // dedup window is rejected pointing back at `id`.
-            session
-                .recent_dispatches
+            ctx.recent_dispatches
+                .lock()
+                .unwrap()
                 .insert(task_hash(task), (id.clone(), now));
             let message = format!(
                 "\x1b[2mdispatched background coordinator \x1b[0m\x1b[1;36m{id}\x1b[0m\x1b[2m \
@@ -4506,6 +4600,35 @@ fn dispatch_coordinator(task: &str, session: &mut Session) -> Dispatched {
         Err(e) => Dispatched::message_only(format!(
             "can't locate the aish binary to launch the coordinator: {e}"
         )),
+    }
+}
+
+/// Execute a colon command that was submitted WHILE a model turn is in flight.
+///
+/// Only lines accepted by [`crate::midturn_input::runs_immediately`] reach here
+/// (the keywatch reader classifies at submit time and routes them down a
+/// separate channel), and the set is deliberately tiny: a command qualifies only
+/// if it never touches the model stream AND needs nothing but the `Arc` handles
+/// captured in [`OpsCtx`] — because the live turn owns `&mut Session`.
+///
+/// Unlike the post-turn path, this deliberately does NOT auto-attach to the
+/// coordinator it launches: the live turn owns the output area and the footer, so
+/// interleaving a worker's stream into it would garble both. The operator gets
+/// the run id in the message and can `:attach` once the turn lands.
+///
+/// Returns the operator-facing message to print, or `None` when the line turned
+/// out not to be an immediate command after all (defensive; the classifier
+/// already gated it).
+pub(crate) fn run_midturn_command(line: &str, ctx: &OpsCtx) -> Option<String> {
+    let word = crate::midturn_input::runs_immediately(line)?;
+    let rest = line.trim().strip_prefix(':')?.strip_prefix(word)?.trim();
+    match word {
+        // Bare `:dispatch` mid-turn can't offer the goal-aligned suggestion the
+        // `&mut Session` path does (goal state isn't in `OpsCtx`), so it falls
+        // through to `dispatch_coordinator_ctx`'s plain usage line. Acceptable:
+        // the mid-turn case that matters is `:dispatch <task>`.
+        "dispatch" => Some(dispatch_coordinator_ctx(rest, ctx).message),
+        _ => None,
     }
 }
 

@@ -441,9 +441,82 @@ impl<'a> FooterRender<'a> {
     }
 }
 
+/// Colon commands that are safe — and USEFUL — to execute the instant they are
+/// submitted mid-turn, instead of being queued until the turn ends.
+///
+/// Two properties qualify a command for this list:
+///
+/// 1. **It does not touch the model stream.** Queuing prose is deliberate (a
+///    line injected into an in-flight request would malform it — see
+///    `docs/design/midturn-input.md`). These commands never reach the backend,
+///    so that reason doesn't apply.
+/// 2. **It needs nothing but `Arc` handles already cloned off `Session`.** The
+///    in-flight turn holds `&mut Session`, so anything that reads or mutates
+///    session state (`:model`, `:clear`, `:restart`, …) CANNOT run concurrently
+///    and must stay queued. The commands below operate purely on shared handles
+///    (`worker_jobs`, `coordinator_store`, `attached`, …), captured up front in
+///    an [`crate::repl::OpsCtx`] snapshot.
+///
+/// Queuing these was the reported bug: `:dispatch` typed while aish was thinking
+/// didn't launch until the turn it was meant to run ALONGSIDE had already
+/// finished, defeating the entire point of dispatching. `:tell` is worse still —
+/// steering a coordinator after the fact is often simply useless.
+///
+/// Returns the normalized command word when `line` is one of them.
+pub fn runs_immediately(line: &str) -> Option<&'static str> {
+    let rest = line.trim().strip_prefix(':')?;
+    // The command word is everything up to the first whitespace; arguments are
+    // irrelevant to the classification.
+    let word = rest.split_whitespace().next().unwrap_or("");
+    // Keep this list NARROW and explicit — an accidental entry that needs
+    // `&mut Session` would deadlock or (worse) race the live turn.
+    //
+    // Deliberately NOT here yet, despite qualifying on property (1):
+    //   · `:tell` / `:stop` — `tell_coordinator`/`stop_coordinator` still take
+    //     `&mut Session` (`:tell goal …` routes into `steer_active_goal`, which
+    //     genuinely needs it). They are the obvious next additions once those
+    //     two are split along the same `OpsCtx` seam `:dispatch` just gained.
+    //   · `:workers` / `:jobs` / `:status` — these PRINT (and `:workers` opens a
+    //     keyboard modal that would steal stdin from the very reader thread
+    //     classifying this line). Racing the live turn's output and footer for
+    //     a listing nobody is blocked on isn't worth it.
+    const IMMEDIATE: &[&str] = &["dispatch"];
+    IMMEDIATE.iter().copied().find(|c| *c == word)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn immediate_classifies_local_only_colon_commands() {
+        assert_eq!(runs_immediately(":dispatch do a thing"), Some("dispatch"));
+        // Surrounding whitespace is incidental, not meaningful.
+        assert_eq!(runs_immediately("  :dispatch go  "), Some("dispatch"));
+        // Bare `:dispatch` still classifies — the usage/goal-suggestion message
+        // is the command's own business, not the classifier's.
+        assert_eq!(runs_immediately(":dispatch"), Some("dispatch"));
+    }
+
+    #[test]
+    fn immediate_rejects_prose_and_session_mutating_commands() {
+        // Prose is model-bound — must stay queued.
+        assert_eq!(runs_immediately("what is the sprint status"), None);
+        assert_eq!(runs_immediately(""), None);
+        assert_eq!(runs_immediately("dispatch without the colon"), None);
+        // `&mut Session` commands must stay queued (the live turn holds it).
+        assert_eq!(runs_immediately(":model opus"), None);
+        assert_eq!(runs_immediately(":clear"), None);
+        assert_eq!(runs_immediately(":restart"), None);
+        assert_eq!(runs_immediately(":quit"), None);
+        // Not yet converted off `&mut Session` — must still queue.
+        assert_eq!(runs_immediately(":tell w_abc narrow it"), None);
+        assert_eq!(runs_immediately(":stop w_abc"), None);
+        assert_eq!(runs_immediately(":workers"), None);
+        // Prefix collisions must not match.
+        assert_eq!(runs_immediately(":dispatchfoo"), None);
+        assert_eq!(runs_immediately(":dispatch-stats"), None);
+    }
 
     fn keys(bytes: &[u8]) -> Vec<Key> {
         KeyParser::new().decode(bytes)

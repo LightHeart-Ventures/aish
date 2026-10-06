@@ -61,6 +61,17 @@ pub struct MidturnCfg {
     /// on Enter, so that row is the operator's only confirmation their command
     /// was accepted rather than swallowed.
     pub line_tx: mpsc::UnboundedSender<String>,
+    /// IMMEDIATE channel for local-only colon commands — today just `:dispatch`
+    /// — classified by [`crate::midturn_input::runs_immediately`].
+    ///
+    /// These never touch the model stream, so the queue-until-the-turn-ends rule
+    /// that protects prose does not apply to them — and applying it anyway was a
+    /// bug: a `:dispatch` typed while aish was thinking didn't launch until the
+    /// turn it was supposed to run ALONGSIDE had already finished. The REPL
+    /// drains this channel from its in-turn `select!` and runs each line through
+    /// [`crate::repl::run_midturn_command`] immediately, leaving a `⚡ ran →`
+    /// receipt instead of `⏳ queued →`.
+    pub now_tx: mpsc::UnboundedSender<String>,
     /// Styled prompt sigil painted before the typed text in the footer row.
     pub prompt: String,
     /// Gate #1 (short / non-footer terminals): when true, the reader paints the
@@ -362,9 +373,18 @@ fn reader_loop(
                         // this the footer echo is simply wiped below and the
                         // operator sees NOTHING — their command looks dropped even
                         // though it will run as soon as the turn ends.
-                        queued_count += 1;
-                        crate::terminal::print_midturn_queued(&line, queued_count);
-                        let _ = cfg.line_tx.send(line);
+                        // Classify at SUBMIT time: a local-only colon command
+                        // (`:dispatch`, `:tell`, …) runs NOW on the immediate
+                        // channel; everything else keeps the queue semantics
+                        // that protect the in-flight model stream.
+                        if crate::midturn_input::runs_immediately(&line).is_some() {
+                            crate::terminal::print_midturn_now(&line);
+                            let _ = cfg.now_tx.send(line);
+                        } else {
+                            queued_count += 1;
+                            crate::terminal::print_midturn_queued(&line, queued_count);
+                            let _ = cfg.line_tx.send(line);
+                        }
                         // Line consumed → return to the bare prompt affordance
                         // (still mid-turn); the cached status message is restored
                         // only on turn teardown via clear_midturn_input.
