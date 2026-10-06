@@ -4889,7 +4889,10 @@ fn backfill_attached(run_id: &str, session: &Session) {
     // rendered set-apart (a 💬 glyph + bold) by `pane_input_row` so it's obvious
     // this row is the prompt the coordinator was given, not one of its own
     // activity lines that follow.
-    println!("{}", crate::worker::pane_input_row(run_id, &job.task));
+    println!(
+        "{}",
+        crate::worker::pane_input_row(crate::worker::PANE_NO_LABEL, &job.task)
+    );
     let mut rows = job.transcript_rows();
     if rows.is_empty() {
         // No activity captured yet. For a LIVE worker, show an ANIMATED
@@ -4908,7 +4911,7 @@ fn backfill_attached(run_id: &str, session: &Session) {
             println!(
                 "{}",
                 crate::worker::pane_row(
-                    run_id,
+                    crate::worker::PANE_NO_LABEL,
                     "\u{b7}thinking (no activity captured yet \u{2014} live output follows)",
                 )
             );
@@ -4931,7 +4934,10 @@ fn backfill_attached(run_id: &str, session: &Session) {
             } else {
                 format!("{suffix} {text}")
             };
-            println!("{}", crate::worker::pane_row(run_id, &row));
+            println!(
+                "{}",
+                crate::worker::pane_row(crate::worker::PANE_NO_LABEL, &row)
+            );
         }
     }
 }
@@ -4949,13 +4955,16 @@ fn backfill_goal_attached(g: &crate::goal::GoalLoop) {
     println!("{}", crate::worker::pane_replay_header(label));
     // The goal CONDITION is the "input" — the START of the pursuit. Rendered
     // set-apart (💬 + bold) by `pane_input_row`, exactly like a worker's task.
-    println!("{}", crate::worker::pane_input_row(label, &g.condition));
+    println!(
+        "{}",
+        crate::worker::pane_input_row(crate::worker::PANE_NO_LABEL, &g.condition)
+    );
     let mut rows = g.attach_backfill();
     if rows.is_empty() {
         println!(
             "{}",
             crate::worker::pane_row(
-                label,
+                crate::worker::PANE_NO_LABEL,
                 "\u{b7}thinking (no activity captured yet \u{2014} live output follows)",
             )
         );
@@ -4968,7 +4977,10 @@ fn backfill_goal_attached(g: &crate::goal::GoalLoop) {
         rows = rows.into_iter().skip(total - TAIL_LINES).collect();
     }
     for row in rows {
-        println!("{}", crate::worker::pane_row(label, &row));
+        println!(
+            "{}",
+            crate::worker::pane_row(crate::worker::PANE_NO_LABEL, &row)
+        );
     }
 }
 
@@ -5115,18 +5127,24 @@ fn attached_result_lines(run_id: &str, jobs: &crate::worker::WorkerJobs) -> Vec<
     };
     let rendered = crate::md::render_stdout_within(
         job.fetch().trim(),
-        crate::worker::pane_content_cols(run_id),
+        crate::worker::pane_content_cols(crate::worker::PANE_NO_LABEL),
     );
     let mut out = Vec::new();
     let mut lines = rendered.split('\n');
     match lines.next() {
         Some(first) => {
-            out.push(crate::worker::pane_row(run_id, &format!("·result {first}")));
+            out.push(crate::worker::pane_row(
+                crate::worker::PANE_NO_LABEL,
+                &format!("·result {first}"),
+            ));
             for line in lines {
-                out.push(crate::worker::pane_row(run_id, line));
+                out.push(crate::worker::pane_row(crate::worker::PANE_NO_LABEL, line));
             }
         }
-        None => out.push(crate::worker::pane_row(run_id, "·result (empty result)")),
+        None => out.push(crate::worker::pane_row(
+            crate::worker::PANE_NO_LABEL,
+            "·result (empty result)",
+        )),
     }
     out
 }
@@ -5152,22 +5170,28 @@ fn print_attached_result(run_id: &str, session: &Session) {
         // `backfill_attached` uses for the streamed activity rows.
         let rendered = crate::md::render_stdout_within(
             job.fetch().trim(),
-            crate::worker::pane_content_cols(run_id),
+            crate::worker::pane_content_cols(crate::worker::PANE_NO_LABEL),
         );
         let mut lines = rendered.split('\n');
         match lines.next() {
             Some(first) => {
                 println!(
                     "{}",
-                    crate::worker::pane_row(run_id, &format!("·result {first}"))
+                    crate::worker::pane_row(
+                        crate::worker::PANE_NO_LABEL,
+                        &format!("·result {first}")
+                    )
                 );
                 for line in lines {
-                    println!("{}", crate::worker::pane_row(run_id, line));
+                    println!(
+                        "{}",
+                        crate::worker::pane_row(crate::worker::PANE_NO_LABEL, line)
+                    );
                 }
             }
             None => println!(
                 "{}",
-                crate::worker::pane_row(run_id, "·result (empty result)")
+                crate::worker::pane_row(crate::worker::PANE_NO_LABEL, "·result (empty result)")
             ),
         }
     } else {
@@ -5183,22 +5207,31 @@ fn print_attached_result(run_id: &str, session: &Session) {
                     };
                     let rendered = crate::md::render_stdout_within(
                         &msg,
-                        crate::worker::pane_content_cols(run_id),
+                        crate::worker::pane_content_cols(crate::worker::PANE_NO_LABEL),
                     );
                     let mut lines = rendered.split('\n');
                     match lines.next() {
                         Some(first) => {
                             println!(
                                 "{}",
-                                crate::worker::pane_row(run_id, &format!("·result {first}"))
+                                crate::worker::pane_row(
+                                    crate::worker::PANE_NO_LABEL,
+                                    &format!("·result {first}")
+                                )
                             );
                             for line in lines {
-                                println!("{}", crate::worker::pane_row(run_id, line));
+                                println!(
+                                    "{}",
+                                    crate::worker::pane_row(crate::worker::PANE_NO_LABEL, line)
+                                );
                             }
                         }
                         None => println!(
                             "{}",
-                            crate::worker::pane_row(run_id, "·result (empty result)")
+                            crate::worker::pane_row(
+                                crate::worker::PANE_NO_LABEL,
+                                "·result (empty result)"
+                            )
                         ),
                     }
                 }
@@ -5224,7 +5257,10 @@ fn backfill_attached_durable(run_id: &str, session: &Session) {
     };
     let short = crate::batch::short_id(run_id);
     println!("{}", crate::worker::pane_replay_header(&short));
-    println!("{}", crate::worker::pane_input_row(run_id, &r.task));
+    println!(
+        "{}",
+        crate::worker::pane_input_row(crate::worker::PANE_NO_LABEL, &r.task)
+    );
 }
 
 /// `:detach` — stop watching the attached coordinator. It keeps running in the

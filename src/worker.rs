@@ -538,6 +538,18 @@ const PANE_BORDER: &str = "\x1b[36m┃\x1b[0m";
 /// stream reads as one continuous column that flips cyan → green at the live edge.
 const PANE_BORDER_LIVE: &str = "\x1b[32m┃\x1b[0m";
 
+/// Label sentinel meaning "render this row with NO `[label]` gutter" — just the
+/// bordered wall then the text.
+///
+/// Used for the stream you are `:attach`ed to (its cyan replay AND its green
+/// live rows, worker or `goal`): the attached id is already shown by the replay
+/// header and carried in the PROMPT for the whole attach, so stamping
+/// `[w_abc12345]` onto every row was pure duplication that ate ~13 columns of
+/// every line. The global `:worker-output` pane keeps its labels — there,
+/// several coordinators interleave under one wall and the tag is what tells
+/// their rows apart.
+pub const PANE_NO_LABEL: &str = "";
+
 /// Two-column pad that aligns a turn/batch narration glyph (🚀/🐌)
 /// under the tool glyph (🛠️/🔧) on the preceding RESULT lines. A tool
 /// RESULT line renders as `✓ <glyph> …` — a 1-column status mark plus a space (2
@@ -893,6 +905,28 @@ pub fn pane_row_live(label: &str, text: &str) -> String {
     pane_row_cols(label, text, pane_cols(), PANE_BORDER_LIVE)
 }
 
+/// Visible columns the row chrome steals before the text begins:
+/// `┃ [label] ` ⇒ 5 + label width; the bare [`PANE_NO_LABEL`] wall `┃ ` ⇒ 2.
+/// Pure → unit-tested.
+fn pane_gutter_cols(label: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    if label.is_empty() {
+        2
+    } else {
+        5 + UnicodeWidthStr::width(label)
+    }
+}
+
+/// The dim `[label] ` tag that follows the wall — empty for [`PANE_NO_LABEL`].
+/// Pure → unit-tested.
+fn pane_label_tag(label: &str) -> String {
+    if label.is_empty() {
+        String::new()
+    } else {
+        format!("\x1b[2m[{label}]\x1b[0m ")
+    }
+}
+
 /// Display columns available for CONTENT inside a pane row, after the
 /// `┃ [label] ` gutter, at the live terminal width. Feed this to
 /// `md::render_stdout_within` so markdown (esp. tables) rendered for a pane fits
@@ -900,12 +934,9 @@ pub fn pane_row_live(label: &str, text: &str) -> String {
 /// `usize::MAX` when the width is unknown (piped/tests) so rendering stays
 /// unbounded — byte-identical to the pre-wrap behaviour there.
 pub fn pane_content_cols(label: &str) -> usize {
-    use unicode_width::UnicodeWidthStr;
     match pane_cols() {
         usize::MAX => usize::MAX,
-        cols => cols
-            .saturating_sub(5 + UnicodeWidthStr::width(label))
-            .max(24),
+        cols => cols.saturating_sub(pane_gutter_cols(label)).max(24),
     }
 }
 
@@ -951,7 +982,6 @@ fn fold_pane_controls(text: &str) -> String {
 /// means "unknown width" → never wrap (single line, byte-identical to the
 /// pre-wrap behaviour).
 fn pane_row_cols(label: &str, text: &str, cols: usize, border: &str) -> String {
-    use unicode_width::UnicodeWidthStr;
     // Fold embedded control chars (newlines/CR/tab from a multi-line task prompt
     // or a chatty tool line) into single spaces FIRST — a raw `\n` in the row
     // text would print a physical line break that escapes the `┃` bordered
@@ -959,13 +989,17 @@ fn pane_row_cols(label: &str, text: &str, cols: usize, border: &str) -> String {
     // SGR runs are preserved verbatim so inline colour survives.
     let folded = fold_pane_controls(text);
     let text = folded.as_str();
-    let first = format!("{border} \x1b[2m[{label}]\x1b[0m {text}");
+    // `[label] ` chrome — empty for PANE_NO_LABEL (the attached stream), where the
+    // row is just the wall + text.
+    let tag = pane_label_tag(label);
+    let first = format!("{border} {tag}{text}");
     if cols == usize::MAX {
         return first; // unknown width (piped/tests): never wrap
     }
     // Column where the message begins on the opening row:
     //   "┃ [label] " = ┃(1) + space(1) + '['(1) + label + ']'(1) + space(1)
-    let gutter_w = 5 + UnicodeWidthStr::width(label);
+    //   "┃ "        = ┃(1) + space(1)                        (PANE_NO_LABEL)
+    let gutter_w = pane_gutter_cols(label);
     let (prefix, message) = split_body_glyph(text);
     let indent = gutter_w + vis_cols(prefix);
     let avail = cols.saturating_sub(indent);
@@ -991,7 +1025,7 @@ fn pane_row_cols(label: &str, text: &str, cols: usize, border: &str) -> String {
     // Continuation rows: border + pad so the message column lines up under the
     // opening row's first message letter (┃ is 1 col, then indent-1 spaces).
     let cont = format!("{border}{}", " ".repeat(indent.saturating_sub(1)));
-    let mut out = format!("{border} \x1b[2m[{label}]\x1b[0m {prefix}{}", chunks[0]);
+    let mut out = format!("{border} {tag}{prefix}{}", chunks[0]);
     for chunk in &chunks[1..] {
         out.push('\n');
         out.push_str(&cont);
@@ -1355,7 +1389,7 @@ impl ThinkingSpinner {
                     // the next forwarded row / the redrawn prompt below it.
                     let body = format!("{NARRATION_ALIGN_PAD}💭 \x1b[2;36mthinking…\x1b[0m");
                     let row = if live {
-                        pane_row_live(&label, &body)
+                        pane_row_live(PANE_NO_LABEL, &body)
                     } else {
                         pane_row(&label, &body)
                     };
@@ -1379,7 +1413,7 @@ impl ThinkingSpinner {
                     THINKING_FRAMES[i % THINKING_FRAMES.len()]
                 );
                 let row = if live {
-                    pane_row_live(&label, &body)
+                    pane_row_live(PANE_NO_LABEL, &body)
                 } else {
                     pane_row(&label, &body)
                 };
@@ -1536,7 +1570,9 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
             // classification and stranding a grandchild's activity.
             let render_row = |t: &str| {
                 let row = if live {
-                    pane_row_live(label, t)
+                    // Attached stream: the id is in the prompt + replay header, so
+                    // the per-row `[label]` tag is dropped (PANE_NO_LABEL).
+                    pane_row_live(PANE_NO_LABEL, t)
                 } else {
                     pane_row(label, t)
                 };
@@ -5063,6 +5099,58 @@ mod tests {
             colored.contains("\x1b[32m✓\x1b[0m 🔧 read /etc/hosts"),
             "inline colour preserved: {colored}"
         );
+    }
+
+    #[test]
+    fn pane_no_label_row_drops_the_id_gutter_entirely() {
+        // The ATTACHED stream (green live rows AND the cyan replay) renders with
+        // PANE_NO_LABEL: the id is already in the prompt + the replay header, so
+        // repeating `[w_…]` on every row was duplication that also ate ~13 cols.
+        let row = pane_row(PANE_NO_LABEL, "🚀 planning the migration");
+        assert!(
+            row.starts_with(PANE_BORDER),
+            "border still opens the row: {row}"
+        );
+        assert!(!row.contains("[w_"), "no `[w_…]` gutter remains: {row:?}");
+        assert!(
+            row.ends_with("🚀 planning the migration"),
+            "text preserved: {row}"
+        );
+        // Exactly one space of gutter between the wall and the text.
+        assert_eq!(row, format!("{PANE_BORDER} 🚀 planning the migration"));
+
+        // Live (green) variant drops it too — same chrome, different wall.
+        let live = pane_row_live(PANE_NO_LABEL, "🔧 read /etc/hosts");
+        assert_eq!(live, format!("{PANE_BORDER_LIVE} 🔧 read /etc/hosts"));
+    }
+
+    #[test]
+    fn pane_gutter_cols_matches_the_rendered_chrome() {
+        // `┃ [label] ` = 5 + label width; bare `┃ ` = 2. Content width follows.
+        assert_eq!(pane_gutter_cols("w_a7k3m2pQ"), 5 + 10);
+        assert_eq!(pane_gutter_cols(PANE_NO_LABEL), 2);
+        assert_eq!(pane_label_tag(PANE_NO_LABEL), "");
+        assert_eq!(pane_label_tag("goal"), "\x1b[2m[goal]\x1b[0m ");
+    }
+
+    #[test]
+    fn pane_no_label_wrapped_rows_hang_indent_two_cols() {
+        // Continuation rows line up under the first letter of the message, which
+        // for a bare row is column 3 (`┃`, space, then the glyph prefix).
+        let msg = "a".repeat(80);
+        let row = pane_row_cols(PANE_NO_LABEL, &format!("🚀 {msg}"), 40, PANE_BORDER);
+        let mut lines = row.split('\n');
+        let first = lines.next().unwrap();
+        assert!(first.starts_with(&format!("{PANE_BORDER} 🚀 ")), "{first}");
+        for cont in lines {
+            let pad = cont.strip_prefix(PANE_BORDER).unwrap();
+            // indent = gutter(2) + glyph prefix width; border itself is 1 col, so
+            // the padding is indent-1 spaces and never fewer than 1.
+            assert!(
+                pad.starts_with(' ') && pad.trim_start().starts_with('a'),
+                "continuation hangs under the message: {cont:?}"
+            );
+        }
     }
 
     #[test]
