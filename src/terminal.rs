@@ -40,23 +40,21 @@ pub const FOOTER_ROWS: u16 = 3;
 pub const MIN_FOOTER_ROWS: u16 = 5;
 
 /// The footer's CURRENT height for a terminal of `rows` rows: [`FOOTER_ROWS`]
-/// normally, plus [`crate::escalation::ROWS`] while a background escalation is
-/// pinned (the escalation message + the worker's latest status, painted directly
-/// ABOVE the footer's horizontal rule, so the rule stays welded to the
-/// statusline block — see [`crate::escalation`]).
+/// normally, plus however many rows the pinned ANCHOR wants — one row per queued
+/// mid-turn command, two per in-flight background escalation (its message + the
+/// worker's latest status). The stack is painted directly ABOVE the footer's
+/// horizontal rule, anchored to it and building upward, so the rule stays welded
+/// to the statusline block. See [`crate::escalation`].
 ///
 /// Every row-arithmetic site — DECSTBM bottom margin, the body-home row, the
 /// resume choreography — routes through this so growing the footer can never
-/// desync the reserved region from what we actually paint. The banner is dropped
-/// (and the footer stays at its base height) when the terminal is too short to
-/// keep 2 scrolling rows above the taller footer: a cramped window keeps its
-/// output instead of being eaten by a notification.
+/// desync the reserved region from what we actually paint. The clamping lives in
+/// [`crate::escalation::extra_footer_rows`] so the height decision and the row
+/// rendering share ONE implementation: on a short window the anchor shrinks (and
+/// marks the hidden depth) rather than eating the body — a cramped window keeps
+/// its output instead of being swallowed by notifications.
 pub fn footer_rows_for(rows: u16) -> u16 {
-    if crate::escalation::active() && rows >= MIN_FOOTER_ROWS + crate::escalation::ROWS {
-        FOOTER_ROWS + crate::escalation::ROWS
-    } else {
-        FOOTER_ROWS
-    }
+    FOOTER_ROWS + crate::escalation::extra_footer_rows(rows, FOOTER_ROWS)
 }
 
 /// The first (topmost) screen row the footer owns: the escalation banner's first
@@ -539,46 +537,42 @@ pub fn footer_seq(
     status_msg: &str,
     statusline: &str,
 ) -> String {
-    // Snapshot the pinned escalation ONCE (dropping it when the window is too
-    // short) and hand it to the pure builder, so the rows we reserve and the
-    // rows we paint agree even if the banner retires mid-paint.
-    let banner = crate::escalation::rows(crate::style::colors_enabled())
-        .filter(|_| rows >= MIN_FOOTER_ROWS + crate::escalation::ROWS);
-    footer_seq_with(rows, cols, separator, status_msg, statusline, banner)
+    // Snapshot the pinned anchor ONCE, clipped to what this window can spare,
+    // and hand it to the pure builder — so the rows we reserve and the rows we
+    // paint agree even if an entry retires mid-paint.
+    let anchor = crate::escalation::render_rows(
+        crate::escalation::extra_footer_rows(rows, FOOTER_ROWS),
+        crate::style::colors_enabled(),
+    );
+    footer_seq_with(rows, cols, separator, status_msg, statusline, anchor)
 }
 
-/// [`footer_seq`] with the escalation banner passed in instead of read from the
-/// process-global pin — the whole row plan is a pure function of `(rows, cols,
-/// banner)`, so the geometry is unit-testable without mutating shared state.
+/// [`footer_seq`] with the anchor rows passed in instead of read from the
+/// process-global stack — the whole row plan is a pure function of `(rows, cols,
+/// anchor)`, so the geometry is unit-testable without mutating shared state.
 pub fn footer_seq_with(
     rows: u16,
     cols: u16,
     separator: &str,
     status_msg: &str,
     statusline: &str,
-    banner: Option<(String, String)>,
+    anchor: Vec<String>,
 ) -> String {
-    let height = if banner.is_some() {
-        FOOTER_ROWS + crate::escalation::ROWS
-    } else {
-        FOOTER_ROWS
-    };
-    // The footer occupies the bottom `height` rows: [escalation message, worker
-    // status,] separator, status message, statusline.
+    let height = FOOTER_ROWS + anchor.len() as u16;
+    // The footer occupies the bottom `height` rows: [anchor rows…,] separator,
+    // status message, statusline.
     //
-    // The pinned escalation is anchored ABOVE the separator, not below it. The
+    // The anchor stack is painted ABOVE the separator, not below it. The
     // horizontal rule is the LID of the statusline block — it marks where the
-    // scrolling body stops — so a banner painted under it looked like a row
+    // scrolling body stops — so a pinned row painted under it looked like a row
     // wedged inside the statusline frame. Above the rule it reads as the last
     // thing the body said, which is where the operator's eye goes for "what is
-    // running right now", and the rule stays welded to the two statusline rows
-    // it opens whether or not a banner is pinned.
+    // still pending", and the rule stays welded to the two statusline rows it
+    // opens whether or not anything is pinned. Oldest entry first, so the NEWEST
+    // promise lands on the row adjacent to the rule and the stack builds upward
+    // into the body.
     let top_row = rows.saturating_sub(height.saturating_sub(1)).max(1);
-    let sep_row = if banner.is_some() {
-        top_row + crate::escalation::ROWS
-    } else {
-        top_row
-    };
+    let sep_row = top_row + anchor.len() as u16;
     let msg_row = rows.saturating_sub(1);
     let bar_row = rows;
     let max = cols as usize;
@@ -594,24 +588,16 @@ pub fn footer_seq_with(
     // next prompt at the top of the screen instead of two lines below the last
     // output. Re-asserting every paint also makes a resize between prompts
     // self-healing without depending on the SIGWINCH watcher.
-    // Derived from the SAME `height` as the row plan (not from the global pin)
-    // so a banner that retires mid-paint can't desync region from paint.
+    // Derived from the SAME `height` as the row plan (not from the global stack)
+    // so an entry that retires mid-paint can't desync region from paint.
     let region_bottom = rows.saturating_sub(height).max(1);
     s.push_str(&format!("\x1b[1;{region_bottom}r"));
-    // The pinned escalation sits ABOVE the separator — the (animated) escalation
-    // message, then the worker's latest status, then the rule that opens the
-    // statusline block.
-    if let Some((escalation, worker)) = banner {
-        let esc_row = top_row;
-        let worker_row = top_row + 1;
-        s.push_str(&format!(
-            "\x1b[{esc_row};1H\x1b[2K{}",
-            clip_visible(&escalation, max)
-        ));
-        s.push_str(&format!(
-            "\x1b[{worker_row};1H\x1b[2K{}",
-            clip_visible(&worker, max)
-        ));
+    // The anchor stack sits ABOVE the separator: oldest entry first, so the
+    // NEWEST promise lands on the row adjacent to the rule that opens the
+    // statusline block, and the stack builds upward into the body.
+    for (i, row) in anchor.iter().enumerate() {
+        let r = top_row + i as u16;
+        s.push_str(&format!("\x1b[{r};1H\x1b[2K{}", clip_visible(row, max)));
     }
     s.push_str(&format!("\x1b[{sep_row};1H\x1b[2K{sep}"));
     s.push_str(&format!("\x1b[{msg_row};1H\x1b[2K{msg}"));
@@ -1528,8 +1514,8 @@ mod tests {
 
     #[test]
     fn footer_positions_three_rows_bottom_up() {
-        // No banner → 3-row footer.
-        let seq = footer_seq_with(24, 10, "----------", "msg", "bar", None);
+        // Nothing pinned → 3-row footer.
+        let seq = footer_seq_with(24, 10, "----------", "msg", "bar", Vec::new());
         assert!(seq.starts_with("\x1b7")); // DECSC
         assert!(seq.ends_with("\x1b8")); // DECRC
         // The scroll-region re-assert (DECSTBM) must be saved-then-emitted: it
@@ -1551,10 +1537,10 @@ mod tests {
         // Regression: the banner first shipped BELOW the separator, which read
         // as a row wedged inside the statusline frame. The rule is the LID of
         // the statusline block, so the banner must sit ABOVE it.
-        let banner = Some((
+        let banner = vec![
             "🚀 escalated → w_a7k3m2 · build and open pr".to_string(),
             "   ↳ coordinating · 1m12s".to_string(),
-        ));
+        ];
 
         // 24-row window, 5-row footer: banner 20-21, rule 22, msg 23, bar 24.
         let seq = footer_seq_with(24, 80, "----------", "msg", "bar", banner);

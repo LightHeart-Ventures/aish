@@ -364,6 +364,15 @@ fn reader_loop(
                         // though it will run as soon as the turn ends.
                         queued_count += 1;
                         crate::terminal::print_midturn_queued(&line, queued_count);
+                        // …and ANCHOR it to the footer. The body receipt above
+                        // is the durable scrollback record, but it scrolls away
+                        // under the running turn's output; the anchor entry is
+                        // the live "still waiting to run" affordance and stays
+                        // pinned (animating) until the REPL actually pops the
+                        // line, then freezes to a green ✓ for its dwell. Same
+                        // stack the escalations use — both are promises the
+                        // shell has accepted but not yet kept.
+                        crate::escalation::pin_queued(&line);
                         let _ = cfg.line_tx.send(line);
                         // Line consumed → return to the bare prompt affordance
                         // (still mid-turn); the cached status message is restored
