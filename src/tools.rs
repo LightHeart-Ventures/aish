@@ -2154,15 +2154,15 @@ fn find_duplicate_running_work(session: &Session, task: &str) -> Option<String> 
 /// on subscription auth: the tool-less Batches API needs a metered
 /// `ANTHROPIC_API_KEY`, and a `CLAUDE_CODE_OAUTH_TOKEN` cannot reach it, so the
 /// grandchild's only sanctioned route out could only ever error. Pick `batch`
-/// only when that key is genuinely available; otherwise `interactive`, whose
-/// recursion risk is already bounded by the child's decremented
-/// `AISH_SPAWN_BUDGET` (the real fork-bomb guard). Pure → unit-tested.
-fn forced_child_tier(metered_key_available: bool) -> &'static str {
-    if metered_key_available {
-        "batch"
-    } else {
-        "interactive"
-    }
+/// only when the batch tier is genuinely reachable; otherwise `interactive`,
+/// whose recursion risk is already bounded by the child's decremented
+/// `AISH_SPAWN_BUDGET` (the real fork-bomb guard).
+///
+/// The reachability question is answered by `batch::capability` — the one
+/// built-in decision point — so this never encodes its own guess about the
+/// backend or the credential. Pure → unit-tested.
+fn forced_child_tier(cap: &crate::batch::BatchCapability) -> &'static str {
+    if cap.available() { "batch" } else { "interactive" }
 }
 
 
@@ -2256,15 +2256,13 @@ OPENAI_API_KEY; OpenRouter needs OPENROUTER_API_KEY (env or ~/.aishrc)"
     // fan-out structurally impossible — a hard failure caused purely by our own
     // recursion cap. Degrade that case; never the explicit one.
     let batch_forced_by_env = want_batch && explicit_tier.is_none();
-    // The metered key the tool-less Batches API needs — resolved through the
-    // SINGLE detection site in `batch` (`~/.aishrc` exports win over the process
-    // env; a blank value counts as absent). Recomputed from the live credentials
-    // on every call rather than decided once and cached, and read here because
-    // BOTH the batch branch below and the child's forced tier need the answer.
-    // (The previous inline resolution filtered blanks only AFTER the process-env
-    // fallback, so a blank `~/.aishrc` export masked a good process-env key.)
+    // Is the batch tier reachable AT ALL right now? Asked of the one built-in
+    // decision point (`batch::capability`) rather than re-derived here, so the
+    // answer tracks the live backend + credential state instead of being a
+    // snapshot someone has to remember to update. Both the batch branch and the
+    // child's forced tier below consume it.
+    let batch_cap = crate::batch::capability(&session.backend_kind, &session.env);
     let metered_api_key: Option<String> = crate::batch::metered_key(&session.env);
-    let metered_key_available = metered_api_key.is_some();
 
     // FIX D — an INHERITED `batch` tier with no metered key DEGRADES to an
     // interactive sub-coordinator rather than erroring. Without this, a
@@ -2273,31 +2271,26 @@ OPENAI_API_KEY; OpenRouter needs OPENROUTER_API_KEY (env or ~/.aishrc)"
     // only route out is the Batches API it structurally cannot reach. Falling
     // through to the worker-spawn path below is safe — `spawn_budget_gate` still
     // enforces the depth cap, which is the real fork-bomb guard.
-    if session.nested && want_batch && !metered_key_available {
-        // Batch tier wanted but UNREACHABLE — never a hard error. The work is
-        // real either way, so DEGRADE to the batch model (Opus by default) on an
-        // interactive sub-coordinator and say so loudly. This now covers an
-        // INHERITED tier (our own recursion cap) AND an EXPLICIT `tier:"batch"`
-        // alike: erroring on the explicit one only pushed the same dead end onto
-        // the model, which has no way to provision a key mid-run. Falling through
-        // to the worker-spawn path below is safe — `spawn_budget_gate` still
-        // enforces the depth cap, which is the real fork-bomb guard.
-        let source = if batch_forced_by_env {
-            "was forced to `batch` by AISH_FANOUT_TIER (recursion cap)"
-        } else {
-            "explicitly requested the `batch` tier"
-        };
+    if session.nested && want_batch && batch_forced_by_env && !batch_cap.available() {
         eprintln!(
-            "aish: this nested fan-out {source}, but {} — degrading to an interactive \
-sub-coordinator; depth stays capped by AISH_SPAWN_BUDGET.",
-            crate::batch::unavailable_fallback_note(&session.batch_model)
+            "aish: nested fan-out tier was forced to `batch` by AISH_FANOUT_TIER (recursion cap), \
+but the batch tier is {}. Degrading this fan-out to an interactive sub-coordinator; depth stays \
+capped by AISH_SPAWN_BUDGET.",
+            batch_cap.reason()
         );
     } else if session.nested && want_batch {
-        // The tool-less Batches API needs a metered key; a subscription OAuth
-        // token can't reach it. Availability was resolved above via
-        // `batch::metered_key`, and the degrade branch catches EVERY missing-key
-        // case — so reaching here means the key is present.
-        let api_key = metered_api_key.expect("metered key presence checked by the branch above");
+        // Reaching here means the caller asked for batch EXPLICITLY. If the tier
+        // isn't reachable, fail with the ONE canonical explanation
+        // (`BatchCapability::reason`) rather than a locally-worded guess that can
+        // drift from what `:batch status` reports.
+        let api_key = metered_api_key.filter(|_| batch_cap.available()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "nested background fan-out asked for the batch tier, but it is {} — re-run with \
+tier:\"interactive\" (or omit `tier`) to use a sub-coordinator instead",
+                batch_cap.reason()
+            )
+        })?;
+
         let _id = crate::batch::spawn(
             &session.batch_jobs,
             task.to_string(),
@@ -2388,7 +2381,7 @@ sentence that you're on it and the answer will appear when ready."
         child_env.retain(|(k, _)| k != "AISH_FANOUT_TIER");
         child_env.push((
             "AISH_FANOUT_TIER".to_string(),
-            forced_child_tier(metered_key_available).to_string(),
+            forced_child_tier(&batch_cap).to_string(),
         ));
     }
     // ── Defect 1: carry the operator's `:output` choice ACROSS the process
@@ -4780,8 +4773,20 @@ mod tests {
     // `interactive` and leans on AISH_SPAWN_BUDGET for depth safety instead.
     #[test]
     fn forced_child_tier_degrades_without_a_metered_key() {
-        assert_eq!(super::forced_child_tier(true), "batch");
-        assert_eq!(super::forced_child_tier(false), "interactive");
+        use crate::batch::BatchCapability;
+        assert_eq!(
+            super::forced_child_tier(&BatchCapability::Available),
+            "batch"
+        );
+        assert_eq!(
+            super::forced_child_tier(&BatchCapability::SubscriptionOnly),
+            "interactive"
+        );
+        // A backend with no Batches API degrades the same way.
+        assert_eq!(
+            super::forced_child_tier(&BatchCapability::UnsupportedBackend("grok".into())),
+            "interactive"
+        );
     }
 
     use super::*;
