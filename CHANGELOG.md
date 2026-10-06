@@ -4,6 +4,20 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.50.0] - 2026-10-06
+
+### Added
+- **Coordinator Plan-DAG infrastructure (SPR-113)**: `PlanGraph` types with topological ordering, ready-set computation, and cycle detection enable deterministic work scheduling
+- **Delta artifact storage**: Phase 1 DISCOVERY output `(ask − state)` now persisted and re-injected on resume, survives context compaction
+- **Plan persistence layer**: `coordinator_store` extended with plan graph and delta artifact tables, keyed by `scope_key` for scope isolation
+- **Node-keyed work-package leases**: In-flight work identification upgraded from run-shape inference to exact plan node id, eliminates resume ambiguity and enables safe parallel sibling dispatch
+- **Derived fan-out logic**: Parallel fan-out is now a computed property of the dependency DAG (`ready_set` + file-disjointness) rather than a discretionary call, replacing the anti-decompose heuristic that was suppressing 87-call runaways
+- **Comprehensive test coverage (TASK-809)**: Unit tests for ready-set, topological sort, cycle detection, serde round-trips; prompt-constant assertions lock down Phase 1 delta directive, Phase 2 plan object, and fan-out derivation rule
+- **Reference documentation**: `docs/reference/coordinator/patterns.md` extended with five-step loop explanation, delta and plan shapes, fan-out derivation table, and incident history (87-call runaway motivating case)
+
+### Fixed
+- **Batch tier availability check**: removed duplicate `metered_key` field definition; `batch::available()` now correctly gates on both backend kind and API key presence (PR #879)
+
 ## [0.49.1] - 2025-01-22
 
 ### Fixed
