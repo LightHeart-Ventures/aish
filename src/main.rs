@@ -33,6 +33,7 @@ mod modelfetch;
 #[cfg(test)]
 mod oracle;
 mod pipeline;
+mod plan;
 mod plugin_auth;
 mod plugin_dispatcher;
 mod plugin_memory;
