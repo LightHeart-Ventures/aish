@@ -55,18 +55,7 @@ pub fn metered_key_in(env: &[(String, String)]) -> Option<String> {
 }
 
 /// `metered_key_in` with the process environment as the fallback source.
-pub fn metered_key(env: &[(String, String)]) -> Option<String> {
-    metered_key_in(env).or_else(|| {
-        std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-    })
-}
 
-/// Whether the Batches API is reachable with the credentials on hand.
-pub fn available(env: &[(String, String)]) -> bool {
-    metered_key(env).is_some()
-}
 
 /// The one-line explanation every caller prints when the batch tier was wanted
 /// but is unreachable: the work still runs — on `batch_model` (Opus by default)
@@ -309,6 +298,10 @@ pub fn capability(backend_kind: &str, env: &[(String, String)]) -> BatchCapabili
     classify(backend_kind, metered_key(env).is_some())
 }
 
+/// Convenience: whether the batch tier is reachable (for early bailouts).
+pub fn available(backend_kind: &str, env: &[(String, String)]) -> bool {
+    matches!(capability(backend_kind, env), BatchCapability::Available)
+}
 
 /// Short, table-friendly form of a uuid job id (first 8 hex chars).
 pub fn short_id(id: &str) -> &str {

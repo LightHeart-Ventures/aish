@@ -9800,7 +9800,7 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
             // instead of letting the first offload fail opaquely: the Batches API
             // is metered and a subscription token can't reach it. Batch work still
             // runs — it falls back to the batch model on an interactive coordinator.
-            if !crate::batch::available(&session.env) {
+            if !crate::batch::available(&session.backend_kind, &session.env) {
                 println!(
                     "\x1b[2mnote: {}\x1b[0m",
                     crate::batch::unavailable_fallback_note(&session.batch_model)
@@ -9849,7 +9849,7 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
                 "batch mode: {} · model: {} · batches api: {}",
                 if session.batch_mode { "on" } else { "off" },
                 session.batch_model,
-                if crate::batch::available(&session.env) {
+                if crate::batch::available(&session.backend_kind, &session.env) {
                     "reachable"
                 } else {
                     "unreachable — falls back to an interactive coordinator"
