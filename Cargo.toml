@@ -12,7 +12,7 @@ resolver = "2"
 
 [package]
 name = "aish"
-version = "0.52.0"
+version = "0.52.1"
 edition = "2024"
 license = "Apache-2.0"
 
