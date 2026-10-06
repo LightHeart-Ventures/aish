@@ -431,17 +431,41 @@ fn visible_width(s: &str) -> usize {
     strip_ansi(&inline(s, "")).width()
 }
 
+/// Drop ANSI escapes so what's left is only what the terminal paints. Handles
+/// both shapes aish emits: CSI/SGR (`ESC [ … letter`) and OSC strings
+/// (`ESC ] … BEL|ST`) — the latter is how OSC 8 hyperlinks travel, and missing
+/// them here would count a link's whole URL as visible columns and blow up
+/// every table that contains one.
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            if chars.next() == Some('[') {
-                for c2 in chars.by_ref() {
-                    if c2.is_ascii_alphabetic() {
-                        break;
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for c2 in chars.by_ref() {
+                        if c2.is_ascii_alphabetic() {
+                            break;
+                        }
                     }
                 }
+                Some(']') => {
+                    chars.next();
+                    // OSC body runs to BEL or ST (`ESC \`).
+                    while let Some(c2) = chars.next() {
+                        if c2 == '\x07' {
+                            break;
+                        }
+                        if c2 == '\x1b' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ => {}
             }
             continue;
         }
@@ -474,8 +498,13 @@ pub fn render_stdout_within(text: &str, max_cols: usize) -> String {
     }
 }
 
-/// Inline spans: `code`, **bold**, *italic*, ~~strike~~, [text](url). Underscore
-/// emphasis is skipped on purpose — it would mangle snake_case identifiers.
+/// Inline spans: `code`, **bold**, *italic*, ~~strike~~, [text](url), and bare
+/// URLs. Underscore emphasis is skipped on purpose — it would mangle
+/// snake_case identifiers.
+///
+/// Both link shapes become OSC 8 hyperlinks when the terminal takes them (see
+/// [`crate::hyperlink`]); a bare URL keeps its visible text byte-for-byte, so
+/// autolinking never shifts a column width.
 fn inline(s: &str, base: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
@@ -531,6 +560,17 @@ fn inline(s: &str, base: &str) -> String {
                     continue;
                 }
             }
+        } else if let Some(len) = crate::hyperlink::url_len(rest) {
+            // Bare URL in prose → clickable, with the visible text left exactly
+            // as the model wrote it (so widths/copy-paste are unchanged).
+            let url = &rest[..len];
+            if crate::hyperlink::enabled() {
+                out.push_str(&crate::hyperlink::wrap(url, url));
+            } else {
+                out.push_str(url);
+            }
+            i += len;
+            continue;
         }
         let ch = rest.chars().next().unwrap();
         out.push(ch);
@@ -555,11 +595,22 @@ fn render_link(rest: &str, base: &str, out: &mut String) -> Option<usize> {
     if label.is_empty() || url.is_empty() {
         return None;
     }
+    // When the terminal takes OSC 8 the cyan label becomes the clickable thing
+    // and the dim `(url)` trailer is dropped — it existed only to keep the
+    // target visible/copyable on a terminal that couldn't link it. On a
+    // non-hyperlink terminal the old two-part rendering is kept verbatim.
+    let clickable = crate::hyperlink::enabled();
     out.push_str("\x1b[36m");
+    if clickable {
+        out.push_str(&crate::hyperlink::open(url));
+    }
     out.push_str(&inline(label, &format!("{base}\x1b[36m")));
+    if clickable {
+        out.push_str(crate::hyperlink::close());
+    }
     out.push_str("\x1b[39m");
     out.push_str(base);
-    if url != label {
+    if !clickable && url != label {
         out.push_str(&format!(" \x1b[2m({url})\x1b[22m{base}"));
     }
     Some(url_end + 1)
@@ -569,9 +620,38 @@ fn render_link(rest: &str, base: &str, out: &mut String) -> Option<usize> {
 mod tests {
     use super::render;
     use super::{
-        DEFAULT_PANE_COLS, PANE_GUTTER_COLS, fit_widths, render_pane, render_within, visible_width,
-        wrap_cell,
+        DEFAULT_PANE_COLS, PANE_GUTTER_COLS, fit_widths, render_pane, render_within, strip_ansi,
+        visible_width, wrap_cell,
     };
+
+    /// OSC 8 hyperlinks (`ESC ] 8 ; ; url ST`) must measure as zero columns, or
+    /// every table cell holding a link is padded by the length of its URL.
+    #[test]
+    fn strip_ansi_drops_osc8_hyperlinks() {
+        let linked = crate::hyperlink::wrap("https://example.com/a/very/long/path", "docs");
+        assert_eq!(strip_ansi(&linked), "docs");
+        // Mixed with SGR, and with the legacy BEL terminator some terminals use.
+        assert_eq!(
+            strip_ansi("\x1b[36m\x1b]8;;https://x.io\x07ok\x1b]8;;\x07\x1b[39m"),
+            "ok"
+        );
+        // Plain text and bare CSI behaviour unchanged.
+        assert_eq!(strip_ansi("\x1b[1mbold\x1b[22m plain"), "bold plain");
+    }
+
+    /// With hyperlinks off (no TTY under the test harness) the rendering is the
+    /// historical two-part form, and a bare URL stays byte-identical — the
+    /// guarantee that autolinking can never shift a column width.
+    #[test]
+    fn bare_url_text_is_unchanged_without_hyperlinks() {
+        assert_eq!(
+            render("see https://x.io/a now", ""),
+            "see https://x.io/a now"
+        );
+        // Trailing sentence punctuation stays outside the link span.
+        assert_eq!(render("at https://x.io.", ""), "at https://x.io.");
+        assert_eq!(visible_width("https://x.io"), 12);
+    }
 
     // Serializes every test that mutates the process-global `COLUMNS` env var.
     // The test runner executes in parallel, so without this one test's

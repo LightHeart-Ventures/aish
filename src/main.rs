@@ -22,6 +22,7 @@ mod goal;
 
 mod hooks;
 mod hwdetect;
+mod hyperlink;
 mod jobs;
 mod keywatch;
 mod lifecycle;

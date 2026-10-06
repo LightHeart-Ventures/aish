@@ -572,6 +572,23 @@ pub fn visible_cols(s: &str) -> usize {
                         break;
                     }
                 }
+            } else if chars.peek() == Some(&']') {
+                // Skip an OSC string: ESC ] ... terminated by BEL or ST (ESC \).
+                // OSC 8 hyperlinks ride this shape; without the skip a link's
+                // URL would be counted as visible columns and knock the
+                // statusline out of alignment.
+                chars.next();
+                while let Some(n) = chars.next() {
+                    if n == '\x07' {
+                        break;
+                    }
+                    if n == '\x1b' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
             }
             continue;
         }
@@ -803,6 +820,16 @@ mod tests {
         assert_eq!(visible_cols("\x1b[36mabc\x1b[0m"), 3);
         assert_eq!(visible_cols("\x1b[1;33m⇄x \x1b[0m"), 3); // arrow + 'x' + space
         assert_eq!(visible_cols(""), 0);
+        // OSC strings (OSC 8 hyperlinks) are zero-width too — only the visible
+        // label counts, never the URL, or a linked statusline loses alignment.
+        assert_eq!(
+            visible_cols("\x1b]8;;https://example.com/long\x1b\\ok\x1b]8;;\x1b\\"),
+            2
+        );
+        assert_eq!(
+            visible_cols("\x1b[36m\x1b]8;;https://x.io\x07ok\x1b]8;;\x07\x1b[39m"),
+            2
+        );
     }
 
     #[test]
