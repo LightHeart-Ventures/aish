@@ -40,22 +40,20 @@ pub const FOOTER_ROWS: u16 = 3;
 pub const MIN_FOOTER_ROWS: u16 = 5;
 
 /// The footer's CURRENT height for a terminal of `rows` rows: [`FOOTER_ROWS`]
-/// normally, plus [`crate::escalation::ROWS`] while a background escalation is
-/// pinned (the escalation message + the worker's latest status, painted directly
-/// above the statusline block — see [`crate::escalation`]).
+/// normally, plus however many rows the pinned ANCHOR wants — one row per queued
+/// mid-turn command, two per in-flight background escalation (its message + the
+/// worker's latest status), painted directly above the statusline block and
+/// anchored to it, building upward. See [`crate::escalation`].
 ///
 /// Every row-arithmetic site — DECSTBM bottom margin, the body-home row, the
 /// resume choreography — routes through this so growing the footer can never
-/// desync the reserved region from what we actually paint. The banner is dropped
-/// (and the footer stays at its base height) when the terminal is too short to
-/// keep 2 scrolling rows above the taller footer: a cramped window keeps its
-/// output instead of being eaten by a notification.
+/// desync the reserved region from what we actually paint. The clamping lives in
+/// [`crate::escalation::extra_footer_rows`] so the height decision and the row
+/// rendering share ONE implementation: on a short window the anchor shrinks (and
+/// marks the hidden depth) rather than eating the body — a cramped window keeps
+/// its output instead of being swallowed by notifications.
 pub fn footer_rows_for(rows: u16) -> u16 {
-    if crate::escalation::active() && rows >= MIN_FOOTER_ROWS + crate::escalation::ROWS {
-        FOOTER_ROWS + crate::escalation::ROWS
-    } else {
-        FOOTER_ROWS
-    }
+    FOOTER_ROWS + crate::escalation::extra_footer_rows(rows, FOOTER_ROWS)
 }
 
 /// Hard ceiling on the DSR (`ESC[6n`) cursor-position exchange in
@@ -527,18 +525,16 @@ pub fn footer_seq(
     status_msg: &str,
     statusline: &str,
 ) -> String {
-    // Snapshot the pinned escalation ONCE (dropping it when the window is too
-    // short) and derive the height from that snapshot, so the rows we reserve
-    // and the rows we paint agree even if the banner retires mid-paint.
-    let banner = crate::escalation::rows(crate::style::colors_enabled())
-        .filter(|_| rows >= MIN_FOOTER_ROWS + crate::escalation::ROWS);
-    let height = if banner.is_some() {
-        FOOTER_ROWS + crate::escalation::ROWS
-    } else {
-        FOOTER_ROWS
-    };
-    // The footer occupies the bottom `height` rows: separator, [escalation
-    // message, worker status,] status message, statusline.
+    // Snapshot the pinned anchor ONCE, clipped to what this window can spare,
+    // and derive the height from THAT snapshot — so the rows we reserve and the
+    // rows we paint agree even if an entry retires mid-paint.
+    let anchor = crate::escalation::render_rows(
+        crate::escalation::extra_footer_rows(rows, FOOTER_ROWS),
+        crate::style::colors_enabled(),
+    );
+    let height = FOOTER_ROWS + anchor.len() as u16;
+    // The footer occupies the bottom `height` rows: separator, [anchor rows…,]
+    // status message, statusline.
     let sep_row = rows.saturating_sub(height.saturating_sub(1)).max(1);
     let msg_row = rows.saturating_sub(1);
     let bar_row = rows;
@@ -557,19 +553,12 @@ pub fn footer_seq(
     // self-healing without depending on the SIGWINCH watcher.
     s.push_str(&scroll_region_seq(rows));
     s.push_str(&format!("\x1b[{sep_row};1H\x1b[2K{sep}"));
-    // The pinned escalation sits between the separator and the statusline block:
-    // the (animated) escalation message, then the worker's latest status.
-    if let Some((escalation, worker)) = banner {
-        let esc_row = sep_row + 1;
-        let worker_row = sep_row + 2;
-        s.push_str(&format!(
-            "\x1b[{esc_row};1H\x1b[2K{}",
-            clip_visible(&escalation, max)
-        ));
-        s.push_str(&format!(
-            "\x1b[{worker_row};1H\x1b[2K{}",
-            clip_visible(&worker, max)
-        ));
+    // The pinned anchor sits between the separator and the statusline block,
+    // oldest entry first so the NEWEST promise lands on the row adjacent to the
+    // statusline and the stack builds upward into the body.
+    for (i, row) in anchor.iter().enumerate() {
+        let r = sep_row + 1 + i as u16;
+        s.push_str(&format!("\x1b[{r};1H\x1b[2K{}", clip_visible(row, max)));
     }
     s.push_str(&format!("\x1b[{msg_row};1H\x1b[2K{msg}"));
     s.push_str(&format!("\x1b[{bar_row};1H\x1b[2K{bar}"));

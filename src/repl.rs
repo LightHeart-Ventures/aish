@@ -748,7 +748,17 @@ pub async fn run(
         // (nobody typed it), so it renders as a single animated "Reviewing and
         // summarizing result" line instead of the full play-by-play.
         let mut quiet_summary_turn = false;
-        let outcome = match injected.take().or_else(|| typeahead.pop_front()) {
+        let outcome = match injected.take().or_else(|| {
+            // A type-ahead line is finally being run. Retire its footer anchor
+            // entry here — at the moment of CONSUMPTION, not submission — so the
+            // pinned "⏳ queued → …" row flips to a static green ✓ exactly when
+            // the promise is kept, dwells for `escalation::DWELL`, then leaves
+            // the stack on its own.
+            typeahead.pop_front().map(|l| {
+                crate::escalation::resolve_queued_text(&l);
+                l
+            })
+        }) {
             Some(l) => ReadOutcome::Line(l),
             // Auto-resume drain: when the last fanned-out coordinator of this
             // session has finished, the presenter armed a coalesced resume (see
