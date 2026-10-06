@@ -15,17 +15,20 @@
 //! footer by [`ROWS`] rows and `footer_seq` paints:
 //!
 //! ```text
-//!   ─────────────────────────────────────────   <- separator
 //!   🚀 escalated → w_a7k3m2 · build and open pr  <- escalation message (animated)
 //!      ↳ coordinating · 1m12s · 🔧 read_file …   <- latest worker status
+//!   ─────────────────────────────────────────   <- separator (the statusline lid)
 //!   ⇄ detached — back to interactive …           <- SecondStatusLine
 //!   aish v0.9 · sonnet …           12:04:51      <- statusline
 //! ```
 //!
-//! i.e. the escalation message sits just above the statusline block with the
+//! i.e. the banner is anchored ABOVE the footer's top horizontal bar, with the
 //! worker's latest status directly beneath it, exactly where the operator's eye
-//! already lives. Because it's inside the DECSTBM-reserved region it can never
-//! scroll away.
+//! already lives. The rule is the LID of the statusline block, so painting the
+//! banner UNDER it read as a row wedged inside the statusline frame; above it the
+//! banner reads as the last thing the body said while the rule stays welded to
+//! the two statusline rows it opens. Because it's still inside the
+//! DECSTBM-reserved region it can never scroll away.
 //!
 //! ANIMATION. The escalation emoji cycles through [`FRAMES`] on a [`FRAME_MS`]
 //! cadence — the same in-place "something is happening" affordance as the
