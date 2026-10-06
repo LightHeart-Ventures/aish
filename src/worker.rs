@@ -2971,6 +2971,10 @@ impl WorkerJob {
         i.status = "done".into();
         i.result = Some(result);
         i.finished.get_or_insert_with(SystemTime::now);
+        drop(i);
+        // Freeze the escalation banner's glyph on the real finish instant (the
+        // dwell clock starts here), not whenever the footer next repaints.
+        crate::escalation::note_terminal(&self.id, false);
     }
     /// Record the branch an isolated worker left its changes on (kept worktree).
     fn set_branch(&self, branch: String) {
@@ -3063,6 +3067,8 @@ impl WorkerJob {
         i.status = "failed".into();
         i.error = Some(err);
         i.finished.get_or_insert_with(SystemTime::now);
+        drop(i);
+        crate::escalation::note_terminal(&self.id, true);
     }
 
     /// The number of distinct coordinator runs (threads) this worker has had: 1
@@ -3479,6 +3485,11 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
     });
     guard.push(job.clone());
     drop(guard);
+
+    // Pin the escalation banner just above the statusline so the "escalated →"
+    // message stays on screen (with a live status row) for the whole run instead
+    // of scrolling away the moment the next output lands.
+    crate::escalation::pin(&id, &task);
 
     // The original run's coordinator `run_id` IS the worker's visible id. A later
     // in-place resume passes a FRESH run id here (a new thread) while reusing this
