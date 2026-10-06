@@ -26,20 +26,24 @@
 //! [`extra_footer_rows`] rows and `footer_seq` paints the stack:
 //!
 //! ```text
-//!   ─────────────────────────────────────────   <- separator
 //!   🚀 escalated → w_a7k3m2 · build and open pr  <- OLDEST pending (top)
 //!      ↳ 1m12s · coordinating · 🔧 read_file …   <- its latest worker status
 //!   ✅ queued → git status                       <- processed: green ✓, dwelling
 //!   ⏳ queued #2 → cargo test                    <- NEWEST pending (the anchor)
+//!   ─────────────────────────────────────────   <- separator (the statusline lid)
 //!   ⇄ detached — back to interactive …           <- SecondStatusLine
 //!   aish v0.9 · sonnet …           12:04:51      <- statusline
 //! ```
 //!
-//! The stack's BOTTOM edge is welded to the statusline block and new entries
-//! land there, pushing older ones up — so the freshest promise is always in the
-//! operator's eye-line, exactly where it already lives, and the block grows
-//! bottom→up into the body. Because it's inside the DECSTBM-reserved region it
-//! can never scroll away.
+//! The stack sits ABOVE the footer's top horizontal bar, and its BOTTOM edge is
+//! welded to that bar: new entries land on the bottom row and push older ones up,
+//! so the freshest promise is always in the operator's eye-line — exactly where
+//! it already lives — and the block grows bottom→up into the body. The rule is
+//! the LID of the statusline block, so painting a pinned row UNDER it read as a
+//! row wedged inside the statusline frame; above it the stack reads as the last
+//! thing the body said, while the rule stays welded to the two statusline rows it
+//! opens whether or not anything is pinned. Because the stack is inside the
+//! DECSTBM-reserved region it can never scroll away.
 //!
 //! ANIMATION. A pending entry's leading glyph cycles in place — escalations
 //! through [`FRAMES`] on a [`FRAME_MS`] cadence, queued lines through
@@ -267,6 +271,11 @@ pub fn pin_queued(text: &str) -> String {
 
 /// Mark a queued entry PROCESSED by id: freezes it to the static green ✅ and
 /// starts the [`DWELL`] retirement clock.
+///
+/// The REPL drains type-ahead as bare strings, so [`resolve_queued_text`] is the
+/// hook that actually fires today; this id-scoped twin is kept for callers that
+/// DO hold the id handed back by [`pin_queued`].
+#[allow(dead_code)]
 pub fn resolve_queued(id: &str) {
     with(|stack| {
         if let Some(e) = stack
@@ -294,13 +303,18 @@ pub fn resolve_queued_text(text: &str) {
     });
 }
 
-/// Retire the whole stack (footer shrinks back on the next paint).
+/// Retire the whole stack (footer shrinks back on the next paint). Teardown
+/// escape hatch — entries normally retire themselves via [`sweep`].
+#[allow(dead_code)]
 pub fn clear() {
     with(|stack| stack.clear());
 }
 
 /// True while ANYTHING is in the stack — the gate
 /// [`crate::terminal::footer_rows_for`] consults to decide the footer height.
+/// The height decision now routes through [`extra_footer_rows`] (which needs the
+/// DEPTH, not just a yes/no), so this stays as the cheap emptiness probe.
+#[allow(dead_code)]
 pub fn active() -> bool {
     with(|stack| !stack.is_empty()).unwrap_or(false)
 }
@@ -351,7 +365,10 @@ pub fn set_status(status: &str) {
 
 /// Record that the newest live escalation reached a terminal state: freezes the
 /// glyph and starts the [`DWELL`] retirement clock. Idempotent — the first call
-/// wins, so the dwell measures from the real finish.
+/// wins, so the dwell measures from the real finish. Superseded in-tree by the
+/// id-scoped [`note_terminal`] (several escalations can be live at once), kept
+/// for callers that only know "the newest one finished".
+#[allow(dead_code)]
 pub fn mark_terminal(failed: bool) {
     with(|stack| {
         if let Some(e) = stack
