@@ -18,7 +18,7 @@ use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaModel},
+    model::{params::LlamaModelParams, LlamaModel},
     sampling::LlamaSampler,
 };
 #[cfg(feature = "local")]
@@ -131,9 +131,12 @@ impl LocalBackend {
             }
         }
 
-        // Tokenize prompt.
-        let tokens = model.str_to_token(&prompt, AddBos::Always)
-            .context("failed to tokenize prompt")?;
+        // Tokenize prompt. As of llama-cpp-2 0.1.158 the token helpers live on
+        // `LlamaVocab` instead of `LlamaModel`, and the `AddBos`/`Special` enums
+        // were replaced by plain bools. `tokenize(.., add_special, parse_special)`
+        // is the exact equivalent of the old `str_to_token(.., AddBos::Always)`.
+        let vocab = model.vocab();
+        let tokens = vocab.tokenize(prompt.as_bytes(), true, true);
 
         // Create context and batch.
         let ctx_params = LlamaContextParams::default()
@@ -161,19 +164,18 @@ impl LocalBackend {
             sampler.accept(next_token);
 
             // Check for end-of-sequence.
-            if model.is_eog_token(next_token) {
+            if vocab.is_eog(next_token) {
                 break;
             }
 
             // Decode token to bytes, then lossily to UTF-8 and add to output.
-            // llama-cpp-2's safe `token_to_piece` requires a stateful
-            // `encoding_rs` decoder; to avoid pulling in that dependency we use
-            // the raw byte API with a generous per-token buffer (a single token
-            // piece is only a few bytes) and decode lossily — adequate for the
-            // experimental local backend.
-            let token_bytes = model
-                .token_to_piece_bytes(next_token, 32, false, None)
-                .unwrap_or_default();
+            // Proper streaming decode wants a stateful `encoding_rs` decoder to
+            // stitch multi-token UTF-8 sequences (emoji); to avoid pulling in
+            // that dependency we take the raw bytes per token and decode
+            // lossily — adequate for the experimental local backend.
+            // `special: false` is the 0.1.158 replacement for the old
+            // `Special`/bool arg on `LlamaModel::token_to_piece_bytes`.
+            let token_bytes = vocab.token_to_piece(next_token, false, None);
             output.push_str(&String::from_utf8_lossy(&token_bytes));
 
             // Prepare next batch.
