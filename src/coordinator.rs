@@ -641,20 +641,27 @@ work; where they conflict with an earlier assumption, the interjection wins:]\n{
     )
 }
 
-/// Drain any operator messages queued for `run_id` and, when present, fold them
-/// into `next_input` as an interjection (see `format_interjection`). Returns the
-/// count folded so callers can emit a notice. A no-op (returns 0) when there's no
-/// store or nothing queued. Best-effort: a store error is swallowed (the run must
-/// not die because the mailbox read hiccuped).
+/// Drain any operator messages queued for EVERY id in `ids` and, when present,
+/// fold them into `next_input` as an interjection (see `format_interjection`).
+/// Returns the count folded so callers can emit a notice. A no-op (returns 0)
+/// when there's no store or nothing queued. Best-effort: a store error is
+/// swallowed (the run must not die because the mailbox read hiccuped).
+///
+/// `ids` is a LIST because a resumed run has two addresses: its fresh `run_id`
+/// and the stable `w_…` job id the operator actually sees and `:tell`s. Draining
+/// both is what keeps a resume-time interjection from being stranded.
 fn fold_operator_messages(
     store: Option<&CoordinatorStore>,
-    run_id: &str,
+    ids: &[&str],
     next_input: &mut String,
 ) -> usize {
     let Some(s) = store else {
         return 0;
     };
-    let msgs = s.drain_messages(run_id).unwrap_or_default();
+    let mut msgs = Vec::new();
+    for id in ids {
+        msgs.extend(s.drain_messages(id).unwrap_or_default());
+    }
     if msgs.is_empty() {
         return 0;
     }
@@ -712,8 +719,20 @@ pub async fn drive(
     session: &mut Session,
     input: String,
     run_id: &str,
+    steer_id: Option<&str>,
     store: Option<&CoordinatorStore>,
 ) -> Outcome {
+    // Every mailbox this run answers to. A FIRST launch has exactly one address
+    // (`run_id`). A RESUMED launch runs under a fresh `run_id` while the
+    // operator keeps addressing it by the stable `w_…` job id passed as
+    // `steer_id` (`--steer-id`) — the only id `:tell`, `send_to_attached`, and
+    // `background_status` ever surface. Draining BOTH at the round boundary is
+    // what fixes interjections that used to queue against the visible id and
+    // never reach the model.
+    let mailbox_ids: Vec<&str> = match steer_id {
+        Some(s) if !s.is_empty() && s != run_id => vec![run_id, s],
+        _ => vec![run_id],
+    };
     // Pin the verbatim task into the system prompt so it survives every history
     // compaction for the whole run (see `Session::task_anchor`). The first turn's
     // `next_input` below also carries the task, but that message is conversational
@@ -1092,7 +1111,10 @@ plus `git status` instead — do not fail the run over it.\n\n{PHASE0_GUARD}\n\n
             control.sender().interrupt();
         }
         if let Some(s) = store {
-            for m in s.drain_messages(run_id).unwrap_or_default() {
+            for m in mailbox_ids
+                .iter()
+                .flat_map(|id| s.drain_messages(id).unwrap_or_default())
+            {
                 // Defect 1 (mid-flight flip): a message whose WHOLE body is an
                 // output directive is a CONTROL signal, not context for the
                 // model. Route it to `OutputMode` so `tell <run> ":output on"`
@@ -1415,7 +1437,7 @@ delivered above). Fold them into your work: continue the task, or give the final
         // isn't dropped on the floor. When present, continue another round with
         // the interjection as the input instead of terminating.
         let mut late_input = String::new();
-        let late = fold_operator_messages(store, run_id, &mut late_input);
+        let late = fold_operator_messages(store, &mailbox_ids, &mut late_input);
         if late > 0 {
             eprintln!("✉ {late} operator message(s) arrived during the turn; continuing");
             next_input = late_input;
@@ -3023,7 +3045,10 @@ mod tests {
 
         // No messages → no-op, input unchanged.
         let mut input = "continue the task".to_string();
-        assert_eq!(fold_operator_messages(Some(&store), "run_x", &mut input), 0);
+        assert_eq!(
+            fold_operator_messages(Some(&store), &["run_x"], &mut input),
+            0
+        );
         assert_eq!(input, "continue the task");
 
         // One message → folded, prepended ahead of the existing input, drained.
@@ -3031,7 +3056,7 @@ mod tests {
             .enqueue_message("run_x", "use the staging DB", None)
             .unwrap();
         let mut input = "continue the task".to_string();
-        let n = fold_operator_messages(Some(&store), "run_x", &mut input);
+        let n = fold_operator_messages(Some(&store), &["run_x"], &mut input);
         assert_eq!(n, 1);
         assert!(input.contains("use the staging DB"));
         assert!(
@@ -3044,14 +3069,51 @@ mod tests {
         // Delete-on-read: a second fold sees nothing.
         let mut input2 = "next".to_string();
         assert_eq!(
-            fold_operator_messages(Some(&store), "run_x", &mut input2),
+            fold_operator_messages(Some(&store), &["run_x"], &mut input2),
             0
         );
         assert_eq!(input2, "next");
 
         // No store → no-op.
         let mut input3 = "x".to_string();
-        assert_eq!(fold_operator_messages(None, "run_x", &mut input3), 0);
+        assert_eq!(fold_operator_messages(None, &["run_x"], &mut input3), 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Resume-steer defect: a resumed run answers to TWO ids — its fresh
+    /// `run_id` and the stable `w_…` job id the operator actually `:tell`s.
+    /// Folding must drain BOTH mailboxes, or interjections queued against the
+    /// visible id pile up unread.
+    #[test]
+    fn fold_operator_messages_drains_every_mailbox_id() {
+        let path = std::env::temp_dir().join(format!("aish_fold2_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+        store
+            .insert("run_thread2", "do the thing", "sess", None)
+            .unwrap();
+
+        // Operator queued against the STABLE visible id (what `:tell` does);
+        // the fresh thread id has its own note too.
+        store
+            .enqueue_message("w_stable", "ah nm, secrets.env", None)
+            .unwrap();
+        store
+            .enqueue_message("run_thread2", "and rerun the tests", None)
+            .unwrap();
+
+        let mut input = "continue".to_string();
+        let n = fold_operator_messages(Some(&store), &["run_thread2", "w_stable"], &mut input);
+        assert_eq!(n, 2, "both mailboxes drained");
+        assert!(input.contains("ah nm, secrets.env"));
+        assert!(input.contains("and rerun the tests"));
+        // Drained: a second fold sees nothing in EITHER mailbox.
+        let mut again = "next".to_string();
+        assert_eq!(
+            fold_operator_messages(Some(&store), &["run_thread2", "w_stable"], &mut again),
+            0
+        );
 
         let _ = std::fs::remove_file(&path);
     }

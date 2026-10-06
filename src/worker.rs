@@ -1760,8 +1760,13 @@ budget only if you understand the recursion risk."
 /// only the execution vehicle changes. Full parity: the coordinator runs on the
 /// SAME backend/model the interactive session uses (claude/grok), inheriting the
 /// relevant credential via the env it's spawned with. Pure → unit-tested.
-fn coordinator_argv(spec: &WorkerSpec, task: &str, run_id: &str) -> Vec<String> {
-    vec![
+fn coordinator_argv(
+    spec: &WorkerSpec,
+    task: &str,
+    run_id: &str,
+    steer_id: Option<&str>,
+) -> Vec<String> {
+    let mut argv = vec![
         "-c".to_string(),
         task.to_string(),
         "--coordinator".to_string(),
@@ -1771,15 +1776,35 @@ fn coordinator_argv(spec: &WorkerSpec, task: &str, run_id: &str) -> Vec<String> 
         spec.backend.clone(),
         "--model".to_string(),
         spec.model.clone(),
-    ]
+    ];
+    // Steer-mailbox alias (resume-steer defect). A RESUMED worker runs under a
+    // FRESH `run_id`, but the operator — and `:tell` / `send_to_attached` —
+    // address it by its STABLE job id (`w_…`), which is the only id the REPL and
+    // `background_status` ever show. Without this the child drains a mailbox
+    // nobody writes to and every interjection queued against the visible id is
+    // silently stranded ("✉ queued … (5 pending)" that never folds in). Hand the
+    // child the stable id so it drains BOTH keys at its round boundary. Only
+    // emitted when it actually differs from `run_id`, so the first (non-resumed)
+    // launch keeps a byte-for-byte identical argv.
+    if let Some(id) = steer_id.filter(|id| *id != run_id) {
+        argv.push("--steer-id".to_string());
+        argv.push(id.to_string());
+    }
+    argv
 }
 
-fn worker_command(spec: &WorkerSpec, task: &str, run_id: &str, cwd: &std::path::Path) -> Command {
+fn worker_command(
+    spec: &WorkerSpec,
+    task: &str,
+    run_id: &str,
+    cwd: &std::path::Path,
+    steer_id: Option<&str>,
+) -> Command {
     let mut cmd = Command::new(&spec.exe);
     // The coordinator argv is the SINGLE source of truth shared with the
     // container backend (see `coordinator_argv` / `container.rs`): the host path
     // execs it directly, the container path passes it as the container command.
-    cmd.args(coordinator_argv(spec, task, run_id))
+    cmd.args(coordinator_argv(spec, task, run_id, steer_id))
         // The effective run directory: `spec.cwd` normally, or the isolated
         // worktree path when isolation is on.
         .current_dir(cwd)
@@ -3324,6 +3349,7 @@ fn build_container_command(
     task: &str,
     run_id: &str,
     run_cwd: &std::path::Path,
+    steer_id: Option<&str>,
 ) -> Option<ContainerLaunch> {
     use crate::container as c;
 
@@ -3414,7 +3440,7 @@ fn build_container_command(
     let cspec = c::ContainerSpec {
         name: c::container_name(&spec.launch_session_id, run_id),
         image: tag,
-        argv: coordinator_argv(spec, task, run_id),
+        argv: coordinator_argv(spec, task, run_id, steer_id),
         labels: c::worker_labels(
             run_id,
             &spec.launch_session_id,
@@ -3665,9 +3691,16 @@ other's files and commit onto the wrong branch, so this run is failed instead. R
         crate::container::runtime_on_path(crate::container::Runtime::Podman),
         crate::container::runtime_on_path(crate::container::Runtime::Docker),
     );
+    // The STABLE job id this run belongs to. On a RESUME, `run_id` is a fresh
+    // per-thread id while the operator (and `:tell` / `send_to_attached`) still
+    // address the worker by `job.id` — so hand the child that id as its steer
+    // mailbox alias (see `coordinator_argv`). `None` when they match (first
+    // launch), keeping the original argv byte-for-byte.
+    let steer_id = (job.id != run_id).then(|| job.id.clone());
+    let steer_id = steer_id.as_deref();
     let (mut cmd, env_file_cleanup) = match selection {
         crate::container::Selection::Container(rt) => {
-            match build_container_command(rt, &spec, &task, &run_id, &run_cwd) {
+            match build_container_command(rt, &spec, &task, &run_id, &run_cwd, steer_id) {
                 Some(launch) => {
                     crate::tools::announce(
                         &format!("[{}]", job.id),
@@ -3675,12 +3708,16 @@ other's files and commit onto the wrong branch, so this run is failed instead. R
                     );
                     (launch.cmd, Some(launch.env_file))
                 }
-                None => (worker_command(&spec, &task, &run_id, &run_cwd), None),
+                None => (
+                    worker_command(&spec, &task, &run_id, &run_cwd, steer_id),
+                    None,
+                ),
             }
         }
-        crate::container::Selection::Host => {
-            (worker_command(&spec, &task, &run_id, &run_cwd), None)
-        }
+        crate::container::Selection::Host => (
+            worker_command(&spec, &task, &run_id, &run_cwd, steer_id),
+            None,
+        ),
     };
 
     let mut child = match cmd.spawn() {
@@ -3904,7 +3941,7 @@ pub fn run_kind(run_id: &str) -> &'static str {
 pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<String, String> {
     // The goal loop never isolates (it iterates in the user's live cwd), so we
     // run in `spec.cwd` directly.
-    let mut cmd = worker_command(spec, task, run_id, &spec.cwd);
+    let mut cmd = worker_command(spec, task, run_id, &spec.cwd, None);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("couldn't launch goal worker: {e}"))?;
@@ -4157,6 +4194,54 @@ fn flush_results(jobs: &WorkerJobs) {
 
 #[cfg(test)]
 mod tests {
+    /// Resume-steer defect: a RESUMED worker runs under a FRESH coordinator
+    /// `run_id`, while the operator keeps addressing it by its stable `w_…` job
+    /// id — the only id `:tell`, `:attach`, and `background_status` ever show.
+    /// The child must be handed that stable id as a SECOND steer mailbox, or
+    /// every queued interjection is stranded ("✉ queued … (5 pending)" that
+    /// never folds in). A FIRST launch must keep a byte-for-byte identical argv.
+    #[test]
+    fn coordinator_argv_passes_the_stable_job_id_as_a_steer_alias() {
+        let spec = super::WorkerSpec {
+            exe: std::path::PathBuf::from("/usr/bin/aish"),
+            backend: "claude".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            model: "opus".to_string(),
+            env: Vec::new(),
+            isolate: false,
+            base: "main".to_string(),
+            launch_session_id: "sess".to_string(),
+            launch_session_name: None,
+            show_output: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            attached: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            coordinator_store: None,
+        };
+
+        // First launch (no alias): argv carries no --steer-id at all.
+        let first = super::coordinator_argv(&spec, "do it", "w_abc", None);
+        assert!(
+            !first.iter().any(|a| a == "--steer-id"),
+            "first launch argv must be unchanged"
+        );
+
+        // Resume: fresh run id for the thread + the stable job id as the alias.
+        let resumed = super::coordinator_argv(&spec, "do it", "w_thread2", Some("w_abc"));
+        let s = resumed
+            .iter()
+            .position(|a| a == "--steer-id")
+            .expect("--steer-id must be emitted on resume");
+        assert_eq!(resumed[s + 1], "w_abc", "alias is the STABLE job id");
+        let r = resumed
+            .iter()
+            .position(|a| a == "--run-id")
+            .expect("--run-id always present");
+        assert_eq!(resumed[r + 1], "w_thread2", "run id stays thread-distinct");
+
+        // Degenerate: alias == run id → omitted, no duplicate mailbox.
+        let same = super::coordinator_argv(&spec, "do it", "w_abc", Some("w_abc"));
+        assert_eq!(same, first);
+    }
+
     /// ISS-409757: the ledger key is DERIVED from the worktree path rather than
     /// carried on the struct, so it can never drift from the layout that made
     /// the tree. If this breaks, cleanup closes the wrong row (or none) and the

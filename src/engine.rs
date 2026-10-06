@@ -1174,10 +1174,12 @@ pub async fn run_coordinator(
     session: &mut Session,
     input: String,
     run_id: &str,
+    steer_id: Option<&str>,
 ) -> Result<()> {
     eprintln!("\x1b[2maish: coordinator run {run_id} starting\x1b[0m");
     let store = session.coordinator_store.clone();
-    let outcome = crate::coordinator::drive(backend, session, input, run_id, store.as_ref()).await;
+    let outcome =
+        crate::coordinator::drive(backend, session, input, run_id, steer_id, store.as_ref()).await;
 
     // Launch-handoff barrier (coordinator-lifecycle bug). `run_in_background`
     // spawns each sub-coordinator as a detached tokio task that, in `run_worker`,

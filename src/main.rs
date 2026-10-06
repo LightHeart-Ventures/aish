@@ -184,6 +184,16 @@ struct Args {
     #[arg(long = "run-id")]
     run_id: Option<String>,
 
+    /// Extra steer-mailbox id to drain alongside `--run-id` (resume-steer fix).
+    /// A RESUMED coordinator runs under a fresh `--run-id`, but operators —
+    /// and `:tell` / a line typed while `:attach`ed — address the worker by its
+    /// STABLE `w_…` job id, the only id the REPL ever shows. The parent passes
+    /// that stable id here so interjections queued against the VISIBLE id are
+    /// folded in at the next round boundary instead of being stranded in a
+    /// mailbox nobody reads.
+    #[arg(long = "steer-id")]
+    steer_id: Option<String>,
+
     /// Script to run non-interactively, then exit, plus its arguments
     /// (TASK-17/18). The FIRST value is the script path; the rest are passed
     /// through as the script's positional parameters `$1`/`$2`/… (with `$0` the
@@ -723,7 +733,14 @@ async fn main() -> Result<()> {
             // PANIC on EPIPE and kill this coordinator mid-work. Relay through
             // a pipe we own so writes never fail, then drain last.
             let shield = fd_shield::engage();
-            let out = engine::run_coordinator(&backend, &mut session, prompt, &run_id).await;
+            let out = engine::run_coordinator(
+                &backend,
+                &mut session,
+                prompt,
+                &run_id,
+                args.steer_id.as_deref(),
+            )
+            .await;
             shield.drain();
             return out;
         }
