@@ -2083,7 +2083,41 @@ fn statusline_segments(
     out
 }
 
+/// Keep the pinned escalation banner's status row in sync with the live worker
+/// list. Called from the footer paint path — the only place holding a `Session`
+/// — while the banner's own clock renders the runtime, so the row stays honest
+/// even on heartbeat-only repaints.
+fn refresh_escalation_status(session: &Session) {
+    let Some(id) = crate::escalation::pinned_id() else {
+        return;
+    };
+    let snapshot = session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|w| w.id == id)
+        .map(|w| {
+            (
+                w.status(),
+                w.transcript_rows().last().map(|(_, text)| text.clone()),
+            )
+        });
+    let Some((status, last)) = snapshot else {
+        return;
+    };
+    let text = match last {
+        Some(a) if !a.trim().is_empty() => format!("{status} · {}", a.trim()),
+        _ => status.clone(),
+    };
+    crate::escalation::set_status(&text);
+    if matches!(status.as_str(), "done" | "failed") {
+        crate::escalation::note_terminal(&id, status == "failed");
+    }
+}
+
 fn coordinator_status_message(session: &Session) -> String {
+    refresh_escalation_status(session);
     let attached = session.attached.lock().unwrap().clone();
     // Same ordering as `cycle_worker`: newest coordinator first (spawn order
     // reversed), each paired with a terminal (done/failed) flag.

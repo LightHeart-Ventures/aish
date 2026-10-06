@@ -15,6 +15,7 @@ mod diag;
 mod dispatch_stats;
 mod editor;
 mod engine;
+mod escalation;
 mod fd_shield;
 mod git;
 mod goal;

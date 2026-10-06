@@ -39,6 +39,25 @@ pub const FOOTER_ROWS: u16 = 3;
 /// below 4 the caller falls back to inline printing.
 pub const MIN_FOOTER_ROWS: u16 = 5;
 
+/// The footer's CURRENT height for a terminal of `rows` rows: [`FOOTER_ROWS`]
+/// normally, plus [`crate::escalation::ROWS`] while a background escalation is
+/// pinned (the escalation message + the worker's latest status, painted directly
+/// above the statusline block — see [`crate::escalation`]).
+///
+/// Every row-arithmetic site — DECSTBM bottom margin, the body-home row, the
+/// resume choreography — routes through this so growing the footer can never
+/// desync the reserved region from what we actually paint. The banner is dropped
+/// (and the footer stays at its base height) when the terminal is too short to
+/// keep 2 scrolling rows above the taller footer: a cramped window keeps its
+/// output instead of being eaten by a notification.
+pub fn footer_rows_for(rows: u16) -> u16 {
+    if crate::escalation::active() && rows >= MIN_FOOTER_ROWS + crate::escalation::ROWS {
+        FOOTER_ROWS + crate::escalation::ROWS
+    } else {
+        FOOTER_ROWS
+    }
+}
+
 /// Hard ceiling on the DSR (`ESC[6n`) cursor-position exchange in
 /// [`query_cursor_row`]. Generous for a local pty and still imperceptible, but
 /// bounded so a terminal that never answers costs one blink, not a hung shell.
@@ -340,8 +359,10 @@ pub fn spawn_footer_heartbeat() {
         .name("aish-footer-heartbeat".into())
         .spawn(|| {
             // Poll well under HEARTBEAT_IDLE so the actual repaint lands within
-            // ~half a second of the 3s idle mark.
-            let tick = Duration::from_millis(500);
+            // ~a fifth of a second of the 3s idle mark. This cadence also drives
+            // the pinned-escalation animation, so it must be ≤ the banner's
+            // frame interval or the emoji would visibly stutter.
+            let tick = Duration::from_millis(crate::escalation::FRAME_MS.min(500));
             let idle_ms = HEARTBEAT_IDLE.as_millis() as u64;
             loop {
                 std::thread::sleep(tick);
@@ -363,7 +384,10 @@ pub fn spawn_footer_heartbeat() {
                 // the last paint. The resize case bypasses the idle gate so the
                 // footer tracks the new canvas size within one tick rather than
                 // waiting out HEARTBEAT_IDLE — "update accordingly on resize".
-                if idle >= idle_ms || size_changed_since_paint() {
+                // A live escalation banner also bypasses the idle gate: its
+                // emoji animates in place (like the thinking spinner) and only
+                // a repaint advances the frame.
+                if idle >= idle_ms || size_changed_since_paint() || crate::escalation::animating() {
                     // Cursor-safe repaint (no body-home): DECSC/DECRC restores
                     // the input cursor exactly where the user left it.
                     paint_cached_footer(false);
@@ -389,6 +413,10 @@ fn paint_cached_footer(home_body: bool) {
     if rows < MIN_FOOTER_ROWS {
         return;
     }
+    // Retire a finished escalation banner once its dwell has elapsed, so the
+    // footer shrinks back on its own even while the shell sits idle (this path
+    // is what the footer heartbeat drives).
+    crate::escalation::sweep();
     // Record the size we're painting at so the heartbeat can detect a later
     // resize and refresh the footer to the new canvas dimensions on sight.
     LAST_PAINTED_SIZE.store(pack_size(rows, cols), Ordering::Relaxed);
@@ -403,7 +431,7 @@ fn paint_cached_footer(home_body: bool) {
     if home_body {
         // Override the restored cursor with an explicit home into the body so
         // the post-clear view grows up from the bottom.
-        let body_bottom = rows.saturating_sub(FOOTER_ROWS).max(1);
+        let body_bottom = rows.saturating_sub(footer_rows_for(rows)).max(1);
         buf.push_str(&format!("\x1b[{body_bottom};1H"));
     }
     let mut out = std::io::stdout();
@@ -419,7 +447,7 @@ fn paint_cached_footer(home_body: bool) {
 /// DECSTBM: set the scroll region to rows `1..=(rows - FOOTER_ROWS)`, reserving
 /// the bottom [`FOOTER_ROWS`] rows for the footer.
 pub fn scroll_region_seq(rows: u16) -> String {
-    let bottom = rows.saturating_sub(FOOTER_ROWS).max(1);
+    let bottom = rows.saturating_sub(footer_rows_for(rows)).max(1);
     format!("\x1b[1;{bottom}r")
 }
 
@@ -499,7 +527,19 @@ pub fn footer_seq(
     status_msg: &str,
     statusline: &str,
 ) -> String {
-    let sep_row = rows.saturating_sub(2);
+    // Snapshot the pinned escalation ONCE (dropping it when the window is too
+    // short) and derive the height from that snapshot, so the rows we reserve
+    // and the rows we paint agree even if the banner retires mid-paint.
+    let banner = crate::escalation::rows(crate::style::colors_enabled())
+        .filter(|_| rows >= MIN_FOOTER_ROWS + crate::escalation::ROWS);
+    let height = if banner.is_some() {
+        FOOTER_ROWS + crate::escalation::ROWS
+    } else {
+        FOOTER_ROWS
+    };
+    // The footer occupies the bottom `height` rows: separator, [escalation
+    // message, worker status,] status message, statusline.
+    let sep_row = rows.saturating_sub(height.saturating_sub(1)).max(1);
     let msg_row = rows.saturating_sub(1);
     let bar_row = rows;
     let max = cols as usize;
@@ -517,6 +557,20 @@ pub fn footer_seq(
     // self-healing without depending on the SIGWINCH watcher.
     s.push_str(&scroll_region_seq(rows));
     s.push_str(&format!("\x1b[{sep_row};1H\x1b[2K{sep}"));
+    // The pinned escalation sits between the separator and the statusline block:
+    // the (animated) escalation message, then the worker's latest status.
+    if let Some((escalation, worker)) = banner {
+        let esc_row = sep_row + 1;
+        let worker_row = sep_row + 2;
+        s.push_str(&format!(
+            "\x1b[{esc_row};1H\x1b[2K{}",
+            clip_visible(&escalation, max)
+        ));
+        s.push_str(&format!(
+            "\x1b[{worker_row};1H\x1b[2K{}",
+            clip_visible(&worker, max)
+        ));
+    }
     s.push_str(&format!("\x1b[{msg_row};1H\x1b[2K{msg}"));
     s.push_str(&format!("\x1b[{bar_row};1H\x1b[2K{bar}"));
     s.push_str("\x1b8"); // DECRC — restore cursor + attrs
@@ -614,7 +668,7 @@ impl Terminal {
         if !self.footer_enabled() {
             return;
         }
-        let body_bottom = self.rows.saturating_sub(FOOTER_ROWS).max(1);
+        let body_bottom = self.rows.saturating_sub(footer_rows_for(self.rows)).max(1);
         let mut out = std::io::stdout();
         // Install the region, suppress alternate-scroll (so the mouse wheel
         // scrolls native scrollback instead of emitting Up/Down into rustyline),
@@ -815,7 +869,7 @@ pub fn suspend_footer_region() -> bool {
 /// [`footer_overflow_rows`] for the "`ls -al` loses its last few lines" bug this
 /// fixes.
 pub fn resume_region_seq(rows: u16) -> String {
-    let body_bottom = rows.saturating_sub(FOOTER_ROWS).max(1);
+    let body_bottom = rows.saturating_sub(footer_rows_for(rows)).max(1);
     format!("{}\x1b[{body_bottom};1H", scroll_region_seq(rows))
 }
 
@@ -849,8 +903,9 @@ pub fn resume_region_seq(rows: u16) -> String {
 /// zone and a fixed scroll would jerk the screen on every single command. The
 /// measured overflow is what makes this safe.
 pub fn footer_overflow_rows(rows: u16, cursor_row: u16) -> u16 {
-    let body_bottom = rows.saturating_sub(FOOTER_ROWS).max(1);
-    cursor_row.saturating_sub(body_bottom).min(FOOTER_ROWS)
+    let height = footer_rows_for(rows);
+    let body_bottom = rows.saturating_sub(height).max(1);
+    cursor_row.saturating_sub(body_bottom).min(height)
 }
 
 /// [`resume_region_seq`] preceded by the corrective scroll-up derived from the
