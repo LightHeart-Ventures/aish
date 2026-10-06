@@ -153,7 +153,9 @@ struct GhReleaseSummary {
 /// name starts with `prefix`. Pure so the Dev/Ci discovery filter is unit-tested
 /// without hitting the network.
 fn first_with_prefix<'a>(tags: &'a [String], prefix: &str) -> Option<&'a str> {
-    tags.iter().map(|s| s.as_str()).find(|t| t.starts_with(prefix))
+    tags.iter()
+        .map(|s| s.as_str())
+        .find(|t| t.starts_with(prefix))
 }
 
 /// Rust target triples whose release asset would run on this host, most-preferred
@@ -280,14 +282,7 @@ async fn resolve_latest(repo: &str) -> Result<Option<GhRelease>> {
 async fn resolve_prefixed(repo: &str, prefix: &str) -> Result<Option<GhRelease>> {
     let out = tokio::process::Command::new("gh")
         .args([
-            "release",
-            "list",
-            "--repo",
-            repo,
-            "--limit",
-            "100",
-            "--json",
-            "tagName",
+            "release", "list", "--repo", repo, "--limit", "100", "--json", "tagName",
         ])
         .output()
         .await
@@ -366,9 +361,7 @@ pub async fn check_channel(ch: Channel) -> Result<Option<UpdateInfo>> {
 /// an upgrade). Keeping the raw latest — not just the upgrade decision — lets a
 /// later cache read re-evaluate `is_newer` against a freshly-updated
 /// `current_version()` without another network round-trip.
-async fn resolve_channel_network(
-    ch: Channel,
-) -> Result<(Option<UpdateInfo>, Option<CachedCheck>)> {
+async fn resolve_channel_network(ch: Channel) -> Result<(Option<UpdateInfo>, Option<CachedCheck>)> {
     let repo = repo();
     let Some(release) = resolve_release(&repo, ch).await? else {
         // No release published for this channel yet — nothing to cache.
@@ -1119,8 +1112,7 @@ pub async fn perform_with_drain(info: &UpdateInfo, ctx: &DrainCtx<'_>) -> Result
     let dest_dir = current_exe
         .parent()
         .ok_or_else(|| anyhow!("can't determine the directory of {}", current_exe.display()))?;
-    writable_check(dest_dir)
-        .with_context(|| format!("{} is not writable", dest_dir.display()))?;
+    writable_check(dest_dir).with_context(|| format!("{} is not writable", dest_dir.display()))?;
 
     // Stage 1 — quiesce (always returns a report).
     let report = drain(ctx).await;
@@ -1132,7 +1124,10 @@ pub async fn perform_with_drain(info: &UpdateInfo, ctx: &DrainCtx<'_>) -> Result
     // Stage 3 — restart (reached ONLY after a successful swap). `restart_in_place`
     // returns only on re-exec failure.
     let restart_error = Some(restart_in_place());
-    Ok(DrainOutcome { report, restart_error })
+    Ok(DrainOutcome {
+        report,
+        restart_error,
+    })
 }
 
 /// The result of a [`perform_with_drain`] that got past the swap. `restart_error`
@@ -1368,8 +1363,14 @@ mod drain_tests {
             },
         );
         assert_eq!(out, StagedOutcome::QuiesceFailed("nope".into()));
-        assert!(!swap_ran.get(), "swap must not run when quiesce fails (AC5)");
-        assert!(!restart_ran.get(), "restart must not run when quiesce fails");
+        assert!(
+            !swap_ran.get(),
+            "swap must not run when quiesce fails (AC5)"
+        );
+        assert!(
+            !restart_ran.get(),
+            "restart must not run when quiesce fails"
+        );
     }
 
     #[test]
@@ -1385,7 +1386,10 @@ mod drain_tests {
             },
         );
         assert_eq!(out, StagedOutcome::SwapFailed("swap blew up".into()));
-        assert!(!restart_ran.get(), "restart must not run when swap fails (AC5)");
+        assert!(
+            !restart_ran.get(),
+            "restart must not run when swap fails (AC5)"
+        );
     }
 
     #[test]

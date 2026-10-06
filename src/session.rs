@@ -84,7 +84,11 @@ pub enum LoopTick {
 /// Read live (not cached) so it can be flipped per invocation. See
 /// [`ResumeState`].
 pub fn auto_resume_enabled() -> bool {
-    resume_enabled_from(std::env::var("AISH_AUTO_RESUME_ON_CHILD_COMPLETE").ok().as_deref())
+    resume_enabled_from(
+        std::env::var("AISH_AUTO_RESUME_ON_CHILD_COMPLETE")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Pure core of [`auto_resume_enabled`] — testable without mutating process env.
@@ -606,7 +610,8 @@ impl Session {
 
     /// Set the `:worker-output` mode. Pins `show_worker_output` to match.
     pub fn set_worker_output_mode(&self, mode: crate::worker::WorkerOutputMode) {
-        self.worker_output_mode.store(mode.as_u8(), Ordering::SeqCst);
+        self.worker_output_mode
+            .store(mode.as_u8(), Ordering::SeqCst);
         match mode {
             crate::worker::WorkerOutputMode::On => {
                 self.show_worker_output.store(true, Ordering::SeqCst)
@@ -861,9 +866,7 @@ impl Session {
                 "loop active — {}/{} iterations dispatched · prompt: {}",
                 st.done, st.total, st.prompt
             ),
-            None => {
-                "no loop running — `:loop <count> <prompt>` to start one".to_string()
-            }
+            None => "no loop running — `:loop <count> <prompt>` to start one".to_string(),
         }
     }
 
@@ -882,13 +885,7 @@ impl Session {
         }
         // Attached to a coordinator → typed input is steered to it; don't also
         // auto-synthesize here.
-        if self
-            .attached
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
-            .is_some()
-        {
+        if self.attached.lock().ok().and_then(|g| g.clone()).is_some() {
             return None;
         }
         let ids = self.resume.lock().ok()?.take()?;
@@ -934,7 +931,10 @@ impl Session {
     pub fn persist_goal(&mut self, goal: crate::goal::Goal) {
         if let Some(db) = &self.db {
             if let Err(e) = db.upsert_goal(&goal) {
-                eprintln!("\x1b[33maish:\x1b[0m could not persist goal {}: {e:#}", goal.id);
+                eprintln!(
+                    "\x1b[33maish:\x1b[0m could not persist goal {}: {e:#}",
+                    goal.id
+                );
             }
         }
         match self.goals.iter_mut().find(|g| g.id == goal.id) {
@@ -952,7 +952,9 @@ impl Session {
                 if db.health_check() {
                     true
                 } else {
-                    eprintln!("\x1b[33maish:\x1b[0m ⚠ database health check failed; persistence may be degraded");
+                    eprintln!(
+                        "\x1b[33maish:\x1b[0m ⚠ database health check failed; persistence may be degraded"
+                    );
                     false
                 }
             }
@@ -1000,7 +1002,6 @@ impl Session {
             );
         }
     }
-
 
     pub fn active_goal(&self) -> Option<&crate::goal::Goal> {
         // `self.goals` is loaded newest-updated-first (all_goals ORDER BY
@@ -1092,7 +1093,11 @@ impl Session {
         let mut notices = Vec::new();
         for task in tasks {
             for (title, pct) in self.record_coordinator_task_progress(&task) {
-                let tail = if pct == 100 { " — goal complete ✅" } else { "" };
+                let tail = if pct == 100 {
+                    " — goal complete ✅"
+                } else {
+                    ""
+                };
                 notices.push(format!(
                     "\x1b[2m🎯 goal '{}' → {pct}%{tail}\x1b[0m",
                     crate::goal::truncate_condition(&title)
@@ -1419,8 +1424,7 @@ fluff.{skills}{batch}{escalate}{console}{goal}{task}",
 
 /// Header for the TASK-279 active-goal context block appended to the per-turn
 /// system prompt. Deliberately terse — the whole block must stay token-cheap.
-const GOAL_CONTEXT_HEADER: &str =
-    "Active goal context (keep your decisions aligned to this; the blockers below are impeding \
+const GOAL_CONTEXT_HEADER: &str = "Active goal context (keep your decisions aligned to this; the blockers below are impeding \
 progress — resolve or work around them):";
 
 /// The default on-disk skills directory: `~/.aish/skills`. Mirrors main.rs's
@@ -1683,7 +1687,12 @@ mod tests {
         assert_eq!(session.goals.len(), 2, "cache tracks both goals");
 
         // Re-mutate the root (status change) — cache must replace, not append.
-        let mut reopened = session.goals.iter().find(|g| g.id == root_id).unwrap().clone();
+        let mut reopened = session
+            .goals
+            .iter()
+            .find(|g| g.id == root_id)
+            .unwrap()
+            .clone();
         reopened.set_status(GoalStatus::Completed);
         session.persist_goal(reopened);
         assert_eq!(session.goals.len(), 2, "in-place update, no duplicate row");
@@ -1694,9 +1703,16 @@ mod tests {
         restarted.load_goals();
         assert_eq!(restarted.goals.len(), 2, "both goals rehydrate on start");
         let loaded_root = restarted.goals.iter().find(|g| g.id == root_id).unwrap();
-        assert_eq!(loaded_root.status, GoalStatus::Completed, "status persisted");
+        assert_eq!(
+            loaded_root.status,
+            GoalStatus::Completed,
+            "status persisted"
+        );
         assert!(
-            restarted.goals.iter().any(|g| g.parent_id.as_deref() == Some(root_id.as_str())),
+            restarted
+                .goals
+                .iter()
+                .any(|g| g.parent_id.as_deref() == Some(root_id.as_str())),
             "subgoal parent link round-trips"
         );
 
@@ -1728,7 +1744,11 @@ mod tests {
         // load_goals orders newest-updated-first; reconcile keeps that one.
         session.load_goals();
         let kept = session.reconcile_active_goal();
-        assert_eq!(kept.as_deref(), Some(newer_id.as_str()), "newest stays active");
+        assert_eq!(
+            kept.as_deref(),
+            Some(newer_id.as_str()),
+            "newest stays active"
+        );
         assert_eq!(
             session.active_goal().map(|g| g.id.clone()),
             Some(newer_id.clone()),
@@ -1778,9 +1798,11 @@ mod tests {
         );
 
         // Re-running the same finish is a no-op (already done).
-        assert!(session
-            .record_coordinator_task_progress("TASK-500 again")
-            .is_empty());
+        assert!(
+            session
+                .record_coordinator_task_progress("TASK-500 again")
+                .is_empty()
+        );
 
         // The second linked coordinator finishes → 100% and auto-complete.
         let advanced2 = session.record_coordinator_task_progress("done with TASK-501");
@@ -1791,7 +1813,10 @@ mod tests {
             "goal auto-completes when all linked tasks finish"
         );
         // Badge reflects the active goal only — none active now.
-        assert!(session.goal_badge().is_none(), "no active goal after completion");
+        assert!(
+            session.goal_badge().is_none(),
+            "no active goal after completion"
+        );
     }
 
     #[test]
@@ -1804,7 +1829,10 @@ mod tests {
         goal.link_task(TaskRef::new("TASK-282"));
         session.persist_goal(goal);
         let badge = session.goal_badge().expect("active goal → badge");
-        assert!(badge.contains("Persist goals"), "badge names the goal: {badge}");
+        assert!(
+            badge.contains("Persist goals"),
+            "badge names the goal: {badge}"
+        );
         assert!(badge.contains("0%"), "badge shows rollup percent: {badge}");
     }
 
@@ -1906,7 +1934,10 @@ mod tests {
         let session = Session::new().unwrap();
         for escalate in [false, true] {
             let p = session.system_prompt(escalate);
-            assert!(p.contains("Batch tool calls"), "missing batch-tool-calls rule");
+            assert!(
+                p.contains("Batch tool calls"),
+                "missing batch-tool-calls rule"
+            );
             assert!(
                 p.contains("fire ALL independent calls in ONE turn"),
                 "missing batch-in-one-turn directive"
@@ -1945,7 +1976,10 @@ mod tests {
         let session = Session::new().unwrap();
         for escalate in [false, true] {
             let p = session.system_prompt(escalate);
-            assert!(p.contains("Decide-then-act"), "missing decide-then-act rule");
+            assert!(
+                p.contains("Decide-then-act"),
+                "missing decide-then-act rule"
+            );
             assert!(
                 p.contains("read→think→read ping-pong"),
                 "missing ping-pong collapse directive"
@@ -1996,12 +2030,18 @@ mod tests {
         session.goals.push(g);
 
         let p = session.system_prompt(false);
-        assert!(p.contains("Active goal context"), "missing goal header: {p}");
+        assert!(
+            p.contains("Active goal context"),
+            "missing goal header: {p}"
+        );
         assert!(
             p.contains("Goal: Ship the active-goal injection"),
             "missing goal title"
         );
-        assert!(p.contains("current milestone: build"), "missing current milestone");
+        assert!(
+            p.contains("current milestone: build"),
+            "missing current milestone"
+        );
         assert!(p.contains("1/3 done"), "missing progress count");
         assert!(p.contains("33%"), "missing percent");
         assert!(
@@ -2031,7 +2071,10 @@ mod tests {
         // Flip one to active → it now injects.
         session.goals.push(Goal::new("Now active"));
         let p = session.system_prompt(false);
-        assert!(p.contains("Active goal context"), "active goal should inject");
+        assert!(
+            p.contains("Active goal context"),
+            "active goal should inject"
+        );
         assert!(p.contains("Goal: Now active"), "wrong goal chosen: {p}");
     }
 
@@ -2047,8 +2090,14 @@ mod tests {
         session.goals.push(older);
         session.goals.push(newer);
         let p = session.system_prompt(false);
-        assert!(p.contains("Goal: Newer goal"), "expected newest active goal: {p}");
-        assert!(!p.contains("Goal: Older goal"), "older goal must not be chosen");
+        assert!(
+            p.contains("Goal: Newer goal"),
+            "expected newest active goal: {p}"
+        );
+        assert!(
+            !p.contains("Goal: Older goal"),
+            "older goal must not be chosen"
+        );
     }
 
     #[test]
@@ -2060,10 +2109,7 @@ mod tests {
         for escalate in [false, true] {
             let p = session.system_prompt(escalate);
             assert!(p.contains(".repospec.json"), "missing repospec directive");
-            assert!(
-                p.contains("read it, VERIFY it"),
-                "missing read/verify path"
-            );
+            assert!(p.contains("read it, VERIFY it"), "missing read/verify path");
             assert!(
                 p.contains("If it's ABSENT, build one"),
                 "missing create-when-absent path"
@@ -2235,7 +2281,10 @@ mod tests {
         let mut r = ResumeState::default();
         assert!(!r.observe(&["w_a".into()], 1));
         assert!(r.observe(&["w_b".into()], 0));
-        assert!(!r.forget("w_a"), "still one pending id → resume stays armed");
+        assert!(
+            !r.forget("w_a"),
+            "still one pending id → resume stays armed"
+        );
         assert_eq!(r.take().unwrap(), vec!["w_b".to_string()]);
     }
 
@@ -2246,7 +2295,10 @@ mod tests {
         }
         let mut r = ResumeState::default();
         assert!(r.observe(&["w_a".into()], 0));
-        assert!(!r.forget("w_zzz"), "forgetting an unknown id changes nothing");
+        assert!(
+            !r.forget("w_zzz"),
+            "forgetting an unknown id changes nothing"
+        );
         assert_eq!(r.take().unwrap(), vec!["w_a".to_string()]);
     }
 

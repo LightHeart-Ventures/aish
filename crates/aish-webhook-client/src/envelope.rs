@@ -116,7 +116,10 @@ impl ServerFrame {
                     .get("session_token")
                     .and_then(|x| x.as_str())
                     .map(String::from),
-                client_id: v.get("client_id").and_then(|x| x.as_str()).map(String::from),
+                client_id: v
+                    .get("client_id")
+                    .and_then(|x| x.as_str())
+                    .map(String::from),
             }),
             Some("pong") => Ok(ServerFrame::Other),
             _ => {
@@ -163,7 +166,10 @@ mod tests {
     fn parse_auth_ok() {
         let txt = r#"{"type":"auth_ok","session_token":"s123","client_id":"c1"}"#;
         match ServerFrame::parse(txt).unwrap() {
-            ServerFrame::AuthOk { session_token, client_id } => {
+            ServerFrame::AuthOk {
+                session_token,
+                client_id,
+            } => {
                 assert_eq!(session_token.as_deref(), Some("s123"));
                 assert_eq!(client_id.as_deref(), Some("c1"));
             }
@@ -173,7 +179,10 @@ mod tests {
 
     #[test]
     fn parse_ping() {
-        assert_eq!(ServerFrame::parse(r#"{"type":"ping"}"#).unwrap(), ServerFrame::Ping);
+        assert_eq!(
+            ServerFrame::parse(r#"{"type":"ping"}"#).unwrap(),
+            ServerFrame::Ping
+        );
     }
 
     #[test]

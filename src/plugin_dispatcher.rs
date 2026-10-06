@@ -30,7 +30,7 @@
 
 use crate::plugin_state::PluginStateStore;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -503,7 +503,10 @@ mod flash_tests {
             "must cap to 60 chars, got {}",
             out.chars().count(),
         );
-        assert!(out.ends_with('…'), "an over-long line must be elided: {out}");
+        assert!(
+            out.ends_with('…'),
+            "an over-long line must be elided: {out}"
+        );
     }
 
     #[test]

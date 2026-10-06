@@ -76,9 +76,9 @@ mod net_impl {
         async fn recv(&mut self) -> Result<Option<WsMessage>> {
             match self.inner.next().await {
                 Some(Ok(Message::Text(t))) => Ok(Some(WsMessage::Text(t))),
-                Some(Ok(Message::Binary(b))) => {
-                    Ok(Some(WsMessage::Text(String::from_utf8_lossy(&b).into_owned())))
-                }
+                Some(Ok(Message::Binary(b))) => Ok(Some(WsMessage::Text(
+                    String::from_utf8_lossy(&b).into_owned(),
+                ))),
                 Some(Ok(Message::Ping(p))) => Ok(Some(WsMessage::Ping(p))),
                 Some(Ok(Message::Pong(p))) => Ok(Some(WsMessage::Pong(p))),
                 Some(Ok(Message::Close(_))) => Ok(Some(WsMessage::Close)),

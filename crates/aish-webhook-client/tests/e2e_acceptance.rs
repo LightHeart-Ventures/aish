@@ -128,7 +128,9 @@ async fn e2e_dispatch_forkexec_captures_output_and_audits() {
         .iter()
         .all(|r| r.webhook_id == "w-e2e-1" && r.tenant_id == "acme"));
     assert!(records.iter().any(|r| r.plugin_id == "echo" && r.success));
-    assert!(records.iter().any(|r| r.plugin_id == "broken" && !r.success));
+    assert!(records
+        .iter()
+        .any(|r| r.plugin_id == "broken" && !r.success));
 }
 
 /// Full ingress path over the mock transport: the message loop reads a webhook

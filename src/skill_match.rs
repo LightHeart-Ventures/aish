@@ -133,7 +133,11 @@ pub fn rank<'a>(task: &str, skills: &'a [Skill]) -> Vec<Match<'a>> {
         })
         .filter(|m| m.score >= MIN_SCORE)
         .collect();
-    matches.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.skill.name.cmp(&b.skill.name)));
+    matches.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.skill.name.cmp(&b.skill.name))
+    });
     matches
 }
 
@@ -584,7 +588,13 @@ mod tests {
     #[test]
     fn repo_scope_boost_promotes_applies_to_match() {
         let c = vec![
-            skill_meta("rust-pro", "Rust performance.", &["performance"], &["aish"], &[]),
+            skill_meta(
+                "rust-pro",
+                "Rust performance.",
+                &["performance"],
+                &["aish"],
+                &[],
+            ),
             skill_meta(
                 "perf-generic",
                 "Generic performance tuning.",
@@ -595,7 +605,10 @@ mod tests {
         ];
         let r = skill_match("optimize performance", Some("aish"), &c);
         assert_eq!(r[0].skill.name, "rust-pro");
-        assert!(r[0].score > r[1].score, "repo-scoped skill should outrank: {r:?}");
+        assert!(
+            r[0].score > r[1].score,
+            "repo-scoped skill should outrank: {r:?}"
+        );
     }
 
     #[test]
@@ -733,7 +746,10 @@ mod tests {
         let skills = catalog();
         // "performance bottleneck latency" hits the profiler name + description
         // strongly; nothing else should rank.
-        let ranked = rank("find the performance bottleneck causing P99 latency", &skills);
+        let ranked = rank(
+            "find the performance bottleneck causing P99 latency",
+            &skills,
+        );
         assert_eq!(ranked[0].skill.name, "performance-profiler");
         assert!(ranked[0].score >= NAME_WEIGHT);
     }
@@ -762,7 +778,11 @@ mod tests {
 
     // ---- registry recommendation (no installed skill matched) -----------
 
-    fn search_result(name: &str, description: &str, reference: &str) -> crate::skill_provider::SearchResult {
+    fn search_result(
+        name: &str,
+        description: &str,
+        reference: &str,
+    ) -> crate::skill_provider::SearchResult {
         crate::skill_provider::SearchResult {
             name: name.into(),
             author: "anthropic".into(),
@@ -776,16 +796,30 @@ mod tests {
     /// A small registry catalog modeled on the binary-shipped index.json.
     fn registry() -> Vec<crate::skill_provider::SearchResult> {
         vec![
-            search_result("git-rebase", "Rebase and squash git commits interactively.", "anthropic/git-rebase"),
-            search_result("kubernetes-deploy", "Deploy applications to Kubernetes clusters.", "anthropic/kubernetes-deploy"),
-            search_result("terraform-plan", "Plan and apply Terraform infrastructure changes.", "anthropic/terraform-plan"),
+            search_result(
+                "git-rebase",
+                "Rebase and squash git commits interactively.",
+                "anthropic/git-rebase",
+            ),
+            search_result(
+                "kubernetes-deploy",
+                "Deploy applications to Kubernetes clusters.",
+                "anthropic/kubernetes-deploy",
+            ),
+            search_result(
+                "terraform-plan",
+                "Plan and apply Terraform infrastructure changes.",
+                "anthropic/terraform-plan",
+            ),
         ]
     }
 
     #[test]
     fn skill_worthy_gate_filters_trivial_tasks() {
         // Substantial multi-word tasks clear the bar; short commands don't.
-        assert!(is_skill_worthy("deploy this application to a kubernetes cluster"));
+        assert!(is_skill_worthy(
+            "deploy this application to a kubernetes cluster"
+        ));
         assert!(!is_skill_worthy("ls /tmp"));
         assert!(!is_skill_worthy("git status"));
         assert!(!is_skill_worthy(""));
@@ -800,10 +834,22 @@ mod tests {
         )
         .expect("a kubernetes task should match the kubernetes-deploy skill");
         assert_eq!(rec.reference, "anthropic/kubernetes-deploy");
-        assert!(rec.note.starts_with("[aish skill-awareness]"), "{}", rec.note);
-        assert!(rec.note.contains(":skill add anthropic/kubernetes-deploy"), "{}", rec.note);
+        assert!(
+            rec.note.starts_with("[aish skill-awareness]"),
+            "{}",
+            rec.note
+        );
+        assert!(
+            rec.note.contains(":skill add anthropic/kubernetes-deploy"),
+            "{}",
+            rec.note
+        );
         // The note steers away from faking/hand-rolling the skill.
-        assert!(rec.note.to_lowercase().contains("not pretend"), "{}", rec.note);
+        assert!(
+            rec.note.to_lowercase().contains("not pretend"),
+            "{}",
+            rec.note
+        );
     }
 
     #[test]
@@ -830,7 +876,11 @@ mod tests {
         assert_eq!(recommend_install("git status", &[], &registry()), None);
         // Substantial, but nothing in the catalog is relevant.
         assert_eq!(
-            recommend_install("what is the capital of france today please", &[], &registry()),
+            recommend_install(
+                "what is the capital of france today please",
+                &[],
+                &registry()
+            ),
             None
         );
     }

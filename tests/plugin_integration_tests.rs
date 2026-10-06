@@ -17,16 +17,15 @@ use std::path::Path;
 #[test]
 fn test_hello_world_plugin_discovery() {
     let plugin_dir = Path::new("examples/plugins/hello-world");
-    assert!(plugin_dir.exists(), "hello-world plugin directory must exist");
-
-    let manifest_path = plugin_dir.join("plugin.json");
     assert!(
-        manifest_path.exists(),
-        "hello-world plugin.json must exist"
+        plugin_dir.exists(),
+        "hello-world plugin directory must exist"
     );
 
-    let manifest_text = fs::read_to_string(&manifest_path)
-        .expect("read hello-world plugin.json");
+    let manifest_path = plugin_dir.join("plugin.json");
+    assert!(manifest_path.exists(), "hello-world plugin.json must exist");
+
+    let manifest_text = fs::read_to_string(&manifest_path).expect("read hello-world plugin.json");
 
     // Verify manifest structure
     let manifest: serde_json::Value =
@@ -54,10 +53,7 @@ fn test_hello_world_plugin_discovery() {
 #[test]
 fn test_hello_world_skill_discovery() {
     let skill_dir = Path::new("examples/plugins/hello-world/skills/hello-world");
-    assert!(
-        skill_dir.exists(),
-        "hello-world skill directory must exist"
-    );
+    assert!(skill_dir.exists(), "hello-world skill directory must exist");
 
     let skill_md = skill_dir.join("SKILL.md");
     assert!(skill_md.exists(), "hello-world SKILL.md must exist");
@@ -103,10 +99,7 @@ fn test_plugin_state_isolation() {
 /// Verifies that state survives across store close/reopen cycles.
 #[test]
 fn test_plugin_state_persistence() {
-    let temp_dir = std::env::temp_dir().join(format!(
-        "aish-plugin-test-{}",
-        std::process::id()
-    ));
+    let temp_dir = std::env::temp_dir().join(format!("aish-plugin-test-{}", std::process::id()));
     let _ = fs::create_dir_all(&temp_dir);
     let db_path = temp_dir.join("test-plugins.db");
 
@@ -115,8 +108,7 @@ fn test_plugin_state_persistence() {
 
     // Open, write, close
     {
-        let store =
-            PluginStateStore::open(&db_path).expect("open file-backed store");
+        let store = PluginStateStore::open(&db_path).expect("open file-backed store");
         store
             .set("hello-world", "init_count", &serde_json::json!(42))
             .expect("write to store");
@@ -141,8 +133,7 @@ fn test_plugin_state_persistence() {
 #[test]
 fn test_hello_world_webhook_manifest() {
     let manifest_path = Path::new("examples/plugins/hello-world/plugin.json");
-    let manifest_text = fs::read_to_string(manifest_path)
-        .expect("read hello-world plugin.json");
+    let manifest_text = fs::read_to_string(manifest_path).expect("read hello-world plugin.json");
     let manifest: serde_json::Value =
         serde_json::from_str(&manifest_text).expect("parse plugin.json");
 

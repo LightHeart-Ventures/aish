@@ -200,7 +200,10 @@ mod tests {
         assert!(out.contains("KB elided"));
         assert!(out.contains("context-offload"));
         // ~3 KB elided (5000 - 2000 = 3000 bytes → 3 KB).
-        assert!(out.contains("+3 KB"), "marker should state elided size: {out}");
+        assert!(
+            out.contains("+3 KB"),
+            "marker should state elided size: {out}"
+        );
     }
 
     #[test]
@@ -214,9 +217,15 @@ mod tests {
 
     #[test]
     fn fts_match_query_builds_prefix_or_and_is_syntax_safe() {
-        assert_eq!(fts_match_query("fix the build").as_deref(), Some("fix* OR the* OR build*"));
+        assert_eq!(
+            fts_match_query("fix the build").as_deref(),
+            Some("fix* OR the* OR build*")
+        );
         // Punctuation/operators are stripped to barewords — never an FTS syntax error.
-        assert_eq!(fts_match_query("error: NEAR(x)").as_deref(), Some("error* OR near* OR x*"));
+        assert_eq!(
+            fts_match_query("error: NEAR(x)").as_deref(),
+            Some("error* OR near* OR x*")
+        );
         // All-punctuation / empty → None so the caller falls back to a scan.
         assert_eq!(fts_match_query("   "), None);
         assert_eq!(fts_match_query("%%%"), None);
@@ -230,7 +239,10 @@ mod tests {
         assert_eq!(a, b);
         // L2-normalized (unit length, modulo float error).
         let norm: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-5, "embedding should be unit length: {norm}");
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "embedding should be unit length: {norm}"
+        );
         // Token overlap drives similarity: a near-identical sentence ranks far
         // above an unrelated one.
         let related = embed("the rust compiler is very fast");

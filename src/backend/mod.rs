@@ -1,8 +1,8 @@
 pub mod claude;
 pub mod grok;
-pub mod openai;
 #[cfg(feature = "local")]
 pub mod local;
+pub mod openai;
 
 use anyhow::Result;
 use serde_json::Value;
@@ -181,9 +181,9 @@ impl ToolResult {
         // knows the payload is off-spec, while the payload itself still flows
         // through unchanged (fail-open). Zero overhead when no violation is set.
         match &self.schema_violation {
-            Some(note) => std::borrow::Cow::Owned(format!(
-                "[schema-validation warning] {note}\n\n{body}"
-            )),
+            Some(note) => {
+                std::borrow::Cow::Owned(format!("[schema-validation warning] {note}\n\n{body}"))
+            }
             None => body,
         }
     }
@@ -410,13 +410,9 @@ impl Backend {
         match self {
             Backend::Claude(b) => b.complete_streaming(system, history, tools, sink).await,
             Backend::Grok(b) => deferred_stream(b.complete(system, history, tools).await?, sink),
-            Backend::OpenAi(b) => {
-                deferred_stream(b.complete(system, history, tools).await?, sink)
-            }
+            Backend::OpenAi(b) => deferred_stream(b.complete(system, history, tools).await?, sink),
             #[cfg(feature = "local")]
-            Backend::Local(b) => {
-                deferred_stream(b.complete(system, history, tools).await?, sink)
-            }
+            Backend::Local(b) => deferred_stream(b.complete(system, history, tools).await?, sink),
         }
     }
 
@@ -507,7 +503,11 @@ fn deferred_stream(turn: Turn, sink: StreamSink<'_>) -> Result<Turn> {
 
 /// Pure escalation policy, split out so it's unit-testable without constructing
 /// a live backend (which needs credentials).
-fn resolve_escalation(kind: &str, model: &str, batch_model: &str) -> Option<(&'static str, String)> {
+fn resolve_escalation(
+    kind: &str,
+    model: &str,
+    batch_model: &str,
+) -> Option<(&'static str, String)> {
     match kind {
         // Opus is already the strongest Claude model — nothing to escalate to.
         "claude" if model.contains("opus") => None,
@@ -575,7 +575,10 @@ mod tests {
         // Did NOT ship the giant JSON array...
         assert!(!out.starts_with("[{"), "oversized JSON must not be sent");
         // ...shipped the (capped) rendered text instead.
-        assert!(out.contains("representative rendered text"), "fell back to text");
+        assert!(
+            out.contains("representative rendered text"),
+            "fell back to text"
+        );
         assert!(out.len() <= 100_000, "capped under budget: {}", out.len());
     }
 
@@ -598,7 +601,10 @@ mod tests {
         // BORROWED — no JSON allocation), is_error preserved.
         assert!(text.structured.is_none(), "text-only carries no payload");
         assert_eq!(text.model_content(), content);
-        assert!(matches!(text.model_content(), std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(
+            text.model_content(),
+            std::borrow::Cow::Borrowed(_)
+        ));
 
         // Structured path: payload present, but content + is_error are UNCHANGED
         // relative to the text-only result — the payload is purely additive.

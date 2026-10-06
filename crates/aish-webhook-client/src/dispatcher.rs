@@ -209,9 +209,11 @@ pub fn passes_filters(
     payload: &serde_json::Value,
     filters: &serde_json::Map<String, serde_json::Value>,
 ) -> bool {
-    filters
-        .iter()
-        .all(|(k, expected)| get_path(payload, k).map(|got| got == expected).unwrap_or(false))
+    filters.iter().all(|(k, expected)| {
+        get_path(payload, k)
+            .map(|got| got == expected)
+            .unwrap_or(false)
+    })
 }
 
 /// Sink for surfacing a handler's stdout live (e.g. the SecondStatusLine
@@ -575,14 +577,18 @@ mod tests {
         }]);
         let flashed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink_store = flashed.clone();
-        let d = WebhookDispatcher::new(Arc::new(reg)).with_flash_sink(Arc::new(
-            move |msg: String| sink_store.lock().unwrap().push(msg),
-        ));
+        let d =
+            WebhookDispatcher::new(Arc::new(reg)).with_flash_sink(Arc::new(move |msg: String| {
+                sink_store.lock().unwrap().push(msg)
+            }));
         let outs = d.dispatch(&wh("issues", json!({"action":"opened"}))).await;
         assert!(outs[0].success);
         let got = flashed.lock().unwrap();
         assert_eq!(got.len(), 1, "exactly one flash for one executed handler");
-        assert!(got[0].contains("Hello, World!"), "stdout reached statusline sink");
+        assert!(
+            got[0].contains("Hello, World!"),
+            "stdout reached statusline sink"
+        );
     }
 
     #[tokio::test]
@@ -617,11 +623,14 @@ mod tests {
                 timeout_secs: None,
             }],
         }]);
-        let d = WebhookDispatcher::new(Arc::new(reg))
-            .with_default_timeout(Duration::from_millis(150));
+        let d =
+            WebhookDispatcher::new(Arc::new(reg)).with_default_timeout(Duration::from_millis(150));
         let start = Instant::now();
         let outs = d.dispatch(&wh("push", json!({}))).await;
-        assert!(start.elapsed() < Duration::from_secs(2), "must not wait full 5s");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must not wait full 5s"
+        );
         assert_eq!(outs.len(), 1);
         assert!(outs[0].error.as_deref().unwrap_or("").contains("timed out"));
         assert!(!outs[0].success);
@@ -643,7 +652,9 @@ mod tests {
             }],
         }]);
         let d = WebhookDispatcher::new(Arc::new(reg));
-        let outs = d.dispatch(&wh("pull_request", json!({"action":"closed"}))).await;
+        let outs = d
+            .dispatch(&wh("pull_request", json!({"action":"closed"})))
+            .await;
         assert_eq!(outs.len(), 1);
         assert!(!outs[0].executed);
         assert!(outs[0].matched);
@@ -677,7 +688,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let base = std::env::temp_dir().join(format!("aish-wh-legacy-{}-{uniq}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("aish-wh-legacy-{}-{uniq}", std::process::id()));
         let pdir = base.join("legacy");
         std::fs::create_dir_all(&pdir).unwrap();
         // Legacy schema: top-level `handlers` (no `webhooks`).
@@ -687,7 +699,11 @@ mod tests {
         )
         .unwrap();
         let reg = PluginRegistry::load_dir(&base).unwrap();
-        assert_eq!(reg.len(), 0, "legacy handlers-only manifest must be skipped, not silently loaded");
+        assert_eq!(
+            reg.len(),
+            0,
+            "legacy handlers-only manifest must be skipped, not silently loaded"
+        );
         assert_eq!(reg.matching("push").len(), 0);
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -700,7 +716,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let base = std::env::temp_dir().join(format!("aish-wh-mixed-{}-{uniq}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("aish-wh-mixed-{}-{uniq}", std::process::id()));
         std::fs::create_dir_all(base.join("legacy")).unwrap();
         std::fs::create_dir_all(base.join("modern")).unwrap();
         std::fs::write(
@@ -714,7 +731,11 @@ mod tests {
         )
         .unwrap();
         let reg = PluginRegistry::load_dir(&base).unwrap();
-        assert_eq!(reg.len(), 1, "only the modern `webhooks` plugin is registered");
+        assert_eq!(
+            reg.len(),
+            1,
+            "only the modern `webhooks` plugin is registered"
+        );
         assert_eq!(reg.matching("push").len(), 1);
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -747,7 +768,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("aish-wh-inject-{}-{uniq}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("aish-wh-inject-{}-{uniq}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         // 1) Metacharacters in a COMMAND ARGUMENT must stay literal.

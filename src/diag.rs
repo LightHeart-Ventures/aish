@@ -42,7 +42,9 @@ pub enum AishDiagnostic {
     #[error("unbalanced quote")]
     #[diagnostic(
         code(aish::parse::unbalanced_quote),
-        help("close the quote — or, if you meant prose (an apostrophe in English), drop the `!` so the line routes to the model")
+        help(
+            "close the quote — or, if you meant prose (an apostrophe in English), drop the `!` so the line routes to the model"
+        )
     )]
     UnbalancedQuote {
         #[source_code]
@@ -57,7 +59,9 @@ pub enum AishDiagnostic {
     #[error("unsupported shell metacharacter `{ch}`")]
     #[diagnostic(
         code(aish::parse::unsupported_meta),
-        help("aish runs pipes and I/O redirection itself, but there's no shell underneath for globbing, command substitution, or control operators (`&&`/`||`/`;`) — those aren't available in a directly-run command")
+        help(
+            "aish runs pipes and I/O redirection itself, but there's no shell underneath for globbing, command substitution, or control operators (`&&`/`||`/`;`) — those aren't available in a directly-run command"
+        )
     )]
     UnsupportedMeta {
         ch: char,
@@ -91,7 +95,9 @@ pub enum AishDiagnostic {
     #[error("malformed variable reference")]
     #[diagnostic(
         code(aish::parse::bad_var_ref),
-        help("use $NAME or ${{NAME}} — the braces must close and contain only letters, digits, or underscores")
+        help(
+            "use $NAME or ${{NAME}} — the braces must close and contain only letters, digits, or underscores"
+        )
     )]
     BadVarRef {
         #[source_code]
@@ -107,7 +113,9 @@ pub enum AishDiagnostic {
     #[error("malformed config line")]
     #[diagnostic(
         code(aish::config::bad_export),
-        help("aish honors only `export NAME=value` and `alias name='value'`; command substitution and extra words need a shell aish doesn't have — the rest of the file still loads")
+        help(
+            "aish honors only `export NAME=value` and `alias name='value'`; command substitution and extra words need a shell aish doesn't have — the rest of the file still loads"
+        )
     )]
     BadConfigLine {
         #[source_code]
@@ -280,9 +288,7 @@ mod tests {
             "aish::parse::unsupported_meta" => AishDiagnostic::unsupported_meta("a | b", 2, '|'),
             "aish::parse::empty_stage" => AishDiagnostic::empty_stage("a | | b", 4),
             "aish::parse::bad_var_ref" => AishDiagnostic::bad_var_ref("echo ${", 5),
-            "aish::config::bad_export" => {
-                AishDiagnostic::bad_config_line("export A=1 B=2", 42, 11)
-            }
+            "aish::config::bad_export" => AishDiagnostic::bad_config_line("export A=1 B=2", 42, 11),
             "aish::exec::not_found" => {
                 AishDiagnostic::exec_not_found("gti", Some("did you mean `git`?".into()))
             }
@@ -309,7 +315,10 @@ mod tests {
         // AC#1: the forced-shell parse failure renders a caret (the snippet
         // pointer), its `aish::parse::` code, and a `help:` line.
         let rendered = render_themed(&AishDiagnostic::unbalanced_quote("echo 'x", 5), false);
-        assert!(rendered.contains("aish::parse::unbalanced_quote"), "{rendered}");
+        assert!(
+            rendered.contains("aish::parse::unbalanced_quote"),
+            "{rendered}"
+        );
         assert!(rendered.contains("help:"), "{rendered}");
         // The graphical handler renders the offending source snippet with a
         // pointer line carrying the span's label — that's the "caret".
@@ -325,7 +334,10 @@ mod tests {
         // AC#6: NO_COLOR / plain theme → no ANSI escape, but the caret, code,
         // and help survive.
         let rendered = render_themed(&AishDiagnostic::unbalanced_quote("echo 'x", 5), false);
-        assert!(!rendered.contains('\x1b'), "plain theme must not emit ANSI:\n{rendered}");
+        assert!(
+            !rendered.contains('\x1b'),
+            "plain theme must not emit ANSI:\n{rendered}"
+        );
         assert!(rendered.contains("aish::parse::unbalanced_quote"));
         assert!(rendered.contains("help:"));
     }
@@ -334,7 +346,10 @@ mod tests {
     fn color_theme_emits_ansi() {
         // AC#6: color on → graphical (colored) theme, which emits ANSI escapes.
         let rendered = render_themed(&AishDiagnostic::unbalanced_quote("echo 'x", 5), true);
-        assert!(rendered.contains('\x1b'), "color theme must emit ANSI:\n{rendered}");
+        assert!(
+            rendered.contains('\x1b'),
+            "color theme must emit ANSI:\n{rendered}"
+        );
     }
 
     #[test]

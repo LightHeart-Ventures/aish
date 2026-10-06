@@ -494,7 +494,6 @@ pub fn repo_and_quant_for(model_id: &str) -> Option<(String, String)> {
         .map(|t| (t.hf_repo.to_string(), t.quant.to_string()))
 }
 
-
 /// An operator pin, if one is in force. `--model` (passed through as `cli_model`
 /// on a local launch) wins over env, then `AISH_LOCAL_MODEL_PATH` (an explicit
 /// GGUF file), then `AISH_LOCAL_MODEL_ID`. Returns `(model_id, model_path?)`.
@@ -763,7 +762,11 @@ mod tests {
         // The persisted selection now lives at ~/.aish/config/local-model.json,
         // not loose in the config home (~/.aish/local-model.json).
         let path = selection_path();
-        assert!(path.ends_with("config/local-model.json"), "{}", path.display());
+        assert!(
+            path.ends_with("config/local-model.json"),
+            "{}",
+            path.display()
+        );
         assert!(config_dir().ends_with("config"));
         // config_dir() is a strict child of aish_dir().
         assert_eq!(config_dir().parent(), Some(aish_dir().as_path()));

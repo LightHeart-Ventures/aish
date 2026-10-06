@@ -130,9 +130,7 @@ pub fn sanitize_memory(raw: &str) -> Option<String> {
     }
 
     // Peel one layer of surrounding quotes / backticks.
-    let s = s
-        .trim_matches(|c| c == '"' || c == '`' || c == '\'')
-        .trim();
+    let s = s.trim_matches(|c| c == '"' || c == '`' || c == '\'').trim();
 
     if s.is_empty() || s.eq_ignore_ascii_case("none") {
         return None;

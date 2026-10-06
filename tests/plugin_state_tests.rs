@@ -57,7 +57,8 @@ fn test_init_db_creates_schema() {
         s1.set("p", "k", &json!(1)).unwrap();
     }
     {
-        let s2 = PluginStateStore::open(&path).expect("second open — must not error on existing schema");
+        let s2 =
+            PluginStateStore::open(&path).expect("second open — must not error on existing schema");
         assert_eq!(s2.get("p", "k").unwrap(), Some(json!(1)));
     }
     cleanup(&path);
@@ -117,7 +118,9 @@ fn test_delete_value() {
     assert_eq!(store.get("p", "k").unwrap(), None);
 
     // Deleting an already-absent key is a no-op, not an error.
-    store.delete("p", "k").expect("deleting a missing key is Ok");
+    store
+        .delete("p", "k")
+        .expect("deleting a missing key is Ok");
     store
         .delete("nonexistent", "nope")
         .expect("deleting from an unseen plugin is Ok");

@@ -405,7 +405,14 @@ pub fn image_exists(rt: Runtime, tag: &str) -> bool {
 /// caller owns the user-facing message. Blocking IO — call off the hot path.
 pub fn image_runnable(rt: Runtime, tag: &str) -> bool {
     std::process::Command::new(rt.bin())
-        .args(["run", "--rm", "--entrypoint", "/usr/local/bin/aish", tag, "--version"])
+        .args([
+            "run",
+            "--rm",
+            "--entrypoint",
+            "/usr/local/bin/aish",
+            tag,
+            "--version",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

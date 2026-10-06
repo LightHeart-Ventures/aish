@@ -56,12 +56,20 @@ fn set_get_roundtrip() {
     let root = temp_root("roundtrip");
     let mem = PluginMemory::new(&root);
 
-    mem.set("github", "prefs", "auto_sync", json!(true)).unwrap();
-    assert_eq!(mem.get("github", "prefs", "auto_sync").unwrap(), json!(true));
+    mem.set("github", "prefs", "auto_sync", json!(true))
+        .unwrap();
+    assert_eq!(
+        mem.get("github", "prefs", "auto_sync").unwrap(),
+        json!(true)
+    );
 
     // overwrite
-    mem.set("github", "prefs", "auto_sync", json!(false)).unwrap();
-    assert_eq!(mem.get("github", "prefs", "auto_sync").unwrap(), json!(false));
+    mem.set("github", "prefs", "auto_sync", json!(false))
+        .unwrap();
+    assert_eq!(
+        mem.get("github", "prefs", "auto_sync").unwrap(),
+        json!(false)
+    );
 
     cleanup(&root);
 }
@@ -85,8 +93,13 @@ fn nested_key_access() {
     let root = temp_root("nested");
     let mem = PluginMemory::new(&root);
 
-    mem.set("github", "webhooks", "github.last_delivery_id", json!("12345"))
-        .unwrap();
+    mem.set(
+        "github",
+        "webhooks",
+        "github.last_delivery_id",
+        json!("12345"),
+    )
+    .unwrap();
     mem.set(
         "github",
         "webhooks",
@@ -96,7 +109,8 @@ fn nested_key_access() {
     .unwrap();
 
     assert_eq!(
-        mem.get("github", "webhooks", "github.last_delivery_id").unwrap(),
+        mem.get("github", "webhooks", "github.last_delivery_id")
+            .unwrap(),
         json!("12345")
     );
     // parent object holds both children
@@ -119,7 +133,9 @@ fn append_to_array_creates_and_grows() {
 
     // appending to a scalar is rejected
     mem.set("github", "cache", "scalar", json!(5)).unwrap();
-    let err = mem.append("github", "cache", "scalar", json!(6)).unwrap_err();
+    let err = mem
+        .append("github", "cache", "scalar", json!(6))
+        .unwrap_err();
     assert!(matches!(err, MemoryError::Validation(_)));
 
     cleanup(&root);
@@ -130,7 +146,8 @@ fn delete_removes_key_and_nested() {
     let root = temp_root("delete");
     let mem = PluginMemory::new(&root);
 
-    mem.set("github", "webhooks", "github.id", json!("x")).unwrap();
+    mem.set("github", "webhooks", "github.id", json!("x"))
+        .unwrap();
     mem.set("github", "webhooks", "top", json!(1)).unwrap();
 
     mem.delete("github", "webhooks", "github.id").unwrap();
@@ -194,8 +211,18 @@ fn cross_plugin_isolation() {
     );
 
     // Files are physically separate.
-    assert!(root.join("plugin-a").join("memory").join("auth.json").exists());
-    assert!(root.join("plugin-b").join("memory").join("auth.json").exists());
+    assert!(
+        root.join("plugin-a")
+            .join("memory")
+            .join("auth.json")
+            .exists()
+    );
+    assert!(
+        root.join("plugin-b")
+            .join("memory")
+            .join("auth.json")
+            .exists()
+    );
 
     cleanup(&root);
 }
@@ -244,7 +271,8 @@ fn auth_file_created_0600() {
     let root = temp_root("perms-create");
     let mem = PluginMemory::new(&root);
 
-    mem.set("github", "auth", "access_token", json!("gho_x")).unwrap();
+    mem.set("github", "auth", "access_token", json!("gho_x"))
+        .unwrap();
     let path = root.join("github").join("memory").join("auth.json");
     assert_eq!(mode_of(&path), 0o600, "auth.json must be 0600 on create");
 
@@ -311,16 +339,26 @@ fn auth_display_is_redacted() {
 
     mem.set("github", "auth", "access_token", json!("gho_secret"))
         .unwrap();
-    mem.set("github", "auth", "expires_at", json!("2026-07-02T10:00:00Z"))
-        .unwrap();
+    mem.set(
+        "github",
+        "auth",
+        "expires_at",
+        json!("2026-07-02T10:00:00Z"),
+    )
+    .unwrap();
 
-    let shown = mem.display_namespace("github", MemoryNamespace::Auth).unwrap();
+    let shown = mem
+        .display_namespace("github", MemoryNamespace::Auth)
+        .unwrap();
     assert_eq!(shown["access_token"], json!("***"));
     assert_eq!(shown["expires_at"], json!("***"));
 
     // non-secret namespace is shown verbatim
-    mem.set("github", "prefs", "auto_sync", json!(true)).unwrap();
-    let shown = mem.display_namespace("github", MemoryNamespace::Prefs).unwrap();
+    mem.set("github", "prefs", "auto_sync", json!(true))
+        .unwrap();
+    let shown = mem
+        .display_namespace("github", MemoryNamespace::Prefs)
+        .unwrap();
     assert_eq!(shown["auto_sync"], json!(true));
 
     cleanup(&root);
@@ -330,7 +368,9 @@ fn auth_display_is_redacted() {
 fn writing_redaction_sentinel_into_auth_rejected() {
     let root = temp_root("sentinel");
     let mem = PluginMemory::new(&root);
-    let err = mem.set("github", "auth", "access_token", json!("***")).unwrap_err();
+    let err = mem
+        .set("github", "auth", "access_token", json!("***"))
+        .unwrap_err();
     assert!(matches!(err, MemoryError::Validation(_)));
     // but fine in non-secret namespaces
     assert!(mem.set("github", "prefs", "note", json!("***")).is_ok());
@@ -388,24 +428,33 @@ fn full_lifecycle_persist_reload() {
     // "load 1": plugin writes memory.
     {
         let mem = PluginMemory::new(&root);
-        mem.set("github", "auth", "access_token", json!("gho_1")).unwrap();
+        mem.set("github", "auth", "access_token", json!("gho_1"))
+            .unwrap();
         mem.set("github", "webhooks", "github.last_delivery_id", json!("42"))
             .unwrap();
         mem.append("github", "cache", "ts", json!(1)).unwrap();
         mem.append("github", "cache", "ts", json!(2)).unwrap();
-        mem.set("github", "prefs", "auto_sync", json!(true)).unwrap();
+        mem.set("github", "prefs", "auto_sync", json!(true))
+            .unwrap();
     }
 
     // "load 2": a fresh store over the same root sees persisted memory.
     {
         let mem = PluginMemory::new(&root);
-        assert_eq!(mem.get("github", "auth", "access_token").unwrap(), json!("gho_1"));
         assert_eq!(
-            mem.get("github", "webhooks", "github.last_delivery_id").unwrap(),
+            mem.get("github", "auth", "access_token").unwrap(),
+            json!("gho_1")
+        );
+        assert_eq!(
+            mem.get("github", "webhooks", "github.last_delivery_id")
+                .unwrap(),
             json!("42")
         );
         assert_eq!(mem.get("github", "cache", "ts").unwrap(), json!([1, 2]));
-        assert_eq!(mem.get("github", "prefs", "auto_sync").unwrap(), json!(true));
+        assert_eq!(
+            mem.get("github", "prefs", "auto_sync").unwrap(),
+            json!(true)
+        );
 
         // counts across namespaces
         assert_eq!(mem.key_count("github", MemoryNamespace::Auth).unwrap(), 1);
@@ -426,9 +475,18 @@ fn multi_plugin_lifecycle_isolated() {
     }
     // reload
     let mem2 = PluginMemory::new(&root);
-    assert_eq!(mem2.get("plug-a", "auth", "access_token").unwrap(), json!("AAA"));
-    assert_eq!(mem2.get("plug-b", "auth", "access_token").unwrap(), json!("BBB"));
-    assert_eq!(mem2.get("plug-a", "prefs", "id_marker").unwrap(), json!("plug-a"));
+    assert_eq!(
+        mem2.get("plug-a", "auth", "access_token").unwrap(),
+        json!("AAA")
+    );
+    assert_eq!(
+        mem2.get("plug-b", "auth", "access_token").unwrap(),
+        json!("BBB")
+    );
+    assert_eq!(
+        mem2.get("plug-a", "prefs", "id_marker").unwrap(),
+        json!("plug-a")
+    );
 
     cleanup(&root);
 }

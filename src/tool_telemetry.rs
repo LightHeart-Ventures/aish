@@ -73,7 +73,6 @@ pub fn parse_cache_secs(v: Option<&str>) -> u64 {
         .unwrap_or(DEFAULT_CACHE_SECS)
 }
 
-
 /// Parse `AISH_TELEMETRY_UNBUFFERED`. Truthy (`1`/`true`/`yes`/`on`, case-
 /// insensitive) restores the legacy per-call insert path — every `record`
 /// flushes immediately. Anything else keeps buffering on.
@@ -505,14 +504,38 @@ mod tests {
 
     #[test]
     fn classify_buckets_common_errors() {
-        assert_eq!(classify("Error: request timed out after 120s"), ErrorClass::Timeout);
-        assert_eq!(classify("HTTP 429 Too Many Requests"), ErrorClass::RateLimit);
-        assert_eq!(classify("GitHub API returned 403 Forbidden"), ErrorClass::Auth);
-        assert_eq!(classify("fatal: repository not found (404)"), ErrorClass::NotFound);
-        assert_eq!(classify("refusing: destination already exists"), ErrorClass::Conflict);
-        assert_eq!(classify("open /etc/shadow: permission denied"), ErrorClass::Permission);
-        assert_eq!(classify("dial tcp: connection refused"), ErrorClass::Network);
-        assert_eq!(classify("400 Bad Request: missing required field"), ErrorClass::InvalidArgs);
+        assert_eq!(
+            classify("Error: request timed out after 120s"),
+            ErrorClass::Timeout
+        );
+        assert_eq!(
+            classify("HTTP 429 Too Many Requests"),
+            ErrorClass::RateLimit
+        );
+        assert_eq!(
+            classify("GitHub API returned 403 Forbidden"),
+            ErrorClass::Auth
+        );
+        assert_eq!(
+            classify("fatal: repository not found (404)"),
+            ErrorClass::NotFound
+        );
+        assert_eq!(
+            classify("refusing: destination already exists"),
+            ErrorClass::Conflict
+        );
+        assert_eq!(
+            classify("open /etc/shadow: permission denied"),
+            ErrorClass::Permission
+        );
+        assert_eq!(
+            classify("dial tcp: connection refused"),
+            ErrorClass::Network
+        );
+        assert_eq!(
+            classify("400 Bad Request: missing required field"),
+            ErrorClass::InvalidArgs
+        );
         assert_eq!(classify("declined by user"), ErrorClass::Declined);
         assert_eq!(classify("something weird happened"), ErrorClass::Other);
     }
@@ -535,13 +558,33 @@ mod tests {
     #[test]
     fn render_report_orders_by_fail_rate_and_shows_recovery() {
         let totals = vec![
-            ToolTotals { tool: "run_program".into(), calls: 100, failures: 2 },
-            ToolTotals { tool: "atum_list_tasks".into(), calls: 10, failures: 8 },
+            ToolTotals {
+                tool: "run_program".into(),
+                calls: 100,
+                failures: 2,
+            },
+            ToolTotals {
+                tool: "atum_list_tasks".into(),
+                calls: 10,
+                failures: 8,
+            },
         ];
         let class_failures = vec![
-            ClassFailure { tool: "atum_list_tasks".into(), class: "timeout".into(), count: 7 },
-            ClassFailure { tool: "atum_list_tasks".into(), class: "other".into(), count: 1 },
-            ClassFailure { tool: "run_program".into(), class: "not-found".into(), count: 2 },
+            ClassFailure {
+                tool: "atum_list_tasks".into(),
+                class: "timeout".into(),
+                count: 7,
+            },
+            ClassFailure {
+                tool: "atum_list_tasks".into(),
+                class: "other".into(),
+                count: 1,
+            },
+            ClassFailure {
+                tool: "run_program".into(),
+                class: "not-found".into(),
+                count: 2,
+            },
         ];
         let retries = vec![RetryStat {
             tool: "atum_list_tasks".into(),
@@ -752,7 +795,10 @@ mod tests {
         assert!(s.tool_telemetry_cache.is_some());
         // A newly recorded tool call clears the cache immediately.
         record(&mut s, "read_file", &ok);
-        assert!(s.tool_telemetry_cache.is_none(), "record must invalidate the cache");
+        assert!(
+            s.tool_telemetry_cache.is_none(),
+            "record must invalidate the cache"
+        );
         flush(&mut s);
         assert_eq!(
             aggregate_cached(&mut s).unwrap().total,
@@ -811,10 +857,7 @@ mod tests {
         assert_eq!(classify("permission denied"), ErrorClass::Permission);
         assert_eq!(classify("EACCES"), ErrorClass::Permission);
         assert_eq!(classify("access denied"), ErrorClass::Permission);
-        assert_eq!(
-            classify("operation not permitted"),
-            ErrorClass::Permission
-        );
+        assert_eq!(classify("operation not permitted"), ErrorClass::Permission);
     }
 
     #[test]

@@ -232,7 +232,10 @@ mod tests {
 
     #[test]
     fn frame_shows_label_only_when_preview_empty() {
-        assert_eq!(frame("rewriting…", ""), "\r\x1b[2K\x1b[2m  ⚙ rewriting…\x1b[0m");
+        assert_eq!(
+            frame("rewriting…", ""),
+            "\r\x1b[2K\x1b[2m  ⚙ rewriting…\x1b[0m"
+        );
         assert_eq!(
             frame("rewriting…", "ls -la"),
             "\r\x1b[2K\x1b[2m  ⚙ rewriting… ls -la\x1b[0m"

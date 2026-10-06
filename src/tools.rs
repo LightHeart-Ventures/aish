@@ -677,8 +677,14 @@ pub async fn execute(
     if session.mode == crate::session::Mode::Paranoid
         && !matches!(
             call.name.as_str(),
-            "read_file" | "write_file" | "edit_file" | "run_program" | "run_interactive"
-                | "copy_file" | "rename_file" | "append_file"
+            "read_file"
+                | "write_file"
+                | "edit_file"
+                | "run_program"
+                | "run_interactive"
+                | "copy_file"
+                | "rename_file"
+                | "append_file"
         )
     {
         let args = truncate_middle(serde_json::to_string(&call.args).unwrap_or_default(), 200);
@@ -688,11 +694,7 @@ pub async fn execute(
             &format!("{} {args}", call.name),
             confirm,
         ) {
-            return ToolResult::text(
-                call.id.clone(),
-                "user declined this tool call",
-                false,
-            );
+            return ToolResult::text(call.id.clone(), "user declined this tool call", false);
         }
     }
 
@@ -1152,7 +1154,6 @@ fn unwrap_noexec_builtin(program: &str, args: &[String]) -> Option<(String, Vec<
     }
 }
 
-
 /// Extract (program, args) from a tool call.
 fn parse_argv(call: &ToolCall) -> Result<(String, Vec<String>)> {
     let program = call.args["program"]
@@ -1316,7 +1317,7 @@ branch, and open a pull request (gh pr create) instead."
     let stderr = await_capture(&mut err_task).await;
 
     let mut out = String::new();
-    
+
     if !stdout.is_empty() {
         out.push_str(&stdout);
     }
@@ -1398,8 +1399,7 @@ fn printer_slot() -> &'static std::sync::Mutex<Option<Box<dyn crate::editor::Lin
 // its next tick and repaints the prompt below the freshly-printed output.
 static IDLE_PROMPT_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-static IDLE_PROMPT_DIRTY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static IDLE_PROMPT_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Mark (or clear) the "editor idle-poll loop has drawn its own raw prompt"
 /// state. Set to `true` right after the idle prompt is drawn and back to `false`
@@ -1742,7 +1742,9 @@ fn job_output(call: &ToolCall, session: &Session) -> Result<String> {
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("missing job id (pass a numeric :job id or a durable/batch job id)"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("missing job id (pass a numeric :job id or a durable/batch job id)")
+        })?;
     durable_job_output(raw, session)
 }
 
@@ -1756,7 +1758,13 @@ fn durable_job_output(q: &str, session: &Session) -> Result<String> {
     let hit = |id: &str| id == q || id.starts_with(q);
 
     // In-memory workers / batches (this session) — freshest state, live result.
-    if let Some(w) = session.worker_jobs.lock().unwrap().iter().find(|j| hit(&j.id)) {
+    if let Some(w) = session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|j| hit(&j.id))
+    {
         return Ok(format!(
             "[{} {}]\nTask: {}\n\n{}",
             crate::batch::short_id(&w.id),
@@ -1765,8 +1773,19 @@ fn durable_job_output(q: &str, session: &Session) -> Result<String> {
             w.fetch()
         ));
     }
-    if let Some(j) = session.batch_jobs.lock().unwrap().iter().find(|j| hit(&j.id)) {
-        return Ok(format!("[{} {}]\n{}", crate::batch::short_id(&j.id), j.status(), j.fetch()));
+    if let Some(j) = session
+        .batch_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|j| hit(&j.id))
+    {
+        return Ok(format!(
+            "[{} {}]\n{}",
+            crate::batch::short_id(&j.id),
+            j.status(),
+            j.fetch()
+        ));
     }
 
     // Durable coordinator runs from the shared store (any session, survives
@@ -1798,7 +1817,12 @@ fn durable_job_output(q: &str, session: &Session) -> Result<String> {
                     .clone()
                     .or_else(|| r.error.clone())
                     .unwrap_or_else(|| format!("(no result yet — status: {})", r.status));
-                return Ok(format!("[{} {}]\n{}", crate::batch::short_id(&r.local_id), r.status, body));
+                return Ok(format!(
+                    "[{} {}]\n{}",
+                    crate::batch::short_id(&r.local_id),
+                    r.status,
+                    body
+                ));
             }
         }
     }
@@ -1857,12 +1881,12 @@ the strong model sees nothing else"
         .await
         .map_err(|e| anyhow::anyhow!("escalation consult failed: {e:#}"))?;
     let latency_ms = start.elapsed().as_millis() as u32;
-    
+
     let answer = turn.text.trim();
     if answer.is_empty() {
         anyhow::bail!("the strong model returned no usable text");
     }
-    
+
     // Reasoning-quality telemetry: every escalate is, by definition, a decision
     // to reach for the stronger model rather than guess — record it (best-effort,
     // never fails the consult) so the escalate-vs-guess boundary is measurable.
@@ -1877,7 +1901,7 @@ the strong model sees nothing else"
             Some(latency_ms),
             None, // trigger_reason: caller knows their own reason; not available here
         );
-        
+
         // Auto-store a durable memory for this escalation so the system learns
         // from its own hard judgments and can use memory to avoid re-escalating
         // the same problem. Fixes the reinforcing loop: no memory → escalate →
@@ -1890,7 +1914,7 @@ the strong model sees nothing else"
         } else {
             format!("[escalated] {}. Resolved in {}ms.", task, latency_ms)
         };
-        
+
         // Try to store the memory. First, check if session.db is available.
         // If not, try to open it as a fallback (fixes the case where escalate()
         // is called from a context where the session db wasn't initialized).
@@ -1911,10 +1935,13 @@ the strong model sees nothing else"
                 }
             }
         };
-        
+
         match store_result {
             Ok(id) => {
-                eprintln!("[aish] stored escalation memory id={id} for topic={:?}", task);
+                eprintln!(
+                    "[aish] stored escalation memory id={id} for topic={:?}",
+                    task
+                );
             }
             Err(e) => {
                 eprintln!(
@@ -1924,7 +1951,7 @@ the strong model sees nothing else"
             }
         }
     }
-    
+
     Ok(answer.to_string())
 }
 
@@ -1933,7 +1960,12 @@ the strong model sees nothing else"
 fn reasoning_note(call: &ToolCall, session: &Session) -> Result<String> {
     use crate::reasoning_telemetry as rt;
 
-    let get = |k: &str| call.args[k].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let get = |k: &str| {
+        call.args[k]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
 
     // Mode 1 — close the loop on a prior event: `event_id` + `outcome`.
     if let Some(id) = get("event_id") {
@@ -1964,9 +1996,15 @@ fn reasoning_note(call: &ToolCall, session: &Session) -> Result<String> {
         let decision = rt::Decision::parse(decision_str).ok_or_else(|| {
             anyhow::anyhow!("unknown decision '{decision_str}' — use escalated | guessed")
         })?;
-        let complexity = get("complexity").map(rt::Level::parse).unwrap_or(rt::Level::Medium);
-        let ambiguity = get("ambiguity").map(rt::Level::parse).unwrap_or(rt::Level::Medium);
-        let risk = get("risk").map(rt::Level::parse).unwrap_or(rt::Level::Medium);
+        let complexity = get("complexity")
+            .map(rt::Level::parse)
+            .unwrap_or(rt::Level::Medium);
+        let ambiguity = get("ambiguity")
+            .map(rt::Level::parse)
+            .unwrap_or(rt::Level::Medium);
+        let risk = get("risk")
+            .map(rt::Level::parse)
+            .unwrap_or(rt::Level::Medium);
         let event = rt::ReasoningEvent::new(decision, topic, "self_report")
             .with_levels(complexity, ambiguity, risk)
             .with_rationale(get("rationale").map(str::to_string));
@@ -1996,7 +2034,10 @@ fn reasoning_note(call: &ToolCall, session: &Session) -> Result<String> {
                 let memory_stored = if let Some(ref db) = session.db {
                     match db.remember(&memory_content, Some("reasoning")) {
                         Ok(mem_id) => {
-                            eprintln!("[aish] stored reasoning memory id={mem_id} for decision={}", decision.as_str());
+                            eprintln!(
+                                "[aish] stored reasoning memory id={mem_id} for decision={}",
+                                decision.as_str()
+                            );
                             true
                         }
                         Err(e) => {
@@ -2014,18 +2055,23 @@ fn reasoning_note(call: &ToolCall, session: &Session) -> Result<String> {
                     );
                     false
                 };
-                
+
                 Ok(format!(
                     "logged reasoning note {id} ({}, complexity={}, risk={}){} Close the loop later with \
 event_id={id} + outcome=correct|wrong_turn.",
                     decision.as_str(),
                     complexity.as_str(),
                     risk.as_str(),
-                    if memory_stored { ". " } else { " (note: memory storage failed) " }
+                    if memory_stored {
+                        ". "
+                    } else {
+                        " (note: memory storage failed) "
+                    }
                 ))
             }
             None => Ok(
-                "note: telemetry store unwritable — reasoning note not persisted, continuing".into(),
+                "note: telemetry store unwritable — reasoning note not persisted, continuing"
+                    .into(),
             ),
         }
     }
@@ -2042,7 +2088,10 @@ event_id={id} + outcome=correct|wrong_turn.",
 /// "no task".
 fn tasks_are_duplicate(a: &str, b: &str) -> bool {
     fn norm(s: &str) -> String {
-        s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
     }
     let (na, nb) = (norm(a), norm(b));
     if na.is_empty() || nb.is_empty() {
@@ -2052,7 +2101,11 @@ fn tasks_are_duplicate(a: &str, b: &str) -> bool {
         return true;
     }
     // Containment.
-    let (short, long) = if na.len() <= nb.len() { (&na, &nb) } else { (&nb, &na) };
+    let (short, long) = if na.len() <= nb.len() {
+        (&na, &nb)
+    } else {
+        (&nb, &na)
+    };
     if short.len() >= 20 && long.contains(short.as_str()) {
         return true;
     }
@@ -2104,8 +2157,13 @@ fn find_duplicate_running_work(session: &Session, task: &str) -> Option<String> 
     // the in-memory workers already checked above.
     if let Some(store) = &session.coordinator_store {
         if let Ok(rows) = store.load_all() {
-            let live: std::collections::HashSet<String> =
-                session.worker_jobs.lock().unwrap().iter().map(|w| w.id.clone()).collect();
+            let live: std::collections::HashSet<String> = session
+                .worker_jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|w| w.id.clone())
+                .collect();
             for r in rows {
                 if live.contains(&r.run_id) {
                     continue;
@@ -2162,9 +2220,12 @@ fn find_duplicate_running_work(session: &Session, task: &str) -> Option<String> 
 /// built-in decision point — so this never encodes its own guess about the
 /// backend or the credential. Pure → unit-tested.
 fn forced_child_tier(cap: &crate::batch::BatchCapability) -> &'static str {
-    if cap.available() { "batch" } else { "interactive" }
+    if cap.available() {
+        "batch"
+    } else {
+        "interactive"
+    }
 }
-
 
 fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
     let task = call.args["task"].as_str().map(str::trim).unwrap_or("");
@@ -2515,9 +2576,7 @@ fn tell(call: &ToolCall, session: &Session) -> Result<String> {
 fn stop(call: &ToolCall, session: &Session) -> Result<String> {
     let id = call.args["id"].as_str().unwrap_or_default().trim();
     if id.is_empty() {
-        anyhow::bail!(
-            "stop requires `id` (a coordinator run id from background_status)"
-        );
+        anyhow::bail!("stop requires `id` (a coordinator run id from background_status)");
     }
     let Some(store) = &session.coordinator_store else {
         anyhow::bail!("coordinator store unavailable — can't stand down a coordinator");
@@ -2550,9 +2609,7 @@ fn stop(call: &ToolCall, session: &Session) -> Result<String> {
         [(run_id, terminal, pid)] => {
             let short = crate::batch::short_id(run_id);
             if *terminal {
-                anyhow::bail!(
-                    "coordinator {short} has already finished — nothing to stand down"
-                );
+                anyhow::bail!("coordinator {short} has already finished — nothing to stand down");
             }
             // Durable flag first: this is the source of truth the coordinator
             // reads at its next round boundary, and it works cross-session even
@@ -2610,8 +2667,11 @@ fn message_console(call: &ToolCall, session: &Session) -> Result<String> {
         anyhow::bail!("`message` is required — the note to show on the operator's console");
     }
     if !session.nested {
-        return Ok("message_console is only available to a background coordinator — an \
-interactive session has no parent console to message".into());
+        return Ok(
+            "message_console is only available to a background coordinator — an \
+interactive session has no parent console to message"
+                .into(),
+        );
     }
     // Emit the note as ONE 📣 sentinel line so the parent frames the 📣 [label]
     // prefix exactly ONCE for the whole note. A multi-line note's physical
@@ -2877,24 +2937,24 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
                 let result = format_result(r.result.as_ref(), r.error.as_ref());
                 // Append run telemetry (turns / tool calls / tokens in·out) to
                 // the status cell when we've captured any — see persist_terminal.
-                let phase_cell = if r.turns == 0
-                    && r.tool_calls == 0
-                    && r.tokens_in == 0
-                    && r.tokens_out == 0
-                {
-                    r.phase.clone()
-                } else {
-                    format!(
-                        "{} · {}t {}tc {}in/{}out",
-                        r.phase, r.turns, r.tool_calls, r.tokens_in, r.tokens_out
-                    )
-                };
+                let phase_cell =
+                    if r.turns == 0 && r.tool_calls == 0 && r.tokens_in == 0 && r.tokens_out == 0 {
+                        r.phase.clone()
+                    } else {
+                        format!(
+                            "{} · {}t {}tc {}in/{}out",
+                            r.phase, r.turns, r.tool_calls, r.tokens_in, r.tokens_out
+                        )
+                    };
                 // done/failed/checkpoint rows have no live beat → em-dash; a
                 // running "coordinating" row shows ♥ age (alive) or ⚠ age (stale).
                 let terminal = matches!(r.phase.as_str(), "done" | "failed" | "checkpoint");
                 let beat =
                     crate::style::fmt_heartbeat_age(r.heartbeat_at.as_deref(), terminal, now_epoch);
-                full_tasks.push((crate::batch::short_id(&r.run_id).to_string(), r.task.clone()));
+                full_tasks.push((
+                    crate::batch::short_id(&r.run_id).to_string(),
+                    r.task.clone(),
+                ));
                 // Kind: goal-loop turns are labelled `goal` (not `coordinator`)
                 // so a wall of iterations is recognizable at a glance — see
                 // `worker::run_kind`.
@@ -2941,7 +3001,10 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
                     owner
                 };
                 let result = format_result(r.result.as_ref(), r.error.as_ref());
-                full_tasks.push((crate::batch::short_id(&r.local_id).to_string(), r.task.clone()));
+                full_tasks.push((
+                    crate::batch::short_id(&r.local_id).to_string(),
+                    r.task.clone(),
+                ));
                 out.push_str(&format!(
                     "| `{}` | batch | {} | {} | — | {} | {} | {} |\n",
                     crate::batch::short_id(&r.local_id),
@@ -3363,7 +3426,6 @@ impl Drop for FooterRegionGuard {
     }
 }
 
-
 /// Owns the foreground child's pid for the lifetime of `run_on_tty`. On the
 /// normal exit path the SIGCHLD task has already reaped it (`reaped = true`); if
 /// the future is dropped first (Ctrl-C aborts the turn), SIGKILL the child's
@@ -3488,15 +3550,13 @@ fn read_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) 
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
             // UTF-8 decoding error; try reading as binary and decode with lossy replacement
             match std::fs::read(&full) {
-                Ok(bytes) => {
-                    String::from_utf8_lossy(&bytes).into_owned()
-                }
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                 Err(e2) => {
                     return Err(anyhow::anyhow!(
                         "{}: cannot read (tried UTF-8 and binary fallback): {}",
                         full.display(),
                         e2
-                    ))
+                    ));
                 }
             }
         }
@@ -3509,9 +3569,9 @@ fn read_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) 
                     std::io::ErrorKind::PermissionDenied => "check file permissions (chmod +r)",
                     std::io::ErrorKind::NotFound => "file not found or invalid symlink",
                     std::io::ErrorKind::IsADirectory => "is a directory, not a file",
-                    _ => "see error details above"
+                    _ => "see error details above",
                 }
-            ))
+            ));
         }
     };
 
@@ -3640,7 +3700,11 @@ struct EditSpec<'a> {
 
 /// 1-based line number of a byte offset into `content`.
 fn line_of_offset(content: &str, off: usize) -> usize {
-    content.as_bytes()[..off].iter().filter(|&&b| b == b'\n').count() + 1
+    content.as_bytes()[..off]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
 }
 
 /// Is `line` inside the (optional, 1-based inclusive) window?
@@ -3655,12 +3719,15 @@ fn apply_edit(content: &str, spec: &EditSpec) -> Result<(String, usize)> {
     if spec.pattern.is_empty() {
         anyhow::bail!("pattern must not be empty");
     }
-    let limit = if spec.count == 0 { usize::MAX } else { spec.count };
+    let limit = if spec.count == 0 {
+        usize::MAX
+    } else {
+        spec.count
+    };
 
     match spec.mode {
         EditMode::Replace if spec.is_regex => {
-            let re = Regex::new(spec.pattern)
-                .map_err(|e| anyhow::anyhow!("invalid regex: {e}"))?;
+            let re = Regex::new(spec.pattern).map_err(|e| anyhow::anyhow!("invalid regex: {e}"))?;
             let mut out = String::with_capacity(content.len());
             let mut last = 0usize;
             let mut n = 0usize;
@@ -3669,7 +3736,11 @@ fn apply_edit(content: &str, spec: &EditSpec) -> Result<(String, usize)> {
                     break;
                 }
                 let m = caps.get(0).expect("group 0 always present");
-                if !within_window(line_of_offset(content, m.start()), spec.line_start, spec.line_end) {
+                if !within_window(
+                    line_of_offset(content, m.start()),
+                    spec.line_start,
+                    spec.line_end,
+                ) {
                     continue;
                 }
                 out.push_str(&content[last..m.start()]);
@@ -3688,10 +3759,16 @@ fn apply_edit(content: &str, spec: &EditSpec) -> Result<(String, usize)> {
             let mut search_from = 0usize;
             let mut n = 0usize;
             while n < limit {
-                let Some(rel) = content[search_from..].find(pat) else { break };
+                let Some(rel) = content[search_from..].find(pat) else {
+                    break;
+                };
                 let start = search_from + rel;
                 let end = start + pat.len();
-                if within_window(line_of_offset(content, start), spec.line_start, spec.line_end) {
+                if within_window(
+                    line_of_offset(content, start),
+                    spec.line_start,
+                    spec.line_end,
+                ) {
                     out.push_str(&content[last..start]);
                     out.push_str(spec.replacement);
                     last = end;
@@ -3741,23 +3818,29 @@ fn apply_edit(content: &str, spec: &EditSpec) -> Result<(String, usize)> {
 }
 
 fn edit_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
-    let path = call.args["path"].as_str().ok_or_else(|| anyhow::anyhow!("missing path"))?;
-    let pattern = call.args["pattern"].as_str().ok_or_else(|| anyhow::anyhow!("missing pattern"))?;
+    let path = call.args["path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing path"))?;
+    let pattern = call.args["pattern"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing pattern"))?;
     let replacement = call.args["replacement"].as_str().unwrap_or("");
     let is_regex = call.args["regex"].as_bool().unwrap_or(false);
     let mode = match call.args["mode"].as_str().unwrap_or("replace") {
         "replace" => EditMode::Replace,
         "insert_before" => EditMode::InsertBefore,
         "insert_after" => EditMode::InsertAfter,
-        other => anyhow::bail!("unknown mode '{other}' — use replace, insert_before, or insert_after"),
+        other => {
+            anyhow::bail!("unknown mode '{other}' — use replace, insert_before, or insert_after")
+        }
     };
     let count = call.args["count"].as_u64().unwrap_or(0) as usize;
     let line_start = call.args["line_start"].as_u64().map(|n| n as usize);
     let line_end = call.args["line_end"].as_u64().map(|n| n as usize);
     let full = resolve(session, path);
 
-    let content = std::fs::read_to_string(&full)
-        .map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
+    let content =
+        std::fs::read_to_string(&full).map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
 
     let spec = EditSpec {
         pattern,
@@ -3812,7 +3895,9 @@ fn list_dir(call: &ToolCall, session: &Session) -> Result<(String, serde_json::V
     let path = call.args["path"].as_str().unwrap_or(".");
     // TASK-322: cap the number of entries returned (overridable via `max`) so a
     // single listing of a huge directory can't flood the model's context.
-    let max = call.args["max"].as_u64().unwrap_or(LIST_DIR_MAX_ENTRIES as u64) as usize;
+    let max = call.args["max"]
+        .as_u64()
+        .unwrap_or(LIST_DIR_MAX_ENTRIES as u64) as usize;
     let full = resolve(session, path);
     // Each row carries its rendered line (the source of truth) and the typed
     // record built from the SAME metadata, so the text and JSON can never drift.
@@ -3884,7 +3969,11 @@ fn list_dir(call: &ToolCall, session: &Session) -> Result<(String, serde_json::V
     let shown = rows.len();
     let truncated = shown < total;
     let payload = serde_json::Value::Array(rows.iter().map(|(_, v)| v.clone()).collect());
-    let mut text = rows.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
+    let mut text = rows
+        .iter()
+        .map(|(l, _)| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     if truncated {
         text.push_str(&format!(
             "\n…[showing {shown} of {total} entries; narrow the path or pass a higher `max`]"
@@ -4005,7 +4094,9 @@ fn glob_path_match(pat_segs: &[&str], path_segs: &[&str]) -> bool {
 }
 
 fn glob_expand(call: &ToolCall, session: &Session) -> Result<(String, serde_json::Value)> {
-    let pattern = call.args["pattern"].as_str().ok_or_else(|| anyhow::anyhow!("missing pattern"))?;
+    let pattern = call.args["pattern"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing pattern"))?;
     let type_filter = call.args["type"].as_str().unwrap_or("any");
     let max = call.args["max"].as_u64().unwrap_or(1000) as usize;
 
@@ -4014,8 +4105,7 @@ fn glob_expand(call: &ToolCall, session: &Session) -> Result<(String, serde_json
     let (base, pat) = if let Some(rest) = pattern.strip_prefix('/') {
         (PathBuf::from("/"), rest.to_string())
     } else {
-        let base = call
-            .args["path"]
+        let base = call.args["path"]
             .as_str()
             .map(|p| resolve(session, p))
             .unwrap_or_else(|| session.cwd.clone());
@@ -4099,7 +4189,11 @@ fn glob_expand(call: &ToolCall, session: &Session) -> Result<(String, serde_json
     if out.is_empty() {
         return Ok((format!("[no matches for {pattern}]"), payload));
     }
-    let mut res = out.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
+    let mut res = out
+        .iter()
+        .map(|(l, _)| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     if truncated {
         res.push_str("\n…[results truncated]");
     }
@@ -4151,22 +4245,26 @@ fn truncate_line(line: &str, max: usize) -> String {
 }
 
 fn grep_files(call: &ToolCall, session: &Session) -> Result<(String, serde_json::Value)> {
-    let pattern = call.args["pattern"].as_str().ok_or_else(|| anyhow::anyhow!("missing pattern"))?;
+    let pattern = call.args["pattern"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing pattern"))?;
     if pattern.is_empty() {
         anyhow::bail!("empty pattern");
     }
     let ignore_case = call.args["ignore_case"].as_bool().unwrap_or(false);
     let context = call.args["context"].as_u64().unwrap_or(0) as usize;
     let max = call.args["max"].as_u64().unwrap_or(500) as usize;
-    let glob_seg: Option<Vec<char>> =
-        call.args["glob"].as_str().map(|g| g.chars().collect());
-    let base = call
-        .args["path"]
+    let glob_seg: Option<Vec<char>> = call.args["glob"].as_str().map(|g| g.chars().collect());
+    let base = call.args["path"]
         .as_str()
         .map(|p| resolve(session, p))
         .unwrap_or_else(|| session.cwd.clone());
 
-    let needle = if ignore_case { pattern.to_lowercase() } else { pattern.to_string() };
+    let needle = if ignore_case {
+        pattern.to_lowercase()
+    } else {
+        pattern.to_string()
+    };
 
     // Gather candidate files (a single file, or a recursive directory walk).
     let mut files: Vec<PathBuf> = Vec::new();
@@ -4202,8 +4300,7 @@ fn grep_files(call: &ToolCall, session: &Session) -> Result<(String, serde_json:
                     stack.push(entry.path());
                 } else if ft.is_file() {
                     if let Some(ref g) = glob_seg {
-                        let name: Vec<char> =
-                            entry.file_name().to_string_lossy().chars().collect();
+                        let name: Vec<char> = entry.file_name().to_string_lossy().chars().collect();
                         if !glob_segment_match(g, &name) {
                             continue;
                         }
@@ -4239,7 +4336,11 @@ fn grep_files(call: &ToolCall, session: &Session) -> Result<(String, serde_json:
             f.strip_prefix(&base).unwrap_or(f).display().to_string()
         };
         for (i, line) in lines.iter().enumerate() {
-            let hay = if ignore_case { line.to_lowercase() } else { (*line).to_string() };
+            let hay = if ignore_case {
+                line.to_lowercase()
+            } else {
+                (*line).to_string()
+            };
             if hay.contains(&needle) {
                 if context > 0 {
                     let lo = i.saturating_sub(context);
@@ -4284,11 +4385,13 @@ fn human_age(secs: i64) -> String {
 fn stat_file(call: &ToolCall, session: &Session) -> Result<(String, serde_json::Value)> {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
-    let path = call.args["path"].as_str().ok_or_else(|| anyhow::anyhow!("missing path"))?;
+    let path = call.args["path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing path"))?;
     let full = resolve(session, path);
     // symlink_metadata so a symlink reports as a symlink rather than its target.
-    let meta = std::fs::symlink_metadata(&full)
-        .map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
+    let meta =
+        std::fs::symlink_metadata(&full).map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
     let ft = meta.file_type();
     let kind = if ft.is_dir() {
         "dir"
@@ -4311,7 +4414,11 @@ fn stat_file(call: &ToolCall, session: &Session) -> Result<(String, serde_json::
         format!("perms: {perms}"),
         format!("uid/gid: {}/{}", meta.uid(), meta.gid()),
         format!("nlink: {}", meta.nlink()),
-        format!("modified: {} (epoch), {} ago", meta.mtime(), human_age(now - meta.mtime())),
+        format!(
+            "modified: {} (epoch), {} ago",
+            meta.mtime(),
+            human_age(now - meta.mtime())
+        ),
     ];
     // Build the typed record from the SAME metadata so it can't drift.
     let mut rec = serde_json::Map::new();
@@ -4333,7 +4440,9 @@ fn stat_file(call: &ToolCall, session: &Session) -> Result<(String, serde_json::
 }
 
 fn diff_files(call: &ToolCall, session: &Session) -> Result<(String, serde_json::Value)> {
-    let a_path = call.args["a"].as_str().ok_or_else(|| anyhow::anyhow!("missing a"))?;
+    let a_path = call.args["a"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing a"))?;
     let full_a = resolve(session, a_path);
     let a_text = std::fs::read_to_string(&full_a)
         .map_err(|e| anyhow::anyhow!("{}: {e}", full_a.display()))?;
@@ -4348,7 +4457,13 @@ fn diff_files(call: &ToolCall, session: &Session) -> Result<(String, serde_json:
         anyhow::bail!("provide either `b` (path) or `b_content` (inline text)");
     };
     let context = call.args["context"].as_u64().unwrap_or(3) as usize;
-    let diff = unified_diff(&a_text, &b_text, &full_a.display().to_string(), &b_label, context);
+    let diff = unified_diff(
+        &a_text,
+        &b_text,
+        &full_a.display().to_string(),
+        &b_label,
+        context,
+    );
     if diff.trim().is_empty() {
         return Ok(("[files are identical]".into(), json!({ "identical": true })));
     }
@@ -4517,8 +4632,12 @@ fn resolve_dest(full_src: &Path, mut full_dst: PathBuf) -> PathBuf {
 }
 
 fn copy_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
-    let src = call.args["src"].as_str().ok_or_else(|| anyhow::anyhow!("missing src"))?;
-    let dst = call.args["dst"].as_str().ok_or_else(|| anyhow::anyhow!("missing dst"))?;
+    let src = call.args["src"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing src"))?;
+    let dst = call.args["dst"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing dst"))?;
     let overwrite = call.args["overwrite"].as_bool().unwrap_or(false);
     let full_src = resolve(session, src);
     if !full_src.exists() {
@@ -4540,14 +4659,27 @@ fn copy_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) 
     let bytes = if full_src.is_dir() {
         copy_dir_recursive(&full_src, &full_dst)?
     } else {
-        std::fs::copy(&full_src, &full_dst).map_err(|e| anyhow::anyhow!("{}: {e}", full_dst.display()))?
+        std::fs::copy(&full_src, &full_dst)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", full_dst.display()))?
     };
-    Ok(format!("copied {} → {} ({bytes} bytes)", full_src.display(), full_dst.display()))
+    Ok(format!(
+        "copied {} → {} ({bytes} bytes)",
+        full_src.display(),
+        full_dst.display()
+    ))
 }
 
-fn rename_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
-    let src = call.args["src"].as_str().ok_or_else(|| anyhow::anyhow!("missing src"))?;
-    let dst = call.args["dst"].as_str().ok_or_else(|| anyhow::anyhow!("missing dst"))?;
+fn rename_file(
+    call: &ToolCall,
+    session: &mut Session,
+    confirm: &mut Confirm<'_>,
+) -> Result<String> {
+    let src = call.args["src"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing src"))?;
+    let dst = call.args["dst"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing dst"))?;
     let overwrite = call.args["overwrite"].as_bool().unwrap_or(false);
     let full_src = resolve(session, src);
     if !full_src.exists() {
@@ -4576,14 +4708,23 @@ fn rename_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>
             std::fs::remove_file(&full_src)?;
         }
     }
-    Ok(format!("renamed {} → {}", full_src.display(), full_dst.display()))
+    Ok(format!(
+        "renamed {} → {}",
+        full_src.display(),
+        full_dst.display()
+    ))
 }
 
-fn append_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) -> Result<String> {
+fn append_file(
+    call: &ToolCall,
+    session: &mut Session,
+    confirm: &mut Confirm<'_>,
+) -> Result<String> {
     use std::io::Write;
-    let path = call.args["path"].as_str().ok_or_else(|| anyhow::anyhow!("missing path"))?;
-    let mut content = call
-        .args["content"]
+    let path = call.args["path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing path"))?;
+    let mut content = call.args["content"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing content"))?
         .to_string();
@@ -4602,9 +4743,14 @@ fn append_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>
         .append(true)
         .open(&full)
         .map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
-    f.write_all(content.as_bytes()).map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
+    f.write_all(content.as_bytes())
+        .map_err(|e| anyhow::anyhow!("{}: {e}", full.display()))?;
     f.flush().ok();
-    Ok(format!("appended {} bytes to {}", content.len(), full.display()))
+    Ok(format!(
+        "appended {} bytes to {}",
+        content.len(),
+        full.display()
+    ))
 }
 
 fn remember(call: &ToolCall, session: &Session) -> Result<String> {
@@ -4676,13 +4822,12 @@ fn recall(call: &ToolCall, session: &Session) -> Result<String> {
     // them (tag filter or the offload sentinel as the query) — they're kept out
     // of normal curated recall so a routine lookup never drags an MB-scale
     // transcript along. Everything else hits the relevance-ranked curated store.
-    let hits = if tag.trim() == crate::memory::OFFLOAD_TAG
-        || query.trim() == crate::memory::OFFLOAD_TAG
-    {
-        db.recall_offloads(limit)?
-    } else {
-        db.recall(query, limit)?
-    };
+    let hits =
+        if tag.trim() == crate::memory::OFFLOAD_TAG || query.trim() == crate::memory::OFFLOAD_TAG {
+            db.recall_offloads(limit)?
+        } else {
+            db.recall(query, limit)?
+        };
     Ok(if hits.is_empty() {
         "no memories match".into()
     } else {
@@ -4850,11 +4995,17 @@ mod tests {
 
     #[test]
     fn dup_guard_exact_and_normalized_match() {
-        assert!(tasks_are_duplicate("Build the report", "build   the\nreport"));
+        assert!(tasks_are_duplicate(
+            "Build the report",
+            "build   the\nreport"
+        ));
         assert!(tasks_are_duplicate("Fix CI on main", "fix ci on main"));
         assert!(!tasks_are_duplicate("", "anything"));
         assert!(!tasks_are_duplicate("anything", "   "));
-        assert!(!tasks_are_duplicate("build the report", "delete the database"));
+        assert!(!tasks_are_duplicate(
+            "build the report",
+            "delete the database"
+        ));
     }
 
     #[test]
@@ -4864,7 +5015,10 @@ mod tests {
         let wrapped = format!("please {core} and email it to finance");
         assert!(tasks_are_duplicate(core, &wrapped));
         // Short overlaps must NOT trip containment.
-        assert!(!tasks_are_duplicate("ci", "run ci on the pr branch now please thanks"));
+        assert!(!tasks_are_duplicate(
+            "ci",
+            "run ci on the pr branch now please thanks"
+        ));
         // Jaccard ≥ 0.8: near-identical token sets.
         assert!(tasks_are_duplicate(
             "audit the aws cost report for october",
@@ -4903,11 +5057,17 @@ mod tests {
         assert!(finish_bell_enabled_from(None));
         // Falsey values (case/space-insensitive) → disabled.
         for v in ["0", "off", "false", "no", "OFF", " No ", "FALSE"] {
-            assert!(!finish_bell_enabled_from(Some(v)), "{v:?} should disable the bell");
+            assert!(
+                !finish_bell_enabled_from(Some(v)),
+                "{v:?} should disable the bell"
+            );
         }
         // Anything else → enabled.
         for v in ["1", "on", "true", "yes", "", "beep"] {
-            assert!(finish_bell_enabled_from(Some(v)), "{v:?} should keep the bell on");
+            assert!(
+                finish_bell_enabled_from(Some(v)),
+                "{v:?} should keep the bell on"
+            );
         }
     }
 
@@ -4920,32 +5080,56 @@ mod tests {
         line_start: Option<usize>,
         line_end: Option<usize>,
     ) -> EditSpec<'a> {
-        EditSpec { pattern, replacement, is_regex, mode, count, line_start, line_end }
+        EditSpec {
+            pattern,
+            replacement,
+            is_regex,
+            mode,
+            count,
+            line_start,
+            line_end,
+        }
     }
 
     #[test]
     fn edit_literal_replace_all_and_count() {
         let c = "foo bar foo baz foo";
         // All occurrences.
-        let (out, n) = apply_edit(c, &spec("foo", "X", false, EditMode::Replace, 0, None, None)).unwrap();
+        let (out, n) = apply_edit(
+            c,
+            &spec("foo", "X", false, EditMode::Replace, 0, None, None),
+        )
+        .unwrap();
         assert_eq!(out, "X bar X baz X");
         assert_eq!(n, 3);
         // First N only.
-        let (out, n) = apply_edit(c, &spec("foo", "X", false, EditMode::Replace, 2, None, None)).unwrap();
+        let (out, n) = apply_edit(
+            c,
+            &spec("foo", "X", false, EditMode::Replace, 2, None, None),
+        )
+        .unwrap();
         assert_eq!(out, "X bar X baz foo");
         assert_eq!(n, 2);
     }
 
     #[test]
     fn edit_literal_replace_empty_deletes() {
-        let (out, n) = apply_edit("a-b-c", &spec("-", "", false, EditMode::Replace, 0, None, None)).unwrap();
+        let (out, n) = apply_edit(
+            "a-b-c",
+            &spec("-", "", false, EditMode::Replace, 0, None, None),
+        )
+        .unwrap();
         assert_eq!(out, "abc");
         assert_eq!(n, 2);
     }
 
     #[test]
     fn edit_no_match_reports_zero() {
-        let (out, n) = apply_edit("hello", &spec("xyz", "Q", false, EditMode::Replace, 0, None, None)).unwrap();
+        let (out, n) = apply_edit(
+            "hello",
+            &spec("xyz", "Q", false, EditMode::Replace, 0, None, None),
+        )
+        .unwrap();
         assert_eq!(out, "hello");
         assert_eq!(n, 0);
     }
@@ -4954,7 +5138,11 @@ mod tests {
     fn edit_replace_in_line_range_only() {
         let c = "foo\nfoo\nfoo\nfoo";
         // Restrict to lines 2..=3 — only those two `foo`s change.
-        let (out, n) = apply_edit(c, &spec("foo", "X", false, EditMode::Replace, 0, Some(2), Some(3))).unwrap();
+        let (out, n) = apply_edit(
+            c,
+            &spec("foo", "X", false, EditMode::Replace, 0, Some(2), Some(3)),
+        )
+        .unwrap();
         assert_eq!(out, "foo\nX\nX\nfoo");
         assert_eq!(n, 2);
     }
@@ -4964,7 +5152,15 @@ mod tests {
         let c = "name: alice\nname: bob";
         let (out, n) = apply_edit(
             c,
-            &spec(r"name: (\w+)", "user=$1", true, EditMode::Replace, 0, None, None),
+            &spec(
+                r"name: (\w+)",
+                "user=$1",
+                true,
+                EditMode::Replace,
+                0,
+                None,
+                None,
+            ),
         )
         .unwrap();
         assert_eq!(out, "user=alice\nuser=bob");
@@ -4975,7 +5171,8 @@ mod tests {
     fn edit_regex_replace_multiline_anchors() {
         // Default regex is single-line; `.` doesn't cross newlines unless asked.
         let c = "a1\nb2\nc3";
-        let (out, n) = apply_edit(c, &spec(r"\d", "#", true, EditMode::Replace, 0, None, None)).unwrap();
+        let (out, n) =
+            apply_edit(c, &spec(r"\d", "#", true, EditMode::Replace, 0, None, None)).unwrap();
         assert_eq!(out, "a#\nb#\nc#");
         assert_eq!(n, 3);
     }
@@ -4983,7 +5180,19 @@ mod tests {
     #[test]
     fn edit_insert_after_matching_line() {
         let c = "alpha\nbeta\ngamma";
-        let (out, n) = apply_edit(c, &spec("beta", "INSERTED", false, EditMode::InsertAfter, 0, None, None)).unwrap();
+        let (out, n) = apply_edit(
+            c,
+            &spec(
+                "beta",
+                "INSERTED",
+                false,
+                EditMode::InsertAfter,
+                0,
+                None,
+                None,
+            ),
+        )
+        .unwrap();
         assert_eq!(out, "alpha\nbeta\nINSERTED\ngamma");
         assert_eq!(n, 1);
     }
@@ -4991,7 +5200,19 @@ mod tests {
     #[test]
     fn edit_insert_before_matching_line() {
         let c = "alpha\nbeta\ngamma";
-        let (out, n) = apply_edit(c, &spec("gamma", "// note", false, EditMode::InsertBefore, 0, None, None)).unwrap();
+        let (out, n) = apply_edit(
+            c,
+            &spec(
+                "gamma",
+                "// note",
+                false,
+                EditMode::InsertBefore,
+                0,
+                None,
+                None,
+            ),
+        )
+        .unwrap();
         assert_eq!(out, "alpha\nbeta\n// note\ngamma");
         assert_eq!(n, 1);
     }
@@ -4999,19 +5220,35 @@ mod tests {
     #[test]
     fn edit_preserves_trailing_newline_on_insert() {
         let c = "x\ny\n";
-        let (out, n) = apply_edit(c, &spec("x", "z", false, EditMode::InsertAfter, 0, None, None)).unwrap();
+        let (out, n) = apply_edit(
+            c,
+            &spec("x", "z", false, EditMode::InsertAfter, 0, None, None),
+        )
+        .unwrap();
         assert_eq!(out, "x\nz\ny\n");
         assert_eq!(n, 1);
     }
 
     #[test]
     fn edit_empty_pattern_rejected() {
-        assert!(apply_edit("abc", &spec("", "x", false, EditMode::Replace, 0, None, None)).is_err());
+        assert!(
+            apply_edit(
+                "abc",
+                &spec("", "x", false, EditMode::Replace, 0, None, None)
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn edit_bad_regex_rejected() {
-        assert!(apply_edit("abc", &spec("(", "x", true, EditMode::Replace, 0, None, None)).is_err());
+        assert!(
+            apply_edit(
+                "abc",
+                &spec("(", "x", true, EditMode::Replace, 0, None, None)
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -5037,7 +5274,10 @@ mod tests {
         let r = execute(&call, &mut session, &mut confirm).await;
         assert!(!r.is_error, "got: {}", r.content);
         assert!(r.content.contains("1 change"), "got: {}", r.content);
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "line1\nREPLACED\nline3\n");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "line1\nREPLACED\nline3\n"
+        );
 
         // A no-match edit leaves the file untouched and says so.
         let miss = ToolCall {
@@ -5048,7 +5288,10 @@ mod tests {
         let r = execute(&miss, &mut session, &mut confirm).await;
         assert!(!r.is_error);
         assert!(r.content.contains("no matches"), "got: {}", r.content);
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "line1\nREPLACED\nline3\n");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "line1\nREPLACED\nline3\n"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5056,7 +5299,10 @@ mod tests {
     #[test]
     fn edit_file_tool_is_offered() {
         let defs = tool_defs(false, false, false);
-        assert!(defs.iter().any(|d| d.name == "edit_file"), "edit_file must be in the tool set");
+        assert!(
+            defs.iter().any(|d| d.name == "edit_file"),
+            "edit_file must be in the tool set"
+        );
     }
 
     #[test]
@@ -5204,7 +5450,10 @@ mod tests {
         assert_eq!((p.as_str(), a), ("git", v(&["status"])));
 
         let (p, a) = parse_argv(&call("git", &["log", "--oneline", "-n", "1"], None)).unwrap();
-        assert_eq!((p.as_str(), a), ("git", v(&["log", "--oneline", "-n", "1"])));
+        assert_eq!(
+            (p.as_str(), a),
+            ("git", v(&["log", "--oneline", "-n", "1"]))
+        );
 
         // Absolute-path program + subcommand is likewise passed through intact.
         let (p, a) = parse_argv(&call("/usr/bin/git", &["status"], None)).unwrap();
@@ -5277,24 +5526,51 @@ mod tests {
         let u = |p: &str, a: &[&str]| unwrap_noexec_builtin(p, &v(a));
 
         // `command which psql` (the reported failure) → run `which psql`.
-        assert_eq!(u("command", &["which", "psql"]), Some(("which".into(), v(&["psql"]))));
+        assert_eq!(
+            u("command", &["which", "psql"]),
+            Some(("which".into(), v(&["psql"])))
+        );
         // `command -v psql` is the existence probe → `which psql`.
-        assert_eq!(u("command", &["-v", "psql"]), Some(("which".into(), v(&["psql"]))));
+        assert_eq!(
+            u("command", &["-v", "psql"]),
+            Some(("which".into(), v(&["psql"])))
+        );
         // `command -V psql` (verbose probe) likewise → `which psql`.
-        assert_eq!(u("command", &["-V", "psql"]), Some(("which".into(), v(&["psql"]))));
+        assert_eq!(
+            u("command", &["-V", "psql"]),
+            Some(("which".into(), v(&["psql"])))
+        );
         // Combined flags like `-pv` still detect the probe bit.
-        assert_eq!(u("command", &["-pv", "psql"]), Some(("which".into(), v(&["psql"]))));
+        assert_eq!(
+            u("command", &["-pv", "psql"]),
+            Some(("which".into(), v(&["psql"])))
+        );
         // `command -p git status` → run `git status` (strip the -p, keep argv).
-        assert_eq!(u("command", &["-p", "git", "status"]), Some(("git".into(), v(&["status"]))));
+        assert_eq!(
+            u("command", &["-p", "git", "status"]),
+            Some(("git".into(), v(&["status"])))
+        );
         // `command git status` (no flags) → `git status`.
-        assert_eq!(u("command", &["git", "status"]), Some(("git".into(), v(&["status"]))));
+        assert_eq!(
+            u("command", &["git", "status"]),
+            Some(("git".into(), v(&["status"])))
+        );
         // `builtin ls -la` unwraps the same way (no -v form).
-        assert_eq!(u("builtin", &["ls", "-la"]), Some(("ls".into(), v(&["-la"]))));
+        assert_eq!(
+            u("builtin", &["ls", "-la"]),
+            Some(("ls".into(), v(&["-la"])))
+        );
         // `type psql` (and multi-name) → `which psql …`.
         assert_eq!(u("type", &["psql"]), Some(("which".into(), v(&["psql"]))));
-        assert_eq!(u("type", &["-a", "psql", "gh"]), Some(("which".into(), v(&["psql", "gh"]))));
+        assert_eq!(
+            u("type", &["-a", "psql", "gh"]),
+            Some(("which".into(), v(&["psql", "gh"])))
+        );
         // `--` terminates flag scanning: `command -- -weird` runs `-weird`.
-        assert_eq!(u("command", &["--", "-weird"]), Some(("-weird".into(), v(&[]))));
+        assert_eq!(
+            u("command", &["--", "-weird"]),
+            Some(("-weird".into(), v(&[])))
+        );
 
         // Untouched: a real program, and the degenerate empty forms.
         assert_eq!(u("psql", &["-l"]), None);
@@ -5302,7 +5578,10 @@ mod tests {
         assert_eq!(u("command", &["-v"]), None);
         assert_eq!(u("type", &[]), None);
         // Absolute path to a `command`-named binary still unwraps on basename.
-        assert_eq!(u("/usr/bin/command", &["which", "psql"]), Some(("which".into(), v(&["psql"]))));
+        assert_eq!(
+            u("/usr/bin/command", &["which", "psql"]),
+            Some(("which".into(), v(&["psql"])))
+        );
     }
 
     #[tokio::test]
@@ -5888,7 +6167,11 @@ mod fileops_tests {
     }
 
     async fn run(session: &mut Session, name: &str, args: serde_json::Value) -> ToolResult {
-        let call = ToolCall { id: "t".into(), name: name.into(), args };
+        let call = ToolCall {
+            id: "t".into(),
+            name: name.into(),
+            args,
+        };
         let mut confirm = |_: &str| Decision::AllowOnce;
         execute(&call, session, &mut confirm).await
     }
@@ -5903,7 +6186,10 @@ mod fileops_tests {
     #[test]
     fn glob_segment_and_class() {
         let m = |p: &str, t: &str| {
-            glob_segment_match(&p.chars().collect::<Vec<_>>(), &t.chars().collect::<Vec<_>>())
+            glob_segment_match(
+                &p.chars().collect::<Vec<_>>(),
+                &t.chars().collect::<Vec<_>>(),
+            )
         };
         assert!(m("*.rs", "main.rs"));
         assert!(!m("*.rs", "main.toml"));
@@ -5917,10 +6203,21 @@ mod fileops_tests {
 
     #[test]
     fn glob_path_doublestar() {
-        fn split(s: &str) -> Vec<&str> { s.split('/').filter(|x| !x.is_empty()).collect() }
-        assert!(glob_path_match(&split("src/**/*.rs"), &split("src/a/b/main.rs")));
-        assert!(glob_path_match(&split("src/**/*.rs"), &split("src/main.rs")));
-        assert!(!glob_path_match(&split("src/**/*.rs"), &split("tests/main.rs")));
+        fn split(s: &str) -> Vec<&str> {
+            s.split('/').filter(|x| !x.is_empty()).collect()
+        }
+        assert!(glob_path_match(
+            &split("src/**/*.rs"),
+            &split("src/a/b/main.rs")
+        ));
+        assert!(glob_path_match(
+            &split("src/**/*.rs"),
+            &split("src/main.rs")
+        ));
+        assert!(!glob_path_match(
+            &split("src/**/*.rs"),
+            &split("tests/main.rs")
+        ));
         assert!(glob_path_match(&split("*.toml"), &split("Cargo.toml")));
         assert!(!glob_path_match(&split("*.toml"), &split("src/Cargo.toml")));
     }
@@ -5940,12 +6237,32 @@ mod fileops_tests {
         assert!(!r.content.contains("c.txt"), "{}", r.content);
         // S7.2: structured payload is an array of {path,type,size} records that
         // matches the rendered text (AC1/AC3).
-        let arr = r.structured.as_ref().expect("glob_expand carries a payload").as_array().unwrap().clone();
-        assert!(arr.iter().any(|e| e["path"] == "src/a.rs" && e["type"] == "file" && e["size"] == 1));
-        assert!(arr.iter().any(|e| e["path"] == "src/inner/b.rs" && e["size"] == 2));
-        assert!(!arr.iter().any(|e| e["path"].as_str().unwrap_or("").ends_with("c.txt")));
+        let arr = r
+            .structured
+            .as_ref()
+            .expect("glob_expand carries a payload")
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            arr.iter()
+                .any(|e| e["path"] == "src/a.rs" && e["type"] == "file" && e["size"] == 1)
+        );
+        assert!(
+            arr.iter()
+                .any(|e| e["path"] == "src/inner/b.rs" && e["size"] == 2)
+        );
+        assert!(
+            !arr.iter()
+                .any(|e| e["path"].as_str().unwrap_or("").ends_with("c.txt"))
+        );
         // type filter
-        let d = run(&mut s, "glob_expand", json!({"pattern": "src/**", "type": "dir"})).await;
+        let d = run(
+            &mut s,
+            "glob_expand",
+            json!({"pattern": "src/**", "type": "dir"}),
+        )
+        .await;
         assert!(d.content.contains("src/inner"), "{}", d.content);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5959,16 +6276,32 @@ mod fileops_tests {
         assert!(r.content.contains("a.txt:1:"), "{}", r.content);
         assert!(!r.content.contains("a.txt:3:"), "{}", r.content);
         // S7.2: one {path,line,text} record per MATCH line.
-        let arr = r.structured.as_ref().expect("grep_files carries a payload").as_array().unwrap().clone();
+        let arr = r
+            .structured
+            .as_ref()
+            .expect("grep_files carries a payload")
+            .as_array()
+            .unwrap()
+            .clone();
         assert_eq!(arr.len(), 1, "one match record");
         assert_eq!(arr[0]["path"], "a.txt");
         assert_eq!(arr[0]["line"], 1);
         assert_eq!(arr[0]["text"], "hello world");
-        let r2 = run(&mut s, "grep_files", json!({"pattern": "hello", "ignore_case": true})).await;
+        let r2 = run(
+            &mut s,
+            "grep_files",
+            json!({"pattern": "hello", "ignore_case": true}),
+        )
+        .await;
         assert!(r2.content.contains("a.txt:3:"), "{}", r2.content);
         // glob scoping excludes non-matching files
         std::fs::write(dir.join("b.rs"), b"hello rust\n").unwrap();
-        let r3 = run(&mut s, "grep_files", json!({"pattern": "hello", "glob": "*.rs"})).await;
+        let r3 = run(
+            &mut s,
+            "grep_files",
+            json!({"pattern": "hello", "glob": "*.rs"}),
+        )
+        .await;
         assert!(r3.content.contains("b.rs:1:"), "{}", r3.content);
         assert!(!r3.content.contains("a.txt"), "{}", r3.content);
         let _ = std::fs::remove_dir_all(&dir);
@@ -5993,8 +6326,17 @@ mod fileops_tests {
         assert_eq!(arr.len(), 1, "only the real source hit: {}", r.content);
         assert_eq!(arr[0]["path"], "real.rs");
         // ...but an EXPLICIT path INTO a skipped dir is honoured (it's the root).
-        let r2 = run(&mut s, "grep_files", json!({"pattern": "llama_cpp_2", "path": "target"})).await;
-        assert!(r2.content.contains("gen.rs"), "explicit root honoured: {}", r2.content);
+        let r2 = run(
+            &mut s,
+            "grep_files",
+            json!({"pattern": "llama_cpp_2", "path": "target"}),
+        )
+        .await;
+        assert!(
+            r2.content.contains("gen.rs"),
+            "explicit root honoured: {}",
+            r2.content
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6010,8 +6352,15 @@ mod fileops_tests {
         let r = run(&mut s, "grep_files", json!({"pattern": "needle"})).await;
         let arr = r.structured.as_ref().unwrap().as_array().unwrap().clone();
         let text = arr[0]["text"].as_str().unwrap();
-        assert!(text.len() <= GREP_MAX_LINE + 32, "record text capped: {}", text.len());
-        assert!(text.contains("[+"), "carries a truncation marker: {text:.80}");
+        assert!(
+            text.len() <= GREP_MAX_LINE + 32,
+            "record text capped: {}",
+            text.len()
+        );
+        assert!(
+            text.contains("[+"),
+            "carries a truncation marker: {text:.80}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6043,9 +6392,21 @@ mod fileops_tests {
         assert!(!r.is_error, "{}", r.content);
         // text rendering is unchanged (AC2): "file f.txt 3", "dir  sub".
         assert!(r.content.contains("file f.txt 3"), "{}", r.content);
-        let arr = r.structured.as_ref().expect("list_dir carries a payload").as_array().unwrap().clone();
-        assert!(arr.iter().any(|e| e["name"] == "f.txt" && e["type"] == "file" && e["size"] == 3));
-        assert!(arr.iter().any(|e| e["name"] == "sub" && e["type"] == "dir" && e["size"].is_null()));
+        let arr = r
+            .structured
+            .as_ref()
+            .expect("list_dir carries a payload")
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            arr.iter()
+                .any(|e| e["name"] == "f.txt" && e["type"] == "file" && e["size"] == 3)
+        );
+        assert!(
+            arr.iter()
+                .any(|e| e["name"] == "sub" && e["type"] == "dir" && e["size"].is_null())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6066,7 +6427,12 @@ mod fileops_tests {
         std::fs::write(dir.join("over_cap"), vec![b'a'; RANGED_READ_MAX_BYTES + 1]).unwrap();
         let r = run(&mut s, "read_file", json!({"path": "over_cap"})).await;
         assert!(r.is_error, "file over cap must be rejected: {}", r.content);
-        assert!(r.content.contains("bulk reads without line bounds are disallowed"), "{}", r.content);
+        assert!(
+            r.content
+                .contains("bulk reads without line bounds are disallowed"),
+            "{}",
+            r.content
+        );
 
         // Same oversized file reads fine WITH line bounds.
         let mut big = String::new();
@@ -6075,9 +6441,22 @@ mod fileops_tests {
         }
         assert!(big.len() > RANGED_READ_MAX_BYTES);
         std::fs::write(dir.join("big"), big.as_bytes()).unwrap();
-        let r = run(&mut s, "read_file", json!({"path": "big", "line_start": 1, "line_end": 3})).await;
-        assert!(!r.is_error, "ranged read of large file must succeed: {}", r.content);
-        assert!(r.content.contains("line 0") && r.content.contains("line 2"), "{}", r.content);
+        let r = run(
+            &mut s,
+            "read_file",
+            json!({"path": "big", "line_start": 1, "line_end": 3}),
+        )
+        .await;
+        assert!(
+            !r.is_error,
+            "ranged read of large file must succeed: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("line 0") && r.content.contains("line 2"),
+            "{}",
+            r.content
+        );
 
         // Empty file reads whole (below cap).
         std::fs::write(dir.join("empty"), b"").unwrap();
@@ -6104,13 +6483,33 @@ mod fileops_tests {
             assert!(body.len() > RANGED_READ_MAX_BYTES);
             std::fs::write(dir.join(name), body.as_bytes()).unwrap();
             let r = run(&mut s, "read_file", json!({"path": name})).await;
-            assert!(r.is_error, "oversized {name} must be refused: {}", r.content);
+            assert!(
+                r.is_error,
+                "oversized {name} must be refused: {}",
+                r.content
+            );
             // Reports the real line count.
-            assert!(r.content.contains(&format!("{lines} lines")), "hint must state line count: {}", r.content);
+            assert!(
+                r.content.contains(&format!("{lines} lines")),
+                "hint must state line count: {}",
+                r.content
+            );
             // Suggests a concrete, retryable slice (capped at 200 lines).
-            assert!(r.content.contains("line_start=1"), "hint must suggest a slice: {}", r.content);
-            assert!(r.content.contains("line_end=200"), "hint must cap the suggested slice: {}", r.content);
-            assert!(r.content.contains("grep_files"), "hint must mention grep_files: {}", r.content);
+            assert!(
+                r.content.contains("line_start=1"),
+                "hint must suggest a slice: {}",
+                r.content
+            );
+            assert!(
+                r.content.contains("line_end=200"),
+                "hint must cap the suggested slice: {}",
+                r.content
+            );
+            assert!(
+                r.content.contains("grep_files"),
+                "hint must mention grep_files: {}",
+                r.content
+            );
         }
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6126,7 +6525,11 @@ mod fileops_tests {
         let mut s = yolo_session(&dir);
         let r = run(&mut s, "list_dir", json!({"max": 3})).await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("showing 3 of 10 entries"), "{}", r.content);
+        assert!(
+            r.content.contains("showing 3 of 10 entries"),
+            "{}",
+            r.content
+        );
         // JSON payload is truncated to the same cap.
         let arr = r.structured.as_ref().unwrap().as_array().unwrap();
         assert_eq!(arr.len(), 3, "payload truncated to max");
@@ -6153,7 +6556,10 @@ mod fileops_tests {
         assert!(!r.is_error, "{}", r.content);
 
         // The byte cap must have engaged: fewer than 300 shown, marker present.
-        assert!(r.content.contains("of 300 entries"), "must warn truncation: head/tail of content missing marker");
+        assert!(
+            r.content.contains("of 300 entries"),
+            "must warn truncation: head/tail of content missing marker"
+        );
 
         let arr = r.structured.as_ref().unwrap().as_array().unwrap();
         // Count file-rows in the human text (every non-marker line renders as
@@ -6166,8 +6572,15 @@ mod fileops_tests {
             "text lists {file_lines} files but payload lists {} — they drifted",
             arr.len()
         );
-        assert!(arr.len() < 300, "byte cap must have dropped some entries (got {})", arr.len());
-        assert!(!arr.is_empty(), "at least one entry must survive the byte cap");
+        assert!(
+            arr.len() < 300,
+            "byte cap must have dropped some entries (got {})",
+            arr.len()
+        );
+        assert!(
+            !arr.is_empty(),
+            "at least one entry must survive the byte cap"
+        );
 
         // Every file the model sees must also appear verbatim in the human text.
         for e in arr {
@@ -6178,7 +6591,11 @@ mod fileops_tests {
             );
         }
         // And the whole rendered text still honors the byte cap.
-        assert!(r.content.len() <= MAX_OUTPUT, "content {} exceeds MAX_OUTPUT {MAX_OUTPUT}", r.content.len());
+        assert!(
+            r.content.len() <= MAX_OUTPUT,
+            "content {} exceeds MAX_OUTPUT {MAX_OUTPUT}",
+            r.content.len()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6224,7 +6641,12 @@ mod fileops_tests {
         let r = run(&mut s, "copy_file", json!({"src": "a", "dst": "b"})).await;
         assert!(r.content.contains("destination exists"), "{}", r.content);
 
-        let r = run(&mut s, "append_file", json!({"path": "b", "content": "+more"})).await;
+        let r = run(
+            &mut s,
+            "append_file",
+            json!({"path": "b", "content": "+more"}),
+        )
+        .await;
         assert!(!r.is_error, "{}", r.content);
         assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "orig+more");
 
@@ -6239,7 +6661,12 @@ mod fileops_tests {
     async fn append_creates_missing_and_newline() {
         let dir = tmp("append");
         let mut s = yolo_session(&dir);
-        let r = run(&mut s, "append_file", json!({"path": "log", "content": "line", "newline": true})).await;
+        let r = run(
+            &mut s,
+            "append_file",
+            json!({"path": "log", "content": "line", "newline": true}),
+        )
+        .await;
         assert!(!r.is_error, "{}", r.content);
         assert_eq!(std::fs::read_to_string(dir.join("log")).unwrap(), "line\n");
         let _ = std::fs::remove_dir_all(&dir);
@@ -6265,7 +6692,12 @@ mod fileops_tests {
         // identical files → {identical:true} (AC3).
         assert_eq!(same.structured.as_ref().unwrap()["identical"], true);
         // inline b_content
-        let ic = run(&mut s, "diff_files", json!({"a": "a", "b_content": "one\ntwo\nthree\n"})).await;
+        let ic = run(
+            &mut s,
+            "diff_files",
+            json!({"a": "a", "b_content": "one\ntwo\nthree\n"}),
+        )
+        .await;
         assert!(ic.content.contains("identical"), "{}", ic.content);
         let _ = std::fs::remove_dir_all(&dir);
     }

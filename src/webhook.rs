@@ -213,10 +213,7 @@ impl WebhookHandle {
 /// Rebuild the webhook service from the environment, reloading plugin handlers
 /// from disk. Used by `:webhook reload`. Returns the reloaded handler count on
 /// success. Errors (returned as a message) when no broker URL is configured.
-pub fn reload(
-    slot: &mut Option<WebhookHandle>,
-    flash: Option<FlashSink>,
-) -> Result<usize, String> {
+pub fn reload(slot: &mut Option<WebhookHandle>, flash: Option<FlashSink>) -> Result<usize, String> {
     let configured = std::env::var("WEBHOOK_BROKER_URL")
         .ok()
         .is_some_and(|u| !u.trim().is_empty());
@@ -289,11 +286,7 @@ fn plugins_dir() -> PathBuf {
 /// `v.len() <= n`.
 fn tail<T>(mut v: Vec<T>, n: usize) -> Vec<T> {
     let len = v.len();
-    if len > n {
-        v.split_off(len - n)
-    } else {
-        v
-    }
+    if len > n { v.split_off(len - n) } else { v }
 }
 
 fn fmt_dur(d: Duration) -> String {

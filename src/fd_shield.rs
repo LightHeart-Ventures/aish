@@ -209,7 +209,9 @@ mod tests {
         let t = std::thread::spawn(move || relay(up_rd, down_wr));
 
         let mut writer = unsafe { std::fs::File::from_raw_fd(up_wr) };
-        writer.write_all(b"before\n").expect("write while parent alive");
+        writer
+            .write_all(b"before\n")
+            .expect("write while parent alive");
 
         // Parent exits: its read end disappears.
         unsafe { libc::close(down_rd) };
@@ -223,7 +225,8 @@ mod tests {
         }
 
         drop(writer); // EOF -> relay exits
-        t.join().expect("relay thread should exit cleanly, not panic");
+        t.join()
+            .expect("relay thread should exit cleanly, not panic");
     }
 
     /// A relay with a live downstream must deliver the bytes verbatim.

@@ -33,7 +33,10 @@ fn unique_tmp(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    p.push(format!("git-discover-it-{tag}-{}-{nanos}", std::process::id()));
+    p.push(format!(
+        "git-discover-it-{tag}-{}-{nanos}",
+        std::process::id()
+    ));
     p
 }
 
@@ -52,11 +55,17 @@ fn discovers_a_freshly_initialized_repo() {
     let ok = git(&dir, &["init", "-q", "-b", "main"]) || git(&dir, &["init", "-q"]);
     assert!(ok, "git init failed");
     let _ = git(&dir, &["symbolic-ref", "HEAD", "refs/heads/main"]);
-    let _ = git(&dir, &["remote", "add", "origin", "git@github.com:acme/widget.git"]);
+    let _ = git(
+        &dir,
+        &["remote", "add", "origin", "git@github.com:acme/widget.git"],
+    );
 
     std::fs::write(dir.join("README.md"), "hi\n").unwrap();
     assert!(git(&dir, &["add", "."]), "git add failed");
-    assert!(git(&dir, &["commit", "-q", "-m", "init"]), "git commit failed");
+    assert!(
+        git(&dir, &["commit", "-q", "-m", "init"]),
+        "git commit failed"
+    );
 
     let info = git_discover::discover(&dir).expect("should discover the repo");
 
@@ -101,7 +110,14 @@ fn linked_worktree_is_flagged() {
     let wt = unique_tmp("wt-linked");
     let added = git(
         &dir,
-        &["worktree", "add", "-q", "-b", "feature", wt.to_str().unwrap()],
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            wt.to_str().unwrap(),
+        ],
     );
     if added {
         let main_info = git_discover::discover(&dir).unwrap();
@@ -112,7 +128,10 @@ fn linked_worktree_is_flagged() {
         assert_eq!(linked.branch.as_deref(), Some("feature"));
         assert!(!linked.on_trunk);
 
-        let _ = git(&dir, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+        let _ = git(
+            &dir,
+            &["worktree", "remove", "--force", wt.to_str().unwrap()],
+        );
     }
     let _ = std::fs::remove_dir_all(&wt);
     let _ = std::fs::remove_dir_all(&dir);

@@ -114,11 +114,7 @@ calls (greps, reads, edits, runs) into a single round rather than chaining them 
 on {}). Escalating to operator.",
                 max_tool_repeats, total_turns, repeated_tool, repeated_file
             );
-            (
-                YieldClassification::StuckPattern,
-                summary,
-                None,
-            )
+            (YieldClassification::StuckPattern, summary, None)
         } else {
             let summary = format!(
                 "Batching opportunity: {} rounds used {} unique tools on {} unique files. \
@@ -157,34 +153,71 @@ mod tests {
     fn test_batching_opportunity() {
         // 5 rounds, all different tools and files → batching opportunity.
         let turns = vec![
-            (1, vec!["grep_files".to_string()], vec!["file1.rs".to_string()]),
+            (
+                1,
+                vec!["grep_files".to_string()],
+                vec!["file1.rs".to_string()],
+            ),
             (
                 2,
                 vec!["read_file".to_string()],
                 vec!["file2.rs".to_string()],
             ),
-            (3, vec!["edit_file".to_string()], vec!["file3.rs".to_string()]),
-            (4, vec!["run_program".to_string()], vec!["file4.rs".to_string()]),
-            (5, vec!["glob_expand".to_string()], vec!["file5.rs".to_string()]),
+            (
+                3,
+                vec!["edit_file".to_string()],
+                vec!["file3.rs".to_string()],
+            ),
+            (
+                4,
+                vec!["run_program".to_string()],
+                vec!["file4.rs".to_string()],
+            ),
+            (
+                5,
+                vec!["glob_expand".to_string()],
+                vec!["file5.rs".to_string()],
+            ),
         ];
 
         let advice = SerialYieldAdvisor::evaluate(&turns);
-        assert_eq!(advice.classification, YieldClassification::BatchingOpportunity);
+        assert_eq!(
+            advice.classification,
+            YieldClassification::BatchingOpportunity
+        );
         assert!(advice.resume_directive.is_some());
-        assert!(advice
-            .summary
-            .contains("Batching opportunity"));
+        assert!(advice.summary.contains("Batching opportunity"));
     }
 
     #[test]
     fn test_stuck_pattern() {
         // 5 rounds, all the same tool and file (>80% repetition) → stuck.
         let turns = vec![
-            (1, vec!["read_file".to_string()], vec!["file.rs".to_string()]),
-            (2, vec!["read_file".to_string()], vec!["file.rs".to_string()]),
-            (3, vec!["read_file".to_string()], vec!["file.rs".to_string()]),
-            (4, vec!["read_file".to_string()], vec!["file.rs".to_string()]),
-            (5, vec!["read_file".to_string()], vec!["file.rs".to_string()]),
+            (
+                1,
+                vec!["read_file".to_string()],
+                vec!["file.rs".to_string()],
+            ),
+            (
+                2,
+                vec!["read_file".to_string()],
+                vec!["file.rs".to_string()],
+            ),
+            (
+                3,
+                vec!["read_file".to_string()],
+                vec!["file.rs".to_string()],
+            ),
+            (
+                4,
+                vec!["read_file".to_string()],
+                vec!["file.rs".to_string()],
+            ),
+            (
+                5,
+                vec!["read_file".to_string()],
+                vec!["file.rs".to_string()],
+            ),
         ];
 
         let advice = SerialYieldAdvisor::evaluate(&turns);
@@ -240,19 +273,42 @@ mod tests {
     fn test_mixed_pattern() {
         // 6 rounds: 4 repeated (grep) + 2 unique → still batching opportunity (67% not > 80%).
         let turns = vec![
-            (1, vec!["grep_files".to_string()], vec!["file1.rs".to_string()]),
-            (2, vec!["grep_files".to_string()], vec!["file1.rs".to_string()]),
-            (3, vec!["grep_files".to_string()], vec!["file1.rs".to_string()]),
-            (4, vec!["grep_files".to_string()], vec!["file1.rs".to_string()]),
+            (
+                1,
+                vec!["grep_files".to_string()],
+                vec!["file1.rs".to_string()],
+            ),
+            (
+                2,
+                vec!["grep_files".to_string()],
+                vec!["file1.rs".to_string()],
+            ),
+            (
+                3,
+                vec!["grep_files".to_string()],
+                vec!["file1.rs".to_string()],
+            ),
+            (
+                4,
+                vec!["grep_files".to_string()],
+                vec!["file1.rs".to_string()],
+            ),
             (
                 5,
                 vec!["read_file".to_string()],
                 vec!["file2.rs".to_string()],
             ),
-            (6, vec!["edit_file".to_string()], vec!["file3.rs".to_string()]),
+            (
+                6,
+                vec!["edit_file".to_string()],
+                vec!["file3.rs".to_string()],
+            ),
         ];
 
         let advice = SerialYieldAdvisor::evaluate(&turns);
-        assert_eq!(advice.classification, YieldClassification::BatchingOpportunity);
+        assert_eq!(
+            advice.classification,
+            YieldClassification::BatchingOpportunity
+        );
     }
 }

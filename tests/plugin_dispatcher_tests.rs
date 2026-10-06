@@ -69,9 +69,8 @@ fn mock_http_server(expect: usize) -> (String, mpsc::Receiver<String>) {
                 break;
             };
             let body = read_http_body(&mut stream);
-            let _ = stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-            );
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
             let _ = stream.flush();
             let _ = tx.send(body);
         }
@@ -93,10 +92,7 @@ fn read_http_body(stream: &mut std::net::TcpStream) -> String {
         if trimmed.is_empty() {
             break; // end of headers
         }
-        if let Some(v) = trimmed
-            .to_ascii_lowercase()
-            .strip_prefix("content-length:")
-        {
+        if let Some(v) = trimmed.to_ascii_lowercase().strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
         }
     }
@@ -122,11 +118,16 @@ async fn test_route_workspace_open_http() {
     let n = d.route_awaiting(Event::WorkspaceOpen).await.unwrap();
     assert_eq!(n, 1, "exactly one subscriber");
 
-    let body = rx.recv_timeout(Duration::from_secs(5)).expect("server got a POST");
+    let body = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("server got a POST");
     let v: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
     assert_eq!(v["event_type"], "workspace_open");
     assert_eq!(v["plugin_id"], "webby");
-    assert!(v["payload_json"].get("cwd").is_some(), "workspace_open carries cwd");
+    assert!(
+        v["payload_json"].get("cwd").is_some(),
+        "workspace_open carries cwd"
+    );
 }
 
 /// Command dispatch (NO SHELL — SPR-069 TASK-379/446): a plugin's
@@ -166,8 +167,16 @@ async fn test_route_skill_loaded_command() {
 async fn test_route_multiple_plugins() {
     let (url, rx) = mock_http_server(2);
     let dir = tempdir("multi");
-    write_plugin(&dir, "alpha", &format!(r#"{{"id":"alpha","webhook_url":"{url}"}}"#));
-    write_plugin(&dir, "bravo", &format!(r#"{{"id":"bravo","webhook_url":"{url}"}}"#));
+    write_plugin(
+        &dir,
+        "alpha",
+        &format!(r#"{{"id":"alpha","webhook_url":"{url}"}}"#),
+    );
+    write_plugin(
+        &dir,
+        "bravo",
+        &format!(r#"{{"id":"bravo","webhook_url":"{url}"}}"#),
+    );
     // A third plugin with NO webhook must be ignored.
     write_plugin(&dir, "silent", r#"{"id":"silent"}"#);
     let state = PluginStateStore::open_in_memory().unwrap();

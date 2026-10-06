@@ -155,7 +155,11 @@ fn parse_list_field(front: &str, key: &str) -> Vec<String> {
         if !value.is_empty() {
             // Scalar on the same line — treat as a single-item list.
             let item = clean_item(value);
-            return if item.is_empty() { Vec::new() } else { vec![item] };
+            return if item.is_empty() {
+                Vec::new()
+            } else {
+                vec![item]
+            };
         }
         // Block form: subsequent `  - item` lines until indentation ends.
         let mut out = Vec::new();
@@ -328,7 +332,11 @@ mod tests {
                 .as_nanos()
         ));
         let skills_dir = root.join("skills");
-        let plugin_skill = root.join("plugins").join("hello-world").join("skills").join("hello-world");
+        let plugin_skill = root
+            .join("plugins")
+            .join("hello-world")
+            .join("skills")
+            .join("hello-world");
         std::fs::create_dir_all(skills_dir.join("deploy")).unwrap();
         std::fs::create_dir_all(&plugin_skill).unwrap();
         std::fs::write(
@@ -347,7 +355,10 @@ mod tests {
         )
         .unwrap();
 
-        let names: Vec<String> = load_catalog(&skills_dir).into_iter().map(|s| s.name).collect();
+        let names: Vec<String> = load_catalog(&skills_dir)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
         // Installed skill + plugin-contributed skill, sorted by name.
         assert_eq!(names, vec!["deploy", "hello-world"]);
 
@@ -396,5 +407,4 @@ unwanted-for:\n  - infrastructure\n  - perf\n---\nbody";
         let (c2, a2, u2) = parse_semantic_metadata("plain body, no frontmatter");
         assert!(c2.is_empty() && a2.is_empty() && u2.is_empty());
     }
-
 }

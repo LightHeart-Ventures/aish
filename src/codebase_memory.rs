@@ -14,7 +14,7 @@
 //! helpers (`binary_present`), so the unit tests below run with no network under
 //! `cargo test --no-default-features --locked`.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 /// The stable name of the server as it appears under `mcpServers` in
@@ -103,9 +103,7 @@ pub fn server_spec(binary: &Path) -> Value {
 
 /// True when `name` is already registered under `mcpServers` in `root`.
 pub fn is_enrolled(root: &Value, name: &str) -> bool {
-    root.get("mcpServers")
-        .and_then(|m| m.get(name))
-        .is_some()
+    root.get("mcpServers").and_then(|m| m.get(name)).is_some()
 }
 
 /// Idempotently merge a `codebase-memory` server entry into a parsed `.mcp.json`
@@ -114,7 +112,11 @@ pub fn is_enrolled(root: &Value, name: &str) -> bool {
 /// so the caller can skip the disk write). Re-running with the same spec is a
 /// no-op — this is the idempotency the AC requires.
 pub fn merge_server_entry(root: &mut Value, name: &str, spec: Value) -> MergeOutcome {
-    if !root.get("mcpServers").map(Value::is_object).unwrap_or(false) {
+    if !root
+        .get("mcpServers")
+        .map(Value::is_object)
+        .unwrap_or(false)
+    {
         root["mcpServers"] = json!({});
     }
     let servers = root["mcpServers"]
@@ -242,7 +244,6 @@ pub fn log_handoff_event(msg: &str) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,7 +323,10 @@ mod tests {
 
     #[test]
     fn asset_url_is_a_github_release_download() {
-        let url = asset_url(PINNED_VERSION, "codebase-memory-mcp-x86_64-unknown-linux-gnu.tar.gz");
+        let url = asset_url(
+            PINNED_VERSION,
+            "codebase-memory-mcp-x86_64-unknown-linux-gnu.tar.gz",
+        );
         assert_eq!(
             url,
             "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.1.0/codebase-memory-mcp-x86_64-unknown-linux-gnu.tar.gz"
@@ -417,8 +421,14 @@ mod tests {
         assert!(should_auto_index(true, true, true, false));
         // Any single failing precondition suppresses the fire.
         assert!(!should_auto_index(false, true, true, false), "not enrolled");
-        assert!(!should_auto_index(true, false, true, false), "not connected");
+        assert!(
+            !should_auto_index(true, false, true, false),
+            "not connected"
+        );
         assert!(!should_auto_index(true, true, false, false), "gate off");
-        assert!(!should_auto_index(true, true, true, true), "already indexed");
+        assert!(
+            !should_auto_index(true, true, true, true),
+            "already indexed"
+        );
     }
 }

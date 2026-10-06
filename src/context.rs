@@ -65,11 +65,7 @@ pub fn context_window(model: &str) -> usize {
         200_000
     } else if m.contains("grok") {
         131_072
-    } else if m.contains("gpt-5")
-        || m.contains("gpt-4.1")
-        || m.contains("o3")
-        || m.contains("o4")
-    {
+    } else if m.contains("gpt-5") || m.contains("gpt-4.1") || m.contains("o3") || m.contains("o4") {
         // OpenAI GPT-5 / GPT-4.1 / o-series expose very large windows.
         1_000_000
     } else if m.contains("gpt-4o") || m.contains("gpt-4") {
@@ -313,7 +309,6 @@ fn json_bytes(v: &serde_json::Value) -> usize {
 pub fn count_tool_calls(history: &[Msg]) -> usize {
     history.iter().map(|m| m.tool_calls.len()).sum()
 }
-
 
 /// The largest prefix length `split` such that compacting `history[..split]`:
 ///   * keeps at least `keep_recent` messages in `history[split..]`, and
@@ -687,7 +682,10 @@ mod tests {
         // The reported failure: 225_423 tokens against a 200k window.
         let c = prompt_ceiling(200_000);
         assert!(c < 200_000, "ceiling must leave headroom: {c}");
-        assert!(c > 150_000, "ceiling must not compact more than needed: {c}");
+        assert!(
+            c > 150_000,
+            "ceiling must not compact more than needed: {c}"
+        );
         assert!(225_423 >= c, "the reported overflow must trip the guard");
         // Unknown window disables the lever rather than dividing by zero.
         assert_eq!(prompt_ceiling(0), 0);
@@ -717,7 +715,9 @@ mod tests {
         assert!(!is_context_overflow_error(
             "claude api authentication failed (401): invalid x-api-key"
         ));
-        assert!(!is_context_overflow_error("network error (connection reset)"));
+        assert!(!is_context_overflow_error(
+            "network error (connection reset)"
+        ));
     }
 
     #[test]
@@ -810,7 +810,10 @@ mod tests {
         // Below the cap but over the absolute token ceiling.
         assert_eq!(b.trigger(120_000, 10, 0), Some(CompactTrigger::TokenBudget));
         // Below both absolute caps but at the % window (150k of 200k).
-        let b2 = CompactBudget { token_ceiling: 0, ..b };
+        let b2 = CompactBudget {
+            token_ceiling: 0,
+            ..b
+        };
         assert_eq!(b2.trigger(150_000, 10, 0), Some(CompactTrigger::WindowPct));
         assert_eq!(b2.trigger(149_999, 10, 0), None);
     }
@@ -828,7 +831,10 @@ mod tests {
         // Every lever off ⇒ never compacts, even with a huge transcript.
         assert_eq!(b.trigger(10_000_000, 10_000, 0), None);
         // Only the tool-call lever on.
-        let b = CompactBudget { tool_call_ceiling: 40, ..b };
+        let b = CompactBudget {
+            tool_call_ceiling: 40,
+            ..b
+        };
         assert_eq!(b.trigger(10_000_000, 39, 0), None);
         assert_eq!(b.trigger(0, 40, 0), Some(CompactTrigger::ToolCalls));
     }
@@ -870,7 +876,11 @@ mod tests {
         assert_eq!(b.trigger(10_000_000, 10_000, 100_000), None);
         // The tool-call cap still takes precedence over the message cap so the
         // logged reason stays the cheapest-and-earliest lever that tripped.
-        let b = CompactBudget { tool_call_ceiling: 50, msg_ceiling: 10, ..b };
+        let b = CompactBudget {
+            tool_call_ceiling: 50,
+            msg_ceiling: 10,
+            ..b
+        };
         assert_eq!(b.trigger(0, 50, 999), Some(CompactTrigger::ToolCalls));
         // Below the tool-call cap, the message cap reports itself.
         assert_eq!(b.trigger(0, 49, 999), Some(CompactTrigger::MsgCount));
@@ -878,7 +888,10 @@ mod tests {
 
     #[test]
     fn msg_ceiling_env_override_parses_like_the_other_ceilings() {
-        assert_eq!(parse_ceiling(None, COMPACT_MSG_CEILING), COMPACT_MSG_CEILING);
+        assert_eq!(
+            parse_ceiling(None, COMPACT_MSG_CEILING),
+            COMPACT_MSG_CEILING
+        );
         assert_eq!(parse_ceiling(Some("off"), COMPACT_MSG_CEILING), 0);
         assert_eq!(parse_ceiling(Some("64"), COMPACT_MSG_CEILING), 64);
         // The default must sit well above the retained working set, or a normal

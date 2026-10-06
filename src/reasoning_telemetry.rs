@@ -136,7 +136,12 @@ pub enum Outcome {
 
 impl Outcome {
     pub fn parse(s: &str) -> Option<Outcome> {
-        match s.trim().to_ascii_lowercase().replace(['-', ' '], "_").as_str() {
+        match s
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_")
+            .as_str()
+        {
             "pending" | "open" => Some(Outcome::Pending),
             "correct" | "right" | "good" | "ok" => Some(Outcome::Correct),
             "wrong_turn" | "wrong" | "wrongturn" | "bad" | "miss" => Some(Outcome::WrongTurn),
@@ -378,8 +383,11 @@ pub fn record(event: &ReasoningEvent) -> Option<String> {
 pub fn record_escalation(topic: &str) -> Option<String> {
     // An escalate call is, by definition, the agent judging the step too hard to
     // guess — record it at HIGH complexity/risk with the outcome left pending.
-    let event = ReasoningEvent::new(Decision::Escalated, topic, "escalate_tool")
-        .with_levels(Level::High, Level::Medium, Level::High);
+    let event = ReasoningEvent::new(Decision::Escalated, topic, "escalate_tool").with_levels(
+        Level::High,
+        Level::Medium,
+        Level::High,
+    );
     record(&event)
 }
 
@@ -620,7 +628,11 @@ fn events_path() -> PathBuf {
 
 /// Whether the operator forced a full rescan (`AISH_REASONING_MEMO_FORCE_RESCAN`).
 fn force_rescan() -> bool {
-    parse_force_rescan(std::env::var("AISH_REASONING_MEMO_FORCE_RESCAN").ok().as_deref())
+    parse_force_rescan(
+        std::env::var("AISH_REASONING_MEMO_FORCE_RESCAN")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Pure parse of `AISH_REASONING_MEMO_FORCE_RESCAN`: truthy (`1`/`true`/`yes`/
@@ -1032,11 +1044,13 @@ mod tests {
         }
         // Case-sensitive exact match: mixed/upper case and falsey tokens are off.
         for f in ["0", "false", "no", "off", "", "TRUE", "Yes", "On "] {
-            assert!(!parse_force_rescan(Some(f)), "{f:?} should not force a rescan");
+            assert!(
+                !parse_force_rescan(Some(f)),
+                "{f:?} should not force a rescan"
+            );
         }
         assert!(!parse_force_rescan(None));
     }
-
 
     // The log path is process-global (an env var), so tests that touch it must
     // not run concurrently. Serialize them behind this mutex.
@@ -1142,11 +1156,12 @@ mod tests {
     #[test]
     fn outcome_update_is_folded_onto_event() {
         let _log = TestLog::new("fold");
-        let id = record(
-            &ReasoningEvent::new(Decision::Guessed, "risky migration", "self_report")
-                .with_levels(Level::High, Level::High, Level::High),
-        )
-        .unwrap();
+        let id =
+            record(
+                &ReasoningEvent::new(Decision::Guessed, "risky migration", "self_report")
+                    .with_levels(Level::High, Level::High, Level::High),
+            )
+            .unwrap();
         // Loop open: outcome pending → not yet counted as wrong/correct.
         let before = summarize();
         assert_eq!(before.overall.guess_wrong, 0);
@@ -1206,7 +1221,12 @@ mod tests {
     #[test]
     fn report_renders_all_buckets() {
         let _log = TestLog::new("report");
-        record(&ReasoningEvent::new(Decision::Escalated, "a", "self_report")).unwrap();
+        record(&ReasoningEvent::new(
+            Decision::Escalated,
+            "a",
+            "self_report",
+        ))
+        .unwrap();
         record(
             &ReasoningEvent::new(Decision::Guessed, "b", "self_report")
                 .with_levels(Level::High, Level::High, Level::High)
@@ -1242,8 +1262,11 @@ mod tests {
     fn summarize_writes_memo_and_matches_full_scan() {
         let _log = TestLog::new("memo_write");
         record(
-            &ReasoningEvent::new(Decision::Escalated, "a", "self_report")
-                .with_levels(Level::High, Level::High, Level::High),
+            &ReasoningEvent::new(Decision::Escalated, "a", "self_report").with_levels(
+                Level::High,
+                Level::High,
+                Level::High,
+            ),
         )
         .unwrap();
         record(
@@ -1282,7 +1305,11 @@ mod tests {
         write_head(&head);
 
         // Log unchanged (same mtime + len) → fast path returns the tampered memo.
-        assert_eq!(summarize().total, 777, "fast path read the memo, not the log");
+        assert_eq!(
+            summarize().total,
+            777,
+            "fast path read the memo, not the log"
+        );
     }
 
     #[test]
@@ -1291,7 +1318,12 @@ mod tests {
         // event, and confirm the delta is ADDED to the memo (incremental) rather
         // than recomputed from the whole file (which would give 2, not 102).
         let _log = TestLog::new("memo_incr");
-        record(&ReasoningEvent::new(Decision::Guessed, "first", "self_report")).unwrap();
+        record(&ReasoningEvent::new(
+            Decision::Guessed,
+            "first",
+            "self_report",
+        ))
+        .unwrap();
         assert_eq!(summarize().total, 1); // memo: total=1, lines_consumed=1
 
         let mut head = read_head();
@@ -1299,9 +1331,17 @@ mod tests {
         write_head(&head);
 
         // Append a 2nd event → log grows → incremental path folds just that line.
-        record(&ReasoningEvent::new(Decision::Guessed, "second", "self_report")).unwrap();
+        record(&ReasoningEvent::new(
+            Decision::Guessed,
+            "second",
+            "self_report",
+        ))
+        .unwrap();
         let s = summarize();
-        assert_eq!(s.total, 102, "incremental added the one new line onto the memo");
+        assert_eq!(
+            s.total, 102,
+            "incremental added the one new line onto the memo"
+        );
         assert_eq!(read_head().lines_consumed, 2);
     }
 
@@ -1312,16 +1352,29 @@ mod tests {
         // constant work regardless of the 10k-line history behind it.
         let _log = TestLog::new("memo_scale");
         for _ in 0..10_000 {
-            record(&ReasoningEvent::new(Decision::Guessed, "bulk", "self_report")).unwrap();
+            record(&ReasoningEvent::new(
+                Decision::Guessed,
+                "bulk",
+                "self_report",
+            ))
+            .unwrap();
         }
         assert_eq!(summarize().total, 10_000);
         assert_eq!(read_head().lines_consumed, 10_000);
         let mut head = read_head();
         head.total = 100_000; // sentinel above any full-rescan result
         write_head(&head);
-        record(&ReasoningEvent::new(Decision::Guessed, "tail", "self_report")).unwrap();
+        record(&ReasoningEvent::new(
+            Decision::Guessed,
+            "tail",
+            "self_report",
+        ))
+        .unwrap();
         let s = summarize();
-        assert_eq!(s.total, 100_001, "only the single new line was folded (O(1))");
+        assert_eq!(
+            s.total, 100_001,
+            "only the single new line was folded (O(1))"
+        );
         assert_eq!(read_head().lines_consumed, 10_001);
     }
 
@@ -1332,8 +1385,11 @@ mod tests {
         // sidecar restores it so the fold is exact.
         let _log = TestLog::new("memo_late_outcome");
         let id = record(
-            &ReasoningEvent::new(Decision::Guessed, "risky", "self_report")
-                .with_levels(Level::High, Level::High, Level::High),
+            &ReasoningEvent::new(Decision::Guessed, "risky", "self_report").with_levels(
+                Level::High,
+                Level::High,
+                Level::High,
+            ),
         )
         .unwrap();
         let before = summarize(); // memoizes the pending guess
@@ -1355,8 +1411,18 @@ mod tests {
         // AC: stale memo triggers correct full recompute + rewrite. A rotation /
         // truncation makes the log SHORTER than the memo's recorded length.
         let _log = TestLog::new("memo_stale");
-        record(&ReasoningEvent::new(Decision::Guessed, "one", "self_report")).unwrap();
-        record(&ReasoningEvent::new(Decision::Guessed, "two", "self_report")).unwrap();
+        record(&ReasoningEvent::new(
+            Decision::Guessed,
+            "one",
+            "self_report",
+        ))
+        .unwrap();
+        record(&ReasoningEvent::new(
+            Decision::Guessed,
+            "two",
+            "self_report",
+        ))
+        .unwrap();
         assert_eq!(summarize().total, 2);
 
         // Sentinel the memo so a stale (fast/incremental) read would be obvious.
@@ -1366,7 +1432,12 @@ mod tests {
 
         // Rotate: truncate the log and write a single fresh event → len shrinks.
         std::fs::write(log_path(), b"").unwrap();
-        record(&ReasoningEvent::new(Decision::Escalated, "post-rotate", "self_report")).unwrap();
+        record(&ReasoningEvent::new(
+            Decision::Escalated,
+            "post-rotate",
+            "self_report",
+        ))
+        .unwrap();
 
         let s = summarize();
         assert_eq!(s.total, 1, "full recompute, sentinel discarded");
@@ -1422,7 +1493,10 @@ mod tests {
         assert_eq!(rotate_threshold_bytes(), 524_288);
         // Unparseable → falls back to the 5 MB default (never disables by accident).
         log.set_rotate_mb("garbage");
-        assert_eq!(rotate_threshold_bytes(), (DEFAULT_ROTATE_MB * 1_048_576.0) as u64);
+        assert_eq!(
+            rotate_threshold_bytes(),
+            (DEFAULT_ROTATE_MB * 1_048_576.0) as u64
+        );
     }
 
     #[test]
@@ -1445,7 +1519,10 @@ mod tests {
         );
         // No data lost: the summary still folds every event (archive + active).
         let s = summarize();
-        assert_eq!(s.total, 6, "all events counted across the rotation boundary");
+        assert_eq!(
+            s.total, 6,
+            "all events counted across the rotation boundary"
+        );
         assert_eq!(s.overall.guessed, 6);
     }
 
@@ -1481,8 +1558,11 @@ mod tests {
         log.set_rotate_mb("0.0008");
         // The tracked guess, recorded first so it lands in the first archive.
         let id = record(
-            &ReasoningEvent::new(Decision::Guessed, "risky call", "t")
-                .with_levels(Level::High, Level::High, Level::High),
+            &ReasoningEvent::new(Decision::Guessed, "risky call", "t").with_levels(
+                Level::High,
+                Level::High,
+                Level::High,
+            ),
         )
         .unwrap();
         // Filler escalations push the active file past the threshold, archiving

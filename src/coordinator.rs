@@ -2306,7 +2306,7 @@ mod tests {
     // "the keeper never ran", i.e. it never started.
     #[test]
     fn stall_kind_separates_never_started_from_went_silent() {
-        use super::{stall_kind, StallKind};
+        use super::{StallKind, stall_kind};
         let created = "2026-03-01 22:00:00";
 
         // Beat still equals the insert stamp ⇒ the keeper never wrote ⇒ launch death.
@@ -2401,8 +2401,7 @@ mod tests {
     #[test]
     fn heartbeat_write_success_clears_the_failure_counter() {
         use super::beat_once;
-        let path = std::env::temp_dir()
-            .join(format!("aish_beat_once_{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!("aish_beat_once_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = crate::db::CoordinatorStore::open(&path).unwrap();
         store.insert("run_beat", "task", "s", None).unwrap();
@@ -2414,7 +2413,10 @@ mod tests {
         // Repeated successes keep it at zero (no spurious warnings).
         beat_once(&store, "run_beat", &mut failures);
         assert_eq!(failures, 0);
-        assert!(super::HEARTBEAT_FAILURE_LOG_AFTER >= 2, "a single lost beat must stay quiet");
+        assert!(
+            super::HEARTBEAT_FAILURE_LOG_AFTER >= 2,
+            "a single lost beat must stay quiet"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

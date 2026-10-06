@@ -220,7 +220,9 @@ fn fmt_dur(secs: i64) -> String {
 pub fn render(st: &DispatchStats, scope: &str) -> Vec<String> {
     let mut out = Vec::new();
     if st.dispatched == 0 {
-        out.push(format!("dispatch stats ({scope}): no background jobs on record"));
+        out.push(format!(
+            "dispatch stats ({scope}): no background jobs on record"
+        ));
         return out;
     }
     out.push(format!(
@@ -334,8 +336,16 @@ mod tests {
     #[test]
     fn counts_outcomes_and_running() {
         let rows = vec![
-            row("done", Some("2024-01-01 00:00:00"), Some("2024-01-01 00:00:30")),
-            row("failed", Some("2024-01-01 00:00:00"), Some("2024-01-01 00:10:00")),
+            row(
+                "done",
+                Some("2024-01-01 00:00:00"),
+                Some("2024-01-01 00:00:30"),
+            ),
+            row(
+                "failed",
+                Some("2024-01-01 00:00:00"),
+                Some("2024-01-01 00:10:00"),
+            ),
             row("coordinating", None, None),
             row("awaiting_batch", None, None),
         ];
@@ -355,9 +365,21 @@ mod tests {
     fn latency_stats_and_quick_flag() {
         // Three done jobs: 30s (quick), 120s, 600s.
         let rows = vec![
-            row("done", Some("2024-01-01 00:00:00"), Some("2024-01-01 00:00:30")),
-            row("done", Some("2024-01-01 00:00:00"), Some("2024-01-01 00:02:00")),
-            row("done", Some("2024-01-01 00:00:00"), Some("2024-01-01 00:10:00")),
+            row(
+                "done",
+                Some("2024-01-01 00:00:00"),
+                Some("2024-01-01 00:00:30"),
+            ),
+            row(
+                "done",
+                Some("2024-01-01 00:00:00"),
+                Some("2024-01-01 00:02:00"),
+            ),
+            row(
+                "done",
+                Some("2024-01-01 00:00:00"),
+                Some("2024-01-01 00:10:00"),
+            ),
         ];
         let refs: Vec<&CoordinatorRow> = rows.iter().collect();
         let st = summarize(&refs);
@@ -390,9 +412,21 @@ mod tests {
     #[test]
     fn over_offload_insight_fires_on_mostly_quick() {
         let rows = vec![
-            row("done", Some("2024-01-01 00:00:00"), Some("2024-01-01 00:00:10")),
-            row("done", Some("2024-01-01 00:00:00"), Some("2024-01-01 00:00:20")),
-            row("done", Some("2024-01-01 00:00:00"), Some("2024-01-01 00:00:30")),
+            row(
+                "done",
+                Some("2024-01-01 00:00:00"),
+                Some("2024-01-01 00:00:10"),
+            ),
+            row(
+                "done",
+                Some("2024-01-01 00:00:00"),
+                Some("2024-01-01 00:00:20"),
+            ),
+            row(
+                "done",
+                Some("2024-01-01 00:00:00"),
+                Some("2024-01-01 00:00:30"),
+            ),
         ];
         let refs: Vec<&CoordinatorRow> = rows.iter().collect();
         let st = summarize(&refs);

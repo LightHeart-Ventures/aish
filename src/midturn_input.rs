@@ -170,7 +170,7 @@ impl KeyParser {
             0x15 => out.push(Key::CtrlU),
             0x17 => out.push(Key::CtrlW),
             0x09 => out.push(Key::Char('\t')), // literal Tab (Shift-Tab is CSI Z)
-            0x00..=0x1f => {} // other control bytes: ignore (ISIG handles ^C/^Z)
+            0x00..=0x1f => {}                  // other control bytes: ignore (ISIG handles ^C/^Z)
             b if b < 0x80 => out.push(Key::Char(b as char)),
             b => {
                 // UTF-8 lead byte — set up continuation accounting.
@@ -265,11 +265,7 @@ impl LineBuf {
     pub fn take(&mut self) -> Option<String> {
         let s: String = self.chars.iter().collect();
         self.clear();
-        if s.trim().is_empty() {
-            None
-        } else {
-            Some(s)
-        }
+        if s.trim().is_empty() { None } else { Some(s) }
     }
 
     fn insert(&mut self, c: char) {
@@ -455,10 +451,7 @@ mod tests {
 
     #[test]
     fn plain_ascii_text() {
-        assert_eq!(
-            keys(b"hi"),
-            vec![Key::Char('h'), Key::Char('i')]
-        );
+        assert_eq!(keys(b"hi"), vec![Key::Char('h'), Key::Char('i')]);
     }
 
     #[test]
@@ -655,13 +648,21 @@ mod tests {
 
     #[test]
     fn footer_draw_is_blank_gap_then_prompt() {
-        let f = FooterRender { prompt: "» ", text: "hi", cols: 80 };
+        let f = FooterRender {
+            prompt: "» ",
+            text: "hi",
+            cols: 80,
+        };
         assert_eq!(f.draw(), "\n» hi");
     }
 
     #[test]
     fn footer_single_row_erase_is_inverse() {
-        let f = FooterRender { prompt: "» ", text: "hi", cols: 80 };
+        let f = FooterRender {
+            prompt: "» ",
+            text: "hi",
+            cols: 80,
+        };
         assert_eq!(f.prompt_rows(), 1);
         // clear prompt row, then up-and-clear the blank gap line.
         assert_eq!(f.erase(), "\r\x1b[2K\x1b[1A\x1b[2K");
@@ -669,31 +670,50 @@ mod tests {
 
     #[test]
     fn footer_empty_text_still_one_row() {
-        let f = FooterRender { prompt: "» ", text: "", cols: 80 };
+        let f = FooterRender {
+            prompt: "» ",
+            text: "",
+            cols: 80,
+        };
         assert_eq!(f.prompt_rows(), 1);
         assert_eq!(f.draw(), "\n» ");
     }
 
     #[test]
     fn footer_unknown_width_assumes_single_row() {
-        let f = FooterRender { prompt: "» ", text: "a very long line that would wrap", cols: 0 };
+        let f = FooterRender {
+            prompt: "» ",
+            text: "a very long line that would wrap",
+            cols: 0,
+        };
         assert_eq!(f.prompt_rows(), 1);
     }
 
     #[test]
     fn footer_wraps_to_multiple_rows() {
         // prompt width 2 + text width 10 = 12 cols; at width 6 → 12/6 + 1 = 3 rows.
-        let f = FooterRender { prompt: "» ", text: "0123456789", cols: 6 };
+        let f = FooterRender {
+            prompt: "» ",
+            text: "0123456789",
+            cols: 6,
+        };
         assert_eq!(f.prompt_rows(), 3);
         // erase clears the last prompt row then walks up over 3 more lines
         // (2 remaining prompt rows + the blank gap).
-        assert_eq!(f.erase(), "\r\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K");
+        assert_eq!(
+            f.erase(),
+            "\r\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K"
+        );
     }
 
     #[test]
     fn footer_wide_chars_count_as_two_columns() {
         // Two double-width chars (width 4) + prompt width 2 = 6 at cols 6 → 2 rows.
-        let f = FooterRender { prompt: "» ", text: "中文", cols: 6 };
+        let f = FooterRender {
+            prompt: "» ",
+            text: "中文",
+            cols: 6,
+        };
         assert_eq!(f.prompt_rows(), 2);
     }
 }

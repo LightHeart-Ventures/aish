@@ -160,8 +160,10 @@ mod tests {
 
         // Signal shutdown; the loop must return Shutdown.
         tx.send(true).unwrap();
-        let reason =
-            tokio::time::timeout(Duration::from_secs(1), jh).await.unwrap().unwrap();
+        let reason = tokio::time::timeout(Duration::from_secs(1), jh)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(reason, StopReason::Shutdown);
     }
 

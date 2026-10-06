@@ -157,13 +157,7 @@ pub fn arm(plugins_dir: &Path) -> usize {
 /// `timeout`, and — on a non-empty first stdout line — store it in the core
 /// registry. All failures are logged best-effort and swallowed; the prior
 /// segment (if any) stays until it ages out.
-async fn run_once(
-    plugin_id: &str,
-    dir: &Path,
-    program: &Path,
-    args: &[String],
-    timeout: Duration,
-) {
+async fn run_once(plugin_id: &str, dir: &Path, program: &Path, args: &[String], timeout: Duration) {
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .current_dir(dir)
@@ -191,7 +185,9 @@ async fn run_once(
             return;
         }
         Err(_) => {
-            log(&format!("{plugin_id}: statusline timed out after {timeout:?}"));
+            log(&format!(
+                "{plugin_id}: statusline timed out after {timeout:?}"
+            ));
             return;
         }
     };
@@ -238,9 +234,10 @@ mod tests {
     #[test]
     fn manifest_parses_statusline_minimal() {
         // AC1: plugin.json accepts `provides.statusline: { command }`.
-        let m: PluginManifest =
-            serde_json::from_str(r#"{"id":"demo","provides":{"statusline":{"command":"badge.sh"}}}"#)
-                .unwrap();
+        let m: PluginManifest = serde_json::from_str(
+            r#"{"id":"demo","provides":{"statusline":{"command":"badge.sh"}}}"#,
+        )
+        .unwrap();
         let sl = m.statusline().expect("statusline parsed");
         assert_eq!(sl.command, "badge.sh");
         assert!(sl.args.is_empty());
@@ -263,7 +260,10 @@ mod tests {
         let sl = m.statusline().unwrap();
         assert_eq!(sl.command, "statusline.sh");
         assert_eq!(sl.args, vec!["--json".to_string()]);
-        assert_eq!(parse_every(sl.every.as_deref().unwrap()), Some(DEFAULT_EVERY));
+        assert_eq!(
+            parse_every(sl.every.as_deref().unwrap()),
+            Some(DEFAULT_EVERY)
+        );
         assert_eq!(sl.timeout_ms, Some(120_000));
     }
 
@@ -280,7 +280,10 @@ mod tests {
     #[test]
     fn pick_line_first_nonempty() {
         assert_eq!(pick_line("⚡cc 63%w"), Some("⚡cc 63%w".to_string()));
-        assert_eq!(pick_line("\n\n  first \nsecond"), Some("  first".to_string()));
+        assert_eq!(
+            pick_line("\n\n  first \nsecond"),
+            Some("  first".to_string())
+        );
         assert_eq!(pick_line(""), None);
         assert_eq!(pick_line("   \n\t\n"), None);
     }
@@ -291,11 +294,17 @@ mod tests {
         let now = Instant::now();
         map.insert(
             "zeta".to_string(),
-            Segment { line: "Z".to_string(), updated: now },
+            Segment {
+                line: "Z".to_string(),
+                updated: now,
+            },
         );
         map.insert(
             "alpha".to_string(),
-            Segment { line: "A".to_string(), updated: now },
+            Segment {
+                line: "A".to_string(),
+                updated: now,
+            },
         );
         let stale_after = Duration::from_secs(3600);
         // Both fresh, sorted by id (BTreeMap order): alpha before zeta.

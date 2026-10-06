@@ -21,8 +21,8 @@
 //!   struct; production uses one lazily-initialised global instance, while unit
 //!   tests spin up their own bus so shared global state never makes them flaky.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::broadcast;
 
 use crate::worker::Pulse;

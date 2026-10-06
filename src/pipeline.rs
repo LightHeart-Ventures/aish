@@ -261,7 +261,8 @@ async fn exec(
     let n = stages.len();
 
     // Inter-stage pipes: pipe[i] connects stage i's stdout to stage i+1's stdin.
-    let mut pipes: Vec<(Option<OwnedFd>, Option<OwnedFd>)> = Vec::with_capacity(n.saturating_sub(1));
+    let mut pipes: Vec<(Option<OwnedFd>, Option<OwnedFd>)> =
+        Vec::with_capacity(n.saturating_sub(1));
     for _ in 0..n.saturating_sub(1) {
         let (r, w) = make_pipe()?;
         pipes.push((Some(r), Some(w)));
@@ -366,7 +367,10 @@ mod tests {
             parse("cat big.log | grep ERROR | wc -l").unwrap(),
             stages(&[&["cat", "big.log"], &["grep", "ERROR"], &["wc", "-l"]])
         );
-        assert_eq!(parse("ls|wc -l").unwrap(), stages(&[&["ls"], &["wc", "-l"]]));
+        assert_eq!(
+            parse("ls|wc -l").unwrap(),
+            stages(&[&["ls"], &["wc", "-l"]])
+        );
     }
 
     #[test]
@@ -473,7 +477,11 @@ mod tests {
         let session = Session::new().unwrap();
         let stages = parse("yes | head -n 3 | wc -l | grep -q 3").unwrap();
         let status = run(&stages, &session).await.unwrap();
-        assert_eq!(status.code(), Some(0), "stdout did not reach the next stage");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "stdout did not reach the next stage"
+        );
     }
 
     #[tokio::test]
@@ -504,7 +512,10 @@ mod tests {
         run(&parse("printf two >> f.txt").unwrap(), &session)
             .await
             .unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "onetwo");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+            "onetwo"
+        );
         // plain `>` truncates
         run(&parse("printf x > f.txt").unwrap(), &session)
             .await

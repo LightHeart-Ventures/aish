@@ -29,7 +29,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use crate::hwdetect::{Selection, SelectionSource};
 
@@ -96,7 +96,9 @@ pub async fn ensure_model_file(sel: Option<&Selection>) -> Result<PathBuf> {
             }
         }
         Err(e) => {
-            eprintln!("\x1b[2m  could not list {repo} files ({e}); trying conventional name\x1b[0m");
+            eprintln!(
+                "\x1b[2m  could not list {repo} files ({e}); trying conventional name\x1b[0m"
+            );
             vec![convention_filename(&repo, &quant)]
         }
     };
@@ -127,10 +129,9 @@ pub async fn ensure_model_file(sel: Option<&Selection>) -> Result<PathBuf> {
         local_paths.push(dest);
     }
 
-    let primary = local_paths
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("no GGUF file resolved for local model '{model_id}' (repo {repo})"))?;
+    let primary = local_paths.into_iter().next().ok_or_else(|| {
+        anyhow!("no GGUF file resolved for local model '{model_id}' (repo {repo})")
+    })?;
 
     persist_model_path(sel, &primary);
     Ok(primary)
@@ -241,15 +242,15 @@ fn parse_siblings(body: &str) -> Vec<String> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| {
-            v.get("siblings")
-                .and_then(|s| s.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|e| {
-                            e.get("rfilename").and_then(|r| r.as_str()).map(String::from)
-                        })
-                        .collect::<Vec<_>>()
-                })
+            v.get("siblings").and_then(|s| s.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|e| {
+                        e.get("rfilename")
+                            .and_then(|r| r.as_str())
+                            .map(String::from)
+                    })
+                    .collect::<Vec<_>>()
+            })
         })
         .unwrap_or_default()
 }
@@ -283,7 +284,9 @@ fn check_url(url: &str) -> Result<()> {
             return Ok(());
         }
     }
-    Err(anyhow!("refusing to fetch local model from non-https URL: {url}"))
+    Err(anyhow!(
+        "refusing to fetch local model from non-https URL: {url}"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -375,11 +378,17 @@ struct Attempt {
 }
 
 fn fatal(err: anyhow::Error) -> Attempt {
-    Attempt { err, retryable: false }
+    Attempt {
+        err,
+        retryable: false,
+    }
 }
 
 fn transient(err: anyhow::Error) -> Attempt {
-    Attempt { err, retryable: true }
+    Attempt {
+        err,
+        retryable: true,
+    }
 }
 
 /// Status codes worth another attempt: rate limits, request timeouts, and any
@@ -570,7 +579,9 @@ async fn download_attempt(
 /// name is checked: a `.part` left by an interrupted run is not "ready", but it
 /// is not discarded either — [`download_file`] resumes from it.
 fn file_ready(dest: &Path) -> bool {
-    std::fs::metadata(dest).map(|m| m.len() > 0).unwrap_or(false)
+    std::fs::metadata(dest)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
 }
 
 /// Persist the resolved absolute path back into the *detected* selection so the
@@ -651,10 +662,7 @@ mod tests {
             "Qwen2.5-14B-Instruct-Q4_K_M.gguf"
         );
         // lowercase -gguf suffix + empty quant falls back to default.
-        assert_eq!(
-            convention_filename("acme/Foo-gguf", ""),
-            "Foo-Q4_K_M.gguf"
-        );
+        assert_eq!(convention_filename("acme/Foo-gguf", ""), "Foo-Q4_K_M.gguf");
         // no GGUF suffix → stem is the whole last segment.
         assert_eq!(convention_filename("acme/Foo", "Q8_0"), "Foo-Q8_0.gguf");
     }
@@ -775,7 +783,12 @@ mod tests {
             "https://huggingface.co/api/models/owner/Repo"
         );
         assert_eq!(
-            resolve_url("https://huggingface.co", "owner/Repo", "main", "sub/file.gguf"),
+            resolve_url(
+                "https://huggingface.co",
+                "owner/Repo",
+                "main",
+                "sub/file.gguf"
+            ),
             "https://huggingface.co/owner/Repo/resolve/main/sub/file.gguf?download=true"
         );
     }

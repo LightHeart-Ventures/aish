@@ -183,7 +183,12 @@ fn end_to_end_single_plugin_install_and_login_unlock() {
     // enterprise's on_init sees AISH_PROFILE_ENTERPRISE_GATEWAY_URL and
     // re-exports it as CORP_GATEWAY; community exports COMMUNITY_READY.
     let env = plugins::collect_lifecycle_env_at(&root, "on_init", &[], &cred_path);
-    let get = |k: &str| env.vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    let get = |k: &str| {
+        env.vars
+            .iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.as_str())
+    };
     assert_eq!(
         get("CORP_GATEWAY"),
         Some("https://gw.corp.example"),
@@ -281,7 +286,9 @@ fn catalog_merge_precedence_and_override_from_disk() {
 
     // Tombstone `muted` (enabled:false) suppresses the plugin's `muted` entry.
     assert!(
-        !set.hooks().iter().any(|h| h.name.as_deref() == Some("muted")),
+        !set.hooks()
+            .iter()
+            .any(|h| h.name.as_deref() == Some("muted")),
         "user tombstone removes the plugin hook and registers nothing"
     );
 
@@ -294,8 +301,7 @@ fn catalog_merge_precedence_and_override_from_disk() {
 
 #[test]
 fn blocking_veto_composition_structural() {
-    let rule =
-        r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "rule", "deny_if": "always" } } ] }"#;
+    let rule = r#"{ "hooks": [ { "event": "PreToolUse", "action": { "type": "rule", "deny_if": "always" } } ] }"#;
 
     // A lone plugin blocking entry, loaded from disk, KEEPS its veto.
     let alone_root = tempdir();
@@ -315,8 +321,10 @@ fn blocking_veto_composition_structural() {
     write_data(&root, "sec", "hooks.json", rule);
     let local = root.join("local-hooks.json");
     fs::write(&local, rule).unwrap();
-    let contended =
-        HookSet::load_layered(std::slice::from_ref(&local), &plugins::plugin_hook_fragments(&root));
+    let contended = HookSet::load_layered(
+        std::slice::from_ref(&local),
+        &plugins::plugin_hook_fragments(&root),
+    );
     let demoted = contended
         .hooks()
         .iter()
@@ -340,7 +348,11 @@ fn mcp_collision_against_config_scope() {
     // only `notes` (community) survives from the plugin layer.
     let (servers, collisions) = plugins::collect_plugin_mcp_servers(&root, &["corp".to_string()]);
     let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, vec!["notes"], "config-owned name blocks both plugins");
+    assert_eq!(
+        names,
+        vec!["notes"],
+        "config-owned name blocks both plugins"
+    );
     // enterprise's corp loses to config; community's corp loses too.
     let corp_losses: Vec<&plugins::McpCollision> =
         collisions.iter().filter(|c| c.name == "corp").collect();
@@ -397,7 +409,9 @@ fn env_injection_rejects_credential_like_from_hook() {
         "credential-like key rejected; benign key survives"
     );
     assert!(
-        env.warnings.iter().any(|w| w.contains("MY_TOKEN") || w.contains("credential")),
+        env.warnings
+            .iter()
+            .any(|w| w.contains("MY_TOKEN") || w.contains("credential")),
         "the rejection is surfaced as a warning: {:?}",
         env.warnings
     );

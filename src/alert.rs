@@ -138,7 +138,9 @@ fn first_path(text: &str) -> Option<PathBuf> {
         return None;
     }
     let expanded = if let Some(rest) = raw.strip_prefix("~/") {
-        dirs_home().map(|h| h.join(rest)).unwrap_or_else(|| PathBuf::from(raw))
+        dirs_home()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|| PathBuf::from(raw))
     } else {
         PathBuf::from(raw)
     };
@@ -181,12 +183,12 @@ pub fn parse_condition(condition: &str) -> AlertKind {
     }
 
     // 2) File change / existence watch.
-    let file_cue = ["file", "change", "chang", "modif", "watch", "exist", "creat", "delet", "touch", "appear"]
-        .iter()
-        .any(|k| lower.contains(k));
-    if file_cue
-        && let Some(path) = first_path(condition)
-    {
+    let file_cue = [
+        "file", "change", "chang", "modif", "watch", "exist", "creat", "delet", "touch", "appear",
+    ]
+    .iter()
+    .any(|k| lower.contains(k));
+    if file_cue && let Some(path) = first_path(condition) {
         let baseline_exists = path.exists();
         let baseline_mtime = mtime_of(&path);
         return AlertKind::FileChange {
@@ -306,7 +308,10 @@ pub fn render_semantic_fired(condition: &str, message: &str) -> Fired {
 /// the `audible` flag or globally with `AISH_ALERT_BELL=0`; override the sound
 /// with `AISH_ALERT_BELL_CMD` (whitespace-split, shell-free, fire-and-forget).
 pub fn play_alert_bell() {
-    if matches!(std::env::var("AISH_ALERT_BELL").ok().as_deref(), Some("0") | Some("false") | Some("off")) {
+    if matches!(
+        std::env::var("AISH_ALERT_BELL").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    ) {
         return;
     }
     if let Ok(cmd) = std::env::var("AISH_ALERT_BELL_CMD") {
@@ -347,7 +352,11 @@ mod tests {
     fn parses_pr_merge_condition() {
         let k = parse_condition("let me know when PR 333 is merged");
         match k {
-            AlertKind::Command { program, args, expect } => {
+            AlertKind::Command {
+                program,
+                args,
+                expect,
+            } => {
                 assert_eq!(program, "gh");
                 assert!(args.contains(&"333".to_string()));
                 assert_eq!(expect.as_deref(), Some("MERGED"));
