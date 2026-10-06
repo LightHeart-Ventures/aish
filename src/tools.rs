@@ -2256,18 +2256,14 @@ OPENAI_API_KEY; OpenRouter needs OPENROUTER_API_KEY (env or ~/.aishrc)"
     // fan-out structurally impossible — a hard failure caused purely by our own
     // recursion cap. Degrade that case; never the explicit one.
     let batch_forced_by_env = want_batch && explicit_tier.is_none();
-    // The metered key the tool-less Batches API needs. `~/.aishrc` exports win
-    // over the process env (same precedence the batch branch used). Resolved
-    // ONCE here because both the batch branch and the child's forced tier below
-    // need to know whether it exists.
-    let metered_api_key: Option<String> = session
-        .env
-        .iter()
-        .rev()
-        .find(|(k, _)| k == "ANTHROPIC_API_KEY")
-        .map(|(_, v)| v.clone())
-        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-        .filter(|v| !v.trim().is_empty());
+    // The metered key the tool-less Batches API needs — resolved through the
+    // SINGLE detection site in `batch` (`~/.aishrc` exports win over the process
+    // env; a blank value counts as absent). Recomputed from the live credentials
+    // on every call rather than decided once and cached, and read here because
+    // BOTH the batch branch below and the child's forced tier need the answer.
+    // (The previous inline resolution filtered blanks only AFTER the process-env
+    // fallback, so a blank `~/.aishrc` export masked a good process-env key.)
+    let metered_api_key: Option<String> = crate::batch::metered_key(&session.env);
     let metered_key_available = metered_api_key.is_some();
 
     // FIX D — an INHERITED `batch` tier with no metered key DEGRADES to an
@@ -2277,24 +2273,31 @@ OPENAI_API_KEY; OpenRouter needs OPENROUTER_API_KEY (env or ~/.aishrc)"
     // only route out is the Batches API it structurally cannot reach. Falling
     // through to the worker-spawn path below is safe — `spawn_budget_gate` still
     // enforces the depth cap, which is the real fork-bomb guard.
-    if session.nested && want_batch && batch_forced_by_env && !metered_key_available {
+    if session.nested && want_batch && !metered_key_available {
+        // Batch tier wanted but UNREACHABLE — never a hard error. The work is
+        // real either way, so DEGRADE to the batch model (Opus by default) on an
+        // interactive sub-coordinator and say so loudly. This now covers an
+        // INHERITED tier (our own recursion cap) AND an EXPLICIT `tier:"batch"`
+        // alike: erroring on the explicit one only pushed the same dead end onto
+        // the model, which has no way to provision a key mid-run. Falling through
+        // to the worker-spawn path below is safe — `spawn_budget_gate` still
+        // enforces the depth cap, which is the real fork-bomb guard.
+        let source = if batch_forced_by_env {
+            "was forced to `batch` by AISH_FANOUT_TIER (recursion cap)"
+        } else {
+            "explicitly requested the `batch` tier"
+        };
         eprintln!(
-            "aish: nested fan-out tier was forced to `batch` by AISH_FANOUT_TIER (recursion cap), but \
-no metered ANTHROPIC_API_KEY is reachable — a Claude subscription token can't use the Batches API. \
-Degrading this fan-out to an interactive sub-coordinator; depth stays capped by AISH_SPAWN_BUDGET."
+            "aish: this nested fan-out {source}, but {} — degrading to an interactive \
+sub-coordinator; depth stays capped by AISH_SPAWN_BUDGET.",
+            crate::batch::unavailable_fallback_note(&session.batch_model)
         );
     } else if session.nested && want_batch {
         // The tool-less Batches API needs a metered key; a subscription OAuth
-        // token can't reach it. Resolved above (`~/.aishrc` exports, then the
-        // process env). Reaching here means the caller asked for batch
-        // EXPLICITLY, so a missing key is a real error — say so plainly rather
-        // than failing opaquely later.
-        let api_key = metered_api_key.ok_or_else(|| {
-            anyhow::anyhow!(
-                "nested background fan-out uses the Anthropic Batches API, which needs a metered \
-ANTHROPIC_API_KEY — a Claude subscription token (CLAUDE_CODE_OAUTH_TOKEN) can't reach it"
-            )
-        })?;
+        // token can't reach it. Availability was resolved above via
+        // `batch::metered_key`, and the degrade branch catches EVERY missing-key
+        // case — so reaching here means the key is present.
+        let api_key = metered_api_key.expect("metered key presence checked by the branch above");
         let _id = crate::batch::spawn(
             &session.batch_jobs,
             task.to_string(),
