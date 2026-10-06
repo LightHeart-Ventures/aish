@@ -4,6 +4,11 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.50.1] - 2026-10-06
+
+### Fixed
+- **Release tag protection**: v0.50.0 tag orphaned by immutable release deletion; bumped to v0.50.1 to bypass protected ref restrictions
+
 ## [0.50.0] - 2026-10-06
 
 ### Added
