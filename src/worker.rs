@@ -1188,6 +1188,25 @@ fn is_thinking_notice(raw: &str) -> bool {
     matches!(lex_activity(raw), ActivityEvent::Thinking(_))
 }
 
+/// Whether a forwarded `💭 thinking…` notice should SPAWN a new animated spinner
+/// row, given (a) whether an attach/resume-time backfill "thinking…" row is being
+/// ADOPTED, (b) whether the previous forwarded line was itself a thinking notice,
+/// and (c) whether a spinner is already turning. All three are suppressors: each
+/// means a "thinking…" row is ALREADY on screen, and a second spinner would
+/// commit a DUPLICATE static row in prompt-preserving (ExternalPrinter) mode —
+/// where a committed line can never be erased. `adopt_backfill` is the case the
+/// operator reported: typing a follow-up to a finished worker starts a backfill
+/// spinner, and the resumed child's first line is its own `💭 thinking…`, so the
+/// naive stop-then-restart printed `💭 thinking…` twice. Pure, so the
+/// one-row-at-a-time invariant is unit-tested without a TTY.
+fn should_start_thinking_spinner(
+    adopt_backfill: bool,
+    prev_thinking: bool,
+    spinner_live: bool,
+) -> bool {
+    !adopt_backfill && !prev_thinking && !spinner_live
+}
+
 /// A transient, animated "thinking…" row for ONE worker in the `:output` pane —
 /// the streaming-pane analogue of the interactive engine's `Spinner`. While the
 /// coordinator is in its model-reasoning phase (it emitted a `💭 thinking…`
@@ -1579,13 +1598,26 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                 nest_row(&event, row)
             };
             if on {
-                // This worker's first forwarded line after an `:attach` replaces
-                // any attach-time "thinking…" placeholder spinner — stop + erase
-                // it so this row lands on the cleared line (no-op once gone).
-                if let Some(job) = &pulse {
-                    job.stop_backfill_thinking();
+                let thinking_event = matches!(event, ActivityEvent::Thinking(_));
+                // The attach/resume-time backfill spinner IS already a
+                // "💭 thinking…" row. When this worker's FIRST forwarded line is
+                // itself a thinking notice, ADOPT that row instead of tearing it
+                // down and spawning a second spinner: in prompt-preserving
+                // (ExternalPrinter) mode every spinner COMMITS its own static
+                // `💭 thinking…` line into the scrollback, which it can never
+                // erase — so stop-then-restart rendered as the DUPLICATE pair the
+                // operator sees after typing a follow-up to a finished worker.
+                let adopt_backfill =
+                    thinking_event && pulse.as_ref().is_some_and(|j| j.has_backfill_thinking());
+                // A non-thinking first line genuinely REPLACES the placeholder —
+                // stop + erase it so this row lands on the cleared line (no-op
+                // once gone).
+                if !adopt_backfill {
+                    if let Some(job) = &pulse {
+                        job.stop_backfill_thinking();
+                    }
                 }
-                if matches!(event, ActivityEvent::Thinking(_)) {
+                if thinking_event {
                     // Model-reasoning phase: show ONE animated "thinking…" row
                     // that persists until the worker's next forwarded line lands
                     // — matching the interactive `Spinner` that animates then
@@ -1597,7 +1629,11 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                     // frame to 0, stuttering the animation. So start a spinner ONLY
                     // on the transition activity → thinking; a run of back-to-back
                     // notices keeps the single live spinner turning.
-                    if !prev_thinking && thinking.is_none() {
+                    if should_start_thinking_spinner(
+                        adopt_backfill,
+                        prev_thinking,
+                        thinking.is_some(),
+                    ) {
                         // Hand the spinner the SAME forward-gate handles the stream
                         // loop reads, so it can self-erase the moment the user
                         // Shift-Tabs / detaches away mid-think (see ThinkingSpinner).
@@ -3095,6 +3131,15 @@ impl WorkerJob {
             }
             None => false,
         }
+    }
+
+    /// Whether this worker currently has a live attach/resume-time backfill
+    /// thinking spinner (see [`start_backfill_thinking`]). The live stderr stream
+    /// checks this to ADOPT that already-rendered "💭 thinking…" row when its own
+    /// first forwarded line is itself a thinking notice — spawning a second
+    /// spinner would commit a DUPLICATE static row in prompt-preserving mode.
+    pub fn has_backfill_thinking(&self) -> bool {
+        self.inner.lock().unwrap().backfill_spinner.is_some()
     }
 
     /// Stop + erase any attach-time thinking spinner this worker is animating
@@ -4949,6 +4994,30 @@ mod tests {
         // Noise (banner/blank) is dropped even when output is ON.
         assert_eq!(forward_decision(banner, true), None);
         assert_eq!(forward_decision("", true), None);
+    }
+
+    #[test]
+    fn adopted_backfill_row_suppresses_a_second_thinking_spinner() {
+        // Regression: typing a follow-up to a FINISHED worker printed
+        // `💭 thinking…` TWICE. `resume_in_place` starts a backfill thinking
+        // spinner for instant feedback; the resumed child's very first forwarded
+        // line is its own `💭 thinking…`, and the live stream used to stop the
+        // backfill spinner and start a fresh one. In prompt-preserving
+        // (ExternalPrinter) mode EACH spinner commits its own static row into the
+        // scrollback and can never erase it — hence the duplicate pair.
+        //
+        // Cold start (no backfill row, no prior thinking, no live spinner): the
+        // one case that SHOULD spawn a spinner.
+        assert!(should_start_thinking_spinner(false, false, false));
+        // Adopting the backfill row: it already reads "thinking…", so no second
+        // spinner — this is the fix for the reported duplicate.
+        assert!(!should_start_thinking_spinner(true, false, false));
+        // Back-to-back notices within one reasoning run keep the single spinner.
+        assert!(!should_start_thinking_spinner(false, true, false));
+        // A spinner already turning is never doubled up.
+        assert!(!should_start_thinking_spinner(false, false, true));
+        // Any suppressor alone is enough; combinations stay suppressed.
+        assert!(!should_start_thinking_spinner(true, true, true));
     }
 
     #[test]
