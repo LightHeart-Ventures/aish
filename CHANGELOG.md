@@ -4,6 +4,11 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.50.2] - 2026-10-06
+
+### Fixed
+- **`llama-cpp-2` v0.1.158+ API migration** (PR #883): the `local` backend failed to build against current `llama-cpp-2` because token/vocab accessors moved off `LlamaModel` onto `LlamaVocab`. `src/backend/local.rs` now routes tokenization through `model.vocab()` (`str_to_token`, `is_eog_token`, token→bytes) and uses the `Special` enum in place of the old boolean argument. Unblocks the 0.50.2 release build with `--features local`.
+
 ## [0.50.1] - 2026-10-06
 
 ### Fixed
