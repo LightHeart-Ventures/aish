@@ -42,7 +42,8 @@ pub const MIN_FOOTER_ROWS: u16 = 5;
 /// The footer's CURRENT height for a terminal of `rows` rows: [`FOOTER_ROWS`]
 /// normally, plus [`crate::escalation::ROWS`] while a background escalation is
 /// pinned (the escalation message + the worker's latest status, painted directly
-/// above the statusline block — see [`crate::escalation`]).
+/// ABOVE the footer's horizontal rule, so the rule stays welded to the
+/// statusline block — see [`crate::escalation`]).
 ///
 /// Every row-arithmetic site — DECSTBM bottom margin, the body-home row, the
 /// resume choreography — routes through this so growing the footer can never
@@ -56,6 +57,17 @@ pub fn footer_rows_for(rows: u16) -> u16 {
     } else {
         FOOTER_ROWS
     }
+}
+
+/// The first (topmost) screen row the footer owns: the escalation banner's first
+/// row while one is pinned, otherwise the separator.
+///
+/// Teardown paths clear from this row to end-of-screen, so it MUST track the
+/// banner — clearing from the separator alone would strand the two banner rows
+/// on the terminal a child program (or the exiting shell) inherits.
+pub fn footer_top_row(rows: u16) -> u16 {
+    rows.saturating_sub(footer_rows_for(rows).saturating_sub(1))
+        .max(1)
 }
 
 /// Hard ceiling on the DSR (`ESC[6n`) cursor-position exchange in
@@ -528,18 +540,45 @@ pub fn footer_seq(
     statusline: &str,
 ) -> String {
     // Snapshot the pinned escalation ONCE (dropping it when the window is too
-    // short) and derive the height from that snapshot, so the rows we reserve
-    // and the rows we paint agree even if the banner retires mid-paint.
+    // short) and hand it to the pure builder, so the rows we reserve and the
+    // rows we paint agree even if the banner retires mid-paint.
     let banner = crate::escalation::rows(crate::style::colors_enabled())
         .filter(|_| rows >= MIN_FOOTER_ROWS + crate::escalation::ROWS);
+    footer_seq_with(rows, cols, separator, status_msg, statusline, banner)
+}
+
+/// [`footer_seq`] with the escalation banner passed in instead of read from the
+/// process-global pin — the whole row plan is a pure function of `(rows, cols,
+/// banner)`, so the geometry is unit-testable without mutating shared state.
+pub fn footer_seq_with(
+    rows: u16,
+    cols: u16,
+    separator: &str,
+    status_msg: &str,
+    statusline: &str,
+    banner: Option<(String, String)>,
+) -> String {
     let height = if banner.is_some() {
         FOOTER_ROWS + crate::escalation::ROWS
     } else {
         FOOTER_ROWS
     };
-    // The footer occupies the bottom `height` rows: separator, [escalation
-    // message, worker status,] status message, statusline.
-    let sep_row = rows.saturating_sub(height.saturating_sub(1)).max(1);
+    // The footer occupies the bottom `height` rows: [escalation message, worker
+    // status,] separator, status message, statusline.
+    //
+    // The pinned escalation is anchored ABOVE the separator, not below it. The
+    // horizontal rule is the LID of the statusline block — it marks where the
+    // scrolling body stops — so a banner painted under it looked like a row
+    // wedged inside the statusline frame. Above the rule it reads as the last
+    // thing the body said, which is where the operator's eye goes for "what is
+    // running right now", and the rule stays welded to the two statusline rows
+    // it opens whether or not a banner is pinned.
+    let top_row = rows.saturating_sub(height.saturating_sub(1)).max(1);
+    let sep_row = if banner.is_some() {
+        top_row + crate::escalation::ROWS
+    } else {
+        top_row
+    };
     let msg_row = rows.saturating_sub(1);
     let bar_row = rows;
     let max = cols as usize;
@@ -555,13 +594,16 @@ pub fn footer_seq(
     // next prompt at the top of the screen instead of two lines below the last
     // output. Re-asserting every paint also makes a resize between prompts
     // self-healing without depending on the SIGWINCH watcher.
-    s.push_str(&scroll_region_seq(rows));
-    s.push_str(&format!("\x1b[{sep_row};1H\x1b[2K{sep}"));
-    // The pinned escalation sits between the separator and the statusline block:
-    // the (animated) escalation message, then the worker's latest status.
+    // Derived from the SAME `height` as the row plan (not from the global pin)
+    // so a banner that retires mid-paint can't desync region from paint.
+    let region_bottom = rows.saturating_sub(height).max(1);
+    s.push_str(&format!("\x1b[1;{region_bottom}r"));
+    // The pinned escalation sits ABOVE the separator — the (animated) escalation
+    // message, then the worker's latest status, then the rule that opens the
+    // statusline block.
     if let Some((escalation, worker)) = banner {
-        let esc_row = sep_row + 1;
-        let worker_row = sep_row + 2;
+        let esc_row = top_row;
+        let worker_row = top_row + 1;
         s.push_str(&format!(
             "\x1b[{esc_row};1H\x1b[2K{}",
             clip_visible(&escalation, max)
@@ -571,6 +613,7 @@ pub fn footer_seq(
             clip_visible(&worker, max)
         ));
     }
+    s.push_str(&format!("\x1b[{sep_row};1H\x1b[2K{sep}"));
     s.push_str(&format!("\x1b[{msg_row};1H\x1b[2K{msg}"));
     s.push_str(&format!("\x1b[{bar_row};1H\x1b[2K{bar}"));
     s.push_str("\x1b8"); // DECRC — restore cursor + attrs
@@ -690,13 +733,14 @@ impl Terminal {
         if !self.active {
             return;
         }
-        let sep_row = self.rows.saturating_sub(2).max(1);
+        let top_row = footer_top_row(self.rows);
         let mut out = std::io::stdout();
         // Restore alternate-scroll, reset region, then clear from the footer's
-        // top row to end of screen so no stale statusline is left behind.
+        // top row to end of screen so no stale statusline — or stale escalation
+        // banner, which now sits ABOVE the separator — is left behind.
         let _ = write!(
             out,
-            "{}{RESET_REGION}\x1b[{sep_row};1H\x1b[J",
+            "{}{RESET_REGION}\x1b[{top_row};1H\x1b[J",
             restore_alt_scroll_seq(),
         );
         let _ = out.flush();
@@ -840,12 +884,13 @@ pub fn suspend_footer_region() -> bool {
     let Some((rows, _cols)) = term_size() else {
         return false;
     };
-    let sep_row = rows.saturating_sub(2).max(1);
+    let top_row = footer_top_row(rows);
     // DECSC → restore alternate-scroll (child gets normal wheel behavior) →
-    // reset region to full screen → clear the footer rows → DECRC, so the
-    // cursor stays exactly where the command line left it.
+    // reset region to full screen → clear the footer rows (banner rows included
+    // — they sit ABOVE the separator) → DECRC, so the cursor stays exactly where
+    // the command line left it.
     let seq = format!(
-        "\x1b7{}{RESET_REGION}\x1b[{sep_row};1H\x1b[J\x1b8",
+        "\x1b7{}{RESET_REGION}\x1b[{top_row};1H\x1b[J\x1b8",
         restore_alt_scroll_seq(),
     );
     let mut out = std::io::stdout();
@@ -1483,7 +1528,8 @@ mod tests {
 
     #[test]
     fn footer_positions_three_rows_bottom_up() {
-        let seq = footer_seq(24, 10, "----------", "msg", "bar");
+        // No banner → 3-row footer.
+        let seq = footer_seq_with(24, 10, "----------", "msg", "bar", None);
         assert!(seq.starts_with("\x1b7")); // DECSC
         assert!(seq.ends_with("\x1b8")); // DECRC
         // The scroll-region re-assert (DECSTBM) must be saved-then-emitted: it
@@ -1498,6 +1544,47 @@ mod tests {
         assert!(seq.contains("\x1b[23;1H")); // status message row = H-1
         assert!(seq.contains("\x1b[24;1H")); // statusline row = H
         assert!(seq.contains("\x1b[2K")); // each row cleared first
+    }
+
+    #[test]
+    fn pinned_escalation_is_anchored_above_the_separator() {
+        // Regression: the banner first shipped BELOW the separator, which read
+        // as a row wedged inside the statusline frame. The rule is the LID of
+        // the statusline block, so the banner must sit ABOVE it.
+        let banner = Some((
+            "🚀 escalated → w_a7k3m2 · build and open pr".to_string(),
+            "   ↳ coordinating · 1m12s".to_string(),
+        ));
+
+        // 24-row window, 5-row footer: banner 20-21, rule 22, msg 23, bar 24.
+        let seq = footer_seq_with(24, 80, "----------", "msg", "bar", banner);
+        let esc = seq.find("\x1b[20;1H").expect("escalation row = H-4");
+        let worker = seq.find("\x1b[21;1H").expect("worker status row = H-3");
+        let rule = seq.find("\x1b[22;1H").expect("separator row = H-2");
+        let msg = seq.find("\x1b[23;1H").expect("status message row = H-1");
+        let bar = seq.find("\x1b[24;1H").expect("statusline row = H");
+        assert!(
+            esc < worker && worker < rule && rule < msg && msg < bar,
+            "footer must paint escalation → worker → rule → message → statusline"
+        );
+        // The rule really is the lid: row H-2 carries the separator, and the
+        // escalation text lands two rows ABOVE it.
+        assert!(
+            seq[rule..msg].contains("----------"),
+            "row H-2 must carry the separator, got {:?}",
+            &seq[rule..msg]
+        );
+        assert!(
+            seq[esc..worker].contains("escalated"),
+            "row H-4 must carry the escalation message, got {:?}",
+            &seq[esc..worker]
+        );
+        // The reserved region grew with the taller footer (24 - 5 = 19), so the
+        // banner can never be scrolled away by body output.
+        assert!(
+            seq.contains("\x1b[1;19r"),
+            "DECSTBM must reserve the banner rows too"
+        );
     }
 
     #[test]
