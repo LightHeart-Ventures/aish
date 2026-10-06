@@ -9840,6 +9840,11 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
                 if session.batch_mode { "on" } else { "off" },
                 session.batch_model
             );
+            // Report the LIVE capability (backend + credential), resolved by the
+            // same code path the fan-out tier uses — so what the operator reads
+            // here is exactly what a batch offload will do.
+            let cap = crate::batch::capability(&session.backend_kind, &session.env);
+            println!("batch tier: {}", cap.reason());
             let jobs = session.batch_jobs.lock().unwrap();
             if jobs.is_empty() {
                 println!("no batch jobs");

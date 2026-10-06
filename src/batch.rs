@@ -189,6 +189,78 @@ pub fn spawn(
     id
 }
 
+// ── Batch-tier capability: a BUILT-IN decision, not a remembered one ─────────
+//
+// Whether the Anthropic Message Batches API is reachable is a property of the
+// ACTIVE BACKEND + the credential on disk — not a fact an agent should discover
+// once and then carry around in its head (or in a session note). Every caller
+// that needs the answer asks here, so the answer can never drift from reality:
+// a `export ANTHROPIC_API_KEY=…` added mid-session, a `:backend grok` switch, or
+// a revoked key all change the next answer. Deliberately NOT memoized.
+
+/// Why the Anthropic Message Batches API is — or isn't — usable right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchCapability {
+    /// A metered `sk-ant-…` key is reachable — the batch tier works.
+    Available,
+    /// Claude backend, but only a subscription credential
+    /// (`CLAUDE_CODE_OAUTH_TOKEN` / the Claude Code CLI token store) is present.
+    /// Subscription auth cannot reach the Batches API.
+    SubscriptionOnly,
+    /// The active backend has no Batches API at all (xAI/OpenAI/OpenRouter).
+    UnsupportedBackend(String),
+}
+
+impl BatchCapability {
+    /// True only when a batch offload can actually succeed.
+    pub fn available(&self) -> bool {
+        matches!(self, BatchCapability::Available)
+    }
+
+    /// One-line, operator/model-facing explanation — the single wording for
+    /// "why not", shared by the `run_in_background` error, `:batch status`, and
+    /// the fan-out tier fallback, so the three can't tell different stories.
+    pub fn reason(&self) -> String {
+        match self {
+            BatchCapability::Available => {
+                "available (metered ANTHROPIC_API_KEY reachable)".to_string()
+            }
+            BatchCapability::SubscriptionOnly => "unavailable — the Anthropic Batches API needs a \
+metered ANTHROPIC_API_KEY; a Claude subscription token (CLAUDE_CODE_OAUTH_TOKEN) can't reach it"
+                .to_string(),
+            BatchCapability::UnsupportedBackend(kind) => format!(
+                "unavailable — the `{kind}` backend has no Batches API (Anthropic-only); \
+work runs on interactive coordinators instead"
+            ),
+        }
+    }
+}
+
+/// The metered key the Batches API needs, resolved with aish's standard
+/// precedence (`~/.aishrc` exports win over the process env; blank = unset).
+pub fn metered_key(env: &[(String, String)]) -> Option<String> {
+    crate::rc::env_value(env, "ANTHROPIC_API_KEY")
+}
+
+/// Pure classifier — the whole decision, isolated and unit-tested.
+pub fn classify(backend_kind: &str, metered_key_present: bool) -> BatchCapability {
+    match backend_kind {
+        // Batches are Anthropic-only. Treat an unset/unknown backend as Claude,
+        // matching the credential fallback in `run_in_background`.
+        "grok" | "openai" | "openrouter" => {
+            BatchCapability::UnsupportedBackend(backend_kind.to_string())
+        }
+        _ if metered_key_present => BatchCapability::Available,
+        _ => BatchCapability::SubscriptionOnly,
+    }
+}
+
+/// The live answer for this session. Call this at every decision point.
+pub fn capability(backend_kind: &str, env: &[(String, String)]) -> BatchCapability {
+    classify(backend_kind, metered_key(env).is_some())
+}
+
+
 /// Short, table-friendly form of a uuid job id (first 8 hex chars).
 pub fn short_id(id: &str) -> &str {
     id.split('-').next().unwrap_or(id)
@@ -222,7 +294,9 @@ pub fn rehydrate(session: &mut crate::session::Session) {
     if mine.is_empty() {
         return;
     }
-    let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+    // Same resolution the capability check uses (rc exports then process env),
+    // so a key exported in ~/.aishrc can reattach a poll loop too.
+    let api_key = metered_key(&session.env);
     let jobs = session.batch_jobs.clone();
     let mut resumed = 0usize;
     for row in mine {
@@ -718,6 +792,51 @@ mod tests {
         let out = render_results(&rs);
         assert!(out.contains("### a\nA"));
         assert!(out.contains("### b — errored"));
+    }
+
+    #[test]
+    fn capability_is_classified_from_backend_and_key() {
+        assert_eq!(super::classify("claude", true), BatchCapability::Available);
+        assert_eq!(
+            super::classify("claude", false),
+            BatchCapability::SubscriptionOnly
+        );
+        // Unset/unknown backend behaves as Claude (matches the credential fallback).
+        assert_eq!(super::classify("", true), BatchCapability::Available);
+        // Non-Anthropic backends have no Batches API even WITH a metered key.
+        for kind in ["grok", "openai", "openrouter"] {
+            assert_eq!(
+                super::classify(kind, true),
+                BatchCapability::UnsupportedBackend(kind.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn capability_available_and_reason_agree() {
+        assert!(BatchCapability::Available.available());
+        assert!(!BatchCapability::SubscriptionOnly.available());
+        assert!(!BatchCapability::UnsupportedBackend("grok".into()).available());
+        assert!(
+            BatchCapability::SubscriptionOnly
+                .reason()
+                .contains("ANTHROPIC_API_KEY")
+        );
+        assert!(
+            BatchCapability::UnsupportedBackend("grok".into())
+                .reason()
+                .contains("grok")
+        );
+    }
+
+    #[test]
+    fn metered_key_prefers_rc_exports_and_ignores_blanks() {
+        let rc = vec![("ANTHROPIC_API_KEY".to_string(), "from-rc".to_string())];
+        assert_eq!(super::metered_key(&rc).as_deref(), Some("from-rc"));
+        let blank = vec![("ANTHROPIC_API_KEY".to_string(), "   ".to_string())];
+        // A blank rc value falls through to the process env, which the test
+        // runner may or may not set — only assert it is never the blank itself.
+        assert_ne!(super::metered_key(&blank).as_deref(), Some("   "));
     }
 
     #[test]
