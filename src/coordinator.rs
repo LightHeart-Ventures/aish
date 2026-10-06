@@ -2838,6 +2838,117 @@ mod tests {
     }
 
     #[test]
+    fn fan_out_prompt_rule_and_plan_graph_predicate_cannot_drift() {
+        // TASK-809, the assertion no other card makes: FAN_OUT_DERIVED is the
+        // PROSE of a rule whose EXECUTABLE form is PlanGraph::fan_out_candidates
+        // (TASK-802). A prompt and a predicate that disagree is the worst
+        // failure mode available here — the model would be instructed to fan out
+        // where the code refuses to (or vice versa), silently, with no test red.
+        // So pin the decision table from the engineering spec against BOTH
+        // halves: the prompt text AND the real code path, same fixtures.
+        use crate::plan::{PlanGraph, PlanNode};
+
+        fn node(id: &str, deps: &[&str], files: &[&str]) -> PlanNode {
+            PlanNode {
+                id: id.into(),
+                intent: format!("do {id}"),
+                files: files.iter().map(|s| (*s).to_string()).collect(),
+                depends_on: deps.iter().map(|s| (*s).to_string()).collect(),
+                acceptance: vec!["lands".into()],
+                est_calls: 2,
+            }
+        }
+        fn graph(nodes: Vec<PlanNode>) -> PlanGraph {
+            PlanGraph {
+                scope_key: "goal:prompt-parity".into(),
+                nodes,
+                created_at: 1_762_000_000,
+            }
+        }
+        let empty = std::collections::HashSet::new();
+
+        // Row 1 — ONE ready node => solo. The prompt says "Otherwise execute
+        // solo"; the predicate returns None.
+        let one_ready = graph(vec![
+            node("a", &[], &["src/a.rs"]),
+            node("b", &["a"], &["src/b.rs"]),
+        ]);
+        assert!(
+            one_ready.fan_out_candidates(&empty).is_none(),
+            "ready.len() == 1 must be solo in CODE, as the prompt states"
+        );
+
+        // Row 2 — >=2 ready AND pairwise-disjoint files => fan out, one worker
+        // per ready node.
+        let disjoint = graph(vec![
+            node("a", &[], &["src/a.rs"]),
+            node("b", &[], &["src/b.rs"]),
+        ]);
+        let fan = disjoint
+            .fan_out_candidates(&empty)
+            .expect(">=2 ready + disjoint files must fan out in CODE, as the prompt states");
+        assert_eq!(fan.len(), 2, "one worker per ready node");
+
+        // Row 3 — >=2 ready but OVERLAPPING files => solo. This is the 87-call
+        // runaway's actual shape: parallel-looking work that contends.
+        let overlapping = graph(vec![
+            node("a", &[], &["src/shared.rs", "src/a.rs"]),
+            node("b", &[], &["src/shared.rs"]),
+        ]);
+        assert_eq!(
+            overlapping.ready_set(&empty).len(),
+            2,
+            "both nodes ARE ready — the collapse is about files, not arity"
+        );
+        assert!(
+            overlapping.fan_out_candidates(&empty).is_none(),
+            "overlapping file sets must collapse to SOLO in CODE, as the prompt states"
+        );
+
+        // Row 4 — a node with an unmet dependency is never a candidate, which is
+        // the prompt's "NEVER dispatch a node with an unmet dependency".
+        let chained = graph(vec![
+            node("a", &[], &["src/a.rs"]),
+            node("b", &["a"], &["src/b.rs"]),
+            node("c", &["a"], &["src/c.rs"]),
+        ]);
+        let ready: Vec<_> = chained
+            .ready_set(&empty)
+            .iter()
+            .map(|n| n.id.clone())
+            .collect();
+        assert_eq!(
+            ready,
+            vec!["a"],
+            "unmet deps keep b and c out of the ready set"
+        );
+
+        // And the prompt states each row of that table in words, so neither half
+        // can be edited into disagreement without a test going red.
+        let f = FAN_OUT_DERIVED;
+        for clause in [
+            "`ready.len() >= 2`",
+            "pairwise disjoint",
+            "Otherwise execute solo",
+            "NEVER dispatch a node with an unmet",
+        ] {
+            assert!(
+                f.contains(clause),
+                "FAN_OUT_DERIVED lost the clause `{clause}` that the code enforces"
+            );
+        }
+        // The pipeline that PRODUCES the graph must still demand the fields the
+        // predicate reads — a plan without `depends_on`/`files` makes the rule
+        // undecidable at runtime.
+        for field in ["depends_on", "files"] {
+            assert!(
+                PHASE_PIPELINE.contains(field),
+                "Phase 2 must emit `{field}` — fan_out_candidates reads it"
+            );
+        }
+    }
+
+    #[test]
     fn assembled_coordinator_prompt_carries_both_guard_and_pipeline() {
         // The runtime prompt template (see `drive`) prepends BOTH the Phase-0
         // guard and the 5-phase pipeline just before the TASK. Guard against a

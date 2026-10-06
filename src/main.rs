@@ -34,6 +34,11 @@ mod modelfetch;
 mod oracle;
 mod pipeline;
 mod plan;
+/// TASK-809 — the five-step loop (`review-ask → review-state → identify-delta →
+/// plan-with-deps → fan-out`) asserted end to end over the REAL `plan` +
+/// `coordinator_store` types. Test-only: compiled out of the shipped binary.
+#[cfg(test)]
+mod plan_dag_loop_tests;
 mod plugin_auth;
 mod plugin_dispatcher;
 mod plugin_memory;
