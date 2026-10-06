@@ -10264,6 +10264,58 @@ mod tests {
         );
     }
 
+    /// Minimal `OpsCtx` for the guard paths — every field is a cheap handle, no
+    /// `Session` required, which is the whole point of the snapshot.
+    fn test_ops_ctx(nested: bool) -> OpsCtx {
+        OpsCtx {
+            nested,
+            cwd: std::path::PathBuf::from("/tmp"),
+            backend_kind: "claude".to_string(),
+            batch_model: "sonnet".to_string(),
+            env: Vec::new(),
+            session_id: "s_test".to_string(),
+            name: None,
+            show_worker_output: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            attached: Arc::new(Mutex::new(None)),
+            coordinator_store: None,
+            worker_jobs: Default::default(),
+            recent_dispatches: Arc::new(Mutex::new(HashMap::new())),
+            rt: None,
+        }
+    }
+
+    // A mid-turn `:dispatch` must reach `dispatch_coordinator_ctx` and come back
+    // with that function's own message — i.e. the `&mut Session`-free path is
+    // wired end to end, which is what makes running it DURING a turn possible.
+    #[test]
+    fn midturn_dispatch_routes_through_the_ctx_path() {
+        // Nested is the cheapest guard to observe: it returns before any spawn,
+        // so the test never launches a process or needs a tokio runtime.
+        let msg = run_midturn_command(":dispatch build the thing", &test_ops_ctx(true))
+            .expect("`:dispatch` is an immediate command");
+        assert!(
+            msg.contains("can't dispatch from inside a coordinator"),
+            "mid-turn dispatch must hit the same guards as the normal path: {msg}"
+        );
+
+        // Bare `:dispatch` falls through to usage (the goal-aligned suggestion
+        // needs `&mut Session`, so it is deliberately not available mid-turn).
+        let usage =
+            run_midturn_command(":dispatch", &test_ops_ctx(false)).expect("still an immediate cmd");
+        assert!(usage.starts_with("usage: :dispatch"), "got: {usage}");
+    }
+
+    // Anything the classifier rejects must NOT be executed here — prose and
+    // session-mutating commands stay on the type-ahead queue.
+    #[test]
+    fn midturn_command_ignores_non_immediate_lines() {
+        let ctx = test_ops_ctx(false);
+        assert!(run_midturn_command("what is the sprint status", &ctx).is_none());
+        assert!(run_midturn_command(":model opus", &ctx).is_none());
+        assert!(run_midturn_command(":dispatch-stats", &ctx).is_none());
+        assert!(run_midturn_command("", &ctx).is_none());
+    }
+
     // A zero window disables suppression entirely (escape hatch).
     #[test]
     fn zero_window_disables_dedup() {

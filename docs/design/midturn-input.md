@@ -137,7 +137,6 @@ interleaving a worker stream would garble both. The run id is printed; `:attach`
 after the turn lands.
 
 `Action::CycleWorker` (Shift-Tab) calls the **existing** worker-cycle handler —
-`Action::CycleWorker` (Shift-Tab) calls the **existing** worker-cycle handler —
 behaviour is preserved exactly, now driven through the unified `KeyParser`
 (`ESC [ Z` ⇒ `Key::ShiftTab`), which is a strict superset of the old
 `scan_csi_z`.
