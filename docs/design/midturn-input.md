@@ -104,6 +104,38 @@ if let Some(next) = type_ahead.lock().pop_front() {
 }
 ```
 
+### Exception: local-only colon commands run immediately
+
+Queue-don't-inject is right for **prose** — it protects the in-flight model
+stream. It is wrong for colon commands that never reach the backend. `:dispatch`
+typed while aish was thinking was queued as type-ahead and only launched once the
+turn ended, i.e. the coordinator you asked to run *alongside* the turn started
+after it finished — defeating the entire point.
+
+So the reader classifies at **submit** time (`midturn_input::runs_immediately`)
+and routes those lines down a second channel (`MidturnCfg::now_tx`), which the
+REPL's in-turn `select!` drains and executes concurrently via
+`repl::run_midturn_command`. Receipt is `⚡ ran → …` instead of `⏳ queued → …`.
+
+Two properties qualify a command for the whitelist:
+
+1. **It never touches the model stream.** The queueing rationale doesn't apply.
+2. **It needs nothing but `Arc` handles cloneable off `Session`.** The live turn
+   owns `&mut Session`, so anything reading or mutating session state (`:model`,
+   `:clear`, `:restart`, …) *cannot* run concurrently and stays queued. The
+   whitelisted commands run off an `OpsCtx` snapshot taken before `run_turn`
+   borrows the session.
+
+Today the whitelist is exactly `["dispatch"]`. `:tell` / `:stop` qualify on (1)
+and are the obvious next additions, but still take `&mut Session` (`:tell goal …`
+routes into `steer_active_goal`) — they need the same `OpsCtx` split first.
+Printing commands (`:jobs`, `:status`) and modal ones (`:workers`, which would
+steal stdin from the classifying reader thread) are deliberately excluded.
+
+Mid-turn `:dispatch` does not auto-attach: the turn owns the output area, so
+interleaving a worker stream would garble both. The run id is printed; `:attach`
+after the turn lands.
+
 `Action::CycleWorker` (Shift-Tab) calls the **existing** worker-cycle handler —
 behaviour is preserved exactly, now driven through the unified `KeyParser`
 (`ESC [ Z` ⇒ `Key::ShiftTab`), which is a strict superset of the old

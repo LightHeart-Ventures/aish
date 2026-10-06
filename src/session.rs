@@ -383,7 +383,13 @@ pub struct Session {
     /// is rejected pointing at the first run instead of spawning a duplicate.
     /// Session-local, never persisted; entries older than the window are pruned
     /// on each dispatch so it stays tiny.
-    pub recent_dispatches: std::collections::HashMap<u64, (String, std::time::Instant)>,
+    ///
+    /// Shared behind an `Arc<Mutex<_>>` so a MID-TURN `:dispatch` (run from the
+    /// keywatch reader thread while the turn still holds `&mut Session`) dedups
+    /// against the same map the normal path uses — see [`crate::repl::OpsCtx`].
+    pub recent_dispatches: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<u64, (String, std::time::Instant)>>,
+    >,
     /// Deferred + recurring `:schedule` tasks (cron / natural language). Each
     /// fire spawns a background coordinator; the tick task updates the 2nd
     /// status line and prints console summaries. Session-local, never persisted.
@@ -678,7 +684,9 @@ impl Session {
             batch_jobs: Default::default(),
             batch_store: None,
             worker_jobs: Default::default(),
-            recent_dispatches: std::collections::HashMap::new(),
+            recent_dispatches: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             schedule: crate::schedule::Scheduler::new(),
             coordinator_store: None,
             alert_store: None,

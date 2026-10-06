@@ -253,6 +253,39 @@ pub fn print_midturn_queued(text: &str, position: usize) {
     note_footer_activity();
 }
 
+/// Build the "ran immediately" receipt for a mid-turn colon command that was
+/// executed WHILE the turn was still in flight (see
+/// [`crate::midturn_input::runs_immediately`]) rather than queued. Same clipping
+/// / locale / color degradation rules as [`midturn_queued_seq`]; the distinct
+/// sigil is the whole point — the operator must be able to tell at a glance that
+/// `:dispatch` fired NOW and is running alongside the turn, not that it is
+/// waiting in line behind it.
+pub fn midturn_now_seq(text: &str, cols: u16, utf8: bool, color_on: bool) -> String {
+    let sigil = if utf8 { "⚡" } else { "[!]" };
+    let arrow = if utf8 { "→" } else { "->" };
+    let body = if color_on {
+        format!("\x1b[2m{sigil} ran {arrow}\x1b[0m {text}")
+    } else {
+        format!("{sigil} ran {arrow} {text}")
+    };
+    let clipped = clip_visible(&body, cols.max(1) as usize);
+    format!("\r\x1b[2K{clipped}\x1b[0m\r\n")
+}
+
+/// Emit the "ran immediately" receipt into the text output area. Called from the
+/// keywatch reader thread the instant a whitelisted colon command is submitted
+/// mid-turn, BEFORE it is handed to the REPL's immediate channel. Same
+/// best-effort stdout-from-the-reader-thread caveat as
+/// [`print_midturn_queued`].
+pub fn print_midturn_now(text: &str) {
+    let cols = term_size().map(|(_, c)| c).unwrap_or(80);
+    let seq = midturn_now_seq(text, cols, utf8_locale(), crate::style::colors_enabled());
+    let mut out = std::io::stdout();
+    let _ = write!(out, "{seq}");
+    let _ = out.flush();
+    note_footer_activity();
+}
+
 /// Erase an inline mid-turn prompt affordance at turn teardown (carriage-return
 /// + erase-line). Pairs with [`set_midturn_inline`]; a no-op-looking write that
 /// keeps the flag-gated inline path from leaving a stale `❯` on the row.
@@ -1804,6 +1837,51 @@ mod tests {
 
         // A zero-width terminal must not panic (cols.max(1) floor).
         let _ = midturn_queued_seq("ls", 1, 0, true, true);
+    }
+
+    #[test]
+    fn midturn_now_seq_is_visibly_distinct_from_the_queued_receipt() {
+        // The whole point of the immediate path is that the operator can tell at
+        // a glance their `:dispatch` fired NOW and is running alongside the turn
+        // — not that it is waiting in line behind it. If these two receipts ever
+        // render the same, that signal is lost.
+        let wide = 80u16;
+
+        assert_eq!(
+            midturn_now_seq(":dispatch audit the logs", wide, true, false),
+            "\r\x1b[2K⚡ ran → :dispatch audit the logs\x1b[0m\r\n"
+        );
+        assert_eq!(
+            midturn_now_seq(":dispatch go", wide, true, true),
+            "\r\x1b[2K\x1b[2m⚡ ran →\x1b[0m :dispatch go\x1b[0m\r\n"
+        );
+        // Non-UTF-8 locale → ASCII sigil + arrow, no mojibake.
+        assert_eq!(
+            midturn_now_seq(":dispatch go", wide, false, false),
+            "\r\x1b[2K[!] ran -> :dispatch go\x1b[0m\r\n"
+        );
+        // Never collides with the queued receipt for the same text.
+        assert_ne!(
+            midturn_now_seq(":dispatch go", wide, true, false),
+            midturn_queued_seq(":dispatch go", 1, wide, true, false)
+        );
+
+        // Clipped to the terminal width so it can never wrap and desync the
+        // footer region, and a zero-width terminal must not panic.
+        let long = "x".repeat(200);
+        let out = midturn_now_seq(&long, 20, true, false);
+        let visible = out
+            .trim_start_matches("\r\x1b[2K")
+            .trim_end_matches("\r\n")
+            .trim_end_matches("\x1b[0m");
+        let label_cols = unicode_width::UnicodeWidthStr::width("⚡ ran → ");
+        assert_eq!(
+            visible.chars().filter(|c| *c == 'x').count(),
+            20 - label_cols,
+            "body is clipped to exactly `cols` visible columns"
+        );
+        assert!(out.ends_with("\r\n"), "row is newline-terminated");
+        let _ = midturn_now_seq(":dispatch go", 0, true, true);
     }
 
     #[test]
