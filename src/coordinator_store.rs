@@ -12,8 +12,10 @@
 //! connections safe. The store is `Clone` so the running coordinator and the
 //! REPL both hold a handle.
 
+use crate::plan::{NodeId, PlanGraph};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -223,6 +225,24 @@ pub fn work_package_key(task: &str) -> String {
     out.chars().take(400).collect()
 }
 
+/// TASK-808: lease key for a PLAN NODE's work package.
+///
+/// Returns `node:<scope_key>/<node_id>`, which cannot collide with any
+/// [`work_package_key`] output (that function strips `:` and `/` along with
+/// every other non-alphanumeric), so node-keyed and text-keyed leases coexist
+/// in the one ledger without a schema change.
+///
+/// Why this exists: the text key is a fuzzy hash of a brief. Two plan nodes
+/// phrased identically ("update the docs") collapse onto ONE key and contend
+/// for a single lease, so the second node is refused as a duplicate even though
+/// it is distinct work; conversely a re-worded re-dispatch of the SAME node
+/// misses its own lease. A plan node id is the stable identity the plan graph
+/// already guarantees is unique within a scope — keying on it makes the lease
+/// exact in both directions. Pure → unit-tested.
+pub fn plan_node_lease_key(scope_key: &str, node_id: &str) -> String {
+    format!("node:{scope_key}/{node_id}")
+}
+
 /// Unix seconds now (lease TTL arithmetic). Monotonicity isn't required — a
 /// lease only needs a coarse wall-clock deadline.
 fn unix_now() -> i64 {
@@ -365,7 +385,26 @@ impl CoordinatorStore {
                  PRIMARY KEY (scope, wp_key)
              );
              CREATE INDEX IF NOT EXISTS idx_wp_leases_owner
-                 ON work_package_leases (owner_run);",
+                 ON work_package_leases (owner_run);
+             -- TASK-804: the Phase-2 PLAN GRAPH (see
+             -- docs/reference/coordinator/plan-dag-design.md §4). One serialized
+             -- `crate::plan::PlanGraph` per coordinator scope — the graph is
+             -- always read WHOLE, so a json blob beats a normalised node table.
+             CREATE TABLE IF NOT EXISTS plan_graph (
+                 scope_key  TEXT PRIMARY KEY,
+                 json       TEXT NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
+             -- Completion is a SEPARATE table rather than a `done` flag inside
+             -- the blob: marking one node done is then a single-row insert that
+             -- never rewrites — and so never loses an update against — the graph
+             -- when two fan-out peers finish at once.
+             CREATE TABLE IF NOT EXISTS plan_node_done (
+                 scope_key TEXT NOT NULL,
+                 node_id   TEXT NOT NULL,
+                 done_at   INTEGER NOT NULL,
+                 PRIMARY KEY (scope_key, node_id)
+             );",
         )
         .context("coordinator_runs schema init failed")?;
         // Back-compat: add session_name to a table created before it existed.
@@ -1131,7 +1170,49 @@ impl CoordinatorStore {
         owner_run: &str,
         ttl_secs: i64,
     ) -> Result<()> {
-        let key = work_package_key(task);
+        self.claim_keyed(scope, &work_package_key(task), task, owner_run, ttl_secs)
+    }
+
+    /// TASK-808: claim the work package for PLAN NODE `node_id` under
+    /// `scope_key`, keyed on the node id instead of a fuzzy hash of `task`.
+    ///
+    /// Same semantics as [`Self::claim_work_package`] — idempotent renewal for
+    /// the same owner, loud refusal while a DIFFERENT run holds a live claim,
+    /// reclaimable once released / lapsed / owner-terminal — but the identity is
+    /// now exact: two nodes with identical briefs no longer contend, and a
+    /// re-worded re-dispatch of one node still hits its own lease.
+    ///
+    /// `task` is still stored on the row: it is the brief the fan-out guard
+    /// fuzzy-matches against and what the in-flight directive renders, so the
+    /// node id identifies the lease while the text stays human-readable.
+    pub fn claim_plan_node(
+        &self,
+        scope_key: &str,
+        node_id: &str,
+        task: &str,
+        owner_run: &str,
+        ttl_secs: i64,
+    ) -> Result<()> {
+        self.claim_keyed(
+            scope_key,
+            &plan_node_lease_key(scope_key, node_id),
+            task,
+            owner_run,
+            ttl_secs,
+        )
+    }
+
+    /// Shared lease body for both key flavours — the conflict check and the
+    /// upsert live here ONCE so a text-keyed and a node-keyed claim can never
+    /// drift in their liveness or renewal rules.
+    fn claim_keyed(
+        &self,
+        scope: &str,
+        key: &str,
+        task: &str,
+        owner_run: &str,
+        ttl_secs: i64,
+    ) -> Result<()> {
         let now = unix_now();
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
@@ -1152,10 +1233,7 @@ impl CoordinatorStore {
                         |r| r.get(0),
                     )
                     .optional()?;
-                let holder_live = !matches!(
-                    holder_phase.as_deref(),
-                    Some("done") | Some("failed")
-                );
+                let holder_live = !matches!(holder_phase.as_deref(), Some("done") | Some("failed"));
                 if holder_live {
                     anyhow::bail!(
                         "work package already claimed by run `{holder}` (lease valid for another \
@@ -1184,7 +1262,24 @@ impl CoordinatorStore {
     /// the owner so a sibling can't release someone else's claim. Idempotent.
     #[cfg(test)]
     pub fn release_work_package(&self, scope: &str, task: &str, owner_run: &str) -> Result<()> {
-        let key = work_package_key(task);
+        self.release_keyed(scope, &work_package_key(task), owner_run)
+    }
+
+    /// TASK-808: hand a PLAN NODE's package back early. Owner-scoped (a sibling
+    /// cannot release someone else's claim) and idempotent, exactly like
+    /// [`Self::release_work_package`].
+    #[allow(dead_code)]
+    pub fn release_plan_node(&self, scope_key: &str, node_id: &str, owner_run: &str) -> Result<()> {
+        self.release_keyed(
+            scope_key,
+            &plan_node_lease_key(scope_key, node_id),
+            owner_run,
+        )
+    }
+
+    /// Shared release body for both key flavours.
+    #[allow(dead_code)]
+    fn release_keyed(&self, scope: &str, key: &str, owner_run: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE work_package_leases SET released = 1
@@ -1241,7 +1336,17 @@ impl CoordinatorStore {
     /// exercisable without sleeping.
     #[cfg(test)]
     pub fn expire_lease_for_test(&self, scope: &str, task: &str) {
-        let key = work_package_key(task);
+        self.expire_key_for_test(scope, &work_package_key(task));
+    }
+
+    /// TASK-808 test hook: same forced expiry, addressed by plan node id.
+    #[cfg(test)]
+    pub fn expire_plan_node_lease_for_test(&self, scope_key: &str, node_id: &str) {
+        self.expire_key_for_test(scope_key, &plan_node_lease_key(scope_key, node_id));
+    }
+
+    #[cfg(test)]
+    fn expire_key_for_test(&self, scope: &str, key: &str) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
             "UPDATE work_package_leases SET expires_at = 0 WHERE scope = ?1 AND wp_key = ?2",
@@ -1318,11 +1423,117 @@ impl CoordinatorStore {
         )?;
         Ok(())
     }
+
+    // ── TASK-804: Phase-2 plan-graph persistence ─────────────────────────────
+    //
+    // The graph and its done-set outlive the process that planned them: the goal
+    // loop respawns a FRESH coordinator each turn, so without this the plan is
+    // re-derived (and re-fanned) every round. Keyed by scope so sibling scopes
+    // in one db never see each other's plan. No reader exists yet — TASK-808
+    // (lease keying) and TASK-803 (delta artifact) are the first consumers — so
+    // the methods carry `allow(dead_code)` until then.
+
+    /// Upsert the plan graph for `graph.scope_key`. One graph per scope: a
+    /// re-plan REPLACES the stored blob and deliberately leaves `plan_node_done`
+    /// UNTOUCHED, so work already finished under the previous revision of the
+    /// plan stays finished. Re-running a done node is the expensive mistake; a
+    /// leftover done-row is harmless, since every reader intersects the done-set
+    /// with the ids the CURRENT graph still declares.
+    #[allow(dead_code)]
+    pub fn save_plan_graph(&self, graph: &PlanGraph) -> Result<()> {
+        let json = serde_json::to_string(graph).context("serialize plan graph")?;
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO plan_graph (scope_key, json, created_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(scope_key) DO UPDATE SET
+                 json       = excluded.json,
+                 created_at = excluded.created_at",
+            rusqlite::params![graph.scope_key, json, graph.created_at],
+        )?;
+        Ok(())
+    }
+
+    /// The stored graph for `scope_key`, or `None` when none is stored.
+    ///
+    /// A row whose `json` no longer deserializes (shape drift, a truncated
+    /// write) is treated as ABSENT — logged at `warn`, returned as `Ok(None)`.
+    /// A poisoned row must never hard-fail a coordinator turn: the worst
+    /// outcome of "absent" is a re-plan, whereas an `Err` here would wedge the
+    /// run on every subsequent round with no way to recover itself.
+    #[allow(dead_code)]
+    pub fn load_plan_graph(&self, scope_key: &str) -> Result<Option<PlanGraph>> {
+        let json: Option<String> = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT json FROM plan_graph WHERE scope_key = ?1",
+                rusqlite::params![scope_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        match serde_json::from_str(&json) {
+            Ok(graph) => Ok(Some(graph)),
+            Err(e) => {
+                tracing::warn!(
+                    "plan_graph: undeserializable row for scope={scope_key}, \
+                     treating as absent: {e}"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Record `node_id` as complete under `scope_key`. `INSERT OR IGNORE`, so
+    /// marking the same node twice (a retried turn, a duplicate completion
+    /// report) is a no-op rather than an error.
+    #[allow(dead_code)]
+    pub fn mark_plan_node_done(&self, scope_key: &str, node_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO plan_node_done (scope_key, node_id, done_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![scope_key, node_id, unix_now()],
+        )?;
+        Ok(())
+    }
+
+    /// The done-set for `scope_key` — exactly the `done` argument
+    /// [`crate::plan::PlanGraph::ready_set`] and `fan_out_candidates` take.
+    #[allow(dead_code)]
+    pub fn plan_nodes_done(&self, scope_key: &str) -> Result<HashSet<NodeId>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT node_id FROM plan_node_done WHERE scope_key = ?1")?;
+        let rows = stmt.query_map(rusqlite::params![scope_key], |r| r.get::<_, NodeId>(0))?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Drop the graph AND the done-set for `scope_key` (goal cleared, scope
+    /// retired). Both deletes run in ONE [`Self::transact`] so the pair can
+    /// never half-apply — a surviving done-set under a deleted graph would
+    /// silently suppress nodes of the NEXT plan that happen to reuse an id.
+    #[allow(dead_code)]
+    pub fn clear_plan_graph(&self, scope_key: &str) -> Result<()> {
+        self.transact(|tx| {
+            tx.execute(
+                "DELETE FROM plan_graph WHERE scope_key = ?1",
+                rusqlite::params![scope_key],
+            )?;
+            tx.execute(
+                "DELETE FROM plan_node_done WHERE scope_key = ?1",
+                rusqlite::params![scope_key],
+            )?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::PlanNode;
 
     /// ISS-409757: the lifecycle ledger is the only record that survives both
     /// blind spots of the filesystem scan, so it must (a) stay QUIET for a
@@ -2003,7 +2214,10 @@ mod tests {
         assert_eq!(work_package_key("fix-the-auth-bug"), "fix the auth bug");
         assert_eq!(work_package_key("  "), "");
         // Distinct work stays distinct.
-        assert_ne!(work_package_key("fix auth"), work_package_key("fix billing"));
+        assert_ne!(
+            work_package_key("fix auth"),
+            work_package_key("fix billing")
+        );
         // Bounded so a giant brief can't blow up the primary key.
         assert!(work_package_key(&"a b ".repeat(500)).chars().count() <= 400);
     }
@@ -2031,13 +2245,23 @@ mod tests {
             .claim_work_package(scope, task, "run_b", DEFAULT_WORK_PACKAGE_TTL_SECS)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("run_a"), "conflict must name the holder: {err}");
+        assert!(
+            err.contains("run_a"),
+            "conflict must name the holder: {err}"
+        );
         assert!(err.contains("already claimed"), "{err}");
 
         // Cosmetic re-wording maps to the same key → still refused.
-        assert!(store
-            .claim_work_package(scope, "Implement the RETRY backoff in worker.rs!", "run_b", 600)
-            .is_err());
+        assert!(
+            store
+                .claim_work_package(
+                    scope,
+                    "Implement the RETRY backoff in worker.rs!",
+                    "run_b",
+                    600
+                )
+                .is_err()
+        );
         // A different scope (another goal) does NOT contend.
         store
             .claim_work_package("goal:other", task, "run_b", 600)
@@ -2052,26 +2276,45 @@ mod tests {
 
         // (1) Explicit release frees the package — and only the owner may.
         store.release_work_package(scope, task, "run_b").unwrap(); // no-op
-        assert_eq!(store.live_work_package_leases(Some(scope)).unwrap().len(), 1);
+        assert_eq!(
+            store.live_work_package_leases(Some(scope)).unwrap().len(),
+            1
+        );
         store.release_work_package(scope, task, "run_a").unwrap();
-        assert!(store.live_work_package_leases(Some(scope)).unwrap().is_empty());
+        assert!(
+            store
+                .live_work_package_leases(Some(scope))
+                .unwrap()
+                .is_empty()
+        );
         store
             .claim_work_package(scope, task, "run_b", DEFAULT_WORK_PACKAGE_TTL_SECS)
             .unwrap();
 
         // (2) TTL lapse frees it — a crashed owner can't wedge the package.
         store.expire_lease_for_test(scope, task);
-        assert!(store.live_work_package_leases(Some(scope)).unwrap().is_empty());
+        assert!(
+            store
+                .live_work_package_leases(Some(scope))
+                .unwrap()
+                .is_empty()
+        );
         store
             .claim_work_package(scope, task, "run_c", DEFAULT_WORK_PACKAGE_TTL_SECS)
             .unwrap();
-        assert_eq!(store.live_work_package_leases(Some(scope)).unwrap().len(), 1);
+        assert_eq!(
+            store.live_work_package_leases(Some(scope)).unwrap().len(),
+            1
+        );
 
         // (3) A TERMINAL owner frees it immediately, without waiting out the TTL.
         store.insert("run_c", task, "sess", None).unwrap();
         store.set_phase("run_c", "done").unwrap();
         assert!(
-            store.live_work_package_leases(Some(scope)).unwrap().is_empty(),
+            store
+                .live_work_package_leases(Some(scope))
+                .unwrap()
+                .is_empty(),
             "a done owner's claim must be reclaimable at once"
         );
         store
@@ -2083,9 +2326,405 @@ mod tests {
         let live = reopened.live_work_package_leases(Some(scope)).unwrap();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].owner_run, "run_d");
-        assert!(reopened
-            .claim_work_package(scope, task, "run_e", 600)
-            .is_err());
+        assert!(
+            reopened
+                .claim_work_package(scope, task, "run_e", 600)
+                .is_err()
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── TASK-804: plan-graph persistence ─────────────────────────────────────
+
+    /// A fresh store on its own temp db, so the plan tests never contend with
+    /// each other (or with a developer's real `aish.db`).
+    fn plan_store(tag: &str) -> (CoordinatorStore, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("aish_plan_{tag}_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+        (store, path)
+    }
+
+    /// The canonical diamond `a → {b, c} → d`: one root, a parallel pair, one
+    /// join. Every [`PlanNode`] field is populated so the round-trip test can
+    /// prove the blob carries all of them, and the shape is what `ready_set`
+    /// fan-out actually cares about.
+    fn diamond(scope_key: &str) -> PlanGraph {
+        let node = |id: &str, deps: Vec<&str>, calls: u32| PlanNode {
+            id: id.to_string(),
+            intent: format!("do {id}"),
+            files: vec![format!("src/{id}.rs")],
+            depends_on: deps.into_iter().map(str::to_string).collect(),
+            acceptance: vec![format!("{id} is green")],
+            est_calls: calls,
+        };
+        PlanGraph {
+            scope_key: scope_key.to_string(),
+            nodes: vec![
+                node("a", vec![], 3),
+                node("b", vec!["a"], 5),
+                node("c", vec!["a"], 2),
+                node("d", vec!["b", "c"], 8),
+            ],
+            created_at: 1_700_000_000,
+        }
+    }
+
+    /// Ready ids, in `ready_set`'s declaration order — the deterministic form
+    /// the fan-out guard compares against.
+    fn ready_ids(graph: &PlanGraph, done: &HashSet<NodeId>) -> Vec<String> {
+        graph.ready_set(done).iter().map(|n| n.id.clone()).collect()
+    }
+
+    /// The whole point of the table: a plan survives the process that made it,
+    /// byte-identically. Declaration order is load-bearing (it is `ready_set`'s
+    /// tie-break), so this asserts the nodes come back in the SAME order, not
+    /// merely the same set.
+    #[test]
+    fn plan_graph_round_trips_a_diamond() {
+        let (store, path) = plan_store("roundtrip");
+        let graph = diamond("goal:alpha");
+        graph.validate().unwrap();
+        store.save_plan_graph(&graph).unwrap();
+
+        // Re-opened handle: this is the cross-process read the goal loop does.
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        let loaded = reopened.load_plan_graph("goal:alpha").unwrap().unwrap();
+        assert_eq!(loaded, graph, "plan must round-trip identically");
+        assert_eq!(
+            loaded
+                .nodes
+                .iter()
+                .map(|n| n.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c", "d"],
+            "declaration order is ready_set's tie-break and must be preserved"
+        );
+        assert_eq!(loaded.created_at, 1_700_000_000);
+        assert_eq!(loaded.nodes[3].depends_on, ["b", "c"]);
+        assert_eq!(loaded.nodes[1].files, ["src/b.rs"]);
+        assert_eq!(loaded.nodes[1].acceptance, ["b is green"]);
+        assert_eq!(loaded.nodes[1].est_calls, 5);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// "No plan yet" is the normal first-turn state, not an error.
+    #[test]
+    fn load_plan_graph_is_none_for_unknown_scope() {
+        let (store, path) = plan_store("unknown");
+        assert!(
+            store
+                .load_plan_graph("goal:never-planned")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .plan_nodes_done("goal:never-planned")
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A re-plan replaces the GRAPH but must not amnesia the done-set: nodes
+    /// already paid for stay paid for, otherwise every re-plan re-runs them.
+    #[test]
+    fn re_saving_plan_graph_replaces_graph_but_keeps_done_set() {
+        let (store, path) = plan_store("replan");
+        store.save_plan_graph(&diamond("goal:alpha")).unwrap();
+        store.mark_plan_node_done("goal:alpha", "a").unwrap();
+
+        let mut revised = diamond("goal:alpha");
+        revised.nodes.truncate(2);
+        revised.nodes[1].intent = "re-worded b".to_string();
+        revised.created_at = 1_700_000_999;
+        store.save_plan_graph(&revised).unwrap();
+
+        let loaded = store.load_plan_graph("goal:alpha").unwrap().unwrap();
+        assert_eq!(loaded, revised, "re-save must REPLACE, not merge");
+        assert_eq!(loaded.nodes.len(), 2);
+        assert_eq!(loaded.created_at, 1_700_000_999);
+        assert_eq!(
+            store.plan_nodes_done("goal:alpha").unwrap(),
+            HashSet::from(["a".to_string()]),
+            "a re-plan must NOT clear completions"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Completions arrive from retried turns and duplicate reports, so marking
+    /// twice has to be a no-op rather than an error (INSERT OR IGNORE).
+    #[test]
+    fn mark_plan_node_done_is_idempotent() {
+        let (store, path) = plan_store("idempotent");
+        store.save_plan_graph(&diamond("goal:alpha")).unwrap();
+        store.mark_plan_node_done("goal:alpha", "a").unwrap();
+        store.mark_plan_node_done("goal:alpha", "a").unwrap();
+        assert_eq!(
+            store.plan_nodes_done("goal:alpha").unwrap(),
+            HashSet::from(["a".to_string()]),
+            "double-mark must collapse to one row"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Ties the store to the TASK-802 predicate: the persisted done-set, fed
+    /// straight into `ready_set`, must unlock exactly the expected nodes.
+    #[test]
+    fn plan_nodes_done_feeds_ready_set() {
+        let (store, path) = plan_store("readyset");
+        let graph = diamond("goal:alpha");
+        store.save_plan_graph(&graph).unwrap();
+
+        // Nothing done → only the root is ready.
+        let done = store.plan_nodes_done("goal:alpha").unwrap();
+        assert_eq!(ready_ids(&graph, &done), ["a"]);
+
+        // Root done → the parallel pair opens up.
+        store.mark_plan_node_done("goal:alpha", "a").unwrap();
+        let done = store.plan_nodes_done("goal:alpha").unwrap();
+        assert_eq!(ready_ids(&graph, &done), ["b", "c"]);
+
+        // One arm done → the join is still blocked on the other arm.
+        store.mark_plan_node_done("goal:alpha", "b").unwrap();
+        let done = store.plan_nodes_done("goal:alpha").unwrap();
+        assert_eq!(ready_ids(&graph, &done), ["c"]);
+
+        // Both arms done → the join is ready.
+        store.mark_plan_node_done("goal:alpha", "c").unwrap();
+        let done = store.plan_nodes_done("goal:alpha").unwrap();
+        assert_eq!(ready_ids(&graph, &done), ["d"]);
+
+        // All done → nothing left to fan out.
+        store.mark_plan_node_done("goal:alpha", "d").unwrap();
+        let done = store.plan_nodes_done("goal:alpha").unwrap();
+        assert!(ready_ids(&graph, &done).is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Sibling goals share one db; a cross-scope leak would suppress or
+    /// re-dispatch another goal's nodes.
+    #[test]
+    fn plan_graph_scopes_are_isolated() {
+        let (store, path) = plan_store("isolation");
+        let alpha = diamond("goal:alpha");
+        let mut beta = diamond("goal:beta");
+        beta.nodes.truncate(1);
+        store.save_plan_graph(&alpha).unwrap();
+        store.save_plan_graph(&beta).unwrap();
+        store.mark_plan_node_done("goal:alpha", "a").unwrap();
+
+        assert_eq!(store.load_plan_graph("goal:alpha").unwrap().unwrap(), alpha);
+        assert_eq!(store.load_plan_graph("goal:beta").unwrap().unwrap(), beta);
+        assert_eq!(
+            store.plan_nodes_done("goal:alpha").unwrap(),
+            HashSet::from(["a".to_string()])
+        );
+        assert!(
+            store.plan_nodes_done("goal:beta").unwrap().is_empty(),
+            "alpha's completion must not leak into beta"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A poisoned row (shape drift, torn write) reads as ABSENT. Worst case is
+    /// a re-plan; an `Err` here would wedge the run on every later round with
+    /// no way for it to recover itself.
+    #[test]
+    fn corrupt_plan_graph_row_reads_as_absent() {
+        let (store, path) = plan_store("corrupt");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO plan_graph (scope_key, json, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["goal:poisoned", "{not valid json", 1_700_000_000i64],
+            )
+            .unwrap();
+
+        let loaded = store.load_plan_graph("goal:poisoned");
+        assert!(loaded.is_ok(), "a poisoned row must never hard-fail a turn");
+        assert!(loaded.unwrap().is_none(), "it reads as absent");
+
+        // And the scope is still writable — a re-plan heals it.
+        store.save_plan_graph(&diamond("goal:poisoned")).unwrap();
+        assert!(store.load_plan_graph("goal:poisoned").unwrap().is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Retiring a scope drops graph AND done-set together — a surviving
+    /// done-set under a deleted graph would silently suppress nodes of the next
+    /// plan that reuse an id — and touches nothing else.
+    #[test]
+    fn clear_plan_graph_removes_graph_and_done_for_that_scope_only() {
+        let (store, path) = plan_store("clear");
+        store.save_plan_graph(&diamond("goal:alpha")).unwrap();
+        store.save_plan_graph(&diamond("goal:beta")).unwrap();
+        store.mark_plan_node_done("goal:alpha", "a").unwrap();
+        store.mark_plan_node_done("goal:beta", "a").unwrap();
+
+        store.clear_plan_graph("goal:alpha").unwrap();
+
+        assert!(store.load_plan_graph("goal:alpha").unwrap().is_none());
+        assert!(store.plan_nodes_done("goal:alpha").unwrap().is_empty());
+        assert!(store.load_plan_graph("goal:beta").unwrap().is_some());
+        assert_eq!(
+            store.plan_nodes_done("goal:beta").unwrap(),
+            HashSet::from(["a".to_string()]),
+            "clearing alpha must not touch beta"
+        );
+
+        // Idempotent: clearing an already-cleared scope is not an error.
+        store.clear_plan_graph("goal:alpha").unwrap();
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── TASK-808: plan-node-keyed work-package leases ────────────────────────
+
+    /// The node key is scope-qualified and stable, and cannot collide with a
+    /// text key — `work_package_key` strips `:` and `/` along with every other
+    /// non-alphanumeric, so the two namespaces are provably disjoint.
+    #[test]
+    fn plan_node_lease_key_is_scope_qualified_and_disjoint_from_text_keys() {
+        assert_eq!(
+            plan_node_lease_key("goal:abc", "parse-flags"),
+            "node:goal:abc/parse-flags"
+        );
+        // Stable across calls.
+        assert_eq!(
+            plan_node_lease_key("goal:abc", "a"),
+            plan_node_lease_key("goal:abc", "a")
+        );
+        // The same node id under a different scope is a DIFFERENT lease.
+        assert_ne!(
+            plan_node_lease_key("goal:abc", "a"),
+            plan_node_lease_key("goal:def", "a")
+        );
+        // No text key can ever equal a node key.
+        let text = work_package_key("node:goal:abc/parse-flags");
+        assert!(!text.contains(':') && !text.contains('/'), "{text}");
+        assert_ne!(text, plan_node_lease_key("goal:abc", "parse-flags"));
+    }
+
+    /// The whole point of the card. Two plan nodes whose briefs are
+    /// word-for-word identical are DISTINCT leases, so both can be in flight at
+    /// once (the text key would have collapsed them into one and refused the
+    /// second as a duplicate); and a node's lease is still hit by a RE-WORDED
+    /// re-dispatch of that same node (the text key would have missed it).
+    #[test]
+    fn node_keyed_leases_separate_identical_briefs_and_survive_rewording() {
+        let (store, path) = plan_store("nodelease");
+        let scope = "goal:deadbeef";
+        let brief = "update the docs";
+
+        store
+            .claim_plan_node(scope, "docs-api", brief, "run_a", 600)
+            .unwrap();
+        store
+            .claim_plan_node(scope, "docs-cli", brief, "run_b", 600)
+            .unwrap();
+        assert_eq!(
+            store.live_work_package_leases(Some(scope)).unwrap().len(),
+            2,
+            "identical briefs on distinct nodes must not contend"
+        );
+
+        // Same owner, same node → idempotent renewal, not a conflict.
+        store
+            .claim_plan_node(scope, "docs-api", brief, "run_a", 600)
+            .unwrap();
+        // Re-worded brief for the SAME node still lands on that node's lease.
+        let err = store
+            .claim_plan_node(
+                scope,
+                "docs-api",
+                "Refresh the API documentation!",
+                "run_c",
+                600,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("run_a"),
+            "conflict must name the holder: {err}"
+        );
+        assert!(err.contains("already claimed"), "{err}");
+
+        // Release is owner-scoped and frees only that node.
+        store.release_plan_node(scope, "docs-api", "run_c").unwrap(); // no-op
+        assert_eq!(
+            store.live_work_package_leases(Some(scope)).unwrap().len(),
+            2
+        );
+        store.release_plan_node(scope, "docs-api", "run_a").unwrap();
+        let live = store.live_work_package_leases(Some(scope)).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].owner_run, "run_b", "docs-cli must be untouched");
+        // Freed → re-claimable by anyone.
+        store
+            .claim_plan_node(scope, "docs-api", brief, "run_c", 600)
+            .unwrap();
+
+        // A TTL lapse frees one node without touching its sibling.
+        store.expire_plan_node_lease_for_test(scope, "docs-api");
+        let live = store.live_work_package_leases(Some(scope)).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].owner_run, "run_b");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Node-keyed and text-keyed leases share the ONE ledger (no schema
+    /// change), and a node lease is cross-process durable — which is the only
+    /// reason the lease exists at all.
+    #[test]
+    fn node_and_text_keyed_leases_coexist_and_survive_a_reopen() {
+        let (store, path) = plan_store("coexist");
+        let scope = "goal:cafe";
+        let brief = "update the docs";
+
+        store
+            .claim_work_package(scope, brief, "run_text", 600)
+            .unwrap();
+        store
+            .claim_plan_node(scope, "docs-api", brief, "run_node", 600)
+            .unwrap();
+        assert_eq!(
+            store.live_work_package_leases(Some(scope)).unwrap().len(),
+            2,
+            "an identical brief keyed both ways is two independent leases"
+        );
+
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .live_work_package_leases(Some(scope))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            reopened
+                .claim_plan_node(scope, "docs-api", brief, "run_other", 600)
+                .is_err(),
+            "a node lease must still be honoured by a fresh process"
+        );
+
+        // A terminal owner frees its node lease at once, without a TTL wait.
+        reopened.insert("run_node", brief, "sess", None).unwrap();
+        reopened.set_phase("run_node", "done").unwrap();
+        let live = reopened.live_work_package_leases(Some(scope)).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].owner_run, "run_text");
 
         let _ = std::fs::remove_file(&path);
     }
