@@ -4,6 +4,15 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.52.0] - 2026-10-07
+
+### Added
+- **Cleaner attached-pane rows** (PR #891): the duplicated `[w_…]` / `[goal]` gutter is dropped from attached pane rows — the worker id and goal are already carried by the pane header, so repeating them per row was pure noise
+
+### Fixed
+- **Escalation banner anchoring** (PR #890): the escalation banner is now anchored ABOVE the statusline's top rule instead of colliding with it
+- **Mid-turn input controls act immediately** (PR #893): Shift-Tab and `:attach` / `:detach` now flip the stream gate the moment they're pressed during a thinking turn, rather than being queued until the turn ends. Mid-turn colon commands (`:dispatch` et al.) route through the `OpsCtx` path and run immediately
+
 ## [0.51.0] - 2026-10-07
 
 ### Added
