@@ -1,0 +1,19 @@
+{
+  "ref": "refs/tags/v1.4.0",
+  "before": "0000000000000000000000000000000000000000",
+  "after": "0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c",
+  "created": true,
+  "deleted": false,
+  "forced": false,
+  "base_ref": "refs/heads/main",
+  "compare": "https://github.com/acme/widgets/compare/v1.4.0",
+  "commits": [],
+  "head_commit": {
+    "id": "0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c",
+    "message": "Fix widget lookup off-by-one",
+    "author": { "name": "The Octocat", "email": "octocat@example.com", "username": "octocat" }
+  },
+  "repository": { "id": 1296269, "name": "widgets", "full_name": "acme/widgets" },
+  "pusher": { "name": "octocat", "email": "octocat@example.com" },
+  "sender": { "login": "octocat", "id": 1, "type": "User" }
+}

@@ -117,7 +117,7 @@ impl JsonlAuditSink {
 /// Keep a plugin id safe as a filename component: no path separators, no
 /// traversal. Anything outside `[A-Za-z0-9._-]` collapses to `_`, and a bare
 /// empty/dotted id falls back to `unknown`.
-fn sanitize_plugin_id(id: &str) -> String {
+pub(crate) fn sanitize_plugin_id(id: &str) -> String {
     let cleaned: String = id
         .chars()
         .map(|c| {
