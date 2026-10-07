@@ -480,6 +480,7 @@ impl Disposition {
 ///     (don't auto-recover forever);
 ///   * a confirmed loop → `Nudge` (change approach, don't just resume the loop);
 ///   * an out-of-budget / forced-summarize stop → `Resume` (continue the work).
+///
 /// Pure — the whole routing table is unit-tested.
 pub fn classify_disposition(
     reason: &ExitReason,

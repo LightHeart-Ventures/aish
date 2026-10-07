@@ -6,7 +6,7 @@
 //! coordinator is a multi-round agentic loop that:
 //!   * runs full-tool turns locally (filesystem, run_program, MCP), AND
 //!   * fans heavy, latency-insensitive sub-work out to the Batches API,
-//! persisting its phase to SQLite so a crash/exit resumes instead of re-running.
+//!     persisting its phase to SQLite so a crash/exit resumes instead of re-running.
 //!
 //! ## Phase state machine (borrowed from atum's `runCoordinator`)
 //! ```text
@@ -52,6 +52,7 @@
 //!     blindly resuming the same path;
 //!   * **flag for the operator** once auto-recovery is spent — stop and record a
 //!     clear failure so a human can take over.
+//!
 //! Auto-recoveries are capped ([`crate::loopguard::MAX_AUTO_RECOVERIES`]) so the
 //! recovery itself can't become an infinite loop.
 //!

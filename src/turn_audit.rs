@@ -402,6 +402,7 @@ fn finalize(acc: &mut Vec<Replay>, turn: u64, tool: &str, output: String, is_err
 ///     api key / auth / credential), and every value under an `env` map, is
 ///     replaced with `"[redacted]"`;
 ///   * any string longer than [`MAX_VALUE_LEN`] is truncated with a marker.
+///
 /// Applied recursively. The redacted form is also what `begin` matches on, so
 /// replay matching is consistent with what was journaled.
 pub fn redact_input(input: &Value) -> Value {

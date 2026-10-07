@@ -7,8 +7,8 @@
 //!
 //!   * `"webhook_url"`     — an HTTP endpoint the event is POSTed to (JSON body).
 //!   * `"webhook_command"` — a shell command run with the event JSON on stdin;
-//!                           its captured output lands in the plugin state store
-//!                           under `<plugin_id>:last_webhook_output`.
+//!     its captured output lands in the plugin state store
+//!     under `<plugin_id>:last_webhook_output`.
 //!
 //! Delivery is **fire-and-forget**: [`PluginDispatcher::route`] reads the
 //! manifests (a cheap directory scan), spawns one detached `tokio` task per

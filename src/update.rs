@@ -965,7 +965,7 @@ fn live_run_ids(ctx: &DrainCtx<'_>) -> Vec<String> {
 
 /// Total background work still tied to THIS binary: in-memory batches + workers
 /// + durable coordinator runs the in-memory tallies miss. Mirrors the prompt's
-/// ⟳N tally; the quiesce loop polls this to zero (or the timeout).
+///   ⟳N tally; the quiesce loop polls this to zero (or the timeout).
 #[allow(dead_code)]
 fn drain_running_count(ctx: &DrainCtx<'_>) -> usize {
     let batches = crate::batch::running_count(ctx.batch_jobs);
@@ -989,6 +989,7 @@ fn drain_running_count(ctx: &DrainCtx<'_>) -> usize {
 ///   2. Poll the combined background tally to zero, bounded by `ctx.timeout` at
 ///      a 200ms cadence. On timeout, the still-active runs are recorded as
 ///      `left_mid_flight` (safe once containerized + persisted) and we proceed.
+///
 /// Always returns a report — drain is best-effort; a store error degrades to an
 /// empty signal set rather than failing the update.
 #[allow(dead_code)]

@@ -4243,15 +4243,15 @@ pub fn fresh_terminal(jobs: &WorkerJobs) -> Option<bool> {
 /// Build the prompt's background-jobs badge, coloured by the *state* of the
 /// worker(s) rather than by transient per-tool events:
 ///   * white `⟳N`  — one or more workers are RUNNING (received input,
-///                    thinking, mid-turn, a tool in flight — all "busy"),
+///     thinking, mid-turn, a tool in flight — all "busy"),
 ///   * green `✓`    — no worker is live and the most-recently-finished worker
-///                    completed successfully (done),
+///     completed successfully (done),
 ///   * red   `✗`    — no worker is live and the most-recently-finished worker
-///                    completed but FAILED.
-/// `running` is the TOTAL live background-job count (workers + batches). While
-/// anything is live the badge is white ⟳N; once the live count hits 0 it briefly
-/// flashes the last terminal outcome ([`fresh_terminal`]) and is otherwise empty.
-/// Pure, so the colour/glyph mapping is unit-testable.
+///     completed but FAILED.
+///     `running` is the TOTAL live background-job count (workers + batches). While
+///     anything is live the badge is white ⟳N; once the live count hits 0 it briefly
+///     flashes the last terminal outcome ([`fresh_terminal`]) and is otherwise empty.
+///     Pure, so the colour/glyph mapping is unit-testable.
 pub fn pulse_badge(running: usize, terminal: Option<bool>) -> String {
     // A live worker is "running" in the broad sense — thinking, mid-turn, or
     // driving a tool. All of those states read as white.

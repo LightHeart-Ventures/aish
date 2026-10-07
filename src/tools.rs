@@ -2082,6 +2082,7 @@ event_id={id} + outcome=correct|wrong_turn.",
 ///     inside the longer — a re-offload that pasted extra context around the
 ///     same ask);
 ///   * Jaccard token-overlap ≥ 0.8.
+///
 /// An empty (post-normalization) string never matches — nothing can duplicate
 /// "no task".
 fn tasks_are_duplicate(a: &str, b: &str) -> bool {

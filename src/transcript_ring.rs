@@ -17,6 +17,7 @@
 //!     full retained tail, replayed the instant an operator `:attach`es; and
 //!   * the **live** cursor — [`LiveCursor`] + [`TranscriptRing::read_live`]
 //!     yields each entry once, in order, as it lands, for the real-time stream.
+//!
 //! Because both cursors read the identical `entries`, the `:attach` replay can
 //! never diverge from the live stream: whatever the live cursor emitted is
 //! exactly what the backfill cursor will later replay (until eviction), and

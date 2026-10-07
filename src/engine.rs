@@ -167,6 +167,7 @@ fn call_budget() -> (usize, usize) {
 ///   3. **Forced summarize** — past ~90%, the model is handed NO tools and must
 ///      produce a best-effort final answer, returned with a `forced-summarize`
 ///      banner instead of an empty hard-cap stop.
+///
 /// An abnormal stop prepends a greppable [`crate::loopguard::ExitReason::banner`]
 /// line to the answer so the coordinator can pick a recovery disposition
 /// (resume / nudge / flag-for-operator) — even across the worker subprocess

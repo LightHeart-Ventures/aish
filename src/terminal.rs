@@ -302,7 +302,7 @@ pub fn print_midturn_now(text: &str) {
 
 /// Erase an inline mid-turn prompt affordance at turn teardown (carriage-return
 /// + erase-line). Pairs with [`set_midturn_inline`]; a no-op-looking write that
-/// keeps the flag-gated inline path from leaving a stale `❯` on the row.
+///   keeps the flag-gated inline path from leaving a stale `❯` on the row.
 pub fn clear_midturn_inline() {
     let mut out = std::io::stdout();
     let _ = write!(out, "\r\x1b[2K");

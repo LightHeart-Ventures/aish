@@ -387,6 +387,7 @@ pub struct ImportedSkill {
 ///   * anything else → a skill.fish `owner/name[@version]` ref, fetched and
 ///     imported as a single skill. On failure, silently tries interpreting the
 ///     input as a GitHub repo path before surfacing an error.
+///
 /// Returns every skill written, so the caller can reload its catalog and report.
 pub async fn add(input: &str, skills_dir: &Path) -> Result<Vec<ImportedSkill>> {
     if let Some(gh) = parse_github_ref(input) {
@@ -1207,18 +1208,18 @@ fn normalize_github_path(path: &str) -> Option<String> {
 ///   * `https://github.com/owner/repo/blob/<ref>/path/to/skill/SKILL.md`
 ///   * `https://raw.githubusercontent.com/owner/repo/<ref>/path/to/SKILL.md`
 ///     (the "Raw" button URL / what `curl` fetches; ref is the 3rd segment)
-/// A `.git` suffix on the repo is stripped. An unparsable/unsafe spec → `None`.
-/// Parse a `raw.githubusercontent.com/<owner>/<repo>/<ref>/<path…>` URL body
-/// (everything after the host) into a [`GithubRef`]. This is the "Raw" button
-/// URL — and exactly what `curl`/`wget` fetch — so a user who copies the raw
-/// link to a SKILL.md can paste it straight into `:skill add`. Unlike a
-/// github.com tree/blob URL, the ref is a single POSITIONAL segment (branch,
-/// tag, or commit SHA) with no `tree`/`blob` marker, so it needs its own parse.
-/// A trailing `?…` query (e.g. a `?token=` on a private raw link) is stripped.
-/// The remaining path is returned verbatim — for a direct raw link it ends in
-/// `SKILL.md`, which [`resolve_github_skill_paths`] fetches as a single skill.
-/// Returns `None` for an unsafe or too-short path (caller falls back to the
-/// skill.fish `parse_ref` path).
+///     A `.git` suffix on the repo is stripped. An unparsable/unsafe spec → `None`.
+///     Parse a `raw.githubusercontent.com/<owner>/<repo>/<ref>/<path…>` URL body
+///     (everything after the host) into a [`GithubRef`]. This is the "Raw" button
+///     URL — and exactly what `curl`/`wget` fetch — so a user who copies the raw
+///     link to a SKILL.md can paste it straight into `:skill add`. Unlike a
+///     github.com tree/blob URL, the ref is a single POSITIONAL segment (branch,
+///     tag, or commit SHA) with no `tree`/`blob` marker, so it needs its own parse.
+///     A trailing `?…` query (e.g. a `?token=` on a private raw link) is stripped.
+///     The remaining path is returned verbatim — for a direct raw link it ends in
+///     `SKILL.md`, which [`resolve_github_skill_paths`] fetches as a single skill.
+///     Returns `None` for an unsafe or too-short path (caller falls back to the
+///     skill.fish `parse_ref` path).
 fn parse_github_raw_ref(rest: &str) -> Option<GithubRef> {
     let body = rest.split('?').next().unwrap_or(rest).trim_matches('/');
     let segs: Vec<&str> = body.split('/').filter(|s| !s.is_empty()).collect();

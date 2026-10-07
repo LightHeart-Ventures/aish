@@ -691,6 +691,7 @@ enum Dollar {
 ///     is `$1` then `2`), and the positional-list specials `$@`/`$*` (the script
 ///     args, space-joined) and `$#` (their count). These feed script mode's
 ///     positional parameters (TASK-18) and resolve empty/zero elsewhere.
+///
 /// Returns None for a malformed `${…}` (unterminated or containing an invalid
 /// character) so the caller rejects the line and routes it to the model.
 fn expand_dollar(

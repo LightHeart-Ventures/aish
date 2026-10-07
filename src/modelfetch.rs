@@ -3,10 +3,10 @@
 //!
 //! [`crate::hwdetect`] decides *which* model to run (a `model_id` + an `hf_repo`
 //! + a `quant`), but it never fetches anything: it only records the choice in
-//! `~/.aish/config/local-model.json`. Before this module existed, the `local` backend
-//! would fall back to opening a bare `"{model_id}.gguf"` in the cwd, which never
-//! exists — so `:backend local` always failed with
-//! `gguf_init_from_file: failed to open GGUF file ... (No such file or directory)`.
+//!   `~/.aish/config/local-model.json`. Before this module existed, the `local` backend
+//!   would fall back to opening a bare `"{model_id}.gguf"` in the cwd, which never
+//!   exists — so `:backend local` always failed with
+//!   `gguf_init_from_file: failed to open GGUF file ... (No such file or directory)`.
 //!
 //! [`ensure_model_file`] closes that gap. It maps the selection to a real
 //! `.gguf` path under `~/.aish/models/<repo_slug>/`, downloading the weights
