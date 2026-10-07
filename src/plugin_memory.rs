@@ -363,15 +363,15 @@ impl PluginMemory {
         };
         let mode = meta.permissions().mode() & 0o777;
         let want = ns.file_mode();
-        if mode != want {
-            if std::fs::set_permissions(path, std::fs::Permissions::from_mode(want)).is_ok() {
-                eprintln!(
-                    "\x1b[33maish:\x1b[0m corrected perms on {} ({:o} -> {:o}) — never chmod plugin auth files by hand",
-                    path.display(),
-                    mode,
-                    want
-                );
-            }
+        if mode != want
+            && std::fs::set_permissions(path, std::fs::Permissions::from_mode(want)).is_ok()
+        {
+            eprintln!(
+                "\x1b[33maish:\x1b[0m corrected perms on {} ({:o} -> {:o}) — never chmod plugin auth files by hand",
+                path.display(),
+                mode,
+                want
+            );
         }
     }
 

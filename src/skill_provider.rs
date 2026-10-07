@@ -387,6 +387,7 @@ pub struct ImportedSkill {
 ///   * anything else → a skill.fish `owner/name[@version]` ref, fetched and
 ///     imported as a single skill. On failure, silently tries interpreting the
 ///     input as a GitHub repo path before surfacing an error.
+///
 /// Returns every skill written, so the caller can reload its catalog and report.
 pub async fn add(input: &str, skills_dir: &Path) -> Result<Vec<ImportedSkill>> {
     if let Some(gh) = parse_github_ref(input) {
@@ -585,7 +586,7 @@ pub async fn install_plugin(plugin_id: &str, plugins_dir: &Path) -> Result<()> {
     // We'll download as a tar.gz and extract it
     let url = format!(
         "https://github.com/{}/{}/archive/refs/heads/{}.tar.gz",
-        owner, repo, &plugin.branch
+        owner, repo, plugin.branch
     );
 
     let client = reqwest::Client::new();
@@ -618,18 +619,18 @@ pub async fn install_plugin(plugin_id: &str, plugins_dir: &Path) -> Result<()> {
 
         // Look for the plugin directory in the archive
         // Format: {repo}-{branch}/plugins/{plugin-id}/...
-        if let Some(rel_path) = path_in_archive.to_str() {
-            if rel_path.contains(&format!("plugins/{plugin_id}")) {
-                // Extract files relative to the plugin directory
-                let remaining = rel_path
-                    .split(&format!("plugins/{plugin_id}"))
-                    .nth(1)
-                    .unwrap_or("");
-                if !remaining.is_empty() && remaining != "/" {
-                    let target = plugin_dir.join(remaining.trim_start_matches('/'));
-                    std::fs::create_dir_all(target.parent().unwrap_or(&plugin_dir))?;
-                    entry.unpack(&target)?;
-                }
+        if let Some(rel_path) = path_in_archive.to_str()
+            && rel_path.contains(&format!("plugins/{plugin_id}"))
+        {
+            // Extract files relative to the plugin directory
+            let remaining = rel_path
+                .split(&format!("plugins/{plugin_id}"))
+                .nth(1)
+                .unwrap_or("");
+            if !remaining.is_empty() && remaining != "/" {
+                let target = plugin_dir.join(remaining.trim_start_matches('/'));
+                std::fs::create_dir_all(target.parent().unwrap_or(&plugin_dir))?;
+                entry.unpack(&target)?;
             }
         }
     }
@@ -878,7 +879,7 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
     // Rank most-popular-first while keeping the registry's relative order as the
     // stable tiebreaker (sort_by is stable), so 0-star ties preserve relevance.
     let mut ranked: Vec<&SearchResult> = results.iter().collect();
-    ranked.sort_by(|a, b| b.stars.cmp(&a.stars));
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.stars));
 
     // Load locally installed skills to mark ones already in the catalog.
     let installed = crate::skills::load(&skills_dir_path());
@@ -903,7 +904,7 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
             // raw `name` field matches a locally-installed skill directory.
             let leaf = r.short_name();
             let leaf = leaf.rsplit('/').next().unwrap_or(&leaf);
-            if installed_names.contains(&leaf.to_string())
+            if installed_names.contains(leaf)
                 || (!r.name.is_empty() && installed_names.contains(&r.name))
             {
                 "✓ installed".to_string()
@@ -993,7 +994,7 @@ pub fn print_results_table_sourced(query: &str, results: &[(SearchResult, String
         return format!("No skills found for {query:?}.");
     }
     let mut ranked: Vec<&(SearchResult, String)> = results.iter().collect();
-    ranked.sort_by(|a, b| b.0.stars.cmp(&a.0.stars));
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.0.stars));
 
     let installed = crate::skills::load(&skills_dir_path());
     let installed_names: std::collections::HashSet<_> =
@@ -1015,7 +1016,7 @@ pub fn print_results_table_sourced(query: &str, results: &[(SearchResult, String
         .map(|r| {
             let leaf = r.0.short_name();
             let leaf = leaf.rsplit('/').next().unwrap_or(&leaf);
-            if installed_names.contains(&leaf.to_string())
+            if installed_names.contains(leaf)
                 || (!r.0.name.is_empty() && installed_names.contains(&r.0.name))
             {
                 "✓ installed".to_string()
@@ -1207,18 +1208,18 @@ fn normalize_github_path(path: &str) -> Option<String> {
 ///   * `https://github.com/owner/repo/blob/<ref>/path/to/skill/SKILL.md`
 ///   * `https://raw.githubusercontent.com/owner/repo/<ref>/path/to/SKILL.md`
 ///     (the "Raw" button URL / what `curl` fetches; ref is the 3rd segment)
-/// A `.git` suffix on the repo is stripped. An unparsable/unsafe spec → `None`.
-/// Parse a `raw.githubusercontent.com/<owner>/<repo>/<ref>/<path…>` URL body
-/// (everything after the host) into a [`GithubRef`]. This is the "Raw" button
-/// URL — and exactly what `curl`/`wget` fetch — so a user who copies the raw
-/// link to a SKILL.md can paste it straight into `:skill add`. Unlike a
-/// github.com tree/blob URL, the ref is a single POSITIONAL segment (branch,
-/// tag, or commit SHA) with no `tree`/`blob` marker, so it needs its own parse.
-/// A trailing `?…` query (e.g. a `?token=` on a private raw link) is stripped.
-/// The remaining path is returned verbatim — for a direct raw link it ends in
-/// `SKILL.md`, which [`resolve_github_skill_paths`] fetches as a single skill.
-/// Returns `None` for an unsafe or too-short path (caller falls back to the
-/// skill.fish `parse_ref` path).
+///     A `.git` suffix on the repo is stripped. An unparsable/unsafe spec → `None`.
+///     Parse a `raw.githubusercontent.com/<owner>/<repo>/<ref>/<path…>` URL body
+///     (everything after the host) into a [`GithubRef`]. This is the "Raw" button
+///     URL — and exactly what `curl`/`wget` fetch — so a user who copies the raw
+///     link to a SKILL.md can paste it straight into `:skill add`. Unlike a
+///     github.com tree/blob URL, the ref is a single POSITIONAL segment (branch,
+///     tag, or commit SHA) with no `tree`/`blob` marker, so it needs its own parse.
+///     A trailing `?…` query (e.g. a `?token=` on a private raw link) is stripped.
+///     The remaining path is returned verbatim — for a direct raw link it ends in
+///     `SKILL.md`, which [`resolve_github_skill_paths`] fetches as a single skill.
+///     Returns `None` for an unsafe or too-short path (caller falls back to the
+///     skill.fish `parse_ref` path).
 fn parse_github_raw_ref(rest: &str) -> Option<GithubRef> {
     let body = rest.split('?').next().unwrap_or(rest).trim_matches('/');
     let segs: Vec<&str> = body.split('/').filter(|s| !s.is_empty()).collect();
@@ -1270,10 +1271,9 @@ pub fn parse_github_ref(input: &str) -> Option<GithubRef> {
         (r, true)
     } else if let Some(r) = s.strip_prefix("github:") {
         (r, false)
-    } else if let Some(r) = s.strip_prefix("gh:") {
-        (r, false)
     } else {
-        return None;
+        let r = s.strip_prefix("gh:")?;
+        (r, false)
     };
 
     // A trailing `@ref` (prefix form only — a URL pins its ref via tree/blob).
@@ -1303,12 +1303,11 @@ pub fn parse_github_ref(input: &str) -> Option<GithubRef> {
     let path_segs: &[&str] =
         if url_form && matches!(rest_segs.first().copied(), Some("tree") | Some("blob")) {
             // /tree/<ref>/<path…> or /blob/<ref>/<path…>
-            match rest_segs.get(1) {
-                Some(r) => {
-                    git_ref = (*r).to_string();
-                    &rest_segs[2..]
-                }
-                None => return None, // `/tree` with no ref is malformed
+            {
+                // `/tree` with no ref is malformed — `?` drops it.
+                let r = rest_segs.get(1)?;
+                git_ref = (*r).to_string();
+                &rest_segs[2..]
             }
         } else {
             rest_segs
@@ -1396,10 +1395,10 @@ fn parse_trees_skill_paths(body: &str, path_prefix: Option<&str>) -> Result<Vec<
         if !is_skill_md_path(p) {
             continue;
         }
-        if let Some(prefix) = path_prefix {
-            if !path_under_prefix(p, prefix) {
-                continue;
-            }
+        if let Some(prefix) = path_prefix
+            && !path_under_prefix(p, prefix)
+        {
+            continue;
         }
         out.push(p.to_string());
     }
@@ -2433,10 +2432,10 @@ mod tests {
                     // Record any Authorization header seen (header names are
                     // case-insensitive; hyper emits them lower-cased on the wire).
                     for line in req.lines() {
-                        if let Some((name, value)) = line.split_once(':') {
-                            if name.trim().eq_ignore_ascii_case("authorization") {
-                                auth_sink.lock().unwrap().push(value.trim().to_string());
-                            }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.trim().eq_ignore_ascii_case("authorization")
+                        {
+                            auth_sink.lock().unwrap().push(value.trim().to_string());
                         }
                     }
                     let (status, body) = match routes.iter().find(|(p, _)| *p == target) {

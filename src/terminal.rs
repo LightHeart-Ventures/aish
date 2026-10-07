@@ -302,7 +302,7 @@ pub fn print_midturn_now(text: &str) {
 
 /// Erase an inline mid-turn prompt affordance at turn teardown (carriage-return
 /// + erase-line). Pairs with [`set_midturn_inline`]; a no-op-looking write that
-/// keeps the flag-gated inline path from leaving a stale `❯` on the row.
+///   keeps the flag-gated inline path from leaving a stale `❯` on the row.
 pub fn clear_midturn_inline() {
     let mut out = std::io::stdout();
     let _ = write!(out, "\r\x1b[2K");
@@ -567,7 +567,7 @@ fn restore_alt_scroll_seq() -> &'static str {
 /// ASCII `-`. Wrapped in dim SGR when `color_on`.
 pub fn separator_line(cols: u16, utf8: bool, color_on: bool) -> String {
     let ch = if utf8 { '─' } else { '-' };
-    let body: String = std::iter::repeat(ch).take(cols.max(1) as usize).collect();
+    let body: String = std::iter::repeat_n(ch, cols.max(1) as usize).collect();
     if color_on {
         format!("\x1b[2m{body}\x1b[0m")
     } else {
@@ -1351,11 +1351,11 @@ fn term_size() -> Option<(u16, u16)> {
 /// via the usual `LC_ALL` → `LC_CTYPE` → `LANG` precedence.
 fn utf8_locale() -> bool {
     for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
-        if let Ok(v) = std::env::var(key) {
-            if !v.is_empty() {
-                let up = v.to_ascii_uppercase();
-                return up.contains("UTF-8") || up.contains("UTF8");
-            }
+        if let Ok(v) = std::env::var(key)
+            && !v.is_empty()
+        {
+            let up = v.to_ascii_uppercase();
+            return up.contains("UTF-8") || up.contains("UTF8");
         }
     }
     false

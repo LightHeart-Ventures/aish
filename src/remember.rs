@@ -112,13 +112,13 @@ pub fn sanitize_memory(raw: &str) -> Option<String> {
     let mut s = raw.trim();
 
     // Strip a wrapping code fence if the whole reply is fenced.
-    if let Some(inner) = s.strip_prefix("```") {
-        if let Some(end) = inner.rfind("```") {
-            s = inner[..end]
-                .split_once('\n')
-                .map_or(&inner[..end], |(_, body)| body)
-                .trim();
-        }
+    if let Some(inner) = s.strip_prefix("```")
+        && let Some(end) = inner.rfind("```")
+    {
+        s = inner[..end]
+            .split_once('\n')
+            .map_or(&inner[..end], |(_, body)| body)
+            .trim();
     }
 
     // Drop a leading label the model sometimes prepends.

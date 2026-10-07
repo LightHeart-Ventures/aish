@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn counts_outcomes_and_running() {
-        let rows = vec![
+        let rows = [
             row(
                 "done",
                 Some("2024-01-01 00:00:00"),
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn latency_stats_and_quick_flag() {
         // Three done jobs: 30s (quick), 120s, 600s.
-        let rows = vec![
+        let rows = [
             row(
                 "done",
                 Some("2024-01-01 00:00:00"),
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn negative_latency_clamped_to_zero() {
         // heartbeat before created (clock skew) must not go negative.
-        let rows = vec![row(
+        let rows = [row(
             "done",
             Some("2024-01-01 00:01:00"),
             Some("2024-01-01 00:00:00"),
@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn over_offload_insight_fires_on_mostly_quick() {
-        let rows = vec![
+        let rows = [
             row(
                 "done",
                 Some("2024-01-01 00:00:00"),
@@ -445,7 +445,7 @@ mod tests {
 
     #[test]
     fn render_includes_core_sections_when_populated() {
-        let rows = vec![row(
+        let rows = [row(
             "done",
             Some("2024-01-01 00:00:00"),
             Some("2024-01-01 00:05:00"),

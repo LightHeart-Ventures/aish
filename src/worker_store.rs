@@ -486,20 +486,20 @@ pub fn append_record(id: &str, record: &TranscriptRecord) -> std::io::Result<()>
     // Whole‑file cap: rotate BEFORE the append so the file never exceeds the cap
     // by more than one record. A stat per append is cheap relative to the model
     // turn it accompanies.
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() >= transcript_cap() {
-            rotate_transcript(&path);
-        }
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta.len() >= transcript_cap()
+    {
+        rotate_transcript(&path);
     }
     let mut line = match serde_json::to_string(record) {
         Ok(s) => s,
         Err(_) => return Ok(()), // unserializable → drop, never crash
     };
     line.push('\n');
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-        if f.write_all(line.as_bytes()).is_ok() {
-            let _ = f.flush();
-        }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path)
+        && f.write_all(line.as_bytes()).is_ok()
+    {
+        let _ = f.flush();
     }
     Ok(())
 }
@@ -780,10 +780,10 @@ pub fn sweep_worker_dirs() -> usize {
         let status = meta.as_ref().map(|m| m.status.as_str());
         let has_branch = meta.as_ref().and_then(|m| m.branch.as_ref()).is_some();
         let age = dir_age_days(&dir);
-        if should_sweep_worker(status, has_branch, age, max_age) {
-            if std::fs::remove_dir_all(&dir).is_ok() {
-                reclaimed += 1;
-            }
+        if should_sweep_worker(status, has_branch, age, max_age)
+            && std::fs::remove_dir_all(&dir).is_ok()
+        {
+            reclaimed += 1;
         }
     }
     reclaimed

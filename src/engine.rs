@@ -167,6 +167,7 @@ fn call_budget() -> (usize, usize) {
 ///   3. **Forced summarize** — past ~90%, the model is handed NO tools and must
 ///      produce a best-effort final answer, returned with a `forced-summarize`
 ///      banner instead of an empty hard-cap stop.
+///
 /// An abnormal stop prepends a greppable [`crate::loopguard::ExitReason::banner`]
 /// line to the answer so the coordinator can pick a recovery disposition
 /// (resume / nudge / flag-for-operator) — even across the worker subprocess
@@ -1009,10 +1010,10 @@ clamped {clamped} tool result(s), retrying\x1b[0m"
                     let result = tools::execute(call, session, &mut gated).await;
                     tool_spin.finish(&desc, result.is_error);
                     // Journal the terminal (complete/failed) record for this live turn.
-                    if let Some(crate::turn_audit::Step::Execute { turn }) = audit_step {
-                        if let Some(a) = session.turn_audit.as_mut() {
-                            a.complete(turn, &call.name, &result);
-                        }
+                    if let Some(crate::turn_audit::Step::Execute { turn }) = audit_step
+                        && let Some(a) = session.turn_audit.as_mut()
+                    {
+                        a.complete(turn, &call.name, &result);
                     }
                     result
                 };
@@ -1135,20 +1136,20 @@ clamped {clamped} tool result(s), retrying\x1b[0m"
             // coordinator keeps the yield-and-resume path (its goal loop re-plans
             // from the banner via recovery_guidance); only a StuckPattern (no
             // directive) yields to the prompt so the operator can intervene.
-            if !session.nested {
-                if let Some(directive) = advice.resume_directive.as_ref() {
-                    pending_batch_nudge = Some(directive.clone());
-                    serial_chain_guard.reset();
-                    eprintln!(
-                        "\x1b[2m  → {} — injecting resume directive into the next round (binding); re-planning in place\x1b[0m",
-                        match advice.classification {
-                            crate::advisor::YieldClassification::BatchingOpportunity =>
-                                "batching opportunity",
-                            _ => "unknown pattern",
-                        }
-                    );
-                    continue;
-                }
+            if !session.nested
+                && let Some(directive) = advice.resume_directive.as_ref()
+            {
+                pending_batch_nudge = Some(directive.clone());
+                serial_chain_guard.reset();
+                eprintln!(
+                    "\x1b[2m  → {} — injecting resume directive into the next round (binding); re-planning in place\x1b[0m",
+                    match advice.classification {
+                        crate::advisor::YieldClassification::BatchingOpportunity =>
+                            "batching opportunity",
+                        _ => "unknown pattern",
+                    }
+                );
+                continue;
             }
 
             eprintln!("\x1b[2maish: {}\x1b[0m", reason.log_line());
@@ -1691,12 +1692,11 @@ impl Spinner {
         Self(Some(tokio::spawn(async {
             const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(80));
-            for i in 0.. {
+            let mut i = 0usize;
+            loop {
                 tick.tick().await;
-                eprint!(
-                    "\r\x1b[36m{}\x1b[0m \x1b[2;36mthinking…\x1b[0m",
-                    FRAMES[i % FRAMES.len()]
-                );
+                eprint!("\r\x1b[36m{}\x1b[0m \x1b[2;36mthinking…\x1b[0m", FRAMES[i]);
+                i = (i + 1) % FRAMES.len();
             }
         })))
     }
@@ -2075,10 +2075,10 @@ fn raw_body(result: &ToolResult) -> String {
     if !result.content.trim().is_empty() {
         return result.content.clone();
     }
-    if let Some(v) = &result.structured {
-        if let Ok(pretty) = serde_json::to_string_pretty(v) {
-            return pretty;
-        }
+    if let Some(v) = &result.structured
+        && let Ok(pretty) = serde_json::to_string_pretty(v)
+    {
+        return pretty;
     }
     "(no output)".to_string()
 }
@@ -2188,12 +2188,11 @@ fn build_turns_audit_from_history(history: &[Msg]) -> Vec<(usize, Vec<String>, V
                     for (key, val) in args {
                         if (key.contains("path") || key.contains("file") || key == "pattern")
                             && val.is_string()
+                            && let Some(s) = val.as_str()
+                            && !s.is_empty()
+                            && s.len() < 200
                         {
-                            if let Some(s) = val.as_str() {
-                                if !s.is_empty() && s.len() < 200 {
-                                    file_paths.push(s.to_string());
-                                }
-                            }
+                            file_paths.push(s.to_string());
                         }
                     }
                 }

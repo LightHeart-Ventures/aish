@@ -1076,6 +1076,7 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::await_holding_lock)] // `env_lock()` is a test-only serialization guard: it is deliberately held across `.await` so no concurrent test observes a half-applied process env.
     use super::*;
 
     /// Serializes tests that touch the PROCESS-GLOBAL recursion-guard env var or

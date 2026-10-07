@@ -7,8 +7,8 @@
 //!
 //!   * `"webhook_url"`     — an HTTP endpoint the event is POSTed to (JSON body).
 //!   * `"webhook_command"` — a shell command run with the event JSON on stdin;
-//!                           its captured output lands in the plugin state store
-//!                           under `<plugin_id>:last_webhook_output`.
+//!     its captured output lands in the plugin state store
+//!     under `<plugin_id>:last_webhook_output`.
 //!
 //! Delivery is **fire-and-forget**: [`PluginDispatcher::route`] reads the
 //! manifests (a cheap directory scan), spawns one detached `tokio` task per
@@ -381,12 +381,11 @@ impl PluginDispatcher {
         // most-recent-wins). This is the "plugin received a webhook → show it on
         // the 2nd statusline" path: the plugin decides the text, the engine caps
         // and routes it.
-        if let Some(flash) = &self.flash {
-            if let Some(msg) = nline_message(&String::from_utf8_lossy(&out.stdout)) {
-                if let Ok(mut slot) = flash.lock() {
-                    *slot = Some(msg);
-                }
-            }
+        if let Some(flash) = &self.flash
+            && let Some(msg) = nline_message(&String::from_utf8_lossy(&out.stdout))
+            && let Ok(mut slot) = flash.lock()
+        {
+            *slot = Some(msg);
         }
     }
 }

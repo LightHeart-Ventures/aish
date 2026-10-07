@@ -202,6 +202,7 @@ pub fn pin(id: &str, task: &str) {
 }
 
 /// Retire EVERY banner (the footer shrinks back on the next paint).
+#[allow(dead_code)] // completes the BANNERS push/remove/clear API; no caller wired yet.
 pub fn clear() {
     if let Ok(mut banners) = BANNERS.lock() {
         banners.clear();
@@ -254,10 +255,10 @@ pub fn pinned_ids() -> Vec<String> {
 /// finished-and-retired worker can't resurrect a row or write into another
 /// banner's.
 pub fn set_status(id: &str, status: &str) {
-    if let Ok(mut banners) = BANNERS.lock() {
-        if let Some(b) = banners.iter_mut().find(|b| b.id == id) {
-            b.status = status.to_string();
-        }
+    if let Ok(mut banners) = BANNERS.lock()
+        && let Some(b) = banners.iter_mut().find(|b| b.id == id)
+    {
+        b.status = status.to_string();
     }
 }
 
@@ -267,10 +268,10 @@ pub fn set_status(id: &str, status: &str) {
 /// the id isn't pinned. The REPL polls this on a throttle (see
 /// `repl::refresh_escalation_beats`) because the beat only moves every 30s.
 pub fn set_beat(id: &str, beat: Option<i64>) {
-    if let Ok(mut banners) = BANNERS.lock() {
-        if let Some(b) = banners.iter_mut().find(|b| b.id == id) {
-            b.beat = beat;
-        }
+    if let Ok(mut banners) = BANNERS.lock()
+        && let Some(b) = banners.iter_mut().find(|b| b.id == id)
+    {
+        b.beat = beat;
     }
 }
 
@@ -279,11 +280,11 @@ pub fn set_beat(id: &str, beat: Option<i64>) {
 /// first call wins, so the dwell measures from the real finish — and strictly
 /// id-scoped, so a worker finishing can never stamp another banner's verdict.
 pub fn note_terminal(id: &str, failed: bool) {
-    if let Ok(mut banners) = BANNERS.lock() {
-        if let Some(b) = banners.iter_mut().find(|b| b.id == id) {
-            b.failed = failed;
-            b.terminal_at.get_or_insert_with(Instant::now);
-        }
+    if let Ok(mut banners) = BANNERS.lock()
+        && let Some(b) = banners.iter_mut().find(|b| b.id == id)
+    {
+        b.failed = failed;
+        b.terminal_at.get_or_insert_with(Instant::now);
     }
 }
 
@@ -569,7 +570,7 @@ mod tests {
         );
         // Short id (not the full run id) keeps the row readable.
         assert!(
-            top.contains(&crate::batch::short_id("w_abcdef123456")),
+            top.contains(crate::batch::short_id("w_abcdef123456")),
             "{top}"
         );
         // Internal whitespace/newlines collapse so the hint can't wrap the footer.
@@ -713,10 +714,10 @@ mod tests {
         pin("w_done000000001", "done");
         note_terminal("w_done000000001", false);
         // Force the finished banner past its dwell without sleeping 45s.
-        if let Ok(mut banners) = BANNERS.lock() {
-            if let Some(b) = banners.iter_mut().find(|b| b.id == "w_done000000001") {
-                b.terminal_at = Some(Instant::now() - DWELL - Duration::from_secs(1));
-            }
+        if let Ok(mut banners) = BANNERS.lock()
+            && let Some(b) = banners.iter_mut().find(|b| b.id == "w_done000000001")
+        {
+            b.terminal_at = Some(Instant::now() - DWELL - Duration::from_secs(1));
         }
         sweep();
         assert_eq!(count(), 1, "only the dwelled-out banner retires");

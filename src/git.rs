@@ -44,6 +44,7 @@ pub(crate) fn is_git_repo(dir: &Path) -> bool {
 }
 
 /// The current HEAD commit sha of a repo/worktree, or `None` on error.
+#[allow(dead_code)] // part of the git probe set alongside toplevel/origin_url; no caller yet.
 pub(crate) fn git_head(dir: &Path) -> Option<String> {
     git_out(dir, &["rev-parse", "HEAD"])
 }

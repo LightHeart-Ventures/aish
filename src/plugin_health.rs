@@ -182,10 +182,11 @@ pub fn record(
 /// the same `kind` + `message` — so a persistently-broken config is logged once,
 /// not once per startup.
 pub fn record_unless_repeat(plugins_dir: &Path, id: &str, entry: &ErrorEntry) {
-    if let Some(last) = read_all(plugins_dir, id).last() {
-        if last.kind == entry.kind && last.message == entry.message {
-            return;
-        }
+    if let Some(last) = read_all(plugins_dir, id).last()
+        && last.kind == entry.kind
+        && last.message == entry.message
+    {
+        return;
     }
     let _ = append(plugins_dir, id, entry);
 }

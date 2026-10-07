@@ -144,10 +144,10 @@ impl KeyParser {
                 self.utf8.push(b);
                 self.utf8_need -= 1;
                 if self.utf8_need == 0 {
-                    if let Ok(s) = std::str::from_utf8(&self.utf8) {
-                        if let Some(c) = s.chars().next() {
-                            out.push(Key::Char(c));
-                        }
+                    if let Ok(s) = std::str::from_utf8(&self.utf8)
+                        && let Some(c) = s.chars().next()
+                    {
+                        out.push(Key::Char(c));
                     }
                     self.utf8.clear();
                 }

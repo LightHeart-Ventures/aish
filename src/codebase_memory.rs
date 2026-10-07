@@ -214,10 +214,10 @@ pub fn debug_echo_enabled(env: Option<&str>) -> bool {
 /// warnings are appended here instead of polluting stderr. Honours
 /// `$AISH_CODEBASE_LOG` (used by tests), else `~/.aish/codebase-memory.log`.
 pub fn handoff_log_path() -> PathBuf {
-    if let Ok(p) = std::env::var("AISH_CODEBASE_LOG") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
+    if let Ok(p) = std::env::var("AISH_CODEBASE_LOG")
+        && !p.is_empty()
+    {
+        return PathBuf::from(p);
     }
     aish_home().join("codebase-memory.log")
 }

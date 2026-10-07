@@ -108,15 +108,15 @@ pub fn render(text: &str, base: &str) -> String {
         // `# Header` → bold line (inline runs with bold in the base so an
         // embedded `code` span doesn't end the header style early)
         let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
-        if (1..=6).contains(&hashes) {
-            if let Some(title) = trimmed[hashes..].strip_prefix(' ') {
-                out.push(format!(
-                    "{indent}\x1b[1m{}\x1b[22m{base}",
-                    inline(title, &format!("{base}\x1b[1m"))
-                ));
-                i += 1;
-                continue;
-            }
+        if (1..=6).contains(&hashes)
+            && let Some(title) = trimmed[hashes..].strip_prefix(' ')
+        {
+            out.push(format!(
+                "{indent}\x1b[1m{}\x1b[22m{base}",
+                inline(title, &format!("{base}\x1b[1m"))
+            ));
+            i += 1;
+            continue;
         }
         // Unordered bullet: `- `, `* `, or `+ ` → a normalized `•` marker. (A
         // lone `*word*` stays italic — the bullet form requires the space.)
@@ -510,10 +510,10 @@ fn inline(s: &str, base: &str) -> String {
     let mut i = 0;
     while i < s.len() {
         let rest = &s[i..];
-        if rest.starts_with('`') {
-            if let Some(end) = rest[1..].find('`') {
+        if let Some(after) = rest.strip_prefix('`') {
+            if let Some(end) = after.find('`') {
                 out.push_str("\x1b[36m");
-                out.push_str(&rest[1..1 + end]);
+                out.push_str(&after[..end]);
                 out.push_str("\x1b[39m");
                 out.push_str(base);
                 i += end + 2;
@@ -526,32 +526,32 @@ fn inline(s: &str, base: &str) -> String {
                 i += consumed;
                 continue;
             }
-        } else if rest.starts_with("~~") {
-            if let Some(end) = rest[2..].find("~~") {
-                if end > 0 {
-                    out.push_str("\x1b[9m");
-                    out.push_str(&inline(&rest[2..2 + end], &format!("{base}\x1b[9m")));
-                    out.push_str("\x1b[29m");
-                    out.push_str(base);
-                    i += end + 4;
-                    continue;
-                }
+        } else if let Some(after) = rest.strip_prefix("~~") {
+            if let Some(end) = after.find("~~")
+                && end > 0
+            {
+                out.push_str("\x1b[9m");
+                out.push_str(&inline(&after[..end], &format!("{base}\x1b[9m")));
+                out.push_str("\x1b[29m");
+                out.push_str(base);
+                i += end + 4;
+                continue;
             }
-        } else if rest.starts_with("**") {
-            if let Some(end) = rest[2..].find("**") {
-                if end > 0 {
-                    out.push_str("\x1b[1m");
-                    out.push_str(&rest[2..2 + end]);
-                    out.push_str("\x1b[22m");
-                    out.push_str(base);
-                    i += end + 4;
-                    continue;
-                }
+        } else if let Some(after) = rest.strip_prefix("**") {
+            if let Some(end) = after.find("**")
+                && end > 0
+            {
+                out.push_str("\x1b[1m");
+                out.push_str(&after[..end]);
+                out.push_str("\x1b[22m");
+                out.push_str(base);
+                i += end + 4;
+                continue;
             }
-        } else if rest.starts_with('*') {
+        } else if let Some(after) = rest.strip_prefix('*') {
             // require non-space inner edges so `2 * 3` stays literal
-            if let Some(end) = rest[1..].find('*') {
-                let span = &rest[1..1 + end];
+            if let Some(end) = after.find('*') {
+                let span = &after[..end];
                 if !span.is_empty() && !span.starts_with(' ') && !span.ends_with(' ') {
                     out.push_str("\x1b[3m");
                     out.push_str(span);

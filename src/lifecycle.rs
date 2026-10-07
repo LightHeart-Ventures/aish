@@ -16,6 +16,7 @@
 //!   * every transition's `from`/`to` state exists,
 //!   * every transition names a real, non-empty event,
 //!   * no duplicate `(from, event)` edge (the machine stays deterministic).
+//!
 //! Illegal edges are then *rejected* — [`next`] returns `None` — and the whole
 //! table can print its own [`TransitionTable::diagram`] for `:workers`.
 //!

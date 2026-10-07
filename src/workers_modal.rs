@@ -326,10 +326,11 @@ fn read_key(state: &mut u8, queue: &mut VecDeque<Key>) -> Option<Key> {
         }
         // No complete key yet. A dangling ESC (state 1): poll briefly — if
         // nothing follows it's a real Escape, else loop to read the CSI tail.
-        if *state == 1 && !poll_readable(40) {
-            if let Some(k) = pending_esc_dismiss(state) {
-                return Some(k);
-            }
+        if *state == 1
+            && !poll_readable(40)
+            && let Some(k) = pending_esc_dismiss(state)
+        {
+            return Some(k);
         }
     }
 }

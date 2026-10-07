@@ -22,21 +22,21 @@
 //!
 //! Configuration (env vars):
 //!   * `WEBHOOK_BROKER_URL`    — broker WebSocket URL (`wss://…/ws`). REQUIRED to
-//!                               enable the service; unset ⇒ soft no-op. The
-//!                               register URL is derived from it
-//!                               (`wss://h/ws` → `https://h/clients/register`).
+//!     enable the service; unset ⇒ soft no-op. The
+//!     register URL is derived from it
+//!     (`wss://h/ws` → `https://h/clients/register`).
 //!   * `WEBHOOK_PLUGIN_ID`     — broker plugin id to register for (e.g.
-//!                               `hello-world`). REQUIRED alongside the URL;
-//!                               unset ⇒ warning + no-op.
+//!     `hello-world`). REQUIRED alongside the URL;
+//!     unset ⇒ warning + no-op.
 //!   * `WEBHOOK_TENANT_ID`     — tenant to register as (default `"default"`).
 //!   * `WEBHOOK_BROKER_SECRET` — optional shared secret sent as the register
-//!                               `secret`; the broker then requires an HMAC
-//!                               `X-Signature` on inbound webhooks.
+//!     `secret`; the broker then requires an HMAC
+//!     `X-Signature` on inbound webhooks.
 //!   * `WEBHOOK_CLIENT_ID`     — optional stable client id (generated if absent);
-//!                               sent as the register `session_id`.
+//!     sent as the register `session_id`.
 //!   * `AISH_PLUGINS_DIR`      — override the plugin directory scanned for handlers.
 //!   * `AISH_WEBHOOK_AUDIT_MAX` — per-plugin delivery-log retention (default
-//!                               1000; `0` disables persistence).
+//!     1000; `0` disables persistence).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -87,10 +87,10 @@ impl Default for WebhookStatus {
 /// last hop of "hello-world plugin received a broker webhook → SecondStatusLine".
 pub fn flash_sink_from_slot(slot: Arc<Mutex<Option<String>>>) -> FlashSink {
     Arc::new(move |stdout: String| {
-        if let Some(msg) = crate::plugin_dispatcher::nline_message(&stdout) {
-            if let Ok(mut s) = slot.lock() {
-                *s = Some(msg);
-            }
+        if let Some(msg) = crate::plugin_dispatcher::nline_message(&stdout)
+            && let Ok(mut s) = slot.lock()
+        {
+            *s = Some(msg);
         }
     })
 }

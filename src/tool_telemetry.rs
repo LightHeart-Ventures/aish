@@ -294,15 +294,13 @@ pub struct TelemetryCache {
 /// tool calls happened — exactly when the numbers wouldn't have changed anyway.
 pub fn aggregate_cached(session: &mut Session) -> Option<TelemetryCache> {
     // No store ⇒ nothing to aggregate.
-    if session.db.is_none() {
-        return None;
-    }
+    session.db.as_ref()?;
 
     // Fresh cache hit: serve the snapshot, no DB scan.
-    if let Some(c) = &session.tool_telemetry_cache {
-        if c.cached_at.elapsed() < session.tool_telemetry_cache_secs {
-            return Some(c.clone());
-        }
+    if let Some(c) = &session.tool_telemetry_cache
+        && c.cached_at.elapsed() < session.tool_telemetry_cache_secs
+    {
+        return Some(c.clone());
     }
 
     // Miss (empty, stale, or TTL=0): re-aggregate and repopulate the cache.
@@ -463,7 +461,7 @@ pub fn render_report(
             "TOOL", "ERROR CLASS", "RETRIES", "RECOVERED", "RATE"
         ));
         let mut retries: Vec<&RetryStat> = retries.iter().collect();
-        retries.sort_by(|a, b| b.retries.cmp(&a.retries));
+        retries.sort_by_key(|r| std::cmp::Reverse(r.retries));
         for r in retries {
             out.push_str(&format!(
                 "{:<24} {:<14} {:>7} {:>9} {:>5.0}%\n",

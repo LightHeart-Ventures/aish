@@ -327,14 +327,12 @@ fn drain_loop(mut file: File, path: PathBuf, rx: Receiver<String>, max_bytes: u6
         let _ = file.flush();
         bytes += batch.len() as u64;
         if bytes > max_bytes {
-            match compact(&path, max_bytes / 2) {
-                Some((f, n)) => {
-                    file = f;
-                    bytes = n;
-                }
-                // Compaction failed (disk full, permissions): keep appending
-                // rather than dropping activity, and retry on the next burst.
-                None => {}
+            // A compaction failure (disk full, permissions) returns `None` and
+            // leaves `file`/`bytes` untouched: keep appending rather than
+            // dropping activity, and retry on the next burst.
+            if let Some((f, n)) = compact(&path, max_bytes / 2) {
+                file = f;
+                bytes = n;
             }
         }
     }

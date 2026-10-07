@@ -266,12 +266,13 @@ impl RustylineEditor {
         #[cfg(unix)]
         {
             let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
-            if is_tty && background_pending() {
-                if let Some(outcome) = self.poll_until_wake_or_key(prompt) {
-                    return outcome;
-                }
-                // Raw-mode setup failed — fall through to the plain read.
+            if is_tty
+                && background_pending()
+                && let Some(outcome) = self.poll_until_wake_or_key(prompt)
+            {
+                return outcome;
             }
+            // Raw-mode setup failed — fall through to the plain read.
         }
         let res = self.rl.readline(prompt);
         self.outcome(res)

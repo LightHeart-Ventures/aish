@@ -15,7 +15,6 @@
 //! and a full persist→reload lifecycle.
 
 #[path = "../src/plugin_memory.rs"]
-#[allow(dead_code)]
 mod plugin_memory;
 
 use plugin_memory::{MemoryError, MemoryNamespace, PluginMemory};

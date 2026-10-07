@@ -896,7 +896,7 @@ mod tests {
         assert_eq!(parse_ceiling(Some("64"), COMPACT_MSG_CEILING), 64);
         // The default must sit well above the retained working set, or a normal
         // turn would compact on every single round.
-        assert!(COMPACT_MSG_CEILING > KEEP_RECENT_MSGS * 2);
+        const { assert!(COMPACT_MSG_CEILING > KEEP_RECENT_MSGS * 2) };
     }
 
     // ISS-409752: compaction must actually hand memory back, not just shift the

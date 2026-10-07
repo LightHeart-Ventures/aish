@@ -289,8 +289,7 @@ mod tests {
     #[test]
     fn register_launched_propagates_a_registrar_error() {
         let r = req("sess-abc", None);
-        let mut registrar =
-            |_: &SiblingRegistration| Err(io::Error::new(io::ErrorKind::Other, "db down"));
+        let mut registrar = |_: &SiblingRegistration| Err(io::Error::other("db down"));
         let err = register_launched(&r, "coord-xyz", 7, &mut registrar).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert!(err.to_string().contains("db down"));

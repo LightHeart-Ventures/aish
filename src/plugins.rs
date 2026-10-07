@@ -412,10 +412,10 @@ where
 
     // 2. Fill missing keys from schema defaults.
     for (k, prop) in schema_properties(&schema) {
-        if !config.contains_key(&k) {
-            if let Some(def) = prop.get("default") {
-                config.insert(k, def.clone());
-            }
+        if !config.contains_key(&k)
+            && let Some(def) = prop.get("default")
+        {
+            config.insert(k, def.clone());
         }
     }
 
@@ -533,14 +533,14 @@ pub(crate) fn validate_config(
         if v.is_null() {
             continue;
         }
-        if let Some(expected) = prop.get("type").and_then(|t| t.as_str()) {
-            if !json_type_matches(expected, v) {
-                return Err(ConfigError::TypeMismatch {
-                    key: k,
-                    expected: expected.to_string(),
-                    got: json_type_name(v).to_string(),
-                });
-            }
+        if let Some(expected) = prop.get("type").and_then(|t| t.as_str())
+            && !json_type_matches(expected, v)
+        {
+            return Err(ConfigError::TypeMismatch {
+                key: k,
+                expected: expected.to_string(),
+                got: json_type_name(v).to_string(),
+            });
         }
     }
     Ok(())
@@ -1089,27 +1089,27 @@ fn validate_at(path: &str, schema: &Value, instance: &Value, out: &mut Vec<Schem
     }
 
     // enum
-    if let Some(Value::Array(allowed)) = schema.get("enum") {
-        if !allowed.iter().any(|a| a == instance) {
-            push(
-                out,
-                path,
-                &format!(
-                    "value not in enum {}",
-                    compact(&Value::Array(allowed.clone()))
-                ),
-            );
-        }
+    if let Some(Value::Array(allowed)) = schema.get("enum")
+        && !allowed.iter().any(|a| a == instance)
+    {
+        push(
+            out,
+            path,
+            &format!(
+                "value not in enum {}",
+                compact(&Value::Array(allowed.clone()))
+            ),
+        );
     }
     // const
-    if let Some(expected) = schema.get("const") {
-        if expected != instance {
-            push(
-                out,
-                path,
-                &format!("value must equal const {}", compact(expected)),
-            );
-        }
+    if let Some(expected) = schema.get("const")
+        && expected != instance
+    {
+        push(
+            out,
+            path,
+            &format!("value must equal const {}", compact(expected)),
+        );
     }
 
     // type (string or array of strings)
@@ -1154,10 +1154,10 @@ fn validate_object(
     // required
     if let Some(Value::Array(req)) = schema.get("required") {
         for r in req {
-            if let Some(name) = r.as_str() {
-                if !map.contains_key(name) {
-                    push(out, path, &format!("missing required property `{name}`"));
-                }
+            if let Some(name) = r.as_str()
+                && !map.contains_key(name)
+            {
+                push(out, path, &format!("missing required property `{name}`"));
             }
         }
     }
@@ -1198,30 +1198,30 @@ fn validate_object(
 
 #[allow(dead_code)]
 fn validate_array(path: &str, schema: &Value, arr: &[Value], out: &mut Vec<SchemaViolation>) {
-    if let Some(min) = schema.get("minItems").and_then(|v| v.as_u64()) {
-        if (arr.len() as u64) < min {
-            push(
-                out,
-                path,
-                &format!("array has {} item(s), minItems is {min}", arr.len()),
-            );
-        }
+    if let Some(min) = schema.get("minItems").and_then(|v| v.as_u64())
+        && (arr.len() as u64) < min
+    {
+        push(
+            out,
+            path,
+            &format!("array has {} item(s), minItems is {min}", arr.len()),
+        );
     }
-    if let Some(max) = schema.get("maxItems").and_then(|v| v.as_u64()) {
-        if (arr.len() as u64) > max {
-            push(
-                out,
-                path,
-                &format!("array has {} item(s), maxItems is {max}", arr.len()),
-            );
-        }
+    if let Some(max) = schema.get("maxItems").and_then(|v| v.as_u64())
+        && (arr.len() as u64) > max
+    {
+        push(
+            out,
+            path,
+            &format!("array has {} item(s), maxItems is {max}", arr.len()),
+        );
     }
     // items: single schema applied to every element.
-    if let Some(items) = schema.get("items") {
-        if items.is_object() || items.is_boolean() {
-            for (i, v) in arr.iter().enumerate() {
-                validate_at(&child(path, &i.to_string()), items, v, out);
-            }
+    if let Some(items) = schema.get("items")
+        && (items.is_object() || items.is_boolean())
+    {
+        for (i, v) in arr.iter().enumerate() {
+            validate_at(&child(path, &i.to_string()), items, v, out);
         }
     }
 }
@@ -1229,23 +1229,23 @@ fn validate_array(path: &str, schema: &Value, arr: &[Value], out: &mut Vec<Schem
 #[allow(dead_code)]
 fn validate_string(path: &str, schema: &Value, s: &str, out: &mut Vec<SchemaViolation>) {
     let len = s.chars().count() as u64;
-    if let Some(min) = schema.get("minLength").and_then(|v| v.as_u64()) {
-        if len < min {
-            push(
-                out,
-                path,
-                &format!("string length {len} is below minLength {min}"),
-            );
-        }
+    if let Some(min) = schema.get("minLength").and_then(|v| v.as_u64())
+        && len < min
+    {
+        push(
+            out,
+            path,
+            &format!("string length {len} is below minLength {min}"),
+        );
     }
-    if let Some(max) = schema.get("maxLength").and_then(|v| v.as_u64()) {
-        if len > max {
-            push(
-                out,
-                path,
-                &format!("string length {len} exceeds maxLength {max}"),
-            );
-        }
+    if let Some(max) = schema.get("maxLength").and_then(|v| v.as_u64())
+        && len > max
+    {
+        push(
+            out,
+            path,
+            &format!("string length {len} exceeds maxLength {max}"),
+        );
     }
     if let Some(pat) = schema.get("pattern").and_then(|v| v.as_str()) {
         match regex::Regex::new(pat) {
@@ -1268,33 +1268,33 @@ fn validate_string(path: &str, schema: &Value, s: &str, out: &mut Vec<SchemaViol
 #[allow(dead_code)]
 fn validate_number(path: &str, schema: &Value, instance: &Value, out: &mut Vec<SchemaViolation>) {
     let Some(n) = instance.as_f64() else { return };
-    if let Some(min) = schema.get("minimum").and_then(|v| v.as_f64()) {
-        if n < min {
-            push(out, path, &format!("{n} is below minimum {min}"));
-        }
+    if let Some(min) = schema.get("minimum").and_then(|v| v.as_f64())
+        && n < min
+    {
+        push(out, path, &format!("{n} is below minimum {min}"));
     }
-    if let Some(max) = schema.get("maximum").and_then(|v| v.as_f64()) {
-        if n > max {
-            push(out, path, &format!("{n} exceeds maximum {max}"));
-        }
+    if let Some(max) = schema.get("maximum").and_then(|v| v.as_f64())
+        && n > max
+    {
+        push(out, path, &format!("{n} exceeds maximum {max}"));
     }
-    if let Some(exmin) = schema.get("exclusiveMinimum").and_then(|v| v.as_f64()) {
-        if n <= exmin {
-            push(
-                out,
-                path,
-                &format!("{n} must be > exclusiveMinimum {exmin}"),
-            );
-        }
+    if let Some(exmin) = schema.get("exclusiveMinimum").and_then(|v| v.as_f64())
+        && n <= exmin
+    {
+        push(
+            out,
+            path,
+            &format!("{n} must be > exclusiveMinimum {exmin}"),
+        );
     }
-    if let Some(exmax) = schema.get("exclusiveMaximum").and_then(|v| v.as_f64()) {
-        if n >= exmax {
-            push(
-                out,
-                path,
-                &format!("{n} must be < exclusiveMaximum {exmax}"),
-            );
-        }
+    if let Some(exmax) = schema.get("exclusiveMaximum").and_then(|v| v.as_f64())
+        && n >= exmax
+    {
+        push(
+            out,
+            path,
+            &format!("{n} must be < exclusiveMaximum {exmax}"),
+        );
     }
 }
 
@@ -1633,7 +1633,7 @@ fn run_lifecycle_hook(
 
 /// Human budget for warnings: whole seconds when ≥1s, else milliseconds.
 fn fmt_budget(d: std::time::Duration) -> String {
-    if d.as_millis() >= 1000 && d.as_millis() % 1000 == 0 {
+    if d.as_millis() >= 1000 && d.as_millis().is_multiple_of(1000) {
         format!("{}s", d.as_secs())
     } else {
         format!("{}ms", d.as_millis())
@@ -2705,7 +2705,7 @@ mod tests {
         assert_eq!(cfg["greeter"], "ada");
     }
 
-    /// A private, dependency-free temp dir (the crate doesn't pull in the
+    // A private, dependency-free temp dir (the crate doesn't pull in the
     // ---- Phase 0.5.4: lifecycle-hook env-injection tests ----
 
     /// Write an executable `<root>/<id>/hooks/<hook>.sh` with the given body.
@@ -3454,7 +3454,7 @@ mod tests {
         );
     }
 
-    /// A private, dependency-free temp dir (the crate doesn't pull in the
+    // A private, dependency-free temp dir (the crate doesn't pull in the
     /// `tempfile` crate for this module — mirror skills.rs's test helper).
     ///
     /// A per-process counter makes names unique even when parallel tests read

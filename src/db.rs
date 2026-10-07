@@ -169,12 +169,10 @@ impl Db {
         }
 
         // Test 2: Can we access critical tables (memories, history)?
-        let tables_ok = self
-            .conn
-            .execute_batch("SELECT 1 FROM memories LIMIT 1; SELECT 1 FROM history LIMIT 1;")
-            .is_ok();
 
-        tables_ok
+        self.conn
+            .execute_batch("SELECT 1 FROM memories LIMIT 1; SELECT 1 FROM history LIMIT 1;")
+            .is_ok()
     }
 
     /// Get database WAL checkpoint mode and current file sizes for diagnostics.
@@ -1232,6 +1230,9 @@ impl ActivityStore {
 
     /// The most-recent `limit` entries, newest first:
     /// `(id, ts, severity, short, detail, source)`.
+    // The tuple mirrors the SELECT column list 1:1; a named alias would add a
+    // layer of indirection between the SQL and the row without adding clarity.
+    #[allow(clippy::type_complexity)]
     pub fn recent(&self, limit: i64) -> Result<Vec<(i64, i64, String, String, String, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -1460,6 +1461,9 @@ impl AlertStore {
 
     /// Display rows for `:alert list` — `(id, state, kind_tag, condition,
     /// fired_short)`, newest first, excluding cancelled/done unless `include_all`.
+    // The tuple mirrors the SELECT column list 1:1; a named alias would add a
+    // layer of indirection between the SQL and the row without adding clarity.
+    #[allow(clippy::type_complexity)]
     pub fn list_alerts(
         &self,
         include_all: bool,

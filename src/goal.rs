@@ -595,11 +595,12 @@ pub(crate) fn live_descendant_runs(
     for _ in 0..=rows.len() {
         let mut grew = false;
         for r in rows {
-            if let Some(parent) = r.parent_run_id.as_deref() {
-                if family.contains(parent) && !family.contains(r.run_id.as_str()) {
-                    family.insert(r.run_id.as_str());
-                    grew = true;
-                }
+            if let Some(parent) = r.parent_run_id.as_deref()
+                && family.contains(parent)
+                && !family.contains(r.run_id.as_str())
+            {
+                family.insert(r.run_id.as_str());
+                grew = true;
             }
         }
         if !grew {
@@ -1759,7 +1760,7 @@ impl Goal {
         let mut out = format!("Goal: {}", truncate_ellipsis(&self.title, 72));
         let (done, total) = self.milestone_progress();
         if total > 0 {
-            let pct = done * 100 / total;
+            let pct = (done * 100).checked_div(total).unwrap_or(0);
             match self.milestones.iter().find(|m| !m.done) {
                 Some(current) => out.push_str(&format!(
                     " — current milestone: {} ({done}/{total} done, {pct}%)",

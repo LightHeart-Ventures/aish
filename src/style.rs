@@ -494,13 +494,13 @@ pub fn missed_heartbeats(age_secs: i64) -> u32 {
 /// Traffic-light classification for a worker's pulse: the glyph plus the colour
 /// that answers "is anyone home?" at a glance.
 ///   * `None` age          → dim `♡` — no beat on record yet (just launched, or
-///                            a pre-heartbeat row). Hollow heart = no claim.
+///     a pre-heartbeat row). Hollow heart = no claim.
 ///   * 0 missed            → GREEN `♥` — beat is current.
 ///   * 1 missed            → YELLOW `♥` — one window skipped; usually a long
-///                            tool call, worth watching but not yet alarming.
+///     tool call, worth watching but not yet alarming.
 ///   * 2+ missed           → RED `♥` — two or more windows skipped; the worker
-///                            is wedged, rate-limited, or dead.
-/// Pure, so the tiers are unit-testable without a clock or a TTY.
+///     is wedged, rate-limited, or dead.
+///     Pure, so the tiers are unit-testable without a clock or a TTY.
 pub fn heartbeat_tier(beat_age_secs: Option<i64>) -> (&'static str, Color) {
     match beat_age_secs.map(missed_heartbeats) {
         None => ("♡", Color::Dim),

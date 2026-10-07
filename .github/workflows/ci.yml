@@ -156,3 +156,53 @@ jobs:
       # directly.
       - name: Test webhook broker
         run: cargo test --manifest-path crates/aish-webhook-broker/Cargo.toml --locked -- --nocapture
+
+  # Clippy gate. Added with the sweep that took this repo from 264 warnings to
+  # 0 (`-D warnings`, `--all-targets`) — the debt accumulated precisely BECAUSE
+  # nothing gated it, so the cleanup is only durable if CI fails on regrowth.
+  #
+  # Flag set is deliberately identical to the `test` job's
+  # (`--no-default-features --locked`) so the lint surface matches the surface
+  # CI actually compiles: --no-default-features drops mistralrs-core/llama.cpp,
+  # and linting a build graph CI never builds would gate on code no test covers.
+  # `--all-targets` extends the gate to tests/benches/examples, where most of
+  # the original 264 lived.
+  clippy:
+    name: cargo clippy (-D warnings)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      # Same rationale as the `test` job: a CI job always builds cold, so
+      # incremental buys nothing and risks restoring fine-grained state across
+      # unrelated checkouts that share a Cargo.lock hash.
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup component add clippy
+
+      - name: Cache cargo + target
+        uses: useblacksmith/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Its OWN profile key. clippy --all-targets writes .rmeta artifacts the
+          # `test` job's target/ does not contain, and only ONE job may save a
+          # given key per run — sharing `-cargo-test-` would make these two jobs
+          # race, and the loser would restore a mismatched target/ and recompile
+          # from scratch for the life of that Cargo.lock (the exact failure
+          # documented on the `test` job above). Separate key, same restore-key
+          # ladder so a Cargo.lock bump degrades to a warm start instead of a
+          # cold one, with the bare tier recovering ~/.cargo/registry at worst.
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-clippy-
+            ${{ runner.os }}-cargo-
+
+      - name: Clippy
+        run: cargo clippy --all-targets --no-default-features --locked -- -D warnings

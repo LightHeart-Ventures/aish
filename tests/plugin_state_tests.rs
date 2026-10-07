@@ -9,7 +9,6 @@
 //!   cargo test --no-default-features --locked plugin_state
 
 #[path = "../src/plugin_state.rs"]
-#[allow(dead_code)]
 mod plugin_state;
 
 use plugin_state::PluginStateStore;

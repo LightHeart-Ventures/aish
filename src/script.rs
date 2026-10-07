@@ -265,10 +265,10 @@ async fn run_directly(
 
 /// Print a dim `[exit N]` note for a non-zero status, matching the REPL.
 fn report_nonzero(status: &std::process::ExitStatus) {
-    if let Some(code) = status.code() {
-        if code != 0 {
-            eprintln!("\x1b[2m[exit {code}]\x1b[0m");
-        }
+    if let Some(code) = status.code()
+        && code != 0
+    {
+        eprintln!("\x1b[2m[exit {code}]\x1b[0m");
     }
 }
 

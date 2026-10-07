@@ -78,11 +78,11 @@ impl Schedule {
 
 fn fmt_dur(d: Duration) -> String {
     let s = d.as_secs();
-    if s % 86400 == 0 && s >= 86400 {
+    if s.is_multiple_of(86400) && s >= 86400 {
         format!("{}d", s / 86400)
-    } else if s % 3600 == 0 && s >= 3600 {
+    } else if s.is_multiple_of(3600) && s >= 3600 {
         format!("{}h", s / 3600)
-    } else if s % 60 == 0 && s >= 60 {
+    } else if s.is_multiple_of(60) && s >= 60 {
         format!("{}m", s / 60)
     } else {
         format!("{s}s")
@@ -405,15 +405,15 @@ pub fn parse(input: &str) -> Result<(Schedule, String, SystemTime), String> {
 
     // Cron: first 5 tokens must be valid cron fields.
     let toks: Vec<&str> = s.split_whitespace().collect();
-    if toks.len() > 5 {
-        if let Some(cron) = Cron::parse(&toks[..5]) {
-            let task = toks[5..].join(" ");
-            if task.trim().is_empty() {
-                return Err("missing task after the cron expression".to_string());
-            }
-            let first = next_fire_after(&Schedule::Cron(cron.clone()), SystemTime::now());
-            return Ok((Schedule::Cron(cron), task, first));
+    if toks.len() > 5
+        && let Some(cron) = Cron::parse(&toks[..5])
+    {
+        let task = toks[5..].join(" ");
+        if task.trim().is_empty() {
+            return Err("missing task after the cron expression".to_string());
         }
+        let first = next_fire_after(&Schedule::Cron(cron.clone()), SystemTime::now());
+        return Ok((Schedule::Cron(cron), task, first));
     }
     Err("unrecognized schedule — use `in N minutes <task>`, `every N min <task>`, or a 5-field cron `M H DoM Mon DoW <task>`".to_string())
 }
@@ -584,10 +584,10 @@ fn next_fire_after(sched: &Schedule, after: SystemTime) -> SystemTime {
             let mut cand = (base / 60) * 60 + 60;
             let limit = cand + 366 * 24 * 60 * 60; // search up to ~1 year
             while cand < limit {
-                if let Some(tm) = broken_down(cand) {
-                    if c.matches(&tm) {
-                        return UNIX_EPOCH + Duration::from_secs(cand as u64);
-                    }
+                if let Some(tm) = broken_down(cand)
+                    && c.matches(&tm)
+                {
+                    return UNIX_EPOCH + Duration::from_secs(cand as u64);
                 }
                 cand += 60;
             }
