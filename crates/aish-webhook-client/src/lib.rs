@@ -62,8 +62,11 @@ pub mod register;
 pub mod service;
 pub mod transport;
 
-pub use audit::{AuditRecord, AuditSink, JsonlAuditSink, MemoryAuditSink, NoopAuditSink};
-pub use backoff::ExponentialBackoff;
+pub use audit::{
+    AuditObserver, AuditRecord, AuditSink, JsonlAuditSink, MemoryAuditSink, NoopAuditSink,
+    ObserverAuditSink,
+};
+pub use backoff::{ExponentialBackoff, DEFAULT_MAX_BACKOFF};
 pub use client::{BrokerClient, ConnState};
 pub use delivery::{DeliveryLog, DeliveryRecord, HandlerSummary, PlannedHandler};
 pub use dispatcher::{

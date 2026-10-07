@@ -280,9 +280,59 @@ impl AuditSink for MemoryAuditSink {
     }
 }
 
+/// Synchronous per-record observer for [`ObserverAuditSink`].
+pub type AuditObserver = std::sync::Arc<dyn Fn(&AuditRecord) + Send + Sync>;
+
+/// Wraps another sink and calls a synchronous observer on every record before
+/// delegating (TASK-274). Lets the host (aish) mirror handler failures into
+/// its own per-plugin errors log without implementing an async trait, while
+/// the inner sink (e.g. [`MemoryAuditSink`] behind `:webhook logs`) keeps
+/// working unchanged. The observer must be cheap and must not panic.
+pub struct ObserverAuditSink {
+    inner: std::sync::Arc<dyn AuditSink>,
+    observer: AuditObserver,
+}
+
+impl ObserverAuditSink {
+    pub fn new(inner: std::sync::Arc<dyn AuditSink>, observer: AuditObserver) -> Self {
+        Self { inner, observer }
+    }
+}
+
+#[async_trait::async_trait]
+impl AuditSink for ObserverAuditSink {
+    async fn record(&self, rec: &AuditRecord) -> Result<()> {
+        (self.observer)(rec);
+        self.inner.record(rec).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TASK-274: the observer sees each record and the inner sink still stores it.
+    #[tokio::test]
+    async fn observer_sink_observes_then_delegates() {
+        let inner = std::sync::Arc::new(MemoryAuditSink::new());
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen2 = seen.clone();
+        let sink = ObserverAuditSink::new(
+            inner.clone(),
+            std::sync::Arc::new(move |r: &AuditRecord| {
+                seen2.lock().unwrap().push(r.plugin_id.clone());
+            }),
+        );
+        sink.record(&AuditRecord::from_outcome(
+            "d1",
+            "t",
+            &outcome("gh", true, false),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec!["gh".to_string()]);
+        assert_eq!(inner.len(), 1);
+    }
 
     fn outcome(plugin: &str, executed: bool, success: bool) -> HandlerOutcome {
         HandlerOutcome {
