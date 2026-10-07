@@ -61,17 +61,23 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          # This key is the TEST-profile cache, shared intentionally with
-          # ci-testbox.yml (same `cargo test --no-default-features` graph).
-          # Do NOT let a release-profile job share it — repl-smoke.yml used to,
-          # and the save race meant one of the two always restored the wrong
-          # profile's target/ and rebuilt from scratch. It now keys on
-          # `<os>-cargo-release-`.
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # One key per cargo PROFILE. This is the TEST-profile cache, shared
+          # intentionally with ci-testbox.yml (same `cargo test
+          # --no-default-features` graph). repl-smoke.yml builds --release and
+          # used to share the bare `<os>-cargo-<lock>` key; only one job can
+          # save a key per run, so the loser restored ~262 MB of the wrong
+          # profile's target/ and recompiled from scratch every time. Worse,
+          # the winner's entry is immutable for the life of that Cargo.lock,
+          # so the loser could never recover — observed on run 37628855874:
+          # restore HIT, then `Finished test profile in 1m56s` (a full
+          # rebuild) and "not saving cache" because the key was already taken.
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           # Without restore-keys, ANY Cargo.lock edit is a total miss and a
-          # from-scratch compile. The prefix falls back to the newest cache
-          # for this OS, so a dep bump reuses every unchanged artifact.
+          # from-scratch compile. Same-profile prefix first; the bare tier is a
+          # last resort that still recovers the profile-independent
+          # ~/.cargo/registry + git dirs even from another profile's entry.
           restore-keys: |
+            ${{ runner.os }}-cargo-test-
             ${{ runner.os }}-cargo-
 
       # --no-default-features drops the in-process local model (mistralrs /
