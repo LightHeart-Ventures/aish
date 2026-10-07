@@ -1034,6 +1034,22 @@ clamped {clamped} tool result(s), retrying\x1b[0m"
             // recovered. Best-effort — never sinks the turn. See tool_telemetry.
             crate::tool_telemetry::record(session, &call.name, &result);
             emit_activity_stream(session, &result);
+            // Mid-round status-line refresh (background coordinator only —
+            // `None` for an interactive session). Note the completed call, then
+            // offer a refresh point; the tracker's own throttle
+            // (`activity_summary::should_refresh`) decides whether this one
+            // actually spends a haiku call, so the common case is pure
+            // bookkeeping with no await-visible work.
+            //
+            // This hook is why the feature works at all: a coordinator does its
+            // whole job in ONE round of 20-44 tool calls over several minutes,
+            // so the end-of-round refresh in `coordinator::drive` fires once, at
+            // termination. Without a mid-round signal every surface shows the
+            // startup summary — "starting up" — for the worker's entire life.
+            if let Some(t) = session.activity.as_mut() {
+                t.note_tool_call(&desc, result.is_error);
+                t.maybe_refresh().await;
+            }
             // Observe hooks: PostToolUse (always) + PostToolUseFailure (on error).
             // Carry the tool name, program/path, and the error flag so an audit
             // sink sees the outcome of every call. Zero-cost when unconfigured.

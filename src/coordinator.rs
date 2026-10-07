@@ -1054,11 +1054,16 @@ plus `git status` instead — do not fail the run over it.\n\n{PHASE0_GUARD}\n\n
     // per round is pure overhead. `None` (no Claude credential, e.g. an offline or
     // non-Claude run) disables summaries entirely and every surface falls back to
     // the task brief exactly as before — this is cosmetic, never load-bearing.
-    let summarizer = crate::activity_summary::lightweight_backend(session);
-    if let (Some(s), Some(sb)) = (store, summarizer.as_ref())
-        && let Some(sum) = crate::activity_summary::summarize(sb, &input, None).await
-    {
-        let _ = s.set_activity_summary(run_id, &sum);
+    // The tracker owns the lightweight backend AND the store handle, so it is
+    // the single writer for all three refresh points (startup here, mid-round
+    // from `engine::run_turn`, round boundary below) — one client, one code
+    // path, one place the durable row is stamped. Attached onto the session so
+    // the engine can reach it from inside the tool loop.
+    let tracker = store
+        .and_then(|s| crate::activity_summary::ActivityTracker::attach(session, s, run_id, &input));
+    session.activity = tracker;
+    if let Some(t) = session.activity.as_mut() {
+        t.refresh_startup().await;
     }
 
     loop {
@@ -1335,10 +1340,8 @@ final status plus your best partial result. After this turn you are terminated."
         // so that round's summary must land even though the round ended badly.
         // Failure is swallowed — a summarizer hiccup leaves the prior summary in
         // place and the run proceeds untouched.
-        if let (Some(s), Some(sb)) = (store, summarizer.as_ref())
-            && let Some(sum) = crate::activity_summary::summarize(sb, &input, Some(&answer)).await
-        {
-            let _ = s.set_activity_summary(run_id, &sum);
+        if let Some(t) = session.activity.as_mut() {
+            t.refresh_round(rounds as u64, &answer).await;
         }
 
         // ── Worker-exit evaluation: did this round's turn end abnormally? The

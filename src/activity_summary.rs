@@ -13,9 +13,28 @@
 //! points in a worker's life where the answer changes:
 //!
 //! 1. **on worker start** — from the task brief, so the row is meaningful before
-//!    the first round even finishes; and
-//! 2. **at the end of every round** — from that round's synthesis, so the row
+//!    the first round even finishes;
+//! 2. **mid-round, from the live tool-call stream** ([`ActivityTracker`]),
+//!    throttled to [`MIDROUND_INTERVAL`]; and
+//! 3. **at the end of every round** — from that round's synthesis, so the row
 //!    tracks the work instead of freezing at the assignment.
+//!
+//! ## Why mid-round is the load-bearing one
+//!
+//! Points 1 and 3 alone are nearly useless in practice, and the reason is
+//! visible in the run table: a coordinator does its ENTIRE job in **one round**.
+//! Observed on live runs — `turns = 1` with 20–44 tool calls spanning 3–8
+//! minutes of wall clock. With refreshes only at round boundaries, the end-of-
+//! round refresh therefore fires exactly ONCE, as the run terminates, and for
+//! the whole visible lifetime of the worker every surface shows the STARTUP
+//! summary. When the brief is short enough that the startup pass can't name
+//! anything concrete it emits the [`STARTUP_FALLBACK`] sentinel, which then
+//! sticks — producing the reported symptom: a worker burning tool calls for
+//! minutes while `:workers` and the escalation banner both read
+//! `running · starting up`.
+//!
+//! [`ActivityTracker`] closes that gap by refreshing from the tool calls as they
+//! complete, so the row tracks work at ~30s granularity INSIDE a round.
 //!
 //! The result is persisted on the run row (`coordinator_runs.activity_summary`)
 //! and preferred over `task` by both consuming surfaces.
@@ -272,6 +291,179 @@ pub async fn summarize(backend: &Backend, task: &str, recent: Option<&str>) -> O
     sanitize(&turn.text, budget)
 }
 
+// ── Mid-round tracker ───────────────────────────────────────────────────────
+//
+// See the "Why mid-round is the load-bearing one" note at the top of the module:
+// rounds are long and there is usually only ONE, so a round-boundary-only
+// refresh leaves the row frozen at the startup summary for the worker's entire
+// visible life. This tracker refreshes from the tool-call stream instead.
+
+/// Minimum wall-clock spacing between mid-round refreshes. Each refresh is one
+/// haiku call, so this is the cost knob: a 10-minute round refreshes ~20 times
+/// (fractions of a cent) while still moving the row faster than an operator
+/// can get impatient with it.
+pub const MIDROUND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Minimum NEW tool calls since the last refresh before another is allowed.
+/// Guards the degenerate case of a round that sits in ONE very long tool call
+/// (a 20-minute `cargo build`): re-summarizing the same unchanged digest every
+/// 30s would spend tokens to rewrite the identical line.
+pub const MIDROUND_MIN_CALLS: usize = 2;
+
+/// How many recent tool-call descriptions to carry into the digest. Enough to
+/// show a direction of travel (read → edit → test) without turning the prompt
+/// into a transcript.
+pub const RECENT_CALLS: usize = 6;
+
+/// Whether a mid-round refresh is due. Pure, so the throttle is unit-testable
+/// without a clock or a backend.
+pub fn should_refresh(since_last: std::time::Duration, new_calls: usize) -> bool {
+    new_calls >= MIDROUND_MIN_CALLS && since_last >= MIDROUND_INTERVAL
+}
+
+/// Strip the leading display glyph (`🛠️ `/`🔧 `/`🤝 `) off an `engine` tool
+/// description, leaving the text a language model should actually read. Pure.
+///
+/// Drops leading characters until the first printable ASCII one, so it degrades
+/// safely if the glyph set ever changes and keeps a leading `./` or `../` on a
+/// path; a desc with no glyph is untouched.
+pub fn strip_glyph(desc: &str) -> &str {
+    match desc.find(|c: char| c.is_ascii_graphic()) {
+        Some(i) => &desc[i..],
+        None => desc.trim(),
+    }
+}
+
+/// Render the mid-round tool-call digest the summarizer reads. Pure +
+/// deterministic so the prompt shape is unit-testable.
+pub fn digest(recent: &[String], total_calls: usize, round: u64) -> String {
+    let mut d = String::with_capacity(RECENT_CALLS * 72 + 160);
+    d.push_str(&format!(
+        "The worker is MID-ROUND (round {round}, {total_calls} tool calls completed so far). \
+It has NOT finished. Its most recent tool calls, oldest first:\n"
+    ));
+    for r in recent {
+        d.push_str("- ");
+        d.push_str(r);
+        d.push('\n');
+    }
+    d
+}
+
+/// Live mid-round summary refresher for a background coordinator run.
+///
+/// Attached to the [`Session`] by `coordinator::drive` (so it is `Some` only for
+/// a headless `--coordinator` run, exactly like `turn_audit` and
+/// `worker_transcript`) and driven by `engine::run_turn`, which notes every
+/// completed tool call and offers a throttled refresh point.
+///
+/// Owns the lightweight backend and the store handle, so it is also the single
+/// writer for the startup and round-boundary refreshes — one code path, one
+/// client, one place where the durable row is stamped.
+pub struct ActivityTracker {
+    backend: Backend,
+    store: crate::coordinator_store::CoordinatorStore,
+    run_id: String,
+    /// The durable assignment, pre-clipped for prompt grounding.
+    task: String,
+    /// Rolling window of the last [`RECENT_CALLS`] tool-call descriptions.
+    recent: std::collections::VecDeque<String>,
+    total_calls: usize,
+    calls_since_refresh: usize,
+    last_refresh: std::time::Instant,
+    round: u64,
+}
+
+impl ActivityTracker {
+    /// Build a tracker, or `None` when no Claude credential resolves (an
+    /// offline / non-Claude run simply has no summaries and every surface falls
+    /// back to the task brief, exactly as before — this is cosmetic, never
+    /// load-bearing).
+    pub fn attach(
+        session: &Session,
+        store: &crate::coordinator_store::CoordinatorStore,
+        run_id: &str,
+        task: &str,
+    ) -> Option<Self> {
+        Some(Self {
+            backend: lightweight_backend(session)?,
+            store: store.clone(),
+            run_id: run_id.to_string(),
+            task: clip_chars(task.trim(), TASK_CONTEXT_MAX),
+            recent: std::collections::VecDeque::with_capacity(RECENT_CALLS),
+            total_calls: 0,
+            calls_since_refresh: 0,
+            last_refresh: std::time::Instant::now(),
+            round: 1,
+        })
+    }
+
+    /// Record a COMPLETED tool call. Cheap and synchronous — pure bookkeeping,
+    /// no I/O, no await — so it is safe to call on every call in the hot loop.
+    ///
+    /// `desc` is `engine`'s display description (glyph included); the glyph is
+    /// stripped here so the prompt carries text rather than decoration.
+    pub fn note_tool_call(&mut self, desc: &str, is_error: bool) {
+        let line = if is_error {
+            format!("failed: {}", strip_glyph(desc))
+        } else {
+            strip_glyph(desc).to_string()
+        };
+        if self.recent.len() == RECENT_CALLS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(clip_chars(&line, 120));
+        self.total_calls = self.total_calls.saturating_add(1);
+        self.calls_since_refresh = self.calls_since_refresh.saturating_add(1);
+    }
+
+    /// Refresh the durable summary from the tool-call stream IF the throttle
+    /// allows it. Returns the new summary when one was written.
+    ///
+    /// Best-effort throughout: a summarizer error leaves the previous summary
+    /// in place and the worker's real work proceeds untouched. The throttle
+    /// counters are reset on an ATTEMPT, not on success — a persistently failing
+    /// summarizer must not turn into a per-tool-call retry storm.
+    pub async fn maybe_refresh(&mut self) -> Option<String> {
+        if !should_refresh(self.last_refresh.elapsed(), self.calls_since_refresh) {
+            return None;
+        }
+        self.last_refresh = std::time::Instant::now();
+        self.calls_since_refresh = 0;
+        let recent: Vec<String> = self.recent.iter().cloned().collect();
+        let d = digest(&recent, self.total_calls, self.round);
+        self.write(summarize(&self.backend, &self.task, Some(&d)).await?)
+    }
+
+    /// Seed the summary from the task brief alone, before the first round runs,
+    /// so the row is meaningful from the moment the worker appears.
+    pub async fn refresh_startup(&mut self) -> Option<String> {
+        self.last_refresh = std::time::Instant::now();
+        self.calls_since_refresh = 0;
+        let task = self.task.clone();
+        self.write(summarize(&self.backend, &task, None).await?)
+    }
+
+    /// Refresh from a finished round's synthesis — the model's own narrative of
+    /// what it just completed, the single best signal available at a boundary.
+    /// Also rolls the round counter and clears the tool-call window so the next
+    /// round's digest doesn't describe the previous round's work.
+    pub async fn refresh_round(&mut self, round: u64, synthesis: &str) -> Option<String> {
+        self.last_refresh = std::time::Instant::now();
+        self.calls_since_refresh = 0;
+        self.recent.clear();
+        self.round = round.saturating_add(1);
+        let task = self.task.clone();
+        self.write(summarize(&self.backend, &task, Some(synthesis)).await?)
+    }
+
+    /// Stamp the durable row. Best-effort — a store write error is swallowed.
+    fn write(&self, sum: String) -> Option<String> {
+        let _ = self.store.set_activity_summary(&self.run_id, &sum);
+        Some(sum)
+    }
+}
+
 // ── Parent-side read path ────────────────────────────────────────────────────
 //
 // A worker's summary is written by its coordinator SUBPROCESS, so the parent's
@@ -286,8 +478,9 @@ pub async fn summarize(backend: &Backend, task: &str, recent: Option<&str>) -> O
 // all) with one implementation, and it keeps a store handle out of `worker.rs`.
 
 /// Minimum spacing between durable-store polls for the SAME run id. A summary
-/// only changes at a round boundary (tens of seconds at best), so a 2s floor is
-/// invisible to the operator and makes the repaint path effectively free.
+/// changes at most once per [`MIDROUND_INTERVAL`] (tens of seconds), so a 2s
+/// floor is invisible to the operator and makes the repaint path effectively
+/// free.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 type SummaryCache =
@@ -327,6 +520,116 @@ pub fn forget_cached(run_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Mid-round tracker ───────────────────────────────────────────────────
+    //
+    // The bug these cover: a coordinator does its whole job in ONE round, so a
+    // round-boundary-only refresh fires once (at termination) and every surface
+    // shows "starting up" for the worker's entire visible life.
+
+    #[test]
+    fn throttle_needs_both_time_and_new_calls() {
+        use std::time::Duration;
+        // Both conditions met -> refresh.
+        assert!(should_refresh(MIDROUND_INTERVAL, MIDROUND_MIN_CALLS));
+        assert!(should_refresh(Duration::from_secs(600), 40));
+        // Enough calls but too soon: a burst of fast reads must not spend a
+        // haiku call per read.
+        assert!(!should_refresh(
+            MIDROUND_INTERVAL - Duration::from_millis(1),
+            99
+        ));
+        // Enough time but no new work: a round parked in ONE 20-minute
+        // `cargo build` must not re-summarize an unchanged digest every 30s.
+        assert!(!should_refresh(Duration::from_secs(3600), 0));
+        assert!(!should_refresh(
+            Duration::from_secs(3600),
+            MIDROUND_MIN_CALLS - 1
+        ));
+        // Nothing has happened at all.
+        assert!(!should_refresh(Duration::ZERO, 0));
+    }
+
+    #[test]
+    fn throttle_fires_well_inside_an_observed_round() {
+        // Live symptom runs: 3m07s and 5m25s, both still on round 1. At one
+        // refresh per MIDROUND_INTERVAL the row moves many times over the span
+        // where it previously never moved once.
+        let span = std::time::Duration::from_secs(187); // 3m07s
+        let refreshes = span.as_secs() / MIDROUND_INTERVAL.as_secs();
+        assert!(
+            refreshes >= 6,
+            "expected the row to move repeatedly inside a single round, got {refreshes}"
+        );
+    }
+
+    #[test]
+    fn strip_glyph_drops_decoration_not_text() {
+        // `engine`'s own description prefixes, which carry no meaning for a
+        // language model but do eat prompt budget.
+        assert_eq!(
+            strip_glyph("🛠️ run_program cargo test"),
+            "run_program cargo test"
+        );
+        assert_eq!(
+            strip_glyph("🔧 read_file src/lib.rs"),
+            "read_file src/lib.rs"
+        );
+        assert_eq!(strip_glyph("🤝 tell w_abc"), "tell w_abc");
+        // Already clean -> untouched.
+        assert_eq!(strip_glyph("grep_files foo"), "grep_files foo");
+        // Degenerate inputs must not panic or slice mid-codepoint.
+        assert_eq!(strip_glyph(""), "");
+        assert_eq!(strip_glyph("🛠️"), "🛠️");
+        assert_eq!(strip_glyph("  🛠️  x"), "x");
+        // Leading ASCII punctuation is text, not decoration: a relative path
+        // must survive intact.
+        assert_eq!(
+            strip_glyph("🛠️ ./scripts/build.sh --release"),
+            "./scripts/build.sh --release"
+        );
+    }
+
+    #[test]
+    fn digest_states_the_round_is_unfinished() {
+        let recent = vec![
+            "read_file src/engine.rs".to_string(),
+            "failed: run_program cargo build".to_string(),
+        ];
+        let d = digest(&recent, 17, 3);
+        // Grounding: the summarizer must not narrate this as a finished result.
+        assert!(d.contains("MID-ROUND"), "{d}");
+        assert!(d.contains("has NOT finished"), "{d}");
+        // Progress signal the old round-boundary-only path could never supply.
+        assert!(d.contains("round 3"), "{d}");
+        assert!(d.contains("17 tool calls"), "{d}");
+        // Every recent call is present, and a failure is marked as such.
+        assert!(d.contains("read_file src/engine.rs"), "{d}");
+        assert!(d.contains("failed: run_program cargo build"), "{d}");
+    }
+
+    #[test]
+    fn digest_survives_an_empty_window() {
+        // First refresh of a round after `refresh_round` cleared the window.
+        let d = digest(&[], 0, 1);
+        assert!(d.contains("round 1"), "{d}");
+        assert!(!d.is_empty());
+    }
+
+    #[test]
+    fn digest_is_a_plausible_prompt_payload() {
+        // The digest goes through `build_prompt`, which clips the recent-turn
+        // slot; a full window must stay comfortably inside that budget so no
+        // call is silently truncated away.
+        let recent: Vec<String> = (0..RECENT_CALLS)
+            .map(|i| format!("run_program cargo test --package aish-{i}"))
+            .collect();
+        let d = digest(&recent, 44, 1);
+        assert!(d.len() < RECENT_CONTEXT_MAX, "digest {} chars", d.len());
+        for r in &recent {
+            assert!(d.contains(r.as_str()), "dropped {r}");
+        }
+    }
 
     #[test]
     fn budget_is_derived_from_the_narrowest_surface() {
