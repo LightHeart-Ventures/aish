@@ -1,0 +1,22 @@
+{
+  "action": "opened",
+  "issue": {
+    "id": 1347,
+    "number": 1347,
+    "title": "Widget registry panics on empty config",
+    "user": { "login": "octocat", "id": 1, "type": "User" },
+    "labels": [
+      { "id": 208045946, "name": "bug", "color": "f29513" },
+      { "id": 208045947, "name": "registry", "color": "0e8a16" }
+    ],
+    "state": "open",
+    "locked": false,
+    "assignees": [],
+    "comments": 0,
+    "created_at": "2026-10-01T12:20:00Z",
+    "body": "Steps to reproduce: run with an empty widgets.toml.",
+    "html_url": "https://github.com/acme/widgets/issues/1347"
+  },
+  "repository": { "id": 1296269, "name": "widgets", "full_name": "acme/widgets" },
+  "sender": { "login": "octocat", "id": 1, "type": "User" }
+}

@@ -1,0 +1,26 @@
+{
+  "action": "opened",
+  "number": 42,
+  "pull_request": {
+    "id": 279147437,
+    "number": 42,
+    "state": "open",
+    "title": "Add widget",
+    "user": { "login": "octocat", "id": 1, "type": "User" },
+    "body": "Adds the widget registry.",
+    "draft": false,
+    "html_url": "https://github.com/acme/widgets/pull/42",
+    "head": {
+      "label": "acme:feat/widget",
+      "ref": "feat/widget",
+      "sha": "ec26c3e57ca3a959ca5aad62de7213c562f8c821"
+    },
+    "base": {
+      "label": "acme:main",
+      "ref": "main",
+      "sha": "6113728f27ae82c7b1a177c8d03f9e96e0adf246"
+    }
+  },
+  "repository": { "id": 1296269, "name": "widgets", "full_name": "acme/widgets" },
+  "sender": { "login": "octocat", "id": 1, "type": "User" }
+}
