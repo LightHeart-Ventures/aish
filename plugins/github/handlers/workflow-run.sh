@@ -118,8 +118,14 @@ Do NOT push to the default branch. Report the fix and the resulting commit/PR."
 
             # Detach: setsid + background + closed stdin so the worker outlives
             # this short-lived handler and never blocks the dispatcher timeout.
-            setsid aish --coordinator --run-id "$run_id" -c "$task" \
-                >"$log" 2>&1 </dev/null &
+            # macOS has no setsid(1) — fall back to nohup there (TASK-373).
+            if command -v setsid >/dev/null 2>&1; then
+                setsid aish --coordinator --run-id "$run_id" -c "$task" \
+                    >"$log" 2>&1 </dev/null &
+            else
+                nohup aish --coordinator --run-id "$run_id" -c "$task" \
+                    >"$log" 2>&1 </dev/null &
+            fi
             disown 2>/dev/null || true
             echo "[github/ci] auto-fix worker dispatched: run-id=${run_id} log=${log}" >&2
         fi

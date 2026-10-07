@@ -71,7 +71,7 @@ Properties:
 |---------------|----------|
 | **Opt-out**   | set `GITHUB_CI_AUTOFIX=0` in the handler env to disable (default: enabled) |
 | **PR-scoped** | only fires when the payload has `workflow_run.pull_requests[]` or a real `head_branch` |
-| **Non-blocking** | worker is `setsid`-detached with closed stdin, so the handler returns well inside its dispatcher timeout |
+| **Non-blocking** | worker is `setsid`-detached (falls back to `nohup` where `setsid` is absent, e.g. macOS) with closed stdin, so the handler returns well inside its dispatcher timeout |
 | **Idempotent** | a per-run marker (`$TMPDIR/aish-ci-autofix-<run_id>.marker`) dedupes webhook redeliveries — one failed run spawns at most one worker |
 | **Best-effort** | dispatch failures never change the handler's exit code, which keeps signalling the raw CI conclusion to the audit sink |
 

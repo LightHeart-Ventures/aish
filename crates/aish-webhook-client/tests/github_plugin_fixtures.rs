@@ -46,10 +46,15 @@ fn fixture(name: &str) -> serde_json::Value {
 }
 
 /// A private, dependency-free temp dir.
+/// A process-wide counter makes names unique even when parallel tests read the
+/// same clock tick (macOS timestamps are only microsecond-granular).
 fn tempdir(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
     let p = std::env::temp_dir().join(format!(
-        "aish-gh-fixtures-{tag}-{}-{}",
+        "aish-gh-fixtures-{tag}-{}-{}-{}",
         std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -275,31 +280,72 @@ impl ReviewSandbox {
         }
     }
 
+    /// Like [`ReviewSandbox::new`], but `PATH` is ONLY the sandbox bin dir,
+    /// populated with symlinks to the tools the handlers need — deliberately
+    /// excluding `setsid`, to emulate macOS (which has no setsid(1)).
+    fn without_setsid(tag: &str) -> Self {
+        let mut sb = Self::new(tag);
+        let bin = sb.dir.join("bin");
+        let host_path = std::env::var("PATH").unwrap_or_default();
+        for tool in [
+            "bash", "python3", "cat", "mktemp", "rm", "date", "nohup", "tr", "printf",
+        ] {
+            if let Some(src) = std::env::split_paths(&host_path)
+                .map(|d| d.join(tool))
+                .find(|p| p.is_file())
+            {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&src, bin.join(tool)).unwrap();
+            }
+        }
+        sb.path_env = bin.display().to_string();
+        assert!(
+            !bin.join("setsid").exists(),
+            "sandbox PATH must not have setsid"
+        );
+        sb
+    }
+
     /// Run pr-review.sh on `payload`; `flag` = value of GITHUB_PR_AUTOREVIEW.
     fn run(&self, payload: &serde_json::Value, flag: Option<&str>) -> std::process::Output {
+        let envs: Vec<(&str, &str)> = flag
+            .map(|v| vec![("GITHUB_PR_AUTOREVIEW", v)])
+            .unwrap_or_default();
+        let out = self.exec("pr-review.sh", payload, &envs);
+        assert!(out.status.success(), "pr-review.sh exit 0: {out:?}");
+        out
+    }
+
+    /// Run `handlers/<script>` on `payload` with extra `envs`. Both opt-in /
+    /// opt-out flags are cleared first so the host env never leaks in.
+    fn exec(
+        &self,
+        script: &str,
+        payload: &serde_json::Value,
+        envs: &[(&str, &str)],
+    ) -> std::process::Output {
         use std::io::Write;
-        let mut cmd = Command::new(github_plugin_dir().join("handlers").join("pr-review.sh"));
+        let mut cmd = Command::new(github_plugin_dir().join("handlers").join(script));
         cmd.env("PATH", &self.path_env)
             .env("TMPDIR", &self.dir)
             .env("AISH_STUB_CALLS", &self.calls)
             .env("WEBHOOK_TENANT_ID", "t_fixture")
             .env_remove("GITHUB_PR_AUTOREVIEW")
+            .env_remove("GITHUB_CI_AUTOFIX")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(v) = flag {
-            cmd.env("GITHUB_PR_AUTOREVIEW", v);
+        for (k, v) in envs {
+            cmd.env(k, v);
         }
-        let mut child = cmd.spawn().expect("spawn pr-review.sh");
+        let mut child = cmd.spawn().expect("spawn handler");
         child
             .stdin
             .take()
             .unwrap()
             .write_all(payload.to_string().as_bytes())
             .unwrap();
-        let out = child.wait_with_output().unwrap();
-        assert!(out.status.success(), "pr-review.sh exit 0: {out:?}");
-        out
+        child.wait_with_output().unwrap()
     }
 
     /// Lines recorded by the stub, waiting up to `wait` for at least `want`.
@@ -378,5 +424,73 @@ fn pr_autoreview_skips_drafts_and_other_actions() {
     let mut closed = fixture("pull_request-opened.json");
     closed["action"] = "closed".into();
     sb.run(&closed, Some("1"));
+    assert!(sb.calls(1, Duration::from_millis(500)).is_empty());
+}
+
+/// Regression: `setsid` absent from PATH (macOS) must not stop the opt-in PR
+/// review agent from launching — the nohup fallback is used instead.
+#[test]
+fn pr_autoreview_dispatches_without_setsid() {
+    let sb = ReviewSandbox::without_setsid("ar-nosetsid");
+    let out = sb.run(&fixture("pull_request-opened.json"), Some("1"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("review agent dispatched"),
+        "{out:?}"
+    );
+    let calls = sb.calls(1, Duration::from_secs(5));
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(calls[0].starts_with("--coordinator --run-id pr-review-42-"));
+}
+
+// ---------------------------------------------------------------------------
+// CI auto-fix worker (workflow-run.sh, GITHUB_CI_AUTOFIX — default on)
+// ---------------------------------------------------------------------------
+
+/// Regression (TASK-373 gap): workflow-run.sh used to call `setsid`
+/// unconditionally, so on macOS the fix-ci worker never launched. With setsid
+/// absent from PATH the worker must still be dispatched (via nohup), once per
+/// failed run.
+#[test]
+fn ci_autofix_dispatches_without_setsid() {
+    let sb = ReviewSandbox::without_setsid("ci-nosetsid");
+    let run = fixture("workflow_run-failure.json");
+    let out = sb.exec("workflow-run.sh", &run, &[]);
+    // Exit 1 signals the bad CI conclusion; dispatch must not change it.
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with(
+            "[github/ci] \u{2717} acme/widgets 'CI' run#562 (feat/widget) completed/failure"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("auto-fix worker dispatched"),
+        "{out:?}"
+    );
+    let calls = sb.calls(1, Duration::from_secs(5));
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(
+        calls[0].starts_with("--coordinator --run-id ci-autofix-30433642-"),
+        "{calls:?}"
+    );
+    assert!(calls[0].contains("PR #42"), "{calls:?}");
+
+    // Redelivery of the same failed run is deduped.
+    sb.exec("workflow-run.sh", &run, &[]);
+    assert_eq!(sb.calls(2, Duration::from_millis(500)).len(), 1);
+}
+
+#[test]
+fn ci_autofix_opt_out_and_success_do_not_dispatch() {
+    let sb = ReviewSandbox::new("ci-off");
+    let run = fixture("workflow_run-failure.json");
+    let out = sb.exec("workflow-run.sh", &run, &[("GITHUB_CI_AUTOFIX", "0")]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+
+    let mut ok = run.clone();
+    ok["workflow_run"]["conclusion"] = "success".into();
+    let out = sb.exec("workflow-run.sh", &ok, &[]);
+    assert!(out.status.success(), "{out:?}");
     assert!(sb.calls(1, Duration::from_millis(500)).is_empty());
 }
