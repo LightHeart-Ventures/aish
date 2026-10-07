@@ -2557,7 +2557,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ),
     ("update", "upgrade aish to the latest release"),
     ("version", "show aish version + backend"),
-    ("webhook", "webhook broker client (status|reload|logs [N])"),
+    (
+        "webhook",
+        "webhook broker client (status|reload|logs|test|replay)",
+    ),
     (
         "workers",
         "list this session's coordinators (all = every session)",
@@ -2594,6 +2597,30 @@ fn complete_colon(after: &str) -> (usize, Vec<Pair>) {
         })
         .collect();
     (0, pairs)
+}
+
+/// Subcommand completion for the first argument of a `:`-command (TASK-273:
+/// `:webhook <TAB>`). `after` is the buffer after the leading `:` up to the
+/// cursor. Returns `None` when the command has no table or the cursor is past
+/// the first argument, so the caller falls through to normal completion. The
+/// returned `start` is relative to the full line (offset by the `:`).
+fn complete_colon_args(after: &str) -> Option<(usize, Vec<Pair>)> {
+    let (cmd, rest) = after.split_once(char::is_whitespace)?;
+    let subs: &[&str] = match cmd {
+        "webhook" => crate::webhook_debug::SUBCOMMANDS,
+        _ => return None,
+    };
+    let word = rest.trim_start();
+    if word.contains(char::is_whitespace) {
+        return None;
+    }
+    let start = 1 + after.len() - word.len();
+    let pairs: Vec<Pair> = matches(subs, word);
+    if pairs.is_empty() {
+        None
+    } else {
+        Some((start, pairs))
+    }
 }
 
 /// Rows the `:`-palette hint may occupy, derived from the live terminal height.
@@ -2708,6 +2735,9 @@ impl Completer for AishHelper {
         if let Some(after) = before.strip_prefix(':') {
             if !after.contains(char::is_whitespace) {
                 return Ok(complete_colon(after));
+            }
+            if let Some(res) = complete_colon_args(after) {
+                return Ok(res);
             }
         }
         let start = line[..pos]
@@ -8276,7 +8306,14 @@ async fn handle_colon(
         }
         Some("webhook") => match parts.next() {
             None | Some("status") => match &session.webhook {
-                Some(h) => println!("\x1b[2m{}\x1b[0m", h.status_lines()),
+                Some(h) => {
+                    // TASK-273: best-effort broker pending-queue size via /health.
+                    let queue = match crate::webhook_debug::broker_queue(&h.broker_url).await {
+                        Some(n) => format!("{n} pending"),
+                        None => "unavailable".to_string(),
+                    };
+                    println!("\x1b[2m{}\n   queue: {queue}\x1b[0m", h.status_lines())
+                }
                 None => println!(
                     "\x1b[2m🪝 webhook: not configured — set WEBHOOK_BROKER_URL and restart to enable\x1b[0m"
                 ),
@@ -8291,26 +8328,81 @@ async fn handle_colon(
                 }
             }
             Some("logs") => {
-                let n = parts
-                    .next()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(20);
-                match &session.webhook {
-                    Some(h) => {
-                        let logs = h.recent_logs(n);
-                        if logs.is_empty() {
-                            println!("\x1b[2mno webhook events yet\x1b[0m");
-                        } else {
-                            for r in &logs {
+                // TASK-273: persisted, filterable delivery log; falls back to the
+                // in-memory ring when persistence is disabled.
+                let rest: Vec<&str> = parts.collect();
+                let log = crate::webhook_debug::delivery_log();
+                match crate::webhook_debug::parse_logs_args(&rest) {
+                    Err(e) => println!(
+                        "\x1b[33m🪝\x1b[0m {e}\n\x1b[2m{}\x1b[0m",
+                        crate::webhook_debug::USAGE
+                    ),
+                    Ok(args) if log.is_enabled() => {
+                        let recs = crate::webhook_debug::query_logs(&log, &args);
+                        if recs.is_empty() {
+                            println!(
+                                "\x1b[2mno webhook deliveries recorded in {}\x1b[0m",
+                                log.dir().display()
+                            );
+                        }
+                        for r in &recs {
+                            println!("\x1b[2m{}\x1b[0m", crate::webhook_debug::fmt_delivery(r));
+                        }
+                    }
+                    Ok(args) => match &session.webhook {
+                        Some(h) => {
+                            let logs: Vec<_> = h
+                                .recent_logs(usize::MAX)
+                                .into_iter()
+                                .filter(|r| args.plugin.as_deref().is_none_or(|p| r.plugin_id == p))
+                                .filter(|r| args.event.as_deref().is_none_or(|e| r.event_type == e))
+                                .collect();
+                            let skip = logs.len().saturating_sub(args.limit);
+                            if logs.is_empty() {
+                                println!("\x1b[2mno webhook events yet\x1b[0m");
+                            }
+                            for r in &logs[skip..] {
                                 println!("\x1b[2m{}\x1b[0m", crate::webhook::fmt_record(r));
                             }
                         }
+                        None => println!("\x1b[2m🪝 webhook: not configured\x1b[0m"),
+                    },
+                }
+            }
+            Some("test") => {
+                let rest: Vec<&str> = parts.collect();
+                let res = match crate::webhook_debug::parse_test_args(&rest) {
+                    Ok(a) => {
+                        crate::webhook_debug::run_test(&crate::webhook::plugins_dir(), &a).await
                     }
-                    None => println!("\x1b[2m🪝 webhook: not configured\x1b[0m"),
+                    Err(e) => Err(e),
+                };
+                match res {
+                    Ok(out) => println!("{out}"),
+                    Err(e) => println!("\x1b[33m🪝\x1b[0m {e}"),
+                }
+            }
+            Some("replay") => {
+                let rest: Vec<&str> = parts.collect();
+                let res = match crate::webhook_debug::parse_replay_args(&rest) {
+                    Ok(a) => {
+                        crate::webhook_debug::run_replay(
+                            &crate::webhook_debug::delivery_log(),
+                            &crate::webhook::plugins_dir(),
+                            &a,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
+                match res {
+                    Ok(out) => println!("{out}"),
+                    Err(e) => println!("\x1b[33m🪝\x1b[0m {e}"),
                 }
             }
             Some(other) => println!(
-                "\x1b[2musage: :webhook [status|reload|logs [N]]  (unknown subcommand: {other})\x1b[0m"
+                "\x1b[2m{}  (unknown subcommand: {other})\x1b[0m",
+                crate::webhook_debug::USAGE
             ),
         },
         Some("loop") => match parts.next() {
@@ -11282,6 +11374,22 @@ mod tests {
             let name = p.replacement.trim_start_matches(':').trim_end();
             assert!(COLON_COMMANDS.iter().any(|(n, _)| *n == name));
         }
+    }
+
+    #[test]
+    fn complete_colon_args_offers_webhook_subcommands() {
+        // TASK-273: `:webhook te<TAB>` → `test`, start points at the word.
+        let (start, pairs) = complete_colon_args("webhook te").expect("webhook has a table");
+        assert_eq!(start, ":webhook ".len());
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].replacement, "test");
+        // Empty slot lists every subcommand.
+        let (_, all) = complete_colon_args("webhook ").unwrap();
+        assert_eq!(all.len(), crate::webhook_debug::SUBCOMMANDS.len());
+        // Past the first argument, or an unknown command → fall through.
+        assert!(complete_colon_args("webhook test gh").is_none());
+        assert!(complete_colon_args("mode x").is_none());
+        assert!(complete_colon_args("webhook zz").is_none());
     }
 
     #[test]
