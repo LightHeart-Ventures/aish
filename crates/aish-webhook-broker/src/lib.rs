@@ -12,4 +12,5 @@ pub mod http;
 pub mod poll;
 pub mod queue;
 pub mod signature;
+pub mod stats;
 pub mod ws;

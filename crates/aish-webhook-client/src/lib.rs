@@ -36,6 +36,7 @@
 //!
 //! let config = BrokerConfig::load("~/.aish/config/broker.json")?; // file-based config (library API)
 //! let mut client = BrokerClient::new(config.clone());
+//! client.register().await?; // POST /clients/register → session_token
 //! let transport = TungsteniteTransport::connect(&config.broker_url).await?;
 //! client.connect(transport).await?;
 //!
@@ -57,6 +58,7 @@ pub mod delivery;
 pub mod dispatcher;
 pub mod envelope;
 pub mod error;
+pub mod register;
 pub mod service;
 pub mod transport;
 
@@ -73,5 +75,6 @@ pub use dispatcher::{
 };
 pub use envelope::{BrokerConfig, ClientFrame, ServerFrame, Webhook};
 pub use error::{Result, WebhookClientError};
+pub use register::{register_url, RegisterRequest, RegisterResponse};
 pub use service::{StopReason, WebhookService};
 pub use transport::{Transport, WsMessage};

@@ -3,6 +3,11 @@
 //! [`BrokerClient`] owns a [`Transport`], performs the auth handshake, exposes a
 //! reconnect loop with exponential backoff, answers heartbeats, and reads the
 //! next webhook off the wire (the read half of the TASK-265 message loop).
+//!
+//! TASK-449: the broker authenticates a WebSocket ONLY by a `session_token`
+//! issued from `POST /clients/register`. Obtain one with
+//! [`BrokerClient::register`] (`net` feature) or inject it with
+//! [`BrokerClient::with_session_token`] before [`BrokerClient::connect`].
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -66,6 +71,35 @@ impl<T: Transport> BrokerClient<T> {
         self
     }
 
+    /// Use a session token previously issued by `POST /clients/register`.
+    pub fn with_session_token(mut self, token: impl Into<String>) -> Self {
+        self.session_token = Some(token.into());
+        self
+    }
+
+    /// Replace (or set) the session token.
+    pub fn set_session_token(&mut self, token: impl Into<String>) {
+        self.session_token = Some(token.into());
+    }
+
+    /// Forget the session token (e.g. after the broker rejected it) so the
+    /// next [`BrokerClient::register`] issues a fresh one.
+    pub fn clear_session_token(&mut self) {
+        self.session_token = None;
+    }
+
+    /// Register this client's `(tenant_id, plugin_id)` route with the broker
+    /// over HTTP(S) (`POST /clients/register`), storing the issued session
+    /// token and adopting the broker-assigned client id. Our current
+    /// `client_id` is sent as the registration `session_id`.
+    #[cfg(feature = "net")]
+    pub async fn register(&mut self) -> Result<crate::register::RegisterResponse> {
+        let resp = crate::register::register(&self.config, &self.client_id).await?;
+        self.session_token = Some(resp.session_token.clone());
+        self.client_id = resp.client_id.clone();
+        Ok(resp)
+    }
+
     /// Override the auth-handshake timeout.
     pub fn with_auth_timeout(mut self, d: Duration) -> Self {
         self.auth_timeout = d;
@@ -114,15 +148,14 @@ impl<T: Transport> BrokerClient<T> {
     /// Send the auth frame and await the broker's acknowledgement.
     async fn authenticate(&mut self) -> Result<()> {
         // Serialize the auth frame in its own scope so the immutable borrow of
-        // `self.config` ends before we take the `&mut self.transport` below.
+        // `self.session_token` ends before we take `&mut self.transport` below.
         let txt = {
-            let frame = ClientFrame::Auth {
-                tenant_id: &self.config.tenant_id,
-                client_id: &self.client_id,
-                plugin: self.config.plugin.as_deref(),
-                secret: self.config.secret.as_deref(),
-            };
-            serde_json::to_string(&frame)?
+            let token = self.session_token.as_deref().ok_or_else(|| {
+                WebhookClientError::Auth("no session token — call register() first".into())
+            })?;
+            serde_json::to_string(&ClientFrame::Auth {
+                session_token: token,
+            })?
         };
         {
             let transport = self
@@ -156,6 +189,9 @@ impl<T: Transport> BrokerClient<T> {
                                 if let Some(cid) = client_id { self.client_id = cid; }
                                 return Ok(());
                             }
+                            // Rejected token: fail fast (the broker closes the
+                            // socket next) instead of waiting out the timeout.
+                            ServerFrame::AuthError(e) => return Err(WebhookClientError::Auth(e)),
                             // Some brokers start streaming immediately; treat the
                             // first webhook as implicit auth success is unsafe, so
                             // require an explicit ack: ignore other frames here.
@@ -186,6 +222,9 @@ impl<T: Transport> BrokerClient<T> {
             match factory().await {
                 Ok(t) => match self.connect(t).await {
                     Ok(()) => return Ok(()),
+                    // A rejected/missing session token never heals by
+                    // retrying: hand it back so the caller can re-register.
+                    Err(e @ WebhookClientError::Auth(_)) => return Err(e),
                     Err(e) => last_err = e,
                 },
                 Err(e) => last_err = e,
@@ -232,15 +271,17 @@ impl<T: Transport> BrokerClient<T> {
                     ServerFrame::Ping => {
                         self.send_frame(&ClientFrame::Pong).await?;
                     }
-                    ServerFrame::AuthOk { .. } | ServerFrame::Other => {}
+                    ServerFrame::AuthOk { .. } | ServerFrame::AuthError(_) | ServerFrame::Other => {
+                    }
                 },
             }
         }
     }
 
     /// Acknowledge a delivered webhook so the broker drops it from its queue.
+    /// Sends `{"type":"ack","webhook_id":<id>}` — the key the broker reads.
     pub async fn ack(&mut self, id: &str) -> Result<()> {
-        self.send_frame(&ClientFrame::Ack { id }).await
+        self.send_frame(&ClientFrame::Ack { webhook_id: id }).await
     }
 
     /// Graceful shutdown: best-effort close + state reset.
@@ -282,16 +323,22 @@ mod tests {
     #[tokio::test]
     async fn connect_sends_auth_and_captures_session() {
         let (mock, mut handle) = mock_transport();
-        let mut client = BrokerClient::new(cfg());
+        let mut client = BrokerClient::new(cfg()).with_session_token("st_test");
 
         // Drive: server replies auth_ok once it sees the auth frame.
         let jh = tokio::spawn(async move {
             let sent = handle.next_sent().await.unwrap();
             match sent {
                 WsMessage::Text(t) => {
-                    assert!(t.contains("\"type\":\"auth\""), "auth frame: {t}");
-                    assert!(t.contains("t1"));
-                    assert!(t.contains("github"));
+                    // Exactly what the broker's ws.rs `authenticate` reads.
+                    let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                    assert_eq!(
+                        v,
+                        serde_json::json!({"type":"auth","session_token":"st_test"}),
+                        "auth frame: {t}"
+                    );
+                    // The shared secret must never travel over the socket.
+                    assert!(!t.contains("s3cr3t"));
                 }
                 other => panic!("expected auth text, got {other:?}"),
             }
@@ -311,7 +358,9 @@ mod tests {
     #[tokio::test]
     async fn auth_times_out_when_no_ack() {
         let (mock, _handle) = mock_transport();
-        let mut client = BrokerClient::new(cfg()).with_auth_timeout(Duration::from_millis(50));
+        let mut client = BrokerClient::new(cfg())
+            .with_session_token("st_test")
+            .with_auth_timeout(Duration::from_millis(50));
         let err = client.connect(mock).await.unwrap_err();
         matches!(err, WebhookClientError::Timeout(_));
         assert_eq!(client.state(), ConnState::Disconnected);
@@ -320,7 +369,7 @@ mod tests {
     #[tokio::test]
     async fn poll_next_answers_transport_ping_then_returns_webhook() {
         let (mock, handle) = mock_transport();
-        let mut client = BrokerClient::new(cfg());
+        let mut client = BrokerClient::new(cfg()).with_session_token("st_test");
         // pre-auth: shove it straight to Connected via connect()
         let (mock2, mut h2) = mock_transport();
         let drive = tokio::spawn(async move {
@@ -369,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn ack_emits_ack_frame() {
         let (mock, mut handle) = mock_transport();
-        let mut client = BrokerClient::new(cfg());
+        let mut client = BrokerClient::new(cfg()).with_session_token("st_test");
         let drive = tokio::spawn(async move {
             let _ = handle.next_sent().await;
             handle.push_text(r#"{"type":"auth_ok"}"#);
@@ -381,21 +430,94 @@ mod tests {
         let sent = handle.next_sent().await.unwrap();
         match sent {
             WsMessage::Text(t) => {
-                assert!(t.contains("\"type\":\"ack\""));
-                assert!(t.contains("d-42"));
+                // The broker's ws.rs reads `webhook_id` (not `id`).
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                assert_eq!(v, serde_json::json!({"type":"ack","webhook_id":"d-42"}));
             }
             other => panic!("expected ack, got {other:?}"),
         }
     }
 
     #[tokio::test]
+    async fn connect_without_session_token_fails_before_sending() {
+        let (mock, mut handle) = mock_transport();
+        let mut client = BrokerClient::new(cfg());
+        let err = client.connect(mock).await.unwrap_err();
+        assert!(matches!(err, WebhookClientError::Auth(_)), "got {err:?}");
+        assert_eq!(client.state(), ConnState::Disconnected);
+        // Nothing went over the wire (the transport was dropped unsent).
+        assert!(handle.next_sent().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_error_fails_fast_without_waiting_for_timeout() {
+        let (mock, mut handle) = mock_transport();
+        // A long timeout proves we return on the frame, not the deadline.
+        let mut client = BrokerClient::new(cfg())
+            .with_session_token("st_bogus")
+            .with_auth_timeout(Duration::from_secs(30));
+        let drive = tokio::spawn(async move {
+            let _ = handle.next_sent().await;
+            handle.push_text(r#"{"type":"auth_error","error":"authentication failed"}"#);
+            handle
+        });
+        let started = Instant::now();
+        let err = client.connect(mock).await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        match err {
+            WebhookClientError::Auth(msg) => assert_eq!(msg, "authentication failed"),
+            other => panic!("expected Auth, got {other:?}"),
+        }
+        let _ = drive.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_does_not_retry_auth_errors() {
+        let mut client = BrokerClient::new(cfg())
+            .with_session_token("st_bogus")
+            .with_backoff(ExponentialBackoff::new(
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+                2.0,
+                false,
+            ));
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let a2 = attempts.clone();
+        let factory = move || {
+            let a2 = a2.clone();
+            async move {
+                a2.fetch_add(1, Ordering::Relaxed);
+                let (mock, mut handle) = mock_transport();
+                tokio::spawn(async move {
+                    let _ = handle.next_sent().await;
+                    handle.push_text(r#"{"type":"auth_error","error":"nope"}"#);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                });
+                Ok(mock)
+            }
+        };
+        let err = client
+            .reconnect_with_backoff(factory, Some(5))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WebhookClientError::Auth(_)));
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            1,
+            "auth errors are terminal"
+        );
+    }
+
+    #[tokio::test]
     async fn reconnect_retries_until_success() {
-        let mut client = BrokerClient::new(cfg()).with_backoff(ExponentialBackoff::new(
-            Duration::from_millis(1),
-            Duration::from_millis(2),
-            2.0,
-            false,
-        ));
+        let mut client = BrokerClient::new(cfg())
+            .with_session_token("st_test")
+            .with_backoff(ExponentialBackoff::new(
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+                2.0,
+                false,
+            ));
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let a2 = attempts.clone();
         // Factory fails twice, then hands back a transport that will auth-ok.

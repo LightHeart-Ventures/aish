@@ -434,7 +434,7 @@ where
 
 /// `config_schema.properties` as a map, or empty when the schema is absent or
 /// shaped unexpectedly.
-fn schema_properties(schema: &Value) -> serde_json::Map<String, Value> {
+pub(crate) fn schema_properties(schema: &Value) -> serde_json::Map<String, Value> {
     schema
         .get("properties")
         .and_then(|p| p.as_object())
@@ -444,7 +444,7 @@ fn schema_properties(schema: &Value) -> serde_json::Map<String, Value> {
 
 /// Recursively expand `${env:VAR}` references inside a JSON value. `key` is the
 /// dotted path used only for error messages.
-fn resolve_env_refs<F>(key: &str, val: Value, get_env: &F) -> Result<Value, ConfigError>
+pub(crate) fn resolve_env_refs<F>(key: &str, val: Value, get_env: &F) -> Result<Value, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -512,7 +512,7 @@ where
 }
 
 /// Validate `required` presence and declared value `type`s against the schema.
-fn validate_config(
+pub(crate) fn validate_config(
     schema: &Value,
     config: &serde_json::Map<String, Value>,
 ) -> Result<(), ConfigError> {
@@ -1478,7 +1478,7 @@ pub fn env_injection_disabled() -> bool {
 }
 
 /// A credential-like env-var NAME must never be injected from a plugin hook.
-fn is_credential_like(key: &str) -> bool {
+pub(crate) fn is_credential_like(key: &str) -> bool {
     let lk = key.to_ascii_lowercase();
     CREDENTIAL_MARKERS.iter().any(|m| lk.contains(m))
 }
