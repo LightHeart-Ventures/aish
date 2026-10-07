@@ -7,8 +7,9 @@
 # GitHub `workflow_run` payload JSON; stdout = one summary line.
 #
 # NEW: when a PR's CI concludes in a bad state, this handler detaches a
-# background aish coordinator ("a worker") that runs the `fix-ci` skill against
-# the failed run to diagnose + push a fix on the PR branch. It is:
+# background aish coordinator ("a worker") with self-contained fix-CI
+# instructions (no skill dependency) to diagnose the failed run and push a fix
+# on the PR branch. It is:
 #   * opt-out         — set GITHUB_CI_AUTOFIX=0 to disable (default: enabled).
 #   * PR-scoped       — only fires when the event carries an associated PR (or,
 #                       failing that, a head branch to work on).
@@ -109,12 +110,19 @@ if [ "${CI_BAD:-0}" = "1" ] && [ "$autofix" != "0" ]; then
             log="${TMPDIR:-/tmp}/${run_id}.log"
             pr_clause=""
             [ -n "${CI_PR:-}" ] && pr_clause="PR #${CI_PR} "
+            # Self-contained instructions: no skill is referenced, because no
+            # `fix-ci` skill ships with this plugin or the repo (the coordinator
+            # only sees ~/.aish/skills + installed plugins' skills/).
             task="GitHub CI failed for ${pr_clause}in repo ${CI_REPO} on branch '${CI_BRANCH}' \
-(workflow '${CI_WORKFLOW}' run ${CI_RUN_ID}, ${CI_URL}). \
-Use the fix-ci skill: check out ${CI_REPO} at branch '${CI_BRANCH}', inspect the failed run with \
-'gh run view ${CI_RUN_ID} --log-failed', find the root cause, implement the smallest correct fix on \
-that branch, run the project's test/lint gate to confirm green, then commit and push to the PR branch. \
-Do NOT push to the default branch. Report the fix and the resulting commit/PR."
+(workflow '${CI_WORKFLOW}' run ${CI_RUN_ID}, ${CI_URL}). Steps: (1) check out ${CI_REPO} at \
+branch '${CI_BRANCH}' in a fresh clone or worktree; (2) read the failing jobs' logs with \
+'gh run view ${CI_RUN_ID} --repo ${CI_REPO} --log-failed'; (3) find the root cause - do not \
+just silence, skip, or loosen the failing test or check; (4) implement the smallest correct fix \
+on that branch; (5) run the project's own build/test/lint commands (from its CI workflow or \
+.repospec.json) and confirm they pass; (6) commit and push to '${CI_BRANCH}'. If the failure is \
+flaky or infrastructure-related rather than a code bug, push nothing and report that instead. \
+Do NOT push to the default branch, force-push, or merge. Report the root cause and the resulting \
+commit."
 
             # Detach: setsid + background + closed stdin so the worker outlives
             # this short-lived handler and never blocks the dispatcher timeout.

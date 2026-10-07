@@ -108,11 +108,19 @@ if [ "${GITHUB_PR_AUTOREVIEW:-0}" = "1" ] && [ "$rc" = "0" ]; then
                 : >"$marker" 2>/dev/null || true
                 run_id="pr-review-$(printf '%s' "${PR_NUM:-0}" | tr -c '0-9' '_')-$(printf '%s' "$sha7" | tr -c 'A-Za-z0-9' '_')-$(date +%s)"
                 log="${TMPDIR:-/tmp}/${run_id}.log"
+                # Self-contained instructions: no skill is referenced, because
+                # none ships with this plugin or the repo (the coordinator only
+                # sees ~/.aish/skills + installed plugins' skills/).
                 task="Review GitHub pull request #${PR_NUM} in repo ${PR_REPO} \
-(${PR_HEAD} -> ${PR_BASE}, head ${PR_SHA}, ${PR_URL}). Use the pr-review skill: read the \
-diff with 'gh pr diff ${PR_NUM} --repo ${PR_REPO}', check correctness, security and tests, \
-then post your findings as a single PR review comment with 'gh pr review ${PR_NUM} \
---repo ${PR_REPO} --comment'. Do NOT push, approve, or merge."
+(${PR_HEAD} -> ${PR_BASE}, head ${PR_SHA}, ${PR_URL}). Steps: (1) read the PR description \
+with 'gh pr view ${PR_NUM} --repo ${PR_REPO}' and the full diff with \
+'gh pr diff ${PR_NUM} --repo ${PR_REPO}'; (2) open surrounding code as needed to judge \
+each change in context; (3) look for correctness bugs, security problems (injection, \
+secrets, unsafe input handling), missing or inadequate tests, and breaking API or \
+behaviour changes; (4) post ONE review comment with 'gh pr review ${PR_NUM} --repo \
+${PR_REPO} --comment --body <findings>', listing each finding with file:line, severity, \
+and a concrete suggested fix, or stating that you found no blocking issues. Only comment \
+- do NOT push commits, approve, request changes, or merge."
 
                 # Detach so the reviewer outlives this short-lived handler and
                 # never blocks the dispatcher timeout. macOS has no setsid(1).

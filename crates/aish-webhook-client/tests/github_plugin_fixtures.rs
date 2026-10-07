@@ -440,6 +440,31 @@ fn pr_autoreview_dispatches_without_setsid() {
     let calls = sb.calls(1, Duration::from_secs(5));
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert!(calls[0].starts_with("--coordinator --run-id pr-review-42-"));
+    assert!(
+        calls[0].contains("gh pr diff 42 --repo acme/widgets"),
+        "{calls:?}"
+    );
+    assert_self_contained(&calls[0]);
+}
+
+/// Dispatched agent prompts must be self-contained: no skill ships with the
+/// github plugin or the repo (the coordinator's catalog is `~/.aish/skills` +
+/// installed plugins' `skills/`), so naming one (e.g. `fix-ci`, `pr-review`)
+/// would point the agent at something that may not exist on the host.
+fn assert_self_contained(argv: &str) {
+    let lower = argv.to_lowercase();
+    assert!(
+        !lower.contains("skill"),
+        "prompt references a skill: {argv}"
+    );
+    assert!(
+        !lower.contains("fix-ci"),
+        "prompt references fix-ci: {argv}"
+    );
+    assert!(
+        !github_plugin_dir().join("skills").exists(),
+        "if the github plugin ships skills, assert the prompt names a real one instead"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +500,11 @@ fn ci_autofix_dispatches_without_setsid() {
         "{calls:?}"
     );
     assert!(calls[0].contains("PR #42"), "{calls:?}");
+    assert!(
+        calls[0].contains("--log-failed") && calls[0].contains("--repo acme/widgets"),
+        "{calls:?}"
+    );
+    assert_self_contained(&calls[0]);
 
     // Redelivery of the same failed run is deduped.
     sb.exec("workflow-run.sh", &run, &[]);

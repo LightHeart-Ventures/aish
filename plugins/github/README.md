@@ -60,10 +60,17 @@ The reviewer's output goes to `$TMPDIR/pr-review-<num>-<sha7>-<ts>.log`.
 When a `workflow_run` concludes in a bad state (`failure`, `timed_out`,
 `cancelled`, `startup_failure`) **and** the event carries an associated PR (or a
 usable head branch), `workflow-run.sh` detaches a background aish coordinator
-that runs the [`fix-ci`](../../skills/fix-ci/SKILL.md) skill against the failed
-run — it checks out the branch, inspects `gh run view <id> --log-failed`, applies
-the smallest correct fix, reconfirms the test/lint gate is green, and pushes to
-the **PR branch** (never the default branch).
+with self-contained instructions (no skill dependency) to fix the failed run —
+it checks out the branch, inspects `gh run view <id> --repo <repo> --log-failed`,
+finds the root cause, applies the smallest correct fix, reconfirms the project's
+test/lint gate is green, and pushes to the **PR branch** (never the default
+branch, never force-push).
+
+Both dispatched agents (this one and the PR reviewer below) get their full
+procedure inline in the `-c` prompt. They do not name a skill, because none
+ships with this plugin. The coordinator's skill catalog is only
+`~/.aish/skills` plus installed plugins' `skills/`, so a named skill could be
+missing on the host.
 
 Properties:
 
