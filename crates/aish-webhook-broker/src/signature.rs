@@ -31,8 +31,8 @@ pub fn verify_signature(payload: &[u8], signature: &str, secret: &str) -> crate:
 /// lowercase hex digest (no `sha256=` prefix). Handy for clients that need to
 /// sign outbound bodies and for tests.
 pub fn sign(payload: &[u8], secret: &str) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC accepts keys of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
     mac.update(payload);
     hex::encode(mac.finalize().into_bytes())
 }
@@ -42,7 +42,10 @@ fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 #[cfg(test)]
