@@ -488,6 +488,15 @@ pub struct Session {
     /// for an interactive session — no per-worker store there (mirrors
     /// `turn_audit`).
     pub worker_transcript: Option<crate::worker_store::TranscriptWriter>,
+    /// Live status-line activity summarizer for a background coordinator run
+    /// (see `crate::activity_summary`). `Some` only for a headless
+    /// `--coordinator` run, where `coordinator::drive` attaches it so
+    /// `engine::run_turn` can refresh the summary MID-ROUND from the tool-call
+    /// stream — a round routinely runs for minutes and there is usually only
+    /// one, so refreshing at round boundaries alone left `:workers` and the
+    /// escalation banner frozen on "starting up" for the worker's whole visible
+    /// life. Always `None` for an interactive session (mirrors `turn_audit`).
+    pub activity: Option<crate::activity_summary::ActivityTracker>,
     /// Shared "attached coordinator" handle (`:attach`/`:detach`). Holds the
     /// run-id of the background coordinator this interactive session is currently
     /// attached to, or `None`. Cloned into every `WorkerSpec` so the live stderr
@@ -731,6 +740,7 @@ impl Session {
             escalation: None,
             turn_audit: None,
             worker_transcript: None,
+            activity: None,
             login: false,
             attached: Arc::new(Mutex::new(None)),
             attach_review_announced: Arc::new(Mutex::new(None)),
