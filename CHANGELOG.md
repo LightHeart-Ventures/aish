@@ -4,8 +4,33 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.53.0] - 2026-10-07
+
+The plugin-and-broker release. The webhook broker reaches feature-complete (stats, OTel, load-tested WS core), the plugin system gets config/enable-disable/reload/error-handling/docs, GitHub push-PR-issue events land, and the worker/escalation UI gets durable activity so `:attach` and `:workers` tell you what a subworker is actually doing.
+
+### Added
+- **GitHub plugin: push, PR, and issue events** (PR #897, TASK-373): the GitHub plugin now handles push events, pull requests, and issues end-to-end through the webhook broker
+- **Webhook testing & debugging tools** (PR #898, TASK-273): local webhook replay/test tooling and a delivery log so plugin handlers can be exercised without waiting on a real provider event
+- **`:plugin` enable / disable / reload** (PR #899, TASK-272): plugins can be toggled and hot-reloaded at runtime, with the enabled/disabled state persisted across sessions
+- **Broker `/stats` endpoint + hardening** (PR #901, TASK-314): operational stats for the webhook broker plus input/connection hardening
+- **Plugin configuration & management** (PR #902, TASK-271): `:plugin config` view/set/reset with schema validation and secret redaction
+- **Plugin error handling & robustness** (PR #903, TASK-274): invalid-config quarantine state, hook timeout warnings, a per-plugin errors log, and health surfaced in `:plugin list`
+- **Broker core close-out** (PR #904, TASK-371): WebSocket test coverage, a load benchmark, backlog stats, and Fly volume/deploy documentation
+- **Broker observability** (PR #905, TASK-375): OTel/SigNoz metrics, structured JSON logs, and per-handler counters for plugin testing and production triage
+- **Plugin developer documentation** (PR #906, TASK-275): developer enablement docs covering the plugin manifest, hooks, webhook handlers, config schema, and local testing loop
+- **Escalation heartbeat** (PR #908): escalation banners carry a heartbeat liveness heart so a stalled worker is visually distinguishable from a working one
+- **Worker activity summaries** (PR #911): `:workers` rows and escalation lines show a width-derived summary of what each worker is currently doing instead of a bare id
+- **Durable subworker activity + tail-mode `:attach`** (PR #913): subworker activity is written to a durable activity log, so `:attach` shows live progress from any session — including attaching after the fact and tailing from where the worker is now
+
+### Changed
+- **Faster CI** (PR #910): cargo jobs run in parallel, Blacksmith caches moved off GitHub's cache quota, and `restore-keys` added so a cold key still warm-starts
+
 ### Fixed
 - **Webhook broker client now speaks the broker's protocol** (TASK-449): the client registers over HTTP (`POST /clients/register`) to get a `session_token`, authenticates the WebSocket with `{"type":"auth","session_token"}`, and acks with `{"type":"ack","webhook_id"}` — previously the broker rejected every auth and never saw an ack. `auth_error` now fails fast and triggers re-registration. `wss://` brokers are dialable (rustls). **New required env var `WEBHOOK_PLUGIN_ID`** alongside `WEBHOOK_BROKER_URL`; `WEBHOOK_BROKER_SECRET` is now the registration secret (the broker then requires signed webhooks). A contract test (`crates/aish-webhook-broker/tests/client_contract.rs`) runs the real broker against the real client. The bundled hello-world plugin declares a `ping` webhook handler, and its `handlers/ping.sh` now actually reads the payload's `message`.
+- **Duplicate "thinking…" row on resume** (PR #895): resuming a finished worker printed two `thinking…` rows; now one
+- **Engine artifacts leaked into dispatched worker briefs** (PR #907): the offload path no longer quotes engine/digest artifacts into a worker's task brief, so a dispatched coordinator sees only the real task
+- **Every queued escalation is shown** (PR #909): the escalation stack rendered only the newest ask and silently dropped the rest; all queued escalations now display
+- **`:tell` and `:stop` run immediately mid-turn** (PR #912): both were queued until the current turn ended, which defeated the point of a mid-flight course-correction or stand-down; they now take effect the moment they're issued
 
 ## [0.52.1] - 2026-10-07
 
