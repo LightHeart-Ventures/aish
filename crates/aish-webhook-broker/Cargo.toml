@@ -49,10 +49,41 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 
+# OpenTelemetry metrics export (TASK-375). OTLP over HTTP/protobuf to SigNoz or
+# any OTel collector; only active at runtime when OTEL_EXPORTER_OTLP_ENDPOINT is
+# set. Gated behind the default-on `otel` feature so `--no-default-features`
+# builds drop the exporter stack entirely.
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics"], optional = true }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics"], optional = true }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["metrics", "http-proto", "reqwest-blocking-client"], optional = true }
+# TLS for the OTLP exporter (https collectors, e.g. SigNoz Cloud): rustls with
+# the `ring` provider — NOT reqwest's default aws-lc-rs, whose aws-lc-sys build
+# needs cmake / a fuller C toolchain in the Docker builder. `telemetry::init`
+# installs ring as the process-default rustls CryptoProvider.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+
+[features]
+default = ["otel"]
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:reqwest",
+    "dep:rustls",
+]
+
 [dev-dependencies]
 tempfile = "3.8"
 tower = { version = "0.4", features = ["util"] }
 http-body-util = "0.1"
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "testing"] }
+# TASK-449 client⇄broker contract test (tests/client_contract.rs): drives the
+# REAL client (register over HTTP + tokio-tungstenite WS, `net` feature) against
+# this crate's real router. Lives here (not in the client crate) so CI's existing
+# `cargo test --manifest-path crates/aish-webhook-broker/Cargo.toml` runs it and
+# axum/rusqlite never enter the root workspace's lock or test graph.
+aish-webhook-client = { path = "../aish-webhook-client" }
 
 [[bin]]
 name = "aish-webhook-broker"

@@ -15,6 +15,7 @@ use tokio::io::AsyncWriteExt;
 use crate::audit::{AuditRecord, AuditSink, NoopAuditSink};
 use crate::envelope::Webhook;
 use crate::error::Result;
+use crate::metrics::HandlerCounters;
 
 /// Default per-handler execution timeout.
 pub const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -42,9 +43,45 @@ pub struct PluginManifest {
     pub name: String,
     #[serde(default)]
     pub version: String,
+    /// Manifest-level opt-out (`"enabled": false`). Absent → enabled. The
+    /// user-level `plugins.state.json` override (TASK-272) takes precedence;
+    /// see [`PluginRegistry::load_dir`].
+    #[serde(default)]
+    pub enabled: Option<bool>,
     /// Declared webhook handlers.
     #[serde(default)]
     pub webhooks: Vec<WebhookHandler>,
+}
+
+/// The user-level enable/disable state file for plugins dir `root`: a sibling
+/// named `<dirname>.state.json` (`~/.aish/plugins` → `~/.aish/plugins.state.json`).
+/// Read-only mirror of `aish::plugin_enable::state_path` — keep in sync.
+pub fn plugin_state_path(root: &Path) -> std::path::PathBuf {
+    match (root.parent(), root.file_name()) {
+        (Some(parent), Some(name)) => parent.join(format!("{}.state.json", name.to_string_lossy())),
+        _ => root.join(".plugins.state.json"),
+    }
+}
+
+/// `plugins.<id>.enabled` from the state file, if set. Forgiving: a missing or
+/// malformed file means "no override". Mirror of
+/// `aish::plugin_enable::enabled_override`.
+fn state_enabled_overrides(root: &Path) -> std::collections::HashMap<String, bool> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(raw) = std::fs::read_to_string(plugin_state_path(root)) else {
+        return out;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return out;
+    };
+    if let Some(map) = v.get("plugins").and_then(|p| p.as_object()) {
+        for (id, entry) in map {
+            if let Some(b) = entry.get("enabled").and_then(|e| e.as_bool()) {
+                out.insert(id.clone(), b);
+            }
+        }
+    }
+    out
 }
 
 /// In-memory registry of loaded plugin manifests.
@@ -61,13 +98,16 @@ impl PluginRegistry {
 
     /// Load every `<root>/*/plugin.json` into the registry. Unreadable or
     /// malformed manifests are skipped with a warning (one bad plugin must not
-    /// sink the rest).
+    /// sink the rest). Disabled plugins are skipped too (TASK-272): the
+    /// effective state is the `plugins.state.json` override (set by
+    /// `:plugin enable|disable`), else the manifest's `enabled`, else `true`.
     pub fn load_dir(root: impl AsRef<Path>) -> Result<Self> {
         let mut plugins = Vec::new();
         let root = root.as_ref();
         if !root.is_dir() {
             return Ok(Self { plugins });
         }
+        let overrides = state_enabled_overrides(root);
         for entry in std::fs::read_dir(root)? {
             let entry = match entry {
                 Ok(e) => e,
@@ -88,6 +128,12 @@ impl PluginRegistry {
                     continue;
                 }
             };
+
+            let enabled = overrides.get(&m.id).copied().or(m.enabled).unwrap_or(true);
+            if !enabled {
+                tracing::debug!(plugin = %m.id, "plugin disabled — webhook handlers not loaded");
+                continue;
+            }
 
             // TASK-447 — fail-fast on the removed `handlers` schema fork.
             // The one-release `handlers` -> `webhooks` serde alias was retired,
@@ -121,6 +167,15 @@ impl PluginRegistry {
             plugins.push(m);
         }
         Ok(Self { plugins })
+    }
+
+    /// Drop every plugin whose id is in `ids` (and with it all its handlers).
+    /// Returns how many plugins were removed. TASK-274: the host uses this to
+    /// skip the handlers of plugins whose config failed validation.
+    pub fn exclude(&mut self, ids: &[String]) -> usize {
+        let before = self.plugins.len();
+        self.plugins.retain(|p| !ids.iter().any(|id| id == &p.id));
+        before - self.plugins.len()
     }
 
     pub fn len(&self) -> usize {
@@ -251,6 +306,7 @@ pub struct WebhookDispatcher {
     default_timeout: Duration,
     audit: Arc<dyn AuditSink>,
     flash: Option<FlashSink>,
+    counters: Option<Arc<HandlerCounters>>,
     delivery: Option<DeliverySink>,
 }
 
@@ -261,8 +317,16 @@ impl WebhookDispatcher {
             default_timeout: DEFAULT_HANDLER_TIMEOUT,
             audit: Arc::new(NoopAuditSink),
             flash: None,
+            counters: None,
             delivery: None,
         }
+    }
+
+    /// Attach per-plugin [`HandlerCounters`] (TASK-375). Every executed
+    /// handler outcome is tallied (dispatched / ok / failed / timeout).
+    pub fn with_counters(mut self, counters: Arc<HandlerCounters>) -> Self {
+        self.counters = Some(counters);
+        self
     }
 
     /// TASK-273 — attach a [`DeliverySink`], called once per dispatch that
@@ -358,6 +422,12 @@ impl WebhookDispatcher {
             } else if o.executed {
                 tracing::info!(plugin_id = %o.plugin_id, event_type = %o.event_type,
                     duration_ms = o.duration_ms, "handler ok");
+            }
+        }
+
+        if let Some(counters) = &self.counters {
+            for o in &outcomes {
+                counters.record(o);
             }
         }
 
@@ -546,6 +616,7 @@ mod tests {
             id: "closer".into(),
             name: String::new(),
             version: String::new(),
+            enabled: None,
             webhooks: vec![WebhookHandler {
                 event_type: "push".into(),
                 command: vec!["true".into()],
@@ -620,6 +691,7 @@ mod tests {
                 id: "a".into(),
                 name: "A".into(),
                 version: "1".into(),
+                enabled: None,
                 webhooks: vec![WebhookHandler {
                     event_type: "pull_request".into(),
                     command: vec!["true".into()],
@@ -631,6 +703,7 @@ mod tests {
                 id: "b".into(),
                 name: "B".into(),
                 version: "1".into(),
+                enabled: None,
                 webhooks: vec![WebhookHandler {
                     event_type: "*".into(),
                     command: vec!["true".into()],
@@ -646,6 +719,31 @@ mod tests {
         assert_eq!(m2[0].0, "b");
     }
 
+    /// TASK-274: excluding a (config-invalid) plugin drops all its handlers.
+    #[test]
+    fn exclude_drops_plugins_and_their_handlers() {
+        let h = |ev: &str| WebhookHandler {
+            event_type: ev.into(),
+            command: vec!["true".into()],
+            filters: Default::default(),
+            timeout_secs: None,
+        };
+        let p = |id: &str| PluginManifest {
+            id: id.into(),
+            name: String::new(),
+            version: String::new(),
+            enabled: None,
+            webhooks: vec![h("pull_request"), h("*")],
+        };
+        let mut reg = PluginRegistry::from_plugins(vec![p("a"), p("b")]);
+        assert_eq!(reg.exclude(&["b".to_string(), "zzz".to_string()]), 1);
+        assert_eq!(reg.len(), 1);
+        let m = reg.matching("pull_request");
+        assert!(m.iter().all(|(id, _)| *id == "a"));
+        assert_eq!(m.len(), 2);
+        assert_eq!(reg.exclude(&[]), 0);
+    }
+
     #[tokio::test]
     async fn two_plugins_same_event_both_run_and_errors_isolated() {
         // Plugin A: `true` (exit 0). Plugin B: `false` (exit 1).
@@ -654,6 +752,7 @@ mod tests {
                 id: "ok".into(),
                 name: "".into(),
                 version: "".into(),
+                enabled: None,
                 webhooks: vec![WebhookHandler {
                     event_type: "pull_request".into(),
                     command: vec!["true".into()],
@@ -665,6 +764,7 @@ mod tests {
                 id: "fail".into(),
                 name: "".into(),
                 version: "".into(),
+                enabled: None,
                 webhooks: vec![WebhookHandler {
                     event_type: "pull_request".into(),
                     command: vec!["false".into()],
@@ -690,6 +790,7 @@ mod tests {
             id: "echo".into(),
             name: "".into(),
             version: "".into(),
+            enabled: None,
             webhooks: vec![WebhookHandler {
                 event_type: "issues".into(),
                 command: vec!["cat".into()],
@@ -712,6 +813,7 @@ mod tests {
             id: "hello-world".into(),
             name: "".into(),
             version: "".into(),
+            enabled: None,
             webhooks: vec![WebhookHandler {
                 event_type: "issues".into(),
                 command: vec!["printf".into(), "Hello, World!".into()],
@@ -742,6 +844,7 @@ mod tests {
             id: "hello-world".into(),
             name: "".into(),
             version: "".into(),
+            enabled: None,
             webhooks: vec![WebhookHandler {
                 event_type: "issues".into(),
                 command: vec!["printf".into(), "hi".into()],
@@ -760,6 +863,7 @@ mod tests {
             id: "slow".into(),
             name: "".into(),
             version: "".into(),
+            enabled: None,
             webhooks: vec![WebhookHandler {
                 event_type: "push".into(),
                 command: vec!["sleep".into(), "5".into()],
@@ -788,6 +892,7 @@ mod tests {
             id: "guarded".into(),
             name: "".into(),
             version: "".into(),
+            enabled: None,
             webhooks: vec![WebhookHandler {
                 event_type: "pull_request".into(),
                 command: vec!["true".into()],
@@ -818,6 +923,48 @@ mod tests {
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.matching("pull_request").len(), 1);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// TASK-272 — disabled plugins (manifest `"enabled": false`, or the
+    /// user-level `plugins.state.json` override) dispatch no webhook handlers;
+    /// the state-file override wins over the manifest in both directions.
+    #[test]
+    fn load_dir_skips_disabled_plugins() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir()
+            .join(format!("aish-wh-enabled-{}-{uniq}", std::process::id()))
+            .join("plugins");
+        let hook = r#""webhooks":[{"event_type":"push","command":["true"]}]"#;
+        for (id, extra) in [
+            ("on", ""),
+            ("manifest-off", r#""enabled":false,"#),
+            ("state-off", ""),
+            ("state-on", r#""enabled":false,"#),
+        ] {
+            std::fs::create_dir_all(base.join(id)).unwrap();
+            std::fs::write(
+                base.join(id).join("plugin.json"),
+                format!(r#"{{"id":"{id}",{extra}{hook}}}"#),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            plugin_state_path(&base),
+            r#"{"version":1,"plugins":{"state-off":{"enabled":false},"state-on":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            plugin_state_path(&base),
+            base.parent().unwrap().join("plugins.state.json")
+        );
+        let reg = PluginRegistry::load_dir(&base).unwrap();
+        let mut ids: Vec<&str> = reg.matching("push").iter().map(|(id, _)| *id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["on", "state-on"]);
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
     }
 
     /// TASK-447 — the retired `handlers` key must fail fast, not silently load.
@@ -927,6 +1074,7 @@ mod tests {
             id: "inject".into(),
             name: "".into(),
             version: "".into(),
+            enabled: None,
             webhooks: vec![WebhookHandler {
                 event_type: "push".into(),
                 command: vec!["echo".into(), injection.clone()],
@@ -955,6 +1103,7 @@ mod tests {
             id: "inject2".into(),
             name: "".into(),
             version: "".into(),
+            enabled: None,
             webhooks: vec![WebhookHandler {
                 event_type: "push".into(),
                 command: vec!["cat".into()],

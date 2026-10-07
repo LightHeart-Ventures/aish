@@ -36,6 +36,7 @@
 //!
 //! let config = BrokerConfig::load("~/.aish/config/broker.json")?; // file-based config (library API)
 //! let mut client = BrokerClient::new(config.clone());
+//! client.register().await?; // POST /clients/register → session_token
 //! let transport = TungsteniteTransport::connect(&config.broker_url).await?;
 //! client.connect(transport).await?;
 //!
@@ -57,11 +58,16 @@ pub mod delivery;
 pub mod dispatcher;
 pub mod envelope;
 pub mod error;
+pub mod metrics;
+pub mod register;
 pub mod service;
 pub mod transport;
 
-pub use audit::{AuditRecord, AuditSink, JsonlAuditSink, MemoryAuditSink, NoopAuditSink};
-pub use backoff::ExponentialBackoff;
+pub use audit::{
+    AuditObserver, AuditRecord, AuditSink, JsonlAuditSink, MemoryAuditSink, NoopAuditSink,
+    ObserverAuditSink,
+};
+pub use backoff::{ExponentialBackoff, DEFAULT_MAX_BACKOFF};
 pub use client::{BrokerClient, ConnState};
 pub use delivery::{DeliveryLog, DeliveryRecord, HandlerSummary, PlannedHandler};
 pub use dispatcher::{
@@ -70,5 +76,7 @@ pub use dispatcher::{
 };
 pub use envelope::{BrokerConfig, ClientFrame, ServerFrame, Webhook};
 pub use error::{Result, WebhookClientError};
+pub use metrics::{HandlerCounters, HandlerCounts};
+pub use register::{register_url, RegisterRequest, RegisterResponse};
 pub use service::{StopReason, WebhookService};
 pub use transport::{Transport, WsMessage};

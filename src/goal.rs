@@ -1922,6 +1922,7 @@ mod tests {
             turns: 0,
             tool_calls: 0,
             kind: None,
+            activity_summary: None,
         }
     }
 

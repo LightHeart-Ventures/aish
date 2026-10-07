@@ -9,6 +9,7 @@ listed under [Errors](#errors).
 | Method | Path | Auth | Success |
 |--------|------|------|---------|
 | `GET` | `/health` | none | `200` |
+| `GET` | `/stats` | none | `200` |
 | `POST` | `/clients/register` | none | `201` |
 | `POST` | `/webhooks/:tenant_id/:plugin_id` | HMAC (if secret set) | `202` |
 | `GET` | `/webhooks/:tenant_id/:plugin_id/pending` | none¹ | `200` |
@@ -35,6 +36,54 @@ DB read throws).
   "db_health": "ok"
 }
 ```
+
+---
+
+## `GET /stats`
+
+Per-(tenant, plugin) delivery counts plus totals. Unauthenticated, like
+`/health`: the body contains **only counts and the routing keys** — never
+payloads, event types, secrets, client ids, session ids or tokens. If the key
+list itself is sensitive in your deployment, keep the broker behind the
+reverse-proxy boundary described in [DEPLOYMENT.md](DEPLOYMENT.md#hardening).
+A DB read failure returns `500 {"error":"Database error"}`.
+
+```json
+{
+  "generated_at": "2026-10-07T03:30:00.000000+00:00",
+  "uptime_secs": 3921,
+  "counters_since": "2026-10-07T02:24:39.000000+00:00",
+  "totals": {
+    "queued": 2, "acked": 1, "delivered": 4, "delivered_ws": 1,
+    "delivered_poll": 3, "received": 5, "dropped": 2, "expired": 0
+  },
+  "plugins": [
+    {
+      "tenant_id": "acme", "plugin_id": "github",
+      "queued": 2, "acked": 1, "delivered": 4, "delivered_ws": 1,
+      "delivered_poll": 3, "received": 5, "dropped": 2, "expired": 0
+    }
+  ]
+}
+```
+
+`plugins` is sorted by `(tenant_id, plugin_id)` and includes every key that has
+a registered client, stored webhooks, or non-zero counters. `totals` is the
+field-wise sum of `plugins`.
+
+| Field | Kind | Meaning |
+|-------|------|---------|
+| `queued` | gauge (durable) | Undelivered webhooks in SQLite now. |
+| `acked` | gauge (durable) | Acknowledged webhooks still retained (until their TTL). |
+| `received` | counter | Webhooks accepted with `202`. Rejected requests (`400`/`401`/`404`) are not counted. |
+| `delivered_ws` | counter | Envelopes pushed to live WebSocket clients on receipt. Does not include the backlog replayed when a client (re)connects. |
+| `delivered_poll` | counter | Envelopes returned by `GET .../pending`. |
+| `delivered` | counter | `delivered_ws + delivered_poll`. A redelivered (unacked) webhook counts each time. |
+| `dropped` | counter | Undelivered webhooks evicted because the queue hit `max_queue_size`. |
+| `expired` | counter | Undelivered webhooks removed by the hourly TTL sweep (acked rows ageing out are not counted). |
+
+Counters are in-memory and reset when the process restarts; `counters_since`
+marks the start of the window. Gauges are read from SQLite on every request.
 
 ---
 

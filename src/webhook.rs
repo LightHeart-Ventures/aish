@@ -7,10 +7,13 @@
 //! webhook handlers from `~/.aish/plugins`, and `tokio::spawn`s a background
 //! task that:
 //!
-//!   1. connects to the broker (auth handshake),
-//!   2. runs the read → dispatch → ack loop,
-//!   3. auto-reconnects with exponential backoff on disconnect,
-//!   4. shuts down gracefully on `:quit`.
+//!   1. registers its `(tenant, plugin)` route over HTTP(S)
+//!      (`POST /clients/register` → `session_token`, TASK-449),
+//!   2. connects to the broker WebSocket (`{"type":"auth","session_token"}`),
+//!   3. runs the read → dispatch → ack (`{"type":"ack","webhook_id"}`) loop,
+//!   4. auto-reconnects with exponential backoff on disconnect, re-registering
+//!      when the broker rejects the token (e.g. its DB was reset),
+//!   5. shuts down gracefully on `:quit`.
 //!
 //! The REPL surfaces the service via `:webhook status|reload|logs|test|replay`.
 //! A shared [`MemoryAuditSink`] captures every handler outcome for the status
@@ -19,10 +22,18 @@
 //!
 //! Configuration (env vars):
 //!   * `WEBHOOK_BROKER_URL`    — broker WebSocket URL (`wss://…/ws`). REQUIRED to
-//!                               enable the service; unset ⇒ soft no-op.
-//!   * `WEBHOOK_TENANT_ID`     — tenant to authenticate as (default `"default"`).
-//!   * `WEBHOOK_BROKER_SECRET` — optional shared secret echoed in the auth frame.
-//!   * `WEBHOOK_CLIENT_ID`     — optional stable client id (generated if absent).
+//!                               enable the service; unset ⇒ soft no-op. The
+//!                               register URL is derived from it
+//!                               (`wss://h/ws` → `https://h/clients/register`).
+//!   * `WEBHOOK_PLUGIN_ID`     — broker plugin id to register for (e.g.
+//!                               `hello-world`). REQUIRED alongside the URL;
+//!                               unset ⇒ warning + no-op.
+//!   * `WEBHOOK_TENANT_ID`     — tenant to register as (default `"default"`).
+//!   * `WEBHOOK_BROKER_SECRET` — optional shared secret sent as the register
+//!                               `secret`; the broker then requires an HMAC
+//!                               `X-Signature` on inbound webhooks.
+//!   * `WEBHOOK_CLIENT_ID`     — optional stable client id (generated if absent);
+//!                               sent as the register `session_id`.
 //!   * `AISH_PLUGINS_DIR`      — override the plugin directory scanned for handlers.
 //!   * `AISH_WEBHOOK_AUDIT_MAX` — per-plugin delivery-log retention (default
 //!                               1000; `0` disables persistence).
@@ -32,8 +43,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aish_webhook_client::{
-    AuditRecord, BrokerClient, BrokerConfig, ConnState, DeliverySink, FlashSink, MemoryAuditSink,
-    PluginRegistry, StopReason, WebhookDispatcher, WebhookService, transport::TungsteniteTransport,
+    AuditRecord, AuditSink, BrokerClient, BrokerConfig, ConnState, DeliverySink,
+    ExponentialBackoff, FlashSink, HandlerCounters, MemoryAuditSink, ObserverAuditSink,
+    PluginRegistry, StopReason, WebhookClientError, WebhookDispatcher, WebhookService,
+    transport::TungsteniteTransport,
 };
 use tokio::sync::watch;
 
@@ -50,6 +63,8 @@ pub struct WebhookStatus {
     pub last_error: Option<String>,
     /// True once the service loop has exited (shutdown).
     pub stopped: bool,
+    /// TASK-375 — per-plugin handler counters (dispatched/ok/failed/timeout).
+    pub counters: Arc<HandlerCounters>,
 }
 
 impl Default for WebhookStatus {
@@ -60,6 +75,7 @@ impl Default for WebhookStatus {
             reconnects: 0,
             last_error: None,
             stopped: false,
+            counters: Arc::new(HandlerCounters::new()),
         }
     }
 }
@@ -104,7 +120,13 @@ impl WebhookHandle {
         if broker_url.trim().is_empty() {
             return None;
         }
-        let config = config_from_env(broker_url);
+        let Some(config) = config_from_env(broker_url) else {
+            tracing::warn!(
+                "webhook: WEBHOOK_BROKER_URL is set but WEBHOOK_PLUGIN_ID is not — \
+                 the broker routes by (tenant, plugin); not starting the broker client"
+            );
+            return None;
+        };
         let dir = plugins_dir();
         Some(Self::spawn(config, dir, flash))
     }
@@ -113,7 +135,7 @@ impl WebhookHandle {
     pub fn spawn(config: BrokerConfig, plugins_dir: PathBuf, flash: Option<FlashSink>) -> Self {
         // Load plugin webhook handlers; soft-fail to an empty registry so a
         // missing/!readable plugin dir never blocks broker connectivity.
-        let registry = match PluginRegistry::load_dir(&plugins_dir) {
+        let mut registry = match PluginRegistry::load_dir(&plugins_dir) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -124,15 +146,38 @@ impl WebhookHandle {
                 PluginRegistry::from_plugins(Vec::new())
             }
         };
+        // TASK-274: a plugin whose config fails validation keeps its skills but
+        // its webhook handlers are skipped until the config is fixed (the
+        // operator was already warned once at startup / on `:plugin reload`).
+        let invalid: Vec<String> = crate::plugins::config_invalid_plugins(&plugins_dir)
+            .into_iter()
+            .map(|(id, err)| {
+                tracing::warn!(plugin = %id, error = %err,
+                    "webhook: config invalid — handlers skipped until fixed");
+                id
+            })
+            .collect();
+        registry.exclude(&invalid);
         let handler_count = registry.len();
         let registry = Arc::new(registry);
         let audit = Arc::new(MemoryAuditSink::new());
+        // TASK-274: mirror handler failures/timeouts into the plugin's
+        // `errors.jsonl` audit trail; `:webhook logs` keeps reading `audit`.
+        let observer_dir = plugins_dir.clone();
+        let task_sink: Arc<dyn AuditSink> = Arc::new(ObserverAuditSink::new(
+            audit.clone(),
+            Arc::new(move |r: &AuditRecord| {
+                if let Some(e) = handler_error_entry(r) {
+                    let _ = crate::plugin_health::append(&observer_dir, &r.plugin_id, &e);
+                }
+            }),
+        ));
         let status = Arc::new(Mutex::new(WebhookStatus::default()));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let task_config = config.clone();
         let task_registry = registry.clone();
-        let task_audit = audit.clone();
+        let task_audit = task_sink;
         let task_status = status.clone();
         let task_flash = flash;
         let task_delivery = crate::webhook_debug::delivery_sink(
@@ -208,13 +253,15 @@ impl WebhookHandle {
             "🪝 webhook: {state} — {url} (tenant {tenant})\n   \
              handlers: {h} from {dir}\n   \
              events: {ev}  reconnects: {rc}  up: {up}\n   \
-             last event: {err}",
+             last event: {err}\n   \
+             {handlers}",
             url = self.broker_url,
             tenant = self.tenant_id,
             h = self.handler_count,
             dir = self.plugins_dir.display(),
             ev = self.events(),
             rc = st.reconnects,
+            handlers = fmt_handler_counts(&st.counters),
         )
     }
 }
@@ -239,7 +286,9 @@ pub fn reload(slot: &mut Option<WebhookHandle>, flash: Option<FlashSink>) -> Res
             *slot = Some(h);
             Ok(n)
         }
-        None => Err("failed to re-initialize webhook service".to_string()),
+        None => {
+            Err("failed to re-initialize webhook service (is WEBHOOK_PLUGIN_ID set?)".to_string())
+        }
     }
 }
 
@@ -267,17 +316,51 @@ pub fn fmt_record(r: &AuditRecord) -> String {
     .to_string()
 }
 
-/// Build a [`BrokerConfig`] from the environment given a broker URL.
-fn config_from_env(broker_url: String) -> BrokerConfig {
-    BrokerConfig {
+/// The errors-log entry for a broker handler outcome (TASK-274): `Some` only
+/// for a handler that ran and failed — `handler_timeout` when it was killed
+/// at its budget, `handler_failed` otherwise. Successes and filter-skips
+/// produce nothing.
+fn handler_error_entry(r: &AuditRecord) -> Option<crate::plugin_health::ErrorEntry> {
+    if !r.executed || r.success {
+        return None;
+    }
+    let message = match (&r.error, r.exit_code) {
+        (Some(e), _) => e.clone(),
+        (None, Some(c)) => format!("exit status {c}"),
+        (None, None) => "failed".to_string(),
+    };
+    let kind = if message.starts_with("timed out") {
+        crate::plugin_health::KIND_HANDLER_TIMEOUT
+    } else {
+        crate::plugin_health::KIND_HANDLER_FAILED
+    };
+    Some(crate::plugin_health::ErrorEntry::new(
+        kind,
+        format!("webhook {}", r.event_type),
+        message,
+        "event dropped; handler runs again on the next delivery",
+    ))
+}
+
+/// Build a [`BrokerConfig`] from the environment given a broker URL. Returns
+/// `None` when `WEBHOOK_PLUGIN_ID` is unset/blank: the broker routes webhooks
+/// by `(tenant_id, plugin_id)` and `POST /clients/register` requires both.
+fn config_from_env(broker_url: String) -> Option<BrokerConfig> {
+    let non_empty = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    Some(BrokerConfig {
         broker_url,
-        tenant_id: std::env::var("WEBHOOK_TENANT_ID").unwrap_or_else(|_| "default".to_string()),
-        plugin: None,
+        tenant_id: non_empty("WEBHOOK_TENANT_ID").unwrap_or_else(|| "default".to_string()),
+        plugin: Some(non_empty("WEBHOOK_PLUGIN_ID")?),
         transport: "websocket".to_string(),
         enabled: true,
-        secret: std::env::var("WEBHOOK_BROKER_SECRET").ok(),
-        client_id: std::env::var("WEBHOOK_CLIENT_ID").ok(),
-    }
+        secret: non_empty("WEBHOOK_BROKER_SECRET"),
+        client_id: non_empty("WEBHOOK_CLIENT_ID"),
+    })
 }
 
 /// Resolve the plugin directory scanned for webhook handlers.
@@ -293,6 +376,38 @@ pub(crate) fn plugins_dir() -> PathBuf {
 
 /// Return the last `n` elements of `v` (oldest-first), or all of them when
 /// `v.len() <= n`.
+/// TASK-375 — handler health for `:webhook status`: totals, plus a per-plugin
+/// `id ok/run` list (failures/timeouts flagged) once anything has run.
+fn fmt_handler_counts(counters: &HandlerCounters) -> String {
+    let t = counters.totals();
+    let mut out = format!(
+        "handlers run: {}  ok: {}  failed: {}  timeout: {}  avg: {}ms",
+        t.dispatched,
+        t.ok,
+        t.failed,
+        t.timeout,
+        t.avg_ms()
+    );
+    let per = counters.per_plugin();
+    if !per.is_empty() {
+        let parts: Vec<String> = per
+            .iter()
+            .map(|(id, c)| {
+                let mut p = format!("{id} {}/{}", c.ok, c.dispatched);
+                if c.failed > 0 {
+                    p.push_str(&format!(" ✗{}", c.failed));
+                }
+                if c.timeout > 0 {
+                    p.push_str(&format!(" ⏱{}", c.timeout));
+                }
+                p
+            })
+            .collect();
+        out.push_str(&format!("\n   plugins: {}", parts.join(", ")));
+    }
+    out
+}
+
 fn tail<T>(mut v: Vec<T>, n: usize) -> Vec<T> {
     let len = v.len();
     if len > n { v.split_off(len - n) } else { v }
@@ -329,7 +444,7 @@ async fn wait_for_shutdown(mut rx: watch::Receiver<bool>) {
 async fn service_loop(
     config: BrokerConfig,
     registry: Arc<PluginRegistry>,
-    audit: Arc<MemoryAuditSink>,
+    audit: Arc<dyn AuditSink>,
     status: Arc<Mutex<WebhookStatus>>,
     shutdown_rx: watch::Receiver<bool>,
     flash: Option<FlashSink>,
@@ -337,13 +452,20 @@ async fn service_loop(
 ) {
     let mut dispatcher = WebhookDispatcher::new(registry)
         .with_audit_sink(audit)
-        .with_delivery_sink(delivery);
+        .with_delivery_sink(delivery)
+        .with_counters(status.lock().unwrap().counters.clone());
     if let Some(f) = flash {
         // Wire the broker dispatcher to the SecondStatusLine: a handler's stdout
         // now surfaces on the footer. This is the seam that completes the goal.
         dispatcher = dispatcher.with_flash_sink(f);
     }
     let dispatcher = Arc::new(dispatcher);
+
+    // Session token issued by `POST /clients/register`. Reused across
+    // reconnects (the broker persists it); dropped and re-issued only when the
+    // broker rejects it with `auth_error`.
+    let mut session: Option<(String, String)> = None; // (client_id, session_token)
+    let mut register_backoff = ExponentialBackoff::default();
 
     loop {
         if *shutdown_rx.borrow() {
@@ -352,17 +474,65 @@ async fn service_loop(
 
         set_state(&status, ConnState::Connecting);
         let mut client = BrokerClient::new(config.clone());
-        let url = config.broker_url.clone();
 
-        // reconnect_with_backoff loops forever (max_attempts = None) until a
-        // connect succeeds; race it against the shutdown signal so `:quit`
-        // interrupts an in-progress reconnect.
+        // 1. Register (HTTP) when we hold no valid token.
+        match session.clone() {
+            Some((client_id, token)) => {
+                let mut cfg = config.clone();
+                cfg.client_id = Some(client_id);
+                client = BrokerClient::new(cfg).with_session_token(token);
+            }
+            None => {
+                let registered = tokio::select! {
+                    r = client.register() => Some(r),
+                    _ = wait_for_shutdown(shutdown_rx.clone()) => None,
+                };
+                match registered {
+                    None => break,
+                    Some(Ok(resp)) => {
+                        register_backoff.reset();
+                        tracing::info!(client_id = %resp.client_id, "webhook: registered with broker");
+                        session = Some((resp.client_id, resp.session_token));
+                    }
+                    Some(Err(e)) => {
+                        let wait = register_backoff.next_backoff();
+                        tracing::warn!(error = %e, ?wait, "webhook: broker registration failed, retrying");
+                        status.lock().unwrap().last_error = Some(e.to_string());
+                        tokio::select! {
+                            _ = tokio::time::sleep(wait) => continue,
+                            _ = wait_for_shutdown(shutdown_rx.clone()) => break,
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Dial + authenticate. reconnect_with_backoff loops forever
+        // (max_attempts = None) on transport errors but returns immediately on
+        // an auth rejection; race it against shutdown so `:quit` interrupts an
+        // in-progress reconnect.
+        let url = config.broker_url.clone();
         let connected = tokio::select! {
-            r = client.reconnect_with_backoff(|| TungsteniteTransport::connect(&url), None) => r.is_ok(),
-            _ = wait_for_shutdown(shutdown_rx.clone()) => false,
+            r = client.reconnect_with_backoff(|| TungsteniteTransport::connect(&url), None) => Some(r),
+            _ = wait_for_shutdown(shutdown_rx.clone()) => None,
         };
-        if !connected {
-            break;
+        match connected {
+            None => break,
+            Some(Ok(())) => register_backoff.reset(),
+            Some(Err(e)) => {
+                if matches!(e, WebhookClientError::Auth(_)) {
+                    // Token unknown to the broker (e.g. its DB was reset on
+                    // redeploy): forget it and re-register next iteration.
+                    session = None;
+                }
+                tracing::warn!(error = %e, "webhook: broker auth failed — re-registering");
+                status.lock().unwrap().last_error = Some(e.to_string());
+                let wait = register_backoff.next_backoff();
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => continue,
+                    _ = wait_for_shutdown(shutdown_rx.clone()) => break,
+                }
+            }
         }
 
         {
@@ -403,6 +573,35 @@ mod tests {
 
     // Env access is process-global; serialize the env-mutating tests.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn handler_counts_render_totals_and_per_plugin() {
+        let c = HandlerCounters::new();
+        assert_eq!(
+            fmt_handler_counts(&c),
+            "handlers run: 0  ok: 0  failed: 0  timeout: 0  avg: 0ms"
+        );
+        let out = |plugin: &str, success: bool, error: Option<&str>| {
+            aish_webhook_client::HandlerOutcome {
+                plugin_id: plugin.into(),
+                event_type: "push".into(),
+                matched: true,
+                executed: true,
+                exit_code: None,
+                success,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: error.map(str::to_string),
+                duration_ms: 20,
+            }
+        };
+        c.record(&out("gh", true, None));
+        c.record(&out("gh", false, None));
+        c.record(&out("slack", false, Some("timed out after 30s")));
+        let s = fmt_handler_counts(&c);
+        assert!(s.starts_with("handlers run: 3  ok: 1  failed: 1  timeout: 1  avg: 20ms"));
+        assert!(s.contains("plugins: gh 1/2 ✗1, slack 0/1 ⏱1"), "{s}");
+    }
 
     #[test]
     fn tail_returns_all_when_shorter() {
@@ -457,20 +656,74 @@ mod tests {
         // SAFETY: guarded by ENV_LOCK; single-threaded within this test.
         unsafe {
             std::env::set_var("WEBHOOK_TENANT_ID", "acme");
+            std::env::set_var("WEBHOOK_PLUGIN_ID", "hello-world");
             std::env::set_var("WEBHOOK_BROKER_SECRET", "s3cr3t");
             std::env::remove_var("WEBHOOK_CLIENT_ID");
         }
-        let cfg = config_from_env("wss://broker.example/ws".to_string());
+        let cfg = config_from_env("wss://broker.example/ws".to_string()).expect("plugin id set");
         assert_eq!(cfg.broker_url, "wss://broker.example/ws");
         assert_eq!(cfg.tenant_id, "acme");
+        assert_eq!(cfg.plugin.as_deref(), Some("hello-world"));
         assert_eq!(cfg.secret.as_deref(), Some("s3cr3t"));
         assert_eq!(cfg.client_id, None);
         assert!(cfg.enabled);
         assert_eq!(cfg.transport, "websocket");
         unsafe {
             std::env::remove_var("WEBHOOK_TENANT_ID");
+            std::env::remove_var("WEBHOOK_PLUGIN_ID");
             std::env::remove_var("WEBHOOK_BROKER_SECRET");
         }
+    }
+
+    #[test]
+    fn config_from_env_requires_plugin_id() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::remove_var("WEBHOOK_PLUGIN_ID");
+        }
+        assert!(config_from_env("wss://broker.example/ws".to_string()).is_none());
+        unsafe {
+            std::env::set_var("WEBHOOK_PLUGIN_ID", "   ");
+        }
+        assert!(config_from_env("wss://broker.example/ws".to_string()).is_none());
+        unsafe {
+            std::env::remove_var("WEBHOOK_PLUGIN_ID");
+        }
+    }
+
+    #[test]
+    fn spawn_from_env_none_without_plugin_id() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            std::env::set_var("WEBHOOK_BROKER_URL", "ws://127.0.0.1:9/ws");
+            std::env::remove_var("WEBHOOK_PLUGIN_ID");
+        }
+        // Returns before any tokio::spawn, so no runtime is needed.
+        assert!(WebhookHandle::spawn_from_env(None).is_none());
+        unsafe {
+            std::env::remove_var("WEBHOOK_BROKER_URL");
+        }
+    }
+
+    #[test]
+    fn bundled_hello_world_declares_ping_webhook() {
+        // TASK-449: the broker e2e relies on hello-world loading a `ping`
+        // handler from `webhooks[]` (the legacy `webhook_command` loads none).
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins");
+        let reg = PluginRegistry::load_dir(&dir).unwrap();
+        let hits = reg.matching("ping");
+        let (pid, h) = hits
+            .iter()
+            .find(|(pid, _)| *pid == "hello-world")
+            .expect("hello-world ping handler");
+        assert_eq!(*pid, "hello-world");
+        assert!(
+            h.command[0].ends_with("plugins/hello-world/handlers/ping.sh"),
+            "resolved against the plugin dir: {:?}",
+            h.command
+        );
     }
 
     #[test]
@@ -522,5 +775,53 @@ mod tests {
             ..ok.clone()
         };
         assert!(fmt_record(&skipped).contains("[skip]"));
+    }
+
+    /// TASK-274: only executed-and-failed handlers become errors-log entries,
+    /// classified timeout vs failure.
+    #[test]
+    fn handler_error_entry_classifies_outcomes() {
+        let ok = AuditRecord {
+            webhook_id: "w1".into(),
+            tenant_id: "t".into(),
+            plugin_id: "gh".into(),
+            event_type: "pull_request".into(),
+            matched: true,
+            executed: true,
+            exit_code: Some(0),
+            success: true,
+            error: None,
+            duration_ms: 12,
+            recorded_at_ms: 0,
+        };
+        assert!(handler_error_entry(&ok).is_none());
+        let filtered = AuditRecord {
+            executed: false,
+            success: false,
+            exit_code: None,
+            ..ok.clone()
+        };
+        assert!(handler_error_entry(&filtered).is_none());
+
+        let failed = AuditRecord {
+            success: false,
+            exit_code: Some(2),
+            ..ok.clone()
+        };
+        let e = handler_error_entry(&failed).unwrap();
+        assert_eq!(e.kind, "handler_failed");
+        assert_eq!(e.source, "webhook pull_request");
+        assert_eq!(e.message, "exit status 2");
+
+        let timed_out = AuditRecord {
+            success: false,
+            exit_code: None,
+            error: Some("timed out after 30s".into()),
+            ..ok
+        };
+        assert_eq!(
+            handler_error_entry(&timed_out).unwrap().kind,
+            "handler_timeout"
+        );
     }
 }

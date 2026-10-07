@@ -1,10 +1,81 @@
 # GitHub Webhook Plugin
 
-Reference webhook plugin for aish (SPR-069, TASK-386 scaffold + TASK-387 handler
-scripts; TASK-373 push/issues + opt-in PR review agent). It demonstrates the
-**canonical** `plugin.json` webhook schema that the `aish-webhook-client`
-dispatcher consumes, and ships self-contained handler scripts that turn GitHub
-events into concise, auditable one-line summaries.
+Turns GitHub events (pushes, PRs, issues, CI runs, releases) into one-line
+SecondStatusLine flashes in your aish session, and can optionally launch aish
+agents to review PRs and fix failing CI. Events reach aish through the
+[webhook broker](../../docs/webhooks.md); handlers follow the standard
+[webhook handler contract](../../docs/WEBHOOK_HANDLERS.md).
+
+- [Quick start](#quick-start)
+- [What it does](#what-it-does)
+- [Environment flags](#environment-flags)
+- [Troubleshooting](#troubleshooting)
+
+## Quick start
+
+### 1. Prerequisites
+
+| Need | Why |
+|---|---|
+| `bash`, `python3` | every handler parses the payload with Python (no `jq`) |
+| A reachable `aish-webhook-broker` | receives GitHub's POSTs and relays them to aish — see [DEPLOYMENT.md](../../crates/aish-webhook-broker/docs/DEPLOYMENT.md) |
+| `aish` on `PATH` | only for the PR-review and CI auto-fix agents |
+| `gh` authenticated | only for the agents: `gh auth login`, or `GITHUB_TOKEN` in aish's env |
+
+### 2. Install the plugin
+
+```sh
+cp -r plugins/github ~/.aish/plugins/github
+chmod +x ~/.aish/plugins/github/handlers/*.sh
+```
+
+In aish: `:plugin info github` should list the `webhooks` handlers and
+`:plugin list` should show `github … (ok)`.
+
+### 3. Connect aish to the broker
+
+Pick a tenant id (any string; `default` if you skip it) and a shared secret:
+
+```sh
+export WEBHOOK_BROKER_URL=wss://<your-broker>/ws
+export WEBHOOK_PLUGIN_ID=github
+export WEBHOOK_TENANT_ID=acme                  # optional, default "default"
+export WEBHOOK_BROKER_SECRET=$(openssl rand -hex 32)   # store it; reuse below
+aish
+```
+
+`:webhook status` should report `connected`. aish must have connected at least
+once before GitHub delivers: the broker returns `404` for a route nobody has
+registered.
+
+### 4. Configure the GitHub webhook
+
+Repository (or organization) → **Settings → Webhooks → Add webhook**:
+
+| Field | Value |
+|---|---|
+| Payload URL | `https://<your-broker>/webhooks/<tenant>/github` (e.g. `…/webhooks/acme/github`) |
+| Content type | `application/json` |
+| Secret | the exact `WEBHOOK_BROKER_SECRET` value |
+| Events | *Let me select*: **Pushes, Pull requests, Issues, Workflow runs, Releases** |
+
+GitHub sends `X-GitHub-Event` (the broker uses it as the event type) and
+`X-Hub-Signature-256` (verified by the broker against the secret). GitHub's
+initial `ping` delivery is accepted and logged but no `github` handler matches
+it — that's expected.
+
+### 5. Authentication for the agents
+
+The handlers themselves never call GitHub. The optional agents they launch use
+`gh`, so the account `gh` is logged in as needs:
+
+| Agent | Permission |
+|---|---|
+| PR review (`GITHUB_PR_AUTOREVIEW=1`) | Pull requests: read & write (to post a review comment) |
+| CI auto-fix (default on) | Contents: read & write, Actions: read (to read logs and push to the PR branch) |
+
+A classic PAT needs `repo` + `workflow`. Prefer a fine-grained token scoped to
+the repositories you route here, exported as `GITHUB_TOKEN` before starting aish.
 
 ## What it does
 
@@ -13,7 +84,7 @@ events into concise, auditable one-line summaries.
 | `push`         | none (every branch/tag push, incl. create/delete/force) | `handlers/push.sh`   | Push line (repo, branch/tag, commit count, before..after short SHAs, pusher, `[forced]`/`[new]`, head-commit headline, compare url); a `deleted` line for ref deletions |
 | `pull_request` | `action ∈ {opened, reopened, ready_for_review}`   | `handlers/pr-review.sh`    | PR triage line (repo#num, author, head→base, title, url); **opt-in review agent** (see below) |
 | `issues`       | `action ∈ {opened, reopened, edited, closed, labeled}` | `handlers/issues.sh`  | Issue line (repo#num, action, `+label:<name>` on labeled, `[pr]` for PR-backed issues, author, state, labels, title, url) |
-| `workflow_run` | `action = completed`                              | `handlers/workflow-run.sh` | CI outcome line (✓/✗, name, branch, status/conclusion); non-zero exit on a bad conclusion; **auto-dispatches a `fix-ci` worker on failure** (see below) |
+| `workflow_run` | `action = completed`                              | `handlers/workflow-run.sh` | CI outcome line (✓/✗, name, branch, status/conclusion); non-zero exit on a bad conclusion; **auto-dispatches a CI-fix worker on failure** (see below) |
 | `release`      | `action = published`                              | `handlers/release.sh`      | Release notice (tag, name, author, pre-release flag) |
 
 Each `action` value is registered as its own handler entry because filters are
@@ -32,7 +103,7 @@ Example lines:
 | Variable               | Default | Effect |
 |------------------------|---------|--------|
 | `GITHUB_PR_AUTOREVIEW` | off     | `1` (exactly) → `pr-review.sh` dispatches a background review agent on PR open (below). Any other value or unset = off. |
-| `GITHUB_CI_AUTOFIX`    | on      | `0` → `workflow-run.sh` does NOT dispatch the `fix-ci` worker on a failed run. |
+| `GITHUB_CI_AUTOFIX`    | on      | `0` → `workflow-run.sh` does NOT dispatch the CI-fix worker on a failed run. |
 
 Set them in the environment of the process running the webhook client; handlers
 inherit it.
@@ -113,7 +184,7 @@ regardless of the process cwd the dispatcher launches them under.
 ```jsonc
 {
   "id": "github",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "webhooks": [                    // canonical key; legacy top-level "handlers" is rejected (TASK-447)
     {
       "event_type": "pull_request", // "*" matches all events
@@ -150,8 +221,9 @@ cargo test -p aish-webhook-client --no-default-features --test github_plugin_fix
 shellcheck plugins/github/handlers/*.sh
 ```
 
-A live end-to-end test (real GitHub-signed delivery → broker → client →
-handler) is pending the TASK-449 broker/client protocol fix.
+For a live check, use GitHub's **Recent Deliveries → Redeliver** and watch
+`:webhook logs --plugin github`; or replay a logged delivery locally with
+`:webhook replay github last --run`.
 
 ## Local smoke test
 
@@ -175,3 +247,40 @@ Expected:
 WEBHOOK_TENANT_ID=t_demo plugins/github/handlers/push.sh   < plugins/github/tests/fixtures/push.json
 WEBHOOK_TENANT_ID=t_demo plugins/github/handlers/issues.sh < plugins/github/tests/fixtures/issues-opened.json
 ```
+
+```sh
+# workflow_run failure (exits 1 by design; set GITHUB_CI_AUTOFIX=0 to avoid spawning a worker)
+GITHUB_CI_AUTOFIX=0 WEBHOOK_TENANT_ID=t_demo plugins/github/handlers/workflow-run.sh \
+  < plugins/github/tests/fixtures/workflow_run-failure.json
+```
+
+From inside aish, without GitHub or a broker:
+
+```text
+:webhook test github push --payload plugins/github/tests/fixtures/push.json --run
+```
+
+## Logs and state
+
+| What | Where |
+|---|---|
+| Delivery log (per event, handler status, redacted payload) | `~/.aish/state/webhooks/github.jsonl` — `:webhook logs --plugin github` |
+| Handler failures / timeouts | `~/.aish/plugins/github/errors.jsonl` — `:plugin errors github` |
+| PR-review agent output | `$TMPDIR/pr-review-<num>-<sha7>-<ts>.log` |
+| CI auto-fix agent output | `$TMPDIR/ci-autofix-<run_id>-<ts>.log` |
+| Idempotency markers | `$TMPDIR/aish-pr-autoreview-*.marker`, `$TMPDIR/aish-ci-autofix-*.marker` — delete one to allow a re-run |
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| GitHub "Recent Deliveries" shows **404** | No aish session registered `<tenant>/github`: start aish with `WEBHOOK_PLUGIN_ID=github` and the same `WEBHOOK_TENANT_ID` as the URL. |
+| GitHub shows **401** | Secret mismatch: the GitHub webhook secret must equal `WEBHOOK_BROKER_SECRET`. Re-save both. |
+| GitHub shows **202** but nothing flashes | `:webhook logs --plugin github`: if the record shows `skipped`, the action isn't one this plugin handles (e.g. `issues` `assigned`, `pull_request` `synchronize`). If there's no record, check `:webhook status`. |
+| Handler `error`, exit 127 / permission denied | `chmod +x ~/.aish/plugins/github/handlers/*.sh`; `python3` must be on `PATH`. |
+| Handler exit 2, "malformed payload" | Content type isn't `application/json` in the GitHub webhook settings. |
+| `workflow_run` always shows `error` for failed runs | By design: the handler exits 1 for `failure`/`timed_out`/`cancelled`/`startup_failure` so the audit reflects CI. |
+| No PR review appears | `GITHUB_PR_AUTOREVIEW` must be exactly `1`; drafts are skipped; `aish` must be on `PATH`; check the `$TMPDIR/pr-review-*.log`; a marker for the same head SHA suppresses repeats. |
+| CI worker never starts | `GITHUB_CI_AUTOFIX=0` set, or the run has no PR / head branch; see `$TMPDIR/ci-autofix-*.log`. |
+| Agents fail to post / push | `gh auth status` in the env aish runs in; token permissions above. |
+| Flash shows only the latest event | The flash slot is most-recent-wins; use `:webhook logs` for history. |

@@ -686,5 +686,4 @@ mod tests {
         assert_eq!(row_count(), 0);
         assert!(pinned_ids().is_empty());
     }
-
 }

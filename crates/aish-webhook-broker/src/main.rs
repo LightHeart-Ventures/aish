@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 use aish_webhook_broker::config::BrokerConfig;
 use aish_webhook_broker::dispatcher::Hub;
+use aish_webhook_broker::logging::{self, LogFormat};
 use aish_webhook_broker::{db, http};
 
 #[derive(Parser, Debug)]
@@ -23,7 +24,12 @@ struct Cli {
     listen: String,
 
     /// SQLite database path
-    #[arg(short, long, env = "BROKER_DB", default_value = "/var/lib/aish-broker.db")]
+    #[arg(
+        short,
+        long,
+        env = "BROKER_DB",
+        default_value = "/var/lib/aish-broker.db"
+    )]
     db: String,
 
     /// Maximum queue size (messages per tenant_id+plugin_id)
@@ -45,16 +51,21 @@ struct Cli {
     /// Log level
     #[arg(long, env = "BROKER_LOG_LEVEL", default_value = "info")]
     log_level: String,
+
+    /// Log output format: `text` (default) or `json` (one object per line)
+    #[arg(long, env = "LOG_FORMAT", default_value = "text", value_enum)]
+    log_format: LogFormat,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(&cli.log_level))
-        .with_target(true)
-        .init();
+    tracing::subscriber::set_global_default(logging::subscriber(
+        cli.log_format,
+        EnvFilter::new(&cli.log_level),
+        std::io::stdout,
+    ))?;
 
     info!("aish-webhook-broker starting up");
     info!(
@@ -69,9 +80,10 @@ async fn main() -> Result<()> {
     // Initialize database (synchronous rusqlite/r2d2 setup).
     let db = db::init(&cli.db)?;
 
+    let hub = Arc::new(Hub::new());
     let config = BrokerConfig {
         db: db.clone(),
-        hub: Arc::new(Hub::new()),
+        hub: hub.clone(),
         start_time: Instant::now(),
         max_queue_size: cli.max_queue_size,
         ws_heartbeat_secs: cli.ws_heartbeat_secs,
@@ -79,16 +91,49 @@ async fn main() -> Result<()> {
         msg_ttl_secs: cli.msg_ttl_secs,
     };
 
+    // OpenTelemetry metrics (TASK-375): active only when
+    // OTEL_EXPORTER_OTLP_ENDPOINT is set. A setup failure is logged, never fatal.
+    #[cfg(feature = "otel")]
+    let metrics = {
+        use aish_webhook_broker::telemetry;
+        let endpoint = telemetry::endpoint_from_env();
+        match telemetry::init(&config, endpoint.as_deref()) {
+            Ok(Some(guard)) => {
+                info!(endpoint = ?endpoint, "OTel metrics export enabled (OTLP/HTTP)");
+                Some(guard)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!(error = %e, "OTel metrics export disabled: exporter setup failed");
+                None
+            }
+        }
+    };
+
     // Background TTL sweep: purge expired webhooks hourly.
     {
         let sweep_db = db.clone();
+        let sweep_hub = hub.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 ticker.tick().await;
                 match db::ttl_cleanup(&sweep_db) {
-                    Ok(n) if n > 0 => info!("TTL cleanup removed {} expired webhook(s)", n),
-                    Ok(_) => {}
+                    Ok(expired) => {
+                        let mut removed = 0u64;
+                        for e in &expired {
+                            removed += e.undelivered + e.acked;
+                            // Only never-acked rows count as `expired` (lost).
+                            sweep_hub.stats().record_expired(
+                                &e.tenant_id,
+                                &e.plugin_id,
+                                e.undelivered,
+                            );
+                        }
+                        if removed > 0 {
+                            info!("TTL cleanup removed {} expired webhook(s)", removed);
+                        }
+                    }
                     Err(e) => warn!("TTL cleanup failed: {}", e),
                 }
             }
@@ -104,6 +149,12 @@ async fn main() -> Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    #[cfg(feature = "otel")]
+    if let Some(guard) = metrics {
+        // Final flush; the SDK shutdown blocks, so keep it off the executor.
+        let _ = tokio::task::spawn_blocking(move || guard.shutdown()).await;
+    }
 
     info!("Server shut down cleanly");
     Ok(())

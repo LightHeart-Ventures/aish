@@ -7,6 +7,7 @@ Welcome to the aish codebase documentation. This index guides you to the right r
 - **New to aish?** Start with [ARCHITECTURE.md](./ARCHITECTURE.md) for a system overview.
 - **Deploying or releasing?** See [RELEASE.md](./RELEASE.md).
 - **Implementing a feature?** Check [reference/](#reference) for implementation details.
+- **Writing a plugin?** Read [PLUGIN_DEVELOPER.md](./PLUGIN_DEVELOPER.md) and [WEBHOOK_HANDLERS.md](./WEBHOOK_HANDLERS.md).
 - **Debugging or deep-diving?** Browse [internals/](#internals) for design decisions and diagnostics.
 
 ---
@@ -30,6 +31,10 @@ Implementation details, schemas, and how things work.
 - [reference/coordinator/stale-row-prevention.md](./reference/coordinator/stale-row-prevention.md) — DDB row staleness detection
 
 ### Plugin System
+- [PLUGIN_DEVELOPER.md](./PLUGIN_DEVELOPER.md) — **Start here:** plugin developer guide (`plugin.json` reference, hooks, config, secrets, `:plugin` commands, testing)
+- [WEBHOOK_HANDLERS.md](./WEBHOOK_HANDLERS.md) — Writing webhook handlers (contract, filters, signing, logs/replay, troubleshooting)
+- [../plugins/github/README.md](../plugins/github/README.md) — GitHub reference plugin: setup and troubleshooting
+- [plugins/skill-source-authoring.md](./plugins/skill-source-authoring.md) — Skill-source plugins
 - [reference/plugins/memory.md](./reference/plugins/memory.md) — Plugin memory schema and APIs
 - [reference/plugins/state.md](./reference/plugins/state.md) — Plugin state management
 - [reference/plugins/webhook-events.md](./reference/plugins/webhook-events.md) — Webhook event contracts
@@ -39,7 +44,7 @@ Implementation details, schemas, and how things work.
 
 ### Infrastructure & Data
 - [reference/database.md](./reference/database.md) — Database schema and key paths
-- [webhooks.md](./webhooks.md) — Webhook handler dispatch and routing
+- [webhooks.md](./webhooks.md) — Webhook architecture, broker/client configuration, deployment, monitoring
 
 ---
 

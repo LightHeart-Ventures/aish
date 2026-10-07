@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Notify;
 
+use crate::stats::BrokerStats;
+
 /// A connected WebSocket client's push channel + routing key.
 struct WsClient {
     tenant_id: String,
@@ -28,6 +30,8 @@ pub struct Hub {
     ws_clients: Mutex<HashMap<String, WsClient>>,
     /// Cached count of connected clients (cheap `/health` read).
     connected: AtomicUsize,
+    /// Per-(tenant,plugin) process counters reported on `/stats`.
+    stats: BrokerStats,
 }
 
 impl Hub {
@@ -39,7 +43,9 @@ impl Hub {
     pub fn notifier(&self, tenant_id: &str, plugin_id: &str) -> Arc<Notify> {
         let key = (tenant_id.to_string(), plugin_id.to_string());
         let mut map = self.notifiers.lock().unwrap();
-        map.entry(key).or_insert_with(|| Arc::new(Notify::new())).clone()
+        map.entry(key)
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
     }
 
     /// Announce a new webhook: push to matching WS clients and wake pollers.
@@ -56,9 +62,16 @@ impl Hub {
                 }
             }
         }
+        self.stats
+            .record_delivered_ws(tenant_id, plugin_id, delivered as u64);
         // Wake long-pollers regardless.
         self.notifier(tenant_id, plugin_id).notify_waiters();
         delivered
+    }
+
+    /// Process counters (received / delivered / dropped / expired) for `/stats`.
+    pub fn stats(&self) -> &BrokerStats {
+        &self.stats
     }
 
     /// Register a connected WebSocket client.
@@ -116,6 +129,13 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(rx_a.try_recv().unwrap(), "envelope");
         assert!(rx_b.try_recv().is_err());
+
+        let counters = hub.stats().counters();
+        assert_eq!(
+            counters[&("t1".to_string(), "github".to_string())].delivered_ws,
+            1
+        );
+        assert!(!counters.contains_key(&("t1".to_string(), "slack".to_string())));
 
         hub.unregister_ws("st_a");
         assert_eq!(hub.connected_count(), 1);

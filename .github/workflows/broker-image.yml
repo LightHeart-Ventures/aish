@@ -1,0 +1,61 @@
+name: Broker Image
+
+# Build-only check of the aish-webhook-broker container image (TASK-375).
+#
+# `flyctl deploy` builds crates/aish-webhook-broker/Dockerfile (fly.toml
+# [build] dockerfile) — a multi-stage self-build on rust:1.88-slim-bookworm with
+# only gcc/libc6-dev installed. The CI "Test webhook broker" step compiles the
+# crate on the runner's toolchain, which does NOT prove the image builds: a new
+# dependency that needs cmake / a C++ toolchain / a newer rustc than the
+# builder's pinned 1.88 would only fail at deploy time. This job runs the exact
+# Dockerfile (release profile, --locked) on every PR that touches the broker,
+# so that class of break surfaces before merge. Nothing is pushed.
+on:
+  pull_request:
+    paths:
+      - "crates/aish-webhook-broker/**"
+      - ".github/workflows/broker-image.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/aish-webhook-broker/**"
+      - ".github/workflows/broker-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: broker-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  broker-image:
+    name: build broker image (no push)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker builder (Blacksmith)
+        uses: useblacksmith/setup-docker-builder@v1
+
+      - name: Build broker image
+        uses: useblacksmith/build-push-action@v2
+        with:
+          context: crates/aish-webhook-broker
+          file: crates/aish-webhook-broker/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: aish-webhook-broker:ci
+
+      - name: Smoke-test the image
+        run: |
+          docker run --rm --entrypoint /usr/local/bin/aish-webhook-broker aish-webhook-broker:ci --help | grep -q -- --log-format
+          cid=$(docker run -d -p 18080:8080 aish-webhook-broker:ci)
+          for i in $(seq 1 20); do
+            curl -fsS http://127.0.0.1:18080/health && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18080/stats
+          docker rm -f "$cid"

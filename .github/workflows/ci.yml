@@ -40,14 +40,45 @@ jobs:
           rustup update --no-self-update stable
           rustup default stable
 
+      # Blacksmith's own cache store, NOT GitHub's shared Actions-cache quota.
+      # useblacksmith/cache is a drop-in fork of actions/cache (identical
+      # inputs) that reads/writes Blacksmith-local storage.
+      #
+      # Why it matters: this repo's GitHub Actions cache was measured at
+      # 9.29 GB / 10 GB across 30 entries — ALL of them
+      # macOS-{x86_64,aarch64}-apple-darwin release-build caches at ~313 MB
+      # each, two freshly written per commit to main. GitHub evicts
+      # least-recently-used once the 10 GB repo quota is hit, so every Linux
+      # CI cache this job wrote was gone before the next PR could restore it.
+      # Observed on run 37568357666: restore step 0s (MISS), Test 6m07s
+      # (cold full rebuild), post-save 4s. Moving the Blacksmith-hosted jobs
+      # onto Blacksmith's store takes them off that quota entirely, so Linux
+      # caches survive AND the macOS release legs stop starving them.
       - name: Cache cargo + target
-        uses: actions/cache@v5
+        uses: useblacksmith/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # One key per cargo PROFILE. This is the TEST-profile cache, shared
+          # intentionally with ci-testbox.yml (same `cargo test
+          # --no-default-features` graph). repl-smoke.yml builds --release and
+          # used to share the bare `<os>-cargo-<lock>` key; only one job can
+          # save a key per run, so the loser restored ~262 MB of the wrong
+          # profile's target/ and recompiled from scratch every time. Worse,
+          # the winner's entry is immutable for the life of that Cargo.lock,
+          # so the loser could never recover — observed on run 37628855874:
+          # restore HIT, then `Finished test profile in 1m56s` (a full
+          # rebuild) and "not saving cache" because the key was already taken.
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          # Without restore-keys, ANY Cargo.lock edit is a total miss and a
+          # from-scratch compile. Same-profile prefix first; the bare tier is a
+          # last resort that still recovers the profile-independent
+          # ~/.cargo/registry + git dirs even from another profile's entry.
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+            ${{ runner.os }}-cargo-
 
       # --no-default-features drops the in-process local model (mistralrs /
       # mistralrs-core), which is huge and unneeded for the oracle harness +
@@ -64,10 +95,21 @@ jobs:
           echo "Disk:" && df -h
           echo "Env (relevant):" && env | grep -E "CARGO|RUST" | sort || true
 
+      # No `-j 1` here (nor on the three cargo invocations below). The jobs cap
+      # lives in the committed .cargo/config.toml (`jobs = 6`), and that cap
+      # exists for ONE reason: the `local` feature's llama.cpp bindings
+      # (llama-cpp-sys-2) compiled at opt-level=3, where a single rustc peaks
+      # past 1.5 GB and `nproc`-wide codegen OOM-kills the build. None of this
+      # job's cargo invocations can reach that crate: the three aish-workspace
+      # ones all pass --no-default-features, and aish-webhook-broker is a
+      # separate workspace that never depends on it. So `-j 1` was serializing
+      # codegen on a 4-vCPU runner to dodge a hazard absent from this build
+      # graph, at ~4 min/PR. `-j` is build parallelism only — test-thread
+      # behaviour is unchanged. Let the committed config govern.
       - name: Test
         run: |
           set -o pipefail
-          cargo test --no-default-features --locked --verbose -j 1 -- --nocapture 2>&1 | tee test-output.log
+          cargo test --no-default-features --locked --verbose -- --nocapture 2>&1 | tee test-output.log
 
       - name: Upload test log on failure
         if: failure()
@@ -81,7 +123,7 @@ jobs:
       # tokio-tungstenite `net` transport). Gated explicitly so the crate can't
       # silently rot outside the root package's test surface.
       - name: Test webhook client (SPR-059)
-        run: cargo test -p aish-webhook-client --no-default-features --locked -j 1 -- --nocapture
+        run: cargo test -p aish-webhook-client --no-default-features --locked -- --nocapture
 
       # The root Cargo.toml is a *mixed* manifest (both `[workspace]` and
       # `[package]`), so a bare `cargo test` above only tests the `aish`
@@ -92,7 +134,7 @@ jobs:
       # compile-linkage smoke test in the root package) touched the crate at
       # all. Run it directly so its real coverage isn't silently skipped.
       - name: Test git-discover
-        run: cargo test -p git-discover --no-default-features --locked -j 1 -- --nocapture
+        run: cargo test -p git-discover --no-default-features --locked -- --nocapture
 
       # webhook-receiver (SPR-059) is a workspace member but is deliberately
       # NOT added here yet: its `sqlx` dependency currently pulls in the
@@ -101,7 +143,7 @@ jobs:
       # backlog). A pending fix (PR #806) rewrites its test module against
       # the crate's real API AND switches sqlx to `runtime-tokio-rustls`,
       # which removes that native dependency. Add
-      # `cargo test -p webhook-receiver --no-default-features --locked -j 1`
+      # `cargo test -p webhook-receiver --no-default-features --locked`
       # here once #806 (or its equivalent) has merged to main.
 
       # aish-webhook-broker (SPR-059, TASK-257) is intentionally a *separate*
@@ -113,4 +155,4 @@ jobs:
       # never been built or tested in CI at all. Point cargo at its manifest
       # directly.
       - name: Test webhook broker
-        run: cargo test --manifest-path crates/aish-webhook-broker/Cargo.toml --locked -j 1 -- --nocapture
+        run: cargo test --manifest-path crates/aish-webhook-broker/Cargo.toml --locked -- --nocapture

@@ -19,7 +19,7 @@ Add either (or both) of these fields to a plugin's `plugin.json`:
 | Field             | Type   | Effect                                                                 |
 |-------------------|--------|-----------------------------------------------------------------------|
 | `webhook_url`     | string | Each event is HTTP `POST`ed to this URL with the event as a JSON body. |
-| `webhook_command` | string | Each event runs this command via `sh -c`, event JSON piped on stdin.   |
+| `webhook_command` | string | Each event runs this command as argv (**no shell**), event JSON on stdin. |
 
 A plugin with neither field is never contacted. A plugin with `"enabled": false`
 is skipped entirely. Example:

@@ -17,19 +17,18 @@ use crate::db;
 use crate::error::{BrokerError, Result};
 use crate::queue::Webhook;
 use crate::signature;
+use crate::stats::{self as broker_stats, StatsSnapshot};
 use crate::ws;
 
 /// Build the HTTP router with all endpoints.
 pub fn router(config: BrokerConfig) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/stats", get(stats))
         .route("/ws", get(ws::ws_handler))
         .route("/clients/register", post(register_client))
         .route("/webhooks/:tenant_id/:plugin_id", post(receive_webhook))
-        .route(
-            "/webhooks/:tenant_id/:plugin_id/pending",
-            get(poll_pending),
-        )
+        .route("/webhooks/:tenant_id/:plugin_id/pending", get(poll_pending))
         .route(
             "/webhooks/:tenant_id/:plugin_id/messages/:webhook_id",
             delete(ack_webhook),
@@ -51,6 +50,14 @@ async fn health(State(config): State<BrokerConfig>) -> impl IntoResponse {
         "db_health": db_health,
     });
     (StatusCode::OK, Json(response))
+}
+
+/// Per-(tenant, plugin) delivery counts + totals.
+///
+/// Unauthenticated, like `/health`: returns only counts and routing keys —
+/// never payloads, secrets, client ids or session tokens.
+async fn stats(State(config): State<BrokerConfig>) -> Result<Json<StatsSnapshot>> {
+    Ok(Json(broker_stats::snapshot(&config)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,12 +156,23 @@ async fn receive_webhook(
 
     // 5. Persist (durable) — enforces the per-tenant queue cap.
     let webhook = Webhook::new(tenant_id.clone(), plugin_id.clone(), event_type, payload);
-    db::insert_webhook(
+    let dropped = db::insert_webhook(
         &config.db,
         &webhook,
         config.msg_ttl_secs,
         config.max_queue_size,
     )?;
+    let counters = config.hub.stats();
+    counters.record_received(&tenant_id, &plugin_id);
+    counters.record_dropped(&tenant_id, &plugin_id, dropped as u64);
+    if dropped > 0 {
+        warn!(
+            tenant = %tenant_id,
+            plugin = %plugin_id,
+            dropped,
+            "queue cap reached: dropped oldest undelivered webhook(s)"
+        );
+    }
 
     // 6. Fast-path dispatch to connected WS clients + wake long-pollers.
     let envelope = webhook.to_envelope().to_string();
@@ -204,6 +222,10 @@ async fn poll_pending(
     }
 
     let messages: Vec<serde_json::Value> = pending.iter().map(|w| w.to_envelope()).collect();
+    config
+        .hub
+        .stats()
+        .record_delivered_poll(&tenant_id, &plugin_id, messages.len() as u64);
     let remaining = db::count_pending(&config.db, &tenant_id, &plugin_id)?;
 
     Ok((

@@ -145,8 +145,7 @@ Your broker is live at `https://<app-name>.fly.dev`.
 | `RETRY_MAX_ATTEMPTS` | Max retries per delivery | `5` | `3`–`10` |
 | `RETRY_BACKOFF_MS` | Initial backoff (exponential) | `1000` | `500`–`5000` |
 | `DLQ_ENABLED` | Dead-letter queue for failed events | `true` | `true`, `false` |
-| `OBSERVABILITY_ENABLED` | Send metrics/logs to external service | `false` | `true`, `false` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OpenTelemetry collector endpoint | unset | `http://localhost:4317` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP collector endpoint; enables metrics export (see `crates/aish-webhook-broker/deploy/signoz/README.md`) | unset | `http://localhost:4318` |
 
 ### 2.2 Setting Variables in Fly.io
 
@@ -386,7 +385,6 @@ If using **SigNoz**, **Datadog**, or **New Relic**, configure OpenTelemetry:
 
 ```bash
 flyctl secrets set \
-  OBSERVABILITY_ENABLED=true \
   OTEL_EXPORTER_OTLP_ENDPOINT="https://your-collector.example.com"
 ```
 

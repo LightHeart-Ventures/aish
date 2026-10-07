@@ -9,7 +9,11 @@ pub mod db;
 pub mod dispatcher;
 pub mod error;
 pub mod http;
+pub mod logging;
 pub mod poll;
 pub mod queue;
 pub mod signature;
+pub mod stats;
+#[cfg(feature = "otel")]
+pub mod telemetry;
 pub mod ws;

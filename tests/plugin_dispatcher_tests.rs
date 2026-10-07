@@ -19,6 +19,14 @@
 #[allow(dead_code)]
 mod plugin_state;
 
+#[path = "../src/plugin_enable.rs"]
+#[allow(dead_code)]
+mod plugin_enable;
+
+#[path = "../src/plugin_health.rs"]
+#[allow(dead_code)]
+mod plugin_health;
+
 #[path = "../src/plugin_dispatcher.rs"]
 #[allow(dead_code)]
 mod plugin_dispatcher;
@@ -233,4 +241,72 @@ async fn test_non_blocking() {
         assert!(Instant::now() < deadline, "async delivery never completed");
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// TASK-272: a plugin disabled via `:plugin disable` (the user-level
+/// `plugins.state.json` override) receives no webhook events, even though its
+/// manifest says it is enabled; re-enabling restores delivery.
+#[tokio::test]
+async fn test_state_file_disable_skips_plugin() {
+    let dir = tempdir("statefile").join("plugins");
+    write_plugin(
+        &dir,
+        "muted",
+        r#"{"id":"muted","enabled":true,"webhook_command":"echo hi"}"#,
+    );
+    plugin_enable::set_enabled(&dir, "muted", false).unwrap();
+    let state = PluginStateStore::open_in_memory().unwrap();
+    let d = PluginDispatcher::new(dir.clone(), state.clone());
+
+    let n = d.route_awaiting(Event::SkillLoaded).await.unwrap();
+    assert_eq!(n, 0, "a state-file-disabled plugin must not subscribe");
+    assert!(state.get("muted", "last_webhook_output").unwrap().is_none());
+
+    plugin_enable::set_enabled(&dir, "muted", true).unwrap();
+    let n = d.route_awaiting(Event::SkillLoaded).await.unwrap();
+    assert_eq!(n, 1, "re-enabled plugin subscribes again");
+}
+
+/// TASK-274: a plugin whose config failed validation (the derived runtime
+/// config-invalid set) receives no webhook events until it is cleared — and
+/// the persisted enabled state is never touched.
+#[tokio::test]
+async fn test_config_invalid_plugin_is_skipped() {
+    let dir = tempdir("cfginvalid").join("plugins");
+    write_plugin(
+        &dir,
+        "broken",
+        r#"{"id":"broken","webhook_command":"echo hi"}"#,
+    );
+    let mut invalid = std::collections::HashMap::new();
+    invalid.insert(
+        "broken".to_string(),
+        "required config key `token` is missing".to_string(),
+    );
+    plugin_health::set_config_invalid(&dir, invalid);
+    let state = PluginStateStore::open_in_memory().unwrap();
+    let d = PluginDispatcher::new(dir.clone(), state.clone());
+
+    let n = d.route_awaiting(Event::SkillLoaded).await.unwrap();
+    assert_eq!(n, 0, "a config-invalid plugin must not subscribe");
+    assert!(!plugin_enable::state_path(&dir).exists(), "no auto-disable");
+
+    plugin_health::set_config_invalid(&dir, std::collections::HashMap::new());
+    let n = d.route_awaiting(Event::SkillLoaded).await.unwrap();
+    assert_eq!(n, 1, "fixed config → subscribes again");
+}
+
+/// TASK-274: a failing `webhook_command` lands in the plugin's errors log.
+#[tokio::test]
+async fn test_failing_command_is_recorded_in_errors_log() {
+    let dir = tempdir("cmdfail").join("plugins");
+    write_plugin(&dir, "flaky", r#"{"id":"flaky","webhook_command":"false"}"#);
+    let state = PluginStateStore::open_in_memory().unwrap();
+    let d = PluginDispatcher::new(dir.clone(), state);
+    assert_eq!(d.route_awaiting(Event::SkillLoaded).await.unwrap(), 1);
+    let log = plugin_health::read_all(&dir, "flaky");
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert_eq!(log[0].kind, "webhook_failed");
+    assert_eq!(log[0].source, "command skill_loaded");
+    assert!(log[0].message.starts_with("exit status"));
 }

@@ -126,11 +126,18 @@ Two properties qualify a command for the whitelist:
    whitelisted commands run off an `OpsCtx` snapshot taken before `run_turn`
    borrows the session.
 
-Today the whitelist is exactly `["dispatch"]`. `:tell` / `:stop` qualify on (1)
-and are the obvious next additions, but still take `&mut Session` (`:tell goal …`
-routes into `steer_active_goal`) — they need the same `OpsCtx` split first.
-Printing commands (`:jobs`, `:status`) and modal ones (`:workers`, which would
-steal stdin from the classifying reader thread) are deliberately excluded.
+Today the whitelist is `dispatch`, `tell` (+ `msg` / `send`) and `stop`
+(+ `standdown` / `stand-down`) — the three coordinator-control verbs, all now
+running off `OpsCtx` via `tell_coordinator_ctx` / `stop_coordinator_ctx`. These
+are the commands immediacy matters most for: a steer that lands after the round
+it was meant to change is a no-op, and a stand-down that waits for the turn to
+end keeps paying for the work it was cancelling.
+
+One carve-out: `:tell goal …` routes into `steer_active_goal`, which needs
+`&mut Session`, so the classifier keeps *that* form queued while `:tell <id> …`
+runs immediately. Printing commands (`:jobs`, `:status`) and modal ones
+(`:workers`, which would steal stdin from the classifying reader thread) are
+deliberately excluded.
 
 Mid-turn `:dispatch` does not auto-attach: the turn owns the output area, so
 interleaving a worker stream would garble both. The run id is printed; `:attach`

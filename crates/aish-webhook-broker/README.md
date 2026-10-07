@@ -141,7 +141,23 @@ cargo test          # unit tests (signature, queue, hub) + HTTP integration test
 ```
 
 Integration tests (`tests/integration.rs`) drive the real axum router in-process
-against a temp-file SQLite DB — no network sockets required.
+against a temp-file SQLite DB — no network sockets required. `tests/ws.rs` covers
+the `/ws` protocol over a loopback socket (auth rejection, reconnect backlog
+replay, ack by `webhook_id`, `delivered_ws` stats); `tests/client_contract.rs`
+runs the real `aish-webhook-client` against the broker.
+
+### Load benchmark (manual, not part of CI)
+
+```bash
+cargo test --release --test load_bench -- --ignored --nocapture
+# BENCH_N=10000 BENCH_CONC=16 BENCH_RATE=1000 (0 = unpaced / saturation)
+```
+
+POSTs signed webhooks over keep-alive HTTP to one acking WS subscriber and prints
+throughput plus p50/p90/p99 POST→WS delivery latency. Reference run (TASK-371,
+Apple M5 Pro, 18 cores, macOS 26.5, release build, N=10000, 16 senders):
+1000/s paced → p50 ≈ 1.6 ms, p99 28–59 ms (max 132–175 ms); unpaced saturation
+≈ 5,000–6,400 webhooks/s end-to-end (latency there is queueing delay).
 
 ## License
 

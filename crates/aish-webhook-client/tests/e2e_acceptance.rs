@@ -35,6 +35,7 @@ fn registry() -> PluginRegistry {
             id: "echo".into(),
             name: "Echo".into(),
             version: "0.0.0".into(),
+            enabled: None,
             webhooks: vec![WebhookHandler {
                 event_type: "pull_request".into(),
                 command: vec!["/bin/cat".into()],
@@ -46,6 +47,7 @@ fn registry() -> PluginRegistry {
             id: "broken".into(),
             name: "Broken".into(),
             version: "0.0.0".into(),
+            enabled: None,
             webhooks: vec![WebhookHandler {
                 event_type: "pull_request".into(),
                 command: vec![
@@ -143,7 +145,7 @@ async fn e2e_ingress_via_mock_transport_dispatches_and_acks() {
         Arc::new(WebhookDispatcher::new(Arc::new(registry())).with_audit_sink(sink.clone()));
 
     let (mock, mut handle) = mock_transport();
-    let mut client = BrokerClient::new(broker_config());
+    let mut client = BrokerClient::new(broker_config()).with_session_token("st_e2e");
 
     // Broker side: consume the client's auth frame, accept it, deliver one webhook.
     let drive = tokio::spawn(async move {
@@ -167,7 +169,7 @@ async fn e2e_ingress_via_mock_transport_dispatches_and_acks() {
         tokio::time::timeout(Duration::from_millis(1000), handle.next_sent()).await
     {
         if let WsMessage::Text(t) = msg {
-            if t.contains("\"type\":\"ack\"") && t.contains("w-e2e-2") {
+            if t.contains("\"type\":\"ack\"") && t.contains("\"webhook_id\":\"w-e2e-2\"") {
                 acked = true;
                 break;
             }
