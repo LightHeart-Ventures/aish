@@ -412,12 +412,22 @@ async fn run_turn_inner(
     // rfind returns None and the fallback (full input) preserves today's
     // behaviour for the interactive hot-path.
     let task = {
-        const TASK_MARKER: &str = "\nTASK:\n";
         input
-            .rfind(TASK_MARKER)
-            .map(|pos| input[pos + TASK_MARKER.len()..].to_string())
+            .rfind(crate::skill_match::TASK_MARKER)
+            .map(|pos| input[pos + crate::skill_match::TASK_MARKER.len()..].to_string())
             .unwrap_or_else(|| input.clone())
     };
+    // The text the MATCHER sees: the task with the coordinator preamble, any
+    // quoted `=== Recent conversation context … ===` digest, and any
+    // already-rendered skill-awareness block stripped out (see
+    // `skill_match::match_text`). A dispatched worker brief carries all three,
+    // and on run w_oihN7xE3 the quoted patent conversation out-scored the real
+    // request so the worker was pointed at `patent-workflow-validator` while
+    // investigating a UI regression. `task` (unstripped) is still what the
+    // UserPromptSubmit hook reports, so observability sees the raw request.
+    let match_task = crate::skill_match::match_text(&input);
+    // Do not stack a second block onto a brief that is already hinted.
+    let already_hinted = crate::skill_match::already_hinted(&input);
     // `:new` sets suppress_context_seed so the freshly-cleared (empty) history
     // doesn't re-trigger the last-output seed below. Consume it one-shot: a later
     // command's output can still seed a genuinely fresh prompt.
@@ -432,45 +442,52 @@ async fn run_turn_inner(
     // recommendation of an installable registry skill (read from the
     // binary-shipped index — no network on the hot path), so the model surfaces a
     // `:skill add <ref>` suggestion instead of faking or hand-rolling the work.
-    let input = match crate::skill_match::hint(&task, &session.skills) {
-        Some(note) => {
-            // Observe hook: SkillMatched — an INSTALLED skill cleared the
-            // relevance bar for this turn's task and its SKILL.md note was folded
-            // into the input. Carry the top-ranked skill's name + path (the path
-            // is matchable via the matcher's `path_glob`), its score, and the
-            // total number of matching skills, so a consumer can log which
-            // playbook was surfaced. Observe-only — it can't change the hint. The
-            // registry-recommendation path (no installed match) is a different
-            // event and deliberately does NOT fire this. Zero-cost when no hook is
-            // registered (`has` short-circuits before any rank/payload work).
-            if session.hooks.has(crate::hooks::HookEvent::SkillMatched) {
-                let matches = crate::skill_match::rank(&task, &session.skills);
-                if let Some(top) = matches.first() {
-                    let p = session
-                        .hook_payload(crate::hooks::HookEvent::SkillMatched)
-                        .with("skill", top.skill.name.clone())
-                        .with("path", top.skill.path.to_string_lossy().into_owned())
-                        .with("score", top.score as u64)
-                        .with("match_count", matches.len() as u64);
-                    session
-                        .hooks
-                        .fire_observe(crate::hooks::HookEvent::SkillMatched, p);
+    let input = if already_hinted {
+        // The brief already carries a skill-awareness block (e.g. an
+        // operator-hinted message quoted into a dispatched worker brief) — leave
+        // the input alone rather than stacking a second block onto it.
+        input
+    } else {
+        match crate::skill_match::hint(&match_task, &session.skills) {
+            Some(note) => {
+                // Observe hook: SkillMatched — an INSTALLED skill cleared the
+                // relevance bar for this turn's task and its SKILL.md note was folded
+                // into the input. Carry the top-ranked skill's name + path (the path
+                // is matchable via the matcher's `path_glob`), its score, and the
+                // total number of matching skills, so a consumer can log which
+                // playbook was surfaced. Observe-only — it can't change the hint. The
+                // registry-recommendation path (no installed match) is a different
+                // event and deliberately does NOT fire this. Zero-cost when no hook is
+                // registered (`has` short-circuits before any rank/payload work).
+                if session.hooks.has(crate::hooks::HookEvent::SkillMatched) {
+                    let matches = crate::skill_match::rank(&match_task, &session.skills);
+                    if let Some(top) = matches.first() {
+                        let p = session
+                            .hook_payload(crate::hooks::HookEvent::SkillMatched)
+                            .with("skill", top.skill.name.clone())
+                            .with("path", top.skill.path.to_string_lossy().into_owned())
+                            .with("score", top.score as u64)
+                            .with("match_count", matches.len() as u64);
+                        session
+                            .hooks
+                            .fire_observe(crate::hooks::HookEvent::SkillMatched, p);
+                    }
                 }
+                // Repo-awareness: when a skill fits AND the working directory has a
+                // `.repospec.json`, remind the model to read that spec first and keep
+                // its conventions in mind while applying the skill. The skill's steps
+                // are generic; the repo spec is project-specific and should win. The
+                // fs check lives here (not in the pure, unit-tested `hint`) since it
+                // depends on `session.cwd`.
+                let note = if session.cwd.join(crate::skill_match::REPOSPEC_FILE).exists() {
+                    format!("{note}\n{}", crate::skill_match::repospec_reminder())
+                } else {
+                    note
+                };
+                format!("{note}\n\n{input}")
             }
-            // Repo-awareness: when a skill fits AND the working directory has a
-            // `.repospec.json`, remind the model to read that spec first and keep
-            // its conventions in mind while applying the skill. The skill's steps
-            // are generic; the repo spec is project-specific and should win. The
-            // fs check lives here (not in the pure, unit-tested `hint`) since it
-            // depends on `session.cwd`.
-            let note = if session.cwd.join(crate::skill_match::REPOSPEC_FILE).exists() {
-                format!("{note}\n{}", crate::skill_match::repospec_reminder())
-            } else {
-                note
-            };
-            format!("{note}\n\n{input}")
+            None => maybe_recommend_skill(&match_task, input, session),
         }
-        None => maybe_recommend_skill(&task, input, session),
     };
     // S9.3: persist the turn input to the per-worker transcript (coordinator
     // run only — None/no-op interactively), so `:attach`/resume can replay the
