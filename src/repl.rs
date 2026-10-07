@@ -2122,84 +2122,95 @@ fn statusline_segments(
     out
 }
 
-/// Keep the pinned escalation banner's status row in sync with the live worker
+/// Keep EVERY pinned escalation banner's status row in sync with the live worker
 /// list. Called from the footer paint path — the only place holding a `Session`
-/// — while the banner's own clock renders the runtime, so the row stays honest
+/// — while each banner's own clock renders its runtime, so the rows stay honest
 /// even on heartbeat-only repaints.
+///
+/// Several escalations can be pinned at once, so this walks all of them and
+/// writes each worker's status into ITS OWN banner (the single-slot banner this
+/// replaced could only ever refresh the newest). The worker list is locked ONCE
+/// and snapshotted, so N banners cost one lock acquisition per paint rather than
+/// N — and no lock is held while writing into the escalation store.
 fn refresh_escalation_status(session: &Session) {
-    let Some(id) = crate::escalation::pinned_id() else {
+    let ids = crate::escalation::pinned_ids();
+    if ids.is_empty() {
         return;
-    };
-    let snapshot = session
+    }
+    let snapshot: Vec<(String, String, String, Option<String>)> = session
         .worker_jobs
         .lock()
         .unwrap()
         .iter()
-        .find(|w| w.id == id)
+        .filter(|w| ids.iter().any(|id| *id == w.id))
         .map(|w| {
             (
+                w.id.clone(),
                 w.status(),
                 w.run_id(),
                 w.transcript_rows().last().map(|(_, text)| text.clone()),
             )
-        });
-    let Some((status, run_id, last)) = snapshot else {
-        return;
-    };
-    // Prefer the lightweight ACTIVITY SUMMARY (see `crate::activity_summary`):
-    // one model-written status-line-sized sentence saying what the worker is
-    // doing, budgeted to this terminal's width. The raw last transcript line is
-    // the fallback — it's whatever the worker happened to print last, so it's
-    // often a tool-call fragment that reads as noise on a pinned banner.
-    //
-    // `cached_summary` throttles its store lookup, which matters here: this runs
-    // on the footer paint path, i.e. on every heartbeat repaint.
-    let summary = session
-        .coordinator_store
-        .as_ref()
-        .and_then(|s| crate::activity_summary::cached_summary(s, &run_id));
-    let activity = summary.or(last);
-    let text = match activity {
-        Some(a) if !a.trim().is_empty() => format!("{status} · {}", a.trim()),
-        _ => status.clone(),
-    };
-    crate::escalation::set_status(&text);
-    refresh_escalation_beat(session, &id);
-    if matches!(status.as_str(), "done" | "failed") {
-        crate::escalation::note_terminal(&id, status == "failed");
+        })
+        .collect();
+    for (id, status, run_id, last) in snapshot {
+        // Prefer the lightweight ACTIVITY SUMMARY (see `crate::activity_summary`):
+        // one model-written status-line-sized sentence saying what the worker is
+        // doing, budgeted to this terminal's width. The raw last transcript line
+        // is the fallback — it's whatever the worker happened to print last, so
+        // it's often a tool-call fragment that reads as noise on a pinned banner.
+        //
+        // `cached_summary` throttles its store lookup, which matters here: this
+        // runs on the footer paint path, i.e. on every heartbeat repaint, once
+        // per pinned banner.
+        let summary = session
+            .coordinator_store
+            .as_ref()
+            .and_then(|s| crate::activity_summary::cached_summary(s, &run_id));
+        let activity = summary.or(last);
+        let text = match activity {
+            Some(a) if !a.trim().is_empty() => format!("{status} · {}", a.trim()),
+            _ => status.clone(),
+        };
+        crate::escalation::set_status(&id, &text);
+        if matches!(status.as_str(), "done" | "failed") {
+            crate::escalation::note_terminal(&id, status == "failed");
+        }
     }
+    refresh_escalation_beats(session, &ids);
 }
 
-/// Feed the pinned banner's liveness heart from the worker's DURABLE heartbeat
+/// Feed every pinned banner's liveness heart from its worker's DURABLE heartbeat
 /// (`coordinator_runs.heartbeat_at`), which the coordinator stamps every ~30s.
 ///
 /// Why this is throttled and why it hands over an ABSOLUTE timestamp: the footer
-/// repaints several times a second to animate, and a SQLite round-trip on every
-/// frame would be a pointless tax on a value that only changes twice a minute.
-/// So we poll at most once per [`BEAT_POLL`] and give the banner the instant of
-/// the beat rather than its age — the banner re-derives the age on each paint,
-/// so the heart still drifts green → yellow → red on its own between polls. A
-/// cheap poll that nonetheless can't go stale.
+/// repaints several times a second to animate, and a SQLite round-trip per banner
+/// on every frame would be a pointless tax on a value that only changes twice a
+/// minute. So we poll at most once per `BEAT_POLL` — ONE window for the whole
+/// stack, then every pinned id in that pass — and give each banner the instant of
+/// its beat rather than the age. The banner re-derives the age on each paint, so
+/// each heart still drifts green → yellow → red on its own between polls.
 ///
 /// Failure-tolerant by construction: no store (ephemeral session) or no row for
-/// this id leaves the beat `None`, which renders the hollow `♡` — "no liveness
-/// claim" — instead of a green heart we have no evidence for.
-fn refresh_escalation_beat(session: &Session, id: &str) {
+/// an id leaves that banner's beat `None`, which renders the hollow `♡` — "no
+/// liveness claim" — instead of a green heart we have no evidence for.
+fn refresh_escalation_beats(session: &Session, ids: &[String]) {
     const BEAT_POLL: std::time::Duration = std::time::Duration::from_secs(3);
     static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
     let Ok(mut last) = LAST.lock() else { return };
     if last.is_some_and(|t| t.elapsed() < BEAT_POLL) {
-        return; // within the throttle window — the banner ages the stored beat
+        return; // within the throttle window — the banners age their stored beats
     }
     *last = Some(std::time::Instant::now());
     drop(last);
 
-    let beat = session
-        .coordinator_store
-        .as_ref()
-        .and_then(|s| s.heartbeat_unix(id));
-    crate::escalation::set_beat(beat);
+    for id in ids {
+        let beat = session
+            .coordinator_store
+            .as_ref()
+            .and_then(|s| s.heartbeat_unix(id));
+        crate::escalation::set_beat(id, beat);
+    }
 }
 
 fn coordinator_status_message(session: &Session) -> String {
