@@ -4781,6 +4781,24 @@ pub(crate) fn run_midturn_command(line: &str, ctx: &OpsCtx) -> Option<String> {
         // through to `dispatch_coordinator_ctx`'s plain usage line. Acceptable:
         // the mid-turn case that matters is `:dispatch <task>`.
         "dispatch" => Some(dispatch_coordinator_ctx(rest, ctx).message),
+        // Steering an in-flight coordinator is the case that needs immediacy
+        // most: queued until the turn ends, a `:tell` arrives after the round it
+        // was meant to change. `:tell goal …` never reaches here — the
+        // classifier keeps that one queued because it needs `&mut Session`.
+        "tell" | "msg" | "send" => {
+            let toks: Vec<&str> = rest.split_whitespace().collect();
+            let (any, toks) = take_any_flag(&toks);
+            let target = toks.first().copied();
+            let message = toks.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
+            Some(tell_coordinator_ctx(target, message.trim(), any, ctx))
+        }
+        // Same reasoning, sharper edge: a stand-down that waits for the turn to
+        // finish keeps paying for the work it was cancelling.
+        "stop" | "standdown" | "stand-down" => {
+            let toks: Vec<&str> = rest.split_whitespace().collect();
+            let (any, toks) = take_any_flag(&toks);
+            Some(stop_coordinator_ctx(toks.first().copied(), any, ctx))
+        }
         _ => None,
     }
 }
@@ -6971,28 +6989,48 @@ fn resolve_tell_target(
 /// short ids shown by `:workers` work. A terminal (finished) run is refused —
 /// nothing would read the message — and an ambiguous prefix lists the matches.
 fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Session) {
-    let Some(id) = id else {
-        println!(
-            "usage: :tell [--any] <worker-id> <message>   — steer an in-flight coordinator (--any: across sessions)"
-        );
-        return;
-    };
-    if message.is_empty() {
-        println!(
-            "usage: :tell [--any] <worker-id> <message>   — steer an in-flight coordinator (--any: across sessions)"
-        );
-        return;
-    }
     // `:tell goal <msg>` steers the active background goal, not a coordinator:
     // the goal has no store row or mailbox, it drains its own steer queue at the
-    // top of each turn. Exact-match so a worker-id prefix never collides.
-    if id == GOAL_ATTACH_ID {
+    // top of each turn. Exact-match so a worker-id prefix never collides. This is
+    // the ONE `:tell` form that needs `&mut Session`, and the reason the mid-turn
+    // classifier keeps it queued (see `midturn_input::runs_immediately`).
+    if id == Some(GOAL_ATTACH_ID) && !message.is_empty() {
         steer_active_goal(message, session);
         return;
     }
-    let Some(store) = session.coordinator_store.clone() else {
-        println!("coordinator store unavailable — can't queue messages");
-        return;
+    let out = tell_coordinator_ctx(id, message, any, &ops_ctx(session));
+    if !out.is_empty() {
+        println!("{out}");
+    }
+}
+
+/// The coordinator-steering half of `:tell`, resolved off an [`OpsCtx`] snapshot
+/// so it can ALSO run mid-turn while the live turn holds `&mut Session` (see
+/// [`run_midturn_command`]). Returns the operator-facing text — possibly several
+/// lines — instead of printing it, so the caller owns the cursor; the mid-turn
+/// path prints into a footer-managed area.
+pub(crate) fn tell_coordinator_ctx(
+    id: Option<&str>,
+    message: &str,
+    any: bool,
+    ctx: &OpsCtx,
+) -> String {
+    const USAGE: &str = "usage: :tell [--any] <worker-id> <message>   — steer an in-flight coordinator (--any: across sessions)";
+    let mut out: Vec<String> = Vec::new();
+    let Some(id) = id else {
+        return USAGE.to_string();
+    };
+    if message.is_empty() {
+        return USAGE.to_string();
+    }
+    if id == GOAL_ATTACH_ID {
+        // Defensive: the classifier routes `:tell goal …` to the queue, so this
+        // is only reachable if that gate ever regresses. Say so rather than
+        // silently dropping the operator's steer.
+        return "`:tell goal …` steers the background goal and needs the session — it is queued and applies when the turn lands".to_string();
+    }
+    let Some(store) = ctx.coordinator_store.clone() else {
+        return "coordinator store unavailable — can't queue messages".to_string();
     };
     let hit = |rid: &str| crate::coordinator::id_matches(rid, id);
 
@@ -7001,12 +7039,12 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
     // message sent immediately after launch still lands — then durable runs from
     // any session (deduped on run_id).
     let mut candidates: Vec<(String, bool, Option<String>)> = Vec::new();
-    for w in session.worker_jobs.lock().unwrap().iter() {
+    for w in ctx.worker_jobs.lock().unwrap().iter() {
         if hit(&w.id) {
             candidates.push((
                 w.id.clone(),
                 matches!(w.status().as_str(), "done" | "failed"),
-                Some(session.session_id.clone()),
+                Some(ctx.session_id.clone()),
             ));
         }
     }
@@ -7029,43 +7067,46 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
     // coordinators your OWN session launched; `--any` opts into another
     // session's. A terminal or unknown-phase run is refused — nothing would read
     // the message — so a `:tell` never becomes a silent no-op (TASK-286).
-    match resolve_tell_target(&candidates, &session.session_id, any) {
+    match resolve_tell_target(&candidates, &ctx.session_id, any) {
         TellTarget::NotFound => {
-            println!("no background coordinator matching '{id}' (see :workers)");
+            out.push(format!(
+                "no background coordinator matching '{id}' (see :workers)"
+            ));
         }
         TellTarget::ForeignOnly => {
-            println!(
+            out.push(format!(
                 "'{id}' matches a coordinator launched by another session — re-run as `:tell --any {id} <message>` to steer it"
-            );
+            ));
         }
         TellTarget::Terminal(run_id) => {
             let short = crate::batch::short_id(&run_id);
-            println!(
+            out.push(format!(
                 "coordinator {short} is finished; unable to send message (`:result {short}` to view its result)"
-            );
+            ));
         }
         TellTarget::Ready(run_id) => {
             let short = crate::batch::short_id(&run_id);
-            match store.enqueue_message(&run_id, message, Some(&session.session_id)) {
+            match store.enqueue_message(&run_id, message, Some(&ctx.session_id)) {
                 Ok(_) => {
                     let pending = store.pending_message_count(&run_id).unwrap_or(0);
-                    println!(
+                    out.push(format!(
                         "\x1b[2m✉ queued for {short} ({pending} pending) — folded in at the start of its next round\x1b[0m"
-                    );
+                    ));
                 }
-                Err(e) => println!("couldn't queue message: {e}"),
+                Err(e) => out.push(format!("couldn't queue message: {e}")),
             }
         }
         TellTarget::Ambiguous(ids) => {
-            println!(
+            out.push(format!(
                 "'{id}' matches {} coordinators — be more specific:",
                 ids.len()
-            );
+            ));
             for rid in ids {
-                println!("  {rid}");
+                out.push(format!("  {rid}"));
             }
         }
     }
+    out.join("\n")
 }
 
 /// `:stop` — stand down an in-flight coordinator: the harsh sibling of `:tell`.
@@ -7134,15 +7175,23 @@ instead of firing.\n\nCondition: {description}"
 }
 
 fn stop_coordinator(id: Option<&str>, any: bool, session: &mut Session) {
+    let out = stop_coordinator_ctx(id, any, &ops_ctx(session));
+    if !out.is_empty() {
+        println!("{out}");
+    }
+}
+
+/// `:stop`, resolved off an [`OpsCtx`] snapshot so it can ALSO run mid-turn (see
+/// [`run_midturn_command`]) — nothing here needs `&mut Session`, which is the
+/// whole point: a stand-down that waits for the turn to end is a coordinator you
+/// keep paying for. Returns the operator-facing text instead of printing it.
+pub(crate) fn stop_coordinator_ctx(id: Option<&str>, any: bool, ctx: &OpsCtx) -> String {
+    let mut out: Vec<String> = Vec::new();
     let Some(id) = id else {
-        println!(
-            "usage: :stop [--any] <worker-id>   — stand down an in-flight coordinator (--any: across sessions)"
-        );
-        return;
+        return "usage: :stop [--any] <worker-id>   — stand down an in-flight coordinator (--any: across sessions)".to_string();
     };
-    let Some(store) = session.coordinator_store.clone() else {
-        println!("coordinator store unavailable — can't stand down a coordinator");
-        return;
+    let Some(store) = ctx.coordinator_store.clone() else {
+        return "coordinator store unavailable — can't stand down a coordinator".to_string();
     };
     let hit = |rid: &str| crate::coordinator::id_matches(rid, id);
 
@@ -7150,12 +7199,12 @@ fn stop_coordinator(id: Option<&str>, any: bool, session: &mut Session) {
     // workers first — their pid is known so we can interrupt the current turn —
     // then durable runs from any session (deduped on run_id; flag-only, no pid).
     let mut candidates: Vec<(String, bool, Option<String>, Option<u32>)> = Vec::new();
-    for w in session.worker_jobs.lock().unwrap().iter() {
+    for w in ctx.worker_jobs.lock().unwrap().iter() {
         if hit(&w.id) {
             candidates.push((
                 w.id.clone(),
                 matches!(w.status().as_str(), "done" | "failed"),
-                Some(session.session_id.clone()),
+                Some(ctx.session_id.clone()),
                 w.pid(),
             ));
         }
@@ -7179,7 +7228,7 @@ fn stop_coordinator(id: Option<&str>, any: bool, session: &mut Session) {
         .iter()
         .filter(|(_, _, owner, _)| {
             matches!(
-                owner_gate(owner.as_deref(), &session.session_id, any),
+                owner_gate(owner.as_deref(), &ctx.session_id, any),
                 OwnerGate::Allow
             )
         })
@@ -7187,27 +7236,23 @@ fn stop_coordinator(id: Option<&str>, any: bool, session: &mut Session) {
         .collect();
     if owned.is_empty() {
         if candidates.is_empty() {
-            println!("no background coordinator matching '{id}' (see :workers)");
-        } else {
-            println!(
-                "'{id}' matches a coordinator launched by another session — re-run as `:stop --any {id}` to stand it down"
-            );
+            return format!("no background coordinator matching '{id}' (see :workers)");
         }
-        return;
+        return format!(
+            "'{id}' matches a coordinator launched by another session — re-run as `:stop --any {id}` to stand it down"
+        );
     }
 
     match owned.as_slice() {
         [(run_id, terminal, _, pid)] => {
             let short = crate::batch::short_id(run_id);
             if *terminal {
-                println!(
+                return format!(
                     "coordinator {short} has already finished — nothing to stand down (`:result {short}` to view its result)"
                 );
-                return;
             }
             if let Err(e) = store.request_stand_down(run_id) {
-                println!("couldn't raise stand-down flag: {e}");
-                return;
+                return format!("couldn't raise stand-down flag: {e}");
             }
             // Best-effort interrupt of the in-flight turn for a worker we own, so
             // the round boundary (where the flag is honored) is reached now rather
@@ -7215,25 +7260,26 @@ fn stop_coordinator(id: Option<&str>, any: bool, session: &mut Session) {
             // group (pgid == pid via the child's setsid()).
             if let Some(pid) = pid {
                 unsafe { libc::kill(-(*pid as i32), libc::SIGINT) };
-                println!(
+                out.push(format!(
                     "\x1b[33m🛑 stand-down ordered for {short}\x1b[0m — turn interrupted; one final wrap-up turn, then it exits"
-                );
+                ));
             } else {
-                println!(
+                out.push(format!(
                     "\x1b[33m🛑 stand-down flag raised for {short}\x1b[0m — it will wrap up and exit at its next round boundary"
-                );
+                ));
             }
         }
         many => {
-            println!(
+            out.push(format!(
                 "'{id}' matches {} coordinators — be more specific:",
                 many.len()
-            );
+            ));
             for (rid, _, _, _) in many {
-                println!("  {rid}");
+                out.push(format!("  {rid}"));
             }
         }
     }
+    out.join("\n")
 }
 
 /// `:context` — show how full the model's context window is, plus the history
@@ -10903,6 +10949,55 @@ mod tests {
         assert!(usage.starts_with("usage: :dispatch"), "got: {usage}");
     }
 
+    // `:tell` / `:stop` must reach their ctx paths DURING the turn — that is the
+    // whole point: steering or standing down a coordinator after the turn it was
+    // meant to change has already landed is useless. `coordinator_store: None`
+    // in the test ctx is the cheapest observable: both bottom out in the
+    // store-unavailable message, which only the real resolution path produces.
+    #[test]
+    fn midturn_tell_and_stop_route_through_the_ctx_paths() {
+        let ctx = test_ops_ctx(false);
+        for line in [
+            ":tell w_abc narrow the scope",
+            ":msg w_abc narrow the scope",
+            ":send --any w_abc narrow the scope",
+        ] {
+            let msg = run_midturn_command(line, &ctx).expect("`{line}` is an immediate command");
+            assert!(
+                msg.contains("can't queue messages"),
+                "mid-turn `{line}` must hit the real tell path: {msg}"
+            );
+        }
+        for line in [":stop w_abc", ":standdown w_abc", ":stand-down --any w_abc"] {
+            let msg = run_midturn_command(line, &ctx).expect("an immediate command");
+            assert!(
+                msg.contains("can't stand down a coordinator"),
+                "mid-turn `{line}` must hit the real stop path: {msg}"
+            );
+        }
+        // Missing operands still print usage rather than acting.
+        assert!(
+            run_midturn_command(":tell", &ctx)
+                .expect("immediate")
+                .starts_with("usage: :tell")
+        );
+        assert!(
+            run_midturn_command(":tell w_abc", &ctx)
+                .expect("immediate")
+                .starts_with("usage: :tell"),
+            "an id with no message is a usage error, not an empty steer"
+        );
+        assert!(
+            run_midturn_command(":stop", &ctx)
+                .expect("immediate")
+                .starts_with("usage: :stop")
+        );
+        // `:tell goal …` is the carve-out: it needs `&mut Session`, so the
+        // classifier keeps it queued and nothing runs here.
+        assert!(run_midturn_command(":tell goal narrow the scope", &ctx).is_none());
+    }
+
+    // Anything the classifier rejects must NOT be executed here — prose and
     // Anything the classifier rejects must NOT be executed here — prose and
     // session-mutating commands stay on the type-ahead queue.
     #[test]
