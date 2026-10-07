@@ -125,10 +125,10 @@ pub fn detect() -> SystemProfile {
 fn detect_total_ram_mb() -> u64 {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
-            if let Some(kb) = parse_meminfo_kb(&contents) {
-                return kb / 1024;
-            }
+        if let Ok(contents) = std::fs::read_to_string("/proc/meminfo")
+            && let Some(kb) = parse_meminfo_kb(&contents)
+        {
+            return kb / 1024;
         }
     }
     #[cfg(target_os = "macos")]
@@ -187,12 +187,11 @@ fn detect_gpu(os: &str, arch: &str) -> (GpuKind, Option<u64>, Option<String>) {
     {
         for card in 0..4 {
             let p = format!("/sys/class/drm/card{card}/device/mem_info_vram_total");
-            if let Ok(s) = std::fs::read_to_string(&p) {
-                if let Ok(bytes) = s.trim().parse::<u64>() {
-                    if bytes > 0 {
-                        return (GpuKind::Amd, Some(bytes / (1024 * 1024)), None);
-                    }
-                }
+            if let Ok(s) = std::fs::read_to_string(&p)
+                && let Ok(bytes) = s.trim().parse::<u64>()
+                && bytes > 0
+            {
+                return (GpuKind::Amd, Some(bytes / (1024 * 1024)), None);
             }
         }
     }
