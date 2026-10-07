@@ -2520,7 +2520,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("output", "stream coordinators' activity (on|off)"),
     (
         "plugin",
-        "plugins (list|info|enable|disable|reload|add|remove <id>)",
+        "plugins (list|info|enable|disable|reload|errors|add|remove <id>)",
     ),
     ("quit", "exit aish"),
     (
@@ -7611,6 +7611,7 @@ fn reapply_plugin_runtime(session: &mut Session, dir: &Path) -> Vec<String> {
 ///   :plugin memory <id> set <namespace> <key> <value…>   # value parsed as JSON, else string
 ///   :plugin memory <id> delete <namespace> <key>         # remove a key
 ///   :plugin memory <id> clear <namespace> [yes]          # empty a namespace (needs `yes`)
+///   :plugin memory <id> errors [N]                       # alias of `:plugin errors <id> [N]`
 fn handle_plugin_memory(args: &[&str]) {
     let mem = crate::plugin_memory::global();
     let verbs = ["get", "set", "delete", "del", "clear"];
@@ -8503,11 +8504,12 @@ async fn handle_colon(
                  :mcp remove <name>                  disconnect + unsave an MCP server\n\
                  :mcp tools [name]                   list MCP tools\n\
                  :mcp test [name|all]                live-probe MCP server(s) — tools/list round-trip + latency\n\
-                 :plugin [list]                      installed plugins (disabled ones marked)\n\
+                 :plugin [list]                      installed plugins + health (ok|disabled|config-invalid|N recent errors)\n\
                  :plugin info <id>                   one plugin's provenance (hooks, MCP, skills, enabled)\n\
                  :plugin enable|disable <id>         toggle a plugin (saved in ~/.aish/plugins.state.json);\n\
                                                      hooks/timers/webhooks apply now, MCP + skills on :restart\n\
                  :plugin reload [id]                 re-load plugin hooks/timers/webhooks (+ re-run <id>'s on_init)\n\
+                 :plugin errors <id> [N]             a plugin's error log, newest N (default 20) — config/hook/webhook failures\n\
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
                  :context                            show context-window usage (tokens, %, memories)\n\
@@ -11432,6 +11434,20 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    /// TASK-274: the `:` palette's `plugin` description lists every user-facing
+    /// `:plugin` subcommand (incl. `errors`), so the palette can't drift.
+    #[test]
+    fn plugin_palette_description_lists_subcommands() {
+        let desc = COLON_COMMANDS
+            .iter()
+            .find(|(n, _)| *n == "plugin")
+            .map(|(_, d)| *d)
+            .expect("plugin in palette");
+        for sub in PLUGIN_SUBCOMMANDS.iter().filter(|s| **s != "memory") {
+            assert!(desc.contains(sub), "palette missing `{sub}`: {desc}");
+        }
     }
 
     /// TASK-274: `:plugin errors <id> [N]` rendering.
