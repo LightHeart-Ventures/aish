@@ -5,6 +5,8 @@
 //! broker's throughput profile and mirror how the parent `aish` crate uses
 //! SQLite. Handlers call these helpers directly.
 
+use std::collections::BTreeMap;
+
 use r2d2_sqlite::SqliteConnectionManager;
 use tracing::info;
 
@@ -128,7 +130,13 @@ pub fn register_client(
         ],
     )?;
 
-    audit(pool, "client_registered", Some(tenant_id), Some(plugin_id), None);
+    audit(
+        pool,
+        "client_registered",
+        Some(tenant_id),
+        Some(plugin_id),
+        None,
+    );
 
     Ok(ClientRow {
         client_id,
@@ -187,7 +195,15 @@ pub fn validate_session(pool: &DbPool, session_token: &str) -> Result<Option<Cli
 
 /// Persist a webhook. Enforces `max_queue_size` per (tenant, plugin) by dropping
 /// the oldest undelivered rows. Returns `QueueFull` only if the cap is 0.
-pub fn insert_webhook(pool: &DbPool, wh: &Webhook, ttl_secs: u64, max_queue: usize) -> Result<()> {
+///
+/// On success returns the number of undelivered rows evicted by the cap
+/// (reported as `dropped` on `/stats`).
+pub fn insert_webhook(
+    pool: &DbPool,
+    wh: &Webhook,
+    ttl_secs: u64,
+    max_queue: usize,
+) -> Result<usize> {
     if max_queue == 0 {
         return Err(BrokerError::QueueFull);
     }
@@ -195,8 +211,8 @@ pub fn insert_webhook(pool: &DbPool, wh: &Webhook, ttl_secs: u64, max_queue: usi
     let tx = conn.transaction()?;
 
     let ttl_expires = (wh.received_at + chrono::Duration::seconds(ttl_secs as i64)).to_rfc3339();
-    let payload_str = serde_json::to_string(&wh.payload)
-        .map_err(|e| BrokerError::InvalidJson(e.to_string()))?;
+    let payload_str =
+        serde_json::to_string(&wh.payload).map_err(|e| BrokerError::InvalidJson(e.to_string()))?;
 
     tx.execute(
         "INSERT INTO webhooks
@@ -214,7 +230,7 @@ pub fn insert_webhook(pool: &DbPool, wh: &Webhook, ttl_secs: u64, max_queue: usi
     )?;
 
     // Bound the queue: drop oldest undelivered beyond the cap (FIFO overflow).
-    tx.execute(
+    let dropped = tx.execute(
         "DELETE FROM webhooks WHERE id IN (
             SELECT id FROM webhooks
             WHERE tenant_id = ?1 AND plugin_id = ?2 AND delivered = 0
@@ -225,7 +241,7 @@ pub fn insert_webhook(pool: &DbPool, wh: &Webhook, ttl_secs: u64, max_queue: usi
     )?;
 
     tx.commit()?;
-    Ok(())
+    Ok(dropped)
 }
 
 /// Count undelivered webhooks for a (tenant, plugin).
@@ -320,15 +336,125 @@ pub fn mark_delivered(
     Ok(n > 0)
 }
 
-/// Delete expired webhooks (TTL cleanup). Returns the number removed.
-pub fn ttl_cleanup(pool: &DbPool) -> Result<usize> {
+/// Durable per-(tenant, plugin) row counts, for `/stats`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyCounts {
+    pub tenant_id: String,
+    pub plugin_id: String,
+    /// Undelivered rows.
+    pub queued: u64,
+    /// Acknowledged rows still retained (until their TTL).
+    pub acked: u64,
+}
+
+fn key_entry<T: Default>(
+    map: &mut BTreeMap<(String, String), T>,
+    tenant_id: String,
+    plugin_id: String,
+) -> &mut T {
+    map.entry((tenant_id, plugin_id)).or_default()
+}
+
+/// Count queued/acked webhooks per (tenant, plugin). Registered keys with no
+/// webhooks are included with zero counts. Sorted by key. Reads only routing
+/// keys and the `delivered` flag — never payloads, secrets or tokens.
+pub fn count_by_key(pool: &DbPool) -> Result<Vec<KeyCounts>> {
     let conn = pool.get()?;
-    let now = chrono::Utc::now().to_rfc3339();
-    let n = conn.execute(
-        "DELETE FROM webhooks WHERE ttl_expires_at < ?1",
-        rusqlite::params![now],
+    let mut by_key: BTreeMap<(String, String), KeyCounts> = BTreeMap::new();
+
+    let mut stmt = conn.prepare("SELECT DISTINCT tenant_id, plugin_id FROM clients")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for r in rows {
+        let (t, p) = r?;
+        key_entry(&mut by_key, t, p);
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT tenant_id, plugin_id,
+                SUM(CASE WHEN delivered = 0 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN delivered = 0 THEN 0 ELSE 1 END)
+         FROM webhooks
+         GROUP BY tenant_id, plugin_id",
     )?;
-    Ok(n)
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    for r in rows {
+        let (t, p, queued, acked) = r?;
+        let e = key_entry(&mut by_key, t, p);
+        e.queued = queued.max(0) as u64;
+        e.acked = acked.max(0) as u64;
+    }
+
+    Ok(by_key
+        .into_iter()
+        .map(|((tenant_id, plugin_id), c)| KeyCounts {
+            tenant_id,
+            plugin_id,
+            ..c
+        })
+        .collect())
+}
+
+/// Per-(tenant, plugin) result of a TTL sweep.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExpiredCounts {
+    pub tenant_id: String,
+    pub plugin_id: String,
+    /// Expired rows that were never acknowledged (lost webhooks).
+    pub undelivered: u64,
+    /// Expired rows that had been acknowledged (normal retention ageing).
+    pub acked: u64,
+}
+
+/// Delete expired webhooks (TTL cleanup) as of now. Returns per-key counts of
+/// the removed rows, sorted by key.
+pub fn ttl_cleanup(pool: &DbPool) -> Result<Vec<ExpiredCounts>> {
+    ttl_cleanup_at(pool, chrono::Utc::now())
+}
+
+/// Delete webhooks whose TTL expired before `now`. Returns per-key counts.
+pub fn ttl_cleanup_at(
+    pool: &DbPool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<ExpiredCounts>> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare(
+        "DELETE FROM webhooks WHERE ttl_expires_at < ?1
+         RETURNING tenant_id, plugin_id, delivered",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![now.to_rfc3339()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut by_key: BTreeMap<(String, String), ExpiredCounts> = BTreeMap::new();
+    for r in rows {
+        let (t, p, delivered) = r?;
+        let e = key_entry(&mut by_key, t, p);
+        if delivered == 0 {
+            e.undelivered += 1;
+        } else {
+            e.acked += 1;
+        }
+    }
+    Ok(by_key
+        .into_iter()
+        .map(|((tenant_id, plugin_id), c)| ExpiredCounts {
+            tenant_id,
+            plugin_id,
+            ..c
+        })
+        .collect())
 }
 
 /// Best-effort audit trail write (never fails the caller).
