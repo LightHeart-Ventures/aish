@@ -726,10 +726,10 @@ fn flatten(v: &Value) -> BatchResult {
         let mut s = String::new();
         if let Some(blocks) = result["message"]["content"].as_array() {
             for b in blocks {
-                if b["type"] == "text" {
-                    if let Some(t) = b["text"].as_str() {
-                        s.push_str(t);
-                    }
+                if b["type"] == "text"
+                    && let Some(t) = b["text"].as_str()
+                {
+                    s.push_str(t);
                 }
             }
         }

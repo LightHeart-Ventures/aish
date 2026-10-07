@@ -191,10 +191,10 @@ pub fn sanitize(raw: &str, budget: usize) -> Option<String> {
         }
     }
     // A status line is a fragment, not a sentence — drop a trailing period.
-    if let Some(rest) = s.strip_suffix('.') {
-        if !rest.ends_with('.') {
-            s = rest.trim_end().to_string();
-        }
+    if let Some(rest) = s.strip_suffix('.')
+        && !rest.ends_with('.')
+    {
+        s = rest.trim_end().to_string();
     }
     if s.is_empty() {
         return None;
@@ -308,10 +308,10 @@ pub fn cached_summary(
 ) -> Option<String> {
     let now = std::time::Instant::now();
     let mut guard = cache().lock().unwrap();
-    if let Some((at, val)) = guard.get(run_id) {
-        if now.duration_since(*at) < POLL_INTERVAL {
-            return val.clone();
-        }
+    if let Some((at, val)) = guard.get(run_id)
+        && now.duration_since(*at) < POLL_INTERVAL
+    {
+        return val.clone();
     }
     let fresh = store.activity_summary(run_id);
     guard.insert(run_id.to_string(), (now, fresh.clone()));

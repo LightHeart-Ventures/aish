@@ -42,10 +42,10 @@ fn struct_fields(src: &str, name: &str) -> Vec<String> {
             continue;
         }
         if let Some(rest) = t.strip_prefix("pub ") {
-            if let Some((field, _)) = rest.split_once(':') {
-                if !skip {
-                    fields.push(rename.take().unwrap_or_else(|| field.trim().to_string()));
-                }
+            if let Some((field, _)) = rest.split_once(':')
+                && !skip
+            {
+                fields.push(rename.take().unwrap_or_else(|| field.trim().to_string()));
             }
             rename = None;
             skip = false;

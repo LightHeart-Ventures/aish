@@ -294,15 +294,13 @@ pub struct TelemetryCache {
 /// tool calls happened — exactly when the numbers wouldn't have changed anyway.
 pub fn aggregate_cached(session: &mut Session) -> Option<TelemetryCache> {
     // No store ⇒ nothing to aggregate.
-    if session.db.is_none() {
-        return None;
-    }
+    session.db.as_ref()?;
 
     // Fresh cache hit: serve the snapshot, no DB scan.
-    if let Some(c) = &session.tool_telemetry_cache {
-        if c.cached_at.elapsed() < session.tool_telemetry_cache_secs {
-            return Some(c.clone());
-        }
+    if let Some(c) = &session.tool_telemetry_cache
+        && c.cached_at.elapsed() < session.tool_telemetry_cache_secs
+    {
+        return Some(c.clone());
     }
 
     // Miss (empty, stale, or TTL=0): re-aggregate and repopulate the cache.

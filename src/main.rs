@@ -640,10 +640,10 @@ async fn main() -> Result<()> {
 
     // Restore the persisted interactive-batch-mode flag. On by default; a prior
     // `:batch off` is honored across restarts (unset → stays on).
-    if let Some(db) = &session.db {
-        if let Ok(Some(v)) = db.get_setting("batch_mode") {
-            session.batch_mode = v == "true";
-        }
+    if let Some(db) = &session.db
+        && let Ok(Some(v)) = db.get_setting("batch_mode")
+    {
+        session.batch_mode = v == "true";
     }
 
     // TASK-277 AC2: load the persistent goal hierarchy from aish.db on start.
@@ -727,19 +727,19 @@ async fn main() -> Result<()> {
             // Adopt the LAUNCHING session's identity so every durable record this
             // coordinator writes is attributed to the session that asked for the
             // work, not to this child's throwaway uuid (set in Session::new).
-            if let Ok(sid) = std::env::var("AISH_LAUNCH_SESSION_ID") {
-                if !sid.is_empty() {
-                    session.session_id = sid;
-                    // Re-export so any children THIS coordinator spawns inherit
-                    // the launching session's id too (the env still carries the
-                    // child's throwaway uuid from the startup export above).
-                    session.set_var("AISH_SESSION_ID", session.session_id.clone());
-                }
+            if let Ok(sid) = std::env::var("AISH_LAUNCH_SESSION_ID")
+                && !sid.is_empty()
+            {
+                session.session_id = sid;
+                // Re-export so any children THIS coordinator spawns inherit
+                // the launching session's id too (the env still carries the
+                // child's throwaway uuid from the startup export above).
+                session.set_var("AISH_SESSION_ID", session.session_id.clone());
             }
-            if let Ok(name) = std::env::var("AISH_LAUNCH_SESSION_NAME") {
-                if !name.is_empty() {
-                    session.name = Some(name);
-                }
+            if let Ok(name) = std::env::var("AISH_LAUNCH_SESSION_NAME")
+                && !name.is_empty()
+            {
+                session.name = Some(name);
             }
             session.output_json = matches!(args.output, OutputFormat::Json);
             // Broken-pipe shield. Our stdout/stderr are pipes owned by the

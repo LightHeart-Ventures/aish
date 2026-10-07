@@ -151,7 +151,7 @@ pub fn url_len(s: &str) -> Option<usize> {
                     b']' => ('[', ']'),
                     _ => ('{', '}'),
                 };
-                if short.matches(open_c).count() >= short.matches(close_c).count() + 1 {
+                if short.matches(open_c).count() > short.matches(close_c).count() {
                     trimmed
                 } else {
                     short

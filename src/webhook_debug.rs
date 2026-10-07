@@ -69,12 +69,11 @@ pub fn delivery_sink(
             if let Err(e) = log.append(&rec) {
                 tracing::warn!(error = %e, plugin_id = %rec.plugin_id, "webhook delivery log write failed");
             }
-            if plugins_dir.join(&rec.plugin_id).is_dir() {
-                if let Err(e) =
+            if plugins_dir.join(&rec.plugin_id).is_dir()
+                && let Err(e) =
                     memory.set(&rec.plugin_id, "webhooks", "last_delivery", rec.metadata())
-                {
-                    tracing::warn!(error = %e, plugin_id = %rec.plugin_id, "webhook last_delivery memory write failed");
-                }
+            {
+                tracing::warn!(error = %e, plugin_id = %rec.plugin_id, "webhook last_delivery memory write failed");
             }
         }
     })

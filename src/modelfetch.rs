@@ -563,14 +563,14 @@ async fn download_attempt(
 
     // Short body ⇒ the connection dropped mid-transfer without erroring. Keep
     // the partial bytes and let the retry loop resume from the new offset.
-    if let Some(t) = total {
-        if downloaded < t {
-            return Err(transient(anyhow!(
-                "truncated transfer: {} of {}",
-                fmt_bytes(downloaded),
-                fmt_bytes(t)
-            )));
-        }
+    if let Some(t) = total
+        && downloaded < t
+    {
+        return Err(transient(anyhow!(
+            "truncated transfer: {} of {}",
+            fmt_bytes(downloaded),
+            fmt_bytes(t)
+        )));
     }
     Ok(())
 }

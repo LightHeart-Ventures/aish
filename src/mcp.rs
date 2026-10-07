@@ -676,7 +676,7 @@ impl McpHost {
         };
 
         // On stdio broken-pipe (dead child process), reconnect once and retry.
-        let result = if first.as_ref().err().map_or(false, is_broken_pipe) {
+        let result = if first.as_ref().err().is_some_and(is_broken_pipe) {
             eprintln!("\x1b[33maish:\x1b[0m mcp:{server_name} disconnected — reconnecting…");
             self.reconnect(server_name)
                 .await
@@ -873,10 +873,8 @@ pub(crate) fn load_profile(file: &str, profile: &str) -> HashMap<String, String>
         let line = line.trim();
         if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
             in_section = section == profile;
-        } else if in_section {
-            if let Some((k, v)) = line.split_once('=') {
-                vars.insert(k.trim().to_string(), v.trim().to_string());
-            }
+        } else if in_section && let Some((k, v)) = line.split_once('=') {
+            vars.insert(k.trim().to_string(), v.trim().to_string());
         }
     }
     vars
@@ -957,38 +955,34 @@ impl McpServer {
         // Prompts are how servers publish skills/playbooks. Fetch the catalog
         // when the server advertises the capability; a failure here must not
         // take the server down — its tools still work.
-        if init["capabilities"]["prompts"].is_object() {
-            if let Ok(listed) = server
+        if init["capabilities"]["prompts"].is_object()
+            && let Ok(listed) = server
                 .request("prompts/list", json!({}), STARTUP_TIMEOUT)
                 .await
+        {
+            for p in listed["prompts"]
+                .as_array()
+                .map(|a| a.as_slice())
+                .unwrap_or_default()
             {
-                for p in listed["prompts"]
-                    .as_array()
-                    .map(|a| a.as_slice())
-                    .unwrap_or_default()
-                {
-                    if let Some(prompt_name) = p["name"].as_str() {
-                        let args = p["arguments"]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|arg| {
-                                        arg["name"].as_str().map(|n| {
-                                            (
-                                                n.to_string(),
-                                                arg["required"].as_bool().unwrap_or(false),
-                                            )
-                                        })
+                if let Some(prompt_name) = p["name"].as_str() {
+                    let args = p["arguments"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|arg| {
+                                    arg["name"].as_str().map(|n| {
+                                        (n.to_string(), arg["required"].as_bool().unwrap_or(false))
                                     })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        server.prompts.push(McpPrompt {
-                            name: prompt_name.to_string(),
-                            description: p["description"].as_str().unwrap_or_default().to_string(),
-                            args,
-                        });
-                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    server.prompts.push(McpPrompt {
+                        name: prompt_name.to_string(),
+                        description: p["description"].as_str().unwrap_or_default().to_string(),
+                        args,
+                    });
                 }
             }
         }

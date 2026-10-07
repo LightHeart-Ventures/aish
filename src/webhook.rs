@@ -87,10 +87,10 @@ impl Default for WebhookStatus {
 /// last hop of "hello-world plugin received a broker webhook → SecondStatusLine".
 pub fn flash_sink_from_slot(slot: Arc<Mutex<Option<String>>>) -> FlashSink {
     Arc::new(move |stdout: String| {
-        if let Some(msg) = crate::plugin_dispatcher::nline_message(&stdout) {
-            if let Ok(mut s) = slot.lock() {
-                *s = Some(msg);
-            }
+        if let Some(msg) = crate::plugin_dispatcher::nline_message(&stdout)
+            && let Ok(mut s) = slot.lock()
+        {
+            *s = Some(msg);
         }
     })
 }

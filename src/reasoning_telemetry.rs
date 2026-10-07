@@ -232,10 +232,10 @@ impl ReasoningEvent {
 /// Resolve the telemetry log path: `$AISH_REASONING_LOG` when set (used by
 /// tests), else `~/.aish/reasoning-telemetry.jsonl`.
 pub fn log_path() -> PathBuf {
-    if let Ok(p) = std::env::var("AISH_REASONING_LOG") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
+    if let Ok(p) = std::env::var("AISH_REASONING_LOG")
+        && !p.is_empty()
+    {
+        return PathBuf::from(p);
     }
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
         .join(".aish")
@@ -601,10 +601,10 @@ struct Memo {
 /// Path of the aggregate memo: `AISH_REASONING_MEMO` when set, else the sibling
 /// `…-memo.json` next to the log (default `~/.aish/reasoning-telemetry-memo.json`).
 pub fn memo_path() -> PathBuf {
-    if let Ok(p) = std::env::var("AISH_REASONING_MEMO") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
+    if let Ok(p) = std::env::var("AISH_REASONING_MEMO")
+        && !p.is_empty()
+    {
+        return PathBuf::from(p);
     }
     let log = log_path();
     let parent = log.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -734,10 +734,9 @@ fn fold_line(memo: &mut Memo, line: &str) {
         if let (Some(id), Some(oc)) = (
             v.get("id").and_then(|i| i.as_str()),
             v.get("outcome").and_then(|o| o.as_str()),
-        ) {
-            if let Some(oc) = Outcome::parse(oc) {
-                apply_outcome_line(memo, id, oc);
-            }
+        ) && let Some(oc) = Outcome::parse(oc)
+        {
+            apply_outcome_line(memo, id, oc);
         }
     } else if let Ok(ev) = serde_json::from_value::<ReasoningEvent>(v) {
         add_event(memo, &ev);
@@ -801,10 +800,11 @@ fn full_recompute() -> Option<Memo> {
     // only the active file's line count feeds the incremental cursor.
     for n in (1..=MAX_ARCHIVES).rev() {
         if let Ok(f) = std::fs::File::open(archive_path(&path, n)) {
-            for line_res in BufReader::new(flate2::read::GzDecoder::new(f)).lines() {
-                if let Ok(line) = line_res {
-                    fold_line(&mut memo, &line);
-                }
+            for line in BufReader::new(flate2::read::GzDecoder::new(f))
+                .lines()
+                .flatten()
+            {
+                fold_line(&mut memo, &line);
             }
         }
     }
@@ -874,20 +874,20 @@ pub fn summarize() -> Summary {
         return Summary::default();
     };
 
-    if !force_rescan() {
-        if let Some(head) = load_head() {
-            // Fresh: neither the content nor the mtime moved → O(1) return.
-            if head.source_len == cur_len && head.source_mtime == cur_mtime {
-                return head.to_summary();
-            }
-            // Grew (append-only): fold only the new tail.
-            if cur_len > head.source_len {
-                let memo = incremental(head);
-                write_memo(&memo);
-                return memo.head.to_summary();
-            }
-            // Shrank / rewritten-in-place / same-len-new-mtime → fall through.
+    if !force_rescan()
+        && let Some(head) = load_head()
+    {
+        // Fresh: neither the content nor the mtime moved → O(1) return.
+        if head.source_len == cur_len && head.source_mtime == cur_mtime {
+            return head.to_summary();
         }
+        // Grew (append-only): fold only the new tail.
+        if cur_len > head.source_len {
+            let memo = incremental(head);
+            write_memo(&memo);
+            return memo.head.to_summary();
+        }
+        // Shrank / rewritten-in-place / same-len-new-mtime → fall through.
     }
 
     // Full recompute (memo missing, stale, forced, truncated, or rotated).

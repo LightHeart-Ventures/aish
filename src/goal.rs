@@ -595,11 +595,12 @@ pub(crate) fn live_descendant_runs(
     for _ in 0..=rows.len() {
         let mut grew = false;
         for r in rows {
-            if let Some(parent) = r.parent_run_id.as_deref() {
-                if family.contains(parent) && !family.contains(r.run_id.as_str()) {
-                    family.insert(r.run_id.as_str());
-                    grew = true;
-                }
+            if let Some(parent) = r.parent_run_id.as_deref()
+                && family.contains(parent)
+                && !family.contains(r.run_id.as_str())
+            {
+                family.insert(r.run_id.as_str());
+                grew = true;
             }
         }
         if !grew {

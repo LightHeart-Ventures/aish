@@ -446,11 +446,11 @@ pub fn skill_match<'a>(task: &str, repo: Option<&str>, skills: &'a [Skill]) -> V
         }
 
         // (4) Repo-scope multiplier.
-        if let Some(r) = &repo_l {
-            if skill.applies_to.iter().any(|a| a == r) {
-                score *= REPO_BOOST;
-                reasons.push(format!("applies-to '{r}' ×{REPO_BOOST}"));
-            }
+        if let Some(r) = &repo_l
+            && skill.applies_to.iter().any(|a| a == r)
+        {
+            score *= REPO_BOOST;
+            reasons.push(format!("applies-to '{r}' ×{REPO_BOOST}"));
         }
 
         scored.push(Scored {

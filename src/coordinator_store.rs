@@ -926,7 +926,6 @@ impl CoordinatorStore {
              AND (strftime('%s', 'now') - strftime('%s', heartbeat_at)) > ?",
             [STALL_THRESHOLD_SECS],
         )
-        .map(|count| count as usize)
         .map_err(Into::into)
     }
 
@@ -1307,23 +1306,25 @@ impl CoordinatorStore {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        if let Some((holder, expires_at, released)) = existing {
-            if holder != owner_run && released == 0 && expires_at > now {
-                let holder_phase: Option<String> = tx
-                    .query_row(
-                        "SELECT phase FROM coordinator_runs WHERE run_id = ?1",
-                        rusqlite::params![holder],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                let holder_live = !matches!(holder_phase.as_deref(), Some("done") | Some("failed"));
-                if holder_live {
-                    anyhow::bail!(
-                        "work package already claimed by run `{holder}` (lease valid for another \
+        if let Some((holder, expires_at, released)) = existing
+            && holder != owner_run
+            && released == 0
+            && expires_at > now
+        {
+            let holder_phase: Option<String> = tx
+                .query_row(
+                    "SELECT phase FROM coordinator_runs WHERE run_id = ?1",
+                    rusqlite::params![holder],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let holder_live = !matches!(holder_phase.as_deref(), Some("done") | Some("failed"));
+            if holder_live {
+                anyhow::bail!(
+                    "work package already claimed by run `{holder}` (lease valid for another \
 {}s) — do NOT re-dispatch it: monitor that run, `tell` it, or `stop` it first",
-                        expires_at - now
-                    );
-                }
+                    expires_at - now
+                );
             }
         }
         tx.execute(

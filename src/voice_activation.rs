@@ -109,10 +109,10 @@ pub fn match_activation(transcript: &str, activation_word: &str) -> Activation {
         return Activation::Ignored;
     }
     // Word boundary: "aisha" must not activate.
-    if let Some(&(_, c)) = chars.get(i) {
-        if c.is_alphanumeric() {
-            return Activation::Ignored;
-        }
+    if let Some(&(_, c)) = chars.get(i)
+        && c.is_alphanumeric()
+    {
+        return Activation::Ignored;
     }
 
     let rest_at = chars.get(i).map(|(b, _)| *b).unwrap_or(trimmed.len());

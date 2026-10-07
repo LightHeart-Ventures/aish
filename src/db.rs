@@ -169,12 +169,10 @@ impl Db {
         }
 
         // Test 2: Can we access critical tables (memories, history)?
-        let tables_ok = self
-            .conn
-            .execute_batch("SELECT 1 FROM memories LIMIT 1; SELECT 1 FROM history LIMIT 1;")
-            .is_ok();
 
-        tables_ok
+        self.conn
+            .execute_batch("SELECT 1 FROM memories LIMIT 1; SELECT 1 FROM history LIMIT 1;")
+            .is_ok()
     }
 
     /// Get database WAL checkpoint mode and current file sizes for diagnostics.

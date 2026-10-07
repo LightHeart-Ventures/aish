@@ -35,10 +35,10 @@ impl GrokAuth {
     /// Prefer the subscription OAuth token (`~/.grok/auth.json`) when present,
     /// else a metered `XAI_API_KEY` from the rc exports or process env.
     fn resolve(extra: &[(String, String)]) -> Result<Self> {
-        if let Some(p) = grok_auth_path() {
-            if p.exists() {
-                return Ok(GrokAuth::OAuthFile(p));
-            }
+        if let Some(p) = grok_auth_path()
+            && p.exists()
+        {
+            return Ok(GrokAuth::OAuthFile(p));
         }
         if let Some(key) = crate::rc::env_value(extra, "XAI_API_KEY") {
             return Ok(GrokAuth::ApiKey(key));

@@ -130,10 +130,10 @@ where
     let schema = manifest.config_schema.clone().unwrap_or(Value::Null);
     let mut config = file.clone();
     for (k, prop) in schema_properties(&schema) {
-        if !config.contains_key(&k) {
-            if let Some(def) = prop.get("default") {
-                config.insert(k, def.clone());
-            }
+        if !config.contains_key(&k)
+            && let Some(def) = prop.get("default")
+        {
+            config.insert(k, def.clone());
         }
     }
     let resolved =

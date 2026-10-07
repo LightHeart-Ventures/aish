@@ -174,7 +174,11 @@ fn parse_add_result(output: &str, reference: &str) -> Result<Vec<SkillMetadata>>
 
     // Otherwise, treat as raw SKILL.md text and synthesize metadata.
     // Extract the skill name from the reference (e.g. "owner/skill-name" → "skill-name").
-    let skill_name = reference.split('/').last().unwrap_or(reference).to_string();
+    let skill_name = reference
+        .split('/')
+        .next_back()
+        .unwrap_or(reference)
+        .to_string();
 
     Ok(vec![SkillMetadata {
         path: skill_name,

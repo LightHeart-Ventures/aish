@@ -116,10 +116,10 @@ fn gate_path(
             // Grant the file's parent directory recursively for this permission.
             // No derivable parent (a bare name or the filesystem root) → behaves
             // like a one-time allow.
-            if let Some(dir) = path.parent() {
-                if !dir.as_os_str().is_empty() {
-                    session.allow_path_dir(perm.as_str(), dir);
-                }
+            if let Some(dir) = path.parent()
+                && !dir.as_os_str().is_empty()
+            {
+                session.allow_path_dir(perm.as_str(), dir);
             }
             true
         }
@@ -161,10 +161,10 @@ fn gate_delete(
         }
         Decision::AllowDir => {
             for p in &paths {
-                if let Some(dir) = p.parent() {
-                    if !dir.as_os_str().is_empty() {
-                        session.allow_path_dir(Perm::Delete.as_str(), dir);
-                    }
+                if let Some(dir) = p.parent()
+                    && !dir.as_os_str().is_empty()
+                {
+                    session.allow_path_dir(Perm::Delete.as_str(), dir);
                 }
             }
             true
@@ -1195,23 +1195,23 @@ async fn run_program(
     // shared main). Unattended (yolo or a background coordinator) → hard refuse;
     // interactive → require an explicit y/N (not the always-allow gate, so this
     // can't be permanently waved through). Branch + PR is the only sanctioned path.
-    if bin_name(&program) == "git" {
-        if let Some(reason) = git_default_branch_guard(&args, &session.cwd) {
-            if session.mode == crate::session::Mode::Yolo || session.nested {
-                anyhow::bail!(
-                    "refused: this command would {reason}. aish does not let an agent touch the \
+    if bin_name(&program) == "git"
+        && let Some(reason) = git_default_branch_guard(&args, &session.cwd)
+    {
+        if session.mode == crate::session::Mode::Yolo || session.nested {
+            anyhow::bail!(
+                "refused: this command would {reason}. aish does not let an agent touch the \
 default branch directly — create a feature branch (git checkout -b …), commit there, push the \
 branch, and open a pull request (gh pr create) instead."
-                );
-            }
-            if confirm(&format!(
-                "⚠ this git command would {reason}, bypassing review — proceed anyway?"
-            )) == Decision::Deny
-            {
-                return Ok(
+            );
+        }
+        if confirm(&format!(
+            "⚠ this git command would {reason}, bypassing review — proceed anyway?"
+        )) == Decision::Deny
+        {
+            return Ok(
                     "declined — use a feature branch + pull request instead of touching the default branch".into(),
                 );
-            }
         }
     }
 
@@ -1436,23 +1436,23 @@ pub fn install_external_printer(printer: Box<dyn crate::editor::LinePrinter>) {
 /// [`announce`] / [`announce_raw`] and directly by the background-result
 /// presenter so every above-the-prompt write shares the one serialised printer.
 pub fn print_above_prompt(text: String) -> bool {
-    if let Ok(mut slot) = printer_slot().lock() {
-        if let Some(printer) = slot.as_mut() {
-            // When the editor's idle-poll loop drew its own raw prompt, rustyline
-            // has no edit-state to erase it, so the row would glue onto the
-            // `prompt> ` line. Wipe the stranded prompt line ourselves (still
-            // inside the printer mutex, so it's serialised against other worker
-            // streams) and flag the loop to repaint the prompt afterward.
-            if IDLE_PROMPT_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
-                use std::io::Write;
-                let mut out = std::io::stdout();
-                let _ = write!(out, "\r\x1b[2K");
-                let _ = out.flush();
-                IDLE_PROMPT_DIRTY.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-            printer.print(to_crlf(&text));
-            return true;
+    if let Ok(mut slot) = printer_slot().lock()
+        && let Some(printer) = slot.as_mut()
+    {
+        // When the editor's idle-poll loop drew its own raw prompt, rustyline
+        // has no edit-state to erase it, so the row would glue onto the
+        // `prompt> ` line. Wipe the stranded prompt line ourselves (still
+        // inside the printer mutex, so it's serialised against other worker
+        // streams) and flag the loop to repaint the prompt afterward.
+        if IDLE_PROMPT_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = write!(out, "\r\x1b[2K");
+            let _ = out.flush();
+            IDLE_PROMPT_DIRTY.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+        printer.print(to_crlf(&text));
+        return true;
     }
     false
 }
@@ -1790,41 +1790,39 @@ fn durable_job_output(q: &str, session: &Session) -> Result<String> {
 
     // Durable coordinator runs from the shared store (any session, survives
     // restart/compaction).
-    if let Some(store) = &session.coordinator_store {
-        if let Ok(rows) = store.load_all() {
-            if let Some(r) = rows.iter().find(|r| hit(&r.run_id)) {
-                let body = r
-                    .result
-                    .clone()
-                    .or_else(|| r.error.clone())
-                    .unwrap_or_else(|| format!("(no result yet — phase: {})", r.phase));
-                return Ok(format!(
-                    "[{} {}]\nTask: {}\n\n{}",
-                    crate::batch::short_id(&r.run_id),
-                    r.phase,
-                    r.task,
-                    body
-                ));
-            }
-        }
+    if let Some(store) = &session.coordinator_store
+        && let Ok(rows) = store.load_all()
+        && let Some(r) = rows.iter().find(|r| hit(&r.run_id))
+    {
+        let body = r
+            .result
+            .clone()
+            .or_else(|| r.error.clone())
+            .unwrap_or_else(|| format!("(no result yet — phase: {})", r.phase));
+        return Ok(format!(
+            "[{} {}]\nTask: {}\n\n{}",
+            crate::batch::short_id(&r.run_id),
+            r.phase,
+            r.task,
+            body
+        ));
     }
     // Durable Anthropic batches from the shared store.
-    if let Some(store) = &session.batch_store {
-        if let Ok(rows) = store.load_all() {
-            if let Some(r) = rows.iter().find(|r| hit(&r.local_id)) {
-                let body = r
-                    .result
-                    .clone()
-                    .or_else(|| r.error.clone())
-                    .unwrap_or_else(|| format!("(no result yet — status: {})", r.status));
-                return Ok(format!(
-                    "[{} {}]\n{}",
-                    crate::batch::short_id(&r.local_id),
-                    r.status,
-                    body
-                ));
-            }
-        }
+    if let Some(store) = &session.batch_store
+        && let Ok(rows) = store.load_all()
+        && let Some(r) = rows.iter().find(|r| hit(&r.local_id))
+    {
+        let body = r
+            .result
+            .clone()
+            .or_else(|| r.error.clone())
+            .unwrap_or_else(|| format!("(no result yet — status: {})", r.status));
+        return Ok(format!(
+            "[{} {}]\n{}",
+            crate::batch::short_id(&r.local_id),
+            r.status,
+            body
+        ));
     }
     anyhow::bail!(
         "no background job matching '{q}' — call background_status (scope:\"all\") to list ids; \
@@ -2243,13 +2241,11 @@ fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
         || std::env::var("AISH_BG_ALLOW_DUP")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-    if !allow_dup {
-        if let Some(dup) = find_duplicate_running_work(session, task) {
-            anyhow::bail!(
-                "not offloading — {dup}. Check `background_status` for progress, `tell` it to \
+    if !allow_dup && let Some(dup) = find_duplicate_running_work(session, task) {
+        anyhow::bail!(
+            "not offloading — {dup}. Check `background_status` for progress, `tell` it to \
 steer, or pass `force: true` (or set AISH_BG_ALLOW_DUP=1) to spawn a duplicate anyway."
-            );
-        }
+        );
     }
 
     // A background coordinator (a re-exec'd headless aish) runs on the SAME
@@ -2416,10 +2412,7 @@ sentence that you're on it and the answer will appear when ready."
     // one tree). The model sets `isolate` explicitly (true for write/build work);
     // when omitted, default to isolated WHEN we're in a git repo — isolation is
     // free for a no-change job (the worktree auto-removes) so it's the safe default.
-    let isolate = match call.args["isolate"].as_bool() {
-        Some(b) => b,
-        None => true, // Force 1 worker = 1 worktree by default to prevent parallel jobs clobbering each other.
-    };
+    let isolate = call.args["isolate"].as_bool().unwrap_or(true);
     // Base for the isolated worktree: default to a clean trunk baseline ("main"),
     // so a job never inherits a stale/unrelated local checkout. The model passes
     // base:"head" to continue the current branch's work instead.
@@ -2974,47 +2967,47 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
     }
     // Anthropic batches from the shared store — every session's, so this answers
     // cross-session "what's running" too.
-    if let Some(store) = &session.batch_store {
-        if let Ok(rows) = store.load_all() {
-            for r in rows {
-                let jref = JobRef {
-                    owner_session_id: r.session_id.as_deref(),
-                    repo_key: None, // Phase 1: populate from the durable repo_key column.
-                    id: &r.local_id,
-                };
-                if !scope.matches(&jref, me) {
-                    continue;
-                }
-                any = true;
-                let owner = r
-                    .session_name
-                    .clone()
-                    .or_else(|| {
-                        r.session_id
-                            .as_deref()
-                            .map(|s| crate::batch::short_id(s).to_string())
-                    })
-                    .unwrap_or_else(|| "—".into());
-                let owner = if r.session_id.as_deref() == Some(session.session_id.as_str()) {
-                    format!("{owner} (you)")
-                } else {
-                    owner
-                };
-                let result = format_result(r.result.as_ref(), r.error.as_ref());
-                full_tasks.push((
-                    crate::batch::short_id(&r.local_id).to_string(),
-                    r.task.clone(),
-                ));
-                out.push_str(&format!(
-                    "| `{}` | batch | {} | {} | — | {} | {} | {} |\n",
-                    crate::batch::short_id(&r.local_id),
-                    owner,
-                    r.status,
-                    r.created_at.as_deref().unwrap_or("—"),
-                    trunc(&r.task),
-                    result
-                ));
+    if let Some(store) = &session.batch_store
+        && let Ok(rows) = store.load_all()
+    {
+        for r in rows {
+            let jref = JobRef {
+                owner_session_id: r.session_id.as_deref(),
+                repo_key: None, // Phase 1: populate from the durable repo_key column.
+                id: &r.local_id,
+            };
+            if !scope.matches(&jref, me) {
+                continue;
             }
+            any = true;
+            let owner = r
+                .session_name
+                .clone()
+                .or_else(|| {
+                    r.session_id
+                        .as_deref()
+                        .map(|s| crate::batch::short_id(s).to_string())
+                })
+                .unwrap_or_else(|| "—".into());
+            let owner = if r.session_id.as_deref() == Some(session.session_id.as_str()) {
+                format!("{owner} (you)")
+            } else {
+                owner
+            };
+            let result = format_result(r.result.as_ref(), r.error.as_ref());
+            full_tasks.push((
+                crate::batch::short_id(&r.local_id).to_string(),
+                r.task.clone(),
+            ));
+            out.push_str(&format!(
+                "| `{}` | batch | {} | {} | — | {} | {} | {} |\n",
+                crate::batch::short_id(&r.local_id),
+                owner,
+                r.status,
+                r.created_at.as_deref().unwrap_or("—"),
+                trunc(&r.task),
+                result
+            ));
         }
     }
 
@@ -3709,7 +3702,7 @@ fn line_of_offset(content: &str, off: usize) -> usize {
 
 /// Is `line` inside the (optional, 1-based inclusive) window?
 fn within_window(line: usize, start: Option<usize>, end: Option<usize>) -> bool {
-    start.map_or(true, |s| line >= s) && end.map_or(true, |e| line <= e)
+    start.is_none_or(|s| line >= s) && end.is_none_or(|e| line <= e)
 }
 
 /// Apply an edit to `content`, returning `(new_content, changes_made)`. Pure —
@@ -4430,11 +4423,11 @@ fn stat_file(call: &ToolCall, session: &Session) -> Result<(String, serde_json::
     rec.insert("gid".into(), json!(meta.gid()));
     rec.insert("nlink".into(), json!(meta.nlink()));
     rec.insert("modified".into(), json!(meta.mtime()));
-    if ft.is_symlink() {
-        if let Ok(target) = std::fs::read_link(&full) {
-            lines.push(format!("symlink_target: {}", target.display()));
-            rec.insert("symlink_target".into(), json!(target.display().to_string()));
-        }
+    if ft.is_symlink()
+        && let Ok(target) = std::fs::read_link(&full)
+    {
+        lines.push(format!("symlink_target: {}", target.display()));
+        rec.insert("symlink_target".into(), json!(target.display().to_string()));
     }
     Ok((lines.join("\n"), serde_json::Value::Object(rec)))
 }
@@ -4623,10 +4616,10 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<u64> {
 /// target path (dir → dir/<src-filename>), the shared cp/mv "into a directory"
 /// convenience.
 fn resolve_dest(full_src: &Path, mut full_dst: PathBuf) -> PathBuf {
-    if full_dst.is_dir() {
-        if let Some(name) = full_src.file_name() {
-            full_dst = full_dst.join(name);
-        }
+    if full_dst.is_dir()
+        && let Some(name) = full_src.file_name()
+    {
+        full_dst = full_dst.join(name);
     }
     full_dst
 }

@@ -260,10 +260,11 @@ fn token_from_credentials_json(contents: &str, now_ms: u64) -> Option<String> {
     }
     // A present, non-zero expiry that's already passed → treat as unusable.
     // A missing or zero `expiresAt` is treated as non-expiring.
-    if let Some(exp) = oauth.get("expiresAt").and_then(Value::as_u64) {
-        if exp != 0 && exp <= now_ms {
-            return None;
-        }
+    if let Some(exp) = oauth.get("expiresAt").and_then(Value::as_u64)
+        && exp != 0
+        && exp <= now_ms
+    {
+        return None;
     }
     Some(token.to_string())
 }
@@ -943,21 +944,19 @@ impl StreamAccumulator {
                         }
                     }
                     "signature_delta" => {
-                        if let Some(sig) = delta["signature"].as_str() {
-                            if let Some(StreamBlock::Thinking { signature, .. }) =
+                        if let Some(sig) = delta["signature"].as_str()
+                            && let Some(StreamBlock::Thinking { signature, .. }) =
                                 self.blocks.get_mut(idx)
-                            {
-                                signature.push_str(sig);
-                            }
+                        {
+                            signature.push_str(sig);
                         }
                     }
                     "input_json_delta" => {
-                        if let Some(pj) = delta["partial_json"].as_str() {
-                            if let Some(StreamBlock::ToolUse { json, .. }) =
+                        if let Some(pj) = delta["partial_json"].as_str()
+                            && let Some(StreamBlock::ToolUse { json, .. }) =
                                 self.blocks.get_mut(idx)
-                            {
-                                json.push_str(pj);
-                            }
+                        {
+                            json.push_str(pj);
                         }
                     }
                     _ => {}

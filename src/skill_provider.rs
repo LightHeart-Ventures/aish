@@ -618,18 +618,18 @@ pub async fn install_plugin(plugin_id: &str, plugins_dir: &Path) -> Result<()> {
 
         // Look for the plugin directory in the archive
         // Format: {repo}-{branch}/plugins/{plugin-id}/...
-        if let Some(rel_path) = path_in_archive.to_str() {
-            if rel_path.contains(&format!("plugins/{plugin_id}")) {
-                // Extract files relative to the plugin directory
-                let remaining = rel_path
-                    .split(&format!("plugins/{plugin_id}"))
-                    .nth(1)
-                    .unwrap_or("");
-                if !remaining.is_empty() && remaining != "/" {
-                    let target = plugin_dir.join(remaining.trim_start_matches('/'));
-                    std::fs::create_dir_all(target.parent().unwrap_or(&plugin_dir))?;
-                    entry.unpack(&target)?;
-                }
+        if let Some(rel_path) = path_in_archive.to_str()
+            && rel_path.contains(&format!("plugins/{plugin_id}"))
+        {
+            // Extract files relative to the plugin directory
+            let remaining = rel_path
+                .split(&format!("plugins/{plugin_id}"))
+                .nth(1)
+                .unwrap_or("");
+            if !remaining.is_empty() && remaining != "/" {
+                let target = plugin_dir.join(remaining.trim_start_matches('/'));
+                std::fs::create_dir_all(target.parent().unwrap_or(&plugin_dir))?;
+                entry.unpack(&target)?;
             }
         }
     }
@@ -1396,10 +1396,10 @@ fn parse_trees_skill_paths(body: &str, path_prefix: Option<&str>) -> Result<Vec<
         if !is_skill_md_path(p) {
             continue;
         }
-        if let Some(prefix) = path_prefix {
-            if !path_under_prefix(p, prefix) {
-                continue;
-            }
+        if let Some(prefix) = path_prefix
+            && !path_under_prefix(p, prefix)
+        {
+            continue;
         }
         out.push(p.to_string());
     }
@@ -2433,10 +2433,10 @@ mod tests {
                     // Record any Authorization header seen (header names are
                     // case-insensitive; hyper emits them lower-cased on the wire).
                     for line in req.lines() {
-                        if let Some((name, value)) = line.split_once(':') {
-                            if name.trim().eq_ignore_ascii_case("authorization") {
-                                auth_sink.lock().unwrap().push(value.trim().to_string());
-                            }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.trim().eq_ignore_ascii_case("authorization")
+                        {
+                            auth_sink.lock().unwrap().push(value.trim().to_string());
                         }
                     }
                     let (status, body) = match routes.iter().find(|(p, _)| *p == target) {

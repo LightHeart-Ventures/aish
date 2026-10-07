@@ -1093,12 +1093,12 @@ fn task_headline(task: &str) -> String {
     let collapsed = core.split_whitespace().collect::<Vec<_>>().join(" ");
     // Fall back to the whole task if peeling left nothing (e.g. a marker with no
     // trailing instruction) so the row is never blank.
-    let collapsed = if collapsed.is_empty() {
+
+    if collapsed.is_empty() {
         task.split_whitespace().collect::<Vec<_>>().join(" ")
     } else {
         collapsed
-    };
-    collapsed
+    }
 }
 
 /// Frame a coordinator's `message_console` note for the operator's terminal.
@@ -1612,10 +1612,8 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                 // A non-thinking first line genuinely REPLACES the placeholder —
                 // stop + erase it so this row lands on the cleared line (no-op
                 // once gone).
-                if !adopt_backfill {
-                    if let Some(job) = &pulse {
-                        job.stop_backfill_thinking();
-                    }
+                if !adopt_backfill && let Some(job) = &pulse {
+                    job.stop_backfill_thinking();
                 }
                 if thinking_event {
                     // Model-reasoning phase: show ONE animated "thinking…" row
@@ -1902,10 +1900,10 @@ fn worker_command(
     // parent so the child's coordinator_store row records `parent_run_id`.
     // `AISH_RUN_ID` is set by our own `coordinator::run` at startup; unset only
     // in odd test paths, in which case the child is simply treated as a root.
-    if let Ok(rid) = std::env::var("AISH_RUN_ID") {
-        if !rid.is_empty() {
-            cmd.env("AISH_PARENT_RUN_ID", rid);
-        }
+    if let Ok(rid) = std::env::var("AISH_RUN_ID")
+        && !rid.is_empty()
+    {
+        cmd.env("AISH_PARENT_RUN_ID", rid);
     }
     if let Some(name) = &spec.launch_session_name {
         cmd.env("AISH_LAUNCH_SESSION_NAME", name);
@@ -2118,10 +2116,10 @@ fn repo_key(src: &std::path::Path) -> String {
 /// `.mcp.json`), NOT `~/.atum` (the atum CLI's config dir) — the latter was a
 /// stray port artifact that polluted an unrelated tool's directory.
 fn worktree_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("AISH_WORKTREE_DIR") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
+    if let Some(dir) = std::env::var_os("AISH_WORKTREE_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
     }
     let home = std::env::var("HOME").unwrap_or_default();
     if !home.is_empty() {
@@ -2184,12 +2182,10 @@ fn trunk_branch(src: &std::path::Path) -> String {
     if let Some(s) = git_out(
         src,
         &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-    ) {
-        if let Some(name) = s.strip_prefix("origin/") {
-            if !name.is_empty() {
-                return name.to_string();
-            }
-        }
+    ) && let Some(name) = s.strip_prefix("origin/")
+        && !name.is_empty()
+    {
+        return name.to_string();
     }
     for cand in ["main", "master"] {
         if git_ok(
@@ -2455,13 +2451,13 @@ fn create_worktree(
     }
     // Open the lifecycle ledger row NOW — before any work happens — so a parent
     // killed mid-run still leaves a durable record of the tree it created.
-    if let Some(store) = store {
-        if let Err(e) = store.record_worktree_created(id, &path, id) {
-            eprintln!(
-                "aish: could not record worktree {} in the lifecycle ledger: {e}",
-                path.display(),
-            );
-        }
+    if let Some(store) = store
+        && let Err(e) = store.record_worktree_created(id, &path, id)
+    {
+        eprintln!(
+            "aish: could not record worktree {} in the lifecycle ledger: {e}",
+            path.display(),
+        );
     }
     // Pin the base commit for clean-up accounting (tip == base_sha ⇒ no commits).
     let base_sha = git_head(&path).unwrap_or_default();
@@ -3367,10 +3363,10 @@ fn new_prefixed_id(prefix: &str) -> String {
 /// else `~/.aish/workers`, else a temp fallback. Each worker mounts
 /// `<root>/<id>` at `/aish/state`.
 pub(crate) fn worker_state_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("AISH_WORKER_STATE_DIR") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
+    if let Some(dir) = std::env::var_os("AISH_WORKER_STATE_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
     }
     let home = std::env::var("HOME").unwrap_or_default();
     if !home.is_empty() {
@@ -3483,16 +3479,16 @@ fn build_container_command(
     }
 
     // Per-worker state dir (AC4), 0700.
-    let state_dir = worker_state_root().join(&spec.id_for_state(run_id));
+    let state_dir = worker_state_root().join(spec.id_for_state(run_id));
     ensure_dir_0700(&state_dir);
 
     // Secret env-file (0600): the rc exports + forwarded process credentials.
     let mut secret_pairs: Vec<(String, String)> = spec.env.clone();
     for key in FORWARDED_SECRET_ENV {
-        if let Ok(val) = std::env::var(key) {
-            if !val.is_empty() {
-                secret_pairs.push(((*key).to_string(), val));
-            }
+        if let Ok(val) = std::env::var(key)
+            && !val.is_empty()
+        {
+            secret_pairs.push(((*key).to_string(), val));
         }
     }
     let env_file = match write_env_file(&state_dir, &secret_pairs) {
@@ -3884,14 +3880,14 @@ other's files and commit onto the wrong branch, so this run is failed instead. R
             } else {
                 t.to_string()
             };
-            if let Some(wt) = worktree.as_ref() {
-                if let Some(branch) = &kept_branch {
-                    result.push_str(&format!(
-                        "\n\n(changes left on branch `{branch}` in worktree `{}` — review/merge \
+            if let Some(wt) = worktree.as_ref()
+                && let Some(branch) = &kept_branch
+            {
+                result.push_str(&format!(
+                    "\n\n(changes left on branch `{branch}` in worktree `{}` — review/merge \
 from the parent repo; not auto-merged.)",
-                        wt.path.display(),
-                    ));
-                }
+                    wt.path.display(),
+                ));
             }
             job.set_done(result);
         }

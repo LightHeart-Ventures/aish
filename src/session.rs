@@ -937,13 +937,13 @@ impl Session {
     /// then inserts-or-replaces the record in `self.goals` by id so the cache
     /// and the durable table never drift.
     pub fn persist_goal(&mut self, goal: crate::goal::Goal) {
-        if let Some(db) = &self.db {
-            if let Err(e) = db.upsert_goal(&goal) {
-                eprintln!(
-                    "\x1b[33maish:\x1b[0m could not persist goal {}: {e:#}",
-                    goal.id
-                );
-            }
+        if let Some(db) = &self.db
+            && let Err(e) = db.upsert_goal(&goal)
+        {
+            eprintln!(
+                "\x1b[33maish:\x1b[0m could not persist goal {}: {e:#}",
+                goal.id
+            );
         }
         match self.goals.iter_mut().find(|g| g.id == goal.id) {
             Some(existing) => *existing = goal,
@@ -1131,10 +1131,10 @@ impl Session {
     /// exists, else the most-recently-updated non-terminal goal, else the most
     /// recently updated goal of any status. `None` only when no goals exist.
     pub fn current_goal(&self) -> Option<&crate::goal::Goal> {
-        if let Some(id) = &self.current_goal_id {
-            if let Some(g) = self.goals.iter().find(|g| &g.id == id) {
-                return Some(g);
-            }
+        if let Some(id) = &self.current_goal_id
+            && let Some(g) = self.goals.iter().find(|g| &g.id == id)
+        {
+            return Some(g);
         }
         self.goals
             .iter()

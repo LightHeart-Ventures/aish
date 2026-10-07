@@ -136,10 +136,9 @@ fn detect_total_ram_mb() -> u64 {
         if let Ok(out) = std::process::Command::new("sysctl")
             .args(["-n", "hw.memsize"])
             .output()
+            && let Ok(bytes) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>()
         {
-            if let Ok(bytes) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
-                return bytes / (1024 * 1024);
-            }
+            return bytes / (1024 * 1024);
         }
     }
     8 * 1024
@@ -167,18 +166,17 @@ fn detect_gpu(os: &str, arch: &str) -> (GpuKind, Option<u64>, Option<String>) {
     }
     // NVIDIA — only spawn nvidia-smi if it's actually on PATH (avoids a slow
     // ENOENT round-trip on machines without it).
-    if on_path("nvidia-smi") {
-        if let Ok(out) = std::process::Command::new("nvidia-smi")
+    if on_path("nvidia-smi")
+        && let Ok(out) = std::process::Command::new("nvidia-smi")
             .args([
                 "--query-gpu=memory.total,name",
                 "--format=csv,noheader,nounits",
             ])
             .output()
-        {
-            let text = String::from_utf8_lossy(&out.stdout);
-            if let Some((vram, name)) = parse_nvidia_smi(&text) {
-                return (GpuKind::Nvidia, Some(vram), Some(name));
-            }
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some((vram, name)) = parse_nvidia_smi(&text) {
+            return (GpuKind::Nvidia, Some(vram), Some(name));
         }
     }
     // AMD — amdgpu exposes total VRAM in bytes via sysfs.
@@ -501,19 +499,19 @@ fn operator_pin(cli_model: Option<&str>) -> Option<(String, Option<String>)> {
     if let Some(m) = cli_model.filter(|s| !s.trim().is_empty()) {
         return Some((m.to_string(), None));
     }
-    if let Ok(path) = std::env::var("AISH_LOCAL_MODEL_PATH") {
-        if !path.trim().is_empty() {
-            let id = PathBuf::from(&path)
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.clone());
-            return Some((id, Some(path)));
-        }
+    if let Ok(path) = std::env::var("AISH_LOCAL_MODEL_PATH")
+        && !path.trim().is_empty()
+    {
+        let id = PathBuf::from(&path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        return Some((id, Some(path)));
     }
-    if let Ok(id) = std::env::var("AISH_LOCAL_MODEL_ID") {
-        if !id.trim().is_empty() {
-            return Some((id, None));
-        }
+    if let Ok(id) = std::env::var("AISH_LOCAL_MODEL_ID")
+        && !id.trim().is_empty()
+    {
+        return Some((id, None));
     }
     None
 }
@@ -549,10 +547,8 @@ pub fn ensure_selected(force: bool, cli_model: Option<&str>) -> Result<Selection
         return Ok(sel);
     }
 
-    if !force {
-        if let Some(existing) = load_selection() {
-            return Ok(existing);
-        }
+    if !force && let Some(existing) = load_selection() {
+        return Ok(existing);
     }
 
     let profile = detect();

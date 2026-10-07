@@ -450,15 +450,15 @@ pub fn parse_flag(s: &str) -> Option<bool> {
 /// `:startup-digest on` (persisted `startup_digest` setting). The env override
 /// wins over the persisted setting; absent both, the default is `false`.
 fn startup_digest_enabled(session: &Session) -> bool {
-    if let Ok(v) = std::env::var("AISH_STARTUP_DIGEST") {
-        if let Some(b) = parse_flag(&v) {
-            return b;
-        }
+    if let Ok(v) = std::env::var("AISH_STARTUP_DIGEST")
+        && let Some(b) = parse_flag(&v)
+    {
+        return b;
     }
-    if let Some(db) = session.db.as_ref() {
-        if let Ok(Some(v)) = db.get_setting("startup_digest") {
-            return parse_flag(&v).unwrap_or(false);
-        }
+    if let Some(db) = session.db.as_ref()
+        && let Ok(Some(v)) = db.get_setting("startup_digest")
+    {
+        return parse_flag(&v).unwrap_or(false);
     }
     false
 }
@@ -1054,10 +1054,10 @@ plus `git status` instead — do not fail the run over it.\n\n{PHASE0_GUARD}\n\n
     // non-Claude run) disables summaries entirely and every surface falls back to
     // the task brief exactly as before — this is cosmetic, never load-bearing.
     let summarizer = crate::activity_summary::lightweight_backend(session);
-    if let (Some(s), Some(sb)) = (store, summarizer.as_ref()) {
-        if let Some(sum) = crate::activity_summary::summarize(sb, &input, None).await {
-            let _ = s.set_activity_summary(run_id, &sum);
-        }
+    if let (Some(s), Some(sb)) = (store, summarizer.as_ref())
+        && let Some(sum) = crate::activity_summary::summarize(sb, &input, None).await
+    {
+        let _ = s.set_activity_summary(run_id, &sum);
     }
 
     loop {
@@ -1334,10 +1334,10 @@ final status plus your best partial result. After this turn you are terminated."
         // so that round's summary must land even though the round ended badly.
         // Failure is swallowed — a summarizer hiccup leaves the prior summary in
         // place and the run proceeds untouched.
-        if let (Some(s), Some(sb)) = (store, summarizer.as_ref()) {
-            if let Some(sum) = crate::activity_summary::summarize(sb, &input, Some(&answer)).await {
-                let _ = s.set_activity_summary(run_id, &sum);
-            }
+        if let (Some(s), Some(sb)) = (store, summarizer.as_ref())
+            && let Some(sum) = crate::activity_summary::summarize(sb, &input, Some(&answer)).await
+        {
+            let _ = s.set_activity_summary(run_id, &sum);
         }
 
         // ── Worker-exit evaluation: did this round's turn end abnormally? The
@@ -1585,13 +1585,13 @@ pub fn rehydrate(session: &mut Session) {
                 // When suppressed, print nothing and KEEP the row so the result
                 // stays retrievable via `:workers all` / `background_status` /
                 // `:result <id>` instead of being surfaced-and-dropped.
-                if let Some(result) = &row.result {
-                    if !result.trim().is_empty() {
-                        if digest {
-                            print_completed(&row.run_id, result);
-                        }
-                        surfaced += 1;
+                if let Some(result) = &row.result
+                    && !result.trim().is_empty()
+                {
+                    if digest {
+                        print_completed(&row.run_id, result);
                     }
+                    surfaced += 1;
                 }
             }
             Phase::Failed => {} // terminal, nothing to do (cleared below)

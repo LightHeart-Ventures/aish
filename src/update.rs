@@ -184,7 +184,7 @@ fn is_tarball(name: &str) -> bool {
 /// triples in `target_triples()` order; returns the first asset whose name
 /// contains a matching triple. Checksum sidecars (`*.sha256`) are skipped so we
 /// never mistake `aish-<triple>.sha256` for the binary itself.
-fn match_asset<'a>(assets: &'a [GhAsset]) -> Option<&'a str> {
+fn match_asset(assets: &[GhAsset]) -> Option<&str> {
     for triple in target_triples() {
         if let Some(a) = assets
             .iter()
@@ -519,13 +519,13 @@ pub fn write_cache(path: &Path, cache: &CachedCheck) -> Result<()> {
 pub async fn check_cached() -> Result<Option<UpdateInfo>> {
     let ch = channel();
     let ttl = check_ttl();
-    if ttl > 0 {
-        if let Some(c) = read_cache(&cache_path()) {
-            if c.channel == ch.as_str() && is_cache_fresh(now_secs(), c.last_check_ts, ttl) {
-                // Fresh cache hit for this channel — serve offline, no `gh`.
-                return Ok(cached_to_info(&c, current_version()));
-            }
-        }
+    if ttl > 0
+        && let Some(c) = read_cache(&cache_path())
+        && c.channel == ch.as_str()
+        && is_cache_fresh(now_secs(), c.last_check_ts, ttl)
+    {
+        // Fresh cache hit for this channel — serve offline, no `gh`.
+        return Ok(cached_to_info(&c, current_version()));
     }
     // Miss / stale / corrupt / TTL=0 — fetch fresh (and rewrite the cache).
     check_channel(ch).await
@@ -1065,10 +1065,10 @@ fn resolve_restart_exe() -> std::io::Result<PathBuf> {
 
     // The swapped-and-unlinked case: `.../aish (deleted)`. The real, freshly
     // installed binary sits at the de-marked path — re-exec THAT.
-    if let Some(clean) = strip_deleted_suffix(&raw) {
-        if clean.exists() {
-            return Ok(std::fs::canonicalize(&clean).unwrap_or(clean));
-        }
+    if let Some(clean) = strip_deleted_suffix(&raw)
+        && clean.exists()
+    {
+        return Ok(std::fs::canonicalize(&clean).unwrap_or(clean));
     }
 
     // Normal `:restart` (no swap): the path exists as-is.

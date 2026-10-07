@@ -671,22 +671,22 @@ pub async fn run(
         install_mcp_if_ready(&mut mcp_rx, &mut session);
         // Surface a discovered upgrade exactly once, above the prompt. The user
         // chooses whether to act on it with `:update`.
-        if pending_update.is_none() {
-            if let Some(rx) = update_rx.as_mut() {
-                match rx.try_recv() {
-                    Ok(info) => {
-                        println!(
-                            "\x1b[1;32m✨ aish {} is available\x1b[0m (you have {}) — type \x1b[1m:update\x1b[0m to upgrade",
-                            info.version,
-                            crate::update::current_version()
-                        );
-                        needs_gap = true;
-                        pending_update = Some(info);
-                        update_rx = None;
-                    }
-                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
-                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => update_rx = None,
+        if pending_update.is_none()
+            && let Some(rx) = update_rx.as_mut()
+        {
+            match rx.try_recv() {
+                Ok(info) => {
+                    println!(
+                        "\x1b[1;32m✨ aish {} is available\x1b[0m (you have {}) — type \x1b[1m:update\x1b[0m to upgrade",
+                        info.version,
+                        crate::update::current_version()
+                    );
+                    needs_gap = true;
+                    pending_update = Some(info);
+                    update_rx = None;
                 }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => update_rx = None,
             }
         }
         if needs_gap {
@@ -1362,24 +1362,21 @@ pub async fn run(
                             auto_recoveries,
                             crate::loopguard::MAX_AUTO_RECOVERIES,
                         )
-                    }) {
-                        if matches!(
-                            exit.disposition,
-                            crate::loopguard::Disposition::Resume
-                                | crate::loopguard::Disposition::Nudge
-                        ) {
-                            if let Some(dir) = exit.directive() {
-                                auto_recoveries += 1;
-                                eprintln!(
-                                    "\x1b[2maish: turn ended [{}] — {} (auto-recovery {auto_recoveries}/{})\x1b[0m",
-                                    exit.reason.tag(),
-                                    exit.disposition.verb(),
-                                    crate::loopguard::MAX_AUTO_RECOVERIES,
-                                );
-                                next_input = dir;
-                                continue 'resume;
-                            }
-                        }
+                    }) && matches!(
+                        exit.disposition,
+                        crate::loopguard::Disposition::Resume
+                            | crate::loopguard::Disposition::Nudge
+                    ) && let Some(dir) = exit.directive()
+                    {
+                        auto_recoveries += 1;
+                        eprintln!(
+                            "\x1b[2maish: turn ended [{}] — {} (auto-recovery {auto_recoveries}/{})\x1b[0m",
+                            exit.reason.tag(),
+                            exit.disposition.verb(),
+                            crate::loopguard::MAX_AUTO_RECOVERIES,
+                        );
+                        next_input = dir;
+                        continue 'resume;
                     }
                     break 'resume;
                 }
@@ -2099,14 +2096,13 @@ fn statusline_segments(
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
-        if let Ok(modified) = meta.modified() {
-            if now
+        if let Ok(modified) = meta.modified()
+            && now
                 .duration_since(modified)
                 .map(|age| age > stale_after)
                 .unwrap_or(false)
-            {
-                continue; // stale — plugin stopped refreshing
-            }
+        {
+            continue; // stale — plugin stopped refreshing
         }
         let Ok(body) = std::fs::read_to_string(&path) else {
             continue;
@@ -2955,10 +2951,10 @@ fn history_suggestion(
     let mut idx = history.len();
     while idx > 0 {
         idx -= 1;
-        if let Ok(Some(res)) = history.get(idx, SearchDirection::Reverse) {
-            if let Some(suffix) = ghost_suffix(line, res.entry.as_ref()) {
-                return Some(suffix);
-            }
+        if let Ok(Some(res)) = history.get(idx, SearchDirection::Reverse)
+            && let Some(suffix) = ghost_suffix(line, res.entry.as_ref())
+        {
+            return Some(suffix);
         }
     }
     None
@@ -3089,10 +3085,11 @@ impl AishHelper {
     /// computes once and re-seeds the memo.
     fn cached_preview(&self, line: &str) -> Preview {
         let mut cache = self.route_cache.lock().unwrap();
-        if let Some(memo) = cache.as_ref() {
-            if memo.line == line && memo.cwd == self.cwd {
-                return memo.preview;
-            }
+        if let Some(memo) = cache.as_ref()
+            && memo.line == line
+            && memo.cwd == self.cwd
+        {
+            return memo.preview;
         }
         let preview = route_preview(line, &self.cwd, &self.path, &self.aliases);
         *cache = Some(RouteMemo {
@@ -3679,10 +3676,10 @@ fn var_lookup(session: &Session) -> impl Fn(&str) -> Option<String> + '_ {
         {
             return Some(v);
         }
-        if matches!(name, "LAST" | "_") {
-            if let Some(out) = session.last_output() {
-                return Some(out);
-            }
+        if matches!(name, "LAST" | "_")
+            && let Some(out) = session.last_output()
+        {
+            return Some(out);
         }
         std::env::var(name).ok()
     }
@@ -3716,10 +3713,10 @@ async fn dispatch(
             match pipeline::run(&stages, session).await {
                 Ok(status) => {
                     session.set_last_status(&status);
-                    if let Some(code) = status.code() {
-                        if code != 0 {
-                            eprintln!("\x1b[2m[exit {code}]\x1b[0m");
-                        }
+                    if let Some(code) = status.code()
+                        && code != 0
+                    {
+                        eprintln!("\x1b[2m[exit {code}]\x1b[0m");
                     }
                 }
                 Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e:#}"),
@@ -3880,10 +3877,10 @@ async fn dispatch(
             match tools::run_on_tty(&path.to_string_lossy(), &words[1..], &[], session).await {
                 Ok(status) => {
                     session.set_last_status(&status);
-                    if let Some(code) = status.code() {
-                        if code != 0 {
-                            eprintln!("\x1b[2m[exit {code}]\x1b[0m");
-                        }
+                    if let Some(code) = status.code()
+                        && code != 0
+                    {
+                        eprintln!("\x1b[2m[exit {code}]\x1b[0m");
                     }
                 }
                 Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e:#}"),
@@ -4929,7 +4926,7 @@ fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
         // as a background worker, tell the operator they can keep working, and
         // point them at Shift-Tab to watch it — newest worker is one press away.
         // The leading ⤴️ "lifts off" with a brief liftoff animation on a TTY.
-        print_escalation_banner(&short);
+        print_escalation_banner(short);
         return;
     }
     // Fire-and-forget: unlike the old behaviour we do NOT auto-attach or turn
@@ -5015,29 +5012,29 @@ fn collect_worker_rows(session: &Session) -> Vec<crate::workers_modal::WorkerRow
     // `worker_jobs`), so we pull them from the shared store and stamp `parent_id`
     // from `parent_run_id`; `build_worker_forest` then indents each beneath its
     // parent. Display-only — attach still resolves ids on its own.
-    if let Some(store) = &session.coordinator_store {
-        if let Ok(all) = store.load_all() {
-            let mut visible: std::collections::HashSet<String> =
-                rows.iter().map(|r| r.id.clone()).collect();
-            loop {
-                let mut added = false;
-                for r in &all {
-                    let Some(parent) = r.parent_run_id.as_deref() else {
-                        continue;
-                    };
-                    if visible.contains(parent) && !visible.contains(&r.run_id) {
-                        rows.push(durable_worker_row(
-                            r,
-                            session.session_id.as_str(),
-                            now_epoch,
-                        ));
-                        visible.insert(r.run_id.clone());
-                        added = true;
-                    }
+    if let Some(store) = &session.coordinator_store
+        && let Ok(all) = store.load_all()
+    {
+        let mut visible: std::collections::HashSet<String> =
+            rows.iter().map(|r| r.id.clone()).collect();
+        loop {
+            let mut added = false;
+            for r in &all {
+                let Some(parent) = r.parent_run_id.as_deref() else {
+                    continue;
+                };
+                if visible.contains(parent) && !visible.contains(&r.run_id) {
+                    rows.push(durable_worker_row(
+                        r,
+                        session.session_id.as_str(),
+                        now_epoch,
+                    ));
+                    visible.insert(r.run_id.clone());
+                    added = true;
                 }
-                if !added {
-                    break;
-                }
+            }
+            if !added {
+                break;
             }
         }
     }
@@ -5180,14 +5177,13 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
     // shared coordinator store and attach in REVIEW mode (replay its durable
     // task + result). Only consulted when the in-mem lookup found nothing, so
     // this session's own workers are never double-listed.
-    if matches.is_empty() {
-        if let Some(store) = &session.coordinator_store {
-            if let Ok(rows) = store.load_all() {
-                for r in &rows {
-                    if hit(&r.run_id) {
-                        matches.push((r.run_id.clone(), true));
-                    }
-                }
+    if matches.is_empty()
+        && let Some(store) = &session.coordinator_store
+        && let Ok(rows) = store.load_all()
+    {
+        for r in &rows {
+            if hit(&r.run_id) {
+                matches.push((r.run_id.clone(), true));
             }
         }
     }
@@ -5253,7 +5249,7 @@ fn backfill_attached(run_id: &str, session: &Session) {
         return;
     };
     let short = crate::batch::short_id(run_id);
-    println!("{}", crate::worker::pane_replay_header(&short));
+    println!("{}", crate::worker::pane_replay_header(short));
     // The task is the coordinator's "input" — the START of the conversation. It's
     // rendered set-apart (a 💬 glyph + bold) by `pane_input_row` so it's obvious
     // this row is the prompt the coordinator was given, not one of its own
@@ -5566,44 +5562,40 @@ fn print_attached_result(run_id: &str, session: &Session) {
     } else {
         // Subworker / cross-session: no in-mem job, so read the final result
         // (or failure) straight from the durable coordinator store.
-        if let Some(store) = &session.coordinator_store {
-            if let Ok(rows) = store.load_all() {
-                if let Some(r) = rows.iter().find(|r| r.run_id == *run_id) {
-                    let msg = match (r.result.as_deref(), r.error.as_deref()) {
-                        (Some(res), _) if !res.trim().is_empty() => res.trim().to_string(),
-                        (_, Some(e)) if !e.trim().is_empty() => format!("failed: {}", e.trim()),
-                        _ => format!("({} — no result captured yet)", r.phase),
-                    };
-                    let rendered = crate::md::render_stdout_within(
-                        &msg,
-                        crate::worker::pane_content_cols(crate::worker::PANE_NO_LABEL),
+        if let Some(store) = &session.coordinator_store
+            && let Ok(rows) = store.load_all()
+            && let Some(r) = rows.iter().find(|r| r.run_id == *run_id)
+        {
+            let msg = match (r.result.as_deref(), r.error.as_deref()) {
+                (Some(res), _) if !res.trim().is_empty() => res.trim().to_string(),
+                (_, Some(e)) if !e.trim().is_empty() => format!("failed: {}", e.trim()),
+                _ => format!("({} — no result captured yet)", r.phase),
+            };
+            let rendered = crate::md::render_stdout_within(
+                &msg,
+                crate::worker::pane_content_cols(crate::worker::PANE_NO_LABEL),
+            );
+            let mut lines = rendered.split('\n');
+            match lines.next() {
+                Some(first) => {
+                    println!(
+                        "{}",
+                        crate::worker::pane_row(
+                            crate::worker::PANE_NO_LABEL,
+                            &format!("·result {first}")
+                        )
                     );
-                    let mut lines = rendered.split('\n');
-                    match lines.next() {
-                        Some(first) => {
-                            println!(
-                                "{}",
-                                crate::worker::pane_row(
-                                    crate::worker::PANE_NO_LABEL,
-                                    &format!("·result {first}")
-                                )
-                            );
-                            for line in lines {
-                                println!(
-                                    "{}",
-                                    crate::worker::pane_row(crate::worker::PANE_NO_LABEL, line)
-                                );
-                            }
-                        }
-                        None => println!(
+                    for line in lines {
+                        println!(
                             "{}",
-                            crate::worker::pane_row(
-                                crate::worker::PANE_NO_LABEL,
-                                "·result (empty result)"
-                            )
-                        ),
+                            crate::worker::pane_row(crate::worker::PANE_NO_LABEL, line)
+                        );
                     }
                 }
+                None => println!(
+                    "{}",
+                    crate::worker::pane_row(crate::worker::PANE_NO_LABEL, "·result (empty result)")
+                ),
             }
         }
     }
@@ -5625,7 +5617,7 @@ fn backfill_attached_durable(run_id: &str, session: &Session) {
         return;
     };
     let short = crate::batch::short_id(run_id);
-    println!("{}", crate::worker::pane_replay_header(&short));
+    println!("{}", crate::worker::pane_replay_header(short));
     println!(
         "{}",
         crate::worker::pane_input_row(crate::worker::PANE_NO_LABEL, &r.task)
@@ -5761,12 +5753,12 @@ fn forget_worker(id: &str, session: &mut Session) {
             found.push((w.id.clone(), w.status()));
         }
     }
-    if let Some(store) = &session.coordinator_store {
-        if let Ok(rows) = store.load_all() {
-            for r in rows.iter().filter(|r| hit(&r.run_id)) {
-                if !found.iter().any(|(mid, _)| mid == &r.run_id) {
-                    found.push((r.run_id.clone(), r.phase.clone()));
-                }
+    if let Some(store) = &session.coordinator_store
+        && let Ok(rows) = store.load_all()
+    {
+        for r in rows.iter().filter(|r| hit(&r.run_id)) {
+            if !found.iter().any(|(mid, _)| mid == &r.run_id) {
+                found.push((r.run_id.clone(), r.phase.clone()));
             }
         }
     }
@@ -5805,13 +5797,13 @@ fn forget_all_exited(session: &mut Session) {
             victims.push(w.id.clone());
         }
     }
-    if let Some(store) = &session.coordinator_store {
-        if let Ok(rows) = store.load_all() {
-            for r in rows.iter() {
-                let mine = r.session_id.as_deref() == Some(session.session_id.as_str());
-                if mine && !forget_status_is_live(&r.phase) && !victims.contains(&r.run_id) {
-                    victims.push(r.run_id.clone());
-                }
+    if let Some(store) = &session.coordinator_store
+        && let Ok(rows) = store.load_all()
+    {
+        for r in rows.iter() {
+            let mine = r.session_id.as_deref() == Some(session.session_id.as_str());
+            if mine && !forget_status_is_live(&r.phase) && !victims.contains(&r.run_id) {
+                victims.push(r.run_id.clone());
             }
         }
     }
@@ -6021,7 +6013,7 @@ fn resume_coordinator(prev_run_id: &str, message: &str, session: &mut Session) {
         }
     };
     let prev_short = crate::batch::short_id(prev_run_id);
-    let resume_task = build_resume_task(&prev_short, &task, &result, message);
+    let resume_task = build_resume_task(prev_short, &task, &result, message);
     let spec = crate::worker::WorkerSpec {
         exe,
         cwd: session.cwd.clone(),
@@ -6538,10 +6530,10 @@ fn owner_gate(target_session: Option<&str>, my_session: &str, any: bool) -> Owne
 /// is left untouched as message text, so a literal `--any` can still be sent as
 /// part of a message after the id. Pure → unit-tested.
 fn take_any_flag<'a>(toks: &[&'a str]) -> (bool, Vec<&'a str>) {
-    if let Some((first, rest)) = toks.split_first() {
-        if *first == "--any" || *first == "-a" {
-            return (true, rest.to_vec());
-        }
+    if let Some((first, rest)) = toks.split_first()
+        && (*first == "--any" || *first == "-a")
+    {
+        return (true, rest.to_vec());
     }
     (false, toks.to_vec())
 }
@@ -8608,8 +8600,8 @@ async fn skill_sources_list() {
         .max()
         .unwrap_or(8);
     println!(
-        "{bold}{:<id_w$}  {:>pr_w$}  {:<6}  {:<3}  {}{reset}",
-        "SOURCE", "PRIORITY", "SEARCH", "ADD", "HANDLES"
+        "{bold}{:<id_w$}  {:>pr_w$}  {:<6}  {:<3}  HANDLES{reset}",
+        "SOURCE", "PRIORITY", "SEARCH", "ADD"
     );
     for r in &rows {
         println!(
@@ -8627,10 +8619,10 @@ fn skill_source(path: &std::path::Path) -> String {
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    if let Some(pos) = comps.iter().position(|c| c == "plugins") {
-        if let Some(plugin) = comps.get(pos + 1) {
-            return format!("Plugin:{plugin}");
-        }
+    if let Some(pos) = comps.iter().position(|c| c == "plugins")
+        && let Some(plugin) = comps.get(pos + 1)
+    {
+        return format!("Plugin:{plugin}");
     }
     let folder = path
         .parent()
@@ -8691,10 +8683,7 @@ fn skill_list(session: &Session) {
         tw.saturating_sub(prefix_w).max(20)
     };
 
-    println!(
-        "{:<name_w$}  {:<src_w$}  {}",
-        "SKILL", "SOURCE", "DESCRIPTION"
-    );
+    println!("{:<name_w$}  {:<src_w$}  DESCRIPTION", "SKILL", "SOURCE");
     for (name, src, desc) in &rows {
         let desc = crate::skill_provider::truncate(desc, desc_w);
         println!("{bold}{name:<name_w$}{reset}  {cyan}{src:<src_w$}{reset}  {desc}");
@@ -9413,10 +9402,10 @@ async fn handle_colon(
                     // `None` and pass through untouched.
                     let mut seen_goal_conditions = std::collections::HashSet::new();
                     for r in durable {
-                        if let Some(cond) = crate::goal::goal_condition_from_directive(&r.task) {
-                            if !seen_goal_conditions.insert(cond) {
-                                continue;
-                            }
+                        if let Some(cond) = crate::goal::goal_condition_from_directive(&r.task)
+                            && !seen_goal_conditions.insert(cond)
+                        {
+                            continue;
                         }
                         any = true;
                         let is_me = r.session_id.as_deref() == Some(session.session_id.as_str());
@@ -9496,7 +9485,7 @@ async fn handle_colon(
             }
             // Sort the merged listing oldest-first (smallest start epoch first),
             // then emit. A stable sort keeps same-epoch rows in insertion order.
-            rows_out.sort_by(|a, b| a.0.cmp(&b.0));
+            rows_out.sort_by_key(|a| a.0);
             for (_, row) in &rows_out {
                 table.push_str(row);
             }
@@ -10670,12 +10659,12 @@ fn handle_allow(sub: Option<&str>, arg: Option<&str>, session: &Session) {
             }
             // Directory-scoped grants (the 'd' answer) — listed alongside the
             // tool allow-list so every standing permission is visible in one place.
-            if let Ok(dirs) = db.allowed_dirs() {
-                if !dirs.is_empty() {
-                    println!("directory grants (recursive):");
-                    for (perm, dir, ts) in dirs {
-                        println!("  {perm:<6} {dir}  ({ts})");
-                    }
+            if let Ok(dirs) = db.allowed_dirs()
+                && !dirs.is_empty()
+            {
+                println!("directory grants (recursive):");
+                for (perm, dir, ts) in dirs {
+                    println!("  {perm:<6} {dir}  ({ts})");
                 }
             }
         }
@@ -10683,15 +10672,15 @@ fn handle_allow(sub: Option<&str>, arg: Option<&str>, session: &Session) {
             // `<perm>:<dir>` (e.g. `read:/tmp/proj`) revokes a directory grant;
             // a bare name revokes a tool/command from the always-allow list.
             Some(spec) => {
-                if let Some((perm, dir)) = spec.split_once(':') {
-                    if matches!(perm, "read" | "write" | "delete") {
-                        match db.revoke_dir(perm, dir) {
-                            Ok(true) => println!("removed {perm} grant on {dir}"),
-                            Ok(false) => println!("no {perm} grant on {dir}"),
-                            Err(e) => println!("allow: {e:#}"),
-                        }
-                        return;
+                if let Some((perm, dir)) = spec.split_once(':')
+                    && matches!(perm, "read" | "write" | "delete")
+                {
+                    match db.revoke_dir(perm, dir) {
+                        Ok(true) => println!("removed {perm} grant on {dir}"),
+                        Ok(false) => println!("no {perm} grant on {dir}"),
+                        Err(e) => println!("allow: {e:#}"),
                     }
+                    return;
                 }
                 match db.revoke(spec) {
                     Ok(true) => println!("removed {spec} from the always-allow list"),

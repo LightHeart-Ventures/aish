@@ -83,10 +83,10 @@ pub fn load() -> Rc {
 pub fn load_login_profiles() -> Rc {
     let mut rc = Rc::default();
     let mut files: Vec<PathBuf> = vec![PathBuf::from("/etc/profile")];
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            files.push(PathBuf::from(&home).join(".profile"));
-        }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        files.push(PathBuf::from(&home).join(".profile"));
     }
     for f in &files {
         if let Ok(text) = std::fs::read_to_string(f) {
@@ -135,10 +135,10 @@ pub(crate) fn parse_into_diagnosed(text: &str, rc: &mut Rc) -> Vec<crate::diag::
             if let Some((name, value)) = split_assignment(rest) {
                 // The replacement has to survive our own tokenizer, or direct
                 // dispatch couldn't run it anyway (pipes etc. need a shell).
-                if let Some(words) = tokenize(&value) {
-                    if !words.is_empty() {
-                        rc.aliases.insert(name, words);
-                    }
+                if let Some(words) = tokenize(&value)
+                    && !words.is_empty()
+                {
+                    rc.aliases.insert(name, words);
                 }
             }
         } else if let Some(rest) = line.strip_prefix("export ") {
@@ -701,16 +701,16 @@ fn expand_dollar(
         Some('{') => {
             chars.next(); // consume '{'
             // A positional-list special as the sole braced content: ${@} ${*} ${#}.
-            if let Some(&(_, c)) = chars.peek() {
-                if matches!(c, '@' | '*' | '#') {
-                    chars.next();
-                    return match chars.next() {
-                        Some((_, '}')) => {
-                            Some(Dollar::Expanded(lookup(&c.to_string()).unwrap_or_default()))
-                        }
-                        _ => None, // ${@x} / unterminated → route to the model
-                    };
-                }
+            if let Some(&(_, c)) = chars.peek()
+                && matches!(c, '@' | '*' | '#')
+            {
+                chars.next();
+                return match chars.next() {
+                    Some((_, '}')) => {
+                        Some(Dollar::Expanded(lookup(&c.to_string()).unwrap_or_default()))
+                    }
+                    _ => None, // ${@x} / unterminated → route to the model
+                };
             }
             let mut name = String::new();
             loop {

@@ -381,12 +381,11 @@ impl PluginDispatcher {
         // most-recent-wins). This is the "plugin received a webhook → show it on
         // the 2nd statusline" path: the plugin decides the text, the engine caps
         // and routes it.
-        if let Some(flash) = &self.flash {
-            if let Some(msg) = nline_message(&String::from_utf8_lossy(&out.stdout)) {
-                if let Ok(mut slot) = flash.lock() {
-                    *slot = Some(msg);
-                }
-            }
+        if let Some(flash) = &self.flash
+            && let Some(msg) = nline_message(&String::from_utf8_lossy(&out.stdout))
+            && let Ok(mut slot) = flash.lock()
+        {
+            *slot = Some(msg);
         }
     }
 }
