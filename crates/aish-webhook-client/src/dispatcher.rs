@@ -168,6 +168,15 @@ impl PluginRegistry {
         Ok(Self { plugins })
     }
 
+    /// Drop every plugin whose id is in `ids` (and with it all its handlers).
+    /// Returns how many plugins were removed. TASK-274: the host uses this to
+    /// skip the handlers of plugins whose config failed validation.
+    pub fn exclude(&mut self, ids: &[String]) -> usize {
+        let before = self.plugins.len();
+        self.plugins.retain(|p| !ids.iter().any(|id| id == &p.id));
+        before - self.plugins.len()
+    }
+
     pub fn len(&self) -> usize {
         self.plugins.len()
     }
@@ -692,6 +701,31 @@ mod tests {
         let m2 = reg.matching("issues");
         assert_eq!(m2.len(), 1); // only wildcard
         assert_eq!(m2[0].0, "b");
+    }
+
+    /// TASK-274: excluding a (config-invalid) plugin drops all its handlers.
+    #[test]
+    fn exclude_drops_plugins_and_their_handlers() {
+        let h = |ev: &str| WebhookHandler {
+            event_type: ev.into(),
+            command: vec!["true".into()],
+            filters: Default::default(),
+            timeout_secs: None,
+        };
+        let p = |id: &str| PluginManifest {
+            id: id.into(),
+            name: String::new(),
+            version: String::new(),
+            enabled: None,
+            webhooks: vec![h("pull_request"), h("*")],
+        };
+        let mut reg = PluginRegistry::from_plugins(vec![p("a"), p("b")]);
+        assert_eq!(reg.exclude(&["b".to_string(), "zzz".to_string()]), 1);
+        assert_eq!(reg.len(), 1);
+        let m = reg.matching("pull_request");
+        assert!(m.iter().all(|(id, _)| *id == "a"));
+        assert_eq!(m.len(), 2);
+        assert_eq!(reg.exclude(&[]), 0);
     }
 
     #[tokio::test]
