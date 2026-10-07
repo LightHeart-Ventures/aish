@@ -61,6 +61,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+          # This key is the TEST-profile cache, shared intentionally with
+          # ci-testbox.yml (same `cargo test --no-default-features` graph).
+          # Do NOT let a release-profile job share it — repl-smoke.yml used to,
+          # and the save race meant one of the two always restored the wrong
+          # profile's target/ and rebuilt from scratch. It now keys on
+          # `<os>-cargo-release-`.
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           # Without restore-keys, ANY Cargo.lock edit is a total miss and a
           # from-scratch compile. The prefix falls back to the newest cache
