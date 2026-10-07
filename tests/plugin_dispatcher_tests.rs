@@ -19,6 +19,10 @@
 #[allow(dead_code)]
 mod plugin_state;
 
+#[path = "../src/plugin_enable.rs"]
+#[allow(dead_code)]
+mod plugin_enable;
+
 #[path = "../src/plugin_dispatcher.rs"]
 #[allow(dead_code)]
 mod plugin_dispatcher;
@@ -233,4 +237,28 @@ async fn test_non_blocking() {
         assert!(Instant::now() < deadline, "async delivery never completed");
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// TASK-272: a plugin disabled via `:plugin disable` (the user-level
+/// `plugins.state.json` override) receives no webhook events, even though its
+/// manifest says it is enabled; re-enabling restores delivery.
+#[tokio::test]
+async fn test_state_file_disable_skips_plugin() {
+    let dir = tempdir("statefile").join("plugins");
+    write_plugin(
+        &dir,
+        "muted",
+        r#"{"id":"muted","enabled":true,"webhook_command":"echo hi"}"#,
+    );
+    plugin_enable::set_enabled(&dir, "muted", false).unwrap();
+    let state = PluginStateStore::open_in_memory().unwrap();
+    let d = PluginDispatcher::new(dir.clone(), state.clone());
+
+    let n = d.route_awaiting(Event::SkillLoaded).await.unwrap();
+    assert_eq!(n, 0, "a state-file-disabled plugin must not subscribe");
+    assert!(state.get("muted", "last_webhook_output").unwrap().is_none());
+
+    plugin_enable::set_enabled(&dir, "muted", true).unwrap();
+    let n = d.route_awaiting(Event::SkillLoaded).await.unwrap();
+    assert_eq!(n, 1, "re-enabled plugin subscribes again");
 }

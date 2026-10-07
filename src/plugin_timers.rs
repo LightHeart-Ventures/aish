@@ -14,9 +14,20 @@
 //! shell or the other timers ("a broken plugin never blocks startup").
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::plugins;
+
+/// Arm generation: bumped by every [`arm`]; a loop keeps running only while
+/// its captured generation is still current (see [`is_current`]).
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// True while `generation` is the latest [`arm`] — loops from a superseded arm
+/// (after `:plugin enable|disable|reload`) exit at their next wake-up.
+pub(crate) fn is_current(generation: u64) -> bool {
+    GENERATION.load(Ordering::SeqCst) == generation
+}
 
 /// Default per-run wall-clock timeout when a timer omits `timeout_ms`.
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
@@ -85,7 +96,13 @@ pub(crate) fn resolve_command(dir: &Path, command: &str) -> PathBuf {
 /// timers. Each timer becomes one detached `tokio` loop. Must be called from
 /// within a `tokio` runtime (aish's `#[tokio::main]` satisfies this). Returns
 /// the number of timers armed (0 when none declared / all disarmed).
+///
+/// **Re-arm (TASK-272):** calling `arm` again (`:plugin enable|disable|reload`)
+/// bumps a process-wide generation; every loop from an earlier `arm` exits at
+/// its next wake-up WITHOUT running again, so a disabled plugin's timers stop
+/// and an enabled/reloaded plugin's timers start fresh — no duplicate loops.
 pub fn arm(plugins_dir: &Path) -> usize {
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let plugins = plugins::discover(plugins_dir);
     let mut armed = 0usize;
     for p in plugins {
@@ -106,7 +123,7 @@ pub fn arm(plugins_dir: &Path) -> usize {
             armed += 1;
             tokio::spawn(async move {
                 tokio::time::sleep(STARTUP_SETTLE).await;
-                loop {
+                while is_current(generation) {
                     run_once(&plugin_id, &dir, &program, &args, cache.as_deref(), timeout).await;
                     tokio::time::sleep(interval).await;
                 }
@@ -210,6 +227,16 @@ fn log(msg: &str) {
 mod tests {
     use super::*;
     use crate::plugins::PluginManifest;
+
+    /// TASK-272: re-arming supersedes every earlier generation.
+    #[test]
+    fn rearm_supersedes_previous_generation() {
+        let empty =
+            std::env::temp_dir().join(format!("aish-timers-rearm-{}-none", std::process::id()));
+        let before = GENERATION.load(Ordering::SeqCst);
+        assert_eq!(arm(&empty), 0);
+        assert!(!is_current(before), "older generation must be superseded");
+    }
 
     #[test]
     fn parse_every_units() {

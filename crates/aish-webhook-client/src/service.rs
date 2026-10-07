@@ -113,6 +113,7 @@ mod tests {
             id: "echo".into(),
             name: "".into(),
             version: "".into(),
+            enabled: None,
             webhooks: vec![WebhookHandler {
                 event_type: "pull_request".into(),
                 command: vec!["true".into()],
