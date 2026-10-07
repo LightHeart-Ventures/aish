@@ -501,6 +501,16 @@ pub struct Session {
     /// once and `:attach`-ing an already-finished worker does not double-announce.
     /// Cleared when the attachment goes live again (e.g. on resume). Session-local.
     pub attach_review_announced: Arc<Mutex<Option<String>>>,
+    /// DURABLE-TAIL attach state: `Some` while this session is `:attach`ed to a
+    /// run whose stderr pipe this process does NOT own — a live SUBWORKER
+    /// (spawned by one of our coordinators, whose parent may already have
+    /// exited) or another session's run. There is no in-memory transcript ring
+    /// for such a run, so the pane is fed from the durable per-run activity log
+    /// (`crate::activity_log`): the attach backfills it, then the background
+    /// presenter tails it from the carried cursor every tick. `None` for an
+    /// in-session attach (the live stderr forwarder prints those) and when
+    /// detached. Session-local, never persisted.
+    pub attached_durable: Arc<Mutex<Option<crate::activity_log::DurableAttach>>>,
     /// When true, a headless `--coordinator` run prints its final result as a
     /// machine-readable JSON object (`{"ok":true,"output":"…"}`) instead of
     /// rendered markdown — set from `--output json` in `main`. Mirrors the
@@ -724,6 +734,7 @@ impl Session {
             login: false,
             attached: Arc::new(Mutex::new(None)),
             attach_review_announced: Arc::new(Mutex::new(None)),
+            attached_durable: Arc::new(Mutex::new(None)),
             output_json: false,
             hooks: crate::hooks::HookSet::empty(),
             suppress_context_seed: false,

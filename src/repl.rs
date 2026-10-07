@@ -450,6 +450,14 @@ pub async fn run(
         let worker_jobs = session.worker_jobs.clone();
         let attached = session.attached.clone();
         let attach_review_announced = session.attach_review_announced.clone();
+        // DURABLE-TAIL attach (`:attach` on a live SUBWORKER, or another
+        // session's run): this process owns no stderr pipe for it, so the pane
+        // is fed by tailing its durable activity log from THIS tick — the main
+        // loop is blocked in `read_line` while the operator watches, so the
+        // presenter is the only thing that can advance it. The store resolves
+        // the run's phase to detect the finish off-process.
+        let attached_durable = session.attached_durable.clone();
+        let durable_store = session.coordinator_store.clone();
         // Shared with the auto-resume wake hook: this presenter observes child
         // completions off the main thread and arms a coalesced resume; the main
         // loop drains it on its next idle pass. See session::ResumeState.
@@ -580,6 +588,17 @@ pub async fn run(
                         crate::editor::nudge_terminal_return();
                     }
                 }
+                // Durable-tail attach: print rows the off-process run appended
+                // since the last tick, and flip to review mode when it finishes.
+                if pump_durable_attach(&attached_durable, &durable_store, &attach_review_announced)
+                {
+                    finished_bell = true;
+                    // Same hands-free redraw as the in-session finish above: the
+                    // main loop is parked in `read_line`, so nudge it to reprint
+                    // the prompt + footer in review mode.
+                    crate::editor::arm_resume_wake();
+                    crate::editor::nudge_terminal_return();
+                }
                 // Notify (one line per finished job), don't dump the full result
                 // over the prompt — the user views it on demand with `:result`.
                 // Batch notices still surface above the prompt; the worker-done
@@ -698,6 +717,15 @@ pub async fn run(
         // announce it once and flip into review mode (stay attached so a typed
         // line resumes it). See `announce_attach_review`.
         announce_attach_review(&mut session);
+        // Same for a DURABLE-TAIL attach (live subworker / another session's
+        // run): drain whatever its activity log gained while we were busy. The
+        // presenter advances it while the prompt is parked; this pass covers the
+        // non-printer (piped) case and the gap right after a command returns.
+        pump_durable_attach(
+            &session.attached_durable,
+            &session.coordinator_store,
+            &session.attach_review_announced,
+        );
         // TASK-282 AC2: fold any finished linked coordinator into its goal's
         // progress rollup (idempotent — fires the notice once, on the pass that
         // first sees the finish).
@@ -5162,34 +5190,45 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
     // Collect every match in this session's workers, LIVE or terminal — a done/
     // failed coordinator is now attachable too (review + resume): a typed line
     // resumes it from its prior result. `(run_id, terminal)`.
-    let mut matches: Vec<(String, bool)> = Vec::new();
+    // `(run_id, terminal?, durable?)`. `durable` marks a run resolved from the
+    // SHARED coordinator store rather than this session's in-memory jobs: this
+    // process owns no stderr pipe for it, so its pane must be fed from the
+    // durable activity log instead of the live stderr forwarder.
+    let mut matches: Vec<(String, bool, bool)> = Vec::new();
     for w in session.worker_jobs.lock().unwrap().iter() {
         if hit(&w.id) {
             matches.push((
                 w.id.clone(),
                 matches!(w.status().as_str(), "done" | "failed"),
+                false,
             ));
         }
     }
     // Subworker / cross-session fallback: an id absent from this session's
     // `worker_jobs` may be a durable SUBWORKER (spawned by one of our
     // coordinators) or a run owned by another session. Resolve it from the
-    // shared coordinator store and attach in REVIEW mode (replay its durable
-    // task + result). Only consulted when the in-mem lookup found nothing, so
-    // this session's own workers are never double-listed.
+    // shared coordinator store. Its PHASE picks the mode: a terminal run
+    // replays its durable task + result (REVIEW mode), a still-live one is
+    // tailed from its durable activity log (DURABLE-TAIL mode). Only consulted
+    // when the in-mem lookup found nothing, so this session's own workers are
+    // never double-listed.
     if matches.is_empty()
         && let Some(store) = &session.coordinator_store
         && let Ok(rows) = store.load_all()
     {
         for r in &rows {
             if hit(&r.run_id) {
-                matches.push((r.run_id.clone(), true));
+                // The phase decides the mode. Previously EVERY durable match
+                // was forced to `true` (review) -- which is the blank-pane bug:
+                // a live subworker has an empty `result`, so review mode
+                // rendered nothing, forever.
+                matches.push((r.run_id.clone(), !phase_is_live(&r.phase), true));
             }
         }
     }
     match matches.as_slice() {
         [] => println!("no coordinator in this session matching '{id}' (see :workers)"),
-        [(run_id, terminal)] => {
+        [(run_id, terminal, durable)] => {
             // Open the worker view inline on the primary buffer (mirrors
             // Shift-Tab). Non-destructive: the interactive output scrolls up into
             // scrollback rather than being wiped, and the worker's output stays
@@ -5201,13 +5240,32 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
                 // Pre-seed the review marker so `announce_attach_review` doesn't
                 // re-announce the same finish on the next loop tick.
                 *session.attach_review_announced.lock().unwrap() = Some(run_id.clone());
+                *session.attached_durable.lock().unwrap() = None;
                 println!(
                     "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m — review mode: replaying its work below. \x1b[2mType a message to resume it, or :detach to stop.\x1b[0m"
                 );
                 backfill_attached(run_id, session);
                 print_attached_result(run_id, session);
+            } else if *durable {
+                // LIVE SUBWORKER (or another session's live run). Its stderr pipe
+                // belongs to a parent coordinator — possibly one that has already
+                // exited — so there is no `WorkerJob`, no transcript ring, and
+                // nothing for the live forwarder to push at us. Feed the pane from
+                // the durable activity log instead: backfill what was recorded,
+                // then the presenter tick tails it from the cursor we anchor here.
+                *session.attach_review_announced.lock().unwrap() = None;
+                println!(
+                    "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m(durable tail — run owned by another process)\x1b[0m — replaying its recorded activity, then following it live; what you type is steered to it. \x1b[2m:detach to stop.\x1b[0m"
+                );
+                let tail = backfill_attached_durable_tail(run_id, session);
+                *session.attached_durable.lock().unwrap() =
+                    Some(crate::activity_log::DurableAttach {
+                        run_id: run_id.clone(),
+                        tail,
+                    });
             } else {
                 *session.attach_review_announced.lock().unwrap() = None;
+                *session.attached_durable.lock().unwrap() = None;
                 println!(
                     "\x1b[1;33m⇄ attached to {short}\x1b[0m — streaming its activity live; what you type is steered to it. \x1b[2m:detach to stop.\x1b[0m"
                 );
@@ -5222,7 +5280,7 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
                 "'{id}' matches {} coordinators — be more specific:",
                 many.len()
             );
-            for (rid, _) in many {
+            for (rid, _, _) in many {
                 println!("  {rid}");
             }
         }
@@ -5624,12 +5682,122 @@ fn backfill_attached_durable(run_id: &str, session: &Session) {
     );
 }
 
+/// The rows a DURABLE-TAIL attach should render for its backfill, given every
+/// retained row of the run's activity log. Pure -> unit-tested.
+///
+/// An EMPTY log yields an EXPLICIT notice rather than nothing: rendering silence
+/// is indistinguishable from the blank-pane bug this path exists to fix, so the
+/// pane must always say *why* it is empty. A long log is tailed to the last
+/// screen, matching `backfill_attached`'s `TAIL_LINES` behaviour so an off-process
+/// attach looks identical to an in-session one.
+fn durable_backfill_rows(rows: Vec<String>) -> Vec<String> {
+    const TAIL_LINES: usize = 40;
+    if rows.is_empty() {
+        return vec![
+            "·no activity recorded yet — this run's output appears below as it reports".to_string(),
+        ];
+    }
+    let total = rows.len();
+    if total > TAIL_LINES {
+        rows.into_iter().skip(total - TAIL_LINES).collect()
+    } else {
+        rows
+    }
+}
+
+/// Backfill a DURABLE-TAIL attach: the durable header + task (shared with review
+/// mode), then every row recorded in the run's durable activity log — the same
+/// `event.forward_text()` bytes an in-session attach replays from its in-memory
+/// ring, so the two panes are byte-identical. Returns the tail cursor anchored
+/// just past what was rendered, which the presenter advances each tick.
+fn backfill_attached_durable_tail(
+    run_id: &str,
+    session: &Session,
+) -> crate::activity_log::ActivityTail {
+    backfill_attached_durable(run_id, session);
+    // Backfill + anchor in ONE read so a row written *during* the attach can be
+    // neither lost nor double-printed.
+    let (rows, tail) = crate::activity_log::backfill_with_cursor(run_id);
+    for row in durable_backfill_rows(rows) {
+        println!(
+            "{}",
+            crate::worker::pane_row(crate::worker::PANE_NO_LABEL, &row)
+        );
+    }
+    tail
+}
+
+/// Tick of a DURABLE-TAIL attach: print whatever landed in the attached run's
+/// durable activity log since the last tick, and detect its finish.
+///
+/// Returns `true` when the run just went TERMINAL (the caller rings the
+/// finish bell): the durable tail is then dropped and the attachment falls back
+/// to review mode, where `:result`/a typed line behave exactly as for any
+/// finished run. A no-op when there is no durable attach.
+///
+/// Deliberately does its file IO OUTSIDE the `attached_durable` lock (snapshot ->
+/// read -> write the cursor back) so a slow disk can never block the REPL, and
+/// the cursor is only written back if we are still attached to the SAME run — a
+/// `:detach` or re-attach that raced this tick wins.
+fn pump_durable_attach(
+    durable: &Arc<Mutex<Option<crate::activity_log::DurableAttach>>>,
+    store: &Option<crate::db::CoordinatorStore>,
+    attach_review_announced: &Arc<Mutex<Option<String>>>,
+) -> bool {
+    let Some(mut snap) = durable.lock().ok().and_then(|g| g.clone()) else {
+        return false;
+    };
+    let rows = crate::activity_log::read_new(&snap.run_id, &mut snap.tail);
+    for row in &rows {
+        crate::tools::print_above_prompt(format!(
+            "{}\n",
+            crate::worker::pane_row(crate::worker::PANE_NO_LABEL, row)
+        ));
+    }
+    match durable.lock().ok().as_deref_mut() {
+        Some(Some(cur)) if cur.run_id == snap.run_id => cur.tail = snap.tail,
+        // Detached (or re-attached elsewhere) mid-tick: drop the advanced cursor.
+        _ => return false,
+    }
+    // Finish detection: the durable phase is the only signal available
+    // off-process. Announce once (claiming the same marker `announce_attach_review`
+    // uses, so the two can't double-announce), then stop tailing.
+    let terminal = store
+        .as_ref()
+        .and_then(|s| s.load_all().ok())
+        .map(|rows| {
+            rows.iter()
+                .any(|r| r.run_id == snap.run_id && !phase_is_live(&r.phase))
+        })
+        .unwrap_or(false);
+    if !terminal {
+        return false;
+    }
+    // Stop tailing and fall back to review mode. The announce is CLAIMED with the
+    // same atomic marker the in-session path uses, so the presenter and the
+    // main-loop pass can't both print it.
+    if let Ok(mut g) = durable.lock() {
+        *g = None;
+    }
+    if !claim_attach_announce(attach_review_announced, &snap.run_id) {
+        return false;
+    }
+    let short = crate::batch::short_id(&snap.run_id);
+    crate::tools::print_above_prompt(format!(
+        "\x1b[2m⇄ {short} finished — review mode: `:result {short}` for its full answer, or :detach to return to your shell.\x1b[0m\n"
+    ));
+    true
+}
+
 /// `:detach` — stop watching the attached coordinator. It keeps running in the
 /// background; its result still auto-delivers and shows in `:workers`.
 fn detach_worker(session: &mut Session) {
     // Stop any live "thinking…" spinner now so it can't erase the next prompt
     // (and restore the cursor it hid) — same race guarded in `cycle_worker`.
     crate::worker::quiesce_thinking_spinners();
+    // Stop any durable tail too — otherwise the presenter would keep printing a
+    // detached run's rows above the prompt.
+    *session.attached_durable.lock().unwrap() = None;
     match session.attached.lock().unwrap().take() {
         Some(run_id) => {
             // Close the worker view. It rendered inline on the primary buffer, so
@@ -5911,7 +6079,18 @@ fn send_to_attached(run_id: &str, message: &str, session: &mut Session) {
     if terminal {
         resume_coordinator(run_id, message, session);
     } else {
-        tell_coordinator(Some(run_id), message, false, session);
+        // A DURABLE-TAIL attach steers across the session boundary: explicitly
+        // `:attach`ing a run owned by another process IS the opt-in that
+        // `:tell --any` asks for, so pass `any` through rather than letting the
+        // ownership gate silently refuse every typed line. `tell_coordinator`
+        // still prints its own refusal if the run went terminal meanwhile —
+        // operator input is never swallowed.
+        let any = session
+            .attached_durable
+            .lock()
+            .map(|g| g.as_ref().is_some_and(|d| d.run_id == *run_id))
+            .unwrap_or(false);
+        tell_coordinator(Some(run_id), message, any, session);
     }
 }
 
@@ -12640,6 +12819,50 @@ mod tests {
         // are therefore dead — a row we cannot interpret must not swallow a msg.
         assert!(!phase_is_live(""));
         assert!(!phase_is_live("zombie"));
+    }
+
+    #[test]
+    /// AC: the attach MODE of a run resolved from the DURABLE store follows its
+    /// phase — a still-live subworker is tailed, a finished one is reviewed.
+    /// Mirrors the `!phase_is_live(&r.phase)` mapping in `attach_worker`'s
+    /// cross-session fallback. The pre-fix code pushed a hard-coded `true`
+    /// (review) for EVERY durable match, which is the blank-pane bug: a live
+    /// subworker has an empty `result`, so review mode rendered nothing forever.
+    fn durable_attach_mode_follows_the_runs_phase() {
+        // `terminal` as `attach_worker` computes it for a durable match.
+        let terminal = |phase: &str| !phase_is_live(phase);
+        for live in ["coordinating", "awaiting_batch"] {
+            assert!(!terminal(live), "{live} must attach in TAIL mode");
+        }
+        for dead in ["done", "failed", "", "zombie"] {
+            assert!(terminal(dead), "{dead} must attach in REVIEW mode");
+        }
+    }
+
+    #[test]
+    /// AC: a durable-tail attach whose log is EMPTY renders an EXPLICIT notice.
+    /// Silence is indistinguishable from the blank pane this path exists to fix,
+    /// so the pane must always say *why* it has nothing to show.
+    fn durable_backfill_names_an_empty_log_instead_of_rendering_nothing() {
+        let rows = durable_backfill_rows(Vec::new());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            rows[0].contains("no activity recorded yet"),
+            "empty log must say so: {rows:?}"
+        );
+    }
+
+    #[test]
+    /// A short log replays verbatim; a long one is tailed to the last screen, the
+    /// same bound `backfill_attached` applies in-session, so an off-process attach
+    /// looks identical.
+    fn durable_backfill_keeps_short_logs_and_tails_long_ones() {
+        let short: Vec<String> = (0..3).map(|i| format!("row {i}")).collect();
+        assert_eq!(durable_backfill_rows(short.clone()), short);
+        let shown = durable_backfill_rows((0..100).map(|i| format!("row {i}")).collect());
+        assert_eq!(shown.len(), 40);
+        assert_eq!(shown.first().map(String::as_str), Some("row 60"));
+        assert_eq!(shown.last().map(String::as_str), Some("row 99"));
     }
 
     #[test]
