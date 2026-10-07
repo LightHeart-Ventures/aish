@@ -70,14 +70,13 @@ impl IntoResponse for BrokerError {
                 "Queue full, retry later".to_string(),
             ),
             BrokerError::InvalidJson(ref msg) => (StatusCode::BAD_REQUEST, msg.clone()),
-            BrokerError::AuthFailed => {
-                (StatusCode::UNAUTHORIZED, "Authentication failed".to_string())
-            }
+            BrokerError::AuthFailed => (
+                StatusCode::UNAUTHORIZED,
+                "Authentication failed".to_string(),
+            ),
             BrokerError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
             BrokerError::WebSocket(ref msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
-            BrokerError::Internal(ref msg) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, msg.clone())
-            }
+            BrokerError::Internal(ref msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         };
 
         let body = Json(json!({ "error": error_message }));
