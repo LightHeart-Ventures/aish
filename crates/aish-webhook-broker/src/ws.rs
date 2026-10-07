@@ -67,17 +67,30 @@ async fn handle_socket(socket: WebSocket, config: BrokerConfig) {
         "WebSocket client connected"
     );
 
-    // 3. Drain any already-queued webhooks for this client.
+    // 3. Drain any already-queued webhooks for this client (reconnect backlog
+    //    replay). Frames written here count toward `/stats` `delivered_ws`, the
+    //    same as the live dispatch fast path in `Hub::dispatch`.
     if let Ok(pending) = db::fetch_pending(&config.db, &client.tenant_id, &client.plugin_id, 500) {
+        let mut replayed = 0u64;
+        let mut send_failed = false;
         for wh in pending {
             if sender
                 .send(Message::Text(wh.to_envelope().to_string()))
                 .await
                 .is_err()
             {
-                config.hub.unregister_ws(&client.session_token);
-                return;
+                send_failed = true;
+                break;
             }
+            replayed += 1;
+        }
+        config
+            .hub
+            .stats()
+            .record_delivered_ws(&client.tenant_id, &client.plugin_id, replayed);
+        if send_failed {
+            config.hub.unregister_ws(&client.session_token);
+            return;
         }
     }
 
