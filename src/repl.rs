@@ -2520,7 +2520,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("output", "stream coordinators' activity (on|off)"),
     (
         "plugin",
-        "plugins (list|info|config|enable|disable|reload|errors|add|remove <id>)",
+        "plugins (list|info|config|enable|disable|reload|errors|create|add|remove <id>)",
     ),
     ("quit", "exit aish"),
     (
@@ -7466,7 +7466,8 @@ fn handle_hooks(sub: Option<&str>, session: &mut Session) {
     }
 }
 
-/// `:plugin [list|info <id>]` — plugin provenance introspection (Phase 0.5.6).
+/// `:plugin [list|info <id>|create <id>]` — plugin provenance introspection (Phase 0.5.6).
+/// `create <id>` (TASK-275) scaffolds a new plugin via [`crate::plugin_scaffold`].
 /// `list` enumerates discovered plugins; `info <id>` renders one plugin's full
 /// capability report (metadata, login, lifecycle + event hooks, MCP servers,
 /// schemas, skills). `info <id> --schema` (Phase 3.5) renders the plugin's
@@ -7623,6 +7624,7 @@ fn handle_plugin(args: Vec<&str>, session: &mut Session) {
             print_plugin_errors(&dir, id, flag);
         }
         Some("memory" | "mem") => handle_plugin_memory(&args[1..]),
+        Some("create" | "new") => crate::plugin_scaffold::run(&dir, id),
         Some("config") => handle_plugin_config(&args[1..], session, &dir),
         Some("list") | None => {
             let Some(list) = crate::plugins::format_plugin_list(&dir) else {
@@ -7637,6 +7639,7 @@ fn handle_plugin(args: Vec<&str>, session: &mut Session) {
                 ":plugin config <id> [--set <key> <value> | --reset [key]] to view/edit config"
             );
             println!(":plugin add <id> to install a plugin from the registry");
+            println!(":plugin create <id> to scaffold a new plugin");
         }
         Some(other) => println!("unknown :plugin subcommand `{other}` — try :plugin list"),
     }
@@ -7644,7 +7647,8 @@ fn handle_plugin(args: Vec<&str>, session: &mut Session) {
 
 /// `:plugin` subcommands, for TAB completion and the usage line.
 const PLUGIN_SUBCOMMANDS: &[&str] = &[
-    "add", "config", "disable", "enable", "errors", "info", "list", "memory", "reload", "remove",
+    "add", "config", "create", "disable", "enable", "errors", "info", "list", "memory", "reload",
+    "remove",
 ];
 
 /// Default row count for `:plugin errors <id>` (TASK-274).
