@@ -51,6 +51,11 @@ mod net_impl {
     impl TungsteniteTransport {
         /// Dial the broker and complete the WebSocket upgrade.
         pub async fn connect(url: &str) -> Result<Self> {
+            // wss:// goes through rustls. With more than one crypto backend
+            // compiled in (aish links both ring and aws-lc-rs), rustls needs an
+            // explicit process default or `ClientConfig::builder()` panics.
+            // Idempotent: `Err` just means one is already installed.
+            let _ = rustls::crypto::ring::default_provider().install_default();
             let (inner, _resp) = connect_async(url)
                 .await
                 .map_err(|e| WebhookClientError::Connection(e.to_string()))?;

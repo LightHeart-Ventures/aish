@@ -24,14 +24,16 @@ actually reads at REPL startup:
 
 | Var | Req | Default | Meaning |
 |-----|-----|---------|---------|
-| `WEBHOOK_BROKER_URL` | ✅ | — | Broker WebSocket URL (`ws://` or `wss://`). Unset ⇒ the broker client never starts (soft no-op). |
-| `WEBHOOK_TENANT_ID` | | `default` | Tenant this client authenticates as. |
-| `WEBHOOK_BROKER_SECRET` | | `null` | Shared secret echoed in the auth frame. |
-| `WEBHOOK_CLIENT_ID` | | generated | Stable client id; auto-generated when absent. |
+| `WEBHOOK_BROKER_URL` | ✅ | — | Broker WebSocket URL (`ws://` or `wss://`). Unset ⇒ the broker client never starts (soft no-op). The registration URL is derived from it: `wss://h/ws` → `https://h/clients/register`. |
+| `WEBHOOK_PLUGIN_ID` | ✅ | — | Broker `plugin_id` to register for (e.g. `hello-world`). The broker routes by `(tenant_id, plugin_id)`; unset ⇒ warning + no-op. |
+| `WEBHOOK_TENANT_ID` | | `default` | Tenant this client registers as. |
+| `WEBHOOK_BROKER_SECRET` | | `null` | Sent as `secret` in `POST /clients/register`. The broker then requires `X-Signature: sha256=<hmac>` on inbound webhooks for this route. Never sent over the WebSocket. |
+| `WEBHOOK_CLIENT_ID` | | generated | Stable client id; auto-generated when absent. Sent as the registration `session_id`. |
 | `AISH_PLUGINS_DIR` | | `~/.aish/plugins` | Directory scanned for `plugin.json` webhook handlers. |
 
 ```bash
 export WEBHOOK_BROKER_URL="wss://webhook-broker.example.com/ws"
+export WEBHOOK_PLUGIN_ID="hello-world"
 export WEBHOOK_TENANT_ID="acme"
 aish
 ```
@@ -54,11 +56,22 @@ path above is what actually runs when you start `aish`. A missing file or
 
 The `ConnectionManager` owns a single logical session and keeps it alive:
 
-1. **Dial** the `broker_url` (real socket only under the `net` feature; see below).
-2. **Auth** — send a `ClientFrame::Auth { tenant_id, client_id, plugin?, secret? }`.
-3. **Await** `AuthOk { session_token?, client_id? }`; adopt any broker-assigned id.
-4. **Serve** — read frames, dispatch webhooks, ack them, answer heartbeats.
-5. **Reconnect** on drop with exponential backoff, then resume from the queue.
+1. **Register** (HTTP, `BrokerClient::register`, `net` feature) —
+   `POST /clients/register {tenant_id, plugin_id, session_id, transport:"websocket", secret?}`
+   → `201 {client_id, session_token:"st_…", ws_path}`. The token is kept across
+   reconnects (the broker persists it).
+2. **Dial** the `broker_url` (real socket only under the `net` feature; `wss://`
+   via rustls).
+3. **Auth** — first frame `{"type":"auth","session_token":"st_…"}`.
+4. **Await** `auth_ok` (adopt `client_id`) or `auth_error` → `WebhookClientError::Auth`
+   immediately; `reconnect_with_backoff` does not retry auth errors — aish drops
+   the token and re-registers (e.g. after a broker DB reset).
+5. **Serve** — read frames, dispatch webhooks, ack them
+   (`{"type":"ack","webhook_id"}`), answer heartbeats.
+6. **Reconnect** on drop with exponential backoff, then resume from the queue.
+
+The wire contract is pinned by `crates/aish-webhook-broker/tests/client_contract.rs`,
+which runs the real broker router against the real client (TASK-449).
 
 Because the broker's SQLite queue is the durable source of truth and delivery is
 at-least-once, a dropped/reconnected client loses nothing — undelivered messages
@@ -79,8 +92,8 @@ bare (untyped) webhook envelopes.
 
 | `type` | Fields | When |
 |--------|--------|------|
-| `auth` | `tenant_id`, `client_id`, `plugin?`, `secret?` | On connect. |
-| `ack` | `id` | After a webhook's handlers have been dispatched. |
+| `auth` | `session_token` | First frame on connect. |
+| `ack` | `webhook_id` | After a webhook's handlers have been dispatched. |
 | `pong` | — | In reply to a broker `ping`. |
 
 **Broker → client** (`ServerFrame`, sniffed):
@@ -89,6 +102,7 @@ bare (untyped) webhook envelopes.
 |-------|-----------|--------|
 | `{"type":"webhook"\|"event", …}` or untyped `{id, event_type, …}` | `Webhook` | dispatch → ack |
 | `{"type":"auth_ok"\|"registered"\|"ack", session_token?, client_id?}` | `AuthOk` | adopt session |
+| `{"type":"auth_error","error"}` | `AuthError` | fail auth (re-register) |
 | `{"type":"ping"}` | `Ping` | reply `pong` |
 | anything else / `{"type":"pong"}` | `Other` | ignore |
 
@@ -104,7 +118,7 @@ bare (untyped) webhook envelopes.
 }
 ```
 
-`id` is echoed back in the `ack`. `event_type` selects handlers; `payload` is the
+`id` is echoed back as `webhook_id` in the `ack`. `event_type` selects handlers; `payload` is the
 raw provider JSON, passed to handlers unchanged.
 
 ## Handler dispatch contract

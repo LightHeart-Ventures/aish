@@ -26,8 +26,12 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Arm generation (TASK-272): loops from a superseded [`arm`] exit.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 use crate::plugin_timers::{parse_every, resolve_command};
 use crate::plugins;
@@ -114,8 +118,18 @@ pub fn segments(stale_after: Duration) -> Vec<String> {
 /// `provides.statusline`. Each becomes one detached `tokio` loop that refreshes
 /// the core-owned in-memory cache. Must be called from within a `tokio` runtime
 /// (aish's `#[tokio::main]` satisfies this). Returns the number armed.
+///
+/// **Re-arm (TASK-272):** a later `arm` (`:plugin enable|disable|reload`)
+/// supersedes earlier loops (they exit at their next wake-up) and drops cached
+/// segments of plugins that are no longer enabled, so a disabled plugin's badge
+/// disappears from the footer immediately.
 pub fn arm(plugins_dir: &Path) -> usize {
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let plugins = plugins::discover(plugins_dir);
+    let live: Vec<String> = plugins.iter().map(|p| p.manifest.id.clone()).collect();
+    if let Ok(mut map) = registry().lock() {
+        map.retain(|id, _| live.contains(id));
+    }
     let mut armed = 0usize;
     for p in plugins {
         let Some(sl) = p.manifest.statusline() else {
@@ -141,7 +155,7 @@ pub fn arm(plugins_dir: &Path) -> usize {
         armed += 1;
         tokio::spawn(async move {
             tokio::time::sleep(STARTUP_SETTLE).await;
-            loop {
+            while GENERATION.load(Ordering::SeqCst) == generation {
                 run_once(&plugin_id, &dir, &program, &args, timeout).await;
                 tokio::time::sleep(interval).await;
             }

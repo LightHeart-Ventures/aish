@@ -422,7 +422,7 @@ where
 
 /// `config_schema.properties` as a map, or empty when the schema is absent or
 /// shaped unexpectedly.
-fn schema_properties(schema: &Value) -> serde_json::Map<String, Value> {
+pub(crate) fn schema_properties(schema: &Value) -> serde_json::Map<String, Value> {
     schema
         .get("properties")
         .and_then(|p| p.as_object())
@@ -432,7 +432,7 @@ fn schema_properties(schema: &Value) -> serde_json::Map<String, Value> {
 
 /// Recursively expand `${env:VAR}` references inside a JSON value. `key` is the
 /// dotted path used only for error messages.
-fn resolve_env_refs<F>(key: &str, val: Value, get_env: &F) -> Result<Value, ConfigError>
+pub(crate) fn resolve_env_refs<F>(key: &str, val: Value, get_env: &F) -> Result<Value, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -500,7 +500,7 @@ where
 }
 
 /// Validate `required` presence and declared value `type`s against the schema.
-fn validate_config(
+pub(crate) fn validate_config(
     schema: &Value,
     config: &serde_json::Map<String, Value>,
 ) -> Result<(), ConfigError> {
@@ -574,12 +574,27 @@ pub fn default_plugins_dir() -> PathBuf {
         .join("plugins")
 }
 
-/// Discover every valid, enabled plugin under `dir`. Missing dir → no plugins;
-/// a subdirectory without a readable/parseable `plugin.json`, or one explicitly
-/// disabled, is skipped silently (mirrors [`crate::skills::load`]'s forgiving
-/// contract — a malformed plugin never blocks startup). Result is sorted by
-/// plugin id for deterministic ordering.
+/// Discover every valid, **enabled** plugin under `dir`. Missing dir → no
+/// plugins; a subdirectory without a readable/parseable `plugin.json`, or one
+/// that is disabled, is skipped silently (mirrors [`crate::skills::load`]'s
+/// forgiving contract — a malformed plugin never blocks startup). "Disabled"
+/// is the EFFECTIVE state: the user-level `plugins.state.json` override set by
+/// `:plugin enable|disable` (TASK-272, see [`crate::plugin_enable`]) wins over
+/// the manifest's own `"enabled"`. Result is sorted by plugin id.
 pub fn discover(dir: &Path) -> Vec<Plugin> {
+    discover_all(dir)
+        .into_iter()
+        .filter(|p| p.manifest.is_enabled())
+        .collect()
+}
+
+/// Like [`discover`] but keeps disabled plugins too — the view `:plugin list`
+/// and `:plugin info` need to show a `(disabled)` plugin. Every returned
+/// manifest has `enabled` rewritten to the EFFECTIVE state (state-file override
+/// → manifest → `true`), so `manifest.is_enabled()` is authoritative. Disabled
+/// plugins carry no skills/config/schemas (they are listed, not loaded).
+pub fn discover_all(dir: &Path) -> Vec<Plugin> {
+    let state = crate::plugin_enable::load(dir);
     let mut plugins = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return plugins;
@@ -592,10 +607,22 @@ pub fn discover(dir: &Path) -> Vec<Plugin> {
         let Ok(text) = std::fs::read_to_string(pdir.join("plugin.json")) else {
             continue;
         };
-        let Ok(manifest) = serde_json::from_str::<PluginManifest>(&text) else {
+        let Ok(mut manifest) = serde_json::from_str::<PluginManifest>(&text) else {
             continue;
         };
+        let state_override = state.plugins.get(&manifest.id).and_then(|e| e.enabled);
+        manifest.enabled = Some(crate::plugin_enable::resolve(
+            state_override,
+            manifest.enabled,
+        ));
         if !manifest.is_enabled() {
+            plugins.push(Plugin {
+                manifest,
+                dir: pdir,
+                skills: Vec::new(),
+                config: None,
+                schemas: Vec::new(),
+            });
             continue;
         }
         // Phase 0.5.1: `provides.hooks` was renamed to `provides.lifecycle_hooks`.
@@ -626,6 +653,50 @@ pub fn discover(dir: &Path) -> Vec<Plugin> {
     }
     plugins.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
     plugins
+}
+
+/// Persist the user-level enable/disable override for plugin `id` under `dir`
+/// (TASK-272 — `:plugin enable|disable`). Errors when no plugin with that id is
+/// installed (enabled or not) or the state file can't be written. Returns
+/// `Ok(true)` when the effective state changed, `Ok(false)` when the plugin was
+/// already in the requested state (nothing is written then).
+pub fn set_plugin_enabled(dir: &Path, id: &str, enabled: bool) -> Result<bool, String> {
+    let plugins = discover_all(dir);
+    let Some(p) = plugins.iter().find(|p| p.manifest.id == id) else {
+        return Err(format!("no such plugin `{id}` — try :plugin list"));
+    };
+    if p.manifest.is_enabled() == enabled {
+        return Ok(false);
+    }
+    crate::plugin_enable::set_enabled(dir, id, enabled).map_err(|e| {
+        format!(
+            "could not write {}: {e}",
+            crate::plugin_enable::state_path(dir).display()
+        )
+    })?;
+    Ok(true)
+}
+
+/// Render `:plugin list`: every installed plugin (enabled AND disabled), one
+/// row each, disabled ones marked `(disabled)`. `None` when none installed.
+pub fn format_plugin_list(dir: &Path) -> Option<String> {
+    let plugins = discover_all(dir);
+    if plugins.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for p in &plugins {
+        let m = &p.manifest;
+        let name = if m.name.is_empty() { &m.id } else { &m.name };
+        let ver = if m.version.is_empty() {
+            "-"
+        } else {
+            &m.version
+        };
+        let state = if m.is_enabled() { "" } else { " (disabled)" };
+        out.push_str(&format!("  {:<20} {name} v{ver}{state}\n", m.id));
+    }
+    Some(out.trim_end().to_string())
 }
 
 /// Flatten every discovered plugin's skills into one list — the skill-registry
@@ -1330,7 +1401,7 @@ pub fn env_injection_disabled() -> bool {
 }
 
 /// A credential-like env-var NAME must never be injected from a plugin hook.
-fn is_credential_like(key: &str) -> bool {
+pub(crate) fn is_credential_like(key: &str) -> bool {
     let lk = key.to_ascii_lowercase();
     CREDENTIAL_MARKERS.iter().any(|m| lk.contains(m))
 }
@@ -1502,6 +1573,35 @@ pub fn collect_lifecycle_env_at(
     session_env: &[(String, String)],
     cred_path: &Path,
 ) -> HookEnv {
+    collect_lifecycle_env_filtered(dir, hook, session_env, cred_path, None)
+}
+
+/// Run lifecycle `hook` for ONE enabled plugin (`id`) and return its parsed,
+/// precedence-checked exports — what `:plugin enable <id>` uses to re-run
+/// `on_init` (TASK-272). Same safety rules as [`collect_lifecycle_env`]; a
+/// disabled/unknown plugin yields an empty [`HookEnv`].
+pub fn collect_plugin_lifecycle_env(
+    dir: &Path,
+    id: &str,
+    hook: &str,
+    session_env: &[(String, String)],
+) -> HookEnv {
+    collect_lifecycle_env_filtered(
+        dir,
+        hook,
+        session_env,
+        &crate::plugin_auth::credentials_path(),
+        Some(id),
+    )
+}
+
+fn collect_lifecycle_env_filtered(
+    dir: &Path,
+    hook: &str,
+    session_env: &[(String, String)],
+    cred_path: &Path,
+    only: Option<&str>,
+) -> HookEnv {
     use std::collections::HashSet;
     let mut merged = HookEnv::default();
     if env_injection_disabled() {
@@ -1511,6 +1611,9 @@ pub fn collect_lifecycle_env_at(
     let mut taken: HashSet<String> = HashSet::new();
     for plugin in discover(dir) {
         if !plugin.manifest.is_enabled() {
+            continue;
+        }
+        if only.is_some_and(|o| o != plugin.manifest.id) {
             continue;
         }
         let id = plugin.manifest.id.clone();
@@ -1578,7 +1681,8 @@ pub fn plugin_hook_fragments(dir: &Path) -> Vec<crate::hooks::PluginHookFragment
 /// refs redacted — names only), the event-catalog hooks from its `hooks.json`,
 /// and the skills it expands into the registry.
 pub fn format_plugin_info(dir: &Path, id: &str) -> Option<String> {
-    let plugins = discover(dir);
+    // TASK-272: include disabled plugins so `enabled: no` is reachable.
+    let plugins = discover_all(dir);
     let plugin = plugins.iter().find(|p| p.manifest.id == id)?;
     let m = &plugin.manifest;
     let mut out = String::new();
@@ -1610,11 +1714,16 @@ pub fn format_plugin_info(dir: &Path, id: &str) -> Option<String> {
             &m.description
         },
     );
-    field(
-        &mut out,
-        "enabled",
-        if m.is_enabled() { "yes" } else { "no" },
-    );
+    let enabled = match (
+        m.is_enabled(),
+        crate::plugin_enable::enabled_override(dir, &m.id).is_some(),
+    ) {
+        (true, false) => "yes",
+        (false, false) => "no (manifest)",
+        (true, true) => "yes (:plugin enable)",
+        (false, true) => "no (:plugin disable)",
+    };
+    field(&mut out, "enabled", enabled);
     field(&mut out, "dir", &plugin.dir.display().to_string());
     field(&mut out, "login", m.login_command().unwrap_or("-"));
 
@@ -1816,6 +1925,77 @@ mod tests {
         );
         assert!(discover(&tmp).is_empty());
         assert!(plugin_skills(&tmp).is_empty());
+    }
+
+    // ---- TASK-272: enable/disable state ---------------------------------
+
+    #[test]
+    fn list_and_info_show_disabled_plugins() {
+        let tmp = tempdir().join("plugins");
+        write_plugin(&tmp, "on", r#"{"id":"on","version":"1.0"}"#, None);
+        write_plugin(&tmp, "off", r#"{"id":"off","enabled":false}"#, None);
+        let all = discover_all(&tmp);
+        assert_eq!(all.len(), 2);
+        let list = format_plugin_list(&tmp).unwrap();
+        assert!(
+            list.contains("off") && list.contains("(disabled)"),
+            "{list}"
+        );
+        let on_row = list.lines().find(|l| l.contains("on ")).unwrap();
+        assert!(!on_row.contains("(disabled)"));
+        let info = format_plugin_info(&tmp, "off").expect("disabled plugin has info");
+        assert!(info.contains("no (manifest)"), "{info}");
+    }
+
+    #[test]
+    fn state_override_beats_manifest_and_persists() {
+        let tmp = tempdir().join("plugins");
+        write_plugin(
+            &tmp,
+            "gh",
+            r#"{"id":"gh"}"#,
+            Some(("gh-skill", "GitHub things.")),
+        );
+        write_plugin(&tmp, "legacy", r#"{"id":"legacy","enabled":false}"#, None);
+
+        assert_eq!(set_plugin_enabled(&tmp, "gh", false), Ok(true));
+        assert_eq!(set_plugin_enabled(&tmp, "gh", false), Ok(false));
+        // Survives a fresh discovery (i.e. a shell restart).
+        assert!(discover(&tmp).iter().all(|p| p.manifest.id != "gh"));
+        assert!(plugin_skills(&tmp).is_empty());
+        let info = format_plugin_info(&tmp, "gh").unwrap();
+        assert!(info.contains("no (:plugin disable)"), "{info}");
+
+        // A manifest-disabled plugin can be turned on by the override.
+        assert_eq!(set_plugin_enabled(&tmp, "legacy", true), Ok(true));
+        assert!(discover(&tmp).iter().any(|p| p.manifest.id == "legacy"));
+
+        // A reinstall rewriting plugin.json doesn't clobber the choice.
+        write_plugin(&tmp, "gh", r#"{"id":"gh","version":"2.0"}"#, None);
+        assert!(discover(&tmp).iter().all(|p| p.manifest.id != "gh"));
+
+        assert_eq!(set_plugin_enabled(&tmp, "gh", true), Ok(true));
+        assert!(discover(&tmp).iter().any(|p| p.manifest.id == "gh"));
+        assert!(set_plugin_enabled(&tmp, "nope", true).is_err());
+    }
+
+    #[test]
+    fn disabled_plugin_contributes_no_hooks_or_lifecycle_env() {
+        let tmp = tempdir().join("plugins");
+        write_plugin(&tmp, "p", r#"{"id":"p"}"#, None);
+        fs::write(
+            tmp.join("p").join("hooks.json"),
+            r#"{"hooks":[{"event":"PreToolUse","action":{"type":"observe"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(plugin_hook_fragments(&tmp).len(), 1);
+        set_plugin_enabled(&tmp, "p", false).unwrap();
+        assert!(plugin_hook_fragments(&tmp).is_empty());
+        assert!(
+            collect_plugin_lifecycle_env(&tmp, "p", "on_init", &[])
+                .vars
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2499,6 +2679,18 @@ mod tests {
         );
     }
 
+    /// TASK-272: `:plugin enable <id>` re-runs on_init for that plugin only.
+    #[test]
+    fn collect_plugin_lifecycle_env_runs_only_the_named_plugin() {
+        let tmp = tempdir().join("plugins");
+        write_plugin(&tmp, "aaa", r#"{"id":"aaa"}"#, None);
+        write_hook(&tmp, "aaa", "on_init", "#!/bin/sh\necho FROM_A=1\n");
+        write_plugin(&tmp, "bbb", r#"{"id":"bbb"}"#, None);
+        write_hook(&tmp, "bbb", "on_init", "#!/bin/sh\necho FROM_B=2\n");
+        let env = collect_plugin_lifecycle_env(&tmp, "bbb", "on_init", &[]);
+        assert_eq!(env.vars, vec![("FROM_B".to_string(), "2".to_string())]);
+    }
+
     #[test]
     fn collect_first_plugin_wins_on_collision() {
         let tmp = tempdir();
@@ -2947,15 +3139,21 @@ mod tests {
 
     /// A private, dependency-free temp dir (the crate doesn't pull in the
     /// `tempfile` crate for this module — mirror skills.rs's test helper).
+    ///
+    /// A per-process counter makes names unique even when parallel tests read
+    /// the same clock value (macOS `SystemTime` is microsecond-resolution, so
+    /// nanos alone collided and tests intermittently shared a plugins dir).
     fn tempdir() -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let mut p = std::env::temp_dir();
         let uniq = format!(
-            "aish-plugins-test-{}-{}",
+            "aish-plugins-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         );
         p.push(uniq);
         std::fs::create_dir_all(&p).unwrap();

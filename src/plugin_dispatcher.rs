@@ -20,7 +20,8 @@
 //! plugin can yet mutate shell state through a hook (Phase 2+).
 //!
 //! Testability: this module is self-contained apart from
-//! [`crate::plugin_state::PluginStateStore`], so `tests/plugin_dispatcher_tests.rs`
+//! [`crate::plugin_state::PluginStateStore`] and the std-only
+//! [`crate::plugin_enable`] state reader, so `tests/plugin_dispatcher_tests.rs`
 //! compiles it (and `plugin_state.rs`) directly via `#[path]` — `crate::` here
 //! resolves to the test crate root, which declares the same sibling modules.
 
@@ -152,7 +153,9 @@ impl PluginDispatcher {
             let Ok(m) = serde_json::from_str::<WebhookManifest>(&text) else {
                 continue;
             };
-            if !m.enabled.unwrap_or(true) {
+            // TASK-272: the user-level `plugins.state.json` override (set by
+            // `:plugin enable|disable`) wins over the manifest's own flag.
+            if !crate::plugin_enable::effective_enabled(&self.plugins_dir, &m.id, m.enabled) {
                 continue;
             }
             if m.webhook_url.is_none() && m.webhook_command.is_none() {

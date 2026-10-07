@@ -42,7 +42,9 @@ mod plan;
 #[cfg(test)]
 mod plan_dag_loop_tests;
 mod plugin_auth;
+mod plugin_config;
 mod plugin_dispatcher;
+mod plugin_enable;
 mod plugin_memory;
 #[cfg(test)]
 mod plugin_phase05_consolidation_tests;

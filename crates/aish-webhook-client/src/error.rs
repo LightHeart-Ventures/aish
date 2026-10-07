@@ -25,6 +25,10 @@ pub enum WebhookClientError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// `POST /clients/register` failed (HTTP error or non-2xx status).
+    #[error("registration failed: {0}")]
+    Registration(String),
+
     /// Malformed or missing configuration.
     #[error("config error: {0}")]
     Config(String),
