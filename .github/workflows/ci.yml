@@ -62,6 +62,11 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # Without restore-keys, ANY Cargo.lock edit is a total miss and a
+          # from-scratch compile. The prefix falls back to the newest cache
+          # for this OS, so a dep bump reuses every unchanged artifact.
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       # --no-default-features drops the in-process local model (mistralrs /
       # mistralrs-core), which is huge and unneeded for the oracle harness +

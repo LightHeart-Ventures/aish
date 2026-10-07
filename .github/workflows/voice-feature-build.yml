@@ -61,6 +61,13 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-voice-${{ hashFiles('**/Cargo.lock') }}
+          # Prefer a previous voice cache; fall back to the plain CI cache,
+          # whose feature-independent deps are still reusable (cargo keys
+          # artifact fingerprints by feature set, so the voice-only ones are
+          # simply rebuilt). Order matters: first match wins.
+          restore-keys: |
+            ${{ runner.os }}-cargo-voice-
+            ${{ runner.os }}-cargo-
 
       - name: Build voice feature
         run: cargo build --features voice --locked

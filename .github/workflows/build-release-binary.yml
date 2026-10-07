@@ -66,6 +66,10 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-${{ inputs.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # Prefix fallback so a Cargo.lock edit is not a total miss. Scoped
+          # to the target triple -- cross-target artifacts are not reusable.
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.target }}-cargo-
 
       - name: Cache cargo + target (GitHub-hosted)
         if: runner.os != 'Linux'
@@ -76,6 +80,10 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-${{ inputs.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # Prefix fallback so a Cargo.lock edit is not a total miss. Scoped
+          # to the target triple -- cross-target artifacts are not reusable.
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.target }}-cargo-
 
       - name: Build release binary
         run: |
