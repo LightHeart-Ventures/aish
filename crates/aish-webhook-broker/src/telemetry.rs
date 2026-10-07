@@ -87,6 +87,7 @@ pub fn init(config: &BrokerConfig, endpoint: Option<&str>) -> anyhow::Result<Opt
         return Ok(None);
     }
 
+    install_ring_provider();
     let exporter = MetricExporter::builder()
         .with_http()
         .with_protocol(Protocol::HttpBinary)
@@ -104,6 +105,15 @@ pub fn init(config: &BrokerConfig, endpoint: Option<&str>) -> anyhow::Result<Opt
         .build();
     register_instruments(&provider.meter(METER_NAME), config.clone());
     Ok(Some(MetricsGuard { provider }))
+}
+
+/// reqwest is built with `rustls-no-provider` (no aws-lc-sys C build), so a
+/// process-default rustls CryptoProvider must exist before the exporter builds
+/// its HTTPS client. Install `ring`; a provider already installed is kept.
+fn install_ring_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
 }
 
 fn key_attrs(tenant_id: &str, plugin_id: &str) -> [KeyValue; 2] {
@@ -251,6 +261,18 @@ mod tests {
         let (config, _dir) = test_config();
         assert!(init(&config, None).unwrap().is_none());
         assert!(init(&config, Some("   ")).unwrap().is_none());
+    }
+
+    #[test]
+    fn init_builds_exporter_with_ring_tls_provider() {
+        // reqwest is compiled with `rustls-no-provider`: building the HTTPS
+        // client must not panic for want of a CryptoProvider.
+        let (config, _dir) = test_config();
+        let guard = init(&config, Some("http://127.0.0.1:9"))
+            .unwrap()
+            .expect("exporter built when endpoint set");
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        guard.shutdown();
     }
 
     #[test]
