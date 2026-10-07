@@ -4,6 +4,18 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.53.1] - 2026-10-07
+
+Patch release: clearing the clippy backlog and gating it in CI, plus three correctness fixes in the worker/REPL surface — mid-turn `Shift-Tab`, the worker status line, and worker skill-hint matching.
+
+### Changed
+- **Clippy backlog cleared and gated in CI** (PR #915): the 539-diagnostic `cargo clippy` backlog is fixed (autofixes, `manual_strip`, `unused_unsafe`, `doc_lazy_continuation`/`doc_overindented_list_items`, dead assignments, nested-if collapses in the Linux-gated `hwdetect` paths) and CI now runs `clippy -D warnings`, so the debt cannot regrow. Also clears 6 new Rust 1.99.0 lints that were blocking CI.
+
+### Fixed
+- **Mid-turn `Shift-Tab` actually switches the view** (PR #916): pressing `Shift-Tab` during a thinking turn flipped internal state but the view never changed; the keypress now switches the view the moment it's issued.
+- **Worker status line no longer reads "starting up" forever** (PR #917): a worker's activity summary was only written once at dispatch, so `:workers` and the escalation lines kept showing `starting up` for the whole run. The summary is now refreshed mid-round, so the row reflects what the worker is actually doing.
+- **Worker skill hints matched the quoted conversation digest instead of the task** (PR #918): workers *do* receive a skill hint, but `skill_match::match_text` was fed the entire turn input — including the quoted `=== Recent conversation context ===` digest — so a brief could match a skill from an unrelated older conversation while the skill that fits the real task never surfaced. Matching now strips preamble, digests, and already-rendered hint blocks and scores only the TASK region, with an `already_hinted` dedup gate. The interactive path is unchanged.
+
 ## [0.53.0] - 2026-10-07
 
 The plugin-and-broker release. The webhook broker reaches feature-complete (stats, OTel, load-tested WS core), the plugin system gets config/enable-disable/reload/error-handling/docs, GitHub push-PR-issue events land, and the worker/escalation UI gets durable activity so `:attach` and `:workers` tell you what a subworker is actually doing.
