@@ -1,0 +1,23 @@
+{
+  "action": "completed",
+  "workflow_run": {
+    "id": 30433642,
+    "name": "CI",
+    "head_branch": "feat/widget",
+    "head_sha": "ec26c3e57ca3a959ca5aad62de7213c562f8c821",
+    "run_number": 562,
+    "event": "pull_request",
+    "status": "completed",
+    "conclusion": "failure",
+    "html_url": "https://github.com/acme/widgets/actions/runs/30433642",
+    "pull_requests": [
+      {
+        "number": 42,
+        "head": { "ref": "feat/widget", "sha": "ec26c3e57ca3a959ca5aad62de7213c562f8c821" },
+        "base": { "ref": "main", "sha": "6113728f27ae82c7b1a177c8d03f9e96e0adf246" }
+      }
+    ]
+  },
+  "repository": { "id": 1296269, "name": "widgets", "full_name": "acme/widgets" },
+  "sender": { "login": "octocat", "id": 1, "type": "User" }
+}
