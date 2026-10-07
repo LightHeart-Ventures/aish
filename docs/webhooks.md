@@ -298,59 +298,81 @@ REDIS_URL=redis://localhost:6379        # Redis session cache
 
 ## Monitoring & Observability
 
-### Key Metrics
+The webhook broker (`crates/aish-webhook-broker`) uses **SigNoz / OpenTelemetry**
+for observability. It does not export Prometheus metrics. Everything below is
+implemented today (TASK-314, TASK-375).
 
-```mermaid
-graph LR
-    WH["Webhook Handler"]
-    
-    WH -->|Counter| Received["Events Received<br/>(per type)"]
-    WH -->|Counter| Processed["Events Processed<br/>(per type)"]
-    WH -->|Counter| Failed["Events Failed<br/>(per type)"]
-    WH -->|Histogram| Latency["Processing Latency<br/>(p50, p99)"]
-    WH -->|Gauge| QueueDepth["Event Queue Depth"]
-    WH -->|Counter| SigErrors["Signature Verification Errors"]
-    WH -->|Counter| DupEvents["Duplicate Events<br/>(idempotency)"]
-    
-    style Received fill:#0f0
-    style Processed fill:#0f0
-    style Failed fill:#f00
-    style Latency fill:#ff0
-    style QueueDepth fill:#0ff
-    style SigErrors fill:#f00
-    style DupEvents fill:#ffa
+### Broker metrics (OTLP)
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` (for example `http://otel-collector:4318`) and
+the broker pushes OpenTelemetry metrics over OTLP HTTP/protobuf. When it is
+unset, the broker builds no exporter, so the default costs nothing. SigNoz Cloud
+also needs `OTEL_EXPORTER_OTLP_HEADERS=signoz-ingestion-key=<key>`. The broker
+also honours `OTEL_SERVICE_NAME` (default `aish-webhook-broker`) and
+`OTEL_METRIC_EXPORT_INTERVAL` (in ms, default 60000).
+
+| Metric | Type | Attributes | Meaning |
+|---|---|---|---|
+| `aish.webhook.broker.received` | counter | tenant_id, plugin_id | Webhooks accepted (HTTP 202) |
+| `aish.webhook.broker.delivered` | counter | + `transport` (ws\|poll) | Envelopes delivered to clients |
+| `aish.webhook.broker.dropped` | counter | tenant_id, plugin_id | Undelivered webhooks evicted by the queue cap |
+| `aish.webhook.broker.expired` | counter | tenant_id, plugin_id | Undelivered webhooks removed by the TTL sweep |
+| `aish.webhook.broker.queued` | gauge | tenant_id, plugin_id | Undelivered webhooks queued now (durable) |
+| `aish.webhook.broker.acked` | gauge | tenant_id, plugin_id | Acked webhooks kept until their TTL |
+
+`GET /stats` returns the same numbers as JSON. The metrics never include
+payloads, secrets, client ids or tokens. The broker does not record
+signature-failure, duplicate-event or delivery-latency histogram metrics yet.
+Queue depth works as the latency proxy.
+
+### Dashboard
+
+Import `crates/aish-webhook-broker/deploy/signoz/broker-dashboard.json` into
+SigNoz (Dashboards → Import JSON). It shows ingress and delivery rates, losses
+(dropped/expired), queue depth and a per-plugin health table. You can filter it
+by `tenant_id` and `plugin_id`. See
+[`deploy/signoz/README.md`](../crates/aish-webhook-broker/deploy/signoz/README.md).
+
+### Logs
+
+`LOG_FORMAT=json` switches broker logs to one JSON object per line, with
+`timestamp`, `level`, `target` and `fields.*`. The SigNoz/OTel collector log
+pipelines parse this format directly. `BROKER_LOG_LEVEL` sets the filter. The
+default `text` format is meant for humans.
+
+### Client-side handler health
+
+In aish, `:webhook status` shows the handler counters for the connected client:
+
+```
+handlers run: 12  ok: 10  failed: 1  timeout: 1  avg: 34ms
+plugins: github 7/8 ✗1, slack 3/4 ⏱1
 ```
 
-### Log Queries (CloudWatch)
+The counters are kept per plugin. "dispatched" counts handlers that were
+actually executed, so handlers removed by filters are not counted. A timeout is
+a handler killed after its `timeout_secs`. `:webhook logs` shows the individual
+audit records, each with `duration_ms`.
 
-```
-# Error rate
-fields @timestamp, @message, error
-| filter error like /true/
-| stats count() as errors by error
-| stats sum(errors) / sum(count()) as error_rate
+### Load testing
 
-# Slow handlers (>5s)
-fields @timestamp, handler, duration_ms
-| filter duration_ms > 5000
-| stats avg(duration_ms), max(duration_ms) by handler
+`crates/aish-webhook-broker/scripts/loadgen.py` sends HMAC-SHA256-signed POSTs
+at a fixed rate. It uses only the Python standard library. The run shows up in
+`/stats` and on the dashboard.
 
-# Signature verification failures
-fields @timestamp, source, event_type
-| filter @message like /signature.*failed/
-| stats count() by source
+```sh
+python3 crates/aish-webhook-broker/scripts/loadgen.py --url http://localhost:8080 \
+  --tenant acme --plugin github --secret s3cret --register --rate 50 --duration 30
 ```
 
-### Alerting
+### Alerting (SigNoz alerts on the metrics above)
 
-| Alert | Threshold | Action |
+| Alert | Condition | Action |
 |-------|-----------|--------|
-| Error Rate | >1% errors/5min | Page on-call |
-| Queue Depth | >1000 events | Scale webhooks or pause consumption |
-| Processing Latency | p99 >10s | Investigate handler performance |
-| Signature Failures | >10/hour | Check webhook secrets, verify sources |
-| Tunnel Disconnection | Any | Alert ops, check connectivity |
-| DynamoDB Throttle | Any | Increase throughput or buffer locally |
+| Data loss (queue cap) | `aish.webhook.broker.dropped` increase > 0 / 5m | Consumer offline: check client connectivity, raise `BROKER_MAX_QUEUE_SIZE` |
+| Data loss (TTL) | `aish.webhook.broker.expired` increase > 0 | Webhooks aged out undelivered |
+| Backlog | `aish.webhook.broker.queued` > 80% of `BROKER_MAX_QUEUE_SIZE` for 10m | Consumer slow or disconnected |
+| Ingress stopped | `aish.webhook.broker.received` rate == 0 for 1h (when traffic is expected) | Check source webhook config / tunnel |
 
 ## Related Docs
 

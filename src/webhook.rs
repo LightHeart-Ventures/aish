@@ -44,8 +44,9 @@ use std::time::{Duration, Instant};
 
 use aish_webhook_client::{
     AuditRecord, AuditSink, BrokerClient, BrokerConfig, ConnState, DeliverySink,
-    ExponentialBackoff, FlashSink, MemoryAuditSink, ObserverAuditSink, PluginRegistry, StopReason,
-    WebhookClientError, WebhookDispatcher, WebhookService, transport::TungsteniteTransport,
+    ExponentialBackoff, FlashSink, HandlerCounters, MemoryAuditSink, ObserverAuditSink,
+    PluginRegistry, StopReason, WebhookClientError, WebhookDispatcher, WebhookService,
+    transport::TungsteniteTransport,
 };
 use tokio::sync::watch;
 
@@ -62,6 +63,8 @@ pub struct WebhookStatus {
     pub last_error: Option<String>,
     /// True once the service loop has exited (shutdown).
     pub stopped: bool,
+    /// TASK-375 — per-plugin handler counters (dispatched/ok/failed/timeout).
+    pub counters: Arc<HandlerCounters>,
 }
 
 impl Default for WebhookStatus {
@@ -72,6 +75,7 @@ impl Default for WebhookStatus {
             reconnects: 0,
             last_error: None,
             stopped: false,
+            counters: Arc::new(HandlerCounters::new()),
         }
     }
 }
@@ -249,13 +253,15 @@ impl WebhookHandle {
             "🪝 webhook: {state} — {url} (tenant {tenant})\n   \
              handlers: {h} from {dir}\n   \
              events: {ev}  reconnects: {rc}  up: {up}\n   \
-             last event: {err}",
+             last event: {err}\n   \
+             {handlers}",
             url = self.broker_url,
             tenant = self.tenant_id,
             h = self.handler_count,
             dir = self.plugins_dir.display(),
             ev = self.events(),
             rc = st.reconnects,
+            handlers = fmt_handler_counts(&st.counters),
         )
     }
 }
@@ -370,6 +376,38 @@ pub(crate) fn plugins_dir() -> PathBuf {
 
 /// Return the last `n` elements of `v` (oldest-first), or all of them when
 /// `v.len() <= n`.
+/// TASK-375 — handler health for `:webhook status`: totals, plus a per-plugin
+/// `id ok/run` list (failures/timeouts flagged) once anything has run.
+fn fmt_handler_counts(counters: &HandlerCounters) -> String {
+    let t = counters.totals();
+    let mut out = format!(
+        "handlers run: {}  ok: {}  failed: {}  timeout: {}  avg: {}ms",
+        t.dispatched,
+        t.ok,
+        t.failed,
+        t.timeout,
+        t.avg_ms()
+    );
+    let per = counters.per_plugin();
+    if !per.is_empty() {
+        let parts: Vec<String> = per
+            .iter()
+            .map(|(id, c)| {
+                let mut p = format!("{id} {}/{}", c.ok, c.dispatched);
+                if c.failed > 0 {
+                    p.push_str(&format!(" ✗{}", c.failed));
+                }
+                if c.timeout > 0 {
+                    p.push_str(&format!(" ⏱{}", c.timeout));
+                }
+                p
+            })
+            .collect();
+        out.push_str(&format!("\n   plugins: {}", parts.join(", ")));
+    }
+    out
+}
+
 fn tail<T>(mut v: Vec<T>, n: usize) -> Vec<T> {
     let len = v.len();
     if len > n { v.split_off(len - n) } else { v }
@@ -414,7 +452,8 @@ async fn service_loop(
 ) {
     let mut dispatcher = WebhookDispatcher::new(registry)
         .with_audit_sink(audit)
-        .with_delivery_sink(delivery);
+        .with_delivery_sink(delivery)
+        .with_counters(status.lock().unwrap().counters.clone());
     if let Some(f) = flash {
         // Wire the broker dispatcher to the SecondStatusLine: a handler's stdout
         // now surfaces on the footer. This is the seam that completes the goal.
@@ -534,6 +573,35 @@ mod tests {
 
     // Env access is process-global; serialize the env-mutating tests.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn handler_counts_render_totals_and_per_plugin() {
+        let c = HandlerCounters::new();
+        assert_eq!(
+            fmt_handler_counts(&c),
+            "handlers run: 0  ok: 0  failed: 0  timeout: 0  avg: 0ms"
+        );
+        let out = |plugin: &str, success: bool, error: Option<&str>| {
+            aish_webhook_client::HandlerOutcome {
+                plugin_id: plugin.into(),
+                event_type: "push".into(),
+                matched: true,
+                executed: true,
+                exit_code: None,
+                success,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: error.map(str::to_string),
+                duration_ms: 20,
+            }
+        };
+        c.record(&out("gh", true, None));
+        c.record(&out("gh", false, None));
+        c.record(&out("slack", false, Some("timed out after 30s")));
+        let s = fmt_handler_counts(&c);
+        assert!(s.starts_with("handlers run: 3  ok: 1  failed: 1  timeout: 1  avg: 20ms"));
+        assert!(s.contains("plugins: gh 1/2 ✗1, slack 0/1 ⏱1"), "{s}");
+    }
 
     #[test]
     fn tail_returns_all_when_shorter() {

@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 use aish_webhook_broker::config::BrokerConfig;
 use aish_webhook_broker::dispatcher::Hub;
+use aish_webhook_broker::logging::{self, LogFormat};
 use aish_webhook_broker::{db, http};
 
 #[derive(Parser, Debug)]
@@ -50,16 +51,21 @@ struct Cli {
     /// Log level
     #[arg(long, env = "BROKER_LOG_LEVEL", default_value = "info")]
     log_level: String,
+
+    /// Log output format: `text` (default) or `json` (one object per line)
+    #[arg(long, env = "LOG_FORMAT", default_value = "text", value_enum)]
+    log_format: LogFormat,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(&cli.log_level))
-        .with_target(true)
-        .init();
+    tracing::subscriber::set_global_default(logging::subscriber(
+        cli.log_format,
+        EnvFilter::new(&cli.log_level),
+        std::io::stdout,
+    ))?;
 
     info!("aish-webhook-broker starting up");
     info!(
@@ -83,6 +89,25 @@ async fn main() -> Result<()> {
         ws_heartbeat_secs: cli.ws_heartbeat_secs,
         poll_timeout_secs: cli.poll_timeout_secs,
         msg_ttl_secs: cli.msg_ttl_secs,
+    };
+
+    // OpenTelemetry metrics (TASK-375): active only when
+    // OTEL_EXPORTER_OTLP_ENDPOINT is set. A setup failure is logged, never fatal.
+    #[cfg(feature = "otel")]
+    let metrics = {
+        use aish_webhook_broker::telemetry;
+        let endpoint = telemetry::endpoint_from_env();
+        match telemetry::init(&config, endpoint.as_deref()) {
+            Ok(Some(guard)) => {
+                info!(endpoint = ?endpoint, "OTel metrics export enabled (OTLP/HTTP)");
+                Some(guard)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!(error = %e, "OTel metrics export disabled: exporter setup failed");
+                None
+            }
+        }
     };
 
     // Background TTL sweep: purge expired webhooks hourly.
@@ -124,6 +149,12 @@ async fn main() -> Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    #[cfg(feature = "otel")]
+    if let Some(guard) = metrics {
+        // Final flush; the SDK shutdown blocks, so keep it off the executor.
+        let _ = tokio::task::spawn_blocking(move || guard.shutdown()).await;
+    }
 
     info!("Server shut down cleanly");
     Ok(())
