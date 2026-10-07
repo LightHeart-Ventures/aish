@@ -21,16 +21,24 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src \
+# The `aish-webhook-client = { path = "../aish-webhook-client" }` dev-dependency
+# (client⇄broker contract test, tests/client_contract.rs) points outside this
+# build context (the crate dir — also what `fly deploy` sends), and cargo must
+# load every path dependency's manifest even for a release build. Drop that one
+# dev-only line here. `--locked` would then reject the (now smaller) lockfile,
+# so build without it: cargo only prunes the client's entries and keeps every
+# other locked version — still a reproducible build.
+RUN sed -i '/^aish-webhook-client = /d' Cargo.toml \
+    && mkdir src \
     && echo 'fn main() { println!("stub"); }' > src/main.rs \
-    && cargo build --release --locked \
+    && cargo build --release \
     && rm -rf src
 
 # Now copy the real sources and build for real.
 COPY src ./src
 # Bust the stub's cached crate artifact so the real main.rs is recompiled.
 RUN touch src/main.rs \
-    && cargo build --release --locked \
+    && cargo build --release \
     && strip target/release/aish-webhook-broker
 
 # ---- runtime ----------------------------------------------------------------

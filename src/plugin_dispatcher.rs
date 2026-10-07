@@ -20,8 +20,9 @@
 //! plugin can yet mutate shell state through a hook (Phase 2+).
 //!
 //! Testability: this module is self-contained apart from
-//! [`crate::plugin_state::PluginStateStore`] and the std-only
-//! [`crate::plugin_enable`] state reader, so `tests/plugin_dispatcher_tests.rs`
+//! [`crate::plugin_state::PluginStateStore`], the std-only
+//! [`crate::plugin_enable`] state reader and the std-only
+//! [`crate::plugin_health`] errors log / config-invalid registry, so `tests/plugin_dispatcher_tests.rs`
 //! compiles it (and `plugin_state.rs`) directly via `#[path]` — `crate::` here
 //! resolves to the test crate root, which declares the same sibling modules.
 
@@ -161,6 +162,12 @@ impl PluginDispatcher {
             if m.webhook_url.is_none() && m.webhook_command.is_none() {
                 continue;
             }
+            // TASK-274: a config-invalid plugin's webhook handlers are skipped
+            // until its config is fixed (derived state, refreshed at startup
+            // and on `:plugin reload`; already warned about there).
+            if crate::plugin_health::config_invalid_reason(&self.plugins_dir, &m.id).is_some() {
+                continue;
+            }
             out.push(Subscriber {
                 plugin_id: m.id,
                 url: m.webhook_url,
@@ -243,22 +250,50 @@ impl PluginDispatcher {
                 .send()
                 .await
             {
-                Ok(resp) => log_channel(&format!(
-                    "{} http {} -> {} ({})",
-                    ev.plugin_id,
-                    ev.event_type,
-                    url,
-                    resp.status().as_u16()
-                )),
-                Err(e) => log_channel(&format!(
-                    "{} http {} -> {} FAILED: {e}",
-                    ev.plugin_id, ev.event_type, url
-                )),
+                Ok(resp) => {
+                    log_channel(&format!(
+                        "{} http {} -> {} ({})",
+                        ev.plugin_id,
+                        ev.event_type,
+                        url,
+                        resp.status().as_u16()
+                    ));
+                    if !resp.status().is_success() {
+                        self.record_failure(
+                            &ev.plugin_id,
+                            &format!("http {}", ev.event_type),
+                            &format!("{url} returned HTTP {}", resp.status().as_u16()),
+                        );
+                    }
+                }
+                Err(e) => {
+                    log_channel(&format!(
+                        "{} http {} -> {} FAILED: {e}",
+                        ev.plugin_id, ev.event_type, url
+                    ));
+                    self.record_failure(
+                        &ev.plugin_id,
+                        &format!("http {}", ev.event_type),
+                        &format!("{url}: {e}"),
+                    );
+                }
             }
         }
         if let Some(cmd) = &sub.command {
             self.run_command(&sub.plugin_id, cmd, &ev).await;
         }
+    }
+
+    /// Best-effort `webhook_failed` entry in the plugin's errors log (TASK-274).
+    fn record_failure(&self, plugin_id: &str, source: &str, message: &str) {
+        crate::plugin_health::record(
+            &self.plugins_dir,
+            plugin_id,
+            crate::plugin_health::KIND_WEBHOOK_FAILED,
+            source,
+            message,
+            "event dropped; next event is delivered normally",
+        );
     }
 
     /// Fork/exec a `webhook_command` as **argv (no shell)** — piping the event
@@ -292,6 +327,11 @@ impl PluginDispatcher {
             Ok(c) => c,
             Err(e) => {
                 log_channel(&format!("{plugin_id} command spawn FAILED: {e}"));
+                self.record_failure(
+                    plugin_id,
+                    &format!("command {}", ev.event_type),
+                    &format!("spawn failed: {e}"),
+                );
                 return;
             }
         };
@@ -303,9 +343,24 @@ impl PluginDispatcher {
             Ok(o) => o,
             Err(e) => {
                 log_channel(&format!("{plugin_id} command wait FAILED: {e}"));
+                self.record_failure(
+                    plugin_id,
+                    &format!("command {}", ev.event_type),
+                    &format!("wait failed: {e}"),
+                );
                 return;
             }
         };
+        if !out.status.success() {
+            self.record_failure(
+                plugin_id,
+                &format!("command {}", ev.event_type),
+                &match out.status.code() {
+                    Some(c) => format!("exit status {c}"),
+                    None => "terminated by signal".to_string(),
+                },
+            );
+        }
         let record = json!({
             "exit_code": out.status.code(),
             "stdout": String::from_utf8_lossy(&out.stdout),

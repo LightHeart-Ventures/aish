@@ -2150,36 +2150,94 @@ fn statusline_segments(
     out
 }
 
-/// Keep the pinned escalation banner's status row in sync with the live worker
+/// Keep EVERY pinned escalation banner's status row in sync with the live worker
 /// list. Called from the footer paint path — the only place holding a `Session`
-/// — while the banner's own clock renders the runtime, so the row stays honest
+/// — while each banner's own clock renders its runtime, so the rows stay honest
 /// even on heartbeat-only repaints.
+///
+/// Several escalations can be pinned at once, so this walks all of them and
+/// writes each worker's status into ITS OWN banner (the single-slot banner this
+/// replaced could only ever refresh the newest). The worker list is locked ONCE
+/// and snapshotted, so N banners cost one lock acquisition per paint rather than
+/// N — and no lock is held while writing into the escalation store.
 fn refresh_escalation_status(session: &Session) {
-    let Some(id) = crate::escalation::pinned_id() else {
+    let ids = crate::escalation::pinned_ids();
+    if ids.is_empty() {
         return;
-    };
-    let snapshot = session
+    }
+    let snapshot: Vec<(String, String, String, Option<String>)> = session
         .worker_jobs
         .lock()
         .unwrap()
         .iter()
-        .find(|w| w.id == id)
+        .filter(|w| ids.iter().any(|id| *id == w.id))
         .map(|w| {
             (
+                w.id.clone(),
                 w.status(),
+                w.run_id(),
                 w.transcript_rows().last().map(|(_, text)| text.clone()),
             )
-        });
-    let Some((status, last)) = snapshot else {
-        return;
-    };
-    let text = match last {
-        Some(a) if !a.trim().is_empty() => format!("{status} · {}", a.trim()),
-        _ => status.clone(),
-    };
-    crate::escalation::set_status(&text);
-    if matches!(status.as_str(), "done" | "failed") {
-        crate::escalation::note_terminal(&id, status == "failed");
+        })
+        .collect();
+    for (id, status, run_id, last) in snapshot {
+        // Prefer the lightweight ACTIVITY SUMMARY (see `crate::activity_summary`):
+        // one model-written status-line-sized sentence saying what the worker is
+        // doing, budgeted to this terminal's width. The raw last transcript line
+        // is the fallback — it's whatever the worker happened to print last, so
+        // it's often a tool-call fragment that reads as noise on a pinned banner.
+        //
+        // `cached_summary` throttles its store lookup, which matters here: this
+        // runs on the footer paint path, i.e. on every heartbeat repaint, once
+        // per pinned banner.
+        let summary = session
+            .coordinator_store
+            .as_ref()
+            .and_then(|s| crate::activity_summary::cached_summary(s, &run_id));
+        let activity = summary.or(last);
+        let text = match activity {
+            Some(a) if !a.trim().is_empty() => format!("{status} · {}", a.trim()),
+            _ => status.clone(),
+        };
+        crate::escalation::set_status(&id, &text);
+        if matches!(status.as_str(), "done" | "failed") {
+            crate::escalation::note_terminal(&id, status == "failed");
+        }
+    }
+    refresh_escalation_beats(session, &ids);
+}
+
+/// Feed every pinned banner's liveness heart from its worker's DURABLE heartbeat
+/// (`coordinator_runs.heartbeat_at`), which the coordinator stamps every ~30s.
+///
+/// Why this is throttled and why it hands over an ABSOLUTE timestamp: the footer
+/// repaints several times a second to animate, and a SQLite round-trip per banner
+/// on every frame would be a pointless tax on a value that only changes twice a
+/// minute. So we poll at most once per `BEAT_POLL` — ONE window for the whole
+/// stack, then every pinned id in that pass — and give each banner the instant of
+/// its beat rather than the age. The banner re-derives the age on each paint, so
+/// each heart still drifts green → yellow → red on its own between polls.
+///
+/// Failure-tolerant by construction: no store (ephemeral session) or no row for
+/// an id leaves that banner's beat `None`, which renders the hollow `♡` — "no
+/// liveness claim" — instead of a green heart we have no evidence for.
+fn refresh_escalation_beats(session: &Session, ids: &[String]) {
+    const BEAT_POLL: std::time::Duration = std::time::Duration::from_secs(3);
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+    let Ok(mut last) = LAST.lock() else { return };
+    if last.is_some_and(|t| t.elapsed() < BEAT_POLL) {
+        return; // within the throttle window — the banners age their stored beats
+    }
+    *last = Some(std::time::Instant::now());
+    drop(last);
+
+    for id in ids {
+        let beat = session
+            .coordinator_store
+            .as_ref()
+            .and_then(|s| s.heartbeat_unix(id));
+        crate::escalation::set_beat(id, beat);
     }
 }
 
@@ -2548,7 +2606,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("output", "stream coordinators' activity (on|off)"),
     (
         "plugin",
-        "plugins (list|info|enable|disable|reload|add|remove <id>)",
+        "plugins (list|info|config|enable|disable|reload|errors|create|add|remove <id>)",
     ),
     ("quit", "exit aish"),
     (
@@ -4809,6 +4867,24 @@ pub(crate) fn run_midturn_command(line: &str, ctx: &OpsCtx) -> Option<String> {
         // through to `dispatch_coordinator_ctx`'s plain usage line. Acceptable:
         // the mid-turn case that matters is `:dispatch <task>`.
         "dispatch" => Some(dispatch_coordinator_ctx(rest, ctx).message),
+        // Steering an in-flight coordinator is the case that needs immediacy
+        // most: queued until the turn ends, a `:tell` arrives after the round it
+        // was meant to change. `:tell goal …` never reaches here — the
+        // classifier keeps that one queued because it needs `&mut Session`.
+        "tell" | "msg" | "send" => {
+            let toks: Vec<&str> = rest.split_whitespace().collect();
+            let (any, toks) = take_any_flag(&toks);
+            let target = toks.first().copied();
+            let message = toks.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
+            Some(tell_coordinator_ctx(target, message.trim(), any, ctx))
+        }
+        // Same reasoning, sharper edge: a stand-down that waits for the turn to
+        // finish keeps paying for the work it was cancelling.
+        "stop" | "standdown" | "stand-down" => {
+            let toks: Vec<&str> = rest.split_whitespace().collect();
+            let (any, toks) = take_any_flag(&toks);
+            Some(stop_coordinator_ctx(toks.first().copied(), any, ctx))
+        }
         _ => None,
     }
 }
@@ -4945,7 +5021,16 @@ fn collect_worker_rows(session: &Session) -> Vec<crate::workers_modal::WorkerRow
                 status: w.status(),
                 started_cell,
                 runtime_cell,
-                task: one_line(&w.task),
+                // Prefer the lightweight ACTIVITY SUMMARY (see
+                // `crate::activity_summary`) over the clipped brief, same as the
+                // static table's `Doing` cell — the summary is written by the
+                // coordinator SUBPROCESS, so it has to be read through the
+                // durable store (throttled by `cached_summary`).
+                task: session
+                    .coordinator_store
+                    .as_ref()
+                    .and_then(|s| crate::activity_summary::cached_summary(s, &w.run_id()))
+                    .unwrap_or_else(|| one_line(&w.task)),
                 result_cell: w.result_cell(),
                 parent_id: None,
                 depth: 0,
@@ -5053,7 +5138,15 @@ fn durable_worker_row(
         status: r.phase.clone(),
         started_cell,
         runtime_cell,
-        task: one_line(&r.task),
+        // The durable row already carries the activity summary — no store
+        // round-trip needed (see `crate::activity_summary`).
+        task: r
+            .activity_summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| one_line(&r.task)),
         result_cell,
         parent_id: r.parent_run_id.clone(),
         depth: 0,
@@ -6572,6 +6665,9 @@ fn close_worker(id: Option<&str>, session: &mut Session) {
     if let Ok(mut r) = session.resume.lock() {
         r.forget(&run_id);
     }
+    // Drop the closed worker's cached activity summary so a long-lived session's
+    // read-through cache can't grow without bound.
+    crate::activity_summary::forget_cached(&run_id);
 
     // Detach if we just closed the worker we were attached to.
     if attached.as_deref() == Some(run_id.as_str()) {
@@ -7150,28 +7246,48 @@ fn resolve_tell_target(
 /// short ids shown by `:workers` work. A terminal (finished) run is refused —
 /// nothing would read the message — and an ambiguous prefix lists the matches.
 fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Session) {
-    let Some(id) = id else {
-        println!(
-            "usage: :tell [--any] <worker-id> <message>   — steer an in-flight coordinator (--any: across sessions)"
-        );
-        return;
-    };
-    if message.is_empty() {
-        println!(
-            "usage: :tell [--any] <worker-id> <message>   — steer an in-flight coordinator (--any: across sessions)"
-        );
-        return;
-    }
     // `:tell goal <msg>` steers the active background goal, not a coordinator:
     // the goal has no store row or mailbox, it drains its own steer queue at the
-    // top of each turn. Exact-match so a worker-id prefix never collides.
-    if id == GOAL_ATTACH_ID {
+    // top of each turn. Exact-match so a worker-id prefix never collides. This is
+    // the ONE `:tell` form that needs `&mut Session`, and the reason the mid-turn
+    // classifier keeps it queued (see `midturn_input::runs_immediately`).
+    if id == Some(GOAL_ATTACH_ID) && !message.is_empty() {
         steer_active_goal(message, session);
         return;
     }
-    let Some(store) = session.coordinator_store.clone() else {
-        println!("coordinator store unavailable — can't queue messages");
-        return;
+    let out = tell_coordinator_ctx(id, message, any, &ops_ctx(session));
+    if !out.is_empty() {
+        println!("{out}");
+    }
+}
+
+/// The coordinator-steering half of `:tell`, resolved off an [`OpsCtx`] snapshot
+/// so it can ALSO run mid-turn while the live turn holds `&mut Session` (see
+/// [`run_midturn_command`]). Returns the operator-facing text — possibly several
+/// lines — instead of printing it, so the caller owns the cursor; the mid-turn
+/// path prints into a footer-managed area.
+pub(crate) fn tell_coordinator_ctx(
+    id: Option<&str>,
+    message: &str,
+    any: bool,
+    ctx: &OpsCtx,
+) -> String {
+    const USAGE: &str = "usage: :tell [--any] <worker-id> <message>   — steer an in-flight coordinator (--any: across sessions)";
+    let mut out: Vec<String> = Vec::new();
+    let Some(id) = id else {
+        return USAGE.to_string();
+    };
+    if message.is_empty() {
+        return USAGE.to_string();
+    }
+    if id == GOAL_ATTACH_ID {
+        // Defensive: the classifier routes `:tell goal …` to the queue, so this
+        // is only reachable if that gate ever regresses. Say so rather than
+        // silently dropping the operator's steer.
+        return "`:tell goal …` steers the background goal and needs the session — it is queued and applies when the turn lands".to_string();
+    }
+    let Some(store) = ctx.coordinator_store.clone() else {
+        return "coordinator store unavailable — can't queue messages".to_string();
     };
     let hit = |rid: &str| crate::coordinator::id_matches(rid, id);
 
@@ -7180,12 +7296,12 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
     // message sent immediately after launch still lands — then durable runs from
     // any session (deduped on run_id).
     let mut candidates: Vec<(String, bool, Option<String>)> = Vec::new();
-    for w in session.worker_jobs.lock().unwrap().iter() {
+    for w in ctx.worker_jobs.lock().unwrap().iter() {
         if hit(&w.id) {
             candidates.push((
                 w.id.clone(),
                 matches!(w.status().as_str(), "done" | "failed"),
-                Some(session.session_id.clone()),
+                Some(ctx.session_id.clone()),
             ));
         }
     }
@@ -7208,43 +7324,46 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
     // coordinators your OWN session launched; `--any` opts into another
     // session's. A terminal or unknown-phase run is refused — nothing would read
     // the message — so a `:tell` never becomes a silent no-op (TASK-286).
-    match resolve_tell_target(&candidates, &session.session_id, any) {
+    match resolve_tell_target(&candidates, &ctx.session_id, any) {
         TellTarget::NotFound => {
-            println!("no background coordinator matching '{id}' (see :workers)");
+            out.push(format!(
+                "no background coordinator matching '{id}' (see :workers)"
+            ));
         }
         TellTarget::ForeignOnly => {
-            println!(
+            out.push(format!(
                 "'{id}' matches a coordinator launched by another session — re-run as `:tell --any {id} <message>` to steer it"
-            );
+            ));
         }
         TellTarget::Terminal(run_id) => {
             let short = crate::batch::short_id(&run_id);
-            println!(
+            out.push(format!(
                 "coordinator {short} is finished; unable to send message (`:result {short}` to view its result)"
-            );
+            ));
         }
         TellTarget::Ready(run_id) => {
             let short = crate::batch::short_id(&run_id);
-            match store.enqueue_message(&run_id, message, Some(&session.session_id)) {
+            match store.enqueue_message(&run_id, message, Some(&ctx.session_id)) {
                 Ok(_) => {
                     let pending = store.pending_message_count(&run_id).unwrap_or(0);
-                    println!(
+                    out.push(format!(
                         "\x1b[2m✉ queued for {short} ({pending} pending) — folded in at the start of its next round\x1b[0m"
-                    );
+                    ));
                 }
-                Err(e) => println!("couldn't queue message: {e}"),
+                Err(e) => out.push(format!("couldn't queue message: {e}")),
             }
         }
         TellTarget::Ambiguous(ids) => {
-            println!(
+            out.push(format!(
                 "'{id}' matches {} coordinators — be more specific:",
                 ids.len()
-            );
+            ));
             for rid in ids {
-                println!("  {rid}");
+                out.push(format!("  {rid}"));
             }
         }
     }
+    out.join("\n")
 }
 
 /// `:stop` — stand down an in-flight coordinator: the harsh sibling of `:tell`.
@@ -7313,15 +7432,23 @@ instead of firing.\n\nCondition: {description}"
 }
 
 fn stop_coordinator(id: Option<&str>, any: bool, session: &mut Session) {
+    let out = stop_coordinator_ctx(id, any, &ops_ctx(session));
+    if !out.is_empty() {
+        println!("{out}");
+    }
+}
+
+/// `:stop`, resolved off an [`OpsCtx`] snapshot so it can ALSO run mid-turn (see
+/// [`run_midturn_command`]) — nothing here needs `&mut Session`, which is the
+/// whole point: a stand-down that waits for the turn to end is a coordinator you
+/// keep paying for. Returns the operator-facing text instead of printing it.
+pub(crate) fn stop_coordinator_ctx(id: Option<&str>, any: bool, ctx: &OpsCtx) -> String {
+    let mut out: Vec<String> = Vec::new();
     let Some(id) = id else {
-        println!(
-            "usage: :stop [--any] <worker-id>   — stand down an in-flight coordinator (--any: across sessions)"
-        );
-        return;
+        return "usage: :stop [--any] <worker-id>   — stand down an in-flight coordinator (--any: across sessions)".to_string();
     };
-    let Some(store) = session.coordinator_store.clone() else {
-        println!("coordinator store unavailable — can't stand down a coordinator");
-        return;
+    let Some(store) = ctx.coordinator_store.clone() else {
+        return "coordinator store unavailable — can't stand down a coordinator".to_string();
     };
     let hit = |rid: &str| crate::coordinator::id_matches(rid, id);
 
@@ -7329,12 +7456,12 @@ fn stop_coordinator(id: Option<&str>, any: bool, session: &mut Session) {
     // workers first — their pid is known so we can interrupt the current turn —
     // then durable runs from any session (deduped on run_id; flag-only, no pid).
     let mut candidates: Vec<(String, bool, Option<String>, Option<u32>)> = Vec::new();
-    for w in session.worker_jobs.lock().unwrap().iter() {
+    for w in ctx.worker_jobs.lock().unwrap().iter() {
         if hit(&w.id) {
             candidates.push((
                 w.id.clone(),
                 matches!(w.status().as_str(), "done" | "failed"),
-                Some(session.session_id.clone()),
+                Some(ctx.session_id.clone()),
                 w.pid(),
             ));
         }
@@ -7358,7 +7485,7 @@ fn stop_coordinator(id: Option<&str>, any: bool, session: &mut Session) {
         .iter()
         .filter(|(_, _, owner, _)| {
             matches!(
-                owner_gate(owner.as_deref(), &session.session_id, any),
+                owner_gate(owner.as_deref(), &ctx.session_id, any),
                 OwnerGate::Allow
             )
         })
@@ -7366,27 +7493,23 @@ fn stop_coordinator(id: Option<&str>, any: bool, session: &mut Session) {
         .collect();
     if owned.is_empty() {
         if candidates.is_empty() {
-            println!("no background coordinator matching '{id}' (see :workers)");
-        } else {
-            println!(
-                "'{id}' matches a coordinator launched by another session — re-run as `:stop --any {id}` to stand it down"
-            );
+            return format!("no background coordinator matching '{id}' (see :workers)");
         }
-        return;
+        return format!(
+            "'{id}' matches a coordinator launched by another session — re-run as `:stop --any {id}` to stand it down"
+        );
     }
 
     match owned.as_slice() {
         [(run_id, terminal, _, pid)] => {
             let short = crate::batch::short_id(run_id);
             if *terminal {
-                println!(
+                return format!(
                     "coordinator {short} has already finished — nothing to stand down (`:result {short}` to view its result)"
                 );
-                return;
             }
             if let Err(e) = store.request_stand_down(run_id) {
-                println!("couldn't raise stand-down flag: {e}");
-                return;
+                return format!("couldn't raise stand-down flag: {e}");
             }
             // Best-effort interrupt of the in-flight turn for a worker we own, so
             // the round boundary (where the flag is honored) is reached now rather
@@ -7394,25 +7517,26 @@ fn stop_coordinator(id: Option<&str>, any: bool, session: &mut Session) {
             // group (pgid == pid via the child's setsid()).
             if let Some(pid) = pid {
                 unsafe { libc::kill(-(*pid as i32), libc::SIGINT) };
-                println!(
+                out.push(format!(
                     "\x1b[33m🛑 stand-down ordered for {short}\x1b[0m — turn interrupted; one final wrap-up turn, then it exits"
-                );
+                ));
             } else {
-                println!(
+                out.push(format!(
                     "\x1b[33m🛑 stand-down flag raised for {short}\x1b[0m — it will wrap up and exit at its next round boundary"
-                );
+                ));
             }
         }
         many => {
-            println!(
+            out.push(format!(
                 "'{id}' matches {} coordinators — be more specific:",
                 many.len()
-            );
+            ));
             for (rid, _, _, _) in many {
-                println!("  {rid}");
+                out.push(format!("  {rid}"));
             }
         }
     }
+    out.join("\n")
 }
 
 /// `:context` — show how full the model's context window is, plus the history
@@ -7599,7 +7723,8 @@ fn handle_hooks(sub: Option<&str>, session: &mut Session) {
     }
 }
 
-/// `:plugin [list|info <id>]` — plugin provenance introspection (Phase 0.5.6).
+/// `:plugin [list|info <id>|create <id>]` — plugin provenance introspection (Phase 0.5.6).
+/// `create <id>` (TASK-275) scaffolds a new plugin via [`crate::plugin_scaffold`].
 /// `list` enumerates discovered plugins; `info <id>` renders one plugin's full
 /// capability report (metadata, login, lifecycle + event hooks, MCP servers,
 /// schemas, skills). `info <id> --schema` (Phase 3.5) renders the plugin's
@@ -7748,7 +7873,15 @@ fn handle_plugin(args: Vec<&str>, session: &mut Session) {
                 None => println!("no such plugin `{id}` — try :plugin list"),
             }
         }
+        Some("errors") => {
+            let Some(id) = id else {
+                println!("usage: :plugin errors <id> [N]");
+                return;
+            };
+            print_plugin_errors(&dir, id, flag);
+        }
         Some("memory" | "mem") => handle_plugin_memory(&args[1..]),
+        Some("create" | "new") => crate::plugin_scaffold::run(&dir, id),
         Some("config") => handle_plugin_config(&args[1..], session, &dir),
         Some("list") | None => {
             let Some(list) = crate::plugins::format_plugin_list(&dir) else {
@@ -7757,11 +7890,13 @@ fn handle_plugin(args: Vec<&str>, session: &mut Session) {
             };
             println!("{list}");
             println!("\n:plugin info <id> for full provenance");
+            println!(":plugin errors <id> [N] for a plugin's error log");
             println!(":plugin enable|disable|reload <id> to toggle or reload a plugin");
             println!(
                 ":plugin config <id> [--set <key> <value> | --reset [key]] to view/edit config"
             );
             println!(":plugin add <id> to install a plugin from the registry");
+            println!(":plugin create <id> to scaffold a new plugin");
         }
         Some(other) => println!("unknown :plugin subcommand `{other}` — try :plugin list"),
     }
@@ -7769,8 +7904,57 @@ fn handle_plugin(args: Vec<&str>, session: &mut Session) {
 
 /// `:plugin` subcommands, for TAB completion and the usage line.
 const PLUGIN_SUBCOMMANDS: &[&str] = &[
-    "add", "config", "disable", "enable", "info", "list", "memory", "reload", "remove",
+    "add", "config", "create", "disable", "enable", "errors", "info", "list", "memory", "reload",
+    "remove",
 ];
+
+/// Default row count for `:plugin errors <id>` (TASK-274).
+const PLUGIN_ERRORS_DEFAULT_N: usize = 20;
+
+/// Render `:plugin errors <id> [N]` (TASK-274): the newest N (default 20)
+/// entries of the plugin's `errors.jsonl`, oldest first. Pure so it unit-tests
+/// against a temp plugins dir; `Err` carries the user-facing message.
+fn render_plugin_errors(dir: &Path, id: &str, n: Option<&str>) -> Result<String, String> {
+    let n = match n {
+        None => PLUGIN_ERRORS_DEFAULT_N,
+        Some(s) => match s.parse::<usize>() {
+            Ok(v) if v > 0 => v,
+            _ => {
+                return Err(format!(
+                    "usage: :plugin errors <id> [N] — `{s}` is not a count"
+                ));
+            }
+        },
+    };
+    if !crate::plugins::discover_all(dir)
+        .iter()
+        .any(|p| p.manifest.id == id)
+    {
+        return Err(format!("no such plugin `{id}` — try :plugin list"));
+    }
+    let path = crate::plugin_health::errors_path(dir, id);
+    let entries = crate::plugin_health::tail(dir, id, n);
+    if entries.is_empty() {
+        return Ok(format!(
+            "no errors recorded for `{id}` ({})",
+            path.display()
+        ));
+    }
+    Ok(format!(
+        "{}\n\x1b[2m{} of up to {} kept · {}\x1b[0m",
+        crate::plugin_health::format_entries(&entries),
+        entries.len(),
+        crate::plugin_health::MAX_ENTRIES,
+        path.display()
+    ))
+}
+
+fn print_plugin_errors(dir: &Path, id: &str, n: Option<&str>) {
+    match render_plugin_errors(dir, id, n) {
+        Ok(s) => println!("{s}"),
+        Err(e) => println!("{e}"),
+    }
+}
 
 /// TAB completion for `:plugin …` arguments (TASK-272): the subcommand in
 /// word two, then a plugin id for `enable|disable|reload|info|remove`
@@ -7800,7 +7984,7 @@ fn complete_plugin_args(before: &str, plugins: &[(String, bool)]) -> Option<(usi
             let want: fn(bool) -> bool = match *sub {
                 "enable" => |on| !on,
                 "disable" | "reload" => |on| on,
-                "info" | "remove" | "rm" | "config" => |_| true,
+                "info" | "remove" | "rm" | "config" | "errors" => |_| true,
                 _ => return None,
             };
             let start = before.len() - partial.len();
@@ -7963,12 +8147,18 @@ fn rerun_plugin_on_init(session: &mut Session, dir: &Path, id: &str) {
 /// configured — the webhook client's handler registry (`:webhook reload`).
 /// Returns one human line per subsystem.
 fn reapply_plugin_runtime(session: &mut Session, dir: &Path) -> Vec<String> {
+    // TASK-274: re-validate configs first so the hook/webhook reloads below
+    // see the fresh config-invalid set; re-warn about any still-broken plugin.
+    let mut lines: Vec<String> = crate::plugins::refresh_config_health(dir)
+        .into_iter()
+        .map(|w| format!("\x1b[33m⚠\x1b[0m {w}"))
+        .collect();
     session.load_hooks();
     let timers = crate::plugin_timers::arm(dir);
     let statuslines = crate::plugin_statusline::arm(dir);
-    let mut lines = vec![format!(
+    lines.push(format!(
         "hooks reloaded · {timers} timer(s) · {statuslines} statusline segment(s) armed"
-    )];
+    ));
     if session.webhook.is_some() {
         let flash = crate::webhook::flash_sink_from_slot(session.flash.clone());
         lines.push(
@@ -7992,6 +8182,7 @@ fn reapply_plugin_runtime(session: &mut Session, dir: &Path) -> Vec<String> {
 ///   :plugin memory <id> set <namespace> <key> <value…>   # value parsed as JSON, else string
 ///   :plugin memory <id> delete <namespace> <key>         # remove a key
 ///   :plugin memory <id> clear <namespace> [yes]          # empty a namespace (needs `yes`)
+///   :plugin memory <id> errors [N]                       # alias of `:plugin errors <id> [N]`
 fn handle_plugin_memory(args: &[&str]) {
     let mem = crate::plugin_memory::global();
     let verbs = ["get", "set", "delete", "del", "clear"];
@@ -8020,6 +8211,13 @@ fn handle_plugin_memory(args: &[&str]) {
         }
 
         // ---- get -----------------------------------------------------------
+        // TASK-274: the card's `:plugin memory <id> errors` spelling aliases
+        // `:plugin errors <id> [N]` (the trail lives in errors.jsonl, not in a
+        // plugin-memory namespace).
+        [id, "errors"] => print_plugin_errors(&crate::plugins::default_plugins_dir(), id, None),
+        [id, "errors", n] => {
+            print_plugin_errors(&crate::plugins::default_plugins_dir(), id, Some(n))
+        }
         [id, "get", ns, key] => match mem.get(id, ns, key) {
             Ok(v) => println!("{}", pretty_json(&v)),
             Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e}"),
@@ -8939,7 +9137,7 @@ async fn handle_colon(
                  :mcp remove <name>                  disconnect + unsave an MCP server\n\
                  :mcp tools [name]                   list MCP tools\n\
                  :mcp test [name|all]                live-probe MCP server(s) — tools/list round-trip + latency\n\
-                 :plugin [list]                      installed plugins (disabled ones marked)\n\
+                 :plugin [list]                      installed plugins + health (ok|disabled|config-invalid|N recent errors)\n\
                  :plugin info <id>                   one plugin's provenance (hooks, MCP, skills, enabled)\n\
                  :plugin enable|disable <id>         toggle a plugin (saved in ~/.aish/plugins.state.json);\n\
                                                      hooks/timers/webhooks apply now, MCP + skills on :restart\n\
@@ -8947,6 +9145,7 @@ async fn handle_colon(
                  :plugin config <id>                 effective plugin config (defaults + config.json + env refs),\n\
                                                      secrets redacted; --set <key> <value> validates + saves,\n\
                                                      --reset [key] drops one key or the whole config.json\n\
+                 :plugin errors <id> [N]             a plugin's error log, newest N (default 20) — config/hook/webhook failures\n\
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
                  :context                            show context-window usage (tokens, %, memories)\n\
@@ -9265,6 +9464,27 @@ async fn handle_colon(
                 };
                 s.replace('|', "\\|")
             };
+            // The `Doing` cell. Prefer the worker's lightweight ACTIVITY SUMMARY
+            // (see `crate::activity_summary`) — one status-line-sized sentence,
+            // regenerated by a cheap model at every round boundary, so the cell
+            // says what the worker is doing NOW. Only when there is none (no
+            // Claude credential, pre-migration row, or the first round hasn't
+            // landed yet) does it fall back to a clipped task brief — which for
+            // a long brief shows only the preamble, and renders every worker in
+            // a shared-preamble fan-out as the same indistinguishable row.
+            //
+            // In-memory workers must read through the durable store: the summary
+            // is written by the coordinator SUBPROCESS, so the parent's
+            // `WorkerJob` never holds it. `cached_summary` throttles the lookup
+            // so this stays cheap on a repaint path.
+            let doing = |run_id: &str, task: &str| -> String {
+                session
+                    .coordinator_store
+                    .as_ref()
+                    .and_then(|s| crate::activity_summary::cached_summary(s, run_id))
+                    .map(|s| s.replace('|', "\\|"))
+                    .unwrap_or_else(|| one_line(task))
+            };
             // This session's label; in-memory workers are always "yours".
             let me_label = session
                 .name
@@ -9319,7 +9539,7 @@ async fn handle_colon(
                         crate::style::styled_status(&w.status()),
                         started_cell,
                         runtime_cell,
-                        one_line(&w.task),
+                        doing(&w.run_id(), &w.task),
                         crate::style::styled_result(&w.result_cell())
                     ),
                 ));
@@ -9436,7 +9656,17 @@ async fn handle_colon(
                                 crate::style::styled_status(&r.phase),
                                 started_cell,
                                 runtime_cell,
-                                one_line(&r.task),
+                                // The durable row already carries the summary —
+                                // no store round-trip needed for these.
+                                match r
+                                    .activity_summary
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    Some(s) => s.replace('|', "\\|"),
+                                    None => one_line(&r.task),
+                                },
                                 crate::style::styled_result(&result_cell)
                             ),
                         ));
@@ -11011,6 +11241,55 @@ mod tests {
         assert!(usage.starts_with("usage: :dispatch"), "got: {usage}");
     }
 
+    // `:tell` / `:stop` must reach their ctx paths DURING the turn — that is the
+    // whole point: steering or standing down a coordinator after the turn it was
+    // meant to change has already landed is useless. `coordinator_store: None`
+    // in the test ctx is the cheapest observable: both bottom out in the
+    // store-unavailable message, which only the real resolution path produces.
+    #[test]
+    fn midturn_tell_and_stop_route_through_the_ctx_paths() {
+        let ctx = test_ops_ctx(false);
+        for line in [
+            ":tell w_abc narrow the scope",
+            ":msg w_abc narrow the scope",
+            ":send --any w_abc narrow the scope",
+        ] {
+            let msg = run_midturn_command(line, &ctx).expect("`{line}` is an immediate command");
+            assert!(
+                msg.contains("can't queue messages"),
+                "mid-turn `{line}` must hit the real tell path: {msg}"
+            );
+        }
+        for line in [":stop w_abc", ":standdown w_abc", ":stand-down --any w_abc"] {
+            let msg = run_midturn_command(line, &ctx).expect("an immediate command");
+            assert!(
+                msg.contains("can't stand down a coordinator"),
+                "mid-turn `{line}` must hit the real stop path: {msg}"
+            );
+        }
+        // Missing operands still print usage rather than acting.
+        assert!(
+            run_midturn_command(":tell", &ctx)
+                .expect("immediate")
+                .starts_with("usage: :tell")
+        );
+        assert!(
+            run_midturn_command(":tell w_abc", &ctx)
+                .expect("immediate")
+                .starts_with("usage: :tell"),
+            "an id with no message is a usage error, not an empty steer"
+        );
+        assert!(
+            run_midturn_command(":stop", &ctx)
+                .expect("immediate")
+                .starts_with("usage: :stop")
+        );
+        // `:tell goal …` is the carve-out: it needs `&mut Session`, so the
+        // classifier keeps it queued and nothing runs here.
+        assert!(run_midturn_command(":tell goal narrow the scope", &ctx).is_none());
+    }
+
+    // Anything the classifier rejects must NOT be executed here — prose and
     // Anything the classifier rejects must NOT be executed here — prose and
     // session-mutating commands stay on the type-ahead queue.
     #[test]
@@ -11860,6 +12139,83 @@ mod tests {
         );
         assert!(complete_plugin_args(":plugin memory x", &plugins).is_none());
         assert!(complete_plugin_args(":hooks re", &plugins).is_none());
+        // TASK-274: `errors` completes as a subcommand and offers every id.
+        assert_eq!(
+            reps(complete_plugin_args(":plugin er", &plugins)),
+            (8, vec!["errors ".to_string()])
+        );
+        assert_eq!(
+            reps(complete_plugin_args(":plugin errors ", &plugins))
+                .1
+                .len(),
+            3
+        );
+    }
+
+    /// TASK-274: the `:` palette's `plugin` description lists every user-facing
+    /// `:plugin` subcommand (incl. `errors`), so the palette can't drift.
+    #[test]
+    fn plugin_palette_description_lists_subcommands() {
+        let desc = COLON_COMMANDS
+            .iter()
+            .find(|(n, _)| *n == "plugin")
+            .map(|(_, d)| *d)
+            .expect("plugin in palette");
+        for sub in PLUGIN_SUBCOMMANDS.iter().filter(|s| **s != "memory") {
+            assert!(desc.contains(sub), "palette missing `{sub}`: {desc}");
+        }
+    }
+
+    /// TASK-274: `:plugin errors <id> [N]` rendering.
+    #[test]
+    fn render_plugin_errors_tail_and_messages() {
+        let dir = std::env::temp_dir().join(format!(
+            "aish-repl-plugin-errors-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pdir = dir.join("gh");
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(pdir.join("plugin.json"), r#"{"id":"gh"}"#).unwrap();
+        assert!(
+            render_plugin_errors(&dir, "gh", None)
+                .unwrap()
+                .starts_with("no errors recorded for `gh`")
+        );
+        for i in 0..3 {
+            crate::plugin_health::record(
+                &dir,
+                "gh",
+                "hook_failed",
+                "on_init",
+                &format!("m{i}"),
+                "r",
+            );
+        }
+        let out = render_plugin_errors(&dir, "gh", Some("2")).unwrap();
+        assert!(
+            !out.contains("m0") && out.contains("m1") && out.contains("m2"),
+            "{out}"
+        );
+        assert!(out.contains("hook_failed on_init: m2 → r"));
+        assert!(
+            render_plugin_errors(&dir, "gh", None)
+                .unwrap()
+                .contains("m0")
+        );
+        assert!(
+            render_plugin_errors(&dir, "nope", None)
+                .unwrap_err()
+                .contains("no such plugin")
+        );
+        assert!(
+            render_plugin_errors(&dir, "gh", Some("x"))
+                .unwrap_err()
+                .contains("usage")
+        );
     }
 
     /// TASK-271: `:plugin config` subcommand, id, flag and key completion.

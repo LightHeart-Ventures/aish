@@ -23,6 +23,9 @@ services:
       BROKER_POLL_TIMEOUT_SECS: "60"
       BROKER_MSG_TTL_SECS: "604800"
       BROKER_LOG_LEVEL: "info"
+      # LOG_FORMAT: "json"
+      # OpenTelemetry metrics (TASK-375) — see deploy/signoz/README.md.
+      # OTEL_EXPORTER_OTLP_ENDPOINT: "http://signoz-otel-collector:4318"
     volumes:
       # Persist the SQLite database across restarts.
       - broker_data:/var/lib

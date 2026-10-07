@@ -281,6 +281,18 @@ fn plugin_registry(plugins_dir: &Path, plugin: &str) -> Result<PluginRegistry, S
             }
         ));
     }
+    // TASK-274: a config-invalid plugin's webhook handlers are skipped on the
+    // live path, so `:webhook test|replay` refuse it the same way (dry-run too
+    // — the plan would never run) and point at the fix.
+    if let Some((_, err)) = crate::plugins::config_invalid_plugins(plugins_dir)
+        .into_iter()
+        .find(|(id, _)| id == plugin)
+    {
+        return Err(format!(
+            "plugin `{plugin}`: config invalid — {err}; its webhook handlers are skipped \
+             until fixed (:plugin errors {plugin}, then :plugin reload)"
+        ));
+    }
     Ok(sub)
 }
 
@@ -643,6 +655,32 @@ mod tests {
         };
         let ran = run_test(&plugins, &args).await.unwrap();
         assert!(ran.contains("error exit=1"), "{ran}");
+        let _ = std::fs::remove_dir_all(&plugins);
+    }
+
+    /// TASK-274: `:webhook test` refuses a config-invalid plugin (its handlers
+    /// are skipped on the live path) and works again once the config is fixed.
+    #[tokio::test]
+    async fn run_test_refuses_config_invalid_plugin() {
+        let plugins = plugins_fixture();
+        let manifest = plugins.join("gh").join("plugin.json");
+        let mut m: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+        m["config_schema"] = json!({
+            "type": "object",
+            "properties": {"token": {"type": "string"}},
+            "required": ["token"]
+        });
+        std::fs::write(&manifest, m.to_string()).unwrap();
+        let args = parse_test_args(&["gh", "pull_request", "--run"]).unwrap();
+        let err = run_test(&plugins, &args).await.unwrap_err();
+        assert!(
+            err.contains("config invalid") && err.contains("token"),
+            "{err}"
+        );
+        std::fs::write(plugins.join("gh").join("config.json"), r#"{"token":"t"}"#).unwrap();
+        let ran = run_test(&plugins, &args).await.unwrap();
+        assert!(ran.contains("ok exit=0"), "{ran}");
         let _ = std::fs::remove_dir_all(&plugins);
     }
 

@@ -1038,6 +1038,28 @@ plus `git status` instead — do not fail the run over it.\n\n{PHASE0_GUARD}\n\n
     let mut control = ControlChannel::new();
     let mut last_output_mode = session.worker_output_mode();
 
+    // ── Status-line activity summary (see `crate::activity_summary`). `:workers`
+    // and the escalation banner previously had nothing to show but a hard-clipped
+    // prefix of the raw task brief, which for a long brief degenerates into "for
+    // aish: on worker start, and at the end of…" — syntax, not status. Instead a
+    // LIGHTWEIGHT model (haiku) writes one status-line-sized sentence saying what
+    // this worker is doing, budgeted to the live terminal width.
+    //
+    // Generated ONCE here from the task alone so the row is meaningful from the
+    // moment the worker appears — before its first round lands — then refreshed
+    // from each round's synthesis at the round boundary below.
+    //
+    // The backend is built once and reused: credential resolution + client setup
+    // per round is pure overhead. `None` (no Claude credential, e.g. an offline or
+    // non-Claude run) disables summaries entirely and every surface falls back to
+    // the task brief exactly as before — this is cosmetic, never load-bearing.
+    let summarizer = crate::activity_summary::lightweight_backend(session);
+    if let (Some(s), Some(sb)) = (store, summarizer.as_ref()) {
+        if let Some(sum) = crate::activity_summary::summarize(sb, &input, None).await {
+            let _ = s.set_activity_summary(run_id, &sum);
+        }
+    }
+
     loop {
         if rounds >= round_cap {
             // TASK-291: hitting the round cap is NOT a failure — park the run in
@@ -1299,6 +1321,23 @@ final status plus your best partial result. After this turn you are terminated."
         // replay shows each round’s final narrative answer, not just the tool turns.
         if let Some(w) = session.worker_transcript.as_mut() {
             w.record_message("assistant", "synthesis", &answer);
+        }
+
+        // ── Refresh the status-line activity summary (see the module-start hook
+        // above). Placed at the END of every round, after the synthesis is in
+        // hand, so `:workers` tracks what the worker is doing NOW rather than what
+        // it was launched to do. The round's synthesis is the single best signal
+        // available: it is the model's own narrative of what it just finished.
+        //
+        // Deliberately BEFORE the abnormal-exit evaluation below: a loop-detected
+        // or budget-exhausted round is exactly when an operator reads `:workers`,
+        // so that round's summary must land even though the round ended badly.
+        // Failure is swallowed — a summarizer hiccup leaves the prior summary in
+        // place and the run proceeds untouched.
+        if let (Some(s), Some(sb)) = (store, summarizer.as_ref()) {
+            if let Some(sum) = crate::activity_summary::summarize(sb, &input, Some(&answer)).await {
+                let _ = s.set_activity_summary(run_id, &sum);
+            }
         }
 
         // ── Worker-exit evaluation: did this round's turn end abnormally? The
@@ -2424,6 +2463,24 @@ mod tests {
         assert!(new_gap(heavy) < STALL_AFTER.as_secs());
     }
 
+    // The display layer needs the beat cadence to classify liveness (how many
+    // beats a worker has MISSED drives the escalation banner's green/yellow/red
+    // heart), but `style` is a pure-formatter module and must not depend on the
+    // coordinator. So the cadence is mirrored as `style::HEARTBEAT_INTERVAL_SECS`
+    // and pinned here: if someone retunes the writer's interval without the
+    // mirror, every missed-beat count silently mis-scales — a liveness lamp that
+    // lies is worse than no lamp. This test is the tripwire.
+    #[test]
+    fn heartbeat_interval_matches_display_const() {
+        assert_eq!(
+            super::HEARTBEAT_INTERVAL.as_secs() as i64,
+            crate::style::HEARTBEAT_INTERVAL_SECS,
+            "style::HEARTBEAT_INTERVAL_SECS mirrors the coordinator's beat cadence — \
+             update both or the missed-beat tiers mis-scale"
+        );
+    }
+
+    // A beat is best-effort, but a RUN of failed writes is the contention signal
     // A beat is best-effort, but a RUN of failed writes is the contention signal
     // the old `let _ = …` threw away. Success must clear the counter so a
     // recovered store stops warning.
@@ -3363,6 +3420,7 @@ mod tests {
             turns: 0,
             tool_calls: 0,
             kind: None,
+            activity_summary: None,
         }
     }
 

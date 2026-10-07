@@ -6,6 +6,10 @@
 
 use std::time::Duration;
 
+/// Default reconnect backoff cap: 5 minutes (TASK-274 — specced "exponential,
+/// capped at 5 min"; previously 30s, which hammered a down broker).
+pub const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(300);
+
 /// Classic capped exponential backoff.
 #[derive(Debug, Clone)]
 pub struct ExponentialBackoff {
@@ -19,12 +23,7 @@ pub struct ExponentialBackoff {
 
 impl Default for ExponentialBackoff {
     fn default() -> Self {
-        Self::new(
-            Duration::from_millis(500),
-            Duration::from_secs(30),
-            2.0,
-            true,
-        )
+        Self::new(Duration::from_millis(500), DEFAULT_MAX_BACKOFF, 2.0, true)
     }
 }
 
@@ -96,6 +95,25 @@ mod tests {
         // capped at max
         assert_eq!(b.next_backoff(), Duration::from_millis(1000));
         assert_eq!(b.next_backoff(), Duration::from_millis(1000));
+    }
+
+    /// TASK-274: the default schedule caps at 5 minutes, not 30s.
+    #[test]
+    fn default_caps_at_five_minutes() {
+        let d = ExponentialBackoff::default();
+        assert_eq!(d.max, Duration::from_secs(300));
+        assert_eq!(d.initial, Duration::from_millis(500));
+        let mut b = ExponentialBackoff::new(d.initial, d.max, d.multiplier, false);
+        let mut last = Duration::ZERO;
+        for _ in 0..20 {
+            last = b.next_backoff();
+            assert!(last <= DEFAULT_MAX_BACKOFF);
+        }
+        assert_eq!(last, DEFAULT_MAX_BACKOFF, "reaches and holds the cap");
+        // 500ms·2^9 = 256s < 300s, so the 30s cap of old is long passed.
+        let mut b = ExponentialBackoff::new(d.initial, d.max, d.multiplier, false);
+        let tenth = (0..10).map(|_| b.next_backoff()).last().unwrap();
+        assert_eq!(tenth, Duration::from_secs(256));
     }
 
     #[test]
