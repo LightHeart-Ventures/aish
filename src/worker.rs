@@ -1470,6 +1470,11 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
     show_output: Arc<AtomicBool>,
     attached: Arc<Mutex<Option<String>>>,
     pulse: Option<Arc<WorkerJob>>,
+    // Durable mirror of the in-memory transcript ring for THIS run, when the
+    // caller owns a run id (the background-worker path). `None` for the goal
+    // stream, which has no durable run row to tail. Writing happens at the SAME
+    // single seam that records into the ring, so the two can never drift.
+    activity: Option<Arc<crate::activity_log::ActivityLogWriter>>,
 ) -> String {
     let mut lines = BufReader::new(r).lines();
     let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_LINES);
@@ -1563,6 +1568,15 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
             // ring — and no `:attach` backfill either — so fall back to the
             // freshly computed `text`, which is byte-identical to what would be
             // stored.
+            // Durable mirror, from the SAME seam and the SAME `text` bytes that
+            // go into the ring — an off-process `:attach` (subworker, or after
+            // the parent coordinator exited) backfills + tails this file and
+            // sees byte-identical rows. `record` only pushes onto a channel
+            // drained by a dedicated IO thread, so a slow disk can never
+            // back-pressure this stderr drain.
+            if let Some(log) = &activity {
+                log.record(&text);
+            }
             let live_rows: Vec<(String, String)> = if let Some(job) = &pulse {
                 job.record_activity("", &text);
                 job.read_live_activity(&mut live_cursor)
@@ -3841,10 +3855,28 @@ other's files and commit onto the wrong branch, so this run is failed instead. R
     let show_output = spec.show_output.clone();
     let attached = spec.attached.clone();
     let pulse_job = job.clone();
+    // Durable per-run activity log. The process that owns this child's stderr
+    // pipe is the ONLY one that can see its activity; persisting the forwardable
+    // rows here is what lets ANY session `:attach` a live SUBWORKER (whose pipe
+    // belongs to a parent coordinator, possibly already exited). Best-effort:
+    // `None` when the file can't be opened — never fails a launch.
+    // Keyed by the durable `run_id` (the THREAD identity recorded in
+    // `coordinator_runs`), not the worker's visible id — an in-place resume
+    // mints a fresh run_id for the same WorkerJob, and a cross-session
+    // `:attach` resolves runs by exactly that durable id.
+    let activity = crate::activity_log::ActivityLogWriter::open(&run_id).map(Arc::new);
+    let activity_stream = activity.clone();
     let collect = tokio::spawn(async move {
         tokio::join!(
             read_capped(stdout, CAPTURE_CAP),
-            stream_stderr(stderr, &label, show_output, attached, Some(pulse_job))
+            stream_stderr(
+                stderr,
+                &label,
+                show_output,
+                attached,
+                Some(pulse_job),
+                activity_stream,
+            )
         )
     });
 
@@ -4047,7 +4079,7 @@ pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<Str
     let collect = tokio::spawn(async move {
         tokio::join!(
             read_capped(stdout, CAPTURE_CAP),
-            stream_stderr(stderr, GOAL_STREAM_LABEL, show_output, attached, None)
+            stream_stderr(stderr, GOAL_STREAM_LABEL, show_output, attached, None, None,)
         )
     });
     let status = match tokio::time::timeout(WORKER_TIMEOUT, child.wait()).await {
@@ -4429,6 +4461,59 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    /// WRITE-side AC: a forwardable row produced by the stderr DRAIN lands in the
+    /// durable activity log with text byte-identical to what is recorded into the
+    /// in-memory transcript ring. Both are the SAME `text` binding at the single
+    /// seam in `stream_stderr`, and this pins that invariant — the durable log and
+    /// a live `:attach` pane can never drift (TASK-296/298).
+    ///
+    /// Also pins the negative case: a bare `🔧` START line forwards nothing, so it
+    /// must not be persisted either.
+    async fn stderr_drain_mirrors_forwardable_rows_into_the_durable_log() {
+        let dir = std::env::temp_dir().join(format!("aish-activity-drain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let run_id = "w_drainTEST";
+        let writer = Arc::new(
+            crate::activity_log::ActivityLogWriter::open_in(&dir, run_id, 1 << 20)
+                .expect("temp-dir log opens"),
+        );
+        let forwardable = ["🗨 planning the migration", "\x1b[2m✓ 🔧 git status\x1b[0m"];
+        // Third line is a tool START: no status glyph ⇒ forwards nothing.
+        let input = format!("{}\n{}\n🔧 git status\n", forwardable[0], forwardable[1]);
+        // `show_output = false` + nothing attached ⇒ the gate is shut, so this
+        // exercises persistence independently of printing.
+        let _tail = stream_stderr(
+            input.as_bytes(),
+            run_id,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            None,
+            Some(writer.clone()),
+        )
+        .await;
+        // The drain dropped its clone on return, so we hold the sole handle and can
+        // join the writer thread for a deterministic read.
+        Arc::try_unwrap(writer)
+            .ok()
+            .expect("sole owner once the drain returned")
+            .close();
+        let expected: Vec<String> = forwardable
+            .iter()
+            .map(|l| {
+                lex_activity(l)
+                    .forward_text()
+                    .expect("both lines are forwardable")
+            })
+            .collect();
+        assert_eq!(
+            crate::activity_log::backfill_in(&dir, run_id),
+            expected,
+            "durable rows must be the ring's exact bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Build a bare in-memory `WorkerJob` for barrier tests — no subprocess, no
     /// worktree. `pid: None` models the launch window (registered but child not

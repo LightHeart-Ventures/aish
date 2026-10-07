@@ -1,3 +1,4 @@
+mod activity_log;
 mod activity_summary;
 mod advisor;
 mod alert;

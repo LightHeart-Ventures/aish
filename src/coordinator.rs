@@ -1558,6 +1558,13 @@ pub fn rehydrate(session: &mut Session) {
         return;
     }
 
+    // Second half of the durable-activity bound (the first is the per-run byte
+    // cap enforced by `ActivityLogWriter`): age out whole logs for runs that
+    // finished long ago. Only the launching interactive session does this —
+    // children returned above — so 100+ concurrent coordinators never stampede
+    // the directory.
+    let _ = crate::activity_log::sweep_older_than(crate::activity_log::RETAIN_DAYS);
+
     let Some(store) = session.coordinator_store.clone() else {
         return;
     };
