@@ -1228,14 +1228,18 @@ pub async fn run(
                         // include the active `:goal` in the rotation (checked live at
                         // press time — goal state can change during the turn).
                         let cb_goal = session.goal.clone();
+                        // Needed by the mid-turn pane replay: a live worker with no
+                        // captured activity yet gets an animated "thinking…" row, and
+                        // the animator needs the output-gate + attach-cursor handles.
+                        let cb_show = session.show_worker_output.clone();
                         let on_shift_tab: crate::keywatch::ShiftTabFn =
                             std::sync::Arc::new(move || {
-                                let goal_active = cb_goal.as_ref().is_some_and(|g| g.is_active());
                                 cycle_worker_live(
                                     &cb_workers,
                                     &cb_attached,
                                     &cb_review,
-                                    goal_active,
+                                    &cb_show,
+                                    cb_goal.as_ref(),
                                 );
                             });
                         // Mid-turn type-ahead is normally enabled only when the pinned
@@ -5291,20 +5295,41 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
 /// so far (its bounded transcript) so the operator sees the full context
 /// BEFORE the live stream continues. A no-op when the worker can't be found.
 fn backfill_attached(run_id: &str, session: &Session) {
-    let job = session
-        .worker_jobs
+    if !backfill_attached_live(
+        run_id,
+        &session.worker_jobs,
+        &session.show_worker_output,
+        &session.attached,
+    ) {
+        // Subworker / cross-session review: not one of THIS session's in-mem
+        // workers, so there's no live transcript to replay — surface the durable
+        // header + task from the coordinator store so an attach still shows what
+        // the worker is/was doing (its result follows via print_attached_result).
+        backfill_attached_durable(run_id, session);
+    }
+}
+
+/// The session-free core of [`backfill_attached`]: replay an IN-MEMORY worker's
+/// transcript off nothing but the shared handles. Split out so the mid-turn
+/// Shift-Tab path ([`cycle_worker_live`]) can replay the pane it just switched
+/// to — it runs on the keywatch reader thread and CANNOT borrow `&Session`
+/// (the in-flight turn owns it exclusively). Returns `false` when `run_id` is
+/// not one of this session's live workers, so the `&Session` wrapper can fall
+/// back to the durable-store replay (which needs the db).
+fn backfill_attached_live(
+    run_id: &str,
+    worker_jobs: &crate::worker::WorkerJobs,
+    show_worker_output: &Arc<AtomicBool>,
+    attached: &Arc<Mutex<Option<String>>>,
+) -> bool {
+    let job = worker_jobs
         .lock()
         .unwrap()
         .iter()
         .find(|w| w.id == *run_id)
         .cloned();
     let Some(job) = job else {
-        // Subworker / cross-session review: not one of THIS session's in-mem
-        // workers, so there's no live transcript to replay — surface the durable
-        // header + task from the coordinator store so an attach still shows what
-        // the worker is/was doing (its result follows via print_attached_result).
-        backfill_attached_durable(run_id, session);
-        return;
+        return false;
     };
     let short = crate::batch::short_id(run_id);
     println!("{}", crate::worker::pane_replay_header(short));
@@ -5326,10 +5351,7 @@ fn backfill_attached(run_id: &str, session: &Session) {
         // left to stop the spinner), fall back to the one-shot static notice.
         let running = job.status() == "running";
         let animated = running
-            && job.start_backfill_thinking(
-                session.show_worker_output.clone(),
-                session.attached.clone(),
-            );
+            && job.start_backfill_thinking(show_worker_output.clone(), attached.clone());
         if !animated {
             println!(
                 "{}",
@@ -5363,6 +5385,7 @@ fn backfill_attached(run_id: &str, session: &Session) {
             );
         }
     }
+    true
 }
 
 /// Replay the active `:goal` loop's history the SAME way `backfill_attached`
@@ -6494,19 +6517,35 @@ fn cycle_worker(session: &mut Session) -> bool {
 /// Mid-turn sibling of [`cycle_worker`]: cycle the attach cursor while a model
 /// turn is actively streaming (driven by [`crate::keywatch`] on a Shift-Tab
 /// press). It CANNOT take `&mut Session` — the in-flight turn borrows it — so it
-/// works off cloned attach-cursor handles and does the minimal, safe subset:
-/// advance the cursor and flip the `attached` / review markers so the worker
-/// forwarder begins routing that coordinator's output. Deliberately omits
-/// `clear_screen` (which would wipe the turn's in-flight output) and the
-/// backfill / result replay (those need `&Session` for the db); a post-turn
-/// Shift-Tab runs the full [`cycle_worker`] with backfill. Index math is the same
-/// pure, unit-tested [`next_attach_index`].
+/// works off cloned handles.
+///
+/// It performs the SAME view switch as the at-the-prompt `cycle_worker`, because
+/// "Shift-Tab while aish is thinking" has to mean the same thing as "Shift-Tab at
+/// the prompt": [`crate::terminal::open_attach_view`] wipes the viewport (into
+/// scrollback — never `ESC[3J`) and re-anchors, then the attach header prints,
+/// then the newly-attached pane's captured transcript is replayed. An earlier
+/// iteration deliberately skipped the wipe + replay to protect the turn's
+/// in-flight output, which left the cursor flipped and the header printed while
+/// the screen still showed the PREVIOUS pane — "it displays the next worker but
+/// doesn't actually switch screens". The wiped output is not lost: it stays in
+/// the terminal's native scrollback, and the in-flight turn keeps streaming into
+/// the fresh screen.
+///
+/// Two things still differ from the post-turn path, both because they need
+/// `&Session`: a finished coordinator's final result pane
+/// (`print_attached_result`) and the durable-store replay for a worker that
+/// isn't in this session's in-memory list — plus the interactive slot, whose
+/// history tail lives behind `&Session` and is actively being mutated by the
+/// running turn. A post-turn Shift-Tab runs the full [`cycle_worker`] and fills
+/// those in. Index math is the same pure, unit-tested [`next_attach_index`].
 fn cycle_worker_live(
     workers: &crate::worker::WorkerJobs,
     attached: &Arc<Mutex<Option<String>>>,
     review: &Arc<Mutex<Option<String>>>,
-    goal_active: bool,
+    show_worker_output: &Arc<AtomicBool>,
+    goal: Option<&crate::goal::Handle>,
 ) {
+    let goal_active = goal.is_some_and(|g| g.is_active());
     let workers_v: Vec<(String, bool, String)> = workers
         .lock()
         .unwrap()
@@ -6541,27 +6580,47 @@ fn cycle_worker_live(
     if next_idx == 0 {
         *attached.lock().unwrap() = None;
         *review.lock().unwrap() = None;
-        // No output-field hint here: the detached "back to interactive" state is
-        // already reflected on the 2nd statusline (see `coordinator_status_line`),
-        // so printing it again would just be redundant noise in the scrollback.
+        // Wrap back to the interactive session. Switch the view for real —
+        // `close_attach_view` wipes the worker pane off the viewport (scrollback
+        // preserved) and re-anchors, mirroring the post-turn `:detach`. We can't
+        // replay the interactive history tail here (it lives behind `&Session`
+        // and the running turn is actively appending to it), so print a marker
+        // row instead: without it the operator would be left staring at a blank
+        // screen until the turn's next streamed line lands, with no confirmation
+        // the hop happened at all.
+        crate::terminal::close_attach_view();
+        println!(
+            "\x1b[1;33m⇄ back to the interactive session\x1b[0m \x1b[2m(0/{} · turn still running; Shift-Tab to cycle)\x1b[0m",
+            ids.len()
+        );
         return;
     }
-    // TASK-299: goal sentinel is the last slot — watch-only, no db backfill
-    // mid-turn (a post-turn Shift-Tab runs full `cycle_worker` with backfill).
+    // TASK-299: goal sentinel is the last slot. Open the attach view (wipe +
+    // anchor) BEFORE the header so the goal's pane starts on a fresh screen, then
+    // replay the goal's captured activity — same as the post-turn path, since the
+    // goal handle needs no db.
     if ids[next_idx - 1] == GOAL_ATTACH_ID {
         *attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
         *review.lock().unwrap() = None;
+        crate::terminal::open_attach_view();
         println!(
             "\x1b[1;33m⇄ attached to the goal\x1b[0m \x1b[2m({}/{} · watch-only; Shift-Tab to cycle, :detach to stop)\x1b[0m",
             next_idx,
             ids.len()
         );
+        if let Some(g) = goal {
+            backfill_goal_attached(g);
+        }
         return;
     }
     let (run_id, terminal, task) = workers_v[next_idx - 1].clone();
     *attached.lock().unwrap() = Some(run_id.clone());
     let short = crate::batch::short_id(&run_id);
     let task_suffix = attach_task_suffix(&task);
+    // Wipe + re-anchor BEFORE the header prints, so the header and the replayed
+    // tail below it land on a fresh screen instead of piling under the pane we
+    // just left (the "displays the next worker but doesn't switch screens" bug).
+    crate::terminal::open_attach_view();
     if terminal {
         *review.lock().unwrap() = Some(run_id.clone());
         println!(
@@ -6579,6 +6638,13 @@ fn cycle_worker_live(
             task_suffix
         );
     }
+    // Replay the input + activity captured so far so the switched-to screen
+    // actually SHOWS that worker, then its live stream continues below. The
+    // finished-coordinator result pane (`print_attached_result`) and the
+    // durable-store replay still need `&Session`, so they stay on the post-turn
+    // path — this covers every worker live in THIS session, which is the whole
+    // mid-turn rotation.
+    backfill_attached_live(&run_id, workers, show_worker_output, attached);
 }
 
 /// `:close [worker-id]` — remove a coordinator from THIS session: drop it from
