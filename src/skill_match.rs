@@ -190,6 +190,108 @@ read the best-fitting one FIRST with read_file and follow it:",
     }
 }
 
+/// Sentinel the coordinator preamble ends with: everything AFTER the last
+/// occurrence is the dispatched task brief. Interactive turns never contain it.
+pub const TASK_MARKER: &str = "\nTASK:\n";
+
+/// Opening line of the quoted-conversation digest `repl::enrich_task_with_context`
+/// prepends to an auto-offloaded brief.
+const CTX_OPEN: &str = "=== Recent conversation context";
+
+/// Terminator of that digest.
+const CTX_CLOSE: &str = "=== End context ===";
+
+/// Marker every rendered skill-awareness note starts with.
+pub const HINT_PREFIX: &str = "[aish skill-awareness]";
+
+/// True when `text` already carries a rendered skill-awareness note — the
+/// engine uses this to avoid stacking a SECOND block onto a brief that was
+/// already hinted (e.g. an operator-hinted message quoted into a worker brief).
+pub fn contains_hint(text: &str) -> bool {
+    text.contains(HINT_PREFIX)
+}
+
+/// True when the dispatched task ITSELF already carries a skill-awareness block
+/// — the engine's "don't double-inject" gate.
+///
+/// Deliberately narrower than [`contains_hint`]: the coordinator preamble and
+/// any QUOTED conversation digest are stripped first, so a stale block that
+/// merely got quoted into a worker brief (w_oihN7xE3) does NOT suppress a fresh,
+/// correctly-matched hint — while a brief that was already hinted in its own
+/// right is left alone instead of growing a second block.
+pub fn already_hinted(input: &str) -> bool {
+    let task = input
+        .rfind(TASK_MARKER)
+        .map(|pos| &input[pos + TASK_MARKER.len()..])
+        .unwrap_or(input);
+    contains_hint(&strip_quoted_context(task))
+}
+
+/// Reduce a raw turn input to the text that should drive skill matching.
+///
+/// Three layers of non-task boilerplate otherwise skew the keyword score — all
+/// three were observed together on coordinator run `w_oihN7xE3`, which was
+/// dispatched to investigate a UI regression and got hinted at
+/// `patent-workflow-validator` / `prior-art-search` because the brief QUOTED an
+/// earlier patent conversation (and the stale hint block naming those very
+/// skills):
+///   1. the coordinator system preamble (stripped by taking the text after the
+///      last [`TASK_MARKER`] — incidental words like "cargo" in the pipeline
+///      boilerplate otherwise light up unrelated categories),
+///   2. the `=== Recent conversation context … === End context ===` digest that
+///      `repl::enrich_task_with_context` prepends to an auto-offloaded brief,
+///   3. any already-rendered [`HINT_PREFIX`] block, whose skill names and
+///      descriptions are pure self-reinforcing noise.
+///
+/// Falls back to the un-stripped task when stripping would leave nothing, so a
+/// brief that is ONLY context still matches something rather than nothing.
+pub fn match_text(input: &str) -> String {
+    let task = input
+        .rfind(TASK_MARKER)
+        .map(|pos| &input[pos + TASK_MARKER.len()..])
+        .unwrap_or(input);
+    let cleaned = strip_hint_blocks(&strip_quoted_context(task));
+    if cleaned.trim().is_empty() {
+        task.to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Remove every `=== Recent conversation context … === End context ===` region.
+/// An unterminated opener (clipped brief) drops the remainder of the text.
+fn strip_quoted_context(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find(CTX_OPEN) {
+        out.push_str(&rest[..open]);
+        let after = &rest[open..];
+        match after.find(CTX_CLOSE) {
+            Some(close) => rest = &after[close + CTX_CLOSE.len()..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Remove every rendered skill-awareness block (prefix line through the next
+/// blank line, or to the end when it runs to the tail of the text).
+fn strip_hint_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(HINT_PREFIX) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        match after.find("\n\n") {
+            Some(end) => rest = &after[end..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The filename aish treats as a repo's machine-readable spec. When present in
 /// the working directory it captures repo conventions (build/test commands,
 /// layout, guardrails) the model should honor before touching code — see the
@@ -651,6 +753,78 @@ mod tests {
             &c,
         );
         assert!(r.len() <= MAX_MATCHES, "got {} matches", r.len());
+    }
+
+    // ── Worker-brief hygiene: match_text / contains_hint / already_hinted ──
+
+    /// A dispatched-coordinator brief in the exact shape that produced the
+    /// w_oihN7xE3 mis-hint: a stale skill-awareness block, a quoted
+    /// conversation digest, the coordinator preamble, then the real task.
+    fn worker_brief(task: &str) -> String {
+        format!(
+            "[aish skill-awareness] These installed skills look relevant to this task — read the \
+best-fitting one FIRST with read_file and follow it:\n\
+- `patent-workflow-validator` (/s/patent-workflow-validator/SKILL.md): End-to-end validation of \
+patent filing workflow, USPTO prior-art filing and defensible claims.\n\n\
+=== Recent conversation context (for reference — the operator's request at the end may refer to \
+it) ===\n\
+Operator: draft the provisional patent and run the prior-art search on USPTO\n\
+Assistant: filed the patent targets doc with claims and prior-art landmines\n\
+=== End context ===\n\n\
+You are running headless as an autonomous aish coordinator. Validate with cargo build.\n\
+\nTASK:\n{task}"
+        )
+    }
+
+    #[test]
+    fn match_text_strips_preamble_quoted_context_and_stale_hint() {
+        let brief = worker_brief("audit our dependencies for vulnerabilities");
+        let m = match_text(&brief);
+        assert_eq!(m.trim(), "audit our dependencies for vulnerabilities");
+        assert!(!contains_hint(&m), "stale block survived: {m}");
+        assert!(!m.contains("USPTO"), "quoted context survived: {m}");
+        assert!(!m.contains("cargo"), "preamble survived: {m}");
+    }
+
+    #[test]
+    fn worker_brief_matching_a_skill_gets_the_block() {
+        let brief = worker_brief("audit our dependencies for vulnerabilities and licenses");
+        assert!(!already_hinted(&brief), "quoted block must not suppress");
+        let h = hint(&match_text(&brief), &catalog()).expect("a skill should match");
+        assert!(h.starts_with(HINT_PREFIX), "{h}");
+        assert!(h.contains("dependency-audit"), "{h}");
+        // Regression (w_oihN7xE3): the quoted patent conversation must not win.
+        assert!(!h.contains("patent"), "{h}");
+    }
+
+    #[test]
+    fn worker_brief_matching_nothing_gets_no_block() {
+        let brief = worker_brief("say hello to the crew and wave");
+        assert!(
+            hint(&match_text(&brief), &catalog()).is_none(),
+            "no skill should match a trivial brief"
+        );
+    }
+
+    #[test]
+    fn already_hinted_brief_is_not_double_injected() {
+        // A block in the TASK region itself (the brief was already hinted) →
+        // the engine must skip injection.
+        let brief = format!(
+            "preamble\nTASK:\n{HINT_PREFIX} Your installed `pr-reviewer` skill fits this task.\n\nreview the diff on PR 12"
+        );
+        assert!(already_hinted(&brief), "{brief}");
+        // …whereas the same block sitting only inside the quoted context does
+        // NOT suppress a fresh hint.
+        assert!(!already_hinted(&worker_brief("review the diff on PR 12")));
+    }
+
+    #[test]
+    fn interactive_turns_are_unaffected() {
+        // No TASK marker, no context digest → match_text is a pass-through.
+        let line = "audit our dependencies for vulnerabilities";
+        assert_eq!(match_text(line), line);
+        assert!(!already_hinted(line));
     }
 
     /// A small catalog modeled on the real installed skills.
