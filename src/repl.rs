@@ -2122,36 +2122,44 @@ fn statusline_segments(
     out
 }
 
-/// Keep the pinned escalation banner's status row in sync with the live worker
+/// Keep EVERY pinned escalation banner's status row in sync with the live worker
 /// list. Called from the footer paint path — the only place holding a `Session`
-/// — while the banner's own clock renders the runtime, so the row stays honest
+/// — while each banner's own clock renders its runtime, so the rows stay honest
 /// even on heartbeat-only repaints.
+///
+/// Several escalations can be pinned at once, so this walks all of them and
+/// writes each worker's status into ITS OWN banner (the single-slot banner this
+/// replaced could only ever refresh the newest). The worker list is locked ONCE
+/// and snapshotted, so N banners cost one lock acquisition per paint rather than
+/// N — and no lock is held while writing into the escalation store.
 fn refresh_escalation_status(session: &Session) {
-    let Some(id) = crate::escalation::pinned_id() else {
+    let ids = crate::escalation::pinned_ids();
+    if ids.is_empty() {
         return;
-    };
-    let snapshot = session
+    }
+    let snapshot: Vec<(String, String, Option<String>)> = session
         .worker_jobs
         .lock()
         .unwrap()
         .iter()
-        .find(|w| w.id == id)
+        .filter(|w| ids.iter().any(|id| *id == w.id))
         .map(|w| {
             (
+                w.id.clone(),
                 w.status(),
                 w.transcript_rows().last().map(|(_, text)| text.clone()),
             )
-        });
-    let Some((status, last)) = snapshot else {
-        return;
-    };
-    let text = match last {
-        Some(a) if !a.trim().is_empty() => format!("{status} · {}", a.trim()),
-        _ => status.clone(),
-    };
-    crate::escalation::set_status(&text);
-    if matches!(status.as_str(), "done" | "failed") {
-        crate::escalation::note_terminal(&id, status == "failed");
+        })
+        .collect();
+    for (id, status, last) in snapshot {
+        let text = match last {
+            Some(a) if !a.trim().is_empty() => format!("{status} · {}", a.trim()),
+            _ => status.clone(),
+        };
+        crate::escalation::set_status(&id, &text);
+        if matches!(status.as_str(), "done" | "failed") {
+            crate::escalation::note_terminal(&id, status == "failed");
+        }
     }
 }
 
