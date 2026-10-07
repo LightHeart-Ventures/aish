@@ -303,6 +303,7 @@ mod tests {
             run_id: "r".into(),
             task: "t".into(),
             kind: None,
+            activity_summary: None,
             phase: phase.into(),
             result: None,
             error: None,
