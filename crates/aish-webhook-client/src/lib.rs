@@ -56,6 +56,7 @@ pub mod client;
 pub mod dispatcher;
 pub mod envelope;
 pub mod error;
+pub mod metrics;
 pub mod service;
 pub mod transport;
 
@@ -68,5 +69,6 @@ pub use dispatcher::{
 };
 pub use envelope::{BrokerConfig, ClientFrame, ServerFrame, Webhook};
 pub use error::{Result, WebhookClientError};
+pub use metrics::{HandlerCounters, HandlerCounts};
 pub use service::{StopReason, WebhookService};
 pub use transport::{Transport, WsMessage};

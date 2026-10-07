@@ -49,10 +49,23 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 
+# OpenTelemetry metrics export (TASK-375). OTLP over HTTP/protobuf to SigNoz or
+# any OTel collector; only active at runtime when OTEL_EXPORTER_OTLP_ENDPOINT is
+# set. Gated behind the default-on `otel` feature so `--no-default-features`
+# builds drop the exporter stack entirely.
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics"], optional = true }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics"], optional = true }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls"], optional = true }
+
+[features]
+default = ["otel"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+
 [dev-dependencies]
 tempfile = "3.8"
 tower = { version = "0.4", features = ["util"] }
 http-body-util = "0.1"
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "testing"] }
 
 [[bin]]
 name = "aish-webhook-broker"

@@ -15,6 +15,7 @@ use tokio::io::AsyncWriteExt;
 use crate::audit::{AuditRecord, AuditSink, NoopAuditSink};
 use crate::envelope::Webhook;
 use crate::error::Result;
+use crate::metrics::HandlerCounters;
 
 /// Default per-handler execution timeout.
 pub const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -228,6 +229,7 @@ pub struct WebhookDispatcher {
     default_timeout: Duration,
     audit: Arc<dyn AuditSink>,
     flash: Option<FlashSink>,
+    counters: Option<Arc<HandlerCounters>>,
 }
 
 impl WebhookDispatcher {
@@ -237,7 +239,15 @@ impl WebhookDispatcher {
             default_timeout: DEFAULT_HANDLER_TIMEOUT,
             audit: Arc::new(NoopAuditSink),
             flash: None,
+            counters: None,
         }
+    }
+
+    /// Attach per-plugin [`HandlerCounters`] (TASK-375). Every executed
+    /// handler outcome is tallied (dispatched / ok / failed / timeout).
+    pub fn with_counters(mut self, counters: Arc<HandlerCounters>) -> Self {
+        self.counters = Some(counters);
+        self
     }
 
     /// Attach a [`FlashSink`]. Every executed handler that exits with a non-empty
@@ -326,6 +336,12 @@ impl WebhookDispatcher {
             } else if o.executed {
                 tracing::info!(plugin_id = %o.plugin_id, event_type = %o.event_type,
                     duration_ms = o.duration_ms, "handler ok");
+            }
+        }
+
+        if let Some(counters) = &self.counters {
+            for o in &outcomes {
+                counters.record(o);
             }
         }
 

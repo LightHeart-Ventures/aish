@@ -76,6 +76,17 @@ The unit is hardened (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
 | `BROKER_POLL_TIMEOUT_SECS` | `60` | Long-poll timeout |
 | `BROKER_MSG_TTL_SECS` | `604800` | Webhook TTL (7 days) |
 | `BROKER_LOG_LEVEL` | `info` | `tracing` env-filter level |
+| `LOG_FORMAT` | `text` | `json` = one JSON object per log line (collector-friendly) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | When set, export OpenTelemetry metrics over OTLP/HTTP (e.g. SigNoz). Unset = no-op |
+| `OTEL_EXPORTER_OTLP_HEADERS` | unset | e.g. `signoz-ingestion-key=<key>` for SigNoz Cloud |
+| `OTEL_SERVICE_NAME` | `aish-webhook-broker` | OTel `service.name` |
+| `OTEL_METRIC_EXPORT_INTERVAL` | `60000` | Metric export interval (ms) |
+
+## Observability (SigNoz / OpenTelemetry)
+
+Metrics (`aish.webhook.broker.*`), the importable SigNoz dashboard, suggested
+alerts and the load generator are documented in [`signoz/README.md`](signoz/README.md).
+`GET /stats` returns the same counts as JSON.
 
 ## Reverse proxy / TLS
 
