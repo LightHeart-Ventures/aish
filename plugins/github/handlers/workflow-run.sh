@@ -22,7 +22,9 @@ payload="$(cat)"
 
 # Deterministic scratch path python writes machine-readable fields to; bash
 # sources it after to decide whether to spawn the auto-fix worker.
-fields="$(mktemp "${TMPDIR:-/tmp}/gh-ci-XXXXXX.env")"
+# (Template must END in X's: BSD/macOS mktemp does not randomise a template
+# with a suffix after the X's, so concurrent runs would collide.)
+fields="$(mktemp "${TMPDIR:-/tmp}/gh-ci.XXXXXX")"
 trap 'rm -f "$fields"' EXIT
 
 rc=0

@@ -1,21 +1,59 @@
 # GitHub Webhook Plugin
 
 Reference webhook plugin for aish (SPR-069, TASK-386 scaffold + TASK-387 handler
-scripts). It demonstrates the **canonical** `plugin.json` webhook schema that the
-`aish-webhook-client` dispatcher consumes, and ships three self-contained handler
-scripts that turn GitHub events into concise, auditable one-line summaries.
+scripts; TASK-373 push/issues + opt-in PR review agent). It demonstrates the
+**canonical** `plugin.json` webhook schema that the `aish-webhook-client`
+dispatcher consumes, and ships self-contained handler scripts that turn GitHub
+events into concise, auditable one-line summaries.
 
 ## What it does
 
 | GitHub event   | Filter(s)                                         | Handler                    | Emits |
 |----------------|---------------------------------------------------|----------------------------|-------|
-| `pull_request` | `action ∈ {opened, reopened, ready_for_review}`   | `handlers/pr-review.sh`    | PR triage line (repo#num, author, head→base, title, url) |
+| `push`         | none (every branch/tag push, incl. create/delete/force) | `handlers/push.sh`   | Push line (repo, branch/tag, commit count, before..after short SHAs, pusher, `[forced]`/`[new]`, head-commit headline, compare url); a `deleted` line for ref deletions |
+| `pull_request` | `action ∈ {opened, reopened, ready_for_review}`   | `handlers/pr-review.sh`    | PR triage line (repo#num, author, head→base, title, url); **opt-in review agent** (see below) |
+| `issues`       | `action ∈ {opened, reopened, edited, closed, labeled}` | `handlers/issues.sh`  | Issue line (repo#num, action, `+label:<name>` on labeled, `[pr]` for PR-backed issues, author, state, labels, title, url) |
 | `workflow_run` | `action = completed`                              | `handlers/workflow-run.sh` | CI outcome line (✓/✗, name, branch, status/conclusion); non-zero exit on a bad conclusion; **auto-dispatches a `fix-ci` worker on failure** (see below) |
 | `release`      | `action = published`                              | `handlers/release.sh`      | Release notice (tag, name, author, pre-release flag) |
 
 Each `action` value is registered as its own handler entry because filters are
 **AND-combined equality** checks — there is no `in` operator, so one entry per
 accepted value keeps the match explicit.
+
+Example lines:
+
+```
+[github/push] acme/widgets branch main: 3 commits 6113728..0d1a26e by @octocat tenant=t1: Fix widget lookup off-by-one https://github.com/acme/widgets/compare/6113728f27ae...0d1a26e67d8f
+[github/issue] acme/widgets#1347 opened by @octocat [open] labels=bug,registry tenant=t1: Widget registry panics on empty config https://github.com/acme/widgets/issues/1347
+```
+
+## Environment flags
+
+| Variable               | Default | Effect |
+|------------------------|---------|--------|
+| `GITHUB_PR_AUTOREVIEW` | off     | `1` (exactly) → `pr-review.sh` dispatches a background review agent on PR open (below). Any other value or unset = off. |
+| `GITHUB_CI_AUTOFIX`    | on      | `0` → `workflow-run.sh` does NOT dispatch the `fix-ci` worker on a failed run. |
+
+Set them in the environment of the process running the webhook client; handlers
+inherit it.
+
+## PR review agent (opt-in)
+
+With `GITHUB_PR_AUTOREVIEW=1`, when a **non-draft** PR is `opened`, `reopened`
+or `ready_for_review`, `pr-review.sh` detaches a background aish coordinator
+(`aish --coordinator --run-id pr-review-<num>-<sha7>-<ts> -c "<task>"`) that
+reads the diff with `gh pr diff`, reviews it, and posts findings as a single
+`gh pr review --comment`. It never pushes, approves or merges.
+
+| Property      | Behavior |
+|---------------|----------|
+| **Opt-in**    | off by default — every review spends model tokens |
+| **Drafts**    | skipped (`ready_for_review` fires it once the PR is marked ready) |
+| **Non-blocking** | `setsid`-detached (falls back to `nohup` where `setsid` is absent, e.g. macOS), closed stdin |
+| **Idempotent** | one marker per (repo, PR, head SHA): `$TMPDIR/aish-pr-autoreview-<repo>-<num>-<sha>.marker` — redeliveries and opened+ready_for_review on the same SHA spawn one reviewer; a new head SHA (e.g. reopened after a push) gets a fresh review |
+| **Best-effort** | missing `aish` on `PATH` → logged skip; dispatch never changes the handler exit code or its stdout summary |
+
+The reviewer's output goes to `$TMPDIR/pr-review-<num>-<sha7>-<ts>.log`.
 
 ## CI auto-fix worker
 
@@ -89,6 +127,25 @@ regardless of the broker process's cwd. Bare program names (no `/`) are left
 alone for `PATH` lookup, and absolute paths are unchanged. See
 `crates/aish-webhook-client/src/dispatcher.rs` (`PluginRegistry::load_dir`).
 
+## Tests and fixtures
+
+Recorded-shape GitHub payloads live in `plugins/github/tests/fixtures/`
+(`push*.json`, `issues-*.json`, `pull_request-*.json`).
+`crates/aish-webhook-client/tests/github_plugin_fixtures.rs` loads this plugin
+with `PluginRegistry::load_dir`, dispatches each fixture through the real
+`WebhookDispatcher` (fork/exec, no shell) and asserts on the summary lines. It
+also proves shell metacharacters in payload fields are printed verbatim and never
+executed, and drives the `GITHUB_PR_AUTOREVIEW` path against a stub `aish` on
+`PATH` (off by default, once per head SHA, drafts skipped).
+
+```sh
+cargo test -p aish-webhook-client --no-default-features --test github_plugin_fixtures
+shellcheck plugins/github/handlers/*.sh
+```
+
+A live end-to-end test (real GitHub-signed delivery → broker → client →
+handler) is pending the TASK-449 broker/client protocol fix.
+
 ## Local smoke test
 
 ```sh
@@ -104,4 +161,10 @@ Expected:
 
 ```
 [github/pr] acme/repo#42 opened by @octocat (feat/widget→main) tenant=t_demo: Add widget https://github.com/acme/repo/pull/42
+```
+
+```sh
+# push / issues, from the recorded fixtures
+WEBHOOK_TENANT_ID=t_demo plugins/github/handlers/push.sh   < plugins/github/tests/fixtures/push.json
+WEBHOOK_TENANT_ID=t_demo plugins/github/handlers/issues.sh < plugins/github/tests/fixtures/issues-opened.json
 ```

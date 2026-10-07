@@ -1,0 +1,18 @@
+{
+  "action": "labeled",
+  "label": { "id": 208045948, "name": "priority:high", "color": "b60205" },
+  "issue": {
+    "id": 1348,
+    "number": 1348,
+    "title": "Docs: registry config reference",
+    "user": { "login": "hubot", "id": 2, "type": "User" },
+    "labels": [
+      { "id": 208045949, "name": "docs", "color": "0075ca" },
+      { "id": 208045948, "name": "priority:high", "color": "b60205" }
+    ],
+    "state": "open",
+    "html_url": "https://github.com/acme/widgets/issues/1348"
+  },
+  "repository": { "id": 1296269, "name": "widgets", "full_name": "acme/widgets" },
+  "sender": { "login": "octocat", "id": 1, "type": "User" }
+}
