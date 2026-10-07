@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
-# hello-world ping handler — processes ping webhook events.
-# Receives raw JSON on stdin, outputs greeting to aish statusline.
+# hello-world ping handler — processes `ping` webhook events.
+# Receives the raw JSON payload on stdin; its stdout is flashed on the aish
+# SecondStatusLine (first non-blank line, capped).
 set -euo pipefail
 
-python3 - <<'PY'
+# Read the payload BEFORE invoking python: `python3 - <<PY` makes the heredoc
+# python's stdin, so reading sys.stdin inside the script would see nothing.
+payload="$(cat)"
+
+AISH_PING_PAYLOAD="$payload" python3 - <<'PY'
 import json, os, sys
 
-payload = sys.stdin.read()
+payload = os.environ.get("AISH_PING_PAYLOAD", "")
 try:
     ev = json.loads(payload) if payload.strip() else {}
 except json.JSONDecodeError as e:
     print(f"[hello-world/ping] malformed payload: {e}", file=sys.stderr)
     sys.exit(2)
 
-message = ev.get("message", "Hello, World!")
-
-# Output to aish statusline
-statusline_msg = f"👋 {message}"
-print(statusline_msg)
+message = ev.get("message") if isinstance(ev, dict) else None
+print(f"👋 {message or 'Hello, World!'}")
 PY

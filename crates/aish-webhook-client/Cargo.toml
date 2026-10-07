@@ -12,7 +12,10 @@ publish = false
 # connection-manager / dispatcher logic and all tests are hermetic and build
 # with `--no-default-features` against the in-crate MockTransport.
 default = ["net"]
-net = ["dep:tokio-tungstenite", "dep:futures-util"]
+# It also pulls reqwest for `POST /clients/register` (TASK-449: the broker only
+# accepts a session_token issued there) and rustls so `wss://` brokers (Fly)
+# are dialable. reqwest/rustls/ring/webpki-roots are already in aish's tree.
+net = ["dep:tokio-tungstenite", "dep:futures-util", "dep:reqwest", "dep:rustls"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "process", "io-util", "fs"] }
@@ -21,7 +24,12 @@ serde_json = "1"
 thiserror = "1"
 tracing = "0.1"
 async-trait = "0.1"
-tokio-tungstenite = { version = "0.23", optional = true }
+tokio-tungstenite = { version = "0.23", optional = true, features = ["rustls-tls-webpki-roots"] }
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["json", "rustls"] }
+# Only used to install a process-default CryptoProvider: aish's build enables
+# both `ring` and `aws-lc-rs` on rustls, so tokio-tungstenite's
+# `ClientConfig::builder()` would otherwise panic on the first wss:// dial.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring"] }
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink", "std"] }
 
 [dev-dependencies]
