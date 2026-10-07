@@ -466,11 +466,7 @@ fn run_handoff_shell() -> ShellOutcome {
             -1
         },
         stopped,
-        stop_signal: if stopped {
-            libc::WSTOPSIG(status)
-        } else {
-            0
-        },
+        stop_signal: if stopped { libc::WSTOPSIG(status) } else { 0 },
     }
 }
 

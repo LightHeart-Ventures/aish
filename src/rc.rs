@@ -427,6 +427,9 @@ pub enum Redir {
 /// still rejected, so those lines route to the model exactly as before. Only
 /// fds 0/1/2 are accepted; a higher fd routes the line to the model. The
 /// pipeline executor consumes the returned redirections.
+// `flush_word!` clears `in_word` on every expansion; at the final expansion the
+// write is never read again. Keeping it makes the macro uniform at all sites.
+#[allow(unused_assignments)]
 pub fn tokenize_redir(
     line: &str,
     lookup: impl Fn(&str) -> Option<String>,

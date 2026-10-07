@@ -7486,7 +7486,9 @@ fn handle_compact(backend: &Backend, session: &mut Session) {
             // just re-seated from a full scan. (ISS-409753)
             session.usage_mark = session.history.len();
             let window = backend.context_window();
-            let pct = (session.context_used * 100).checked_div(window).unwrap_or(0);
+            let pct = (session.context_used * 100)
+                .checked_div(window)
+                .unwrap_or(0);
             println!(
                 "compacted — {dropped} message(s) offloaded to memory (recall \"context-offload\"); context now ~{pct}%"
             );

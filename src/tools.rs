@@ -6118,10 +6118,7 @@ mod tests {
             unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
             pid
         );
-        assert!(
-            libc::WIFSTOPPED(status),
-            "child should be stopped"
-        );
+        assert!(libc::WIFSTOPPED(status), "child should be stopped");
 
         // Build the matching Job and resume it.
         let (job, _kill_rx) = Job::background(1, "sleep 30".into());

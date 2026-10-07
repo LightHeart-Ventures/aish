@@ -171,7 +171,9 @@ pub struct McpSkill {
 
 enum Transport {
     Stdio {
-        _child: Child, // held for lifetime; killed on drop
+        // Boxed to keep `Transport`'s two variants a similar size (large_enum_variant);
+        // drop semantics are unchanged — the child is still killed when the variant drops.
+        _child: Box<Child>, // held for lifetime; killed on drop
         stdin: ChildStdin,
         lines: Lines<BufReader<ChildStdout>>,
     },
@@ -1026,7 +1028,7 @@ impl McpServer {
         let stdin = child.stdin.take().expect("piped");
         let lines = BufReader::new(child.stdout.take().expect("piped")).lines();
         Ok(Transport::Stdio {
-            _child: child,
+            _child: Box::new(child),
             stdin,
             lines,
         })

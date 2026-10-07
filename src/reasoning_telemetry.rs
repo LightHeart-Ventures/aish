@@ -798,7 +798,7 @@ fn full_recompute() -> Option<Memo> {
         if let Ok(f) = std::fs::File::open(archive_path(&path, n)) {
             for line in BufReader::new(flate2::read::GzDecoder::new(f))
                 .lines()
-                .flatten()
+                .map_while(Result::ok)
             {
                 fold_line(&mut memo, &line);
             }
