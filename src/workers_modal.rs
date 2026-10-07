@@ -396,6 +396,15 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
         .max()
         .unwrap_or(7);
 
+    // Width of the Task cell. DERIVED from this terminal rather than the former
+    // hardcoded 60: `activity_summary::current_budget()` subtracts this row's
+    // real chrome (`WORKERS_ROW_CHROME`, kept in sync with the format string
+    // below) from the live width and clamps it, which is the SAME budget the
+    // summarizer was told to write to — so a summary that fit when it was
+    // generated also fits when it is painted, and a narrow terminal shrinks the
+    // cell instead of wrapping the row.
+    let task_w = crate::activity_summary::current_budget();
+
     let mut lines: Vec<String> = Vec::new();
     // Title.
     lines.push(if color {
@@ -433,10 +442,10 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
         // tree; roots (depth 0) are flush. A `└ ` elbow marks each child.
         let task = if r.depth > 0 {
             let indent = "  ".repeat(r.depth);
-            let budget = 60usize.saturating_sub(indent.chars().count() + 2);
+            let budget = task_w.saturating_sub(indent.chars().count() + 2);
             format!("{indent}└ {}", clip(&r.task, budget))
         } else {
-            clip(&r.task, 60)
+            clip(&r.task, task_w)
         };
         // Type glyph rides at the front (unpadded — every glyph is 2 cells, so
         // the data columns stay aligned with the blank 2-wide header cell).

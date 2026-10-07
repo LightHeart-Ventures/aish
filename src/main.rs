@@ -1,3 +1,4 @@
+mod activity_summary;
 mod advisor;
 mod alert;
 mod autosuggest;
