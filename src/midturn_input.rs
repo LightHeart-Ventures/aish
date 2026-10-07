@@ -471,17 +471,42 @@ pub fn runs_immediately(line: &str) -> Option<&'static str> {
     // Keep this list NARROW and explicit — an accidental entry that needs
     // `&mut Session` would deadlock or (worse) race the live turn.
     //
-    // Deliberately NOT here yet, despite qualifying on property (1):
-    //   · `:tell` / `:stop` — `tell_coordinator`/`stop_coordinator` still take
-    //     `&mut Session` (`:tell goal …` routes into `steer_active_goal`, which
-    //     genuinely needs it). They are the obvious next additions once those
-    //     two are split along the same `OpsCtx` seam `:dispatch` just gained.
+    // Deliberately NOT here, despite qualifying on property (1):
     //   · `:workers` / `:jobs` / `:status` — these PRINT (and `:workers` opens a
     //     keyboard modal that would steal stdin from the very reader thread
     //     classifying this line). Racing the live turn's output and footer for
     //     a listing nobody is blocked on isn't worth it.
-    const IMMEDIATE: &[&str] = &["dispatch"];
-    IMMEDIATE.iter().copied().find(|c| *c == word)
+    const IMMEDIATE: &[&str] = &[
+        "dispatch",
+        // `:tell` + aliases. Steering is the case that needs immediacy MOST: a
+        // correction folded in after the turn lands is one the coordinator has
+        // already blown past, which is exactly the bug this module exists for.
+        "tell",
+        "msg",
+        "send",
+        // `:stop` + aliases. Standing down a runaway coordinator you wait for is
+        // a coordinator you keep paying for — the opposite of standing it down.
+        "stop",
+        "standdown",
+        "stand-down",
+    ];
+    let word = IMMEDIATE.iter().copied().find(|c| *c == word)?;
+    // One carve-out: `:tell goal <msg>` is not a coordinator message at all — it
+    // routes into `steer_active_goal`, which DOES need `&mut Session` (goal state
+    // is not in `OpsCtx`). That single form stays queued; the live turn owns the
+    // session. Exact-match the target so `:tell goalkeeper …` still runs now.
+    if matches!(word, "tell" | "msg" | "send") {
+        let mut args = rest.split_whitespace().skip(1);
+        let mut target = args.next();
+        // A leading `--any`/`-a` is the cross-session override, not the target.
+        if matches!(target, Some("--any") | Some("-a")) {
+            target = args.next();
+        }
+        if target == Some(crate::worker::GOAL_STREAM_LABEL) {
+            return None;
+        }
+    }
+    Some(word)
 }
 
 #[cfg(test)]
@@ -509,10 +534,13 @@ mod tests {
         assert_eq!(runs_immediately(":clear"), None);
         assert_eq!(runs_immediately(":restart"), None);
         assert_eq!(runs_immediately(":quit"), None);
-        // Not yet converted off `&mut Session` — must still queue.
-        assert_eq!(runs_immediately(":tell w_abc narrow it"), None);
-        assert_eq!(runs_immediately(":stop w_abc"), None);
+        // Prints / opens a modal — see the exclusion note in `runs_immediately`.
         assert_eq!(runs_immediately(":workers"), None);
+        // `:tell goal …` routes into `steer_active_goal`, which needs the
+        // session — the one steering form that must still queue.
+        assert_eq!(runs_immediately(":tell goal narrow the scope"), None);
+        assert_eq!(runs_immediately(":tell --any goal narrow it"), None);
+        assert_eq!(runs_immediately(":msg -a goal narrow it"), None);
         // Prefix collisions must not match.
         assert_eq!(runs_immediately(":dispatchfoo"), None);
         assert_eq!(runs_immediately(":dispatch-stats"), None);
