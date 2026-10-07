@@ -436,19 +436,7 @@ pub fn fmt_heartbeat_age(heartbeat_at: Option<&str>, terminal: bool, now: i64) -
         return "—".to_string();
     };
     let age = (now - beat).max(0);
-    // Single-unit compact age: 12s · 4m · 2h · 3d.
-    const MIN: i64 = 60;
-    const HOUR: i64 = 60 * MIN;
-    const DAY: i64 = 24 * HOUR;
-    let label = if age < MIN {
-        format!("{age}s")
-    } else if age < HOUR {
-        format!("{}m", age / MIN)
-    } else if age < DAY {
-        format!("{}h", age / HOUR)
-    } else {
-        format!("{}d", age / DAY)
-    };
+    let label = compact_age(age);
     if terminal {
         // Finished: no liveness claim, just "last beat was N ago".
         format!("· {label}")
@@ -457,6 +445,83 @@ pub fn fmt_heartbeat_age(heartbeat_at: Option<&str>, terminal: bool, now: i64) -
     } else {
         format!("♥ {label}")
     }
+}
+
+/// Single-unit compact age: `12s` · `4m` · `2h` · `3d`. The shared vocabulary
+/// behind every heartbeat cell so the `:workers` table, `background_status`, and
+/// the pinned escalation banner all spell "how long ago" the same way.
+pub fn compact_age(age_secs: i64) -> String {
+    const MIN: i64 = 60;
+    const HOUR: i64 = 60 * MIN;
+    const DAY: i64 = 24 * HOUR;
+    let age = age_secs.max(0);
+    if age < MIN {
+        format!("{age}s")
+    } else if age < HOUR {
+        format!("{}m", age / MIN)
+    } else if age < DAY {
+        format!("{}h", age / HOUR)
+    } else {
+        format!("{}d", age / DAY)
+    }
+}
+
+/// The coordinator's durable heartbeat cadence — a display-side mirror of
+/// `coordinator::HEARTBEAT_INTERVAL` (30s), kept here so these pure formatters
+/// carry no coordinator dependency. A coordinator-side test
+/// (`heartbeat_interval_matches_display_const`) asserts the two stay equal.
+pub const HEARTBEAT_INTERVAL_SECS: i64 = 30;
+
+/// Jitter grace before a LATE beat counts as a MISSED beat — half an interval.
+/// A beat that lands a couple of seconds behind schedule (scheduler jitter, a
+/// long-running tool call holding the loop) must not flip a healthy worker's
+/// heart to yellow; a genuinely skipped 30s window must.
+pub const HEARTBEAT_GRACE_SECS: i64 = HEARTBEAT_INTERVAL_SECS / 2;
+
+/// How many heartbeats a coordinator has MISSED, given the age of its last
+/// beat. `0` while the beat is fresh (age under one interval + [`HEARTBEAT_GRACE_SECS`]),
+/// then one per fully-elapsed interval after that: 45s → 1, 75s → 2, 105s → 3.
+/// Pure integer math — the single definition of "missed a beat" shared by every
+/// liveness indicator.
+pub fn missed_heartbeats(age_secs: i64) -> u32 {
+    let overdue = age_secs - HEARTBEAT_GRACE_SECS;
+    if overdue < HEARTBEAT_INTERVAL_SECS {
+        return 0;
+    }
+    (overdue / HEARTBEAT_INTERVAL_SECS).clamp(0, u32::MAX as i64) as u32
+}
+
+/// Traffic-light classification for a worker's pulse: the glyph plus the colour
+/// that answers "is anyone home?" at a glance.
+///   * `None` age          → dim `♡` — no beat on record yet (just launched, or
+///                            a pre-heartbeat row). Hollow heart = no claim.
+///   * 0 missed            → GREEN `♥` — beat is current.
+///   * 1 missed            → YELLOW `♥` — one window skipped; usually a long
+///                            tool call, worth watching but not yet alarming.
+///   * 2+ missed           → RED `♥` — two or more windows skipped; the worker
+///                            is wedged, rate-limited, or dead.
+/// Pure, so the tiers are unit-testable without a clock or a TTY.
+pub fn heartbeat_tier(beat_age_secs: Option<i64>) -> (&'static str, Color) {
+    match beat_age_secs.map(missed_heartbeats) {
+        None => ("♡", Color::Dim),
+        Some(0) => ("♥", Color::Green),
+        Some(1) => ("♥", Color::Yellow),
+        Some(_) => ("♥", Color::Red),
+    }
+}
+
+/// The painted liveness HEART for a live worker, ready to drop into a status
+/// row. A HEALTHY heart renders as the bare glyph — a quiet green `♥` is the
+/// whole signal, and stamping an age onto every frame is noise that trains the
+/// eye to ignore the cell. Once a beat is MISSED the age is appended (`♥ 45s`)
+/// because then the operator needs the evidence, not just the alarm.
+pub fn heartbeat_heart(beat_age_secs: Option<i64>, color_on: bool) -> String {
+    let (glyph, color) = heartbeat_tier(beat_age_secs);
+    let text = match beat_age_secs {
+        Some(age) if missed_heartbeats(age) > 0 => format!("{glyph} {}", compact_age(age)),
+        _ => glyph.to_string(),
+    };
+    paint_with(&text, color, color_on)
 }
 
 // ---------------------------------------------------------------------------
@@ -706,6 +771,72 @@ mod tests {
         assert_eq!(fmt_heartbeat_age(None, false, base), "—");
         assert_eq!(fmt_heartbeat_age(Some("not-a-date"), false, base), "—");
         assert_eq!(fmt_heartbeat_age(Some(beat), false, base - 100), "♥ 0s");
+    }
+
+    #[test]
+    fn missed_heartbeats_counts_whole_skipped_windows() {
+        // Fresh: anything inside one interval + the jitter grace is ZERO missed
+        // beats. A beat that lands a second or two late must NOT be reported as
+        // a miss — that false positive is what makes a liveness lamp useless.
+        assert_eq!(missed_heartbeats(0), 0);
+        assert_eq!(missed_heartbeats(29), 0);
+        assert_eq!(missed_heartbeats(30), 0);
+        assert_eq!(missed_heartbeats(44), 0);
+        // One full window skipped past the grace.
+        assert_eq!(missed_heartbeats(45), 1);
+        assert_eq!(missed_heartbeats(74), 1);
+        // Two or more.
+        assert_eq!(missed_heartbeats(75), 2);
+        assert_eq!(missed_heartbeats(104), 2);
+        assert_eq!(missed_heartbeats(105), 3);
+        assert_eq!(missed_heartbeats(15 * 60), 29);
+        // Clock skew (a beat stamped in the future) degrades to "fresh", never
+        // to a negative/overflowing count.
+        assert_eq!(missed_heartbeats(-500), 0);
+    }
+
+    #[test]
+    fn heartbeat_tier_is_a_traffic_light() {
+        // No beat on record: hollow heart, no colour claim.
+        assert_eq!(heartbeat_tier(None), ("♡", Color::Dim));
+        // Beating.
+        assert_eq!(heartbeat_tier(Some(0)), ("♥", Color::Green));
+        assert_eq!(heartbeat_tier(Some(44)), ("♥", Color::Green));
+        // One missed beat → yellow (watch it).
+        assert_eq!(heartbeat_tier(Some(45)), ("♥", Color::Yellow));
+        assert_eq!(heartbeat_tier(Some(74)), ("♥", Color::Yellow));
+        // Two or more → red (wedged/dead).
+        assert_eq!(heartbeat_tier(Some(75)), ("♥", Color::Red));
+        assert_eq!(heartbeat_tier(Some(9_999)), ("♥", Color::Red));
+    }
+
+    #[test]
+    fn heartbeat_heart_shows_age_only_once_a_beat_is_missed() {
+        // Healthy: the bare glyph. An age on every repaint is noise.
+        assert_eq!(heartbeat_heart(Some(10), false), "♥");
+        assert_eq!(heartbeat_heart(None, false), "♡");
+        // Missed: the age IS the evidence, so it joins the glyph.
+        assert_eq!(heartbeat_heart(Some(45), false), "♥ 45s");
+        assert_eq!(heartbeat_heart(Some(600), false), "♥ 10m");
+        // Colour is carried by the SGR prefix, not by a different glyph, so a
+        // monochrome terminal still gets the age text.
+        let painted = heartbeat_heart(Some(10), true);
+        assert!(painted.starts_with(Color::Green.code()), "{painted:?}");
+        let painted = heartbeat_heart(Some(45), true);
+        assert!(painted.starts_with(Color::Yellow.code()), "{painted:?}");
+        let painted = heartbeat_heart(Some(300), true);
+        assert!(painted.starts_with(Color::Red.code()), "{painted:?}");
+    }
+
+    #[test]
+    fn compact_age_single_unit() {
+        assert_eq!(compact_age(0), "0s");
+        assert_eq!(compact_age(59), "59s");
+        assert_eq!(compact_age(60), "1m");
+        assert_eq!(compact_age(3599), "59m");
+        assert_eq!(compact_age(3600), "1h");
+        assert_eq!(compact_age(86_400), "1d");
+        assert_eq!(compact_age(-5), "0s");
     }
 
     #[test]
