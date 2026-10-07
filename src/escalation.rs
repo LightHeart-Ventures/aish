@@ -16,9 +16,9 @@
 //!
 //! ```text
 //!   🚀 escalated → w_a7k3m2 · build and open pr  <- escalation message (animated)
-//!      ↳ coordinating · 1m12s · 🔧 read_file …   <- latest worker status
+//!      ↳ ♥ 1m12s · 🔧 read_file …                <- heart + latest worker status
 //!   🛸 escalated → w_b2c9f1 · audit the deps     <- a SECOND live escalation
-//!      ↳ coordinating · 18s · 🔧 grep_files      <- …with its own status row
+//!      ↳ ♥ 18s · 🔧 grep_files                   <- …with its own heart + status
 //!   ─────────────────────────────────────────   <- separator (the statusline lid)
 //!   ⇄ detached — back to interactive …           <- SecondStatusLine
 //!   aish v0.9 · sonnet …           12:04:51      <- statusline
@@ -56,6 +56,21 @@
 //! a 2-column emoji so the text after it never jitters (pinned by
 //! `frames_are_uniform_width`). Once a worker reaches a terminal state its glyph
 //! freezes to ✅/⚠️ — motion means "still working".
+//!
+//! LIVENESS. The animation only proves the SHELL is still repainting — it keeps
+//! cycling just as happily when the coordinator behind it is wedged, rate-limited
+//! or dead, which makes a moving glyph the most confident lie the footer can
+//! tell. So each status row also carries a traffic-light HEART fed by that
+//! coordinator's own DURABLE heartbeat (`coordinator_runs.heartbeat_at`, written
+//! every 30s): green `♥` while the beat is current, yellow after ONE missed beat,
+//! red after two or more, and a dim hollow `♡` when no beat is on record yet
+//! ([`crate::style::heartbeat_heart`]). Two independent signals in one block:
+//! motion = the UI is live, heart = the WORKER is live. The REPL polls the store
+//! on a throttle and hands each banner its absolute timestamp via [`set_beat`];
+//! the age (and therefore the colour) is derived on every paint, so a worker
+//! that stops beating goes yellow then red on its own without further polling.
+//! Like every other mutator, the beat is ID-SCOPED: each banner shows its OWN
+//! worker's liveness.
 //!
 //! LIFECYCLE. [`pin`] on escalation, [`set_status`] on every footer paint (the
 //! REPL owns the worker list, so it composes each status row), [`note_terminal`]
@@ -124,6 +139,23 @@ struct Banner {
     failed: bool,
     /// Latest composed worker-status text for the second row.
     status: String,
+    /// Epoch seconds of this coordinator's last DURABLE heartbeat (the
+    /// `coordinator_runs.heartbeat_at` column), or `None` when no beat is on
+    /// record yet. Stored as an ABSOLUTE timestamp rather than a pre-computed
+    /// age so the rendered heart keeps aging between the REPL's throttled
+    /// polls — the footer repaints ~4.5x/sec but the beat only moves every 30s,
+    /// so re-reading SQLite on every frame would be ~136x waste.
+    beat: Option<i64>,
+}
+
+/// Wall clock in epoch seconds — the reference each banner ages `beat` against.
+/// Matches `coordinator::now_unix_secs`; kept local so this module stays free of
+/// coordinator imports.
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Every live escalation, OLDEST FIRST (push order). Rendering reverses this so
@@ -148,9 +180,13 @@ pub fn pin(id: &str, task: &str) {
         terminal_at: None,
         failed: false,
         status: "queued — waiting for the coordinator to start".into(),
+        beat: None,
     };
     if let Some(slot) = banners.iter_mut().find(|b| b.id == id) {
-        *slot = fresh;
+        // Same coordinator: its durable heartbeat is still valid evidence, so
+        // keep it rather than flashing the hollow "no claim" heart on a retry.
+        let beat = slot.beat;
+        *slot = Banner { beat, ..fresh };
         return;
     }
     banners.push(fresh);
@@ -221,6 +257,19 @@ pub fn set_status(id: &str, status: &str) {
     if let Ok(mut banners) = BANNERS.lock() {
         if let Some(b) = banners.iter_mut().find(|b| b.id == id) {
             b.status = status.to_string();
+        }
+    }
+}
+
+/// Record coordinator `id`'s last durable heartbeat (epoch seconds from
+/// `coordinator_runs.heartbeat_at`), which drives the liveness heart on THAT
+/// banner's status row. `None` clears it back to "no beat on record". No-op when
+/// the id isn't pinned. The REPL polls this on a throttle (see
+/// `repl::refresh_escalation_beats`) because the beat only moves every 30s.
+pub fn set_beat(id: &str, beat: Option<i64>) {
+    if let Ok(mut banners) = BANNERS.lock() {
+        if let Some(b) = banners.iter_mut().find(|b| b.id == id) {
+            b.beat = beat;
         }
     }
 }
@@ -320,12 +369,21 @@ pub fn one_line(text: &str, max: usize) -> String {
 /// Returns `(escalation_row, status_row)`. The escalation row leads with the
 /// animated glyph; the status row is indented under it with a `↳` so the two
 /// read as one block.
+///
+/// `beat_age_secs` is the age of the coordinator's last DURABLE heartbeat, which
+/// renders as the traffic-light heart (green beating / yellow one missed / red
+/// two or more — [`crate::style::heartbeat_heart`]) in a fixed position right
+/// after the `↳`. The animated glyph only proves the SHELL is repainting; the
+/// heart is the independent evidence that the WORKER is alive. A terminal banner
+/// renders no heart — the ✅/⚠️ verdict already settles liveness, and a second
+/// indicator there would just echo it.
 pub fn render(
     elapsed_ms: u64,
     id: &str,
     task: &str,
     status: &str,
     terminal: Option<bool>,
+    beat_age_secs: Option<i64>,
     color_on: bool,
 ) -> (String, String) {
     use crate::style::{Color, paint_with};
@@ -342,12 +400,29 @@ pub fn render(
         format!("{glyph} escalated → {short} · {hint}")
     };
     let top = paint_with(&head, Color::Cyan, color_on);
-    let body = format!(
-        "   ↳ {} · {}",
-        fmt_elapsed(elapsed_ms),
-        one_line(status, STATUS_MAX)
+    // The heart is painted on its own (green/yellow/red) and spliced between two
+    // dim segments, so the liveness colour survives while the rest of the row
+    // stays recessive.
+    let heart = match terminal {
+        None => format!(
+            "{} ",
+            crate::style::heartbeat_heart(beat_age_secs, color_on)
+        ),
+        Some(_) => String::new(),
+    };
+    let bottom = format!(
+        "{}{heart}{}",
+        paint_with("   ↳ ", Color::Dim, color_on),
+        paint_with(
+            &format!(
+                "{} · {}",
+                fmt_elapsed(elapsed_ms),
+                one_line(status, STATUS_MAX)
+            ),
+            Color::Dim,
+            color_on
+        )
     );
-    let bottom = paint_with(&body, Color::Dim, color_on);
     (top, bottom)
 }
 
@@ -379,6 +454,9 @@ pub fn rows(color_on: bool, max_banners: usize) -> Vec<(String, String)> {
         .enumerate()
         .map(|(i, b)| {
             let terminal = b.terminal_at.map(|_| b.failed);
+            // Age the absolute beat here, on the paint path, so each heart keeps
+            // ticking (and can go yellow → red) between the REPL's throttled polls.
+            let beat_age = b.beat.map(|t| (now_unix_secs() - t).max(0));
             // The overflow tail rides the LAST painted status row (the oldest
             // visible banner) rather than claiming a row of its own, so the
             // block height stays an exact multiple of ROWS_PER_BANNER.
@@ -393,6 +471,7 @@ pub fn rows(color_on: bool, max_banners: usize) -> Vec<(String, String)> {
                 &b.task,
                 &status,
                 terminal,
+                beat_age,
                 color_on,
             )
         })
@@ -434,9 +513,25 @@ mod tests {
 
     #[test]
     fn live_banner_animates_and_terminal_banner_freezes() {
-        let (top, _) = render(0, "w_abcdef123456", "build it", "coordinating", None, false);
+        let (top, _) = render(
+            0,
+            "w_abcdef123456",
+            "build it",
+            "coordinating",
+            None,
+            Some(0),
+            false,
+        );
         assert!(top.starts_with(FRAMES[0]), "{top}");
-        let (top, _) = render(FRAME_MS, "w_abcdef123456", "build it", "x", None, false);
+        let (top, _) = render(
+            FRAME_MS,
+            "w_abcdef123456",
+            "build it",
+            "x",
+            None,
+            Some(0),
+            false,
+        );
         assert!(top.starts_with(FRAMES[1]), "{top}");
         // Terminal verdicts freeze the glyph: motion means "still working".
         let (ok, _) = render(
@@ -445,6 +540,7 @@ mod tests {
             "b",
             "done",
             Some(false),
+            Some(0),
             false,
         );
         assert!(ok.starts_with("✅"), "{ok}");
@@ -454,6 +550,7 @@ mod tests {
             "b",
             "failed",
             Some(true),
+            Some(0),
             false,
         );
         assert!(bad.starts_with("⚠️"), "{bad}");
@@ -467,6 +564,7 @@ mod tests {
             "build   and\nopen pr",
             "coordinating · 1m12s",
             None,
+            Some(0),
             false,
         );
         // Short id (not the full run id) keeps the row readable.
@@ -485,7 +583,7 @@ mod tests {
     fn long_task_and_status_are_truncated() {
         let task = "x".repeat(400);
         let status = "y".repeat(400);
-        let (top, bottom) = render(0, "w_a", &task, &status, None, false);
+        let (top, bottom) = render(0, "w_a", &task, &status, None, Some(0), false);
         assert!(top.contains('…'), "{top}");
         assert!(top.chars().count() < 120, "escalation row too wide: {top}");
         assert!(bottom.contains('…'), "{bottom}");
@@ -630,9 +728,9 @@ mod tests {
     fn status_row_carries_a_ticking_runtime() {
         // The runtime is derived from the elapsed clock on every paint, so it
         // advances even when the worker pushes no new activity.
-        let (_, a) = render(0, "w_1", "t", "coordinating", None, false);
-        let (_, b) = render(72_000, "w_1", "t", "coordinating", None, false);
-        let (_, c) = render(3_900_000, "w_1", "t", "coordinating", None, false);
+        let (_, a) = render(0, "w_1", "t", "coordinating", None, Some(0), false);
+        let (_, b) = render(72_000, "w_1", "t", "coordinating", None, Some(0), false);
+        let (_, c) = render(3_900_000, "w_1", "t", "coordinating", None, Some(0), false);
         assert!(a.contains("0s · coordinating"), "{a}");
         assert!(b.contains("1m12s · coordinating"), "{b}");
         assert!(c.contains("1h05m · coordinating"), "{c}");
@@ -648,6 +746,7 @@ mod tests {
             "t",
             "running · \u{1b}[36m🔧 read_file\u{1b}[0m src/repl.rs",
             None,
+            Some(0),
             false,
         );
         assert!(!bottom.contains('\u{1b}'), "{bottom:?}");
@@ -680,10 +779,120 @@ mod tests {
         clear();
         set_status("w_ghost", "nothing to attach to");
         note_terminal("w_ghost", true);
+        set_beat("w_ghost", Some(123));
         sweep();
         assert!(!active());
         assert_eq!(count(), 0);
         assert_eq!(row_count(), 0);
         assert!(pinned_ids().is_empty());
+    }
+
+    #[test]
+    fn status_row_carries_the_liveness_heart() {
+        // The heart sits in a FIXED position right after the `↳` so the eye can
+        // park on one cell. Healthy = bare glyph; a missed beat appends the age.
+        let (_, fresh) = render(0, "w_1", "t", "coordinating", None, Some(3), false);
+        assert!(fresh.starts_with("   ↳ ♥ "), "{fresh}");
+        assert!(
+            !fresh.contains("♥ 3s"),
+            "healthy heart must stay quiet: {fresh}"
+        );
+
+        let (_, late) = render(0, "w_1", "t", "coordinating", None, Some(50), false);
+        assert!(
+            late.contains("♥ 50s"),
+            "one missed beat shows its age: {late}"
+        );
+
+        let (_, dead) = render(0, "w_1", "t", "coordinating", None, Some(600), false);
+        assert!(dead.contains("♥ 10m"), "{dead}");
+
+        // No beat on record yet → hollow heart, no liveness claim.
+        let (_, unknown) = render(0, "w_1", "t", "coordinating", None, None, false);
+        assert!(unknown.starts_with("   ↳ ♡ "), "{unknown}");
+
+        // The runtime and status still follow the heart, in that order.
+        assert!(fresh.contains("0s · coordinating"), "{fresh}");
+    }
+
+    #[test]
+    fn heart_is_colored_independently_of_the_dim_row() {
+        use crate::style::Color;
+        // The row is dim, but the heart carries its own colour — otherwise the
+        // traffic light is invisible. Each tier's SGR code must appear.
+        let (_, green) = render(0, "w_1", "t", "s", None, Some(1), true);
+        assert!(green.contains(Color::Green.code()), "{green:?}");
+        let (_, yellow) = render(0, "w_1", "t", "s", None, Some(50), true);
+        assert!(yellow.contains(Color::Yellow.code()), "{yellow:?}");
+        let (_, red) = render(0, "w_1", "t", "s", None, Some(300), true);
+        assert!(red.contains(Color::Red.code()), "{red:?}");
+    }
+
+    #[test]
+    fn terminal_banner_drops_the_heart() {
+        // ✅/⚠️ already settles liveness; a heart next to a finished verdict
+        // would be a second indicator echoing the first.
+        let (_, done) = render(0, "w_1", "t", "done", Some(false), Some(900), false);
+        assert!(!done.contains('♥'), "{done}");
+        assert!(!done.contains('♡'), "{done}");
+        assert!(done.starts_with("   ↳ 0s · done"), "{done}");
+    }
+
+    #[test]
+    fn set_beat_drives_that_banners_heart() {
+        let _g = lock();
+        clear();
+        pin("w_beat", "t");
+        let status_row = || rows(false, MAX_VISIBLE)[0].1.clone();
+        // A freshly pinned banner has no beat on record yet.
+        let b = status_row();
+        assert!(b.contains('♡'), "{b}");
+
+        // A current beat goes green-and-quiet…
+        set_beat("w_beat", Some(now_unix_secs()));
+        let b = status_row();
+        assert!(b.contains('♥'), "{b}");
+
+        // …and an old beat ages into an annotated heart on the NEXT paint, with
+        // no further polling — the banner stores the absolute timestamp.
+        set_beat("w_beat", Some(now_unix_secs() - 120));
+        let b = status_row();
+        assert!(b.contains("♥ 2m"), "{b}");
+
+        // Clearing the beat returns to "no claim".
+        set_beat("w_beat", None);
+        let b = status_row();
+        assert!(b.contains('♡'), "{b}");
+
+        // A beat for an unpinned id is a no-op, not a panic or a stray row.
+        set_beat("w_nobody", Some(now_unix_secs()));
+        assert_eq!(count(), 1);
+        clear();
+    }
+
+    #[test]
+    fn each_banner_shows_its_own_workers_heart() {
+        // Two live escalations: a healthy worker and a silent one. Each status
+        // row must carry ITS worker's liveness — the beat is id-scoped like
+        // every other mutator, so one worker's heart can't paint another's row.
+        let _g = lock();
+        clear();
+        pin("w_alive", "a");
+        pin("w_silent", "b");
+        set_beat("w_alive", Some(now_unix_secs()));
+        set_beat("w_silent", Some(now_unix_secs() - 600));
+        let painted = rows(false, MAX_VISIBLE);
+        // Newest first: w_silent was pinned last.
+        assert!(painted[0].1.contains("♥ 10m"), "{:?}", painted[0]);
+        assert!(painted[1].1.contains('♥'), "{:?}", painted[1]);
+        assert!(!painted[1].1.contains("♥ 10m"), "{:?}", painted[1]);
+
+        // Re-pinning a tracked id keeps its known beat instead of flashing ♡.
+        pin("w_alive", "a retry");
+        let painted = rows(false, MAX_VISIBLE);
+        let alive = painted.iter().find(|r| r.0.contains("a retry")).unwrap();
+        assert!(alive.1.contains('♥'), "{alive:?}");
+        assert!(!alive.1.contains('♡'), "{alive:?}");
+        clear();
     }
 }
