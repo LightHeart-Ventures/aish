@@ -23,7 +23,12 @@ struct Cli {
     listen: String,
 
     /// SQLite database path
-    #[arg(short, long, env = "BROKER_DB", default_value = "/var/lib/aish-broker.db")]
+    #[arg(
+        short,
+        long,
+        env = "BROKER_DB",
+        default_value = "/var/lib/aish-broker.db"
+    )]
     db: String,
 
     /// Maximum queue size (messages per tenant_id+plugin_id)
@@ -69,9 +74,10 @@ async fn main() -> Result<()> {
     // Initialize database (synchronous rusqlite/r2d2 setup).
     let db = db::init(&cli.db)?;
 
+    let hub = Arc::new(Hub::new());
     let config = BrokerConfig {
         db: db.clone(),
-        hub: Arc::new(Hub::new()),
+        hub: hub.clone(),
         start_time: Instant::now(),
         max_queue_size: cli.max_queue_size,
         ws_heartbeat_secs: cli.ws_heartbeat_secs,
@@ -82,13 +88,27 @@ async fn main() -> Result<()> {
     // Background TTL sweep: purge expired webhooks hourly.
     {
         let sweep_db = db.clone();
+        let sweep_hub = hub.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 ticker.tick().await;
                 match db::ttl_cleanup(&sweep_db) {
-                    Ok(n) if n > 0 => info!("TTL cleanup removed {} expired webhook(s)", n),
-                    Ok(_) => {}
+                    Ok(expired) => {
+                        let mut removed = 0u64;
+                        for e in &expired {
+                            removed += e.undelivered + e.acked;
+                            // Only never-acked rows count as `expired` (lost).
+                            sweep_hub.stats().record_expired(
+                                &e.tenant_id,
+                                &e.plugin_id,
+                                e.undelivered,
+                            );
+                        }
+                        if removed > 0 {
+                            info!("TTL cleanup removed {} expired webhook(s)", removed);
+                        }
+                    }
                     Err(e) => warn!("TTL cleanup failed: {}", e),
                 }
             }
