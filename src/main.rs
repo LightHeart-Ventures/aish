@@ -46,6 +46,7 @@ mod plugin_dispatcher;
 mod plugin_memory;
 #[cfg(test)]
 mod plugin_phase05_consolidation_tests;
+mod plugin_scaffold;
 mod plugin_state;
 mod plugin_statusline;
 mod plugin_timers;

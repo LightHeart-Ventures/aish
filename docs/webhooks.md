@@ -1,300 +1,139 @@
 # Webhook Architecture
 
-aish supports receiving events from external sources (GitHub, AWS EventBridge, Slack, CI/CD platforms) and routing them to workflows, agents, and integrations. The webhook layer is designed to handle both public cloud and NAT'd/private network environments.
+aish receives events from external sources (GitHub, CI systems, Atum, anything
+that can POST JSON) through a small relay — the **webhook broker** — and routes
+each event to plugin **handlers** running inside your aish session. aish always
+**dials out** to the broker, so it works unchanged behind NAT, on a laptop, or in
+a container: no inbound port, tunnel, or public IP on the aish side.
+
+> Writing a handler? See [WEBHOOK_HANDLERS.md](./WEBHOOK_HANDLERS.md).
+> Writing a plugin? See [PLUGIN_DEVELOPER.md](./PLUGIN_DEVELOPER.md).
+> Running the broker? See the broker crate docs linked under
+> [Deployment](#deployment).
+>
+> The client↔broker protocol described here is the one shipping in SPR-104
+> (TASK-449: register → `session_token` auth → `webhook_id` acks).
 
 ## High-Level Architecture
 
-```mermaid
-graph TB
-    subgraph Sources["External Event Sources"]
-        GH["GitHub<br/>push, PR, release, workflow_run"]
-        EB["AWS EventBridge"]
-        Slack["Slack<br/>slash commands, events"]
-        Generic["Generic Webhooks"]
-        CI["CI/CD Platforms<br/>GitLab, Gitea, Woodpecker"]
-    end
-
-    subgraph Ingress["Public Ingress Layer<br/>(Cloud/CDN)"]
-        ALB["ALB / API Gateway<br/>TLS Termination<br/>Signature Verification<br/>Rate Limiting"]
-    end
-
-    subgraph Server["aish Webhook Server"]
-        WH["Webhook Handler :8080/:443<br/>Route Parsing<br/>Signature Validation<br/>Payload Decompression<br/>Idempotency Tracking"]
-    end
-
-    subgraph NAT["NAT & Private Network Layer<br/>(when direct is unreachable)"]
-        Tunnel["Reverse Tunnel<br/>ngrok / Cloudflare Warp<br/>Persistent Outbound Connection<br/>Auto-Reconnect"]
-    end
-
-    subgraph EventBus["Webhook Event Bus<br/>(In-Process)"]
-        Queue["Event Queue<br/>tokio::sync::broadcast<br/>Backpressure & Retry<br/>Dead-Letter Queue"]
-    end
-
-    subgraph Consumers["Event Consumers"]
-        WF["Workflow Dispatch<br/>Sprint Manager<br/>a02 Config"]
-        Agent["Agent Invocation<br/>a40, a92<br/>Custom Agents"]
-        Callback["Integration Callbacks<br/>Slack, GitHub<br/>Discord, Webhooks"]
-    end
-
-    subgraph Runtime["Orchestration Runtime<br/>(tokio)"]
-        Exec["Task Spawning<br/>Concurrent Execution<br/>Timeout & Cancellation<br/>Error Recovery"]
-    end
-
-    subgraph Store["State Persistence"]
-        DDB["DynamoDB<br/>Events, Runs"]
-        Redis["Redis<br/>Session Cache"]
-        Local["Local Filesystem<br/>Dev"]
-    end
-
-    Sources -->|HTTPS| Ingress
-    Ingress -->|HTTP/JSON| Server
-    Ingress -->|Tunnel Fallback| NAT
-    Server -->|IPC/gRPC| Queue
-    NAT -->|Tunnel| Server
-    Queue --> Consumers
-    Consumers --> Runtime
-    Runtime --> Store
+```text
+ GitHub / CI / any sender
+        │  POST /webhooks/<tenant_id>/<plugin_id>     (optional X-Signature HMAC)
+        ▼
+ ┌──────────────────────────────┐
+ │ aish-webhook-broker          │  axum + SQLite (crates/aish-webhook-broker)
+ │  • verifies HMAC per route   │  durable queue per (tenant, plugin), TTL 7 d
+ │  • queues, delivers, acks    │  GET /health, GET /stats, OTLP metrics
+ └──────────────┬───────────────┘
+                │  WebSocket (or HTTP long-poll) — opened BY aish
+                ▼
+ ┌──────────────────────────────┐
+ │ aish session                 │  src/webhook.rs + crates/aish-webhook-client
+ │  • registers, authenticates  │
+ │  • matches plugin webhooks[] │  ~/.aish/plugins/*/plugin.json
+ │  • fork/execs handlers       │  payload JSON on stdin, WEBHOOK_* env
+ │  • logs deliveries (JSONL)   │  ~/.aish/state/webhooks/<plugin>.jsonl
+ └──────────────┬───────────────┘
+                ▼
+     first stdout line → SecondStatusLine flash
 ```
 
-## NAT Traversal Scenarios
-
-### Scenario 1: Public Cloud (Static IP)
-
-```mermaid
-graph LR
-    GitHub["GitHub"]
-    ALB["ALB<br/>203.0.113.42"]
-    Aish["aish:8080"]
-    Events["Event Bus"]
-
-    GitHub -->|HTTPS| ALB
-    ALB -->|HTTP| Aish
-    Aish -->|In-Process| Events
-
-    style GitHub fill:#f9f,stroke:#333
-    style ALB fill:#0f0,stroke:#333
-    style Aish fill:#0ff,stroke:#333
-    style Events fill:#ff0,stroke:#333
-```
-
-**Benefits:**
-- ✅ Direct inbound allowed
-- ✅ No tunnel overhead
-- ✅ Lowest latency
-
-### Scenario 2: NAT'd Office/Home Network
-
-```mermaid
-graph LR
-    subgraph Internet["Internet"]
-        GitHub["GitHub"]
-    end
-    
-    subgraph NAT_GW["NAT Gateway / Firewall"]
-        Relay["ngrok/Warp Relay"]
-    end
-    
-    subgraph Private["Private Network<br/>192.168.1.0/24"]
-        Aish["aish:8080"]
-        Handler["Webhook Handler"]
-        Events["Event Bus"]
-    end
-
-    GitHub -->|webhook.example.com| Relay
-    Relay -->|Tunnel| Aish
-    Aish --> Handler
-    Handler --> Events
-
-    style GitHub fill:#f9f,stroke:#333
-    style Relay fill:#0f0,stroke:#333
-    style Aish fill:#0ff,stroke:#333
-    style Handler fill:#ff0,stroke:#333
-    style Events fill:#ffa,stroke:#333
-```
-
-**Key Points:**
-- Persistent outbound tunnel (no inbound firewall rules needed)
-- Public relay maps external requests to private instance
-- Auto-reconnect on network change
-- Keepalive + heartbeats prevent idle timeouts
-
-### Scenario 3: Kubernetes with Ingress
-
-```mermaid
-graph TB
-    GitHub["GitHub/External"]
-    Ingress["Ingress Controller<br/>TLS Termination"]
-    Service["aish-webhook Service<br/>ClusterIP:8080"]
-    Pod["Pod<br/>aish"]
-    Store["DynamoDB<br/>Redis<br/>Git"]
-
-    GitHub -->|HTTPS| Ingress
-    Ingress -->|HTTP| Service
-    Service -->|ClusterIP| Pod
-    Pod --> Store
-
-    style GitHub fill:#f9f,stroke:#333
-    style Ingress fill:#0f0,stroke:#333
-    style Service fill:#0ff,stroke:#333
-    style Pod fill:#ff0,stroke:#333
-    style Store fill:#ffa,stroke:#333
-```
-
-### Scenario 4: Docker Desktop with ngrok
-
-```mermaid
-graph TB
-    GitHub["GitHub"]
-    Ngrok["ngrok.com Relay<br/>abc123.ngrok.io"]
-    Docker["Docker Desktop"]
-    Container["aish Container<br/>localhost:8080"]
-    Handler["Webhook Handler"]
-
-    GitHub -->|HTTPS| Ngrok
-    Ngrok -->|Tunnel| Docker
-    Docker --> Container
-    Container --> Handler
-
-    style GitHub fill:#f9f,stroke:#333
-    style Ngrok fill:#0f0,stroke:#333
-    style Docker fill:#0ff,stroke:#333
-    style Container fill:#ff0,stroke:#333
-    style Handler fill:#ffa,stroke:#333
-```
+Delivery is **at-least-once**: the broker keeps each message in SQLite until the
+client acks it (or it ages out after `BROKER_MSG_TTL_SECS`, default 7 days), and
+replays the backlog when a client reconnects. Handlers should be idempotent;
+the envelope `id` is stable across redeliveries.
 
 ## Event Flow
 
-```mermaid
-sequenceDiagram
-    participant GH as GitHub
-    participant ALB as ALB/Relay
-    participant WH as Webhook Handler
-    participant BUS as Event Bus
-    participant WF as Workflow Dispatcher
-    participant AGENT as Agent Invoker
-    participant STATE as DynamoDB
+1. A sender POSTs JSON to `https://<broker>/webhooks/<tenant_id>/<plugin_id>`.
+   The broker answers `404` if no client has registered that route, `401` if the
+   route has a secret and the signature is missing/wrong, else
+   `202 {"id": "...", "status": "queued"}`.
+2. The event type is taken from the first header present — `X-Event-Type`,
+   `X-GitHub-Event`, `X-GitLab-Event` — falling back to `payload.action`, then
+   `payload.event`, then `"unknown"`. Set `X-Event-Type` explicitly for
+   non-GitHub senders.
+3. The broker pushes `{"type":"webhook","id","tenant_id","plugin_id","event_type","payload","received_at"}`
+   to the connected client (or holds it for the next poll/reconnect).
+4. aish dispatches the event to every handler whose `event_type` and `filters`
+   match, records the outcome in the delivery log, and acks with
+   `{"type":"ack","webhook_id":"..."}`.
 
-    GH->>ALB: POST /webhooks/github<br/>(HMAC-SHA256 signature)
-    ALB->>WH: Route to handler
-    WH->>WH: Verify signature
-    WH->>WH: Check idempotency<br/>(webhook-id)
-    WH->>STATE: Record event
-    WH->>BUS: Emit event<br/>(type, payload)
-    
-    rect rgba(0, 255, 0, 0.1)
-        Note over BUS: Parallel subscribers
-        BUS->>WF: Match workflow filters
-        BUS->>AGENT: Match agent triggers
-    end
-    
-    par
-        WF->>WF: Spawn workflow task
-        AGENT->>AGENT: Invoke agent with task
-    end
-    
-    WF->>STATE: Update run status
-    AGENT->>STATE: Update run status
-    WH-->>GH: 202 Accepted
-```
+Handler contract, matching rules, and troubleshooting:
+[WEBHOOK_HANDLERS.md](./WEBHOOK_HANDLERS.md).
 
-## Security & Reliability Features
+## Security
 
-### Inbound (Events → aish)
-
-| Feature | Implementation |
-|---------|-----------------|
-| **Protocol** | HTTPS (TLS 1.3) with certificate pinning (optional) |
-| **Signature Verification** | HMAC-SHA256 (GitHub, AWS) or custom JWT |
-| **Idempotent Delivery** | Dedup on `X-Webhook-ID` / `MessageId` header |
-| **Payload Compression** | gzip support with auto-decompression |
-| **Rate Limiting** | Token bucket (per source IP / per webhook) |
-| **Timeout Protection** | 30s request timeout, 5s socket timeout |
-
-### Event Processing
-
-| Feature | Implementation |
-|---------|-----------------|
-| **Event Queue** | tokio::sync::broadcast (bounded, N subscribers) |
-| **Backpressure** | Slow-subscriber detection + circuit breaker |
-| **Retry Logic** | Exponential backoff (1s → 60s, max 3 retries) |
-| **Dead-Letter Queue** | Failed events stored for manual inspection |
-| **Audit Trail** | All events logged with request ID + trace ID |
-
-### Outbound (aish → External)
-
-| Feature | Implementation |
-|---------|-----------------|
-| **Protocol** | HTTPS, gRPC over HTTP/2 |
-| **Connection Pooling** | Reuse TCP connections for throughput |
-| **Keepalive** | TCP keepalive (9min) + app-level heartbeats |
-| **Reconnection** | Exponential backoff on connection failure |
-| **Circuit Breaker** | Fail fast after 5 consecutive errors |
+- **Outbound only.** aish opens the connection; nothing listens on the aish host.
+- **Registration + session token.** aish registers at
+  `POST /clients/register` and authenticates the WebSocket with the returned
+  `session_token`; a bad token gets `auth_error`.
+- **Per-route HMAC.** If aish registers with `WEBHOOK_BROKER_SECRET`, the broker
+  requires `X-Signature` or `X-Hub-Signature-256` (`sha256=<hex HMAC-SHA256 of
+  the raw body>`, constant-time compare) on every inbound webhook for that
+  (tenant, plugin). Use the same value as the GitHub webhook secret.
+- **No shell.** Handlers are fork/exec'd as argv; payload data only arrives on
+  stdin.
+- **Redacted logs.** The delivery log masks secret-looking keys (`token`,
+  `secret`, `authorization`, `signature`, …) before writing.
+- Terminate TLS in front of the broker (Fly, nginx, ALB) — see the broker's
+  hardening notes.
 
 ## Configuration
 
-### Environment Variables
+### aish (client)
 
-```bash
-# Webhook server
-WEBHOOK_ADDR=0.0.0.0:8080              # Listen address
-WEBHOOK_TLS_CERT=/path/to/cert.pem     # TLS certificate (optional)
-WEBHOOK_TLS_KEY=/path/to/key.pem       # TLS private key (optional)
-WEBHOOK_SECRET_GITHUB=<hmac-key>       # GitHub webhook secret
-WEBHOOK_SECRET_AWS=<api-key>           # AWS EventBridge secret
-WEBHOOK_MAX_PAYLOAD_SIZE=10485760      # Max payload: 10MB
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `WEBHOOK_BROKER_URL` | yes | — | `wss://host/ws` (or `ws://`). Unset → webhooks off, zero cost. |
+| `WEBHOOK_PLUGIN_ID` | yes | — | Plugin route this session registers for. Missing → client not started (warning). |
+| `WEBHOOK_TENANT_ID` | no | `default` | Tenant route segment. |
+| `WEBHOOK_BROKER_SECRET` | no | — | Per-route HMAC secret, sent once at registration. |
+| `WEBHOOK_CLIENT_ID` | no | generated | Stable client/session id. |
+| `AISH_PLUGINS_DIR` | no | `~/.aish/plugins` | Where handler manifests are loaded from. |
+| `AISH_WEBHOOK_AUDIT_MAX` | no | `1000` | Delivery-log records kept per plugin; `0` disables the log. |
 
-# Event queue
-EVENT_QUEUE_CAPACITY=10000              # Max events in flight
-EVENT_QUEUE_TIMEOUT_SECS=30             # Max time to process event
-EVENT_MAX_RETRIES=3                     # Retry attempts on failure
+### Broker
 
-# NAT/Tunnel (if applicable)
-TUNNEL_PROVIDER=ngrok|warp|custom       # Reverse tunnel backend
-TUNNEL_TOKEN=<auth-token>               # Tunnel credentials
-TUNNEL_URL=https://abc123.ngrok.io     # Public URL for webhook registration
-TUNNEL_KEEPALIVE_INTERVAL_SECS=30       # Tunnel heartbeat interval
+| Variable | Default | Meaning |
+|---|---|---|
+| `BROKER_LISTEN` | `0.0.0.0:8080` | Bind address |
+| `BROKER_DB` | `/var/lib/aish-broker.db` | SQLite path (Fly: `/data/aish-broker.db` on a volume) |
+| `BROKER_MAX_QUEUE_SIZE` | `1000` | Per-(tenant, plugin) queue cap; oldest evicted (counted as `dropped`) |
+| `BROKER_WS_HEARTBEAT_SECS` | `30` | WebSocket ping interval |
+| `BROKER_POLL_TIMEOUT_SECS` | `60` | Long-poll wait |
+| `BROKER_MSG_TTL_SECS` | `604800` | Message TTL (7 days) |
+| `BROKER_LOG_LEVEL` | `info` | Log filter |
 
-# State persistence
-DYNAMODB_EVENTS_TABLE=aish_events       # DynamoDB table for event log
-DYNAMODB_RUNS_TABLE=aish_runs           # DynamoDB table for run records
-REDIS_URL=redis://localhost:6379        # Redis session cache
-```
+Full reference: [CONFIGURATION.md](../crates/aish-webhook-broker/docs/CONFIGURATION.md).
 
-## Deployment Checklist
+## Deployment
 
-### Public Cloud (AWS/GCP/Azure)
+The broker is a single static binary with an embedded SQLite file; run one
+instance per database.
 
-- [ ] ALB or API Gateway configured
-- [ ] TLS certificate provisioned (ACM)
-- [ ] Security group allows :443 inbound from GitHub/AWS/etc.
-- [ ] aish service listening on `0.0.0.0:8080` (or :443 with redirect)
-- [ ] Webhook secrets stored in AWS Secrets Manager
-- [ ] CloudWatch logs configured for webhook handler
-- [ ] Alarms set on error rate (>1% errors/5min)
-- [ ] DynamoDB tables created with auto-scaling
-- [ ] Redis cluster provisioned (or use ElastiCache)
+- Docker, systemd, AWS, nginx, hardening, and Fly.io (persistent volume at
+  `/data`): [DEPLOYMENT.md](../crates/aish-webhook-broker/docs/DEPLOYMENT.md)
+- HTTP/WebSocket API, `/health`, `/stats`: [API.md](../crates/aish-webhook-broker/docs/API.md)
+- Client protocol: [CLIENT.md](../crates/aish-webhook-broker/docs/CLIENT.md)
+- Load bench (`tests/load_bench.rs`, ignored by default; `BENCH_N`,
+  `BENCH_CONC`, `BENCH_RATE`) — TASK-371
 
-### NAT'd Environment (ngrok/Cloudflare Warp)
+- Metrics: `GET /stats`, plus OTLP metrics and a SigNoz dashboard when
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is set — see
+  [Monitoring & Observability](#monitoring--observability) (TASK-375)
 
-- [ ] Tunnel daemon installed (systemd service)
-- [ ] Public URL registered in webhook sources (GitHub, EventBridge, etc.)
-- [ ] aish service listening on `localhost:8080`
-- [ ] Tunnel client auto-starts on boot
-- [ ] Reconnection monitoring + alerting
-- [ ] Graceful shutdown sequence (drain events before disconnect)
-- [ ] Backup public IP failover (if available)
+Hosted `aish.sh` broker: not yet available (TASK-270, deferred).
 
-### Kubernetes
+### Operator checklist
 
-- [ ] Ingress resource created (`cert-manager` for TLS)
-- [ ] aish Deployment + Service (`ClusterIP:8080`)
-- [ ] NetworkPolicy allows ingress from external sources
-- [ ] Pod disruption budgets (min 1 replica always available)
-- [ ] Readiness probe: `GET /healthz` → 200
-- [ ] Liveness probe: `GET /alive` → 200
-- [ ] HPA configured (scale 2-10 replicas on request rate)
-- [ ] DynamoDB IAM role attached to pod service account
-- [ ] Redis accessible from pod network
+- [ ] Broker reachable over TLS; `GET /health` returns `"status"`.
+- [ ] `BROKER_DB` on persistent storage.
+- [ ] Each aish session has `WEBHOOK_BROKER_URL` + `WEBHOOK_PLUGIN_ID`
+      (+ `WEBHOOK_TENANT_ID`, `WEBHOOK_BROKER_SECRET` if signing).
+- [ ] Sender (e.g. GitHub) points at `https://<broker>/webhooks/<tenant>/<plugin>`
+      with the same secret.
+- [ ] `:webhook status` shows `connected`; `:webhook logs` shows deliveries.
 
 ## Monitoring & Observability
 
@@ -354,8 +193,8 @@ fields @timestamp, source, event_type
 
 ## Related Docs
 
-- [Event Routing & Filtering](./event-routing.md)
-- [Agent Invocation Patterns](./agents.md)
-- [Workflow Dispatch](./workflows.md)
-- [Setup: ngrok / Cloudflare Warp](./setup/nat-traversal.md)
-- [aish Architecture](./architecture.md)
+- [WEBHOOK_HANDLERS.md](./WEBHOOK_HANDLERS.md) — handler contract, testing, troubleshooting
+- [PLUGIN_DEVELOPER.md](./PLUGIN_DEVELOPER.md) — plugin manifest and lifecycle
+- [reference/plugins/webhook-events.md](./reference/plugins/webhook-events.md) — shell lifecycle events (`webhook_url` / `webhook_command`)
+- [design/webhook-plugin-routing.md](./design/webhook-plugin-routing.md) — routing design
+- [ARCHITECTURE.md](./ARCHITECTURE.md) — aish architecture

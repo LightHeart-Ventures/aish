@@ -307,7 +307,6 @@ Design notes and the full wire contract live in
 [docs/design/skill-registry-mirror.md](docs/design/skill-registry-mirror.md).
 
 ## Webhook Integration
-## Webhook Integration
 
 aish can connect to an external webhook broker to receive real-time events
 (card moves, orchestration runs, alerts) and dispatch them to registered
@@ -316,7 +315,9 @@ handlers. The integration is **opt-in** and **lazy** — it does nothing unless
 
 ```bash
 # Enable the webhook client for this session
-export WEBHOOK_BROKER_URL="wss://broker.example.com/tenant/t_abc123/stream"
+export WEBHOOK_BROKER_URL="wss://broker.example.com/ws"
+export WEBHOOK_PLUGIN_ID=github          # plugin route to register for
+export WEBHOOK_TENANT_ID=t_abc123        # optional, default "default"
 aish
 # → 🪝 webhook: connecting to wss://broker.example.com/… (tenant t_abc123, N handler(s))
 ```
@@ -331,7 +332,22 @@ is stored in session state and shut down cleanly on `:quit`.
 | --- | --- |
 | `:webhook status` | Connection state (connected/disconnected), broker URL, uptime, handler count |
 | `:webhook reload` | Manually reconnect and reload handlers from installed plugins |
-| `:webhook logs [N]` | Show the last N received events (default 20) |
+| `:webhook logs [N] [--plugin id] [--event type]` | Show the last N deliveries from the persistent log (default 20) |
+| `:webhook test <plugin> <event> [--payload f.json] [--run]` | Dry-run (or run) a plugin's handlers against a sample payload |
+| `:webhook replay [plugin] <id\|last> [--run]` | Re-dispatch a logged delivery |
+
+`WEBHOOK_PLUGIN_ID` (the plugin route this session registers for) is required
+alongside `WEBHOOK_BROKER_URL`. Guides: [docs/webhooks.md](docs/webhooks.md)
+(architecture, operators), [docs/WEBHOOK_HANDLERS.md](docs/WEBHOOK_HANDLERS.md)
+(writing handlers), [plugins/github/README.md](plugins/github/README.md)
+(GitHub setup).
+
+### Writing plugins
+
+`:plugin create <id>` scaffolds a new plugin in `~/.aish/plugins/<id>/`. The
+[Plugin Developer Guide](docs/PLUGIN_DEVELOPER.md) covers the full `plugin.json`
+reference, hooks, skills, timers, statusline segments, config, secrets, memory,
+`:plugin enable|disable|reload|config|errors`, and testing.
 
 When `WEBHOOK_BROKER_URL` is unset, `:webhook status` reports
 `not configured` and no connection is attempted — zero cost in the common case.

@@ -170,7 +170,7 @@ action="$(jq -r '.action // empty' <<<"$payload")"
 # … do work …
 ```
 
-See [PLUGINS.md](PLUGINS.md) and `examples/plugins/github/` (#517) for a complete
+See [PLUGINS.md](PLUGINS.md) and `plugins/github/` for a complete
 reference plugin.
 
 ## Features / build

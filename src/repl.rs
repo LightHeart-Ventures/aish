@@ -7267,7 +7267,8 @@ fn handle_hooks(sub: Option<&str>, session: &mut Session) {
     }
 }
 
-/// `:plugin [list|info <id>]` — plugin provenance introspection (Phase 0.5.6).
+/// `:plugin [list|info <id>|create <id>]` — plugin provenance introspection (Phase 0.5.6).
+/// `create <id>` (TASK-275) scaffolds a new plugin via [`crate::plugin_scaffold`].
 /// `list` enumerates discovered plugins; `info <id>` renders one plugin's full
 /// capability report (metadata, login, lifecycle + event hooks, MCP servers,
 /// schemas, skills). `info <id> --schema` (Phase 3.5) renders the plugin's
@@ -7357,6 +7358,7 @@ fn handle_plugin(args: Vec<&str>, session: &Session) {
             }
         }
         Some("memory" | "mem") => handle_plugin_memory(&args[1..]),
+        Some("create" | "new") => crate::plugin_scaffold::run(&dir, id),
         Some("list") | None => {
             let plugins = crate::plugins::discover(&dir);
             if plugins.is_empty() {
@@ -7376,6 +7378,7 @@ fn handle_plugin(args: Vec<&str>, session: &Session) {
             }
             println!("\n:plugin info <id> for full provenance");
             println!(":plugin add <id> to install a plugin from the registry");
+            println!(":plugin create <id> to scaffold a new plugin");
         }
         Some(other) => println!("unknown :plugin subcommand `{other}` — try :plugin list"),
     }
