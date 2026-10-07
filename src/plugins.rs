@@ -3432,7 +3432,19 @@ mod tests {
         let hooks: WebhookManifest =
             serde_json::from_str(&text).expect("canonical PluginManifest parses github plugin");
         assert_eq!(hooks.id, "github");
-        assert_eq!(hooks.webhooks.len(), 5, "all five handlers parsed");
+        assert_eq!(hooks.webhooks.len(), 11, "all eleven handlers parsed");
+        // TASK-373 — every GitHub event the plugin owns is declared.
+        let events: std::collections::BTreeSet<&str> = hooks
+            .webhooks
+            .iter()
+            .map(|h| h.event_type.as_str())
+            .collect();
+        assert_eq!(
+            events,
+            ["issues", "pull_request", "push", "release", "workflow_run"]
+                .into_iter()
+                .collect(),
+        );
         let first = &hooks.webhooks[0];
         assert_eq!(first.event_type, "pull_request");
         assert_eq!(first.command, vec!["handlers/pr-review.sh".to_string()]);

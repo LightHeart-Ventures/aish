@@ -1,0 +1,15 @@
+{
+  "action": "closed",
+  "issue": {
+    "id": 1347,
+    "number": 1347,
+    "title": "Widget registry panics on empty config",
+    "user": { "login": "octocat", "id": 1, "type": "User" },
+    "labels": [],
+    "state": "closed",
+    "state_reason": "completed",
+    "html_url": "https://github.com/acme/widgets/issues/1347"
+  },
+  "repository": { "id": 1296269, "name": "widgets", "full_name": "acme/widgets" },
+  "sender": { "login": "octocat", "id": 1, "type": "User" }
+}

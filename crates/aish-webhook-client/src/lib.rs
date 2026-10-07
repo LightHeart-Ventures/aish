@@ -53,6 +53,7 @@
 pub mod audit;
 pub mod backoff;
 pub mod client;
+pub mod delivery;
 pub mod dispatcher;
 pub mod envelope;
 pub mod error;
@@ -65,9 +66,10 @@ pub use audit::{
 };
 pub use backoff::{ExponentialBackoff, DEFAULT_MAX_BACKOFF};
 pub use client::{BrokerClient, ConnState};
+pub use delivery::{DeliveryLog, DeliveryRecord, HandlerSummary, PlannedHandler};
 pub use dispatcher::{
-    FlashSink, HandlerOutcome, PluginManifest, PluginRegistry, WebhookDispatcher, WebhookHandler,
-    DEFAULT_HANDLER_TIMEOUT,
+    DeliverySink, FlashSink, HandlerOutcome, PluginManifest, PluginRegistry, WebhookDispatcher,
+    WebhookHandler, DEFAULT_HANDLER_TIMEOUT,
 };
 pub use envelope::{BrokerConfig, ClientFrame, ServerFrame, Webhook};
 pub use error::{Result, WebhookClientError};

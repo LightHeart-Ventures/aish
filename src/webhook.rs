@@ -12,9 +12,10 @@
 //!   3. auto-reconnects with exponential backoff on disconnect,
 //!   4. shuts down gracefully on `:quit`.
 //!
-//! The REPL surfaces the service via `:webhook status|reload|logs`. A shared
-//! [`MemoryAuditSink`] captures every handler outcome so `:webhook logs` can
-//! show recent activity without a subscriber.
+//! The REPL surfaces the service via `:webhook status|reload|logs|test|replay`.
+//! A shared [`MemoryAuditSink`] captures every handler outcome for the status
+//! counters; TASK-273 additionally persists every delivery to
+//! `~/.aish/state/webhooks/<plugin>.jsonl` (see [`crate::webhook_debug`]).
 //!
 //! Configuration (env vars):
 //!   * `WEBHOOK_BROKER_URL`    — broker WebSocket URL (`wss://…/ws`). REQUIRED to
@@ -23,15 +24,17 @@
 //!   * `WEBHOOK_BROKER_SECRET` — optional shared secret echoed in the auth frame.
 //!   * `WEBHOOK_CLIENT_ID`     — optional stable client id (generated if absent).
 //!   * `AISH_PLUGINS_DIR`      — override the plugin directory scanned for handlers.
+//!   * `AISH_WEBHOOK_AUDIT_MAX` — per-plugin delivery-log retention (default
+//!                               1000; `0` disables persistence).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aish_webhook_client::{
-    AuditRecord, AuditSink, BrokerClient, BrokerConfig, ConnState, FlashSink, MemoryAuditSink,
-    ObserverAuditSink, PluginRegistry, StopReason, WebhookDispatcher, WebhookService,
-    transport::TungsteniteTransport,
+    AuditRecord, AuditSink, BrokerClient, BrokerConfig, ConnState, DeliverySink, FlashSink,
+    MemoryAuditSink, ObserverAuditSink, PluginRegistry, StopReason, WebhookDispatcher,
+    WebhookService, transport::TungsteniteTransport,
 };
 use tokio::sync::watch;
 
@@ -156,6 +159,11 @@ impl WebhookHandle {
         let task_audit = task_sink;
         let task_status = status.clone();
         let task_flash = flash;
+        let task_delivery = crate::webhook_debug::delivery_sink(
+            crate::webhook_debug::delivery_log(),
+            plugins_dir.clone(),
+            registry.clone(),
+        );
         let join = tokio::spawn(async move {
             service_loop(
                 task_config,
@@ -164,6 +172,7 @@ impl WebhookHandle {
                 task_status,
                 shutdown_rx,
                 task_flash,
+                task_delivery,
             )
             .await;
         });
@@ -322,7 +331,7 @@ fn config_from_env(broker_url: String) -> BrokerConfig {
 }
 
 /// Resolve the plugin directory scanned for webhook handlers.
-fn plugins_dir() -> PathBuf {
+pub(crate) fn plugins_dir() -> PathBuf {
     if let Ok(d) = std::env::var("AISH_PLUGINS_DIR") {
         return PathBuf::from(d);
     }
@@ -374,8 +383,11 @@ async fn service_loop(
     status: Arc<Mutex<WebhookStatus>>,
     shutdown_rx: watch::Receiver<bool>,
     flash: Option<FlashSink>,
+    delivery: DeliverySink,
 ) {
-    let mut dispatcher = WebhookDispatcher::new(registry).with_audit_sink(audit);
+    let mut dispatcher = WebhookDispatcher::new(registry)
+        .with_audit_sink(audit)
+        .with_delivery_sink(delivery);
     if let Some(f) = flash {
         // Wire the broker dispatcher to the SecondStatusLine: a handler's stdout
         // now surfaces on the footer. This is the seam that completes the goal.

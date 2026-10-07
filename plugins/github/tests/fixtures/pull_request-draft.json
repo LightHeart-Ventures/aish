@@ -1,0 +1,23 @@
+{
+  "action": "opened",
+  "number": 43,
+  "pull_request": {
+    "id": 279147438,
+    "number": 43,
+    "state": "open",
+    "title": "WIP: widget caching",
+    "user": { "login": "hubot", "id": 2, "type": "User" },
+    "draft": true,
+    "html_url": "https://github.com/acme/widgets/pull/43",
+    "head": {
+      "ref": "feat/widget-cache",
+      "sha": "fa11c3e57ca3a959ca5aad62de7213c562f8c822"
+    },
+    "base": {
+      "ref": "main",
+      "sha": "6113728f27ae82c7b1a177c8d03f9e96e0adf246"
+    }
+  },
+  "repository": { "id": 1296269, "name": "widgets", "full_name": "acme/widgets" },
+  "sender": { "login": "hubot", "id": 2, "type": "User" }
+}
