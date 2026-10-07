@@ -663,6 +663,30 @@ impl CoordinatorStore {
         Ok(())
     }
 
+    /// The run's last durable beat as a UNIX timestamp, or `None` when the run
+    /// is unknown or has no beat on record. The ABSOLUTE instant is returned
+    /// (not an age) so a caller can poll on a slow throttle and still age the
+    /// value on every repaint — which is exactly what the escalation banner's
+    /// liveness heart does, letting it drift green → yellow → red between polls
+    /// instead of freezing at whatever the last poll happened to see.
+    ///
+    /// Read-only and failure-tolerant: a missing table, a closed connection, or
+    /// a malformed timestamp all collapse to `None` ("no claim"), never an
+    /// error — a liveness indicator must not be able to break the paint path.
+    pub fn heartbeat_unix(&self, run_id: &str) -> Option<i64> {
+        self.conn
+            .lock()
+            .ok()?
+            .query_row(
+                "SELECT CAST(strftime('%s', heartbeat_at) AS INTEGER) \
+                 FROM coordinator_runs WHERE run_id = ?1",
+                [run_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()
+    }
+
     pub fn set_done(&self, run_id: &str, result: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE coordinator_runs \

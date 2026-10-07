@@ -2417,6 +2417,24 @@ mod tests {
         assert!(new_gap(heavy) < STALL_AFTER.as_secs());
     }
 
+    // The display layer needs the beat cadence to classify liveness (how many
+    // beats a worker has MISSED drives the escalation banner's green/yellow/red
+    // heart), but `style` is a pure-formatter module and must not depend on the
+    // coordinator. So the cadence is mirrored as `style::HEARTBEAT_INTERVAL_SECS`
+    // and pinned here: if someone retunes the writer's interval without the
+    // mirror, every missed-beat count silently mis-scales — a liveness lamp that
+    // lies is worse than no lamp. This test is the tripwire.
+    #[test]
+    fn heartbeat_interval_matches_display_const() {
+        assert_eq!(
+            super::HEARTBEAT_INTERVAL.as_secs() as i64,
+            crate::style::HEARTBEAT_INTERVAL_SECS,
+            "style::HEARTBEAT_INTERVAL_SECS mirrors the coordinator's beat cadence — \
+             update both or the missed-beat tiers mis-scale"
+        );
+    }
+
+    // A beat is best-effort, but a RUN of failed writes is the contention signal
     // A beat is best-effort, but a RUN of failed writes is the contention signal
     // the old `let _ = …` threw away. Success must clear the counter so a
     // recovered store stops warning.

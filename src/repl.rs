@@ -2150,9 +2150,42 @@ fn refresh_escalation_status(session: &Session) {
         _ => status.clone(),
     };
     crate::escalation::set_status(&text);
+    refresh_escalation_beat(session, &id);
     if matches!(status.as_str(), "done" | "failed") {
         crate::escalation::note_terminal(&id, status == "failed");
     }
+}
+
+/// Feed the pinned banner's liveness heart from the worker's DURABLE heartbeat
+/// (`coordinator_runs.heartbeat_at`), which the coordinator stamps every ~30s.
+///
+/// Why this is throttled and why it hands over an ABSOLUTE timestamp: the footer
+/// repaints several times a second to animate, and a SQLite round-trip on every
+/// frame would be a pointless tax on a value that only changes twice a minute.
+/// So we poll at most once per [`BEAT_POLL`] and give the banner the instant of
+/// the beat rather than its age — the banner re-derives the age on each paint,
+/// so the heart still drifts green → yellow → red on its own between polls. A
+/// cheap poll that nonetheless can't go stale.
+///
+/// Failure-tolerant by construction: no store (ephemeral session) or no row for
+/// this id leaves the beat `None`, which renders the hollow `♡` — "no liveness
+/// claim" — instead of a green heart we have no evidence for.
+fn refresh_escalation_beat(session: &Session, id: &str) {
+    const BEAT_POLL: std::time::Duration = std::time::Duration::from_secs(3);
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+    let Ok(mut last) = LAST.lock() else { return };
+    if last.is_some_and(|t| t.elapsed() < BEAT_POLL) {
+        return; // within the throttle window — the banner ages the stored beat
+    }
+    *last = Some(std::time::Instant::now());
+    drop(last);
+
+    let beat = session
+        .coordinator_store
+        .as_ref()
+        .and_then(|s| s.heartbeat_unix(id));
+    crate::escalation::set_beat(beat);
 }
 
 fn coordinator_status_message(session: &Session) -> String {
