@@ -449,9 +449,23 @@ async fn run_handler(
         }
     };
 
+    // A handler may exit (or close stdin) before reading the payload. The
+    // write then fails with EPIPE — which must stay an error *value*, never a
+    // process-killing SIGPIPE (aish is a long-lived shell).
+    ignore_sigpipe();
+    let mut stdin_error: Option<String> = None;
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(&payload_bytes).await;
-        let _ = stdin.shutdown().await;
+        let res = match stdin.write_all(&payload_bytes).await {
+            Ok(()) => stdin.shutdown().await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = res {
+            stdin_error = Some(if e.kind() == std::io::ErrorKind::BrokenPipe {
+                "stdin closed before the payload was written (broken pipe)".to_string()
+            } else {
+                format!("writing payload to stdin failed: {e}")
+            });
+        }
         drop(stdin);
     }
 
@@ -470,9 +484,36 @@ async fn run_handler(
             outcome.error = Some(format!("timed out after {timeout:?}"));
         }
     }
+    // Report a stdin write failure as a handler error. A handler that ignores
+    // stdin and exits 0 keeps `success` (exit status is the contract), but the
+    // failure is still recorded so `:webhook logs` / audit show it.
+    if outcome.error.is_none() {
+        outcome.error = stdin_error;
+    }
     outcome.duration_ms = started.elapsed().as_millis();
     outcome
 }
+
+/// Make sure a write to a closed pipe yields `EPIPE` instead of killing the
+/// process. Rust binaries normally start with SIGPIPE ignored, but that is not
+/// guaranteed for every host/test harness/toolchain, so re-assert it when the
+/// disposition is still the default (an embedder's own handler is left alone).
+#[cfg(unix)]
+fn ignore_sigpipe() {
+    // SAFETY: querying then (conditionally) installing SIG_IGN via sigaction(2)
+    // on zero-initialised POD; no handler code runs.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut old) == 0
+            && old.sa_sigaction == libc::SIG_DFL
+        {
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn ignore_sigpipe() {}
 
 #[cfg(test)]
 mod tests {
@@ -487,6 +528,73 @@ mod tests {
             event_type: event_type.into(),
             payload,
         }
+    }
+
+    /// Child half of `handler_closing_stdin_never_kills_process`: runs only when
+    /// re-executed with the env flag, with SIGPIPE forced back to SIG_DFL (as a
+    /// host/toolchain might leave it), and dispatches a 1 MiB payload (larger
+    /// than any pipe buffer) to `true`, which exits without reading stdin.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigpipe_child_dispatch() {
+        if std::env::var_os("AISH_WEBHOOK_SIGPIPE_CHILD").is_none() {
+            return;
+        }
+        // SAFETY: test-only; this re-executed process exists solely for this test.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        let reg = PluginRegistry::from_plugins(vec![PluginManifest {
+            id: "closer".into(),
+            name: String::new(),
+            version: String::new(),
+            webhooks: vec![WebhookHandler {
+                event_type: "push".into(),
+                command: vec!["true".into()],
+                filters: Default::default(),
+                timeout_secs: None,
+            }],
+        }]);
+        let d = WebhookDispatcher::new(Arc::new(reg));
+        let big = "x".repeat(1024 * 1024);
+        let out = d.dispatch(&wh("push", json!({ "blob": big }))).await;
+        assert_eq!(out.len(), 1);
+        assert!(out[0].executed);
+        assert_eq!(out[0].exit_code, Some(0));
+        assert!(
+            out[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("broken pipe")),
+            "stdin EPIPE is reported: {:?}",
+            out[0].error
+        );
+        println!("SIGPIPE_CHILD_SURVIVED");
+    }
+
+    /// Regression (PR #898 CI, rustc 1.99): a handler that exits before reading
+    /// its stdin payload must surface as an error value, never kill the host
+    /// with SIGPIPE. The dispatch runs in a re-executed child so forcing SIGPIPE
+    /// to SIG_DFL can't race other tests in this binary.
+    #[cfg(unix)]
+    #[test]
+    fn handler_closing_stdin_never_kills_process() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "dispatcher::tests::sigpipe_child_dispatch",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("AISH_WEBHOOK_SIGPIPE_CHILD", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("SIGPIPE_CHILD_SURVIVED"),
+            "child died: status={:?}\nstdout={stdout}\nstderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]
