@@ -144,8 +144,8 @@ pub fn blob_to_embed(bytes: &[u8]) -> Option<Vec<f32>> {
         return None;
     }
     let mut v = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
-        v.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in bytes.as_chunks::<4>().0 {
+        v.push(f32::from_le_bytes(*chunk));
     }
     Some(v)
 }

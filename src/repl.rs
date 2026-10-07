@@ -4546,10 +4546,10 @@ fn digest_worthy(text: &str) -> Option<String> {
     // drop the stale stdout. A malformed/unterminated wrapper carries nothing
     // quotable and is dropped whole.
     let trimmed = match trimmed.strip_prefix(OUTPUT_SEED_PREFIX) {
-        Some(rest) => match rest.find(OUTPUT_SEED_END) {
-            Some(i) => rest[i + OUTPUT_SEED_END.len()..].trim(),
-            None => return None,
-        },
+        Some(rest) => {
+            let i = rest.find(OUTPUT_SEED_END)?;
+            rest[i + OUTPUT_SEED_END.len()..].trim()
+        }
         None => trimmed,
     };
     // Peel any embedded digest scaffolding so it can't nest.

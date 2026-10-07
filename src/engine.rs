@@ -1692,12 +1692,11 @@ impl Spinner {
         Self(Some(tokio::spawn(async {
             const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(80));
-            for i in 0.. {
+            let mut i = 0usize;
+            loop {
                 tick.tick().await;
-                eprint!(
-                    "\r\x1b[36m{}\x1b[0m \x1b[2;36mthinking…\x1b[0m",
-                    FRAMES[i % FRAMES.len()]
-                );
+                eprint!("\r\x1b[36m{}\x1b[0m \x1b[2;36mthinking…\x1b[0m", FRAMES[i]);
+                i = (i + 1) % FRAMES.len();
             }
         })))
     }

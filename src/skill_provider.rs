@@ -586,7 +586,7 @@ pub async fn install_plugin(plugin_id: &str, plugins_dir: &Path) -> Result<()> {
     // We'll download as a tar.gz and extract it
     let url = format!(
         "https://github.com/{}/{}/archive/refs/heads/{}.tar.gz",
-        owner, repo, &plugin.branch
+        owner, repo, plugin.branch
     );
 
     let client = reqwest::Client::new();
@@ -1271,10 +1271,9 @@ pub fn parse_github_ref(input: &str) -> Option<GithubRef> {
         (r, true)
     } else if let Some(r) = s.strip_prefix("github:") {
         (r, false)
-    } else if let Some(r) = s.strip_prefix("gh:") {
-        (r, false)
     } else {
-        return None;
+        let r = s.strip_prefix("gh:")?;
+        (r, false)
     };
 
     // A trailing `@ref` (prefix form only — a URL pins its ref via tree/blob).
@@ -1304,12 +1303,11 @@ pub fn parse_github_ref(input: &str) -> Option<GithubRef> {
     let path_segs: &[&str] =
         if url_form && matches!(rest_segs.first().copied(), Some("tree") | Some("blob")) {
             // /tree/<ref>/<path…> or /blob/<ref>/<path…>
-            match rest_segs.get(1) {
-                Some(r) => {
-                    git_ref = (*r).to_string();
-                    &rest_segs[2..]
-                }
-                None => return None, // `/tree` with no ref is malformed
+            {
+                // `/tree` with no ref is malformed — `?` drops it.
+                let r = rest_segs.get(1)?;
+                git_ref = (*r).to_string();
+                &rest_segs[2..]
             }
         } else {
             rest_segs
