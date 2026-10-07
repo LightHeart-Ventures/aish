@@ -2518,7 +2518,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("model-detect", "pick the best local model for this machine"),
     ("new", "clear conversation history"),
     ("output", "stream coordinators' activity (on|off)"),
-    ("plugin", "plugin provenance (list|info <id>)"),
+    (
+        "plugin",
+        "plugins (list|info|enable|disable|reload|add|remove <id>)",
+    ),
     ("quit", "exit aish"),
     (
         "reasoning",
@@ -2735,6 +2738,29 @@ impl Completer for AishHelper {
         if let Some(after) = before.strip_prefix(':') {
             if !after.contains(char::is_whitespace) {
                 return Ok(complete_colon(after));
+            }
+
+            // TASK-272: `:plugin <sub> <id>` argument completion.
+            if after.starts_with("plugin ") || after.starts_with("plugins ") {
+                let plugins: Vec<(String, bool)> =
+                    crate::plugins::discover_all(&crate::plugins::default_plugins_dir())
+                        .into_iter()
+                        .map(|p| (p.manifest.id.clone(), p.manifest.is_enabled()))
+                        .collect();
+                if let Some(done) = complete_plugin_args(before, &plugins) {
+                    return Ok(done);
+                }
+                // TASK-271: `:plugin config <id> --set|--reset <key>`.
+                let keys_for = |id: &str| -> Vec<String> {
+                    crate::plugins::discover_all(&crate::plugins::default_plugins_dir())
+                        .into_iter()
+                        .find(|p| p.manifest.id == id)
+                        .map(|p| crate::plugin_config::config_keys(&p.dir, &p.manifest))
+                        .unwrap_or_default()
+                };
+                if let Some(done) = complete_plugin_config_args(before, &keys_for) {
+                    return Ok(done);
+                }
             }
             if let Some(res) = complete_colon_args(after) {
                 return Ok(res);
@@ -7402,12 +7428,64 @@ fn handle_hooks(sub: Option<&str>, session: &mut Session) {
 /// renders which of the plugin's `.mcp.json` servers will actually connect
 /// vs. lose a name collision against the session's already-configured MCP
 /// servers. Bare `:plugin` is an alias for `list`.
-fn handle_plugin(args: Vec<&str>, session: &Session) {
+///
+/// TASK-272: `enable|disable <id>` persist the user-level override in
+/// `~/.aish/plugins.state.json` and re-apply the live plugin wiring (event
+/// hooks, timers, statusline segments, webhook handlers); `enable` also re-runs
+/// the plugin's `on_init`. `reload [id]` re-applies the wiring (and re-runs
+/// `on_init` for `id` when given) without changing state.
+fn handle_plugin(args: Vec<&str>, session: &mut Session) {
     let dir = crate::plugins::default_plugins_dir();
     let sub = args.first().copied();
     let id = args.get(1).copied();
     let flag = args.get(2).copied();
     match sub {
+        Some(verb @ ("enable" | "disable")) => {
+            let Some(id) = id else {
+                println!("usage: :plugin {verb} <id>");
+                return;
+            };
+            let enable = verb == "enable";
+            match crate::plugins::set_plugin_enabled(&dir, id, enable) {
+                Ok(false) => println!("plugin `{id}` is already {verb}d"),
+                Ok(true) => {
+                    println!(
+                        "\x1b[32m✓\x1b[0m plugin `{id}` {verb}d (saved to {})",
+                        crate::plugin_enable::state_path(&dir).display()
+                    );
+                    if enable {
+                        rerun_plugin_on_init(session, &dir, id);
+                    }
+                    for line in reapply_plugin_runtime(session, &dir) {
+                        println!("  {line}");
+                    }
+                    println!(
+                        "  \x1b[2mMCP servers and skills from this plugin change on :restart\x1b[0m"
+                    );
+                }
+                Err(e) => eprintln!("\x1b[31m✗\x1b[0m {e}"),
+            }
+        }
+        Some("reload") => {
+            if let Some(id) = id {
+                let known = crate::plugins::discover_all(&dir);
+                match known.iter().find(|p| p.manifest.id == id) {
+                    None => {
+                        println!("no such plugin `{id}` — try :plugin list");
+                        return;
+                    }
+                    Some(p) if !p.manifest.is_enabled() => {
+                        println!("plugin `{id}` is disabled — :plugin enable {id} first");
+                        return;
+                    }
+                    Some(_) => rerun_plugin_on_init(session, &dir, id),
+                }
+            }
+            println!("plugins reloaded");
+            for line in reapply_plugin_runtime(session, &dir) {
+                println!("  {line}");
+            }
+        }
         Some("add") => {
             let Some(plugin_id) = id else {
                 println!("usage: :plugin add <plugin-id>");
@@ -7430,7 +7508,10 @@ fn handle_plugin(args: Vec<&str>, session: &Session) {
                 })) {
                     Ok(Ok(())) => {
                         println!("\x1b[32m✓\x1b[0m plugin `{plugin_id}` installed successfully");
-                        println!("  reload with `:restart` to activate");
+                        println!(
+                            "  `:plugin reload {plugin_id}` activates its hooks/timers/webhooks; \
+                             MCP servers and skills need `:restart`"
+                        );
                     }
                     Ok(Err(e)) => {
                         eprintln!("\x1b[31m✗\x1b[0m failed to install plugin: {e:#}");
@@ -7448,8 +7529,13 @@ fn handle_plugin(args: Vec<&str>, session: &Session) {
             };
             match crate::skill_provider::remove_plugin(plugin_id, &dir) {
                 Ok(()) => {
+                    // TASK-272: drop its enable/disable override with it.
+                    let _ = crate::plugin_enable::forget(&dir, plugin_id);
                     println!("\x1b[32m✓\x1b[0m plugin `{plugin_id}` removed");
-                    println!("  reload with `:restart` to apply");
+                    for line in reapply_plugin_runtime(session, &dir) {
+                        println!("  {line}");
+                    }
+                    println!("  \x1b[2mMCP servers and skills from it go away on :restart\x1b[0m");
                 }
                 Err(e) => eprintln!("\x1b[31m✗\x1b[0m {e:#}"),
             }
@@ -7484,28 +7570,236 @@ fn handle_plugin(args: Vec<&str>, session: &Session) {
             }
         }
         Some("memory" | "mem") => handle_plugin_memory(&args[1..]),
+        Some("config") => handle_plugin_config(&args[1..], session, &dir),
         Some("list") | None => {
-            let plugins = crate::plugins::discover(&dir);
-            if plugins.is_empty() {
+            let Some(list) = crate::plugins::format_plugin_list(&dir) else {
                 println!("no plugins installed ({})", dir.display());
                 return;
-            }
-            for p in &plugins {
-                let m = &p.manifest;
-                let name = if m.name.is_empty() { &m.id } else { &m.name };
-                let ver = if m.version.is_empty() {
-                    "-"
-                } else {
-                    &m.version
-                };
-                let state = if m.is_enabled() { "" } else { " (disabled)" };
-                println!("  {:<20} {name} v{ver}{state}", m.id);
-            }
+            };
+            println!("{list}");
             println!("\n:plugin info <id> for full provenance");
+            println!(":plugin enable|disable|reload <id> to toggle or reload a plugin");
+            println!(
+                ":plugin config <id> [--set <key> <value> | --reset [key]] to view/edit config"
+            );
             println!(":plugin add <id> to install a plugin from the registry");
         }
         Some(other) => println!("unknown :plugin subcommand `{other}` — try :plugin list"),
     }
+}
+
+/// `:plugin` subcommands, for TAB completion and the usage line.
+const PLUGIN_SUBCOMMANDS: &[&str] = &[
+    "add", "config", "disable", "enable", "info", "list", "memory", "reload", "remove",
+];
+
+/// TAB completion for `:plugin …` arguments (TASK-272): the subcommand in
+/// word two, then a plugin id for `enable|disable|reload|info|remove`
+/// (`enable` offers disabled plugins, `disable` enabled ones). `plugins` is
+/// `(id, enabled)` — injected so the logic unit-tests without a plugins dir.
+/// Returns `None` when the line isn't a `:plugin` argument position.
+fn complete_plugin_args(before: &str, plugins: &[(String, bool)]) -> Option<(usize, Vec<Pair>)> {
+    let rest = before
+        .strip_prefix(":plugins ")
+        .or_else(|| before.strip_prefix(":plugin "))?;
+    let offset = before.len() - rest.len();
+    let words: Vec<&str> = rest.split(' ').collect();
+    let pair = |s: &str| Pair {
+        display: s.to_string(),
+        replacement: format!("{s} "),
+    };
+    match words.as_slice() {
+        [partial] => Some((
+            offset,
+            PLUGIN_SUBCOMMANDS
+                .iter()
+                .filter(|s| s.starts_with(partial))
+                .map(|s| pair(s))
+                .collect(),
+        )),
+        [sub, partial] => {
+            let want: fn(bool) -> bool = match *sub {
+                "enable" => |on| !on,
+                "disable" | "reload" => |on| on,
+                "info" | "remove" | "rm" | "config" => |_| true,
+                _ => return None,
+            };
+            let start = before.len() - partial.len();
+            Some((
+                start,
+                plugins
+                    .iter()
+                    .filter(|(id, on)| want(*on) && id.starts_with(partial))
+                    .map(|(id, _)| pair(id))
+                    .collect(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// TAB completion for `:plugin config <id> …` (TASK-271): `--set`/`--reset`
+/// after the id, then a config key (from `keys_for(id)` — `config_schema`
+/// properties ∪ `config.json` keys) after either flag. `None` otherwise.
+fn complete_plugin_config_args(
+    before: &str,
+    keys_for: &dyn Fn(&str) -> Vec<String>,
+) -> Option<(usize, Vec<Pair>)> {
+    let rest = before
+        .strip_prefix(":plugins ")
+        .or_else(|| before.strip_prefix(":plugin "))?;
+    let words: Vec<&str> = rest.split(' ').collect();
+    let pair = |s: &str| Pair {
+        display: s.to_string(),
+        replacement: format!("{s} "),
+    };
+    match words.as_slice() {
+        ["config", _id, partial] => Some((
+            before.len() - partial.len(),
+            ["--set", "--reset"]
+                .iter()
+                .filter(|f| f.starts_with(partial))
+                .map(|f| pair(f))
+                .collect(),
+        )),
+        ["config", id, "--set" | "--reset", partial] => Some((
+            before.len() - partial.len(),
+            keys_for(id)
+                .iter()
+                .filter(|k| k.starts_with(partial))
+                .map(|k| pair(k))
+                .collect(),
+        )),
+        _ => None,
+    }
+}
+
+/// `:plugin config …` (TASK-271) — view/edit a plugin's `config.json`.
+/// `args` is the token stream *after* `config`.
+///
+/// ```text
+/// :plugin config <id>                       effective config, secrets redacted
+/// :plugin config <id> --set <key> <value…>  value parsed as JSON, else string;
+///                                           whole config validated, then atomic write
+/// :plugin config <id> --reset [key]         drop one key, or delete config.json
+/// ```
+///
+/// Config stays at `~/.aish/plugins/<id>/config.json` (PO decision — no
+/// separate `~/.aish/config/plugins/` tree; broker config stays env-only).
+fn handle_plugin_config(args: &[&str], session: &mut Session, dir: &Path) {
+    const USAGE: &str = "usage: :plugin config <id> [--set <key> <value> | --reset [key]]";
+    let Some(id) = args.first().copied() else {
+        println!("{USAGE}");
+        return;
+    };
+    let plugins = crate::plugins::discover_all(dir);
+    let Some(p) = plugins.iter().find(|p| p.manifest.id == id) else {
+        println!("no such plugin `{id}` — try :plugin list");
+        return;
+    };
+    let path = crate::plugin_config::config_path(&p.dir);
+    let msg = match &args[1..] {
+        [] => {
+            let view = crate::plugin_config::view(&p.dir, &p.manifest);
+            println!("{}", crate::plugin_config::format_view(id, &view));
+            if !p.manifest.is_enabled() {
+                println!("\x1b[2m(plugin is disabled — config applies once enabled)\x1b[0m");
+            }
+            return;
+        }
+        ["--set", key, value @ ..] if !value.is_empty() => {
+            let v = crate::plugin_config::parse_value(&value.join(" "));
+            let shown = crate::plugin_config::display_value(key, &v);
+            if let Err(e) = crate::plugin_config::set_key(&p.dir, &p.manifest, key, v) {
+                eprintln!("\x1b[31m✗\x1b[0m {e}");
+                return;
+            }
+            format!("{id}.{key} = {shown}")
+        }
+        ["--reset"] | ["--reset", _] => {
+            let key = args.get(2).copied();
+            let out = match crate::plugin_config::reset(&p.dir, &p.manifest, key) {
+                Ok(out) => out,
+                Err(e) => {
+                    eprintln!("\x1b[31m✗\x1b[0m {e}");
+                    return;
+                }
+            };
+            if let Some(w) = &out.warning {
+                println!("  \x1b[33maish:\x1b[0m {w}");
+            }
+            match (out.changed, key) {
+                (false, Some(k)) => {
+                    println!("`{k}` is not set in {} — nothing to reset", path.display());
+                    return;
+                }
+                (false, None) => {
+                    println!("plugin `{id}` has no config.json — already at defaults");
+                    return;
+                }
+                (true, Some(k)) => format!("{id}.{k} reset to its default"),
+                (true, None) => format!("{id} config reset to defaults (config.json removed)"),
+            }
+        }
+        _ => {
+            println!("{USAGE}");
+            return;
+        }
+    };
+    println!("\x1b[32m✓\x1b[0m {msg} ({})", path.display());
+    if p.manifest.is_enabled() {
+        for line in reapply_plugin_runtime(session, dir) {
+            println!("  {line}");
+        }
+        println!(
+            "  \x1b[2mhooks/timers/webhooks pick this up now; MCP servers and skills on :restart\x1b[0m"
+        );
+    } else {
+        println!("  \x1b[2mplugin is disabled — takes effect on :plugin enable {id}\x1b[0m");
+    }
+}
+
+/// Re-run `on_init` for plugin `id` (TASK-272 `:plugin enable` / `reload <id>`)
+/// and fold its `KEY=VALUE` exports into the session env. Same precedence as
+/// startup: anything already set (ambient or session env) wins.
+fn rerun_plugin_on_init(session: &mut Session, dir: &Path, id: &str) {
+    let mut ambient: Vec<(String, String)> = std::env::vars().collect();
+    ambient.extend(session.env.iter().cloned());
+    let env = crate::plugins::collect_plugin_lifecycle_env(dir, id, "on_init", &ambient);
+    for w in &env.warnings {
+        println!("  \x1b[33maish:\x1b[0m {w}");
+    }
+    let n = env.vars.len();
+    for (k, v) in env.vars {
+        session.set_var(&k, v);
+    }
+    if n > 0 {
+        println!("  on_init: {n} env var(s) set");
+    }
+}
+
+/// Re-apply the live plugin wiring after `:plugin enable|disable|reload|remove`
+/// (TASK-272): event hooks (`:hooks reload`), declarative timers + statusline
+/// segments (re-armed; superseded loops exit), and — when a broker is
+/// configured — the webhook client's handler registry (`:webhook reload`).
+/// Returns one human line per subsystem.
+fn reapply_plugin_runtime(session: &mut Session, dir: &Path) -> Vec<String> {
+    session.load_hooks();
+    let timers = crate::plugin_timers::arm(dir);
+    let statuslines = crate::plugin_statusline::arm(dir);
+    let mut lines = vec![format!(
+        "hooks reloaded · {timers} timer(s) · {statuslines} statusline segment(s) armed"
+    )];
+    if session.webhook.is_some() {
+        let flash = crate::webhook::flash_sink_from_slot(session.flash.clone());
+        lines.push(
+            match crate::webhook::reload(&mut session.webhook, Some(flash)) {
+                Ok(n) => format!("webhook reloaded — {n} handler(s)"),
+                Err(e) => format!("webhook reload failed: {e}"),
+            },
+        );
+    }
+    lines
 }
 
 /// `:plugin memory …` — inspect and manage a plugin's file-based memory
@@ -8466,6 +8760,14 @@ async fn handle_colon(
                  :mcp remove <name>                  disconnect + unsave an MCP server\n\
                  :mcp tools [name]                   list MCP tools\n\
                  :mcp test [name|all]                live-probe MCP server(s) — tools/list round-trip + latency\n\
+                 :plugin [list]                      installed plugins (disabled ones marked)\n\
+                 :plugin info <id>                   one plugin's provenance (hooks, MCP, skills, enabled)\n\
+                 :plugin enable|disable <id>         toggle a plugin (saved in ~/.aish/plugins.state.json);\n\
+                                                     hooks/timers/webhooks apply now, MCP + skills on :restart\n\
+                 :plugin reload [id]                 re-load plugin hooks/timers/webhooks (+ re-run <id>'s on_init)\n\
+                 :plugin config <id>                 effective plugin config (defaults + config.json + env refs),\n\
+                                                     secrets redacted; --set <key> <value> validates + saves,\n\
+                                                     --reset [key] drops one key or the whole config.json\n\
                  :yolo                               toggle yolo mode\n\
                  :new                                clear conversation history\n\
                  :context                            show context-window usage (tokens, %, memories)\n\
@@ -11345,6 +11647,93 @@ mod tests {
         assert_eq!(names("model"), vec!["model", "model-detect"]);
         // a char that matches nothing yields an empty set (menu closes / beeps).
         assert!(names("modez").is_empty());
+    }
+
+    /// TASK-272: `:plugin` subcommand + id completion.
+    #[test]
+    fn complete_plugin_args_subcommands_and_ids() {
+        let plugins = vec![
+            ("github".to_string(), true),
+            ("gitlab".to_string(), false),
+            ("slack".to_string(), true),
+        ];
+        let reps = |r: Option<(usize, Vec<Pair>)>| -> (usize, Vec<String>) {
+            let (s, p) = r.expect("completes");
+            (s, p.into_iter().map(|p| p.replacement).collect())
+        };
+        assert_eq!(
+            reps(complete_plugin_args(":plugin re", &plugins)),
+            (8, vec!["reload ".to_string(), "remove ".to_string()])
+        );
+        assert_eq!(
+            reps(complete_plugin_args(":plugin disable g", &plugins)),
+            (16, vec!["github ".to_string()])
+        );
+        assert_eq!(
+            reps(complete_plugin_args(":plugin enable ", &plugins)),
+            (15, vec!["gitlab ".to_string()])
+        );
+        assert_eq!(
+            reps(complete_plugin_args(":plugins info ", &plugins))
+                .1
+                .len(),
+            3
+        );
+        assert!(complete_plugin_args(":plugin memory x", &plugins).is_none());
+        assert!(complete_plugin_args(":hooks re", &plugins).is_none());
+    }
+
+    /// TASK-271: `:plugin config` subcommand, id, flag and key completion.
+    #[test]
+    fn complete_plugin_config_subcommand_ids_flags_and_keys() {
+        let plugins = vec![("github".to_string(), true), ("gitlab".to_string(), false)];
+        let reps = |r: Option<(usize, Vec<Pair>)>| -> (usize, Vec<String>) {
+            let (s, p) = r.expect("completes");
+            (s, p.into_iter().map(|p| p.replacement).collect())
+        };
+        assert_eq!(
+            reps(complete_plugin_args(":plugin co", &plugins)),
+            (8, vec!["config ".to_string()])
+        );
+        // Both enabled and disabled plugins are configurable.
+        assert_eq!(
+            reps(complete_plugin_args(":plugin config git", &plugins)).1,
+            vec!["github ".to_string(), "gitlab ".to_string()]
+        );
+        let keys_for = |id: &str| -> Vec<String> {
+            if id == "github" {
+                vec!["token_refresh_interval".into(), "webhook_events".into()]
+            } else {
+                vec![]
+            }
+        };
+        assert_eq!(
+            reps(complete_plugin_config_args(
+                ":plugin config github --",
+                &keys_for
+            )),
+            (22, vec!["--set ".to_string(), "--reset ".to_string()])
+        );
+        assert_eq!(
+            reps(complete_plugin_config_args(
+                ":plugin config github --set to",
+                &keys_for
+            )),
+            (28, vec!["token_refresh_interval ".to_string()])
+        );
+        assert_eq!(
+            reps(complete_plugin_config_args(
+                ":plugin config github --reset ",
+                &keys_for
+            ))
+            .1
+            .len(),
+            2
+        );
+        assert!(complete_plugin_config_args(":plugin info github x", &keys_for).is_none());
+        assert!(
+            complete_plugin_config_args(":plugin config github --set k v", &keys_for).is_none()
+        );
     }
 
     #[test]

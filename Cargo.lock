@@ -78,6 +78,8 @@ dependencies = [
  "async-trait",
  "futures-util",
  "libc",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3468,8 +3470,12 @@ checksum = "c6989540ced10490aaf14e6bad2e3d33728a2813310a0c71d1574304c49631cd"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -3693,6 +3699,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.8.8",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror 1.0.69",
  "utf-8",

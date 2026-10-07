@@ -166,6 +166,7 @@ mod tests {
             id: id.into(),
             name: String::new(),
             version: String::new(),
+            enabled: None,
             webhooks,
         };
         let reg = PluginRegistry::from_plugins(vec![

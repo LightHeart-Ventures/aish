@@ -4,6 +4,9 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Fixed
+- **Webhook broker client now speaks the broker's protocol** (TASK-449): the client registers over HTTP (`POST /clients/register`) to get a `session_token`, authenticates the WebSocket with `{"type":"auth","session_token"}`, and acks with `{"type":"ack","webhook_id"}` — previously the broker rejected every auth and never saw an ack. `auth_error` now fails fast and triggers re-registration. `wss://` brokers are dialable (rustls). **New required env var `WEBHOOK_PLUGIN_ID`** alongside `WEBHOOK_BROKER_URL`; `WEBHOOK_BROKER_SECRET` is now the registration secret (the broker then requires signed webhooks). A contract test (`crates/aish-webhook-broker/tests/client_contract.rs`) runs the real broker against the real client. The bundled hello-world plugin declares a `ping` webhook handler, and its `handlers/ping.sh` now actually reads the payload's `message`.
+
 ## [0.52.1] - 2026-10-07
 
 Shipped as 0.52.1: the `v0.52.0` tag is unusable. The release for it was pre-published by hand instead of by the Release workflow, GitHub marked it immutable with zero assets, and the workflow's `Assert no published release already exists for this tag` gate then (correctly) refused to attach the `:update` binaries. Same failure mode as `v0.48.0`.
