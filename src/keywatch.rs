@@ -394,6 +394,14 @@ fn reader_loop(
                         if let Some(cb) = on_shift_tab.as_ref() {
                             cb();
                         }
+                        // The cycle SWITCHES the view: `cycle_worker_live` wipes
+                        // the viewport and redraws the newly-attached pane
+                        // (header + replayed tail), exactly like the at-the-prompt
+                        // `:attach`. That wipe takes the mid-turn prompt
+                        // affordance with it, so repaint the in-progress line —
+                        // otherwise a half-typed command is still in `linebuf` but
+                        // invisible until the next keystroke.
+                        paint_midturn(cfg, &linebuf.as_string());
                         let _ = tx.send(TurnKey::ShiftTab);
                     }
                 }
