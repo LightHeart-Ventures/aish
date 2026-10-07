@@ -4971,7 +4971,7 @@ fn collect_worker_rows(session: &Session) -> Vec<crate::workers_modal::WorkerRow
         .iter()
         .cloned()
         .collect();
-    in_mem.sort_by(|a, b| b.started_epoch().cmp(&a.started_epoch())); // newest-first
+    in_mem.sort_by_key(|w| std::cmp::Reverse(w.started_epoch())); // newest-first
     let mut rows: Vec<crate::workers_modal::WorkerRow> = in_mem
         .iter()
         .map(|w| {
@@ -6538,7 +6538,7 @@ fn take_any_flag<'a>(toks: &[&'a str]) -> (bool, Vec<&'a str>) {
     (false, toks.to_vec())
 }
 
-/// Queue an operator message for an in-flight background coordinator — the
+// Queue an operator message for an in-flight background coordinator — the
 // ───────────────────────── `:goal` subcommands (TASK-278) ─────────────────────────
 //
 // CRUD over the durable `crate::goal::Goal` records that TASK-277 persists in
@@ -6654,7 +6654,7 @@ fn goal_status_dashboard(session: &mut Session) -> String {
 
     let current = session.current_goal().map(|g| g.id.clone());
     let mut goals: Vec<&Goal> = session.goals.iter().collect();
-    goals.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    goals.sort_by_key(|g| std::cmp::Reverse(g.updated_at));
     let active = goals
         .iter()
         .filter(|g| g.status == GoalStatus::Active)
@@ -7358,7 +7358,7 @@ pub(crate) fn stop_coordinator_ctx(id: Option<&str>, any: bool, ctx: &OpsCtx) ->
 fn handle_context(backend: &Backend, session: &Session) {
     let window = backend.context_window();
     let used = session.context_used;
-    let pct = if window > 0 { used * 100 / window } else { 0 };
+    let pct = (used * 100).checked_div(window).unwrap_or(0);
     let mem = session
         .db
         .as_ref()
@@ -7486,11 +7486,7 @@ fn handle_compact(backend: &Backend, session: &mut Session) {
             // just re-seated from a full scan. (ISS-409753)
             session.usage_mark = session.history.len();
             let window = backend.context_window();
-            let pct = if window > 0 {
-                session.context_used * 100 / window
-            } else {
-                0
-            };
+            let pct = (session.context_used * 100).checked_div(window).unwrap_or(0);
             println!(
                 "compacted — {dropped} message(s) offloaded to memory (recall \"context-offload\"); context now ~{pct}%"
             );
@@ -9325,7 +9321,7 @@ async fn handle_colon(
                 .iter()
                 .cloned()
                 .collect();
-            in_mem.sort_by(|a, b| b.started_epoch().cmp(&a.started_epoch()));
+            in_mem.sort_by_key(|w| std::cmp::Reverse(w.started_epoch()));
             for w in in_mem.iter() {
                 any = true;
                 seen.insert(w.id.clone());

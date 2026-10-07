@@ -46,6 +46,7 @@ pub const DEFAULT_BATCH_MODEL: &str = "claude-opus-5";
 
 /// The metered key as seen in an explicit env slice (session env / `~/.aishrc`
 /// exports). Last export wins; blank is absent. Pure — no process env access.
+#[allow(dead_code)] // pure half, unit-tested directly; production resolves via `metered_key`.
 pub fn metered_key_in(env: &[(String, String)]) -> Option<String> {
     env.iter()
         .rev()
@@ -54,7 +55,7 @@ pub fn metered_key_in(env: &[(String, String)]) -> Option<String> {
         .filter(|v| !v.trim().is_empty())
 }
 
-/// `metered_key_in` with the process environment as the fallback source.
+// `metered_key_in` with the process environment as the fallback source.
 
 /// The one-line explanation every caller prints when the batch tier was wanted
 /// but is unreachable: the work still runs — on `batch_model` (Opus by default)

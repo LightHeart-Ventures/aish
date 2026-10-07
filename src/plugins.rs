@@ -2705,7 +2705,7 @@ mod tests {
         assert_eq!(cfg["greeter"], "ada");
     }
 
-    /// A private, dependency-free temp dir (the crate doesn't pull in the
+    // A private, dependency-free temp dir (the crate doesn't pull in the
     // ---- Phase 0.5.4: lifecycle-hook env-injection tests ----
 
     /// Write an executable `<root>/<id>/hooks/<hook>.sh` with the given body.
@@ -3454,7 +3454,7 @@ mod tests {
         );
     }
 
-    /// A private, dependency-free temp dir (the crate doesn't pull in the
+    // A private, dependency-free temp dir (the crate doesn't pull in the
     /// `tempfile` crate for this module — mirror skills.rs's test helper).
     ///
     /// A per-process counter makes names unique even when parallel tests read

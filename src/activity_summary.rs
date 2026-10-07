@@ -334,8 +334,8 @@ mod tests {
         // 118 - 46 = 72, which is inside the clamp window.
         assert_eq!(budget(118), 72);
         // The other two surfaces would have allowed more.
-        assert!(118 - ESCALATION_HEAD_CHROME > 72);
-        assert!(118 - ESCALATION_STATUS_CHROME > 72);
+        const { assert!(118 - ESCALATION_HEAD_CHROME > 72) };
+        const { assert!(118 - ESCALATION_STATUS_CHROME > 72) };
     }
 
     #[test]

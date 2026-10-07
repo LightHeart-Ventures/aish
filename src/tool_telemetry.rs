@@ -461,7 +461,7 @@ pub fn render_report(
             "TOOL", "ERROR CLASS", "RETRIES", "RECOVERED", "RATE"
         ));
         let mut retries: Vec<&RetryStat> = retries.iter().collect();
-        retries.sort_by(|a, b| b.retries.cmp(&a.retries));
+        retries.sort_by_key(|r| std::cmp::Reverse(r.retries));
         for r in retries {
             out.push_str(&format!(
                 "{:<24} {:<14} {:>7} {:>9} {:>5.0}%\n",

@@ -145,6 +145,9 @@ fn detect_total_ram_mb() -> u64 {
 }
 
 /// Parse `MemTotal:` (kB) out of `/proc/meminfo` contents.
+// Only the Linux branch of `total_mem_mb` reads /proc/meminfo, so this is
+// genuinely unreachable off Linux; the lint stays live there.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_meminfo_kb(contents: &str) -> Option<u64> {
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {

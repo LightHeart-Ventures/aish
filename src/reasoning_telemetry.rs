@@ -444,11 +444,9 @@ impl Bucket {
     /// 0%).
     pub fn guess_wrong_pct(&self) -> Option<u32> {
         let known = self.guess_correct + self.guess_wrong;
-        if known == 0 {
-            None
-        } else {
-            Some((self.guess_wrong * 100 / known) as u32)
-        }
+        (self.guess_wrong * 100)
+            .checked_div(known)
+            .map(|pct| pct as u32)
     }
 }
 
@@ -466,11 +464,9 @@ pub struct Summary {
 impl Summary {
     /// Escalate rate over all recorded decisions, as a percentage.
     pub fn escalate_pct(&self) -> Option<u32> {
-        if self.total == 0 {
-            None
-        } else {
-            Some((self.overall.escalated * 100 / self.total) as u32)
-        }
+        (self.overall.escalated * 100)
+            .checked_div(self.total)
+            .map(|pct| pct as u32)
     }
 }
 

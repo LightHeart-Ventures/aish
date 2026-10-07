@@ -3602,7 +3602,7 @@ fn read_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) 
         // It reports the file's line count and suggests a concrete first slice so
         // the agent can retry immediately with real bounds instead of guessing.
         let total = content.lines().count();
-        let suggested_end = total.min(200).max(1);
+        let suggested_end = total.clamp(1, 200);
         return Err(anyhow::anyhow!(
             "{} is {} bytes / {} lines (> {} KiB): bulk reads without line bounds are disallowed. \
 Read a slice — e.g. line_start=1, line_end={} (first {} of {} lines) — or use grep_files to \
@@ -4339,9 +4339,9 @@ fn grep_files(call: &ToolCall, session: &Session) -> Result<(String, serde_json:
                 if context > 0 {
                     let lo = i.saturating_sub(context);
                     let hi = (i + context + 1).min(lines.len());
-                    for j in lo..hi {
+                    for (j, ctx_line) in lines.iter().enumerate().take(hi).skip(lo) {
                         let marker = if j == i { ":" } else { "-" };
-                        out.push(format!("{display}:{}{marker} {}", j + 1, lines[j]));
+                        out.push(format!("{display}:{}{marker} {}", j + 1, ctx_line));
                     }
                     out.push("--".into());
                 } else {

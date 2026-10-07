@@ -218,12 +218,12 @@ fn ctrl_c_kills_child_not_shell() {
 
     // ── 6. Assert: child died from SIGINT ────────────────────────────────────
     assert!(
-        unsafe { libc::WIFSIGNALED(raw_status) },
+        libc::WIFSIGNALED(raw_status),
         "child exited cleanly (code {}); expected it to be killed by SIGINT \
          (raw_status={raw_status:#010x})",
-        unsafe { libc::WEXITSTATUS(raw_status) },
+        libc::WEXITSTATUS(raw_status),
     );
-    let sig = unsafe { libc::WTERMSIG(raw_status) };
+    let sig = libc::WTERMSIG(raw_status);
     assert_eq!(
         sig,
         libc::SIGINT,
@@ -304,15 +304,15 @@ fn sigint_to_child_pgrp_does_not_kill_shell() {
     );
 
     assert!(
-        unsafe { libc::WIFSIGNALED(status) },
+        libc::WIFSIGNALED(status),
         "child should have been killed by a signal (raw={status:#010x})",
     );
     assert_eq!(
-        unsafe { libc::WTERMSIG(status) },
+        libc::WTERMSIG(status),
         libc::SIGINT,
         "expected SIGINT ({}), got {}",
         libc::SIGINT,
-        unsafe { libc::WTERMSIG(status) },
+        libc::WTERMSIG(status),
     );
 
     // Shell is still here — SIGINT was scoped to the child's pgid only.
@@ -447,7 +447,7 @@ fn run_handoff_shell() -> ShellOutcome {
         std::io::Error::last_os_error()
     );
 
-    let stopped = unsafe { libc::WIFSTOPPED(status) };
+    let stopped = libc::WIFSTOPPED(status);
     if stopped {
         // The shell was SIGTTOU-stopped (AC violation) — don't leave it parked.
         unsafe {
@@ -459,15 +459,15 @@ fn run_handoff_shell() -> ShellOutcome {
     unsafe { libc::close(master_fd) };
 
     ShellOutcome {
-        exited: unsafe { libc::WIFEXITED(status) },
-        exit_code: if unsafe { libc::WIFEXITED(status) } {
-            unsafe { libc::WEXITSTATUS(status) }
+        exited: libc::WIFEXITED(status),
+        exit_code: if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
         } else {
             -1
         },
         stopped,
         stop_signal: if stopped {
-            unsafe { libc::WSTOPSIG(status) }
+            libc::WSTOPSIG(status)
         } else {
             0
         },

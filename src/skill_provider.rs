@@ -879,7 +879,7 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
     // Rank most-popular-first while keeping the registry's relative order as the
     // stable tiebreaker (sort_by is stable), so 0-star ties preserve relevance.
     let mut ranked: Vec<&SearchResult> = results.iter().collect();
-    ranked.sort_by(|a, b| b.stars.cmp(&a.stars));
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.stars));
 
     // Load locally installed skills to mark ones already in the catalog.
     let installed = crate::skills::load(&skills_dir_path());
@@ -904,7 +904,7 @@ pub fn print_results_table(query: &str, results: &[SearchResult]) -> String {
             // raw `name` field matches a locally-installed skill directory.
             let leaf = r.short_name();
             let leaf = leaf.rsplit('/').next().unwrap_or(&leaf);
-            if installed_names.contains(&leaf.to_string())
+            if installed_names.contains(leaf)
                 || (!r.name.is_empty() && installed_names.contains(&r.name))
             {
                 "✓ installed".to_string()
@@ -994,7 +994,7 @@ pub fn print_results_table_sourced(query: &str, results: &[(SearchResult, String
         return format!("No skills found for {query:?}.");
     }
     let mut ranked: Vec<&(SearchResult, String)> = results.iter().collect();
-    ranked.sort_by(|a, b| b.0.stars.cmp(&a.0.stars));
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.0.stars));
 
     let installed = crate::skills::load(&skills_dir_path());
     let installed_names: std::collections::HashSet<_> =
@@ -1016,7 +1016,7 @@ pub fn print_results_table_sourced(query: &str, results: &[(SearchResult, String
         .map(|r| {
             let leaf = r.0.short_name();
             let leaf = leaf.rsplit('/').next().unwrap_or(&leaf);
-            if installed_names.contains(&leaf.to_string())
+            if installed_names.contains(leaf)
                 || (!r.0.name.is_empty() && installed_names.contains(&r.0.name))
             {
                 "✓ installed".to_string()

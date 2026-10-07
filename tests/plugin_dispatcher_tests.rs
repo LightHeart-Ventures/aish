@@ -16,7 +16,6 @@
 //!   cargo test --no-default-features --locked plugin_dispatcher
 
 #[path = "../src/plugin_state.rs"]
-#[allow(dead_code)]
 mod plugin_state;
 
 #[path = "../src/plugin_enable.rs"]
@@ -28,7 +27,6 @@ mod plugin_enable;
 mod plugin_health;
 
 #[path = "../src/plugin_dispatcher.rs"]
-#[allow(dead_code)]
 mod plugin_dispatcher;
 
 use plugin_dispatcher::{Event, PluginDispatcher};
@@ -55,7 +53,7 @@ fn tempdir(tag: &str) -> PathBuf {
 }
 
 /// Write `<root>/<id>/plugin.json` with the given manifest JSON.
-fn write_plugin(root: &PathBuf, id: &str, manifest: &str) {
+fn write_plugin(root: &std::path::Path, id: &str, manifest: &str) {
     let pdir = root.join(id);
     std::fs::create_dir_all(&pdir).unwrap();
     std::fs::write(pdir.join("plugin.json"), manifest).unwrap();

@@ -206,10 +206,12 @@ impl McpHost {
     /// that fails to start or handshake is skipped with a warning — one bad
     /// entry must not take the shell down.
     pub async fn start(config_paths: &[&Path]) -> Self {
-        let mut host = Self::default();
-        // Last path is user scope (project precedes user) — adds/removes land there.
-        host.user_config = config_paths.last().map(|p| p.to_path_buf());
-        host.config_paths = config_paths.iter().map(|p| p.to_path_buf()).collect();
+        let mut host = Self {
+            // Last path is user scope (project precedes user) — adds/removes land there.
+            user_config: config_paths.last().map(|p| p.to_path_buf()),
+            config_paths: config_paths.iter().map(|p| p.to_path_buf()).collect(),
+            ..Default::default()
+        };
         host.connect_missing().await;
         host
     }

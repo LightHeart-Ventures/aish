@@ -3627,14 +3627,14 @@ pub fn resume_in_place(
     (id, thread)
 }
 
-/// The run task: re-exec aish in `--coordinator` mode, capture stdout as the
-/// result, enforce a timeout, then surface it.
-/// Drive one coordinator run to completion against `job`. `run_id` is the
-/// coordinator run identity for THIS thread — equal to `job.id` for the original
-/// run, but a fresh id for an in-place resume (so the child's worktree leaf,
-/// durable record, and per-worker transcript are thread-distinct). All
-/// operator-facing labels (`[{}]` announces, `:workers` row) stay keyed on the
-/// stable `job.id`.
+// The run task: re-exec aish in `--coordinator` mode, capture stdout as the
+// result, enforce a timeout, then surface it.
+// Drive one coordinator run to completion against `job`. `run_id` is the
+// coordinator run identity for THIS thread — equal to `job.id` for the original
+// run, but a fresh id for an in-place resume (so the child's worktree leaf,
+// durable record, and per-worker transcript are thread-distinct). All
+// operator-facing labels (`[{}]` announces, `:workers` row) stay keyed on the
+// stable `job.id`.
 // ── Fan-out spawn stagger (ISS-407772) ──────────────────────────────────────
 //
 // A fan-out wave dispatches N workers from the SAME turn, so with no gate all N
@@ -5806,7 +5806,7 @@ mod tests {
         assert_eq!(effective_worker_mem_mb(8192), 8192);
         // Sanity: the default cap must itself be runnable (never below the floor),
         // so out-of-the-box coordinators can always launch Node-based tools.
-        assert!(DEFAULT_WORKER_MEM_MB >= MIN_WORKER_MEM_MB);
+        const { assert!(DEFAULT_WORKER_MEM_MB >= MIN_WORKER_MEM_MB) };
     }
 
     #[test]

@@ -2493,10 +2493,12 @@ mod tests {
         // Repeated successes keep it at zero (no spurious warnings).
         beat_once(&store, "run_beat", &mut failures);
         assert_eq!(failures, 0);
-        assert!(
-            super::HEARTBEAT_FAILURE_LOG_AFTER >= 2,
-            "a single lost beat must stay quiet"
-        );
+        const {
+            assert!(
+                super::HEARTBEAT_FAILURE_LOG_AFTER >= 2,
+                "a single lost beat must stay quiet"
+            )
+        };
         let _ = std::fs::remove_file(&path);
     }
 

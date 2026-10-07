@@ -202,6 +202,7 @@ pub fn pin(id: &str, task: &str) {
 }
 
 /// Retire EVERY banner (the footer shrinks back on the next paint).
+#[allow(dead_code)] // completes the BANNERS push/remove/clear API; no caller wired yet.
 pub fn clear() {
     if let Ok(mut banners) = BANNERS.lock() {
         banners.clear();

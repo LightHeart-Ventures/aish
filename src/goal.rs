@@ -1760,7 +1760,7 @@ impl Goal {
         let mut out = format!("Goal: {}", truncate_ellipsis(&self.title, 72));
         let (done, total) = self.milestone_progress();
         if total > 0 {
-            let pct = done * 100 / total;
+            let pct = (done * 100).checked_div(total).unwrap_or(0);
             match self.milestones.iter().find(|m| !m.done) {
                 Some(current) => out.push_str(&format!(
                     " — current milestone: {} ({done}/{total} done, {pct}%)",
