@@ -548,6 +548,7 @@ mod tests {
                 id: "gh".into(),
                 name: String::new(),
                 version: String::new(),
+                enabled: None,
                 webhooks: vec![
                     handler("pull_request", "/p/gh/on_pr.sh", json!({})),
                     handler("pull_request", "true", json!({"action": "closed"})),
@@ -557,6 +558,7 @@ mod tests {
                 id: "other".into(),
                 name: String::new(),
                 version: String::new(),
+                enabled: None,
                 webhooks: vec![handler("*", "true", json!({}))],
             },
         ])

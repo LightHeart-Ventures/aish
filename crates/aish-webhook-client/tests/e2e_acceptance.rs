@@ -35,6 +35,7 @@ fn registry() -> PluginRegistry {
             id: "echo".into(),
             name: "Echo".into(),
             version: "0.0.0".into(),
+            enabled: None,
             webhooks: vec![WebhookHandler {
                 event_type: "pull_request".into(),
                 command: vec!["/bin/cat".into()],
@@ -46,6 +47,7 @@ fn registry() -> PluginRegistry {
             id: "broken".into(),
             name: "Broken".into(),
             version: "0.0.0".into(),
+            enabled: None,
             webhooks: vec![WebhookHandler {
                 event_type: "pull_request".into(),
                 command: vec![
