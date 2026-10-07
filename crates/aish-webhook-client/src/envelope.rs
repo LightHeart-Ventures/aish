@@ -13,7 +13,9 @@ pub struct BrokerConfig {
     pub broker_url: String,
     /// Tenant this client authenticates as.
     pub tenant_id: String,
-    /// Optional plugin scope (broker may fan out per-plugin).
+    /// Broker `plugin_id` this client registers for. The broker routes
+    /// webhooks by `(tenant_id, plugin_id)`, so this is REQUIRED for
+    /// `POST /clients/register` (aish: `WEBHOOK_PLUGIN_ID`).
     #[serde(default)]
     pub plugin: Option<String>,
     /// Transport hint; only `"websocket"` is implemented.
@@ -22,7 +24,10 @@ pub struct BrokerConfig {
     /// Master enable switch — aish skips broker init when false.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Optional shared secret echoed in the auth frame.
+    /// Optional shared secret sent as `secret` in `POST /clients/register`.
+    /// Once registered, the broker requires an HMAC-SHA256 `X-Signature` on
+    /// inbound webhooks for this `(tenant_id, plugin_id)` (aish:
+    /// `WEBHOOK_BROKER_SECRET`). Never sent over the WebSocket.
     #[serde(default)]
     pub secret: Option<String>,
     /// Stable client id; generated when absent.
@@ -68,17 +73,14 @@ pub struct Webhook {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientFrame<'a> {
-    /// Auth/registration handshake.
-    Auth {
-        tenant_id: &'a str,
-        client_id: &'a str,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        plugin: Option<&'a str>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        secret: Option<&'a str>,
-    },
-    /// Acknowledge a delivered webhook so the broker drops it from its queue.
-    Ack { id: &'a str },
+    /// WebSocket auth handshake. The broker only accepts a `session_token`
+    /// previously issued by `POST /clients/register` (see [`crate::register`]),
+    /// validates it against its client table and answers `auth_ok` or
+    /// `auth_error`.
+    Auth { session_token: &'a str },
+    /// Acknowledge a delivered webhook so the broker marks it delivered and
+    /// drops it from its queue. The broker reads the `webhook_id` key.
+    Ack { webhook_id: &'a str },
     /// Application-level heartbeat response.
     Pong,
 }
@@ -93,6 +95,9 @@ pub enum ServerFrame {
         session_token: Option<String>,
         client_id: Option<String>,
     },
+    /// Auth rejected (`{"type":"auth_error","error":"..."}`); the broker closes
+    /// the socket right after sending it.
+    AuthError(String),
     /// Application-level heartbeat request.
     Ping,
     /// Anything else we safely ignore.
@@ -111,6 +116,12 @@ impl ServerFrame {
                 Ok(ServerFrame::Webhook(w))
             }
             Some("ping") => Ok(ServerFrame::Ping),
+            Some("auth_error") => Ok(ServerFrame::AuthError(
+                v.get("error")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("authentication failed")
+                    .to_string(),
+            )),
             Some("auth_ok") | Some("registered") | Some("ack") => Ok(ServerFrame::AuthOk {
                 session_token: v
                     .get("session_token")
@@ -175,6 +186,45 @@ mod tests {
             }
             other => panic!("expected auth_ok, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_auth_error() {
+        let txt = r#"{"type":"auth_error","error":"authentication failed"}"#;
+        assert_eq!(
+            ServerFrame::parse(txt).unwrap(),
+            ServerFrame::AuthError("authentication failed".into())
+        );
+    }
+
+    #[test]
+    fn parse_broker_webhook_envelope() {
+        // Exact shape of aish-webhook-broker `queue::Webhook::to_envelope`.
+        let txt = r#"{"type":"webhook","id":"wh_1","tenant_id":"t","plugin_id":"hello-world","event_type":"ping","payload":{"message":"hi"},"received_at":"2026-10-06T00:00:00Z"}"#;
+        match ServerFrame::parse(txt).unwrap() {
+            ServerFrame::Webhook(w) => {
+                assert_eq!(w.id, "wh_1");
+                assert_eq!(w.plugin_id, "hello-world");
+                assert_eq!(w.event_type, "ping");
+            }
+            other => panic!("expected webhook, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_frames_match_broker_wire_format() {
+        // The broker (ws.rs) reads `session_token` from auth and `webhook_id`
+        // from ack — pin the exact JSON so the two crates cannot drift again.
+        let auth = serde_json::to_value(ClientFrame::Auth {
+            session_token: "st_abc",
+        })
+        .unwrap();
+        assert_eq!(
+            auth,
+            serde_json::json!({"type":"auth","session_token":"st_abc"})
+        );
+        let ack = serde_json::to_value(ClientFrame::Ack { webhook_id: "wh_1" }).unwrap();
+        assert_eq!(ack, serde_json::json!({"type":"ack","webhook_id":"wh_1"}));
     }
 
     #[test]

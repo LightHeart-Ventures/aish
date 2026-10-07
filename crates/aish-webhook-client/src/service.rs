@@ -126,7 +126,7 @@ mod tests {
     #[tokio::test]
     async fn run_dispatches_then_acks_then_shuts_down() {
         let (mock, mut handle) = mock_transport();
-        let mut client = BrokerClient::new(cfg());
+        let mut client = BrokerClient::new(cfg()).with_session_token("st_test");
 
         // Complete auth, then deliver one webhook.
         let drive = tokio::spawn(async move {
@@ -170,7 +170,7 @@ mod tests {
     #[tokio::test]
     async fn broker_close_stops_loop() {
         let (mock, mut handle) = mock_transport();
-        let mut client = BrokerClient::new(cfg());
+        let mut client = BrokerClient::new(cfg()).with_session_token("st_test");
         let drive = tokio::spawn(async move {
             let _ = handle.next_sent().await;
             handle.push_text(r#"{"type":"auth_ok"}"#);
