@@ -6119,7 +6119,7 @@ mod tests {
             pid
         );
         assert!(
-            unsafe { libc::WIFSTOPPED(status) },
+            libc::WIFSTOPPED(status),
             "child should be stopped"
         );
 
@@ -6136,7 +6136,7 @@ mod tests {
             pid
         );
         assert!(
-            unsafe { libc::WIFCONTINUED(status) },
+            libc::WIFCONTINUED(status),
             "child should have been continued by SIGCONT"
         );
 
