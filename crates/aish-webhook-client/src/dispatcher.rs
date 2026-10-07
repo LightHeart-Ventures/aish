@@ -130,6 +130,24 @@ impl PluginRegistry {
         self.plugins.is_empty()
     }
 
+    /// TASK-273 — ids of every loaded plugin, in load order.
+    pub fn plugin_ids(&self) -> Vec<&str> {
+        self.plugins.iter().map(|p| p.id.as_str()).collect()
+    }
+
+    /// TASK-273 — a registry containing only `plugin_id` (empty when unknown).
+    /// Used by `:webhook test|replay` to dispatch to a single plugin.
+    pub fn only(&self, plugin_id: &str) -> PluginRegistry {
+        Self {
+            plugins: self
+                .plugins
+                .iter()
+                .filter(|p| p.id == plugin_id)
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// All (plugin_id, handler) pairs subscribed to `event_type` (or `"*"`).
     pub fn matching(&self, event_type: &str) -> Vec<(&str, &WebhookHandler)> {
         let mut out = Vec::new();
@@ -222,12 +240,18 @@ pub fn passes_filters(
 /// aish's `session.flash` type — the caller adapts it (cap/format) to the slot.
 pub type FlashSink = Arc<dyn Fn(String) + Send + Sync>;
 
+/// TASK-273 — sink handed the full webhook plus every handler outcome once per
+/// dispatch (after the audit records). aish uses it to persist the per-plugin
+/// delivery log and write `last_delivery` plugin-memory metadata.
+pub type DeliverySink = Arc<dyn Fn(&Webhook, &[HandlerOutcome]) + Send + Sync>;
+
 /// Dispatches webhooks to plugin handlers (Phase 5 seam realized).
 pub struct WebhookDispatcher {
     registry: Arc<PluginRegistry>,
     default_timeout: Duration,
     audit: Arc<dyn AuditSink>,
     flash: Option<FlashSink>,
+    delivery: Option<DeliverySink>,
 }
 
 impl WebhookDispatcher {
@@ -237,7 +261,15 @@ impl WebhookDispatcher {
             default_timeout: DEFAULT_HANDLER_TIMEOUT,
             audit: Arc::new(NoopAuditSink),
             flash: None,
+            delivery: None,
         }
+    }
+
+    /// TASK-273 — attach a [`DeliverySink`], called once per dispatch that
+    /// matched at least one handler. Defaults to none.
+    pub fn with_delivery_sink(mut self, sink: DeliverySink) -> Self {
+        self.delivery = Some(sink);
+        self
     }
 
     /// Attach a [`FlashSink`]. Every executed handler that exits with a non-empty
@@ -350,6 +382,10 @@ impl WebhookDispatcher {
                 tracing::warn!(error = %e, plugin_id = %o.plugin_id,
                     "audit sink write failed");
             }
+        }
+
+        if let Some(delivery) = &self.delivery {
+            delivery(webhook, &outcomes);
         }
 
         outcomes
