@@ -46,7 +46,25 @@ jobs:
           rustup target add ${{ matrix.target }}
         shell: bash
 
-      - name: Cache cargo + target
+      # Split by runner because the two halves of this matrix must not share a
+      # cache store. GitHub's Actions cache is a single 10 GB per-repo quota and
+      # the macOS legs alone had it at 9.29 GB / 10 GB (30 entries, ~313 MB
+      # each), LRU-evicting every Linux entry before it could be restored.
+      # Blacksmith-hosted legs now cache to Blacksmith-local storage (drop-in
+      # fork, identical inputs); the GitHub-hosted macOS legs keep
+      # actions/cache. See .github/workflows/ci.yml for the full measurement.
+      - name: Cache cargo + target (Blacksmith)
+        if: runner.os == 'Linux'
+        uses: useblacksmith/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo + target (GitHub-hosted)
+        if: runner.os != 'Linux'
         uses: actions/cache@v5
         with:
           path: |

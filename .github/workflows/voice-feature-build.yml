@@ -50,8 +50,11 @@ jobs:
           rustup update --no-self-update stable
           rustup default stable
 
+      # Blacksmith's own cache store — see ci.yml for why this is NOT
+      # actions/cache (GitHub's shared 10 GB quota is fully consumed by the
+      # macOS release legs, so Linux entries never survived to be restored).
       - name: Cache cargo + target
-        uses: actions/cache@v5
+        uses: useblacksmith/cache@v5
         with:
           path: |
             ~/.cargo/registry

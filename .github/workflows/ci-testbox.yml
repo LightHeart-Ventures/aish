@@ -68,8 +68,11 @@ jobs:
           rustup update --no-self-update stable
           rustup default stable
 
+      # Blacksmith's own cache store — see ci.yml for why this is NOT
+      # actions/cache. Kept in lockstep with ci.yml so the warm testbox VM
+      # restores from the same store the real gate writes to.
       - name: Cache cargo + target
-        uses: actions/cache@v5
+        uses: useblacksmith/cache@v5
         with:
           path: |
             ~/.cargo/registry
