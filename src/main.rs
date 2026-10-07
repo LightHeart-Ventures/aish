@@ -87,6 +87,7 @@ mod transcript_ring;
 mod turn_audit;
 mod update;
 mod webhook;
+mod webhook_debug;
 mod worker;
 mod worker_store;
 mod workers_modal;

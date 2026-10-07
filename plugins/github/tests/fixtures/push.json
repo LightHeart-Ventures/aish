@@ -1,0 +1,50 @@
+{
+  "ref": "refs/heads/main",
+  "before": "6113728f27ae82c7b1a177c8d03f9e96e0adf246",
+  "after": "0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c",
+  "created": false,
+  "deleted": false,
+  "forced": false,
+  "base_ref": null,
+  "compare": "https://github.com/acme/widgets/compare/6113728f27ae...0d1a26e67d8f",
+  "commits": [
+    {
+      "id": "a10867b14bb761a232cd80139fbd4c0d33264240",
+      "message": "Add widget registry",
+      "timestamp": "2026-10-01T12:00:00Z",
+      "author": { "name": "The Octocat", "email": "octocat@example.com", "username": "octocat" },
+      "added": ["src/registry.rs"], "removed": [], "modified": []
+    },
+    {
+      "id": "b2f2c3a4d5e6f708192a3b4c5d6e7f8091a2b3c4",
+      "message": "Wire registry into CLI",
+      "timestamp": "2026-10-01T12:05:00Z",
+      "author": { "name": "The Octocat", "email": "octocat@example.com", "username": "octocat" },
+      "added": [], "removed": [], "modified": ["src/main.rs"]
+    },
+    {
+      "id": "0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c",
+      "message": "Fix widget lookup off-by-one\n\nThe index was 1-based in one call site.",
+      "timestamp": "2026-10-01T12:10:00Z",
+      "author": { "name": "The Octocat", "email": "octocat@example.com", "username": "octocat" },
+      "added": [], "removed": [], "modified": ["src/registry.rs"]
+    }
+  ],
+  "head_commit": {
+    "id": "0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c",
+    "message": "Fix widget lookup off-by-one\n\nThe index was 1-based in one call site.",
+    "timestamp": "2026-10-01T12:10:00Z",
+    "url": "https://github.com/acme/widgets/commit/0d1a26e67d8f5eaf1f6ba5c57fc3c7d91ac0fd1c",
+    "author": { "name": "The Octocat", "email": "octocat@example.com", "username": "octocat" }
+  },
+  "repository": {
+    "id": 1296269,
+    "name": "widgets",
+    "full_name": "acme/widgets",
+    "private": false,
+    "html_url": "https://github.com/acme/widgets",
+    "default_branch": "main"
+  },
+  "pusher": { "name": "octocat", "email": "octocat@example.com" },
+  "sender": { "login": "octocat", "id": 1, "type": "User" }
+}
