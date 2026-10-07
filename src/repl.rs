@@ -7430,6 +7430,13 @@ fn handle_plugin(args: Vec<&str>, session: &mut Session) {
                 None => println!("no such plugin `{id}` — try :plugin list"),
             }
         }
+        Some("errors") => {
+            let Some(id) = id else {
+                println!("usage: :plugin errors <id> [N]");
+                return;
+            };
+            print_plugin_errors(&dir, id, flag);
+        }
         Some("memory" | "mem") => handle_plugin_memory(&args[1..]),
         Some("list") | None => {
             let Some(list) = crate::plugins::format_plugin_list(&dir) else {
@@ -7438,6 +7445,7 @@ fn handle_plugin(args: Vec<&str>, session: &mut Session) {
             };
             println!("{list}");
             println!("\n:plugin info <id> for full provenance");
+            println!(":plugin errors <id> [N] for a plugin's error log");
             println!(":plugin enable|disable|reload <id> to toggle or reload a plugin");
             println!(":plugin add <id> to install a plugin from the registry");
         }
@@ -7447,8 +7455,56 @@ fn handle_plugin(args: Vec<&str>, session: &mut Session) {
 
 /// `:plugin` subcommands, for TAB completion and the usage line.
 const PLUGIN_SUBCOMMANDS: &[&str] = &[
-    "add", "disable", "enable", "info", "list", "memory", "reload", "remove",
+    "add", "disable", "enable", "errors", "info", "list", "memory", "reload", "remove",
 ];
+
+/// Default row count for `:plugin errors <id>` (TASK-274).
+const PLUGIN_ERRORS_DEFAULT_N: usize = 20;
+
+/// Render `:plugin errors <id> [N]` (TASK-274): the newest N (default 20)
+/// entries of the plugin's `errors.jsonl`, oldest first. Pure so it unit-tests
+/// against a temp plugins dir; `Err` carries the user-facing message.
+fn render_plugin_errors(dir: &Path, id: &str, n: Option<&str>) -> Result<String, String> {
+    let n = match n {
+        None => PLUGIN_ERRORS_DEFAULT_N,
+        Some(s) => match s.parse::<usize>() {
+            Ok(v) if v > 0 => v,
+            _ => {
+                return Err(format!(
+                    "usage: :plugin errors <id> [N] — `{s}` is not a count"
+                ));
+            }
+        },
+    };
+    if !crate::plugins::discover_all(dir)
+        .iter()
+        .any(|p| p.manifest.id == id)
+    {
+        return Err(format!("no such plugin `{id}` — try :plugin list"));
+    }
+    let path = crate::plugin_health::errors_path(dir, id);
+    let entries = crate::plugin_health::tail(dir, id, n);
+    if entries.is_empty() {
+        return Ok(format!(
+            "no errors recorded for `{id}` ({})",
+            path.display()
+        ));
+    }
+    Ok(format!(
+        "{}\n\x1b[2m{} of up to {} kept · {}\x1b[0m",
+        crate::plugin_health::format_entries(&entries),
+        entries.len(),
+        crate::plugin_health::MAX_ENTRIES,
+        path.display()
+    ))
+}
+
+fn print_plugin_errors(dir: &Path, id: &str, n: Option<&str>) {
+    match render_plugin_errors(dir, id, n) {
+        Ok(s) => println!("{s}"),
+        Err(e) => println!("{e}"),
+    }
+}
 
 /// TAB completion for `:plugin …` arguments (TASK-272): the subcommand in
 /// word two, then a plugin id for `enable|disable|reload|info|remove`
@@ -7478,7 +7534,7 @@ fn complete_plugin_args(before: &str, plugins: &[(String, bool)]) -> Option<(usi
             let want: fn(bool) -> bool = match *sub {
                 "enable" => |on| !on,
                 "disable" | "reload" => |on| on,
-                "info" | "remove" | "rm" => |_| true,
+                "info" | "remove" | "rm" | "errors" => |_| true,
                 _ => return None,
             };
             let start = before.len() - partial.len();
@@ -7520,12 +7576,18 @@ fn rerun_plugin_on_init(session: &mut Session, dir: &Path, id: &str) {
 /// configured — the webhook client's handler registry (`:webhook reload`).
 /// Returns one human line per subsystem.
 fn reapply_plugin_runtime(session: &mut Session, dir: &Path) -> Vec<String> {
+    // TASK-274: re-validate configs first so the hook/webhook reloads below
+    // see the fresh config-invalid set; re-warn about any still-broken plugin.
+    let mut lines: Vec<String> = crate::plugins::refresh_config_health(dir)
+        .into_iter()
+        .map(|w| format!("\x1b[33m⚠\x1b[0m {w}"))
+        .collect();
     session.load_hooks();
     let timers = crate::plugin_timers::arm(dir);
     let statuslines = crate::plugin_statusline::arm(dir);
-    let mut lines = vec![format!(
+    lines.push(format!(
         "hooks reloaded · {timers} timer(s) · {statuslines} statusline segment(s) armed"
-    )];
+    ));
     if session.webhook.is_some() {
         let flash = crate::webhook::flash_sink_from_slot(session.flash.clone());
         lines.push(
@@ -7577,6 +7639,13 @@ fn handle_plugin_memory(args: &[&str]) {
         }
 
         // ---- get -----------------------------------------------------------
+        // TASK-274: the card's `:plugin memory <id> errors` spelling aliases
+        // `:plugin errors <id> [N]` (the trail lives in errors.jsonl, not in a
+        // plugin-memory namespace).
+        [id, "errors"] => print_plugin_errors(&crate::plugins::default_plugins_dir(), id, None),
+        [id, "errors", n] => {
+            print_plugin_errors(&crate::plugins::default_plugins_dir(), id, Some(n))
+        }
         [id, "get", ns, key] => match mem.get(id, ns, key) {
             Ok(v) => println!("{}", pretty_json(&v)),
             Err(e) => eprintln!("\x1b[31maish:\x1b[0m {e}"),
@@ -11352,6 +11421,69 @@ mod tests {
         );
         assert!(complete_plugin_args(":plugin memory x", &plugins).is_none());
         assert!(complete_plugin_args(":hooks re", &plugins).is_none());
+        // TASK-274: `errors` completes as a subcommand and offers every id.
+        assert_eq!(
+            reps(complete_plugin_args(":plugin er", &plugins)),
+            (8, vec!["errors ".to_string()])
+        );
+        assert_eq!(
+            reps(complete_plugin_args(":plugin errors ", &plugins))
+                .1
+                .len(),
+            3
+        );
+    }
+
+    /// TASK-274: `:plugin errors <id> [N]` rendering.
+    #[test]
+    fn render_plugin_errors_tail_and_messages() {
+        let dir = std::env::temp_dir().join(format!(
+            "aish-repl-plugin-errors-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pdir = dir.join("gh");
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(pdir.join("plugin.json"), r#"{"id":"gh"}"#).unwrap();
+        assert!(
+            render_plugin_errors(&dir, "gh", None)
+                .unwrap()
+                .starts_with("no errors recorded for `gh`")
+        );
+        for i in 0..3 {
+            crate::plugin_health::record(
+                &dir,
+                "gh",
+                "hook_failed",
+                "on_init",
+                &format!("m{i}"),
+                "r",
+            );
+        }
+        let out = render_plugin_errors(&dir, "gh", Some("2")).unwrap();
+        assert!(
+            !out.contains("m0") && out.contains("m1") && out.contains("m2"),
+            "{out}"
+        );
+        assert!(out.contains("hook_failed on_init: m2 → r"));
+        assert!(
+            render_plugin_errors(&dir, "gh", None)
+                .unwrap()
+                .contains("m0")
+        );
+        assert!(
+            render_plugin_errors(&dir, "nope", None)
+                .unwrap_err()
+                .contains("no such plugin")
+        );
+        assert!(
+            render_plugin_errors(&dir, "gh", Some("x"))
+                .unwrap_err()
+                .contains("usage")
+        );
     }
 
     #[test]

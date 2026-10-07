@@ -44,6 +44,7 @@ mod plan_dag_loop_tests;
 mod plugin_auth;
 mod plugin_dispatcher;
 mod plugin_enable;
+mod plugin_health;
 mod plugin_memory;
 #[cfg(test)]
 mod plugin_phase05_consolidation_tests;
@@ -568,6 +569,13 @@ async fn main() -> Result<()> {
     // alphabetically-first wins (first-plugin-wins). Operators can disable the
     // whole mechanism with `AISH_ENV_INJECTION_DISABLED=1`.
     {
+        // TASK-274: validate every enabled plugin's config ONCE here. A
+        // config-invalid plugin keeps its skills but its hooks + webhook
+        // handlers are skipped until fixed — this is the single startup warning
+        // (never an auto-disable; plugins.state.json is untouched).
+        for w in plugins::refresh_config_health(&aish_dir.join("plugins")) {
+            startup_notices.push(format!("\x1b[33maish:\x1b[0m {w}"));
+        }
         let ambient: Vec<(String, String)> = std::env::vars().collect();
         let injected =
             plugins::collect_lifecycle_env(&aish_dir.join("plugins"), "on_init", &ambient);
