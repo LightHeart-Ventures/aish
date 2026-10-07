@@ -43,9 +43,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aish_webhook_client::{
-    AuditRecord, BrokerClient, BrokerConfig, ConnState, DeliverySink, ExponentialBackoff,
-    FlashSink, HandlerCounters, MemoryAuditSink, PluginRegistry, StopReason, WebhookClientError,
-    WebhookDispatcher, WebhookService, transport::TungsteniteTransport,
+    AuditRecord, AuditSink, BrokerClient, BrokerConfig, ConnState, DeliverySink,
+    ExponentialBackoff, FlashSink, HandlerCounters, MemoryAuditSink, ObserverAuditSink,
+    PluginRegistry, StopReason, WebhookClientError, WebhookDispatcher, WebhookService,
+    transport::TungsteniteTransport,
 };
 use tokio::sync::watch;
 
@@ -134,7 +135,7 @@ impl WebhookHandle {
     pub fn spawn(config: BrokerConfig, plugins_dir: PathBuf, flash: Option<FlashSink>) -> Self {
         // Load plugin webhook handlers; soft-fail to an empty registry so a
         // missing/!readable plugin dir never blocks broker connectivity.
-        let registry = match PluginRegistry::load_dir(&plugins_dir) {
+        let mut registry = match PluginRegistry::load_dir(&plugins_dir) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -145,15 +146,38 @@ impl WebhookHandle {
                 PluginRegistry::from_plugins(Vec::new())
             }
         };
+        // TASK-274: a plugin whose config fails validation keeps its skills but
+        // its webhook handlers are skipped until the config is fixed (the
+        // operator was already warned once at startup / on `:plugin reload`).
+        let invalid: Vec<String> = crate::plugins::config_invalid_plugins(&plugins_dir)
+            .into_iter()
+            .map(|(id, err)| {
+                tracing::warn!(plugin = %id, error = %err,
+                    "webhook: config invalid — handlers skipped until fixed");
+                id
+            })
+            .collect();
+        registry.exclude(&invalid);
         let handler_count = registry.len();
         let registry = Arc::new(registry);
         let audit = Arc::new(MemoryAuditSink::new());
+        // TASK-274: mirror handler failures/timeouts into the plugin's
+        // `errors.jsonl` audit trail; `:webhook logs` keeps reading `audit`.
+        let observer_dir = plugins_dir.clone();
+        let task_sink: Arc<dyn AuditSink> = Arc::new(ObserverAuditSink::new(
+            audit.clone(),
+            Arc::new(move |r: &AuditRecord| {
+                if let Some(e) = handler_error_entry(r) {
+                    let _ = crate::plugin_health::append(&observer_dir, &r.plugin_id, &e);
+                }
+            }),
+        ));
         let status = Arc::new(Mutex::new(WebhookStatus::default()));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let task_config = config.clone();
         let task_registry = registry.clone();
-        let task_audit = audit.clone();
+        let task_audit = task_sink;
         let task_status = status.clone();
         let task_flash = flash;
         let task_delivery = crate::webhook_debug::delivery_sink(
@@ -292,6 +316,32 @@ pub fn fmt_record(r: &AuditRecord) -> String {
     .to_string()
 }
 
+/// The errors-log entry for a broker handler outcome (TASK-274): `Some` only
+/// for a handler that ran and failed — `handler_timeout` when it was killed
+/// at its budget, `handler_failed` otherwise. Successes and filter-skips
+/// produce nothing.
+fn handler_error_entry(r: &AuditRecord) -> Option<crate::plugin_health::ErrorEntry> {
+    if !r.executed || r.success {
+        return None;
+    }
+    let message = match (&r.error, r.exit_code) {
+        (Some(e), _) => e.clone(),
+        (None, Some(c)) => format!("exit status {c}"),
+        (None, None) => "failed".to_string(),
+    };
+    let kind = if message.starts_with("timed out") {
+        crate::plugin_health::KIND_HANDLER_TIMEOUT
+    } else {
+        crate::plugin_health::KIND_HANDLER_FAILED
+    };
+    Some(crate::plugin_health::ErrorEntry::new(
+        kind,
+        format!("webhook {}", r.event_type),
+        message,
+        "event dropped; handler runs again on the next delivery",
+    ))
+}
+
 /// Build a [`BrokerConfig`] from the environment given a broker URL. Returns
 /// `None` when `WEBHOOK_PLUGIN_ID` is unset/blank: the broker routes webhooks
 /// by `(tenant_id, plugin_id)` and `POST /clients/register` requires both.
@@ -394,7 +444,7 @@ async fn wait_for_shutdown(mut rx: watch::Receiver<bool>) {
 async fn service_loop(
     config: BrokerConfig,
     registry: Arc<PluginRegistry>,
-    audit: Arc<MemoryAuditSink>,
+    audit: Arc<dyn AuditSink>,
     status: Arc<Mutex<WebhookStatus>>,
     shutdown_rx: watch::Receiver<bool>,
     flash: Option<FlashSink>,
@@ -725,5 +775,53 @@ mod tests {
             ..ok.clone()
         };
         assert!(fmt_record(&skipped).contains("[skip]"));
+    }
+
+    /// TASK-274: only executed-and-failed handlers become errors-log entries,
+    /// classified timeout vs failure.
+    #[test]
+    fn handler_error_entry_classifies_outcomes() {
+        let ok = AuditRecord {
+            webhook_id: "w1".into(),
+            tenant_id: "t".into(),
+            plugin_id: "gh".into(),
+            event_type: "pull_request".into(),
+            matched: true,
+            executed: true,
+            exit_code: Some(0),
+            success: true,
+            error: None,
+            duration_ms: 12,
+            recorded_at_ms: 0,
+        };
+        assert!(handler_error_entry(&ok).is_none());
+        let filtered = AuditRecord {
+            executed: false,
+            success: false,
+            exit_code: None,
+            ..ok.clone()
+        };
+        assert!(handler_error_entry(&filtered).is_none());
+
+        let failed = AuditRecord {
+            success: false,
+            exit_code: Some(2),
+            ..ok.clone()
+        };
+        let e = handler_error_entry(&failed).unwrap();
+        assert_eq!(e.kind, "handler_failed");
+        assert_eq!(e.source, "webhook pull_request");
+        assert_eq!(e.message, "exit status 2");
+
+        let timed_out = AuditRecord {
+            success: false,
+            exit_code: None,
+            error: Some("timed out after 30s".into()),
+            ..ok
+        };
+        assert_eq!(
+            handler_error_entry(&timed_out).unwrap().kind,
+            "handler_timeout"
+        );
     }
 }

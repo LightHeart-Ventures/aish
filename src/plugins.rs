@@ -283,6 +283,12 @@ pub struct Plugin {
     /// startup" contract. The concrete failure is available on demand via
     /// [`load_config`].
     pub config: Option<Value>,
+    /// The rendered [`ConfigError`] when config loading failed (TASK-274).
+    /// A DERIVED runtime state, never persisted: a config-invalid plugin keeps
+    /// its skills, but its lifecycle hooks, `hooks.json` fragments and webhook
+    /// handlers are skipped until the config is fixed (PO decision
+    /// 2026-10-07 — not an auto-disable). Always `None` for disabled plugins.
+    pub config_error: Option<String>,
     /// The JSON Schemas this plugin ships under `<plugin>/schemas/*.json`
     /// (Phase 3). Each file's stem is the schema name; the parsed body is a
     /// JSON-Schema document used to validate structured tool/skill output via
@@ -293,6 +299,12 @@ pub struct Plugin {
 }
 
 impl Plugin {
+    /// True when this (enabled) plugin's configuration failed validation —
+    /// its hooks and webhook handlers are skipped (TASK-274).
+    pub fn config_invalid(&self) -> bool {
+        self.config_error.is_some()
+    }
+
     /// This plugin's schema with the given name (file stem), or `None`.
     // Phase 3.4: WIRED — reached via `validate` → the engine tool-return hook.
     pub fn schema(&self, name: &str) -> Option<&PluginSchema> {
@@ -621,6 +633,7 @@ pub fn discover_all(dir: &Path) -> Vec<Plugin> {
                 dir: pdir,
                 skills: Vec::new(),
                 config: None,
+                config_error: None,
                 schemas: Vec::new(),
             });
             continue;
@@ -639,8 +652,12 @@ pub fn discover_all(dir: &Path) -> Vec<Plugin> {
         // Phase 1.4: resolve config best-effort. A config error (unset
         // `${env:VAR}`, missing required key, …) yields `None` but never drops
         // the plugin — its skills still load, preserving the "a broken plugin
-        // never blocks startup" contract.
-        let config = load_config(&pdir, &manifest).ok();
+        // never blocks startup" contract. TASK-274: the error is kept as the
+        // derived config-invalid state that hook/webhook paths consult.
+        let (config, config_error) = match load_config(&pdir, &manifest) {
+            Ok(v) => (Some(v), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
         // Phase 3.1: load every JSON Schema the plugin ships under `schemas/`.
         let schemas = load_schemas(&pdir);
         plugins.push(Plugin {
@@ -648,6 +665,7 @@ pub fn discover_all(dir: &Path) -> Vec<Plugin> {
             dir: pdir,
             skills,
             config,
+            config_error,
             schemas,
         });
     }
@@ -677,8 +695,67 @@ pub fn set_plugin_enabled(dir: &Path, id: &str, enabled: bool) -> Result<bool, S
     Ok(true)
 }
 
+/// Every enabled plugin under `dir` whose config currently fails validation,
+/// as `(id, error)` pairs in id order (TASK-274). The webhook service uses it
+/// to drop those plugins' handlers.
+pub fn config_invalid_plugins(dir: &Path) -> Vec<(String, String)> {
+    discover(dir)
+        .into_iter()
+        .filter_map(|p| p.config_error.map(|e| (p.manifest.id, e)))
+        .collect()
+}
+
+/// Re-validate every enabled plugin's config (TASK-274). Publishes the derived
+/// config-invalid set (consulted by the Phase 1.6 webhook dispatcher), records
+/// a `config_invalid` entry in each such plugin's errors log (not repeated when
+/// the newest entry is the same error), and returns one warning line per
+/// config-invalid plugin. Called once at startup (the single startup warning)
+/// and whenever the plugin runtime is re-applied (`:plugin reload|enable|…`).
+/// Never touches `plugins.state.json` — this is not an auto-disable.
+pub fn refresh_config_health(dir: &Path) -> Vec<String> {
+    let invalid = config_invalid_plugins(dir);
+    crate::plugin_health::set_config_invalid(dir, invalid.iter().cloned().collect());
+    invalid
+        .into_iter()
+        .map(|(id, err)| {
+            crate::plugin_health::record_unless_repeat(
+                dir,
+                &id,
+                &crate::plugin_health::ErrorEntry::new(
+                    crate::plugin_health::KIND_CONFIG_INVALID,
+                    "config.json",
+                    err.clone(),
+                    "skills loaded; hooks + webhook handlers skipped until config is fixed (:plugin reload)",
+                ),
+            );
+            format!(
+                "plugin `{id}`: config invalid — {err}; skills stay loaded, hooks + webhook \
+                 handlers skipped until fixed (:plugin errors {id})"
+            )
+        })
+        .collect()
+}
+
+/// The health marker `:plugin list` shows for `p` (TASK-274): `disabled`,
+/// `config-invalid`, `N recent error(s)` (errors log, last 24h), else `ok`.
+pub fn plugin_health_marker(dir: &Path, p: &Plugin) -> String {
+    if !p.manifest.is_enabled() {
+        return "disabled".to_string();
+    }
+    if p.config_invalid() {
+        return "config-invalid".to_string();
+    }
+    match crate::plugin_health::recent_count(dir, &p.manifest.id, crate::plugin_health::now_secs())
+    {
+        0 => "ok".to_string(),
+        1 => "1 recent error".to_string(),
+        n => format!("{n} recent errors"),
+    }
+}
+
 /// Render `:plugin list`: every installed plugin (enabled AND disabled), one
-/// row each, disabled ones marked `(disabled)`. `None` when none installed.
+/// row each with a health marker — `(ok)`, `(disabled)`, `(config-invalid)` or
+/// `(N recent errors)` (TASK-274). `None` when none installed.
 pub fn format_plugin_list(dir: &Path) -> Option<String> {
     let plugins = discover_all(dir);
     if plugins.is_empty() {
@@ -693,8 +770,8 @@ pub fn format_plugin_list(dir: &Path) -> Option<String> {
         } else {
             &m.version
         };
-        let state = if m.is_enabled() { "" } else { " (disabled)" };
-        out.push_str(&format!("  {:<20} {name} v{ver}{state}\n", m.id));
+        let health = plugin_health_marker(dir, p);
+        out.push_str(&format!("  {:<20} {name} v{ver} ({health})\n", m.id));
     }
     Some(out.trim_end().to_string())
 }
@@ -1478,20 +1555,35 @@ fn strip_one_quote_layer(v: &str) -> String {
     }
 }
 
+/// The outcome of one lifecycle-hook run (TASK-274: failures are no longer
+/// collapsed into a silent `None` — the caller warns/logs per variant).
+#[derive(Debug, Clone, PartialEq)]
+enum HookRun {
+    /// The plugin ships no `hooks/<hook>.sh`.
+    Absent,
+    /// Clean exit; captured stdout.
+    Ok(String),
+    /// Outran its budget and was killed.
+    Timeout,
+    /// Spawn/wait error or non-zero exit (rendered reason).
+    Failed(String),
+}
+
 /// Run one plugin lifecycle-hook script and capture its stdout.
 ///
 /// The script is `<plugin_dir>/hooks/<hook>.sh`, fork/exec'd directly (NO shell)
-/// with `AISH_IN_HOOK=1` set and the current session env layered on. Returns the
-/// captured stdout on a clean exit; `None` when the script is absent, cannot be
-/// spawned, times out, or exits non-zero (a broken hook never blocks startup).
+/// with `AISH_IN_HOOK=1` set and the current session env layered on, bounded by
+/// `timeout` (killed past it). A broken hook never blocks startup; the
+/// [`HookRun`] says what went wrong so the caller can surface it.
 fn run_lifecycle_hook(
     plugin_dir: &Path,
     hook: &str,
     session_env: &[(String, String)],
-) -> Option<String> {
+    timeout: std::time::Duration,
+) -> HookRun {
     let script = plugin_dir.join("hooks").join(format!("{hook}.sh"));
     if !script.is_file() {
-        return None;
+        return HookRun::Absent;
     }
     use std::process::{Command, Stdio};
     let mut cmd = Command::new(&script);
@@ -1503,8 +1595,11 @@ fn run_lifecycle_hook(
     for (k, v) in session_env {
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn().ok()?;
-    // Bounded wait: poll for completion up to HOOK_TIMEOUT, then kill.
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return HookRun::Failed(format!("spawn failed: {e}")),
+    };
+    // Bounded wait: poll for completion up to `timeout`, then kill.
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
@@ -1514,18 +1609,34 @@ fn run_lifecycle_hook(
                     use std::io::Read;
                     let _ = so.read_to_string(&mut buf);
                 }
-                return status.success().then_some(buf);
+                return if status.success() {
+                    HookRun::Ok(buf)
+                } else {
+                    HookRun::Failed(match status.code() {
+                        Some(c) => format!("exit status {c}"),
+                        None => "terminated by signal".to_string(),
+                    })
+                };
             }
             Ok(None) => {
-                if start.elapsed() >= HOOK_TIMEOUT {
+                if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    return HookRun::Timeout;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            Err(_) => return None,
+            Err(e) => return HookRun::Failed(format!("wait failed: {e}")),
         }
+    }
+}
+
+/// Human budget for warnings: whole seconds when ≥1s, else milliseconds.
+fn fmt_budget(d: std::time::Duration) -> String {
+    if d.as_millis() >= 1000 && d.as_millis() % 1000 == 0 {
+        format!("{}s", d.as_secs())
+    } else {
+        format!("{}ms", d.as_millis())
     }
 }
 
@@ -1573,7 +1684,7 @@ pub fn collect_lifecycle_env_at(
     session_env: &[(String, String)],
     cred_path: &Path,
 ) -> HookEnv {
-    collect_lifecycle_env_filtered(dir, hook, session_env, cred_path, None)
+    collect_lifecycle_env_filtered(dir, hook, session_env, cred_path, None, HOOK_TIMEOUT)
 }
 
 /// Run lifecycle `hook` for ONE enabled plugin (`id`) and return its parsed,
@@ -1592,15 +1703,22 @@ pub fn collect_plugin_lifecycle_env(
         session_env,
         &crate::plugin_auth::credentials_path(),
         Some(id),
+        HOOK_TIMEOUT,
     )
 }
 
+/// Shared body of the lifecycle collectors. TASK-274: config-invalid plugins
+/// are skipped (no hook run); a hook that times out yields a one-line warning
+/// naming the plugin + hook and a `hook_timeout` errors-log entry; a spawn
+/// failure / non-zero exit is logged as `hook_failed` (no warning — some hooks
+/// exit non-zero by design; it still shows in `:plugin list` health).
 fn collect_lifecycle_env_filtered(
     dir: &Path,
     hook: &str,
     session_env: &[(String, String)],
     cred_path: &Path,
     only: Option<&str>,
+    timeout: std::time::Duration,
 ) -> HookEnv {
     use std::collections::HashSet;
     let mut merged = HookEnv::default();
@@ -1616,14 +1734,46 @@ fn collect_lifecycle_env_filtered(
         if only.is_some_and(|o| o != plugin.manifest.id) {
             continue;
         }
+        // TASK-274: config-invalid → hooks skipped until fixed (already warned
+        // once by `refresh_config_health`; no per-skip noise here).
+        if plugin.config_invalid() {
+            continue;
+        }
         let id = plugin.manifest.id.clone();
         // Phase 0.5.5: export this plugin's own logged-in credentials to its
         // hook as AISH_PROFILE_<ID>_<FIELD>. Passed to the hook process ONLY —
         // never merged into `merged` (the shared session env).
         let mut hook_env: Vec<(String, String)> = session_env.to_vec();
         hook_env.extend(crate::plugin_auth::profile_env_at(cred_path, &id));
-        let Some(stdout) = run_lifecycle_hook(&plugin.dir, hook, &hook_env) else {
-            continue;
+        let stdout = match run_lifecycle_hook(&plugin.dir, hook, &hook_env, timeout) {
+            HookRun::Ok(s) => s,
+            HookRun::Absent => continue,
+            HookRun::Timeout => {
+                let budget = fmt_budget(timeout);
+                merged.warnings.push(format!(
+                    "plugin `{id}` hook `{hook}` timed out after {budget} — killed; shell continues"
+                ));
+                crate::plugin_health::record(
+                    dir,
+                    &id,
+                    crate::plugin_health::KIND_HOOK_TIMEOUT,
+                    hook,
+                    &format!("timed out after {budget}"),
+                    "killed; its env exports were skipped",
+                );
+                continue;
+            }
+            HookRun::Failed(why) => {
+                crate::plugin_health::record(
+                    dir,
+                    &id,
+                    crate::plugin_health::KIND_HOOK_FAILED,
+                    hook,
+                    &why,
+                    "its env exports were skipped",
+                );
+                continue;
+            }
         };
         let parsed = parse_hook_env(&stdout);
         merged.warnings.extend(parsed.warnings);
@@ -1660,6 +1810,8 @@ fn collect_lifecycle_env_filtered(
 pub fn plugin_hook_fragments(dir: &Path) -> Vec<crate::hooks::PluginHookFragment> {
     discover(dir)
         .into_iter()
+        // TASK-274: a config-invalid plugin's event hooks are skipped.
+        .filter(|p| !p.config_invalid())
         .filter_map(|p| {
             let path = p.dir.join("hooks.json");
             path.is_file().then(|| crate::hooks::PluginHookFragment {
@@ -2637,7 +2789,10 @@ mod tests {
             "on_init",
             "#!/bin/sh\necho 'plugin loaded'\necho FOO=bar\necho BAZ=qux\n",
         );
-        let out = run_lifecycle_hook(&tmp.join("p"), "on_init", &[]).expect("hook ran");
+        let HookRun::Ok(out) = run_lifecycle_hook(&tmp.join("p"), "on_init", &[], HOOK_TIMEOUT)
+        else {
+            panic!("hook should have run");
+        };
         let env = parse_hook_env(&out);
         assert_eq!(
             env.vars,
@@ -2652,14 +2807,176 @@ mod tests {
     fn run_hook_absent_returns_none() {
         let tmp = tempdir();
         fs::create_dir_all(tmp.join("p")).unwrap();
-        assert!(run_lifecycle_hook(&tmp.join("p"), "on_init", &[]).is_none());
+        assert_eq!(
+            run_lifecycle_hook(&tmp.join("p"), "on_init", &[], HOOK_TIMEOUT),
+            HookRun::Absent
+        );
     }
 
     #[test]
-    fn run_hook_nonzero_exit_returns_none() {
+    fn run_hook_nonzero_exit_returns_failed() {
         let tmp = tempdir();
         write_hook(&tmp, "p", "on_init", "#!/bin/sh\necho FOO=bar\nexit 1\n");
-        assert!(run_lifecycle_hook(&tmp.join("p"), "on_init", &[]).is_none());
+        assert_eq!(
+            run_lifecycle_hook(&tmp.join("p"), "on_init", &[], HOOK_TIMEOUT),
+            HookRun::Failed("exit status 1".to_string())
+        );
+    }
+
+    // ---- TASK-274: error handling & robustness ----
+
+    /// A manifest whose config requires `token`, which no config.json supplies.
+    const NEEDS_TOKEN: &str = r#"{"id":"ID","config_schema":{"type":"object",
+        "properties":{"token":{"type":"string"}},"required":["token"]}}"#;
+
+    fn needs_token(id: &str) -> String {
+        NEEDS_TOKEN.replace("ID", id)
+    }
+
+    /// AC1: config-invalid plugin keeps its skills, carries the error, and is
+    /// excluded from `config_invalid_plugins`' complement.
+    #[test]
+    fn config_invalid_plugin_keeps_skills_and_records_error() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "bad", &needs_token("bad"), Some(("s1", "A skill.")));
+        write_plugin(&tmp, "good", r#"{"id":"good"}"#, None);
+        let plugins = discover(&tmp);
+        let bad = plugins.iter().find(|p| p.manifest.id == "bad").unwrap();
+        assert_eq!(bad.skills.len(), 1, "skills stay loaded");
+        assert!(bad.config_invalid());
+        assert!(bad.config_error.as_deref().unwrap().contains("token"));
+        let invalid = config_invalid_plugins(&tmp);
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid[0].0, "bad");
+    }
+
+    /// AC1/AC2: one warning naming plugin + error, one (deduped) log entry,
+    /// registry published, state file untouched; fixing config clears it.
+    #[test]
+    fn refresh_config_health_warns_logs_once_and_clears_on_fix() {
+        let tmp = tempdir().join("plugins");
+        write_plugin(&tmp, "bad", &needs_token("bad"), None);
+        let w = refresh_config_health(&tmp);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("`bad`") && w[0].contains("token"), "{w:?}");
+        assert!(w[0].contains("skills stay loaded"));
+        assert!(crate::plugin_health::config_invalid_reason(&tmp, "bad").is_some());
+        // Second refresh (e.g. :plugin reload) re-warns but does not re-log.
+        assert_eq!(refresh_config_health(&tmp).len(), 1);
+        let log = crate::plugin_health::read_all(&tmp, "bad");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].kind, "config_invalid");
+        // Never an auto-disable: no state file written, still enabled.
+        assert!(!crate::plugin_enable::state_path(&tmp).exists());
+        assert!(discover(&tmp).iter().any(|p| p.manifest.id == "bad"));
+        // Fix the config → refresh clears the invalid state.
+        fs::write(tmp.join("bad").join("config.json"), r#"{"token":"t"}"#).unwrap();
+        assert!(refresh_config_health(&tmp).is_empty());
+        assert!(crate::plugin_health::config_invalid_reason(&tmp, "bad").is_none());
+        assert!(config_invalid_plugins(&tmp).is_empty());
+    }
+
+    /// AC1: config-invalid plugin's on_init is not run; a valid one's is.
+    #[test]
+    fn collect_skips_config_invalid_plugin_hook() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "bad", &needs_token("bad"), None);
+        let marker = tmp.join("bad-ran");
+        write_hook(
+            &tmp,
+            "bad",
+            "on_init",
+            &format!("#!/bin/sh\ntouch {}\necho FROM_BAD=1\n", marker.display()),
+        );
+        write_plugin(&tmp, "good", r#"{"id":"good"}"#, None);
+        write_hook(&tmp, "good", "on_init", "#!/bin/sh\necho FROM_GOOD=1\n");
+        let env = collect_lifecycle_env(&tmp, "on_init", &[]);
+        assert_eq!(env.vars, vec![("FROM_GOOD".to_string(), "1".to_string())]);
+        assert!(!marker.exists(), "config-invalid hook must not run");
+        assert!(
+            collect_plugin_lifecycle_env(&tmp, "bad", "on_init", &[])
+                .vars
+                .is_empty()
+        );
+    }
+
+    /// AC1: config-invalid plugin contributes no hooks.json fragment.
+    #[test]
+    fn hook_fragments_skip_config_invalid_plugin() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "bad", &needs_token("bad"), None);
+        fs::write(tmp.join("bad").join("hooks.json"), r#"{"hooks":[]}"#).unwrap();
+        write_plugin(&tmp, "good", r#"{"id":"good"}"#, None);
+        fs::write(tmp.join("good").join("hooks.json"), r#"{"hooks":[]}"#).unwrap();
+        let ids: Vec<String> = plugin_hook_fragments(&tmp)
+            .into_iter()
+            .map(|f| f.plugin_id)
+            .collect();
+        assert_eq!(ids, vec!["good".to_string()]);
+    }
+
+    /// AC3: a wedged hook is killed, warned about by plugin + hook, and logged.
+    #[test]
+    fn lifecycle_hook_timeout_warns_and_logs() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "slow", r#"{"id":"slow"}"#, None);
+        write_hook(&tmp, "slow", "on_init", "#!/bin/sh\nsleep 5\necho X=1\n");
+        let start = std::time::Instant::now();
+        let env = collect_lifecycle_env_filtered(
+            &tmp,
+            "on_init",
+            &[],
+            &tmp.join("no-creds"),
+            None,
+            std::time::Duration::from_millis(200),
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        assert!(env.vars.is_empty());
+        assert_eq!(env.warnings.len(), 1);
+        let w = &env.warnings[0];
+        assert!(w.contains("`slow`") && w.contains("`on_init`") && w.contains("timed out"));
+        let log = crate::plugin_health::read_all(&tmp, "slow");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].kind, "hook_timeout");
+        assert_eq!(log[0].source, "on_init");
+    }
+
+    /// A non-zero hook exit is logged (hook_failed) without a warning.
+    #[test]
+    fn lifecycle_hook_failure_logs_without_warning() {
+        let tmp = tempdir();
+        write_plugin(&tmp, "f", r#"{"id":"f"}"#, None);
+        write_hook(&tmp, "f", "on_init", "#!/bin/sh\nexit 3\n");
+        let env = collect_lifecycle_env(&tmp, "on_init", &[]);
+        assert!(env.warnings.is_empty());
+        let log = crate::plugin_health::read_all(&tmp, "f");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].kind, "hook_failed");
+        assert_eq!(log[0].message, "exit status 3");
+    }
+
+    /// AC7: `:plugin list` health markers.
+    #[test]
+    fn plugin_list_shows_health_markers() {
+        let tmp = tempdir().join("plugins");
+        write_plugin(&tmp, "aok", r#"{"id":"aok"}"#, None);
+        write_plugin(&tmp, "bad", &needs_token("bad"), None);
+        write_plugin(&tmp, "err", r#"{"id":"err"}"#, None);
+        write_plugin(&tmp, "off", r#"{"id":"off","enabled":false}"#, None);
+        for _ in 0..2 {
+            crate::plugin_health::record(&tmp, "err", "hook_failed", "on_init", "x", "");
+        }
+        let list = format_plugin_list(&tmp).unwrap();
+        let row = |id: &str| {
+            list.lines()
+                .find(|l| l.trim_start().starts_with(id))
+                .unwrap()
+                .to_string()
+        };
+        assert!(row("aok").ends_with("(ok)"), "{list}");
+        assert!(row("bad").ends_with("(config-invalid)"), "{list}");
+        assert!(row("err").ends_with("(2 recent errors)"), "{list}");
+        assert!(row("off").ends_with("(disabled)"), "{list}");
     }
 
     #[test]

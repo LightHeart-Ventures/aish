@@ -45,6 +45,53 @@ cargo build --release --target x86_64-unknown-linux-musl
   separate DBs/processes.
 - Graceful shutdown: the broker drains and exits cleanly on `SIGINT`/`SIGTERM`.
 
+### Persistent volume (Fly.io)
+
+The shipped `fly.toml` has **no `[mounts]`**: `BROKER_DB=/var/lib/aish-broker.db`
+sits on the machine's ephemeral root filesystem, so every deploy or machine
+restart wipes the queue (undelivered webhooks) and all client registrations.
+To make it durable (one-time, by an operator with Fly access; TASK-371):
+
+1. Create a volume in the app's region (1 GB is ample; one volume per machine):
+
+   ```bash
+   fly volumes create aish_broker_data --app aish-webhook-broker --region iad --size 1
+   ```
+
+2. Mount it and point the DB at it in `fly.toml` — mount at `/data`, **not**
+   `/var/lib` (a mount there would hide the image's `/var/lib`):
+
+   ```toml
+   [env]
+     BROKER_DB = "/data/aish-broker.db"   # was /var/lib/aish-broker.db
+
+   [mounts]
+     source = "aish_broker_data"
+     destination = "/data"
+   ```
+
+3. Deploy, then fix ownership once — the image runs as the unprivileged
+   `broker` user, while a fresh Fly volume root is owned by `root`:
+
+   ```bash
+   fly deploy --config fly.toml
+   fly ssh console --app aish-webhook-broker -C "chown broker:broker /data"
+   fly machine restart --app aish-webhook-broker   # broker re-opens the DB as broker
+   ```
+
+   Ownership is stored on the volume, so this survives later deploys.
+
+4. Verify: `curl -s https://aish-webhook-broker.fly.dev/health` reports
+   `"db_health":"ok"`, and `fly ssh console -C "ls -la /data"` shows
+   `aish-broker.db` (+ `-wal`/`-shm`). Register a client, `fly machine restart`,
+   and confirm its session token still authenticates.
+
+Notes: a volume pins the machine to one host — keep `min_machines_running = 1`
+and a single machine (one broker per DB, see above). Clients registered before
+the volume existed must re-register once (their rows lived on the old ephemeral
+disk). Snapshots: `fly volumes snapshots list <vol-id>` (daily, 5-day retention
+by default).
+
 ---
 
 ## Docker

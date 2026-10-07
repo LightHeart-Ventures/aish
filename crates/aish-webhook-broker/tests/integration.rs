@@ -71,7 +71,12 @@ async fn register(app: &axum::Router, tenant: &str, plugin: &str, secret: Option
 async fn health_reports_ok() {
     let (app, _dir) = test_app();
     let resp = app
-        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
