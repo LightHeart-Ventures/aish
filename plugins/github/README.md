@@ -84,7 +84,7 @@ the repositories you route here, exported as `GITHUB_TOKEN` before starting aish
 | `push`         | none (every branch/tag push, incl. create/delete/force) | `handlers/push.sh`   | Push line (repo, branch/tag, commit count, before..after short SHAs, pusher, `[forced]`/`[new]`, head-commit headline, compare url); a `deleted` line for ref deletions |
 | `pull_request` | `action ∈ {opened, reopened, ready_for_review}`   | `handlers/pr-review.sh`    | PR triage line (repo#num, author, head→base, title, url); **opt-in review agent** (see below) |
 | `issues`       | `action ∈ {opened, reopened, edited, closed, labeled}` | `handlers/issues.sh`  | Issue line (repo#num, action, `+label:<name>` on labeled, `[pr]` for PR-backed issues, author, state, labels, title, url) |
-| `workflow_run` | `action = completed`                              | `handlers/workflow-run.sh` | CI outcome line (✓/✗, name, branch, status/conclusion); non-zero exit on a bad conclusion; **auto-dispatches a `fix-ci` worker on failure** (see below) |
+| `workflow_run` | `action = completed`                              | `handlers/workflow-run.sh` | CI outcome line (✓/✗, name, branch, status/conclusion); non-zero exit on a bad conclusion; **auto-dispatches a CI-fix worker on failure** (see below) |
 | `release`      | `action = published`                              | `handlers/release.sh`      | Release notice (tag, name, author, pre-release flag) |
 
 Each `action` value is registered as its own handler entry because filters are
@@ -103,7 +103,7 @@ Example lines:
 | Variable               | Default | Effect |
 |------------------------|---------|--------|
 | `GITHUB_PR_AUTOREVIEW` | off     | `1` (exactly) → `pr-review.sh` dispatches a background review agent on PR open (below). Any other value or unset = off. |
-| `GITHUB_CI_AUTOFIX`    | on      | `0` → `workflow-run.sh` does NOT dispatch the `fix-ci` worker on a failed run. |
+| `GITHUB_CI_AUTOFIX`    | on      | `0` → `workflow-run.sh` does NOT dispatch the CI-fix worker on a failed run. |
 
 Set them in the environment of the process running the webhook client; handlers
 inherit it.
@@ -131,10 +131,17 @@ The reviewer's output goes to `$TMPDIR/pr-review-<num>-<sha7>-<ts>.log`.
 When a `workflow_run` concludes in a bad state (`failure`, `timed_out`,
 `cancelled`, `startup_failure`) **and** the event carries an associated PR (or a
 usable head branch), `workflow-run.sh` detaches a background aish coordinator
-that asks the agent to use a `fix-ci` skill against the failed run (install
-one with `:skill add`; without it the agent follows the inline instructions) — it checks out the branch, inspects `gh run view <id> --log-failed`, applies
-the smallest correct fix, reconfirms the test/lint gate is green, and pushes to
-the **PR branch** (never the default branch).
+with self-contained instructions (no skill dependency) to fix the failed run —
+it checks out the branch, inspects `gh run view <id> --repo <repo> --log-failed`,
+finds the root cause, applies the smallest correct fix, reconfirms the project's
+test/lint gate is green, and pushes to the **PR branch** (never the default
+branch, never force-push).
+
+Both dispatched agents (this one and the PR reviewer below) get their full
+procedure inline in the `-c` prompt. They do not name a skill, because none
+ships with this plugin. The coordinator's skill catalog is only
+`~/.aish/skills` plus installed plugins' `skills/`, so a named skill could be
+missing on the host.
 
 Properties:
 

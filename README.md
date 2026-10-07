@@ -265,7 +265,7 @@ reasoning rescan.
 · `:yolo` — shorthand for `:mode yolo`
 · `:new` — start a fresh session
 · `:goal <new|show|status|link|block|unblock|milestone|complete>` — manage long-horizon goals (see [Goals](#goals--long-horizon-work-with-goal))
-· `:webhook <status|reload|logs [N]>` — inspect the webhook broker client (see [Webhook Integration](#webhook-integration))
+· `:webhook <status|reload|logs|test|replay>` — inspect and debug the webhook broker client (see [Webhook Integration](#webhook-integration))
 · `:help` — show all commands
 · `:quit` (or Ctrl-D / `exit`) — exit
 

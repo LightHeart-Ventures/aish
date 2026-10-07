@@ -83,7 +83,7 @@ Changes to `webhooks[]` apply on `:plugin reload` or `:webhook reload`.
 | Channel | Content |
 |---|---|
 | **argv** | `command` exactly as declared (no shell expansion). |
-| **stdin** | The event **payload** JSON (not the envelope), then EOF. |
+| **stdin** | The event **payload** JSON (not the envelope), then EOF. You may ignore it: if your handler exits or closes stdin before the payload is written, aish never gets SIGPIPE — the record keeps your exit status (`ok` on exit 0) and notes `stdin closed before the payload was written (broken pipe)` in its `error` field. |
 | **env** | Inherited aish env plus `WEBHOOK_ID`, `WEBHOOK_TENANT_ID`, `WEBHOOK_PLUGIN_ID`, `WEBHOOK_EVENT_TYPE`. |
 | **cwd** | aish's working directory — use paths relative to your script (`$(dirname "$0")`), not the cwd. |
 | **stdout** | The first non-blank line becomes the SecondStatusLine **flash** (trimmed, ≤60 chars with `…`). Most-recent-wins. Printed even if you exit non-zero. |
