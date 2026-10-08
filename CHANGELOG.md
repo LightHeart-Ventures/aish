@@ -4,6 +4,9 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Fixed
+- **`:close` now clears the worker's escalation banner immediately**: closing a coordinator removed it from `:workers` and the Shift-Tab rotation but left its pinned escalation banner animating in the footer tray. `escalation::sweep` could never retire it either — sweep only retires a banner that reached a terminal state and then outlived its dwell, which a still-running closed worker never does from the session's point of view — so the rows outlived the worker indefinitely. `:close` now calls the new `escalation::unpin(id)`, which is strictly id-scoped (live siblings stay pinned) and a no-op for a worker that never escalated; the confirmation line names the tray only when a banner was really there.
+
 ## [0.53.1] - 2026-10-07
 
 Patch release: clearing the clippy backlog and gating it in CI, plus three correctness fixes in the worker/REPL surface — mid-turn `Shift-Tab`, the worker status line, and worker skill-hint matching.

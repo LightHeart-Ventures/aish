@@ -201,6 +201,30 @@ pub fn pin(id: &str, task: &str) {
     }
 }
 
+/// Remove coordinator `id`'s banner from the tray RIGHT NOW, reporting whether
+/// one was actually pinned for it.
+///
+/// This is the DISMISSAL path, and it exists because [`sweep`] can't serve it:
+/// sweep only retires a banner that already reached a terminal state AND then
+/// outlived [`DWELL`]. A `:close`d coordinator that is still RUNNING never
+/// reaches that state from this session's point of view — the operator stopped
+/// tracking it — so without an explicit removal its two footer rows would keep
+/// animating forever, advertising a worker that is gone from `:workers` and the
+/// Shift-Tab rotation. `:close` calls this so the banner disappears on the next
+/// footer paint instead of never.
+///
+/// Strictly id-scoped: dismissing one escalation leaves its live siblings
+/// pinned, and an id that isn't pinned is a silent no-op (closing a plain
+/// `:dispatch` worker that never escalated must not disturb the tray).
+pub fn unpin(id: &str) -> bool {
+    let Ok(mut banners) = BANNERS.lock() else {
+        return false;
+    };
+    let before = banners.len();
+    banners.retain(|b| b.id != id);
+    banners.len() != before
+}
+
 /// Retire EVERY banner (the footer shrinks back on the next paint).
 #[allow(dead_code)] // completes the BANNERS push/remove/clear API; no caller wired yet.
 pub fn clear() {
@@ -617,6 +641,48 @@ mod tests {
         clear();
         assert!(!active());
         assert!(rows(false, MAX_VISIBLE).is_empty());
+    }
+
+    #[test]
+    fn closing_a_worker_unpins_only_its_own_banner() {
+        // `:close` is a dismissal of the whole worker surface, and the tray is
+        // part of it. Before `unpin` existed the ONLY removal paths were
+        // `sweep` (terminal + dwell) and `clear` (everything), so closing a
+        // still-RUNNING coordinator left its two footer rows animating forever
+        // for a worker already gone from `:workers`.
+        let _g = lock();
+        clear();
+        pin("w_keepme000001", "sibling still working");
+        pin("w_closeme00002", "the one being closed");
+        assert_eq!(count(), 2);
+
+        // Removal is immediate (no terminal mark, no dwell wait) and reports
+        // that a banner was really there.
+        assert!(unpin("w_closeme00002"));
+        assert_eq!(count(), 1);
+        assert_eq!(row_count(), ROWS_PER_BANNER);
+
+        // Strictly id-scoped: the live sibling keeps its rows and its animation.
+        let painted = rows(false, MAX_VISIBLE);
+        assert_eq!(painted.len(), 1);
+        assert!(
+            painted[0].0.contains("sibling still working"),
+            "{:?}",
+            painted[0].0
+        );
+        assert!(animating(), "the untouched sibling must still animate");
+
+        // Closing a worker that never escalated must not disturb the tray, and
+        // says so by returning false.
+        assert!(!unpin("w_neverpinned1"));
+        assert_eq!(count(), 1);
+
+        // Last banner out shrinks the footer back to nothing.
+        assert!(unpin("w_keepme000001"));
+        assert!(!active());
+        assert_eq!(row_count(), 0);
+        assert!(rows(false, MAX_VISIBLE).is_empty());
+        clear();
     }
 
     #[test]
