@@ -1939,9 +1939,12 @@ mod tests {
         // second live escalation was invisible. N banners must stack upward from
         // the rule, newest on top, with the region grown to cover all of them.
         let banners = vec![
-            ("🚀 newest".to_string(), "   ↳ newest status".to_string()),
-            ("🛸 middle".to_string(), "   ↳ middle status".to_string()),
-            ("🌠 oldest".to_string(), "   ↳ oldest status".to_string()),
+            // All three lead with the same stable identity glyph — the head row
+            // no longer animates (see `escalation::LIVE_GLYPH`); the motion is a
+            // braille frame in the status row's prefix cell.
+            ("🚀 newest".to_string(), "   ⠋ newest status".to_string()),
+            ("🚀 middle".to_string(), "   ⠙ middle status".to_string()),
+            ("🚀 oldest".to_string(), "   ⠹ oldest status".to_string()),
         ];
         // 24-row window, 3 banners → 9-row footer: rows 16..21 banners, 22 rule,
         // 23 msg, 24 bar.
