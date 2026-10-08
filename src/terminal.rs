@@ -34,28 +34,188 @@ use std::time::{Duration, Instant};
 /// statusline.
 pub const FOOTER_ROWS: u16 = 3;
 
-/// Minimum terminal height to render the footer. The footer needs 3 rows and we
-/// insist on at least 2 scrolling rows above it, so height must be ≥ 5. At or
-/// below 4 the caller falls back to inline printing.
-pub const MIN_FOOTER_ROWS: u16 = 5;
+/// Scrolling rows the body keeps no matter how hard the footer is squeezed. The
+/// footer is chrome; command output is the product — footer zones are shed to
+/// protect these rows, never the other way round.
+pub const MIN_BODY_ROWS: u16 = 2;
 
-/// The footer's CURRENT height for a terminal of `rows` rows: [`FOOTER_ROWS`]
-/// normally, plus two rows PER pinned background escalation (the escalation
-/// message + that worker's latest status), painted directly ABOVE the footer's
-/// horizontal rule so the rule stays welded to the statusline block — see
-/// [`crate::escalation`].
+/// Minimum terminal height for the FULL footer: [`FOOTER_ROWS`] of chrome plus
+/// the [`MIN_BODY_ROWS`] scrolling rows we insist on keeping above it.
+pub const MIN_FOOTER_ROWS: u16 = MIN_BODY_ROWS + FOOTER_ROWS;
+
+/// Smallest terminal height that still gets SOME footer: [`MIN_BODY_ROWS`] of
+/// body plus the one un-sheddable statusline row. Between this and
+/// [`MIN_FOOTER_ROWS`] the footer DEGRADES — it drops the rule, then the status
+/// message — instead of vanishing outright. See [`FooterLayout`].
+pub const MIN_FOOTER_ROWS_DEGRADED: u16 = MIN_BODY_ROWS + 1;
+
+/// The footer's resolved row plan for one terminal size — the SINGLE source of
+/// truth every row-arithmetic site reads.
 ///
-/// Every row-arithmetic site — DECSTBM bottom margin, the body-home row, the
-/// resume choreography — routes through this so growing the footer can never
-/// desync the reserved region from what we actually paint. Banners are dropped
-/// WHOLE (never split across the rule) until 2 scrolling rows remain above the
-/// taller footer: a cramped window keeps its output instead of being eaten by
-/// notifications.
-pub fn footer_rows_for(rows: u16) -> u16 {
-    if !crate::escalation::active() {
-        return FOOTER_ROWS; // common case: no escalation, no banner arithmetic
+/// ## Why a solver instead of a hard row stack
+/// The footer used to be a rigid bottom-up stack: three fixed rows (separator,
+/// status message, statusline) reserved and painted unconditionally, with
+/// escalation banners layered on top. Two problems fell out of that rigidity:
+///
+/// 1. **A cliff, not a gradient.** Below [`MIN_FOOTER_ROWS`] the ENTIRE footer
+///    was dropped, so a 4-row window got no statusline at all — even though the
+///    statusline is the single highest-value row and the separator directly
+///    above it is pure chrome carrying zero information. The shed order was
+///    effectively "everything or nothing".
+/// 2. **Two independent derivations.** A `footer_rows_for` helper computed the reserved
+///    height while `footer_seq_with` recomputed its own `height` and hardcoded
+///    `msg_row = rows - 1` / `bar_row = rows`. They happened to agree, but
+///    nothing structurally forced them to, so any new zone risked a
+///    region-vs-paint desync — which shows up as a corrupted viewport.
+///
+/// [`FooterLayout::solve`] fixes both: zones are shed in PRIORITY order until
+/// the plan fits the window, and the survivors are packed contiguously upward
+/// from the last row. The DECSTBM bottom margin, the body-home row, the resume
+/// choreography and the paint itself all read this one struct, so region and
+/// paint cannot disagree by construction.
+///
+/// ## Shed order (first shed → last)
+/// | Zone | Rows | Why it sheds where it does |
+/// |---|---|---|
+/// | escalation banners | 2 each | notifications; shed WHOLE, oldest-first |
+/// | separator rule | 1 | pure chrome — carries no information at all |
+/// | status message | 1 | transient, and the same text also prints inline |
+/// | statusline | 1 | version/model/stats/clock — never shed while a footer exists |
+///
+/// A plan with `height == 0` means "no footer fits"; the caller falls back to
+/// inline printing exactly as it did below the old threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FooterLayout {
+    /// Terminal height this plan was solved for.
+    pub rows: u16,
+    /// Total rows the footer owns (`0` → no footer fits; print inline).
+    pub height: u16,
+    /// Rows granted to the pinned escalation block — always a whole multiple of
+    /// [`crate::escalation::ROWS_PER_BANNER`].
+    pub banner_rows: u16,
+    /// Screen row of the horizontal rule, or `None` when it was shed.
+    pub sep_row: Option<u16>,
+    /// Screen row of the status message, or `None` when it was shed.
+    pub msg_row: Option<u16>,
+    /// Screen row of the statusline, or `None` only when no footer fits at all.
+    pub bar_row: Option<u16>,
+    /// Last scrolling row — the DECSTBM bottom margin AND the body-home target.
+    pub body_bottom: u16,
+}
+
+impl FooterLayout {
+    /// Solve the row plan for a `rows`-tall window that WANTS `want_banner_rows`
+    /// of pinned escalation. Pure — no globals, no I/O — so every window size is
+    /// unit-testable without touching a real terminal.
+    pub fn solve(rows: u16, want_banner_rows: u16) -> Self {
+        let per = crate::escalation::ROWS_PER_BANNER.max(1);
+        // Normalize DOWN to whole banners first: a banner is an indivisible
+        // 2-row unit (the escalation message + that worker's latest status), so
+        // half a banner must never become reservable.
+        let mut banner_rows = want_banner_rows - (want_banner_rows % per);
+        let (mut sep, mut msg, mut bar) = (true, true, true);
+        // Budget = every row except the body rows we refuse to give up.
+        let budget = rows.saturating_sub(MIN_BODY_ROWS);
+        let height = loop {
+            let h = banner_rows + u16::from(sep) + u16::from(msg) + u16::from(bar);
+            if h <= budget {
+                break h;
+            }
+            // Shed strictly in priority order. `bar` is last, and shedding it
+            // yields h == 0, which fits any budget — so the loop terminates.
+            if banner_rows > 0 {
+                banner_rows -= per;
+            } else if sep {
+                sep = false;
+            } else if msg {
+                msg = false;
+            } else {
+                bar = false;
+            }
+        };
+        // The two documented thresholds are DERIVED facts about this solver, not
+        // independent knobs — assert they still describe it so the doc table and
+        // the code can never quietly disagree.
+        debug_assert_eq!(
+            height > 0,
+            rows >= MIN_FOOTER_ROWS_DEGRADED,
+            "degraded-footer threshold drifted from the solver at {rows} rows"
+        );
+        debug_assert_eq!(
+            sep && msg && bar,
+            rows >= MIN_FOOTER_ROWS,
+            "full-footer threshold drifted from the solver at {rows} rows"
+        );
+        // Pack the survivors contiguously upward from the last row, so a shed
+        // zone closes the gap instead of leaving a hole the body can't use.
+        let mut next = rows;
+        let mut take = |want: bool| -> Option<u16> {
+            if !want || next == 0 {
+                return None;
+            }
+            let row = next;
+            next -= 1;
+            Some(row)
+        };
+        let bar_row = take(bar);
+        let msg_row = take(msg);
+        let sep_row = take(sep);
+        Self {
+            rows,
+            height,
+            banner_rows,
+            sep_row,
+            msg_row,
+            bar_row,
+            body_bottom: rows.saturating_sub(height).max(1),
+        }
     }
-    FOOTER_ROWS + escalation_rows_that_fit(rows, crate::escalation::row_count())
+
+    /// [`Self::solve`] against the LIVE escalation stack — the runtime entry
+    /// point. Kept separate so the solver itself stays pure.
+    pub fn for_rows(rows: u16) -> Self {
+        let want = if crate::escalation::active() {
+            crate::escalation::row_count()
+        } else {
+            0 // common case: no escalation, no banner arithmetic
+        };
+        Self::solve(rows, want)
+    }
+
+    /// True when any footer — full or degraded — fits this window.
+    pub fn enabled(&self) -> bool {
+        self.height > 0
+    }
+
+    /// How many WHOLE banners the plan granted.
+    pub fn banner_count(&self) -> usize {
+        (self.banner_rows / crate::escalation::ROWS_PER_BANNER.max(1)) as usize
+    }
+
+    /// The first (topmost) screen row the footer owns. Teardown paths clear from
+    /// here to end-of-screen, so it MUST track the banner block — clearing from
+    /// the separator alone would strand banner rows on the terminal a child
+    /// program (or the exiting shell) inherits.
+    pub fn top_row(&self) -> u16 {
+        self.rows
+            .saturating_sub(self.height.saturating_sub(1))
+            .max(1)
+    }
+
+    /// The DECSTBM bottom margin for this plan. Identical to
+    /// [`Self::body_bottom`] by definition — named separately so region code
+    /// reads as region code, and so the two can never drift apart.
+    pub fn region_bottom(&self) -> u16 {
+        self.body_bottom
+    }
+
+    /// Rows of child output sitting UNDER this plan's footer, given the 1-based
+    /// `cursor_row` the child left behind. See [`footer_overflow_rows`] for the
+    /// bug this measures; keeping it a method on the plan means the resume
+    /// choreography and the region arithmetic read the SAME solved layout.
+    pub fn overflow_rows(&self, cursor_row: u16) -> u16 {
+        cursor_row.saturating_sub(self.body_bottom).min(self.height)
+    }
 }
 
 /// How many of the `want`ed escalation rows a window of `rows` rows can actually
@@ -66,11 +226,7 @@ pub fn footer_rows_for(rows: u16) -> u16 {
 /// Both the reserved region and the paint derive their banner count from THIS
 /// function, so a resize can never leave the two disagreeing.
 fn escalation_rows_that_fit(rows: u16, want: u16) -> u16 {
-    let mut fit = want;
-    while fit > 0 && rows < MIN_FOOTER_ROWS + fit {
-        fit = fit.saturating_sub(crate::escalation::ROWS_PER_BANNER);
-    }
-    fit
+    FooterLayout::solve(rows, want).banner_rows
 }
 
 /// The first (topmost) screen row the footer owns: the escalation banner's first
@@ -80,8 +236,7 @@ fn escalation_rows_that_fit(rows: u16, want: u16) -> u16 {
 /// banner — clearing from the separator alone would strand the two banner rows
 /// on the terminal a child program (or the exiting shell) inherits.
 pub fn footer_top_row(rows: u16) -> u16 {
-    rows.saturating_sub(footer_rows_for(rows).saturating_sub(1))
-        .max(1)
+    FooterLayout::for_rows(rows).top_row()
 }
 
 /// Hard ceiling on the DSR (`ESC[6n`) cursor-position exchange in
@@ -469,7 +624,7 @@ fn paint_cached_footer(home_body: bool) {
     let Some((rows, cols)) = term_size() else {
         return;
     };
-    if rows < MIN_FOOTER_ROWS {
+    if !FooterLayout::for_rows(rows).enabled() {
         return;
     }
     // Retire a finished escalation banner once its dwell has elapsed, so the
@@ -490,7 +645,7 @@ fn paint_cached_footer(home_body: bool) {
     if home_body {
         // Override the restored cursor with an explicit home into the body so
         // the post-clear view grows up from the bottom.
-        let body_bottom = rows.saturating_sub(footer_rows_for(rows)).max(1);
+        let body_bottom = FooterLayout::for_rows(rows).body_bottom;
         buf.push_str(&format!("\x1b[{body_bottom};1H"));
     }
     let mut out = std::io::stdout();
@@ -506,7 +661,7 @@ fn paint_cached_footer(home_body: bool) {
 /// DECSTBM: set the scroll region to rows `1..=(rows - FOOTER_ROWS)`, reserving
 /// the bottom [`FOOTER_ROWS`] rows for the footer.
 pub fn scroll_region_seq(rows: u16) -> String {
-    let bottom = rows.saturating_sub(footer_rows_for(rows)).max(1);
+    let bottom = FooterLayout::for_rows(rows).region_bottom();
     format!("\x1b[1;{bottom}r")
 }
 
@@ -606,25 +761,26 @@ pub fn footer_seq_with(
     statusline: &str,
     banners: Vec<(String, String)>,
 ) -> String {
-    // Every banner is two rows, so the block height is a pure function of how
-    // many pairs the caller handed us — no second read of the global stack,
-    // which is what keeps region and paint in agreement.
-    let banner_rows = (banners.len() as u16) * crate::escalation::ROWS_PER_BANNER;
-    let height = FOOTER_ROWS + banner_rows;
-    // The footer occupies the bottom `height` rows: [escalation message, worker
-    // status, …per live escalation,] separator, status message, statusline.
+    // ONE row plan, solved from `(rows, banners.len())`, drives both the
+    // reserved region and every painted row — see [`FooterLayout`] for why the
+    // old "reserve here, recompute there" split was a desync waiting to happen.
+    //
+    // The footer occupies the bottom `layout.height` rows: [escalation message,
+    // worker status, …per live escalation,] separator, status message,
+    // statusline — minus whatever a short window made us shed.
     //
     // The pinned escalation is anchored ABOVE the separator, not below it. The
     // horizontal rule is the LID of the statusline block — it marks where the
     // scrolling body stops — so a banner painted under it looked like a row
     // wedged inside the statusline frame. Above the rule it reads as the last
     // thing the body said, which is where the operator's eye goes for "what is
-    // running right now", and the rule stays welded to the two statusline rows
-    // it opens whether or not a banner is pinned.
-    let top_row = rows.saturating_sub(height.saturating_sub(1)).max(1);
-    let sep_row = top_row + banner_rows;
-    let msg_row = rows.saturating_sub(1);
-    let bar_row = rows;
+    // running right now", and the rule stays welded to the statusline rows it
+    // opens whether or not a banner is pinned.
+    let layout = FooterLayout::solve(
+        rows,
+        (banners.len() as u16) * crate::escalation::ROWS_PER_BANNER,
+    );
+    let top_row = layout.top_row();
     let max = cols as usize;
     let sep = clip_visible(separator, max);
     let msg = clip_visible(status_msg, max);
@@ -638,14 +794,17 @@ pub fn footer_seq_with(
     // next prompt at the top of the screen instead of two lines below the last
     // output. Re-asserting every paint also makes a resize between prompts
     // self-healing without depending on the SIGWINCH watcher.
-    // Derived from the SAME `height` as the row plan (not from the global pin)
-    // so a banner that retires mid-paint can't desync region from paint.
-    let region_bottom = rows.saturating_sub(height).max(1);
+    // Read off the SAME layout as the row plan (not from the global pin) so a
+    // banner that retires mid-paint can't desync region from paint.
+    let region_bottom = layout.region_bottom();
     s.push_str(&format!("\x1b[1;{region_bottom}r"));
     // The pinned escalations sit ABOVE the separator — for each one the
     // (animated) escalation message then that worker's latest status, newest
     // escalation on top, then the rule that opens the statusline block.
-    for (i, (escalation, worker)) in banners.iter().enumerate() {
+    // `banner_count()` clamps to what the window actually granted: a caller that
+    // hands us more banners than fit gets the newest ones painted, never a row
+    // written outside the reserved region.
+    for (i, (escalation, worker)) in banners.iter().take(layout.banner_count()).enumerate() {
         let esc_row = top_row + (i as u16) * crate::escalation::ROWS_PER_BANNER;
         let worker_row = esc_row + 1;
         s.push_str(&format!(
@@ -657,9 +816,18 @@ pub fn footer_seq_with(
             clip_visible(worker, max)
         ));
     }
-    s.push_str(&format!("\x1b[{sep_row};1H\x1b[2K{sep}"));
-    s.push_str(&format!("\x1b[{msg_row};1H\x1b[2K{msg}"));
-    s.push_str(&format!("\x1b[{bar_row};1H\x1b[2K{bar}"));
+    // Each zone paints ONLY if the plan granted it a row. A degraded footer
+    // (short window) silently drops the rule, then the message, and keeps the
+    // statusline — rather than dropping the whole footer off a cliff.
+    if let Some(sep_row) = layout.sep_row {
+        s.push_str(&format!("\x1b[{sep_row};1H\x1b[2K{sep}"));
+    }
+    if let Some(msg_row) = layout.msg_row {
+        s.push_str(&format!("\x1b[{msg_row};1H\x1b[2K{msg}"));
+    }
+    if let Some(bar_row) = layout.bar_row {
+        s.push_str(&format!("\x1b[{bar_row};1H\x1b[2K{bar}"));
+    }
     s.push_str("\x1b8"); // DECRC — restore cursor + attrs
     s
 }
@@ -743,9 +911,11 @@ impl Terminal {
         })
     }
 
-    /// True when the terminal is tall enough to host the footer.
+    /// True when the terminal is tall enough to host the footer — including the
+    /// DEGRADED forms (statusline-only, or rule-less), which is why this asks
+    /// the solver instead of comparing against [`MIN_FOOTER_ROWS`].
     pub fn footer_enabled(&self) -> bool {
-        self.rows >= MIN_FOOTER_ROWS
+        FooterLayout::for_rows(self.rows).enabled()
     }
 
     /// Install the DECSTBM scroll region and drop the cursor into the body (the
@@ -755,7 +925,7 @@ impl Terminal {
         if !self.footer_enabled() {
             return;
         }
-        let body_bottom = self.rows.saturating_sub(footer_rows_for(self.rows)).max(1);
+        let body_bottom = FooterLayout::for_rows(self.rows).body_bottom;
         let mut out = std::io::stdout();
         // Install the region, suppress alternate-scroll (so the mouse wheel
         // scrolls native scrollback instead of emitting Up/Down into rustyline),
@@ -813,7 +983,7 @@ impl Terminal {
         }
         // A resize below the footer threshold mid-turn: skip the paint (a footer
         // no longer fits) and let the idle handle_resize tear the region down.
-        if self.rows < MIN_FOOTER_ROWS {
+        if !FooterLayout::for_rows(self.rows).enabled() {
             return;
         }
         let sep = separator_line(self.cols, self.utf8, crate::style::colors_enabled());
@@ -958,7 +1128,7 @@ pub fn suspend_footer_region() -> bool {
 /// [`footer_overflow_rows`] for the "`ls -al` loses its last few lines" bug this
 /// fixes.
 pub fn resume_region_seq(rows: u16) -> String {
-    let body_bottom = rows.saturating_sub(footer_rows_for(rows)).max(1);
+    let body_bottom = FooterLayout::for_rows(rows).body_bottom;
     format!("{}\x1b[{body_bottom};1H", scroll_region_seq(rows))
 }
 
@@ -992,9 +1162,7 @@ pub fn resume_region_seq(rows: u16) -> String {
 /// zone and a fixed scroll would jerk the screen on every single command. The
 /// measured overflow is what makes this safe.
 pub fn footer_overflow_rows(rows: u16, cursor_row: u16) -> u16 {
-    let height = footer_rows_for(rows);
-    let body_bottom = rows.saturating_sub(height).max(1);
-    cursor_row.saturating_sub(body_bottom).min(height)
+    FooterLayout::for_rows(rows).overflow_rows(cursor_row)
 }
 
 /// [`resume_region_seq`] preceded by the corrective scroll-up derived from the
@@ -1173,7 +1341,7 @@ pub fn resume_footer_region() {
     let Some((rows, _cols)) = term_size() else {
         return;
     };
-    if rows < MIN_FOOTER_ROWS {
+    if !FooterLayout::for_rows(rows).enabled() {
         return;
     }
     // Measure first: how far did the child's output run into the rows the
@@ -1453,9 +1621,13 @@ mod tests {
         // rows the footer is about to reclaim. This is the alt-screen case —
         // vim/less restore the pre-launch cursor, so leaving them never jerks
         // the viewport.
-        assert_eq!(footer_overflow_rows(24, 21), 0);
-        assert_eq!(footer_overflow_rows(24, 10), 0);
-        assert_eq!(footer_overflow_rows(24, 1), 0);
+        // Solved explicitly rather than through `footer_overflow_rows`, which
+        // reads the LIVE escalation stack: banner rows shrink the body, and a
+        // sibling test pinning a banner would otherwise flip these numbers.
+        let plan = FooterLayout::solve(24, 0);
+        assert_eq!(plan.overflow_rows(21), 0);
+        assert_eq!(plan.overflow_rows(10), 0);
+        assert_eq!(plan.overflow_rows(1), 0);
     }
 
     #[test]
@@ -1463,14 +1635,18 @@ mod tests {
         // THE BUG, in numbers: `ls -al` on a 24-row terminal left the cursor at
         // row 24 while the region was suspended, so 3 rows of output sat under
         // the footer and got painted over. Lift exactly that many.
-        assert_eq!(footer_overflow_rows(24, 22), 1);
-        assert_eq!(footer_overflow_rows(24, 23), 2);
-        assert_eq!(footer_overflow_rows(24, 24), 3);
+        let plan = FooterLayout::solve(24, 0);
+        assert_eq!(plan.overflow_rows(22), 1);
+        assert_eq!(plan.overflow_rows(23), 2);
+        assert_eq!(plan.overflow_rows(24), 3);
         // Never more than the footer's own height — that is all it can hide.
-        assert_eq!(footer_overflow_rows(24, 99), FOOTER_ROWS);
-        // Tiny terminals reuse the `.max(1)` body floor from scroll_region_seq,
-        // so the two never disagree about where the body ends.
-        assert_eq!(footer_overflow_rows(3, 3), 2);
+        assert_eq!(plan.overflow_rows(99), FOOTER_ROWS);
+        // Tiny terminals read the SAME solved plan as scroll_region_seq, so the
+        // two never disagree about where the body ends. A 3-row window runs a
+        // DEGRADED 1-row footer (statusline only), so exactly one row can be
+        // hidden — not FOOTER_ROWS' worth.
+        assert_eq!(FooterLayout::solve(3, 0).height, 1);
+        assert_eq!(FooterLayout::solve(3, 0).overflow_rows(3), 1);
     }
 
     #[test]
@@ -1531,9 +1707,14 @@ mod tests {
 
     #[test]
     fn scroll_region_never_collapses_below_row_one() {
-        // Degenerate tiny sizes still emit a valid (row 1) region.
-        assert_eq!(scroll_region_seq(3), "\x1b[1;1r");
+        // Degenerate tiny sizes still emit a valid (row >= 1) region, and the
+        // bottom margin always matches the solved plan's body_bottom.
+        // 3 rows: degraded 1-row footer → body is rows 1..=2.
+        assert_eq!(scroll_region_seq(3), "\x1b[1;2r");
+        // 1 row: nothing fits, so the footer is dropped entirely and the single
+        // row stays a scrolling body row rather than becoming an invalid region.
         assert_eq!(scroll_region_seq(1), "\x1b[1;1r");
+        assert_eq!(FooterLayout::solve(1, 0).height, 0);
     }
 
     #[test]
@@ -1545,9 +1726,11 @@ mod tests {
 
     #[test]
     fn resume_region_clamps_tiny_terminals() {
-        // Degenerate heights collapse to a row-1 region AND a row-1 home rather
-        // than emitting an invalid ESC[0;1H.
-        assert_eq!(resume_region_seq(3), "\x1b[1;1r\x1b[1;1H");
+        // Degenerate heights never emit an invalid ESC[0;1H — the home row is
+        // the solved body_bottom, which is floored at 1.
+        // 3 rows: degraded footer owns row 3, body is 1..=2, home row 2.
+        assert_eq!(resume_region_seq(3), "\x1b[1;2r\x1b[2;1H");
+        // 1 row: no footer fits, so the lone row is the body and the home row.
         assert_eq!(resume_region_seq(1), "\x1b[1;1r\x1b[1;1H");
     }
 
@@ -1905,20 +2088,135 @@ mod tests {
 
     #[test]
     fn footer_enabled_threshold() {
-        let t = Terminal {
-            rows: 5,
-            cols: 80,
-            active: false,
-            utf8: true,
+        let at = |rows: u16| {
+            Terminal {
+                rows,
+                cols: 80,
+                active: false,
+                utf8: true,
+            }
+            .footer_enabled()
         };
-        assert!(t.footer_enabled());
-        let short = Terminal {
-            rows: 4,
-            cols: 80,
-            active: false,
-            utf8: true,
-        };
-        assert!(!short.footer_enabled());
+        // MIN_FOOTER_ROWS and up: the FULL footer fits.
+        assert!(at(MIN_FOOTER_ROWS));
+        assert!(at(24));
+        // Between MIN_FOOTER_ROWS_DEGRADED and MIN_FOOTER_ROWS the footer
+        // DEGRADES rather than vanishing — a 4-row window keeps the statusline
+        // (and the status message), a 3-row window keeps the statusline alone.
+        // This is the gradient that replaced the old all-or-nothing cliff.
+        assert!(at(4));
+        assert!(at(MIN_FOOTER_ROWS_DEGRADED));
+        // Below that, MIN_BODY_ROWS wins outright: chrome is shed to zero so
+        // command output — the actual product — keeps every row it has.
+        assert!(!at(MIN_BODY_ROWS));
+        assert!(!at(1));
+    }
+
+    #[test]
+    fn footer_degrades_by_priority_instead_of_vanishing() {
+        // The shed order is load-bearing, so pin it row by row.
+        // 24 rows: everything fits — rule, message, statusline, in that order
+        // upward from the bottom.
+        let full = FooterLayout::solve(24, 0);
+        assert_eq!(full.height, FOOTER_ROWS);
+        assert_eq!(
+            (full.sep_row, full.msg_row, full.bar_row),
+            (Some(22), Some(23), Some(24))
+        );
+        assert_eq!(full.body_bottom, 21);
+
+        // 4 rows: the separator — pure chrome, zero information — sheds FIRST,
+        // and the survivors pack contiguously upward so no hole is left behind.
+        let tight = FooterLayout::solve(4, 0);
+        assert_eq!(tight.height, 2);
+        assert_eq!(tight.sep_row, None);
+        assert_eq!((tight.msg_row, tight.bar_row), (Some(3), Some(4)));
+        assert_eq!(tight.body_bottom, MIN_BODY_ROWS);
+
+        // 3 rows: the transient status message sheds next (it also prints
+        // inline, so nothing is actually lost), leaving the statusline.
+        let bare = FooterLayout::solve(3, 0);
+        assert_eq!(bare.height, 1);
+        assert_eq!((bare.sep_row, bare.msg_row), (None, None));
+        assert_eq!(bare.bar_row, Some(3));
+        assert_eq!(bare.body_bottom, MIN_BODY_ROWS);
+
+        // 2 rows and below: the statusline itself goes, footer height hits 0,
+        // and the caller falls back to inline printing.
+        let none = FooterLayout::solve(2, 0);
+        assert_eq!(none.height, 0);
+        assert_eq!(none.bar_row, None);
+        assert!(!none.enabled());
+
+        // MIN_BODY_ROWS is never traded away, at ANY size, and the plan always
+        // accounts for exactly the whole window: footer + body == rows.
+        for rows in 1..=120u16 {
+            let l = FooterLayout::solve(rows, 0);
+            assert!(
+                l.body_bottom >= MIN_BODY_ROWS.min(rows),
+                "{rows} rows starved the body: {l:?}"
+            );
+            assert_eq!(l.height + l.body_bottom, rows, "plan lost a row at {rows}");
+        }
+    }
+
+    #[test]
+    fn banners_shed_whole_and_before_any_chrome() {
+        let per = crate::escalation::ROWS_PER_BANNER;
+        // Roomy window: three banners fit on top of the full footer.
+        let roomy = FooterLayout::solve(60, per * 3);
+        assert_eq!(roomy.banner_rows, per * 3);
+        assert_eq!(roomy.banner_count(), 3);
+        assert_eq!(roomy.height, FOOTER_ROWS + per * 3);
+        // top_row must cover the BANNER block, not just the rule — teardown
+        // clears from there, and clearing from the rule would strand banners.
+        assert_eq!(roomy.top_row(), 60 - roomy.height + 1);
+
+        // A half banner is never reservable: an odd want normalizes DOWN.
+        assert_eq!(FooterLayout::solve(60, per * 2 + 1).banner_rows, per * 2);
+
+        // Squeeze: banners shed BEFORE the separator, whole units at a time,
+        // and the full 3-row footer survives intact.
+        let squeezed = FooterLayout::solve(MIN_FOOTER_ROWS + per, per * 4);
+        assert_eq!(squeezed.banner_rows, per);
+        assert!(squeezed.sep_row.is_some());
+        assert!(squeezed.banner_rows.is_multiple_of(per));
+
+        // No room for any banner → chrome is still fully intact.
+        let full_only = FooterLayout::solve(MIN_FOOTER_ROWS, per * 4);
+        assert_eq!(full_only.banner_rows, 0);
+        assert_eq!(full_only.height, FOOTER_ROWS);
+    }
+
+    #[test]
+    fn region_and_paint_cannot_disagree_at_any_size() {
+        // The regression this refactor exists to prevent: the DECSTBM bottom
+        // margin and the painted rows derived from two separate computations.
+        // Now both read one plan, so assert the invariant exhaustively — every
+        // painted row must sit strictly BELOW the scrolling region.
+        for rows in 1..=200u16 {
+            for want in [0u16, 2, 4, 8, 20] {
+                let l = FooterLayout::solve(rows, want);
+                assert_eq!(l.region_bottom(), l.body_bottom);
+                for row in [l.sep_row, l.msg_row, l.bar_row].into_iter().flatten() {
+                    assert!(
+                        row > l.body_bottom,
+                        "rows={rows} want={want}: painted row {row} is inside the body (bottom {})",
+                        l.body_bottom
+                    );
+                    assert!(row <= rows, "rows={rows}: painted row {row} is off-screen");
+                }
+                // Survivors are contiguous and strictly ordered upward.
+                if let (Some(s), Some(m)) = (l.sep_row, l.msg_row) {
+                    assert_eq!(s + 1, m);
+                }
+                if let (Some(m), Some(b)) = (l.msg_row, l.bar_row) {
+                    assert_eq!(m + 1, b);
+                }
+                // A footer that exists ALWAYS keeps the statusline.
+                assert_eq!(l.enabled(), l.bar_row.is_some());
+            }
+        }
     }
 
     #[test]

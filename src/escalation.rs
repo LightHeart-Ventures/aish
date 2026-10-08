@@ -11,7 +11,7 @@
 //! `:workers` to answer "is that thing still going?".
 //!
 //! THE FIX. Pin the escalation to the footer instead of the body. While
-//! coordinators are live, [`crate::terminal::footer_rows_for`] grows the pinned
+//! coordinators are live, [`crate::terminal::FooterLayout`] grows the pinned
 //! footer by [`row_count`] rows and `footer_seq` paints:
 //!
 //! ```text
@@ -43,7 +43,7 @@
 //! an id that is already on screen REFRESHES it in place instead of duplicating
 //! it. At most [`MAX_VISIBLE`] banners paint — beyond that the oldest visible
 //! status row carries a `+N more` tail, so the footer can never eat the window;
-//! [`crate::terminal::footer_rows_for`] additionally drops whole banners (newest
+//! [`crate::terminal::FooterLayout`] additionally drops whole banners (newest
 //! kept) on a window too short to hold them all.
 //!
 //! ANIMATION. The escalation emoji cycles through [`FRAMES`] on a [`FRAME_MS`]
@@ -210,7 +210,7 @@ pub fn clear() {
 }
 
 /// True while ANY banner is pinned — the gate
-/// [`crate::terminal::footer_rows_for`] consults to decide the footer height.
+/// [`crate::terminal::FooterLayout`] consults to decide the footer height.
 pub fn active() -> bool {
     BANNERS.lock().map(|b| !b.is_empty()).unwrap_or(false)
 }
@@ -224,7 +224,7 @@ pub fn count() -> usize {
 /// Footer rows the pinned block WANTS: two per visible banner, capped at
 /// [`MAX_VISIBLE`] banners. Zero when nothing is pinned.
 ///
-/// [`crate::terminal::footer_rows_for`] may hand back fewer on a short window —
+/// [`crate::terminal::FooterLayout`] may hand back fewer on a short window —
 /// it drops whole banners rather than splitting one across the rule.
 pub fn row_count() -> u16 {
     (count().min(MAX_VISIBLE) as u16) * ROWS_PER_BANNER
