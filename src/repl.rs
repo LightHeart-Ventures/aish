@@ -2621,6 +2621,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
         "show reasoning-quality telemetry (escalate vs guess)",
     ),
     (
+        "redact",
+        "secret-redaction filter: status / toggle (status|on|off)",
+    ),
+    (
         "remember",
         "capture a rich, context-enriched memory from a short note",
     ),
@@ -10458,6 +10462,13 @@ async fn handle_colon(
         Some("context") => handle_context(backend, session),
         Some("config") => handle_config(backend, session),
         Some("reasoning") => handle_reasoning(),
+        Some("redact") => {
+            // Session-local escape valve. Refused in an unattended session —
+            // nobody is reading a coordinator's transcript before it is
+            // persisted (SEC-3.2 / F-02).
+            let unattended = crate::redact::is_unattended(session.mode, session.nested);
+            println!("{}", crate::redact::handle_redact(parts.next(), unattended));
+        }
         Some("metrics") => handle_metrics(),
         Some("compact") => handle_compact(backend, session),
         Some("remember") => {
@@ -12822,11 +12833,14 @@ mod tests {
         assert!(full.contains(":mode"));
         assert!(full.contains("confirmation"));
 
-        // Typing narrows it in place: `:re` -> reasoning + rename + restart + result + rewrite.
-        let re = palette_hint(":re", 3, usize::MAX)
-            .expect("`:re` matches reasoning + remember + rename + restart + result + rewrite");
-        assert_eq!(re.matches('\n').count(), 6);
+        // Typing narrows it in place: `:re` -> reasoning + redact + remember + rename
+        // + restart + result + rewrite.
+        let re = palette_hint(":re", 3, usize::MAX).expect(
+            "`:re` matches reasoning + redact + remember + rename + restart + result + rewrite",
+        );
+        assert_eq!(re.matches('\n').count(), 7);
         assert!(re.contains(":reasoning"));
+        assert!(re.contains(":redact"));
         assert!(re.contains(":remember"));
         assert!(re.contains(":rename"));
         assert!(re.contains(":restart"));
