@@ -67,6 +67,9 @@ mod rewrite;
 mod scope;
 mod script;
 mod secrets;
+// Sensitive-path denylist (SEC-2.3 / F-09): credential/key/identity paths are
+// gated in EVERY mode, including Yolo, and are never covered by an 'a'/'d' grant.
+mod sensitive;
 mod session;
 // Shared skill-registry contract. Also re-exported from src/lib.rs so the
 // `skill-mirror` generator (tools/skill-mirror, TASK-694) validates and emits
@@ -150,7 +153,9 @@ struct Args {
     #[arg(long, default_value = "normal")]
     mode: String,
 
-    /// Skip all confirmation prompts (alias for --mode yolo)
+    /// Skip all confirmation prompts (alias for --mode yolo). Sensitive paths
+    /// (credentials, SSH/GPG/cloud keys, .env files) are the ONE exception: they
+    /// still confirm, and 'a'/'d' are never offered for them (SEC-2.3).
     #[arg(long)]
     yolo: bool,
 

@@ -1232,6 +1232,9 @@ final status plus your best partial result. After this turn you are terminated."
             if let Some(s) = store {
                 let _ = s.set_phase(run_id, Phase::Coordinating.as_str());
             }
+            // Nobody is at the keyboard: this hook says yes to everything, so the
+            // sensitive-path gate must REFUSE rather than "confirm" (SEC-2.3).
+            crate::sensitive::set_unattended(true);
             let mut allow = |_: &str| tools::Decision::AllowOnce;
             let answer =
                 match crate::engine::run_turn(backend, session, next_input, &mut allow).await {
@@ -1296,6 +1299,9 @@ final status plus your best partial result. After this turn you are terminated."
         if let Some(s) = store {
             let _ = s.set_phase(run_id, Phase::Coordinating.as_str());
         }
+        // Nobody is at the keyboard: this hook says yes to everything, so the
+        // sensitive-path gate must REFUSE rather than "confirm" (SEC-2.3).
+        crate::sensitive::set_unattended(true);
         let mut allow = |_: &str| tools::Decision::AllowOnce;
         let turn = crate::engine::run_turn(backend, session, next_input, &mut allow).await;
         rounds += 1;
