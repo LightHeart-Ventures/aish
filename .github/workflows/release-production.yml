@@ -215,6 +215,14 @@ jobs:
   release:
     name: publish release
     needs: [verify-version, build]
+    # SEC-4.1 / F-06: publish SLSA build provenance alongside the assets so the
+    # client-side `gh attestation verify` check in src/update.rs has something to
+    # verify. Job-level permissions REPLACE the workflow-level block, so
+    # contents:write is restated here.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
@@ -241,6 +249,17 @@ jobs:
           cd dist
           cat *.sha256 > SHA256SUMS
           cat SHA256SUMS
+
+      # SEC-4.1 / F-06: SLSA build provenance for every shipped binary. Runs
+      # BEFORE publish so a failed attestation blocks the release rather than
+      # shipping an unattested asset. Verified client-side by
+      # `gh attestation verify` in src/update.rs (AISH_UPDATE_ATTESTATION).
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            dist/aish-*
+            !dist/*.sha256
 
       - name: Create and publish GitHub Release
         env:
