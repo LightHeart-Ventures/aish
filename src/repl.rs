@@ -9738,8 +9738,8 @@ async fn handle_colon(
                                 }
                             }
                             (None, Some(e)) => {
-                                let t = if e.len() > 40 {
-                                    format!("{}…", &e[..40])
+                                let t = if e.chars().count() > 40 {
+                                    format!("{}…", e.chars().take(40).collect::<String>())
                                 } else {
                                     e.to_string()
                                 };
