@@ -2764,8 +2764,8 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
             }
             (None, Some(e)) => {
                 // Truncate error message to ~40 chars
-                let truncated = if e.len() > 40 {
-                    format!("{}…", &e[..40])
+                let truncated = if e.chars().count() > 40 {
+                    format!("{}…", e.chars().take(40).collect::<String>())
                 } else {
                     e.clone()
                 };

@@ -3398,8 +3398,8 @@ impl WorkerJob {
             }
             "failed" => {
                 let e = i.error.as_deref().unwrap_or("unknown error");
-                let truncated = if e.len() > 40 {
-                    format!("{}…", &e[..40])
+                let truncated = if e.chars().count() > 40 {
+                    format!("{}…", e.chars().take(40).collect::<String>())
                 } else {
                     e.to_string()
                 };
