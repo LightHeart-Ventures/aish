@@ -4,6 +4,9 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Fixed
+- **Statusline stops disappearing while the model is thinking** (PR #944): the footer heartbeat — the background thread that repaints the statusline from cache to heal a footer that scrolled out of view — only ran while the REPL was parked at the prompt (`READING_LINE`). For the whole duration of a turn (thinking + tool calls, often minutes) nothing repainted the footer, so anything that scrolled it away or overwrote it during that window left it gone until the turn ENDED: a mouse-wheel/trackpad scroll (which sends aish no input at all, so the shell never learns the viewport moved), a window resize leaving DECSTBM stale, or a full-screen program's leftovers. The `READING_LINE` requirement was never a safety property — the repaint is cursor-safe (DECSC/DECRC) and mid-turn type-ahead lives in `MIDTURN_INPUT`, which the repaint itself draws. The one genuine hazard, rustyline rendering a partially-typed line (`INPUT_DIRTY`), is now scoped to the prompt instead of blocking unconditionally, so the heartbeat keeps healing the footer straight through a turn. The gate is extracted as a pure `heartbeat_should_paint(HeartbeatState)` with regression tests covering mid-turn healing, resize/animation bypasses, the in-progress-prompt-line hold-off, `:attach` and foreground-TTY-child (`vim`/`sudo`) yielding, and the no-change quiet case.
+
 ## [0.53.2] - 2026-10-08
 
 The TUI-layout release. The footer and statusline stop being rigid row stacks and become pure layout solvers that shed zones by priority, so a short window degrades gracefully instead of falling off a cliff. On top of that: the `:workers` modal wraps and scrolls instead of cropping, worker-pane bursts carry a stable per-worker hue and a seam rule, the prompt prefix is budgeted so there is always room to type, and the escalation banner stops flickering through unrelated emoji.
