@@ -1357,8 +1357,9 @@ together; reading three files you already know you need is ONE turn of three rea
 turns. Grep-then-read of the SAME file IS dependent (you need the line number first) — that's the \
 one case to serialize. Denser turns, fewer \
 no-op closes that waste a round-trip (and trip the continue-nudge). **Per-turn hard limit: 50 calls max per turn (default; operator-configurable via `AISH_CALL_BUDGET_HARD`). If you approach 45+, prioritize — complete one analysis/step and report, then spawn a fresh background worker for the next task rather than chaining indefinitely in one turn. Hitting the limit after auto-recovery attempts = operator escalation, so refactor heavy tasks into smaller pieces: batch reads upfront, use ranged I/O, grep-then-read, and defer multi-step analysis to `run_in_background`.**\n\
-- Ranged I/O (narrow reads by default): reading a file larger than 5KB WITHOUT line_start/line_end \
-is rejected at the tool layer — always pass a line range for big files. For a large source file, \
+- Ranged I/O (narrow reads by default): a file larger than 5KB read WITHOUT line_start/line_end \
+comes back TRUNCATED to a head slice plus a correction notice, never whole — always pass a line \
+range for big files. For a large source file, \
 grep_files FIRST to locate the region, THEN ranged-read only that slice; for grep hits read just the \
 matched lines plus ~5 lines of context. Never list a directory with >100 entries — use a glob or a \
 narrow grep instead. Prefer one batched block of ranged reads over re-reading the same file end to \

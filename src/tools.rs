@@ -11,11 +11,14 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 const MAX_OUTPUT: usize = 50_000; // bytes of program output fed back to the model
 const MAX_FILE_READ: usize = 100_000;
-/// TASK-322: whole-file reads larger than this are rejected by the tool layer —
-/// the agent must pass `line_start`/`line_end` to slice the file (or use
-/// `grep_files` to locate the region first). Bulk unranged reads blow the
-/// model's context budget; a ranged read is always cheaper. A file of EXACTLY
-/// this size still reads whole; one byte over is rejected.
+/// TASK-322: whole-file reads larger than this are NOT served whole — the agent
+/// must pass `line_start`/`line_end` to slice the file (or use `grep_files` to
+/// locate the region first). Bulk unranged reads blow the model's context
+/// budget; a ranged read is always cheaper. A file of EXACTLY this size still
+/// reads whole; one byte over degrades to a head slice + a truncation notice
+/// (see `read_file`; this superseded the hard refusal). The same value
+/// doubles as the byte ceiling on that head slice, so the degraded response can
+/// never serve more body than a conformant whole-file read would.
 const RANGED_READ_MAX_BYTES: usize = 5 * 1024; // 5 KiB
 /// TASK-322: default cap on the number of entries `list_dir` returns before it
 /// truncates and warns. Overridable per-call via the `max` arg. Bans a single
@@ -233,8 +236,9 @@ whenever you need the output."
             description: "Read a file's contents. Call this instead of running cat/head/tail. \
 Relative paths resolve against the shell's current directory. For a LARGE file, pass \
 `line_start`/`line_end` (1-based, inclusive) to read only that slice instead of re-reading the \
-whole file — cheaper, and it avoids the duplicate-read loop-guard. Prefer a targeted range (or \
-grep_files) over repeatedly reading a big file end to end."
+whole file — cheaper, and it avoids the duplicate-read loop-guard. A file over 5 KiB read WITHOUT \
+bounds is never served whole: you get the first lines plus a truncation notice, so pass a range (or \
+grep_files first) to reach the region you actually need."
                 .into(),
             schema: json!({
                 "type": "object",
@@ -3600,26 +3604,66 @@ fn read_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) 
     }
 
     // TASK-322 system-level enforcement: a whole-file read of a file larger than
-    // RANGED_READ_MAX_BYTES is rejected at the tool layer. The agent must pass
+    // RANGED_READ_MAX_BYTES is NOT served whole. The agent must pass
     // line_start/line_end to read a slice, or grep_files to find the region of
     // interest first. Files at or below the cap read whole (back-compat).
+    //
+    // TASK-333 made that refusal an ACTIONABLE, context-sensitive hint. This
+    // supersedes the hard refusal entirely: telemetry showed the TASK-322 `Err`
+    // was 58.4% of EVERY tool error aish has ever logged (read_file: 10.6% error
+    // rate, the worst of any tool), and 83% of the retries were simply the SAME
+    // file WITH bounds. A whole model round-trip bought nothing the response
+    // could not have carried itself, so the guard now DEGRADES GRACEFULLY — it
+    // serves a bounded head slice AND the identical corrective guidance. The
+    // discipline is unchanged (the notice still says, unmistakably, that the
+    // call was wrong and what to do instead); only the Err→Ok shape moved.
     if content.len() > RANGED_READ_MAX_BYTES {
-        // TASK-333: turn the refusal into an ACTIONABLE, context-sensitive hint.
-        // It reports the file's line count and suggests a concrete first slice so
-        // the agent can retry immediately with real bounds instead of guessing.
         let total = content.lines().count();
         let suggested_end = total.clamp(1, 200);
-        return Err(anyhow::anyhow!(
-            "{} is {} bytes / {} lines (> {} KiB): bulk reads without line bounds are disallowed. \
-Read a slice — e.g. line_start=1, line_end={} (first {} of {} lines) — or use grep_files to \
-locate the region first.",
+        // Serve at most `suggested_end` lines AND at most RANGED_READ_MAX_BYTES
+        // of body, so a file of few-but-enormous lines cannot smuggle a bulk
+        // read through the head slice. Keeps the payload far under MAX_FILE_READ.
+        let mut head = String::new();
+        let mut shown = 0usize;
+        for line in content.lines().take(suggested_end) {
+            if !head.is_empty() && head.len() + 1 + line.len() > RANGED_READ_MAX_BYTES {
+                break;
+            }
+            if !head.is_empty() {
+                head.push('\n');
+            }
+            head.push_str(line);
+            shown += 1;
+        }
+        // Same `[lines A-B of TOTAL]` header the ranged path above emits, so the
+        // degraded response is shaped like an ordinary slice.
+        let header = format!("[lines 1-{shown} of {total}]\n");
+        // Point at the NEXT chunk: the head slice already covers 1..=shown.
+        let next_chunk = if shown < total {
+            format!(
+                " — e.g. line_start={}, line_end={} for the next chunk",
+                shown + 1,
+                (shown + suggested_end).min(total)
+            )
+        } else {
+            String::new()
+        };
+        let notice = format!(
+            "\n\n--- TRUNCATED: bulk reads without line bounds are disallowed ---\n\
+{} is {} bytes / {} lines (> {} KiB); only the first {} of {} lines are shown above.\n\
+Pass line_start/line_end to read the slice you actually need{} — or use grep_files to locate \
+the region first, then ranged-read just that slice.",
             full.display(),
             content.len(),
             total,
             RANGED_READ_MAX_BYTES / 1024,
-            suggested_end,
-            suggested_end,
+            shown,
             total,
+            next_chunk,
+        );
+        return Ok(truncate_middle(
+            format!("{header}{head}{notice}"),
+            MAX_FILE_READ,
         ));
     }
 
@@ -6408,7 +6452,8 @@ mod fileops_tests {
     }
 
     // TASK-322: a whole-file read of a file EXACTLY at the cap still reads
-    // whole; one byte over is rejected unless line bounds are supplied.
+    // whole; one byte over degrades to a head slice + truncation notice instead
+    // of being served whole (it used to hard-fail — see read_file).
     #[tokio::test]
     async fn read_file_ranged_read_enforcement() {
         let dir = tmp("rangedread");
@@ -6420,14 +6465,24 @@ mod fileops_tests {
         assert!(!r.is_error, "file at cap must read whole: {}", r.content);
         assert_eq!(r.content.len(), RANGED_READ_MAX_BYTES);
 
-        // One byte over — rejected without line bounds.
+        // One byte over — NOT served whole: degrades to a head slice carrying the
+        // truncation notice, so the agent gets data AND the correction in one hop.
         std::fs::write(dir.join("over_cap"), vec![b'a'; RANGED_READ_MAX_BYTES + 1]).unwrap();
         let r = run(&mut s, "read_file", json!({"path": "over_cap"})).await;
-        assert!(r.is_error, "file over cap must be rejected: {}", r.content);
+        assert!(
+            !r.is_error,
+            "file over cap must degrade, not fail: {}",
+            r.content
+        );
         assert!(
             r.content
                 .contains("bulk reads without line bounds are disallowed"),
             "{}",
+            r.content
+        );
+        assert!(
+            r.content.contains("[lines 1-1 of 1]"),
+            "degraded read keeps the ranged-read header: {}",
             r.content
         );
 
@@ -6463,9 +6518,10 @@ mod fileops_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // TASK-333: the oversize refusal must be an ACTIONABLE, context-sensitive
-    // hint — it reports the file's line count and suggests a concrete slice the
-    // agent can retry with, across a range of oversized files.
+    // TASK-333: the oversize response must carry ACTIONABLE, context-sensitive
+    // guidance — real line counts plus a concrete slice the agent can retry
+    // with — across a range of oversized files. It now rides along with a head
+    // slice (Ok) instead of a hard refusal (Err).
     #[tokio::test]
     async fn read_file_oversize_hint_is_actionable() {
         let dir = tmp("readhint");
@@ -6481,8 +6537,15 @@ mod fileops_tests {
             std::fs::write(dir.join(name), body.as_bytes()).unwrap();
             let r = run(&mut s, "read_file", json!({"path": name})).await;
             assert!(
-                r.is_error,
-                "oversized {name} must be refused: {}",
+                !r.is_error,
+                "oversized {name} must degrade, not fail: {}",
+                r.content
+            );
+            // Still says, unmistakably, that the unranged call was wrong.
+            assert!(
+                r.content
+                    .contains("bulk reads without line bounds are disallowed"),
+                "notice must keep the guard's verdict: {}",
                 r.content
             );
             // Reports the real line count.
@@ -6491,14 +6554,15 @@ mod fileops_tests {
                 "hint must state line count: {}",
                 r.content
             );
-            // Suggests a concrete, retryable slice (capped at 200 lines).
+            // Suggests a concrete, retryable slice for the NEXT chunk (the head
+            // slice already covered lines 1-200).
             assert!(
-                r.content.contains("line_start=1"),
-                "hint must suggest a slice: {}",
+                r.content.contains("line_start=201"),
+                "hint must suggest the next slice: {}",
                 r.content
             );
             assert!(
-                r.content.contains("line_end=200"),
+                r.content.contains("line_end=400"),
                 "hint must cap the suggested slice: {}",
                 r.content
             );
@@ -6508,6 +6572,150 @@ mod fileops_tests {
                 r.content
             );
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // An oversize unranged read DEGRADES GRACEFULLY: the payload is a real head
+    // slice (so the hop is not wasted) plus a delimited truncation notice (so
+    // the discipline is preserved). Measured justification: the old `Err` was
+    // 58.4% of all tool errors logged and 83% of its retries were the same file
+    // WITH bounds, i.e. a full model round-trip that taught nothing.
+    #[tokio::test]
+    async fn read_file_oversize_degrades_to_head_slice() {
+        let dir = tmp("readdegrade");
+        let mut s = yolo_session(&dir);
+
+        let mut body = String::new();
+        for i in 0..1500 {
+            body.push_str(&format!("line {i}\n"));
+        }
+        assert!(body.len() > RANGED_READ_MAX_BYTES);
+        std::fs::write(dir.join("big"), body.as_bytes()).unwrap();
+
+        let r = run(&mut s, "read_file", json!({"path": "big"})).await;
+        assert!(!r.is_error, "must be Ok now: {}", r.content);
+        // Same `[lines A-B of TOTAL]` header the ranged-read path emits.
+        assert!(
+            r.content.contains("[lines 1-200 of 1500]"),
+            "missing ranged header: {}",
+            r.content
+        );
+        // Real head slice: first 200 lines, nothing past them.
+        assert!(
+            r.content.contains("line 0") && r.content.contains("line 199"),
+            "head slice must carry the first 200 lines: {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains("line 200"),
+            "head slice must stop at the cap: {}",
+            r.content
+        );
+        // Delimited truncation notice with the real counts.
+        assert!(
+            r.content.contains("--- TRUNCATED:"),
+            "missing truncation delimiter: {}",
+            r.content
+        );
+        assert!(
+            r.content
+                .contains(&format!("{} bytes / 1500 lines", body.len())),
+            "notice must state bytes + total lines: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("first 200 of 1500 lines"),
+            "notice must state how many lines were shown: {}",
+            r.content
+        );
+        assert!(
+            r.content.contains("line_start/line_end"),
+            "notice must name the fix: {}",
+            r.content
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The head slice is byte-bounded as well as line-bounded: a file of
+    // few-but-enormous lines cannot smuggle a bulk read through it.
+    #[tokio::test]
+    async fn read_file_oversize_head_slice_is_byte_bounded() {
+        let dir = tmp("readdegradebytes");
+        let mut s = yolo_session(&dir);
+
+        // 3 lines × 4 KiB = 12 KiB: over the cap, but only 3 lines total.
+        let long = "x".repeat(4 * 1024);
+        let body = format!("{long}\n{long}\n{long}\n");
+        std::fs::write(dir.join("wide"), body.as_bytes()).unwrap();
+
+        let r = run(&mut s, "read_file", json!({"path": "wide"})).await;
+        assert!(!r.is_error, "must degrade, not fail: {}", r.content);
+        // Only the first line fits under the byte ceiling.
+        assert!(
+            r.content.contains("[lines 1-1 of 3]"),
+            "byte ceiling must stop the slice at one line: {}",
+            r.content
+        );
+        assert!(
+            r.content.len() < body.len(),
+            "degraded payload must be smaller than the file: {} vs {}",
+            r.content.len(),
+            body.len()
+        );
+        assert!(
+            r.content.contains("line_start=2"),
+            "notice must point at the next unread line: {}",
+            r.content
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Guard scope: small files and explicit ranges are untouched by the
+    // degradation path, and the range validation error is still an Err.
+    #[tokio::test]
+    async fn read_file_small_and_ranged_reads_unaffected_by_degradation() {
+        let dir = tmp("readunaffected");
+        let mut s = yolo_session(&dir);
+
+        // Small file: whole content, no header, no notice.
+        std::fs::write(dir.join("small"), b"alpha\nbeta\n").unwrap();
+        let r = run(&mut s, "read_file", json!({"path": "small"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(r.content, "alpha\nbeta\n");
+        assert!(!r.content.contains("TRUNCATED"), "{}", r.content);
+
+        // Explicit range over an oversized file: plain slice, no notice.
+        let mut body = String::new();
+        for i in 0..1500 {
+            body.push_str(&format!("line {i}\n"));
+        }
+        std::fs::write(dir.join("big"), body.as_bytes()).unwrap();
+        let r = run(
+            &mut s,
+            "read_file",
+            json!({"path": "big", "line_start": 5, "line_end": 7}),
+        )
+        .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            r.content.starts_with("[lines 5-7 of 1500]"),
+            "{}",
+            r.content
+        );
+        assert!(!r.content.contains("TRUNCATED"), "{}", r.content);
+
+        // Inverted range still errors.
+        let r = run(
+            &mut s,
+            "read_file",
+            json!({"path": "big", "line_start": 9, "line_end": 2}),
+        )
+        .await;
+        assert!(r.is_error, "inverted range must still fail: {}", r.content);
+        assert!(r.content.contains("before line_start"), "{}", r.content);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
