@@ -20,9 +20,11 @@
 //!
 //! # The invariant (read this before touching any mid-turn writer)
 //!
-//! The erase is `CSI {painted} F` (cursor-previous-line) + `CSI 0 J` (erase to
-//! end of display) — the SAME anchor pattern [`crate::engine::render_raw_toggle`]
-//! uses for its in-place Ctrl-O block. It is only correct while:
+//! The erase walks UP from the anchor row erasing one row at a time —
+//! `CSI 1 F` (cursor-previous-line) + `CSI 2 K` (erase line), repeated
+//! `painted` times — the SAME bounded pattern
+//! [`crate::engine::render_raw_toggle`] uses for its in-place Ctrl-O block. See
+//! [`erase_rows_above`] for why it is NOT `CSI 0 J`. It is only correct while:
 //!
 //! 1. **The cursor sits at column 1 of the row immediately below the window.**
 //!    Every painted row is terminated with `\n`, so this holds by construction
@@ -83,6 +85,35 @@ pub fn rows_cap(term_rows: usize) -> usize {
     MAX_ROWS.min(term_rows.saturating_sub(2))
 }
 
+/// Erase the `n` physical rows immediately ABOVE the cursor, leaving the cursor
+/// at column 1 of the topmost erased row (so the caller repaints into the rows
+/// it just reclaimed).
+///
+/// # Why this is a row walk and not `CSI {n} F` + `CSI 0 J`
+///
+/// ED (erase-in-display) is **not bounded by the DECSTBM scroll region** — `CSI
+/// 0 J` erases from the cursor to the end of the *screen*, and aish's
+/// bottom-anchored footer (separator, status message, statusline, and the
+/// escalation/queued tray that rides above the separator) lives in the rows
+/// BELOW the body region. So an anchor-relative `0 J` wiped the entire footer on
+/// every single repaint; it only reappeared when the next statusline tick or the
+/// idle heartbeat happened to repaint it, which reads as "the statusline keeps
+/// disappearing while output streams" (the v0.53.2 regression).
+///
+/// EL (`CSI 2 K`) erases only the cursor's own row, so a walk touches exactly
+/// the rows the window owns and nothing below them. The walk goes UP (CPL then
+/// EL, `n` times) rather than up-then-down on purpose: CPL saturates at the top
+/// margin, so if `n` ever exceeds the rows actually above the cursor the walk
+/// harmlessly re-erases the top row instead of marching back DOWN past the
+/// anchor and into the footer — the failure mode is clamped, not inverted.
+pub fn erase_rows_above(n: usize) -> String {
+    let mut out = String::with_capacity(n * 8);
+    for _ in 0..n {
+        out.push_str("\x1b[1F\x1b[2K");
+    }
+    out
+}
+
 /// The pure window transform. Holds the last K rows and how many physical rows
 /// are currently painted on screen; every method returns the exact byte string
 /// to write to stderr, so the whole state machine is unit-testable without a
@@ -136,7 +167,7 @@ impl Ticker {
         }
         let mut out = String::with_capacity(row.len() + 16 * self.window.len());
         if self.painted > 0 {
-            out.push_str(&format!("\x1b[{}F\x1b[0J", self.painted));
+            out.push_str(&erase_rows_above(self.painted));
         }
         for line in &self.window {
             out.push_str(line);
@@ -151,11 +182,7 @@ impl Ticker {
     /// every writer can call it unconditionally without tracking whether someone
     /// else already did.
     pub fn teardown(&mut self) -> String {
-        let out = if self.painted > 0 {
-            format!("\x1b[{}F\x1b[0J", self.painted)
-        } else {
-            String::new()
-        };
+        let out = erase_rows_above(self.painted);
         self.window.clear();
         self.painted = 0;
         out
@@ -361,6 +388,30 @@ impl Drop for TurnGuard {
 mod tests {
     use super::*;
 
+    /// One row of the bounded erase walk: up one line, erase that line.
+    const E: &str = "\x1b[1F\x1b[2K";
+
+    /// The erase NEVER uses erase-in-display: ED is not bounded by the DECSTBM
+    /// scroll region, so `CSI 0 J` from a body row wipes the bottom-anchored
+    /// footer (separator + statusline + escalation tray) on every repaint. This
+    /// pins the v0.53.2 regression shut for both the push and teardown paths.
+    #[test]
+    fn erase_never_reaches_below_the_window() {
+        assert_eq!(erase_rows_above(0), "");
+        assert_eq!(erase_rows_above(1), E);
+        assert_eq!(erase_rows_above(3), E.repeat(3));
+        let mut t = Ticker::new();
+        let mut emitted = String::new();
+        for r in ["a", "b", "c", "d", "e", "f"] {
+            emitted.push_str(&t.push(r, 3));
+        }
+        emitted.push_str(&t.teardown());
+        assert!(
+            !emitted.contains("\x1b[J") && !emitted.contains("\x1b[0J"),
+            "ticker emitted an unbounded erase-in-display: {emitted:?}"
+        );
+    }
+
     #[test]
     fn first_push_paints_without_erasing() {
         let mut t = Ticker::new();
@@ -374,9 +425,9 @@ mod tests {
         let mut t = Ticker::new();
         t.push("a", 3);
         // Second push erases the 1 painted row and repaints both.
-        assert_eq!(t.push("b", 3), "\x1b[1F\x1b[0Ja\nb\n");
+        assert_eq!(t.push("b", 3), format!("{E}a\nb\n"));
         assert_eq!(t.painted(), 2);
-        assert_eq!(t.push("c", 3), "\x1b[2F\x1b[0Ja\nb\nc\n");
+        assert_eq!(t.push("c", 3), format!("{}a\nb\nc\n", E.repeat(2)));
         assert_eq!(t.painted(), 3);
     }
 
@@ -387,7 +438,7 @@ mod tests {
             t.push(r, 3);
         }
         // At cap: erase 3, repaint the NEWEST 3 — "a" is gone for good.
-        assert_eq!(t.push("d", 3), "\x1b[3F\x1b[0Jb\nc\nd\n");
+        assert_eq!(t.push("d", 3), format!("{}b\nc\nd\n", E.repeat(3)));
         assert_eq!(t.painted(), 3);
         assert_eq!(t.window(), ["b", "c", "d"]);
         // Steady state: the payload never grows past cap rows, no matter how
@@ -395,7 +446,7 @@ mod tests {
         for r in ["e", "f", "g", "h", "i", "j"] {
             let out = t.push(r, 3);
             assert_eq!(out.lines().count(), 3);
-            assert!(out.starts_with("\x1b[3F\x1b[0J"));
+            assert!(out.starts_with(&E.repeat(3)));
         }
         assert_eq!(t.window(), ["h", "i", "j"]);
     }
@@ -405,7 +456,7 @@ mod tests {
         let mut t = Ticker::new();
         t.push("a", 3);
         t.push("b", 3);
-        assert_eq!(t.teardown(), "\x1b[2F\x1b[0J");
+        assert_eq!(t.teardown(), E.repeat(2));
         assert_eq!(t.painted(), 0);
         // Second call writes nothing — every writer can call it blind.
         assert_eq!(t.teardown(), "");
