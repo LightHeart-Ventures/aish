@@ -641,6 +641,43 @@ impl CoordinatorStore {
         Ok(())
     }
 
+    /// Test-only: back-date a ledger row's `created_at` by `hours` so the leak
+    /// threshold can be exercised without sleeping. Mirrors the inline
+    /// back-dating in this module's own ledger test; shared so
+    /// [`crate::worktree_gc`]'s gating tests can age fixtures the same way.
+    #[cfg(test)]
+    pub fn age_worktree_row_for_test(&self, worktree_id: &str, hours: i64) {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE worktree_lifecycle \
+                 SET created_at = datetime('now', ?2 || ' hours') \
+                 WHERE worktree_id = ?1",
+                (worktree_id, format!("-{hours}")),
+            )
+            .unwrap();
+    }
+
+    /// Test-only: the `cleanup_failed` flag for `worktree_id`, or `None` when
+    /// there is no such row. Lets a caller assert that a FAILED reclamation was
+    /// stamped while the row stayed open.
+    #[cfg(test)]
+    pub fn worktree_cleanup_failed_for_test(&self, worktree_id: &str) -> Option<bool> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT cleanup_failed FROM worktree_lifecycle WHERE worktree_id = ?1",
+                (worktree_id,),
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .map(|v| v != 0)
+    }
+
     /// Ledger rows still OPEN (created, never cleaned up) and older than
     /// `hours_old`, as `(worktree_id, worktree_path, run_id)`, oldest first.
     /// These are the leak candidates the filesystem scan cannot produce.

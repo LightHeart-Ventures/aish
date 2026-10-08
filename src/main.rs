@@ -98,6 +98,7 @@ mod webhook_debug;
 mod worker;
 mod worker_store;
 mod workers_modal;
+mod worktree_gc;
 // Voice ACTIVATION-word matching + voice-mode toggle state. Ungated on purpose
 // (dependency-free decision logic — see the module docs): the default CI build
 // must compile and test it even though the audio pipeline below is gated.
