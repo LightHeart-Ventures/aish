@@ -10436,6 +10436,7 @@ async fn handle_colon(
             println!("history cleared");
         }
         Some("allow") => handle_allow(parts.next(), parts.next(), session),
+        Some("secrets") => handle_secrets(parts.collect(), session),
         Some("batch") => handle_batch(parts.next(), parts.next(), session),
         Some("startup-digest") => handle_startup_digest(parts.next(), session),
         Some("update") => {
@@ -11026,6 +11027,48 @@ fn handle_allow(sub: Option<&str>, arg: Option<&str>, session: &Session) {
         },
         Some(other) => println!(
             "unknown :allow subcommand '{other}' — usage: :allow [remove <tool> | <perm>:<dir>]"
+        ),
+    }
+}
+
+/// `:secrets` shows the session's `${profile:KEY}` policy and the
+/// materialisation log; `:secrets allow <KEY>` / `:secrets deny <KEY>` move a
+/// key in and out of the allowlist, `:secrets allow-program <bin>` grants one
+/// binary (TASK-946 / SEC-3.1 F-02).
+///
+/// The policy is deliberately per-SESSION and in-memory: a standing on-disk
+/// grant would quietly re-open the finding for every future session, and the
+/// whole point of the gate is that materialising a secret is an explicit,
+/// auditable act.
+fn handle_secrets(args: Vec<&str>, session: &mut Session) {
+    match args.as_slice() {
+        [] | ["show" | "status"] => {
+            println!("{}", session.secret_policy.describe());
+            let log = crate::secrets::recent_log();
+            if log.is_empty() {
+                println!("\nno secret materialisation attempts this session");
+            } else {
+                println!("\nmaterialisation log (key names only — values are never recorded):");
+                for line in log {
+                    println!("  {line}");
+                }
+            }
+        }
+        ["allow", key] => {
+            session.secret_policy.allow_key(key);
+            println!("secrets: ${{profile:{key}}} may now be materialised");
+        }
+        ["deny", key] => {
+            session.secret_policy.deny_key(key);
+            println!("secrets: ${{profile:{key}}} denied for this session");
+        }
+        ["allow-program", bin] => {
+            session.secret_policy.allow_program(bin);
+            println!("secrets: `{bin}` may now receive materialised secrets");
+        }
+        _ => println!(
+            "usage: :secrets [allow <KEY> | deny <KEY> | allow-program <bin>]\n\
+             \u{20}      :secrets                    show policy + materialisation log"
         ),
     }
 }

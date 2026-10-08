@@ -143,9 +143,7 @@ pub fn viewport(len: usize, sel: usize, avail: usize) -> (usize, usize) {
         return (0, len);
     }
     let sel = sel.min(len - 1);
-    let first = sel
-        .saturating_sub(avail / 2)
-        .min(len.saturating_sub(avail));
+    let first = sel.saturating_sub(avail / 2).min(len.saturating_sub(avail));
     (first, avail)
 }
 
@@ -682,7 +680,8 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
     }
 
     // Footer hint.
-    let hint = "  ↑/↓ move · PgUp/PgDn page · g/G top/end · Enter attach · Del/d close · Esc/q dismiss";
+    let hint =
+        "  ↑/↓ move · PgUp/PgDn page · g/G top/end · Enter attach · Del/d close · Esc/q dismiss";
     lines.push(if color {
         format!("\x1b[2m{hint}\x1b[0m")
     } else {
@@ -795,12 +794,9 @@ pub fn run(rows: &[WorkerRow], initial_sel: usize) -> ModalAction {
             break ModalAction::Dismiss;
         };
         match key {
-            Key::Up
-            | Key::Down
-            | Key::PageUp
-            | Key::PageDown
-            | Key::Home
-            | Key::End => sel = move_selection(sel, rows.len(), key),
+            Key::Up | Key::Down | Key::PageUp | Key::PageDown | Key::Home | Key::End => {
+                sel = move_selection(sel, rows.len(), key)
+            }
             Key::Enter => break ModalAction::Attach(rows[sel].id.clone()),
             Key::Delete => break ModalAction::Close(rows[sel].id.clone()),
             Key::Dismiss => break ModalAction::Dismiss,
@@ -1033,7 +1029,11 @@ mod tests {
         for sel in 0..20 {
             let (first, count) = viewport(20, sel, 5);
             assert_eq!(count, 5, "sel={sel}");
-            assert!(sel >= first && sel < first + count, "sel={sel} window={first}..{}", first + count);
+            assert!(
+                sel >= first && sel < first + count,
+                "sel={sel} window={first}..{}",
+                first + count
+            );
             assert!(first + count <= 20);
         }
     }

@@ -66,6 +66,7 @@ mod repl;
 mod rewrite;
 mod scope;
 mod script;
+mod secrets;
 mod session;
 // Shared skill-registry contract. Also re-exported from src/lib.rs so the
 // `skill-mirror` generator (tools/skill-mirror, TASK-694) validates and emits

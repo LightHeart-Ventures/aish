@@ -1697,7 +1697,7 @@ branch, and open a pull request (gh pr create) instead."
         }
     }
 
-    let env = resolve_env(call, session);
+    let env = resolve_env(call, session, &program, &args)?;
     let background = call.args["background"].as_bool() == Some(true);
 
     let timeout_secs = call.args["timeout_secs"]
@@ -3565,26 +3565,88 @@ running jobs (workers auto-deliver, so you usually don't need to fetch at all)"
 // Spawn environment — the call's `env` object, with secret-safe references
 // ---------------------------------------------------------------------------
 
-/// Extra env for a spawn. Values may reference `${NAME}` (session exports,
-/// then process env) or `${profile:KEY}` (~/.atum/credentials) — resolved
-/// here at spawn time so secret values never enter the conversation.
-fn resolve_env(call: &ToolCall, session: &Session) -> Vec<(String, String)> {
-    let Some(map) = call.args["env"].as_object() else {
-        return Vec::new();
-    };
-    let creds = format!(
+/// Path of the credentials file `${profile:KEY}` reads from.
+fn creds_path() -> String {
+    format!(
         "{}/.atum/credentials",
         std::env::var("HOME").unwrap_or_default()
-    );
-    map.iter()
-        .filter_map(|(k, v)| {
-            v.as_str()
-                .map(|v| (k.clone(), resolve_env_value(v, &session.env, &creds)))
-        })
-        .collect()
+    )
 }
 
-fn resolve_env_value(raw: &str, session_env: &[(String, String)], creds_file: &str) -> String {
+/// Credentials profile (INI section) a bare `${profile:KEY}` reads from.
+///
+/// `AISH_CREDENTIALS_PROFILE` wins, else `default`. Before TASK-946 this form
+/// was parsed as `<section>:<key>` with section = the literal string `profile`,
+/// which no credentials file has — so it never resolved. src/mcp.rs (≈line 837)
+/// always treated `profile:` as a FIXED PREFIX; this aligns tools.rs with it.
+fn session_profile() -> String {
+    std::env::var("AISH_CREDENTIALS_PROFILE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+/// Look `key` up in the session profile, then the documented fallbacks
+/// (`aish`, `default`) so aish's own section stays reachable.
+fn profile_lookup(creds_file: &str, profile: &str, key: &str) -> Option<String> {
+    let mut tried: Vec<&str> = Vec::new();
+    for p in [profile, "aish", "default"] {
+        if tried.contains(&p) {
+            continue;
+        }
+        tried.push(p);
+        if let Some(v) = crate::mcp::load_profile(creds_file, p).get(key) {
+            return Some(v.clone());
+        }
+    }
+    None
+}
+
+/// Extra env for a spawn. Values may reference `${NAME}` / `${env:NAME}`
+/// (session exports, then process env) or `${profile:KEY}` /
+/// `${<section>:KEY}` (~/.atum/credentials) — resolved here at spawn time so
+/// secret values never enter the conversation.
+///
+/// TASK-946: every credentials reference now goes through
+/// [`crate::secrets::SpawnCtx::materialise`], which gates it on the effective
+/// program (deny by default), audits the attempt, and registers the resolved
+/// value for redaction before the child is spawned. A refused reference fails
+/// the whole tool call with a message that names the fix — it must NOT fall
+/// through to an un-gated spawn.
+fn resolve_env(
+    call: &ToolCall,
+    session: &Session,
+    program: &str,
+    args: &[String],
+) -> Result<Vec<(String, String)>> {
+    let Some(map) = call.args["env"].as_object() else {
+        return Ok(Vec::new());
+    };
+    let creds = creds_path();
+    let ctx = crate::secrets::SpawnCtx {
+        program,
+        args,
+        session_id: &session.session_id,
+        policy: &session.secret_policy,
+    };
+    let mut out = Vec::with_capacity(map.len());
+    for (k, v) in map {
+        let Some(raw) = v.as_str() else { continue };
+        match resolve_env_value(raw, &session.env, &creds, &ctx) {
+            Ok(value) => out.push((k.clone(), value)),
+            Err(refusal) => anyhow::bail!("{refusal}"),
+        }
+    }
+    Ok(out)
+}
+
+/// Interpolate one `env` value. `Err` is a gate refusal (see [`resolve_env`]).
+fn resolve_env_value(
+    raw: &str,
+    session_env: &[(String, String)],
+    creds_file: &str,
+    ctx: &crate::secrets::SpawnCtx<'_>,
+) -> std::result::Result<String, String> {
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
     while let Some(start) = rest.find("${") {
@@ -3592,20 +3654,36 @@ fn resolve_env_value(raw: &str, session_env: &[(String, String)], creds_file: &s
         let after = &rest[start + 2..];
         let Some(end) = after.find('}') else {
             out.push_str(&rest[start..]);
-            return out;
+            return Ok(out);
         };
         let name = &after[..end];
-        let resolved = if let Some((profile, key)) = name.split_once(':') {
-            crate::mcp::load_profile(creds_file, profile)
-                .get(key)
-                .cloned()
-        } else {
+        let plain = |var: &str| {
             session_env
                 .iter()
                 .rev()
-                .find(|(k, _)| k == name)
+                .find(|(k, _)| k == var)
                 .map(|(_, v)| v.clone())
-                .or_else(|| std::env::var(name).ok())
+                .or_else(|| std::env::var(var).ok())
+        };
+        // Three reference forms, mirroring src/mcp.rs::interpolate:
+        //   ${env:VAR}       — explicit session/process env (not a credential)
+        //   ${profile:KEY}   — the session's resolved credentials profile
+        //   ${section:KEY}   — legacy explicit section (back-compat), gated and
+        //                      audited identically
+        //   ${NAME}          — session/process env
+        let resolved = if let Some(var) = name.strip_prefix("env:") {
+            plain(var)
+        } else if let Some(key) = name.strip_prefix("profile:") {
+            let profile = session_profile();
+            ctx.materialise(key, &profile, || profile_lookup(creds_file, &profile, key))?
+        } else if let Some((section, key)) = name.split_once(':') {
+            ctx.materialise(key, section, || {
+                crate::mcp::load_profile(creds_file, section)
+                    .get(key)
+                    .cloned()
+            })?
+        } else {
+            plain(name)
         };
         match resolved {
             // Anything resolved out of a credentials profile (or the
@@ -3626,7 +3704,7 @@ fn resolve_env_value(raw: &str, session_env: &[(String, String)], creds_file: &s
         rest = &after[end + 1..];
     }
     out.push_str(rest);
-    out
+    Ok(out)
 }
 
 /// Read a pipe to EOF, keeping at most `cap` bytes: a head prefix plus a tail
@@ -3689,7 +3767,7 @@ async fn run_interactive(
     confirm: &mut Confirm<'_>,
 ) -> Result<String> {
     let (program, args) = parse_argv(call)?;
-    let env = resolve_env(call, session);
+    let env = resolve_env(call, session, &program, &args)?;
 
     let display = format!("{} {}", program, args.join(" "));
     if exec_needs_confirm(session.mode, &program, &args)
@@ -5927,43 +6005,153 @@ mod tests {
         assert!(protected_git_mutation(&a("log -5"), Some("main")).is_none());
     }
 
-    #[test]
-    fn env_value_resolution() {
-        let creds = std::env::temp_dir().join(format!("aish_env_creds_{}", std::process::id()));
+    /// Scratch credentials file + an open policy, for the `${…}` tests below.
+    fn creds_fixture(tag: &str) -> String {
+        let p = std::env::temp_dir().join(format!("aish_env_creds_{}_{tag}", std::process::id()));
         std::fs::write(
-            &creds,
-            "[aish]\nATUM_API_KEY = sk_secret\n[other]\nATUM_API_KEY = nope\n",
+            &p,
+            "[aish]\nATUM_API_KEY = sk_secret\n[default]\nATUM_API_KEY = sk_default\n\
+[other]\nATUM_API_KEY = nope\n",
         )
         .unwrap();
-        let creds = creds.to_str().unwrap().to_string();
-        let session_env = vec![("FOO".to_string(), "from_session".to_string())];
+        p.to_str().unwrap().to_string()
+    }
 
-        // session exports win; ${profile:KEY} reads the right INI section
+    /// A policy that permits every key, so these tests exercise *resolution*
+    /// semantics; the gate itself is covered by src/secrets.rs's suite.
+    fn open_policy() -> crate::secrets::SecretPolicy {
+        let mut p = crate::secrets::SecretPolicy::for_session(false);
+        p.allowed_keys = None;
+        p
+    }
+
+    #[test]
+    fn env_value_resolution() {
+        let creds = creds_fixture("basic");
+        let session_env = vec![("FOO".to_string(), "from_session".to_string())];
+        let policy = open_policy();
+        // `gh` is a KNOWN_SECRET_CONSUMERS entry, so credential refs resolve.
+        let argv: Vec<String> = vec!["api".into()];
+        let ctx = crate::secrets::SpawnCtx {
+            program: "gh",
+            args: &argv,
+            session_id: "test",
+            policy: &policy,
+        };
+        let r = |raw: &str| resolve_env_value(raw, &session_env, &creds, &ctx).unwrap();
+
+        // session exports win; ${section:KEY} reads the right INI section
+        assert_eq!(r("${FOO}"), "from_session");
+        assert_eq!(r("${aish:ATUM_API_KEY}"), "sk_secret");
+        // explicit ${env:NAME} form is env, never a credential lookup
+        assert_eq!(r("${env:FOO}"), "from_session");
+        // composition with literal text
+        assert_eq!(r("Bearer ${aish:ATUM_API_KEY}!"), "Bearer sk_secret!");
+        // process env fallback (PATH is always set)
+        assert_ne!(r("${PATH}"), "${PATH}");
+        // no references: passthrough
+        assert_eq!(r("plain"), "plain");
+        let _ = std::fs::remove_file(&creds);
+    }
+
+    /// TASK-946: `profile:` is a FIXED PREFIX meaning "the session's resolved
+    /// credentials profile" — matching src/mcp.rs (≈line 837). Before this
+    /// change tools.rs parsed it as `<section>:<key>` with section = the
+    /// literal `profile`, which no credentials file has, so the documented
+    /// `${profile:KEY}` form never resolved at all.
+    #[test]
+    fn profile_prefix_semantics() {
+        let creds = creds_fixture("profile");
+        let policy = open_policy();
+        let argv: Vec<String> = vec!["api".into()];
+        let ctx = crate::secrets::SpawnCtx {
+            program: "gh",
+            args: &argv,
+            session_id: "test",
+            policy: &policy,
+        };
+
+        // No AISH_CREDENTIALS_PROFILE → the `default` section.
+        let prev = std::env::var("AISH_CREDENTIALS_PROFILE").ok();
+        unsafe { std::env::remove_var("AISH_CREDENTIALS_PROFILE") };
         assert_eq!(
-            resolve_env_value("${FOO}", &session_env, &creds),
-            "from_session"
+            resolve_env_value("${profile:ATUM_API_KEY}", &[], &creds, &ctx).unwrap(),
+            "sk_default",
+            "bare profile: must resolve, not fall through as a `profile` section"
         );
+
+        // An explicit profile selects that section.
+        unsafe { std::env::set_var("AISH_CREDENTIALS_PROFILE", "other") };
         assert_eq!(
-            resolve_env_value("${aish:ATUM_API_KEY}", &session_env, &creds),
+            resolve_env_value("${profile:ATUM_API_KEY}", &[], &creds, &ctx).unwrap(),
+            "nope"
+        );
+
+        // Legacy explicit-section form still works (back-compat).
+        assert_eq!(
+            resolve_env_value("${aish:ATUM_API_KEY}", &[], &creds, &ctx).unwrap(),
             "sk_secret"
         );
-        // composition with literal text
-        assert_eq!(
-            resolve_env_value("Bearer ${aish:ATUM_API_KEY}!", &session_env, &creds),
-            "Bearer sk_secret!"
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AISH_CREDENTIALS_PROFILE", v) },
+            None => unsafe { std::env::remove_var("AISH_CREDENTIALS_PROFILE") },
+        }
+        let _ = std::fs::remove_file(&creds);
+    }
+
+    /// An unresolvable reference comes back VERBATIM — deliberately, so the
+    /// failure surfaces in the program instead of silently becoming "".
+    #[test]
+    fn unresolvable_verbatim() {
+        let creds = creds_fixture("unresolvable");
+        let policy = open_policy();
+        let argv: Vec<String> = Vec::new();
+        let ctx = crate::secrets::SpawnCtx {
+            program: "gh",
+            args: &argv,
+            session_id: "test",
+            policy: &policy,
+        };
+        let r = |raw: &str| resolve_env_value(raw, &[], &creds, &ctx).unwrap();
+
+        assert_eq!(r("${NO_SUCH_VAR_XYZ}"), "${NO_SUCH_VAR_XYZ}");
+        assert_eq!(r("${missing:KEY}"), "${missing:KEY}");
+        assert_eq!(r("${profile:NO_SUCH_KEY}"), "${profile:NO_SUCH_KEY}");
+        assert_eq!(r("${env:NO_SUCH_VAR_XYZ}"), "${env:NO_SUCH_VAR_XYZ}");
+        // Unterminated reference is left alone rather than eating the tail.
+        assert_eq!(r("prefix ${unclosed"), "prefix ${unclosed");
+        let _ = std::fs::remove_file(&creds);
+    }
+
+    /// The finding itself: `run_program{program:"env", env:{X:"${profile:K}"}}`
+    /// must be REFUSED, not resolved — that spawn printed the secret to stdout,
+    /// which lands in model context, the transcript, and the DB.
+    #[test]
+    fn env_dumper_refused_at_resolution() {
+        let creds = creds_fixture("dumper");
+        let policy = open_policy();
+        let argv: Vec<String> = Vec::new();
+        let ctx = crate::secrets::SpawnCtx {
+            program: "env",
+            args: &argv,
+            session_id: "test",
+            policy: &policy,
+        };
+        let err = resolve_env_value("${profile:ATUM_API_KEY}", &[], &creds, &ctx)
+            .expect_err("env must not receive a materialised secret");
+        assert!(err.contains("refused to resolve"), "{err}");
+        assert!(err.contains(":secrets allow-program env"), "{err}");
+        assert!(
+            !err.contains("sk_default") && !err.contains("sk_secret"),
+            "refusal leaked the value: {err}"
         );
-        // process env fallback (PATH is always set), unresolved kept verbatim
-        assert_ne!(resolve_env_value("${PATH}", &[], &creds), "${PATH}");
+
+        // A non-credential env ref to the same program is untouched.
         assert_eq!(
-            resolve_env_value("${NO_SUCH_VAR_XYZ}", &[], &creds),
-            "${NO_SUCH_VAR_XYZ}"
+            resolve_env_value("${PATH}", &[], &creds, &ctx).unwrap(),
+            std::env::var("PATH").unwrap()
         );
-        assert_eq!(
-            resolve_env_value("${missing:KEY}", &[], &creds),
-            "${missing:KEY}"
-        );
-        // no references: passthrough
-        assert_eq!(resolve_env_value("plain", &[], &creds), "plain");
         let _ = std::fs::remove_file(&creds);
     }
 
