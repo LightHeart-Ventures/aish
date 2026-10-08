@@ -60,6 +60,7 @@ mod present;
 mod pulse;
 mod rc;
 mod reasoning_telemetry;
+mod redact;
 mod remember;
 mod repl;
 mod rewrite;

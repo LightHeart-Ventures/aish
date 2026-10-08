@@ -1344,7 +1344,10 @@ branch, and open a pull request (gh pr create) instead."
     if out.is_empty() {
         out = "[no output, exit 0]".into();
     }
-    Ok(truncate_middle(out, MAX_OUTPUT))
+    // Redact BEFORE truncating: a secret that straddles the head/tail seam
+    // would otherwise be split into two unrecognisable halves and survive
+    // into the model context, the transcript and the history DB.
+    Ok(truncate_middle(crate::redact::scrub_owned(out), MAX_OUTPUT))
 }
 
 // ---------------------------------------------------------------------------
@@ -2674,6 +2677,8 @@ interactive session has no parent console to message"
     // parent's `worker::console_row` decodes them back into aligned continuation
     // lines. (Previously we emitted one sentinel per physical line, which
     // repeated the 📣 [label] prefix on every line of a multi-line note.)
+    // An out-of-band note is still model- and transcript-visible: scrub it.
+    let message = crate::redact::scrub(message);
     let encoded = message
         .lines()
         .collect::<Vec<_>>()
@@ -3121,7 +3126,13 @@ fn resolve_env_value(raw: &str, session_env: &[(String, String)], creds_file: &s
                 .or_else(|| std::env::var(name).ok())
         };
         match resolved {
-            Some(v) => out.push_str(&v),
+            // Anything resolved out of a credentials profile (or the
+            // environment) is a candidate secret: register it so it can never
+            // echo back out through a captured stream (SEC-3.2 / F-02).
+            Some(v) => {
+                crate::redact::register_secret(&v, name);
+                out.push_str(&v);
+            }
             // Unresolvable: keep the reference verbatim so the failure
             // surfaces in the program, not silently as an empty string.
             None => {
@@ -3177,7 +3188,10 @@ async fn await_capture(task: &mut tokio::task::JoinHandle<(Vec<u8>, Vec<u8>, u64
                 s.push_str(&format!("\n…[dropped {dropped} bytes]…\n"));
             }
             s.push_str(&String::from_utf8_lossy(&tail));
-            s
+            // Scrub at the capture chokepoint — BEFORE the caller's
+            // truncate_middle — so a secret cannot survive the trip by
+            // straddling the head/tail boundary (SEC-3.2 / F-02).
+            crate::redact::scrub_owned(s)
         }
         Ok(Err(_)) => "[output lost: capture task failed]".into(),
         Err(_) => {
@@ -3573,6 +3587,15 @@ fn read_file(call: &ToolCall, session: &mut Session, confirm: &mut Confirm<'_>) 
                 }
             ));
         }
+    };
+
+    // Credential-bearing files come back scrubbed; every ordinary source file
+    // must come back byte-identical, so the filter is gated on the path
+    // (SEC-3.2 / F-02).
+    let content = if crate::redact::is_sensitive_path(&full) {
+        crate::redact::scrub_owned(content)
+    } else {
+        content
     };
 
     // Optional 1-based inclusive line range. Reading a slice of a large file is
@@ -4329,6 +4352,13 @@ fn grep_files(call: &ToolCall, session: &Session) -> Result<(String, serde_json:
             continue; // skip binary files
         }
         let text = String::from_utf8_lossy(&bytes);
+        // Hits inside a credential-bearing file are scrubbed; every ordinary
+        // source file is matched verbatim (SEC-3.2 / F-02).
+        let text: std::borrow::Cow<'_, str> = if crate::redact::is_sensitive_path(f) {
+            std::borrow::Cow::Owned(crate::redact::scrub_owned(text.into_owned()))
+        } else {
+            text
+        };
         let lines: Vec<&str> = text.lines().collect();
         let display = if scope_is_file {
             f.display().to_string()
