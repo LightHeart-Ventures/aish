@@ -917,13 +917,87 @@ fn pane_gutter_cols(label: &str) -> usize {
     }
 }
 
+/// Readable 256-colour codes used to TINT a worker's `[label]` tag so two
+/// workers interleaving in the same pane are distinguishable at a glance. Muted
+/// on purpose — the label is chrome, not content, so it must not out-shout the
+/// row text. Six entries: enough to separate a realistic fan-out without the
+/// palette wrapping into near-identical hues.
+const PANE_LABEL_HUES: [u8; 6] = [110, 114, 180, 139, 73, 174];
+
+/// Stable per-label colour: FNV-1a over the label bytes, indexed into
+/// [`PANE_LABEL_HUES`]. STABLE is the load-bearing property — the same worker id
+/// must get the same hue for the whole session (and across `:attach`/`:detach`),
+/// so the operator can learn "the teal one is the indexer". Pure → unit-tested.
+pub fn label_hue(label: &str) -> u8 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in label.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    PANE_LABEL_HUES[(h % PANE_LABEL_HUES.len() as u64) as usize]
+}
+
 /// The dim `[label] ` tag that follows the wall — empty for [`PANE_NO_LABEL`].
-/// Pure → unit-tested.
+/// Tinted with the label's stable [`label_hue`] so interleaved workers read as
+/// separate streams. Pure → unit-tested.
 fn pane_label_tag(label: &str) -> String {
     if label.is_empty() {
         String::new()
     } else {
-        format!("\x1b[2m[{label}]\x1b[0m ")
+        format!("\x1b[2;38;5;{}m[{label}]\x1b[0m ", label_hue(label))
+    }
+}
+
+/// A thin attribution rule printed INSIDE the pane when the speaker changes:
+/// `┠─ w_abc123 ──────`. Rows carry a `[label]` tag, but in a busy fan-out the
+/// eye still loses the boundary between one worker's burst and the next's; the
+/// rule is the visual seam. Tinted with the speaker's stable hue so it matches
+/// the tags beneath it. `cols` bounds the rule width (`usize::MAX` = unknown
+/// width → fixed short rule). Pure → unit-tested.
+pub fn pane_context_strip(label: &str, cols: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    const MAX_RULE: usize = 48;
+    let hue = label_hue(label);
+    // "┠─ " + label + " " = 4 + label width.
+    let head = 4 + UnicodeWidthStr::width(label);
+    let width = if cols == usize::MAX {
+        head + 12
+    } else {
+        cols.min(MAX_RULE)
+    };
+    let dashes = width.saturating_sub(head).min(MAX_RULE);
+    format!(
+        "\x1b[38;5;{hue}m┠─ \x1b[0m\x1b[2;38;5;{hue}m{label}\x1b[0m\x1b[38;5;{hue}m {}\x1b[0m",
+        "─".repeat(dashes)
+    )
+}
+
+/// Which worker last spoke in the pane. `None` = nothing printed since the pane
+/// opened, so the FIRST burst also gets a rule (it names the stream the operator
+/// is about to read).
+static PANE_SPEAKER: Mutex<Option<String>> = Mutex::new(None);
+
+/// Decide whether `label` opens a new burst, returning the attribution rule to
+/// print above the row when it does. Records `label` as the current speaker.
+/// Returns `None` while the same worker keeps talking — one rule per burst, not
+/// one per row. A poisoned lock degrades to `None` (no rule) rather than
+/// panicking inside the stream drain.
+fn speaker_rule(label: &str, cols: usize) -> Option<String> {
+    let mut cur = PANE_SPEAKER.lock().ok()?;
+    if cur.as_deref() == Some(label) {
+        return None;
+    }
+    *cur = Some(label.to_string());
+    Some(pane_context_strip(label, cols))
+}
+
+/// Forget the current pane speaker so the next burst re-announces itself. Called
+/// when the pane is framed open/closed (`:output` toggled) — the rule's job is to
+/// orient the operator inside a CONTIGUOUS pane, and a reopened pane is a fresh
+/// one.
+pub fn reset_pane_speaker() {
+    if let Ok(mut cur) = PANE_SPEAKER.lock() {
+        *cur = None;
     }
 }
 
@@ -1609,7 +1683,20 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
                 } else {
                     pane_row(label, t)
                 };
-                nest_row(&event, row)
+                let row = nest_row(&event, row);
+                // Multi-worker pane (global `:worker-output`, not attached): when
+                // the speaker CHANGES, lead the burst with a thin attribution rule
+                // so the operator can see where one worker's lines end and the
+                // next's begin. The attached stream is single-speaker by
+                // construction — no rule there.
+                if live {
+                    row
+                } else {
+                    match speaker_rule(label, pane_cols()) {
+                        Some(rule) => format!("{rule}\n{row}"),
+                        None => row,
+                    }
+                }
             };
             if on {
                 let thinking_event = matches!(event, ActivityEvent::Thinking(_));
@@ -5219,6 +5306,96 @@ mod tests {
     }
 
     #[test]
+    fn label_hue_is_stable_and_in_palette() {
+        let a = label_hue("w_a7k3m2pQ");
+        assert_eq!(a, label_hue("w_a7k3m2pQ"), "same label → same hue");
+        assert!(PANE_LABEL_HUES.contains(&a), "hue from the palette: {a}");
+    }
+
+    #[test]
+    fn label_hue_separates_realistic_fanout() {
+        // A 6-worker fan-out should land on >=3 distinct hues — the point of the
+        // tint is telling interleaved streams apart, so near-total collision
+        // would make it useless.
+        let ids = [
+            "w_aaa111", "w_bbb222", "w_ccc333", "w_ddd444", "w_eee555", "w_fff666",
+        ];
+        let mut hues: Vec<u8> = ids.iter().map(|i| label_hue(i)).collect();
+        hues.sort_unstable();
+        hues.dedup();
+        assert!(hues.len() >= 3, "too much hue collision: {hues:?}");
+    }
+
+    #[test]
+    fn pane_label_tag_is_tinted_and_keeps_bare_id() {
+        let tag = pane_label_tag("w_child");
+        assert!(tag.contains("[w_child]"), "bare id preserved: {tag}");
+        assert!(
+            tag.contains(&format!("38;5;{}", label_hue("w_child"))),
+            "tinted with the stable hue: {tag}"
+        );
+        assert!(tag.contains("\x1b[2;"), "still dim chrome: {tag}");
+        // PANE_NO_LABEL (attached stream) stays bare — no tag, no tint.
+        assert!(pane_label_tag(PANE_NO_LABEL).is_empty());
+    }
+
+    #[test]
+    fn context_strip_names_speaker_and_respects_width() {
+        let strip = pane_context_strip("w_child", 40);
+        assert!(strip.contains("┠─"), "rule glyph: {strip}");
+        assert!(strip.contains("w_child"), "names the speaker: {strip}");
+        assert!(
+            strip.contains(&format!("38;5;{}", label_hue("w_child"))),
+            "matches the label tint: {strip}"
+        );
+        assert!(
+            vis_cols(&strip) <= 40,
+            "rule fits the terminal: {} cols",
+            vis_cols(&strip)
+        );
+        // Unknown width (piped/tests) → a short fixed rule, never zero-length.
+        let unknown = pane_context_strip("w_child", usize::MAX);
+        assert!(unknown.contains("─"), "has a rule body: {unknown}");
+    }
+
+    #[test]
+    fn context_strip_survives_narrow_terminal() {
+        // Narrower than the header itself: still renders (no panic, no underflow).
+        let strip = pane_context_strip("w_a_very_long_worker_id", 8);
+        assert!(strip.contains("w_a_very_long_worker_id"));
+    }
+
+    #[test]
+    fn speaker_rule_fires_once_per_burst() {
+        reset_pane_speaker();
+        // First line of a burst → rule; later lines of the SAME speaker → none.
+        assert!(speaker_rule("w_one", 40).is_some());
+        assert!(speaker_rule("w_one", 40).is_none());
+        assert!(speaker_rule("w_one", 40).is_none());
+        // Speaker changes → new rule, then quiet again.
+        let two = speaker_rule("w_two", 40);
+        assert!(two.is_some());
+        assert!(two.unwrap().contains("w_two"));
+        assert!(speaker_rule("w_two", 40).is_none());
+        // Back to the first worker → it re-announces (that's the seam).
+        assert!(speaker_rule("w_one", 40).is_some());
+        reset_pane_speaker();
+    }
+
+    #[test]
+    fn reset_pane_speaker_re_announces_next_burst() {
+        reset_pane_speaker();
+        assert!(speaker_rule("w_same", 40).is_some());
+        assert!(speaker_rule("w_same", 40).is_none());
+        reset_pane_speaker(); // `:output` toggled off/on → fresh pane
+        assert!(
+            speaker_rule("w_same", 40).is_some(),
+            "a reopened pane re-announces the speaker"
+        );
+        reset_pane_speaker();
+    }
+
+    #[test]
     fn pane_row_frames_with_border_label_and_preserved_text() {
         // A pane row carries the cyan box-drawing left border, the dim [label]
         // gutter (just the worker id), then the text VERBATIM (so any inline
@@ -5280,7 +5457,13 @@ mod tests {
         assert_eq!(pane_gutter_cols("w_a7k3m2pQ"), 5 + 10);
         assert_eq!(pane_gutter_cols(PANE_NO_LABEL), 2);
         assert_eq!(pane_label_tag(PANE_NO_LABEL), "");
-        assert_eq!(pane_label_tag("goal"), "\x1b[2m[goal]\x1b[0m ");
+        // The tag is dim chrome TINTED with the label's stable hue (item 5); the
+        // visible width is still `[goal] `, which is what the gutter math counts.
+        assert_eq!(
+            pane_label_tag("goal"),
+            format!("\x1b[2;38;5;{}m[goal]\x1b[0m ", label_hue("goal"))
+        );
+        assert_eq!(vis_cols(&pane_label_tag("goal")), 7);
     }
 
     #[test]
