@@ -2216,7 +2216,7 @@ fn repo_key(src: &std::path::Path) -> String {
 /// It lives under aish's OWN home (`~/.aish`, alongside the DB / skills /
 /// `.mcp.json`), NOT `~/.atum` (the atum CLI's config dir) — the latter was a
 /// stray port artifact that polluted an unrelated tool's directory.
-fn worktree_root() -> PathBuf {
+pub(crate) fn worktree_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("AISH_WORKTREE_DIR")
         && !dir.is_empty()
     {
@@ -2462,6 +2462,12 @@ fn create_worktree(
         return None;
     }
     let root = worktree_root();
+    // Informational only: 96 GB of unreclaimed worker trees was the measured
+    // steady state before `:worktrees gc` existed, so when the root is over the
+    // pressure threshold, say so once per process and point at that command.
+    // Bounded, best-effort, silent on any error — it must never block, panic,
+    // or sink a worker spawn.
+    crate::worktree_gc::warn_if_disk_pressure();
     let key = repo_key(src);
     let (branch, path) = worktree_layout(&root, &key, id);
     // Off the OS temp dir now (ISS-2046), so aish owns cleanup — create the root

@@ -2661,6 +2661,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
         "workers",
         "list this session's coordinators (all = every session)",
     ),
+    (
+        "worktrees",
+        "reclaim provably-safe leaked worktrees (gc [--apply]; dry-run by default)",
+    ),
     ("yolo", "toggle yolo mode"),
 ];
 
@@ -9280,6 +9284,8 @@ async fn handle_colon(
                  :jobs                               list background jobs\n\
                  :kill <id>                          kill a background job\n\
                  :workers [all]                      list this session's background coordinators (all = every session)\n\
+                 :worktrees gc [--apply]             dry-run list of leaked worker worktrees that are PROVABLY safe to reclaim\n\
+                                                     (clean + merged + aged); --apply actually removes them. Never touches a tree holding work\n\
                  :runtime [host|podman|docker|status] show/select the worker execution runtime (host vs container); sets AISH_WORKER_RUNTIME for the next coordinator\n\
                  :dispatch-stats [all]               background-job dispatch efficiency: outcomes, latency\n\
                                                      distribution + missed-inline heuristic (alias :dstats)\n\
@@ -9334,6 +9340,15 @@ async fn handle_colon(
                 println!("{line}");
             }
         }
+        // Opt-in worktree reclamation. DRY RUN unless `--apply` is passed, and
+        // it only ever removes trees that are clean, merged, and aged out —
+        // `report_leaked_worktrees`'s never-delete policy (ISS-409757) is
+        // untouched; this is the explicit operator escape hatch beside it.
+        Some("worktrees" | "wt") => {
+            let args: Vec<&str> = parts.by_ref().collect();
+            println!("{}", crate::worktree_gc::command(&args));
+        }
+
         Some("kill") => match parts.next().and_then(|s| s.parse::<usize>().ok()) {
             Some(id) => {
                 let jobs = session.jobs.lock().unwrap();
