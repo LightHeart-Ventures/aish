@@ -2376,9 +2376,11 @@ fn build_turns_audit_from_history(history: &[Msg]) -> Vec<(usize, Vec<String>, V
 /// The erase math: after rustyline handles Ctrl-O it abandons the prompt line
 /// and leaves the cursor on the next row, so between the cursor and the top of
 /// the prior block sit exactly `raw_view_rows` block rows + 1 prompt row. We
-/// move the cursor up that many rows to column 1 (`CSI n F`) and clear to end of
-/// screen (`CSI 0 J`), then paint the new view and record its physical height in
-/// `session.raw_view_rows` for the next toggle. The anchor is only valid while
+/// walk the cursor up over exactly those rows, erasing each one in place
+/// (`CSI 1 F` + `CSI 2 K` per row, via [`crate::ticker::erase_rows_above`] —
+/// never erase-in-display, which is unbounded by the scroll region and would
+/// take the footer with it), then paint the new view and record its physical
+/// height in `session.raw_view_rows` for the next toggle. The anchor is only valid while
 /// the block is the last thing printed; the REPL zeroes `raw_view_rows` on any
 /// non-Ctrl-O outcome. Non-TTY (piped / background coordinator) just prints the
 /// header + body with no cursor games.
@@ -2412,8 +2414,15 @@ pub fn render_raw_toggle(session: &mut Session, now_on: bool) {
     // Erase the prior in-place block (block rows + the intervening prompt row)
     // before repainting, so the toggle flips the same region rather than
     // appending. Skipped on the first toggle of a turn (raw_view_rows == 0).
+    // Bounded row walk, NOT `CSI 0 J`: erase-in-display ignores the DECSTBM
+    // scroll region and would wipe the bottom-anchored footer (separator,
+    // statusline, escalation tray) along with the block. See
+    // `crate::ticker::erase_rows_above`.
     if session.raw_view_rows > 0 {
-        eprint!("\x1b[{}F\x1b[0J", session.raw_view_rows + 1);
+        eprint!(
+            "{}",
+            crate::ticker::erase_rows_above(session.raw_view_rows + 1)
+        );
     }
     let mut rows = 0usize;
     for line in &lines {
