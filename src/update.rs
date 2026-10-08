@@ -222,16 +222,90 @@ fn is_newer(latest: &str, current: &str) -> bool {
     }
 }
 
-/// Whether `gh` is on PATH at all. A cheap gate so the rest of the flow can
-/// assume it's present (and so the startup check stays silent without it).
+// ---------------------------------------------------------------------------
+// TASK-948 / SEC-4.1 (F-06) — trusted `gh` resolution
+// ---------------------------------------------------------------------------
+//
+// Every byte of the update channel arrives through `gh`. Spawning the bare
+// string "gh" resolves it through PATH *order*, so anything that can prepend a
+// directory to PATH (a compromised agent, a dotfile, a `.`-in-PATH shell) owns
+// the updater. We therefore resolve `gh` to an ABSOLUTE path from an allow-list
+// of install prefixes plus the absolute entries of PATH, verify it answers
+// `--version`, and fail CLOSED when no trusted binary is found.
+
+/// Absolute directories trusted to hold the `gh` CLI, most-preferred first.
+/// Consulted BEFORE PATH so an early-PATH shim can never win.
+const GH_INSTALL_DIRS: &[&str] = &[
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/home/linuxbrew/.linuxbrew/bin",
+    "/snap/bin",
+];
+
+/// Resolve `gh` to an absolute path: allow-listed install dirs first, then only
+/// the ABSOLUTE entries of `path_var`. Relative or empty PATH entries (`.`,
+/// `""`, `bin`) are rejected outright — a `gh` found through one of those is
+/// whatever happens to sit in the current working directory. Pure over the
+/// filesystem via `exists` so the policy is unit-testable without installing
+/// binaries.
+fn resolve_gh_in(path_var: &str, exists: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
+    for dir in GH_INSTALL_DIRS {
+        let cand = Path::new(dir).join("gh");
+        if exists(&cand) {
+            return Some(cand);
+        }
+    }
+    for entry in path_var.split(':') {
+        if entry.is_empty() || !Path::new(entry).is_absolute() {
+            continue;
+        }
+        let cand = Path::new(entry).join("gh");
+        if exists(&cand) {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Process-wide memo for the resolved `gh` path (the `--version` probe runs once).
+static GH_BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// The absolute, version-verified `gh` binary used for ALL release I/O.
+/// `AISH_GH_PATH` overrides discovery but must itself be an absolute path to an
+/// existing file. Returns `Err` — never a bare-`"gh"` PATH fallback — when no
+/// trusted binary is found.
+fn gh_bin() -> Result<&'static Path> {
+    let resolved = GH_BIN.get_or_init(|| {
+        if let Some(raw) = std::env::var_os("AISH_GH_PATH") {
+            let p = PathBuf::from(raw);
+            return (p.is_absolute() && p.is_file()).then_some(p);
+        }
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        let found = resolve_gh_in(&path_var, &|p: &Path| p.is_file())?;
+        // Confirm it actually answers before trusting it with the update channel.
+        let ok = std::process::Command::new(&found)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        ok.then_some(found)
+    });
+    resolved.as_deref().ok_or_else(|| {
+        anyhow!(
+            "cannot locate a trusted `gh` executable — aish resolves gh to an absolute path and refuses to fall back to PATH order (set AISH_GH_PATH=/absolute/path/to/gh)"
+        )
+    })
+}
+
+/// Whether a trusted (absolute, version-verified) `gh` is available. A cheap
+/// gate so the rest of the flow can assume it's present — and so the startup
+/// check stays silent without it.
 pub fn gh_available() -> bool {
-    std::process::Command::new("gh")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    gh_bin().is_ok()
 }
 
 /// Resolve the target release for `channel` on `repo`, returning its tag + full
@@ -251,7 +325,7 @@ async fn resolve_release(repo: &str, channel: Channel) -> Result<Option<GhReleas
 /// Prod discovery: `gh release view` with no tag returns the repo's latest
 /// published (non-pre-release) release. Unchanged from the original `check()`.
 async fn resolve_latest(repo: &str) -> Result<Option<GhRelease>> {
-    let out = tokio::process::Command::new("gh")
+    let out = tokio::process::Command::new(gh_bin()?)
         .args([
             "release",
             "view",
@@ -280,7 +354,7 @@ async fn resolve_latest(repo: &str) -> Result<Option<GhRelease>> {
 /// `prefix`, then fetch that release's assets. Pre-releases are included by
 /// `gh release list` by default, which is exactly what dev/ci channels want.
 async fn resolve_prefixed(repo: &str, prefix: &str) -> Result<Option<GhRelease>> {
-    let out = tokio::process::Command::new("gh")
+    let out = tokio::process::Command::new(gh_bin()?)
         .args([
             "release", "list", "--repo", repo, "--limit", "100", "--json", "tagName",
         ])
@@ -306,7 +380,7 @@ async fn resolve_prefixed(repo: &str, prefix: &str) -> Result<Option<GhRelease>>
 
 /// Fetch a specific release's tag + assets by tag name.
 async fn view_release(repo: &str, tag: &str) -> Result<GhRelease> {
-    let out = tokio::process::Command::new("gh")
+    let out = tokio::process::Command::new(gh_bin()?)
         .args([
             "release",
             "view",
@@ -566,7 +640,7 @@ async fn download_asset(repo: &str, info: &UpdateInfo, work: &Path) -> Result<()
     let err_path = work.join(".gh-download.log");
     let err_file = std::fs::File::create(&err_path).context("creating the gh download log")?;
 
-    let mut child = tokio::process::Command::new("gh")
+    let mut child = tokio::process::Command::new(gh_bin()?)
         .args([
             "release",
             "download",
@@ -639,6 +713,282 @@ async fn download_asset(repo: &str, info: &UpdateInfo, work: &Path) -> Result<()
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// TASK-948 / SEC-4.1 (F-06) — release-artifact integrity
+// ---------------------------------------------------------------------------
+//
+// `perform()` renames a downloaded file over the RUNNING binary and re-execs it.
+// That is the single highest-value target in aish, so the artifact is verified
+// before anything is staged:
+//
+//   1. the release's published `<asset>.sha256` sidecar is fetched and the
+//      downloaded bytes are hashed and compared — FAIL CLOSED on mismatch AND
+//      on a missing/unparseable sidecar;
+//   2. SLSA provenance is checked with `gh attestation verify` under a policy
+//      (`require` | `prefer` (default) | `off`);
+//   3. tarball members are validated before extraction (no absolute paths, no
+//      `..` escapes) and `tar` runs with `--no-same-owner --no-same-permissions`.
+//
+// Every failure path returns `Err` with the scratch dir removed and the running
+// binary untouched.
+
+/// Name of the checksum sidecar for `asset` when the release actually lists it.
+/// `None` means the release published no sidecar for this asset — which
+/// [`verify_digest`] turns into a refusal rather than a silent pass.
+fn match_sidecar<'a>(assets: &'a [GhAsset], asset: &str) -> Option<&'a str> {
+    let want = format!("{asset}.sha256");
+    assets
+        .iter()
+        .find(|a| a.name == want)
+        .map(|a| a.name.as_str())
+}
+
+/// Normalize + validate a hex sha256 digest (64 lowercase hex chars).
+fn normalize_digest(d: &str) -> Result<String> {
+    let d = d.trim().to_ascii_lowercase();
+    if d.len() != 64 || !d.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("not a sha256 digest: {d:?}");
+    }
+    Ok(d)
+}
+
+/// Extract the expected digest for `asset_name` from sidecar contents. Accepts
+/// every shape the release workflows emit: `sha256sum` output
+/// (`<digest>  <name>`), BSD/`shasum -a 256` output, a bare digest with no
+/// filename, and an aggregate `SHA256SUMS` listing (the matching line wins).
+fn parse_sha256_sidecar(contents: &str, asset_name: &str) -> Result<String> {
+    let mut bare: Option<&str> = None;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(digest) = parts.next() else { continue };
+        match parts.next().map(|n| n.trim_start_matches('*')) {
+            // `<digest>  <path>` — match on the filename tail so a
+            // `./dist/aish-<triple>` prefix still resolves.
+            Some(name) => {
+                if Path::new(name)
+                    .file_name()
+                    .map(|f| f == std::ffi::OsStr::new(asset_name))
+                    .unwrap_or(false)
+                    || name == asset_name
+                {
+                    return normalize_digest(digest);
+                }
+            }
+            // Bare digest, no filename: only usable as a fallback.
+            None if bare.is_none() => bare = Some(digest),
+            None => {}
+        }
+    }
+    match bare {
+        Some(d) => normalize_digest(d),
+        None => bail!("sidecar contains no sha256 line for {asset_name}"),
+    }
+}
+
+/// Streaming SHA-256 of a file, lowercase hex. Streams in 64 KiB chunks so a
+/// 30 MB release asset never lands in memory twice.
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("opening {} to hash it", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .with_context(|| format!("reading {} to hash it", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// The fail-closed integrity gate. `sidecar` is the sidecar's CONTENTS, or
+/// `None` when the release publishes none for this asset — which is a REFUSAL,
+/// not a pass. Returns the verified digest on success.
+fn verify_digest(artifact: &Path, sidecar: Option<&str>, asset_name: &str) -> Result<String> {
+    let Some(raw) = sidecar else {
+        bail!(
+            "refusing to install {asset_name}: the release publishes no .sha256 sidecar for it — aish fails closed rather than install an unverified binary"
+        );
+    };
+    let expected = parse_sha256_sidecar(raw, asset_name)
+        .with_context(|| format!("unusable .sha256 sidecar for {asset_name}"))?;
+    let actual = sha256_file(artifact)?;
+    if actual != expected {
+        bail!(
+            "checksum mismatch for {asset_name}: sidecar says {expected}, downloaded bytes hash to {actual} — refusing to install"
+        );
+    }
+    Ok(actual)
+}
+
+/// How hard to insist on SLSA provenance (`gh attestation verify`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttestationPolicy {
+    /// Attestation must verify; absent provenance is a hard failure.
+    Require,
+    /// Attestation must verify IF published; absent provenance warns and
+    /// continues (the checksum gate is still mandatory). Default.
+    Prefer,
+    /// Skip the attestation check entirely (checksum still enforced).
+    Off,
+}
+
+/// Parse `AISH_UPDATE_ATTESTATION`. Unset/unrecognised ⇒ [`AttestationPolicy::Prefer`]
+/// so a client never bricks against releases published before provenance existed.
+fn parse_attestation_policy(s: Option<&str>) -> AttestationPolicy {
+    match s.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("require") | Some("required") | Some("strict") => AttestationPolicy::Require,
+        Some("off") | Some("none") | Some("0") | Some("false") | Some("skip") => {
+            AttestationPolicy::Off
+        }
+        _ => AttestationPolicy::Prefer,
+    }
+}
+
+/// True when gh's stderr means "no provenance was published" rather than
+/// "provenance was published and FAILED to verify". Only the former is
+/// tolerable under [`AttestationPolicy::Prefer`].
+fn attestation_absent(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("no attestation")
+        || s.contains("no matching attestation")
+        || s.contains("no attestations found")
+        || s.contains("unknown command")
+        || s.contains("unknown subcommand")
+}
+
+/// Verify SLSA provenance for `artifact` under `policy`.
+async fn verify_attestation(
+    gh: &Path,
+    repo: &str,
+    artifact: &Path,
+    policy: AttestationPolicy,
+) -> Result<()> {
+    if policy == AttestationPolicy::Off {
+        eprintln!(
+            "\x1b[33mwarning:\x1b[0m attestation verification disabled (AISH_UPDATE_ATTESTATION=off) — checksum verification still enforced"
+        );
+        return Ok(());
+    }
+    let out = tokio::process::Command::new(gh)
+        .arg("attestation")
+        .arg("verify")
+        .arg(artifact)
+        .args(["--repo", repo])
+        .output()
+        .await
+        .context("running `gh attestation verify`")?;
+    if out.status.success() {
+        println!("\x1b[32m✓\x1b[0m attestation verified (SLSA provenance, {repo})");
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    let absent = attestation_absent(&err);
+    match policy {
+        AttestationPolicy::Prefer if absent => {
+            eprintln!(
+                "\x1b[33mwarning:\x1b[0m no attestation published for {} — continuing on the verified checksum (AISH_UPDATE_ATTESTATION=require to refuse)",
+                artifact.display()
+            );
+            Ok(())
+        }
+        AttestationPolicy::Off => Ok(()),
+        _ => bail!(
+            "attestation verification failed for {}: {}",
+            artifact.display(),
+            err.trim()
+        ),
+    }
+}
+
+/// True when a tar member path is safe to extract into a scratch dir: relative,
+/// no `..` traversal, not `~`-rooted, no Windows drive prefix. (F-18 tail.)
+fn tar_member_safe(name: &str) -> bool {
+    let n = name.trim();
+    if n.is_empty() || n.starts_with('/') || n.starts_with('~') || n.contains(":\\") {
+        return false;
+    }
+    !Path::new(n).components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    })
+}
+
+/// Validate `tar -tzf` listing output; `Err` names the first offending member.
+fn validate_tar_listing(listing: &str) -> Result<()> {
+    for line in listing.lines() {
+        let member = line.trim();
+        if member.is_empty() {
+            continue;
+        }
+        if !tar_member_safe(member) {
+            bail!("refusing to extract {member:?}: archive member escapes the scratch directory");
+        }
+    }
+    Ok(())
+}
+
+/// Download `<asset>.sha256` into `work` and return its contents.
+async fn download_sidecar(repo: &str, tag: &str, sidecar: &str, work: &Path) -> Result<String> {
+    let out = tokio::process::Command::new(gh_bin()?)
+        .args([
+            "release",
+            "download",
+            tag,
+            "--repo",
+            repo,
+            "--pattern",
+            sidecar,
+            "--dir",
+            &work.to_string_lossy(),
+            "--clobber",
+        ])
+        .output()
+        .await
+        .context("running `gh release download` for the .sha256 sidecar")?;
+    if !out.status.success() {
+        bail!(
+            "downloading the .sha256 sidecar {sidecar} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    std::fs::read_to_string(work.join(sidecar))
+        .with_context(|| format!("reading the downloaded sidecar {sidecar}"))
+}
+
+/// Fetch + verify the integrity of `downloaded` (checksum sidecar, then
+/// provenance). Returns the verified sha256 digest. The release's asset list is
+/// re-read at install time — NOT taken from the TTL cache — so the
+/// "is a sidecar published?" decision reflects what exists right now.
+async fn verify_artifact(
+    repo: &str,
+    info: &UpdateInfo,
+    downloaded: &Path,
+    work: &Path,
+) -> Result<String> {
+    let release = view_release(repo, &info.tag).await?;
+    let sidecar_name = match_sidecar(&release.assets, &info.asset_name).map(|s| s.to_string());
+    let sidecar = match sidecar_name.as_deref() {
+        Some(name) => Some(download_sidecar(repo, &info.tag, name, work).await?),
+        None => None,
+    };
+    let digest = verify_digest(downloaded, sidecar.as_deref(), &info.asset_name)?;
+    let policy = parse_attestation_policy(std::env::var("AISH_UPDATE_ATTESTATION").ok().as_deref());
+    verify_attestation(gh_bin()?, repo, downloaded, policy).await?;
+    Ok(digest)
+}
+
 /// Download the release asset, extract the `aish` binary, and atomically replace
 /// the running executable. Prints brief progress to stdout. On macOS the freshly
 /// installed binary is re-signed with an ad-hoc signature (matching the Makefile)
@@ -674,18 +1024,59 @@ pub async fn perform(info: &UpdateInfo) -> Result<()> {
         bail!("downloaded asset not found at {}", downloaded.display());
     }
 
+    // --- TASK-948 / F-06 ------------------------------------------------
+    // Verify BEFORE anything is staged next to (let alone renamed over) the
+    // running binary. Any failure here aborts with the scratch dir removed and
+    // the installed aish untouched.
+    let digest = match verify_artifact(&repo, info, &downloaded, &work).await {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&work);
+            return Err(e.context(format!(
+                "refusing to install {} — release-artifact verification failed",
+                info.asset_name
+            )));
+        }
+    };
+    println!(
+        "\x1b[32m✓\x1b[0m verified {} (sha256 {}…)",
+        info.asset_name,
+        &digest[..12]
+    );
+
     // The release ships the platform binary either as a raw executable
     // (`aish-<triple>`, the current format) or — for resilience against older /
     // differently-packaged releases — as a gzip tarball. Decide which by the
     // asset's filename extension and pull out the `aish` binary accordingly.
     let new_bin = if is_tarball(&info.asset_name) {
         println!("\x1b[2munpacking …\x1b[0m");
+        // F-18 tail: list members and validate every path BEFORE extracting, so
+        // a crafted archive can't zipslip out of the scratch dir.
+        let listed = tokio::process::Command::new("tar")
+            .args(["-tzf", &downloaded.to_string_lossy()])
+            .output()
+            .await
+            .context("listing the release archive with tar")?;
+        if !listed.status.success() {
+            let _ = std::fs::remove_dir_all(&work);
+            bail!(
+                "tar could not list {}: {}",
+                info.asset_name,
+                String::from_utf8_lossy(&listed.stderr).trim()
+            );
+        }
+        if let Err(e) = validate_tar_listing(&String::from_utf8_lossy(&listed.stdout)) {
+            let _ = std::fs::remove_dir_all(&work);
+            return Err(e);
+        }
         let untar = tokio::process::Command::new("tar")
             .args([
                 "-xzf",
                 &downloaded.to_string_lossy(),
                 "-C",
                 &work.to_string_lossy(),
+                "--no-same-owner",
+                "--no-same-permissions",
             ])
             .output()
             .await
@@ -1588,5 +1979,230 @@ mod drain_tests {
         std::fs::write(&path, b"{ not valid json ]").expect("write corrupt");
         assert!(read_cache(&path).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- TASK-948 / SEC-4.1 (F-06): artifact integrity --------------------
+
+    /// Scratch dir helper for the verification tests.
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("aish-task948-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("create scratch");
+        d
+    }
+
+    /// (a) A sidecar whose digest MATCHES the downloaded bytes verifies, and the
+    /// verified digest is returned so the caller can log/attest it.
+    #[test]
+    fn sidecar_digest_match_verifies() {
+        let dir = tmp_dir("match");
+        let asset = "aish-x86_64-unknown-linux-gnu";
+        let artifact = dir.join(asset);
+        std::fs::write(&artifact, b"pretend this is the aish binary").expect("write artifact");
+
+        let digest = sha256_file(&artifact).expect("hash artifact");
+        assert_eq!(digest.len(), 64, "sha256 is 64 hex chars");
+
+        // The exact shape `shasum -a 256` / `sha256sum` emits.
+        let sidecar = format!("{digest}  {asset}\n");
+        let verified = verify_digest(&artifact, Some(&sidecar), asset).expect("must verify");
+        assert_eq!(verified, digest);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (b) A MISMATCHED sidecar aborts — and nothing is staged. The gate is a
+    /// pure function over the downloaded file, so a refusal cannot have written
+    /// anything next to the running binary: assert the staging dir stays empty.
+    #[test]
+    fn sidecar_digest_mismatch_fails_closed() {
+        let dir = tmp_dir("mismatch");
+        let dest = tmp_dir("mismatch-dest"); // stands in for the install dir
+        let asset = "aish-aarch64-apple-darwin";
+        let artifact = dir.join(asset);
+        std::fs::write(&artifact, b"tampered payload").expect("write artifact");
+
+        let wrong = "0".repeat(64);
+        let sidecar = format!("{wrong}  {asset}\n");
+        let err = verify_digest(&artifact, Some(&sidecar), asset)
+            .expect_err("a mismatched checksum must abort");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("checksum mismatch"), "unexpected error: {msg}");
+        assert!(msg.contains("refusing to install"), "must refuse: {msg}");
+
+        // Nothing staged: no `.aish-update-*` artifact appeared in the dest dir.
+        let staged = std::fs::read_dir(&dest).expect("read dest").count();
+        assert_eq!(staged, 0, "verification failure must stage nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// (c) A MISSING sidecar fails CLOSED — the absence of a checksum is a
+    /// refusal, never an implicit pass.
+    #[test]
+    fn missing_sidecar_fails_closed() {
+        let dir = tmp_dir("missing");
+        let asset = "aish-x86_64-apple-darwin";
+        let artifact = dir.join(asset);
+        std::fs::write(&artifact, b"unverifiable bytes").expect("write artifact");
+
+        let err = verify_digest(&artifact, None, asset).expect_err("no sidecar must fail closed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no .sha256 sidecar"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("fails closed"),
+            "must say it fails closed: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (d) `gh` is resolved to an ABSOLUTE path from trusted install dirs, and
+    /// relative / empty PATH entries are never honoured — PATH *order* must not
+    /// decide which `gh` drives the update channel.
+    #[test]
+    fn gh_resolves_to_absolute_path_not_path_order() {
+        // A relative entry holding a `gh` shim is ignored outright...
+        // A relative entry holding a `gh` shim is ignored outright: with ONLY
+        // relative candidates "existing", nothing resolves.
+        let only_relative = ".:bin:..";
+        assert!(
+            resolve_gh_in(only_relative, &|p: &Path| !p.is_absolute()).is_none(),
+            "relative PATH entries must never resolve gh"
+        );
+
+        // ...while an absolute entry resolves, and the result is absolute.
+        let abs = "/opt/custom/bin";
+        let got = resolve_gh_in(abs, &|p: &Path| p == Path::new("/opt/custom/bin/gh"))
+            .expect("absolute PATH entry resolves");
+        assert!(got.is_absolute());
+        assert_eq!(got, PathBuf::from("/opt/custom/bin/gh"));
+
+        // Allow-listed install dirs win over PATH order: even with a shim dir
+        // first in PATH, /usr/bin/gh is chosen because it exists.
+        let shim_first = "/tmp/evil-shim:/usr/bin";
+        let chosen = resolve_gh_in(shim_first, &|p: &Path| {
+            p == Path::new("/usr/bin/gh") || p == Path::new("/tmp/evil-shim/gh")
+        })
+        .expect("resolves");
+        assert_eq!(
+            chosen,
+            PathBuf::from("/usr/bin/gh"),
+            "allow-listed install dirs must beat PATH order"
+        );
+
+        // Nothing anywhere ⇒ None (callers turn this into a hard error).
+        assert!(resolve_gh_in("/usr/bin:/bin", &|_p: &Path| false).is_none());
+    }
+
+    #[test]
+    fn match_sidecar_finds_published_sidecar_only() {
+        let assets = vec![
+            GhAsset {
+                name: "aish-x86_64-unknown-linux-gnu".into(),
+            },
+            GhAsset {
+                name: "aish-x86_64-unknown-linux-gnu.sha256".into(),
+            },
+            GhAsset {
+                name: "aish-aarch64-apple-darwin".into(),
+            },
+        ];
+        assert_eq!(
+            match_sidecar(&assets, "aish-x86_64-unknown-linux-gnu"),
+            Some("aish-x86_64-unknown-linux-gnu.sha256")
+        );
+        // No sidecar published for the darwin asset → None (⇒ fail closed).
+        assert_eq!(match_sidecar(&assets, "aish-aarch64-apple-darwin"), None);
+    }
+
+    #[test]
+    fn parse_sidecar_accepts_sha256sum_bsd_and_bare_forms() {
+        let d = "a".repeat(64);
+        let asset = "aish-x86_64-unknown-linux-gnu";
+        // GNU sha256sum: two spaces.
+        assert_eq!(
+            parse_sha256_sidecar(&format!("{d}  {asset}"), asset).unwrap(),
+            d
+        );
+        // Binary-mode marker.
+        assert_eq!(
+            parse_sha256_sidecar(&format!("{d} *{asset}"), asset).unwrap(),
+            d
+        );
+        // Path-prefixed name still matches on the filename tail.
+        assert_eq!(
+            parse_sha256_sidecar(&format!("{d}  ./dist/{asset}"), asset).unwrap(),
+            d
+        );
+        // Bare digest, no filename.
+        assert_eq!(parse_sha256_sidecar(&format!("{d}\n"), asset).unwrap(), d);
+        // Aggregate listing: the MATCHING line wins, not the first line.
+        let other = "b".repeat(64);
+        let agg = format!("{other}  aish-aarch64-apple-darwin\n{d}  {asset}\n");
+        assert_eq!(parse_sha256_sidecar(&agg, asset).unwrap(), d);
+        // Uppercase is normalised.
+        assert_eq!(
+            parse_sha256_sidecar(&format!("{}  {asset}", d.to_uppercase()), asset).unwrap(),
+            d
+        );
+        // Garbage / wrong-length digests are rejected rather than trusted.
+        assert!(parse_sha256_sidecar("deadbeef  x", asset).is_err());
+        assert!(parse_sha256_sidecar("", asset).is_err());
+        assert!(parse_sha256_sidecar(&format!("{}  {asset}", "z".repeat(64)), asset).is_err());
+    }
+
+    #[test]
+    fn attestation_policy_parses_with_prefer_default() {
+        assert_eq!(parse_attestation_policy(None), AttestationPolicy::Prefer);
+        assert_eq!(
+            parse_attestation_policy(Some("  REQUIRE ")),
+            AttestationPolicy::Require
+        );
+        assert_eq!(
+            parse_attestation_policy(Some("strict")),
+            AttestationPolicy::Require
+        );
+        assert_eq!(
+            parse_attestation_policy(Some("off")),
+            AttestationPolicy::Off
+        );
+        assert_eq!(parse_attestation_policy(Some("0")), AttestationPolicy::Off);
+        // Unrecognised values must NOT silently disable the check.
+        assert_eq!(
+            parse_attestation_policy(Some("banana")),
+            AttestationPolicy::Prefer
+        );
+    }
+
+    #[test]
+    fn attestation_absent_distinguishes_missing_from_failed() {
+        assert!(attestation_absent(
+            "no attestations found for subject sha256:abc"
+        ));
+        assert!(attestation_absent(
+            "unknown command \"attestation\" for \"gh\""
+        ));
+        // A real verification FAILURE is not "absent" — it must stay fatal.
+        assert!(!attestation_absent(
+            "✗ verification failed: signature does not match"
+        ));
+        assert!(!attestation_absent("error: digest mismatch"));
+    }
+
+    #[test]
+    fn tar_member_validation_rejects_traversal() {
+        assert!(tar_member_safe("aish"));
+        assert!(tar_member_safe("dist/aish"));
+        assert!(!tar_member_safe("/etc/passwd"));
+        assert!(!tar_member_safe("../../.ssh/authorized_keys"));
+        assert!(!tar_member_safe("dist/../../evil"));
+        assert!(!tar_member_safe("~/.bashrc"));
+        assert!(!tar_member_safe("C:\\windows\\system32"));
+
+        validate_tar_listing("aish\ndist/aish\n\n").expect("safe listing passes");
+        let err = validate_tar_listing("aish\n../../evil\n").expect_err("traversal must abort");
+        assert!(format!("{err:#}").contains("escapes the scratch directory"));
     }
 }
