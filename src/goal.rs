@@ -766,7 +766,15 @@ async fn run_goal(
     model: String,
     cred: crate::backend::claude::Credential,
 ) {
-    goal.note(&format!("started — {}", goal.condition));
+    // `note_quiet`, not `note`: the `:goal` command handler has ALREADY printed
+    // the actionable confirmation ("goal set — pursuing it in the background;
+    // `:goal` for status, `:goal clear` to stop") on the line directly above,
+    // and the condition is the text the operator just typed one line above
+    // THAT. Announcing "started — <condition>" here made a single event occupy
+    // two rows, the second of which only echoed the operator's own input back
+    // at them. The line is still recorded, so `:attach goal` / Shift-Tab replay
+    // keeps the start marker in the transcript tail.
+    goal.note_quiet(&format!("started — {}", goal.condition));
     goal.fire_hook(crate::hooks::HookEvent::GoalStart, |p| {
         p.with("condition", goal.condition.clone())
     });
