@@ -472,10 +472,8 @@ pub fn runs_immediately(line: &str) -> Option<&'static str> {
     // `&mut Session` would deadlock or (worse) race the live turn.
     //
     // Deliberately NOT here, despite qualifying on property (1):
-    //   · `:workers` / `:jobs` / `:status` — these PRINT (and `:workers` opens a
-    //     keyboard modal that would steal stdin from the very reader thread
-    //     classifying this line). Racing the live turn's output and footer for
-    //     a listing nobody is blocked on isn't worth it.
+    //   · `:jobs` / `:status` — these PRINT, and racing the live turn's output
+    //     and footer for a listing nobody is blocked on isn't worth it.
     const IMMEDIATE: &[&str] = &[
         "dispatch",
         // `:tell` + aliases. Steering is the case that needs immediacy MOST: a
@@ -489,6 +487,15 @@ pub fn runs_immediately(line: &str) -> Option<&'static str> {
         "stop",
         "standdown",
         "stand-down",
+        // `:workers`. The listing of what's running is the ONE print worth the
+        // output-area race: you type it mid-turn precisely BECAUSE work is in
+        // flight, and queueing it means the table you asked for lands after the
+        // turn — showing a different, already-moved-on world. It renders off
+        // `OpsCtx` via `repl::workers_listing_ctx`, so no `&mut Session`. The
+        // interactive keyboard modal is NOT a hazard here: `handle_colon` gates
+        // it behind `!keywatch::installed()`, and keywatch owns stdin for the
+        // whole turn, so the mid-turn path is always the static table.
+        "workers",
     ];
     let word = IMMEDIATE.iter().copied().find(|c| *c == word)?;
     // One carve-out: `:tell goal <msg>` is not a coordinator message at all — it
@@ -521,6 +528,15 @@ mod tests {
         // Bare `:dispatch` still classifies — the usage/goal-suggestion message
         // is the command's own business, not the classifier's.
         assert_eq!(runs_immediately(":dispatch"), Some("dispatch"));
+        // `:workers` — asked for mid-turn precisely BECAUSE work is in flight,
+        // so it must run NOW, in every argument form, rather than render a
+        // post-turn world.
+        assert_eq!(runs_immediately(":workers"), Some("workers"));
+        assert_eq!(runs_immediately(":workers all"), Some("workers"));
+        assert_eq!(runs_immediately(":workers diagram"), Some("workers"));
+        assert_eq!(runs_immediately("  :workers  "), Some("workers"));
+        // ...but a prefix collision is a different command entirely.
+        assert_eq!(runs_immediately(":workersfoo"), None);
     }
 
     #[test]
@@ -534,8 +550,9 @@ mod tests {
         assert_eq!(runs_immediately(":clear"), None);
         assert_eq!(runs_immediately(":restart"), None);
         assert_eq!(runs_immediately(":quit"), None);
-        // Prints / opens a modal — see the exclusion note in `runs_immediately`.
-        assert_eq!(runs_immediately(":workers"), None);
+        // Still-excluded prints — see the exclusion note in `runs_immediately`.
+        assert_eq!(runs_immediately(":jobs"), None);
+        assert_eq!(runs_immediately(":status"), None);
         // `:tell goal …` routes into `steer_active_goal`, which needs the
         // session — the one steering form that must still queue.
         assert_eq!(runs_immediately(":tell goal narrow the scope"), None);

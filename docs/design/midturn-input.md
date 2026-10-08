@@ -126,18 +126,28 @@ Two properties qualify a command for the whitelist:
    whitelisted commands run off an `OpsCtx` snapshot taken before `run_turn`
    borrows the session.
 
-Today the whitelist is `dispatch`, `tell` (+ `msg` / `send`) and `stop`
-(+ `standdown` / `stand-down`) — the three coordinator-control verbs, all now
-running off `OpsCtx` via `tell_coordinator_ctx` / `stop_coordinator_ctx`. These
-are the commands immediacy matters most for: a steer that lands after the round
-it was meant to change is a no-op, and a stand-down that waits for the turn to
-end keeps paying for the work it was cancelling.
+Today the whitelist is `dispatch`, `tell` (+ `msg` / `send`), `stop`
+(+ `standdown` / `stand-down`) and `workers` — the coordinator-control verbs plus
+the worker listing, all running off `OpsCtx` via `tell_coordinator_ctx` /
+`stop_coordinator_ctx` / `workers_listing_ctx`. These are the commands immediacy
+matters most for: a steer that lands after the round it was meant to change is a
+no-op, a stand-down that waits for the turn to end keeps paying for the work it
+was cancelling, and `:workers` is typed mid-turn *precisely because* work is in
+flight — queued, it renders the post-turn world instead of the one you asked
+about.
+
+`:workers` is also the one whitelisted command that PRINTS, which is why its
+mid-turn render is the static table and never the interactive modal: the modal
+is gated behind `!keywatch::installed()` in `handle_colon`, and keywatch owns
+stdin for the whole turn, so it cannot steal input from the reader thread that
+classified the line. The `diagram` / `states` / `lifecycle` subcommand is a pure
+print of the lifecycle transition table and runs immediately too.
 
 One carve-out: `:tell goal …` routes into `steer_active_goal`, which needs
 `&mut Session`, so the classifier keeps *that* form queued while `:tell <id> …`
-runs immediately. Printing commands (`:jobs`, `:status`) and modal ones
-(`:workers`, which would steal stdin from the classifying reader thread) are
-deliberately excluded.
+runs immediately. The remaining printing commands (`:jobs`, `:status`) stay
+excluded — nobody is blocked on them, so they aren't worth racing the live turn's
+output area and footer for.
 
 Mid-turn `:dispatch` does not auto-attach: the turn owns the output area, so
 interleaving a worker stream would garble both. The run id is printed; `:attach`
