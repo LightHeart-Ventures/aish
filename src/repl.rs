@@ -315,6 +315,19 @@ pub async fn run(
         // prompt so a terminal scroll that carried it out of view self-heals
         // (the "I scrolled and the footer disappeared" complaint).
         crate::terminal::spawn_footer_heartbeat();
+        // Give that heartbeat the ability to refresh the footer's CONTENT, not
+        // just redraw the cached frame: every pre-paint tick rewrites each
+        // pinned escalation banner's status row from the live worker list. The
+        // REPL's idle pass does the same thing, but it only runs between
+        // prompts — so while the session sat parked in a read (or attached to a
+        // worker) the banner's phase/activity text froze and only moved when an
+        // operator keystroke forced a fresh pass. Handles are Arc-backed clones,
+        // so the thread holds its own without touching `Session`.
+        let refresh_jobs = session.worker_jobs.clone();
+        let refresh_store = session.coordinator_store.clone();
+        crate::terminal::set_footer_refresher(Box::new(move || {
+            refresh_escalation_status_from(&refresh_jobs, refresh_store.as_ref());
+        }));
         // SIGWINCH → set the resize flag; the loop drains it before the prompt.
         let resized_sig = resized.clone();
         tokio::spawn(async move {
@@ -2166,12 +2179,27 @@ fn statusline_segments(
 /// and snapshotted, so N banners cost one lock acquisition per paint rather than
 /// N — and no lock is held while writing into the escalation store.
 fn refresh_escalation_status(session: &Session) {
+    refresh_escalation_status_from(&session.worker_jobs, session.coordinator_store.as_ref());
+}
+
+/// The `Session`-free body of [`refresh_escalation_status`], taking only the two
+/// shared handles it actually needs.
+///
+/// Split out so the FOOTER HEARTBEAT can drive it too (via
+/// [`crate::terminal::set_footer_refresher`]). The REPL's idle pass is the only
+/// other caller, and it does not run while the session is parked in a blocking
+/// read or attached to a worker — which is exactly when a pinned banner's status
+/// row went stale and only came back after an operator keystroke. Both handles
+/// are cheap clones (`Arc`-backed), so the heartbeat thread can hold its own.
+fn refresh_escalation_status_from(
+    jobs: &crate::worker::WorkerJobs,
+    store: Option<&crate::db::CoordinatorStore>,
+) {
     let ids = crate::escalation::pinned_ids();
     if ids.is_empty() {
         return;
     }
-    let snapshot: Vec<(String, String, String, Option<String>)> = session
-        .worker_jobs
+    let snapshot: Vec<(String, String, String, Option<String>)> = jobs
         .lock()
         .unwrap()
         .iter()
@@ -2195,10 +2223,7 @@ fn refresh_escalation_status(session: &Session) {
         // `cached_summary` throttles its store lookup, which matters here: this
         // runs on the footer paint path, i.e. on every heartbeat repaint, once
         // per pinned banner.
-        let summary = session
-            .coordinator_store
-            .as_ref()
-            .and_then(|s| crate::activity_summary::cached_summary(s, &run_id));
+        let summary = store.and_then(|s| crate::activity_summary::cached_summary(s, &run_id));
         let activity = summary.or(last);
         let text = match activity {
             Some(a) if !a.trim().is_empty() => format!("{status} · {}", a.trim()),
@@ -2209,7 +2234,7 @@ fn refresh_escalation_status(session: &Session) {
             crate::escalation::note_terminal(&id, status == "failed");
         }
     }
-    refresh_escalation_beats(session, &ids);
+    refresh_escalation_beats(store, &ids);
 }
 
 /// Feed every pinned banner's liveness heart from its worker's DURABLE heartbeat
@@ -2226,7 +2251,7 @@ fn refresh_escalation_status(session: &Session) {
 /// Failure-tolerant by construction: no store (ephemeral session) or no row for
 /// an id leaves that banner's beat `None`, which renders the hollow `♡` — "no
 /// liveness claim" — instead of a green heart we have no evidence for.
-fn refresh_escalation_beats(session: &Session, ids: &[String]) {
+fn refresh_escalation_beats(store: Option<&crate::db::CoordinatorStore>, ids: &[String]) {
     const BEAT_POLL: std::time::Duration = std::time::Duration::from_secs(3);
     static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
@@ -2238,10 +2263,7 @@ fn refresh_escalation_beats(session: &Session, ids: &[String]) {
     drop(last);
 
     for id in ids {
-        let beat = session
-            .coordinator_store
-            .as_ref()
-            .and_then(|s| s.heartbeat_unix(id));
+        let beat = store.and_then(|s| s.heartbeat_unix(id));
         crate::escalation::set_beat(id, beat);
     }
 }

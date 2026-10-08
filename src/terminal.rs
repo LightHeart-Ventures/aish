@@ -571,6 +571,63 @@ pub fn set_reading_line(reading: bool) {
     }
 }
 
+/// Serializes the two writers that can move the body/footer boundary: the
+/// heartbeat's cached repaint ([`paint_cached_footer`]) and the growth absorb a
+/// pinning banner performs ([`absorb_banner_growth_around`]).
+///
+/// Without it the two race in the one window that matters. `escalation::pin`
+/// measures the footer's row demand, grows the store, then scrolls the body out
+/// of the rows the footer is about to claim. If a heartbeat paint lands between
+/// the store mutation and the scroll it installs the SHORTER region first, and
+/// the absorb's line feeds then scroll inside the already-shrunk body — losing a
+/// body row and leaving the cursor one row off, which is the same class of
+/// corruption the absorb exists to prevent. Holding this across the whole
+/// measure → mutate → measure → write transition makes it atomic with respect to
+/// paints.
+///
+/// LOCK ORDER (never invert): `FOOTER_PAINT` → `escalation::BANNERS`. Both
+/// holders reach into the escalation store while holding this; nothing takes
+/// `BANNERS` first and then this.
+static FOOTER_PAINT: Mutex<()> = Mutex::new(());
+
+/// Hook the heartbeat calls immediately before a repaint so the footer's
+/// *content* can be refreshed, not just redrawn.
+///
+/// The heartbeat thread paints the CACHED footer (see [`paint_cached_footer`]),
+/// which is why a pinned escalation banner's clock and emoji animate from it —
+/// those are re-derived from the escalation store on every paint — while the
+/// banner's STATUS ROW (worker phase + activity summary) stayed frozen: that row
+/// is only rewritten by the REPL's idle pass, which never runs while the session
+/// is parked in a blocking read (or attached to a worker). The REPL installs a
+/// closure here that re-reads the live worker list / coordinator store and
+/// rewrites every pinned banner's status, so a heartbeat frame carries fresh
+/// text instead of a stale snapshot. No hook installed (tests, non-footer
+/// sessions) = the previous paint-only behavior.
+static FOOTER_REFRESH: Mutex<Option<Box<dyn Fn() + Send>>> = Mutex::new(None);
+
+/// Install the pre-paint footer content refresher. Called once at REPL startup
+/// when the footer region is live; replaces any prior hook.
+pub fn set_footer_refresher(f: Box<dyn Fn() + Send>) {
+    if let Ok(mut slot) = FOOTER_REFRESH.lock() {
+        *slot = Some(f);
+    }
+}
+
+/// Run the installed pre-paint refresher, if any.
+///
+/// Deliberately called OUTSIDE [`FOOTER_PAINT`]: the hook takes the worker-jobs
+/// lock and writes into the escalation store, so running it under the paint lock
+/// would add a third lock to the ordering for no benefit. It only mutates TEXT —
+/// never the banner COUNT — so it cannot change the footer's row demand and
+/// cannot race the growth absorb.
+fn run_footer_refresher() {
+    if let Ok(slot) = FOOTER_REFRESH.lock()
+        && let Some(f) = slot.as_ref()
+    {
+        f();
+    }
+}
+
 /// Everything the heartbeat knows at one tick, sampled from the footer-state
 /// atomics. Split out so the repaint decision is a pure function the tests can
 /// drive exhaustively (the thread itself is untestable).
@@ -580,8 +637,6 @@ struct HeartbeatState {
     /// child owns the terminal — `suspend_footer_region` clears `ACTIVE` — so
     /// vim/sudo/less are never painted over.
     region_active: bool,
-    /// A worker alt-screen (`:attach`) view owns the terminal.
-    attach_active: bool,
     /// The REPL is parked in a blocking line read (idle at the prompt).
     reading_line: bool,
     /// The in-progress input buffer holds text.
@@ -612,9 +667,22 @@ struct HeartbeatState {
 /// it only applies AT the prompt. So `input_dirty` is now scoped to
 /// `reading_line` instead of blocking unconditionally, and the heartbeat keeps
 /// healing the footer straight through a turn.
+///
+/// THE SECOND BUG THIS FIXES: an `ATTACH_ACTIVE` veto used to sit alongside
+/// `region_active` here, on the assumption that a worker `:attach` view owned an
+/// ALTERNATE screen buffer. It does not — [`open_attach_view`] deliberately
+/// renders on the PRIMARY buffer (so worker output keeps native scrollback) and
+/// re-asserts the footer region on entry, which means the footer — including the
+/// pinned escalation tray — is live and meant to be visible during an attach.
+/// With the veto in place the tray's clock and emoji FROZE for as long as the
+/// operator watched a worker, which is exactly when an escalation matters most.
+/// The repaint is cursor-safe either way, so attach is no longer a veto.
+/// Body-SCROLLING writes are a different matter and still skip under attach —
+/// see [`absorb_banner_growth_around`].
 fn heartbeat_should_paint(s: HeartbeatState) -> bool {
-    // No region to paint, or someone else owns the screen.
-    if !s.region_active || s.attach_active {
+    // No region to paint — `suspend_footer_region` clears ACTIVE, so this also
+    // covers a foreground TTY child (vim/sudo/less) owning the screen.
+    if !s.region_active {
         return false;
     }
     // Never repaint over a line the user is mid-editing: a non-empty buffer
@@ -653,13 +721,16 @@ pub fn spawn_footer_heartbeat() {
                     .saturating_sub(LAST_FOOTER_ACTIVITY_MS.load(Ordering::Relaxed));
                 if heartbeat_should_paint(HeartbeatState {
                     region_active: ACTIVE.load(Ordering::Relaxed),
-                    attach_active: ATTACH_ACTIVE.load(Ordering::Relaxed),
                     reading_line: READING_LINE.load(Ordering::Relaxed),
                     input_dirty: INPUT_DIRTY.load(Ordering::Relaxed),
                     idle_elapsed: idle >= idle_ms,
                     size_changed: size_changed_since_paint(),
                     animating: crate::escalation::animating(),
                 }) {
+                    // Refresh the footer's CONTENT before redrawing it, so a
+                    // pinned banner's status row tracks the live worker list
+                    // instead of freezing until the next operator keystroke.
+                    run_footer_refresher();
                     // Cursor-safe repaint (no body-home): DECSC/DECRC restores
                     // the caller's cursor exactly where it was — the in-progress
                     // input line at the prompt, or the spinner/ticker row
@@ -681,6 +752,11 @@ fn paint_cached_footer(home_body: bool) {
     if !ACTIVE.load(Ordering::Relaxed) {
         return;
     }
+    // Hold the boundary lock for the whole paint so a banner pinning on another
+    // thread cannot slip its body-scroll between this paint's region install and
+    // its footer write (see `FOOTER_PAINT`). Poisoning is not fatal here — the
+    // worst case is a redundant repaint — so recover rather than propagate.
+    let _boundary = FOOTER_PAINT.lock().unwrap_or_else(|e| e.into_inner());
     let Some((rows, cols)) = term_size() else {
         return;
     };
@@ -1288,23 +1364,54 @@ pub fn banner_growth_seq(grow: u16) -> String {
     format!("{}\x1b[{grow}A", "\n".repeat(grow as usize))
 }
 
-/// Runtime entry point for [`banner_growth_seq`]: absorb the body rows the
-/// footer takes when the escalation block grows from `prev_want_rows` to
-/// `next_want_rows`. Called by [`crate::escalation::pin`] the moment a banner
-/// lands, BEFORE the next footer paint installs the shorter region.
+/// Run `mutate` — a change to the pinned-escalation store — with the footer's
+/// body-row growth absorbed around it, atomically with respect to footer paints.
 ///
-/// No-op unless a footer region is actually installed, and skipped while a
-/// worker view owns the terminal (`ATTACH_ACTIVE`) or the operator is mid-edit
-/// on a non-empty prompt line (`INPUT_DIRTY`) — in those states the line feeds
-/// would disturb a cursor this module doesn't own, and the next full repaint
-/// heals the layout anyway. Same gating shape as [`resync_after_wake`].
-pub fn absorb_banner_growth(prev_want_rows: u16, next_want_rows: u16) {
-    if !ACTIVE.load(Ordering::Relaxed)
-        || ATTACH_ACTIVE.load(Ordering::Relaxed)
-        || INPUT_DIRTY.load(Ordering::Relaxed)
-    {
-        return;
+/// `want_rows` is the escalation block's current row demand
+/// ([`crate::escalation::row_count`]); it is sampled before and after `mutate`
+/// so the growth is derived from what the store actually holds rather than from
+/// a caller's guess. Everything happens under [`FOOTER_PAINT`], so a heartbeat
+/// repaint cannot install the newer (shorter-body) region between the store
+/// mutation and the line feeds — the absorb MUST emit its LFs while the OLD,
+/// taller body region is still installed, which is what lets it skip a DSR round
+/// trip. See [`banner_growth_seq`] for the choreography and the bug.
+///
+/// The absorb is skipped — `mutate` still runs — unless a footer region is
+/// installed, and while a worker `:attach` view owns the body
+/// (`ATTACH_ACTIVE`) or the operator is mid-edit on a non-empty prompt line
+/// (`READING_LINE` + `INPUT_DIRTY`). In those states the line feeds would
+/// scroll a body this module does not own, and the next full repaint heals the
+/// layout anyway.
+///
+/// NOTE the deliberate asymmetry with [`heartbeat_should_paint`], which no
+/// longer treats attach as a veto: that path emits a cursor-safe DECSC/DECRC
+/// footer repaint, which is harmless under an attach view, whereas this one
+/// SCROLLS THE BODY. `INPUT_DIRTY` is scoped to `READING_LINE` for the same
+/// reason it is there: mid-turn the flag is a stale leftover from the previous
+/// prompt and rustyline is not rendering, and mid-turn is exactly when workers
+/// escalate — honoring a stale flag would skip the absorb in the common case and
+/// leave `thinking…` painting over the banner.
+pub fn absorb_banner_growth_around<T>(
+    want_rows: impl Fn() -> u16,
+    mutate: impl FnOnce() -> T,
+) -> T {
+    let _boundary = FOOTER_PAINT.lock().unwrap_or_else(|e| e.into_inner());
+    let allowed = ACTIVE.load(Ordering::Relaxed)
+        && !ATTACH_ACTIVE.load(Ordering::Relaxed)
+        && !(READING_LINE.load(Ordering::Relaxed) && INPUT_DIRTY.load(Ordering::Relaxed));
+    if !allowed {
+        return mutate();
     }
+    let before = want_rows();
+    let out = mutate();
+    absorb_banner_growth(before, want_rows());
+    out
+}
+
+/// Emit the growth absorb for a footer going from `prev_want_rows` to
+/// `next_want_rows` rows of escalation block. Callers come through
+/// [`absorb_banner_growth_around`], which owns the gating and the lock.
+fn absorb_banner_growth(prev_want_rows: u16, next_want_rows: u16) {
     let Some((rows, _cols)) = term_size() else {
         return;
     };
@@ -1316,7 +1423,6 @@ pub fn absorb_banner_growth(prev_want_rows: u16, next_want_rows: u16) {
     let _ = write!(out, "{seq}");
     let _ = out.flush();
 }
-
 
 /// Parse a DSR cursor-position reply — `ESC [ row ; col R` — out of a raw read
 /// buffer, returning the 1-based `(row, col)`.
@@ -1833,6 +1939,51 @@ mod tests {
     }
 
     #[test]
+    fn pinned_banner_and_an_animating_body_row_never_share_cells() {
+        // THE INTERACTION the two halves of this fix have to survive together:
+        // an escalation pins (footer grows, body floor rises) WHILE the in-place
+        // `thinking…` row is still rewriting itself on a cadence. Half a fix
+        // either way leaves the bug: without the absorb the spinner paints onto
+        // the tray, and without the mid-turn heartbeat the tray's clock/emoji
+        // freeze until a keystroke.
+        let rows = 24u16;
+        let before = FooterLayout::solve(rows, 0);
+        let after = FooterLayout::solve(rows, 2);
+        let grow = banner_growth_rows(rows, 0, 2);
+
+        // The rows the tray claims == the rows the absorb lifts the body by.
+        assert_eq!(grow, after.banner_rows);
+        assert_eq!(before.body_bottom - after.body_bottom, grow);
+        let seq = banner_growth_seq(grow);
+        assert_eq!(seq.matches('\n').count(), grow as usize);
+        assert_eq!(seq, format!("{}\x1b[{grow}A", "\n".repeat(grow as usize)));
+
+        // The cursor started on the OLD last body row, got scrolled up by
+        // `grow`, then walked back up `grow` to the same CONTENT line — which
+        // now sits ON the new body floor, i.e. strictly ABOVE the banner rows
+        // [after.body_bottom + 1 ..= before.body_bottom]. So the next in-place
+        // `thinking…` rewrite cannot land in the tray.
+        let cursor_content_row = before.body_bottom - grow;
+        assert_eq!(cursor_content_row, after.body_bottom);
+        assert!(
+            cursor_content_row < after.body_bottom + 1,
+            "animated body row would land inside the pinned tray"
+        );
+
+        // …and the tray keeps ticking with NO keystroke: mid-turn, with a live
+        // banner animating, the heartbeat paints even before the idle gate.
+        assert!(heartbeat_should_paint(HeartbeatState {
+            reading_line: false,
+            idle_elapsed: false,
+            animating: true,
+            ..beat()
+        }));
+        // The two mechanisms stay disjoint on a no-op transition: a heartbeat
+        // repaint that changes no banner count scrolls nothing.
+        assert!(banner_growth_seq(banner_growth_rows(rows, 2, 2)).is_empty());
+    }
+
+    #[test]
     fn resume_lifts_overflow_before_reclaiming_the_rows() {
         // Order is load-bearing: SU (ESC[nS) must come BEFORE the DECSTBM
         // re-assert, while the region is still full-screen, so the whole
@@ -2083,7 +2234,6 @@ mod tests {
     fn beat() -> HeartbeatState {
         HeartbeatState {
             region_active: true,
-            attach_active: false,
             reading_line: false,
             input_dirty: false,
             idle_elapsed: true,
@@ -2160,10 +2310,18 @@ mod tests {
             animating: true,
             ..beat()
         }));
-        // A worker alt-screen view owns the terminal.
-        assert!(!heartbeat_should_paint(HeartbeatState {
-            attach_active: true,
-            size_changed: true,
+    }
+
+    #[test]
+    fn heartbeat_keeps_painting_under_an_attach_view() {
+        // THE REGRESSION: a `:attach` worker view used to veto the heartbeat on
+        // a stale alternate-screen assumption. `open_attach_view` renders on the
+        // PRIMARY buffer and re-asserts the footer region, so the escalation
+        // tray is on screen during an attach and its clock/emoji must keep
+        // advancing. `ATTACH_ACTIVE` is no longer part of the paint gate at all.
+        assert!(heartbeat_should_paint(beat()));
+        assert!(heartbeat_should_paint(HeartbeatState {
+            idle_elapsed: false,
             animating: true,
             ..beat()
         }));
