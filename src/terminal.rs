@@ -1317,7 +1317,6 @@ pub fn absorb_banner_growth(prev_want_rows: u16, next_want_rows: u16) {
     let _ = out.flush();
 }
 
-
 /// Parse a DSR cursor-position reply — `ESC [ row ; col R` — out of a raw read
 /// buffer, returning the 1-based `(row, col)`.
 ///
