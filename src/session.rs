@@ -292,6 +292,12 @@ pub struct Session {
     /// and the grant covers `dir` recursively. Populated on every 'd' answer and
     /// consulted before the DB.
     pub session_dir_allows: HashSet<(String, PathBuf)>,
+    /// Which `${profile:KEY}` secrets may be materialised, and into which
+    /// programs, for THIS session (TASK-946 / SEC-3.1 F-02). Driven by the
+    /// `:secrets` command and `AISH_SECRET_KEYS`; in unattended mode (a
+    /// background coordinator) the key allowlist starts EMPTY, so a coordinator
+    /// resolves no secrets unless it was granted one at launch.
+    pub secret_policy: crate::secrets::SecretPolicy,
     /// Running estimate of how many tokens the current `history` occupies in the
     /// model's context window — updated after each turn from the backend's
     /// reported usage (or a char-based estimate). Drives auto-compaction and the
@@ -676,6 +682,9 @@ impl Session {
             last_status: 0,
             session_allows: HashSet::new(),
             session_dir_allows: HashSet::new(),
+            secret_policy: crate::secrets::SecretPolicy::for_session(
+                std::env::var("AISH_COORDINATOR").is_ok(),
+            ),
             context_used: 0,
             usage_mark: 0,
             tokens_in: 0,
