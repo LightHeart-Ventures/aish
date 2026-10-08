@@ -2309,10 +2309,12 @@ fn coordinator_status_message(session: &Session) -> String {
             ));
         }
         if !segs.is_empty() {
-            let joined = segs.join("  \u{b7}  ");
-            // Bound the segment area (escape-aware clip keeps ANSI intact) so a
-            // chatty plugin can't crowd the live hint off the row.
-            let clamped = crate::terminal::clip_visible(&joined, STATUSLINE_SEGMENT_MAX_COLS);
+            // Bound the segment area so a chatty plugin can't crowd the live hint
+            // off the row — but share that budget FAIRLY: every segment gets an
+            // equal column quota and is individually clipped (escape-aware, ANSI
+            // intact), rather than clipping the joined run and letting the first
+            // segment silence every one after it.
+            let clamped = crate::style::segments_with_quota(&segs, STATUSLINE_SEGMENT_MAX_COLS);
             left = if left.is_empty() {
                 clamped
             } else {
