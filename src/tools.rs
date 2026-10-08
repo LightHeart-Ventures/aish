@@ -821,7 +821,6 @@ const READ_ONLY_PROGRAMS: &[&str] = &[
     "pwd",
     "grep",
     "rg",
-    "find",
     "fd",
     "head",
     "tail",
@@ -833,8 +832,6 @@ const READ_ONLY_PROGRAMS: &[&str] = &[
     "du",
     "stat",
     "file",
-    "env",
-    "printenv",
     "date",
     "whoami",
     "id",
@@ -851,8 +848,6 @@ const READ_ONLY_PROGRAMS: &[&str] = &[
     "sort",
     "uniq",
     "cut",
-    "less",
-    "more",
     "lsblk",
     "lscpu",
     "lsusb",
@@ -877,8 +872,6 @@ const GIT_READ_ONLY: &[&str] = &[
     "shortlog",
     "describe",
     "rev-parse",
-    "config",
-    "stash",
 ];
 
 /// Programs whose whole purpose is to mutate — always confirm.
@@ -933,6 +926,155 @@ const DESTRUCTIVE_VERBS: &[&str] = &[
     "exec",
 ];
 
+/// Max wrapper-unwrap recursion before we stop reasoning and fail closed.
+const MAX_WRAPPER_DEPTH: usize = 8;
+
+/// Programs whose job is to exec ANOTHER argv given on their own command line.
+/// Classification must follow the wrapped command: `env rm -rf x` is an `rm`,
+/// not an `env`. Resolved recursively (the pattern `sudo` always used).
+const WRAPPER_PROGRAMS: &[&str] = &[
+    "env", "xargs", "nohup", "timeout", "watch", "nice", "ionice", "stdbuf", "setsid", "script",
+    "time", "sudo", "doas", "ssh",
+];
+
+/// Programs that can spawn an arbitrary command regardless of argv — shells,
+/// pagers with a `!cmd` escape, editors with `:!`. Always confirm: these are
+/// how a shell gets smuggled back into a fork/exec-only design (`less f` →
+/// `!sh`), which is the one property of this codebase worth protecting most.
+const ALWAYS_CONFIRM_PROGRAMS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "csh",
+    "tcsh",
+    "python",
+    "python2",
+    "python3",
+    "node",
+    "deno",
+    "bun",
+    "ruby",
+    "perl",
+    "php",
+    "lua",
+    "osascript",
+    "awk",
+    "gawk",
+    "mawk",
+    "nawk",
+    "expect",
+    "less",
+    "more",
+    "most",
+    "pg",
+    "vi",
+    "vim",
+    "nvim",
+    "nano",
+    "pico",
+    "emacs",
+    "ed",
+];
+
+/// `find` actions that delete or execute.
+const FIND_MUTATING_ACTIONS: &[&str] = &[
+    "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint", "-fprint0", "-fprintf",
+];
+
+/// git global flags that consume a SEPARATE value token.
+const GIT_GLOBAL_VALUE_FLAGS: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--exec-path",
+    "--namespace",
+    "--super-prefix",
+    "--config-env",
+];
+
+/// git global flags that stand alone.
+const GIT_GLOBAL_BOOL_FLAGS: &[&str] = &[
+    "-P",
+    "--paginate",
+    "--no-pager",
+    "--bare",
+    "--no-replace-objects",
+    "--literal-pathspecs",
+    "--glob-pathspecs",
+    "--noglob-pathspecs",
+    "--icase-pathspecs",
+    "--no-optional-locks",
+    "--no-lazy-fetch",
+    "--html-path",
+    "--man-path",
+    "--info-path",
+    "--version",
+    "--help",
+    "-v",
+    "-h",
+];
+
+/// `git config` explicit READ selectors.
+const GIT_CONFIG_READ_FLAGS: &[&str] = &[
+    "--get",
+    "--get-all",
+    "--get-regexp",
+    "--get-urlmatch",
+    "--get-color",
+    "--get-colorbool",
+    "--list",
+    "-l",
+];
+
+/// `git config` explicit WRITE/mutate selectors.
+const GIT_CONFIG_WRITE_FLAGS: &[&str] = &[
+    "--add",
+    "--replace-all",
+    "--unset",
+    "--unset-all",
+    "--edit",
+    "-e",
+    "--rename-section",
+    "--remove-section",
+];
+
+/// `git config` flags that consume a value token (so it is not an operand).
+const GIT_CONFIG_VALUE_FLAGS: &[&str] = &["-f", "--file", "--blob", "--default", "--type", "-t"];
+
+/// config keys whose value is EXECUTED by a later git command — writing one
+/// turns the next innocuous `git status` into arbitrary code execution.
+const GIT_EXEC_CONFIG_KEYS: &[&str] = &[
+    "core.pager",
+    "core.hookspath",
+    "core.editor",
+    "core.askpass",
+    "core.fsmonitor",
+    "core.sshcommand",
+    "credential.helper",
+    "diff.external",
+    "sequence.editor",
+    "include.path",
+    "init.templatedir",
+    "uploadpack.packobjectshook",
+    "gpg.program",
+    "ssh.variant",
+    "protocol.ext.allow",
+];
+const GIT_EXEC_CONFIG_PREFIXES: &[&str] = &["alias.", "pager.", "includeif.", "filter."];
+const GIT_EXEC_CONFIG_SUFFIXES: &[&str] = &[
+    ".sshcommand",
+    ".clean",
+    ".smudge",
+    ".uploadpack",
+    ".receivepack",
+    ".helper",
+    ".pager",
+];
+
 fn bin_name(program: &str) -> &str {
     Path::new(program)
         .file_name()
@@ -940,20 +1082,306 @@ fn bin_name(program: &str) -> &str {
         .unwrap_or(program)
 }
 
+/// What a wrapper program's argv resolves to.
+enum Wrapped {
+    /// Re-classify this (program, args) — the command that will actually run.
+    Argv(String, Vec<String>),
+    /// A shape we cannot reason about (shell string, bare wrapper, interactive
+    /// session). Fail closed.
+    Opaque,
+}
+
+/// Per-wrapper argv shape: flags that consume a separate value token, and how
+/// many positional tokens precede the wrapped command (`timeout`'s DURATION,
+/// `ssh`'s `[user@]host`).
+fn wrapper_flag_shape(bin: &str) -> (&'static [&'static str], usize) {
+    match bin {
+        "env" => (&["-u", "--unset", "-C", "--chdir"], 0),
+        "xargs" => (
+            &[
+                "-n",
+                "--max-args",
+                "-P",
+                "--max-procs",
+                "-I",
+                "-i",
+                "--replace",
+                "-d",
+                "--delimiter",
+                "-E",
+                "-e",
+                "--eof",
+                "-a",
+                "--arg-file",
+                "-s",
+                "--max-chars",
+                "-L",
+                "-l",
+            ],
+            0,
+        ),
+        "timeout" => (&["-s", "--signal", "-k", "--kill-after"], 1),
+        "nice" | "ionice" => (&["-n", "--adjustment", "-c", "-p"], 0),
+        "stdbuf" => (&["-i", "--input", "-o", "--output", "-e", "--error"], 0),
+        "watch" => (&["-n", "--interval"], 0),
+        "sudo" | "doas" => (
+            &["-u", "--user", "-g", "--group", "-C", "-p", "--prompt"],
+            0,
+        ),
+        "ssh" => (
+            &[
+                "-p", "-i", "-o", "-l", "-F", "-J", "-L", "-R", "-D", "-W", "-S", "-E", "-b", "-c",
+                "-m", "-I", "-e", "-Q",
+            ],
+            1,
+        ),
+        _ => (&[], 0),
+    }
+}
+
+/// Resolve a wrapper program to the argv it will actually exec, so the
+/// classifier judges the real command (`env rm -rf x` → `rm -rf x`).
+/// Returns `None` when `bin` is not a wrapper.
+fn resolve_wrapper(bin: &str, args: &[String]) -> Option<Wrapped> {
+    if !WRAPPER_PROGRAMS.contains(&bin) {
+        return None;
+    }
+    // `script` runs an interactive shell session; `env -S` hands a whole
+    // command STRING to a parser. Neither is an argv we can inspect.
+    if bin == "script" {
+        return Some(Wrapped::Opaque);
+    }
+    if bin == "env"
+        && args.iter().any(|a| {
+            a == "-S"
+                || a == "--split-string"
+                || a.starts_with("--split-string=")
+                || (a.starts_with("-S") && a.len() > 2)
+        })
+    {
+        return Some(Wrapped::Opaque);
+    }
+    let (value_flags, positionals) = wrapper_flag_shape(bin);
+    let mut i = 0;
+    while i < args.len() {
+        let tok = args[i].as_str();
+        if tok == "--" {
+            i += 1;
+            break;
+        }
+        // env's KEY=VALUE assignments precede the command.
+        if bin == "env" && !tok.starts_with('-') && tok.contains('=') {
+            i += 1;
+            continue;
+        }
+        if !tok.starts_with('-') {
+            break;
+        }
+        if value_flags.contains(&tok) {
+            if i + 1 >= args.len() {
+                return Some(Wrapped::Opaque); // dangling value
+            }
+            i += 2;
+        } else {
+            // `--flag=value`, bundled shorts (`-n1`), bare booleans.
+            i += 1;
+        }
+    }
+    for _ in 0..positionals {
+        if i >= args.len() {
+            return Some(Wrapped::Opaque);
+        }
+        i += 1;
+    }
+    if i >= args.len() {
+        return Some(Wrapped::Opaque); // bare wrapper: nothing to inspect
+    }
+    Some(Wrapped::Argv(args[i].clone(), args[i + 1..].to_vec()))
+}
+
+/// Interpreters, pagers, editors and build drivers that can run arbitrary
+/// commands no matter what the argv looks like — always confirm.
+fn is_always_confirm(bin: &str, args: &[String]) -> bool {
+    if ALWAYS_CONFIRM_PROGRAMS.contains(&bin) || bin == "npx" {
+        return true;
+    }
+    if bin == "make" {
+        // A dry run is safe; anything else runs the recipe (i.e. a shell).
+        return !args.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "-n" | "--dry-run" | "--just-print" | "--recon" | "-q" | "--question" | "--version"
+            )
+        });
+    }
+    if matches!(
+        bin,
+        "cargo" | "npm" | "pnpm" | "yarn" | "bun" | "deno" | "go"
+    ) && let Some(sub) = args.iter().find(|a| !a.starts_with('-'))
+    {
+        return matches!(
+            sub.as_str(),
+            "run" | "run-script" | "exec" | "start" | "generate"
+        );
+    }
+    false
+}
+
+/// True when a `find` argv carries a delete-or-exec action.
+fn find_has_mutating_action(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| FIND_MUTATING_ACTIONS.contains(&a.as_str()))
+}
+
+/// Strip leading git GLOBAL flags so callers see the subcommand first:
+/// `git -C /r push origin main` → `["push", "origin", "main"]`.
+/// Returns the remaining argv and whether the shape was fully understood;
+/// `recognised == false` means FAIL CLOSED at every call site.
+fn normalize_git_argv(args: &[String]) -> (Vec<String>, bool) {
+    let mut i = 0;
+    while i < args.len() {
+        let tok = args[i].as_str();
+        if tok == "--" {
+            i += 1;
+            break;
+        }
+        if !tok.starts_with('-') {
+            break;
+        }
+        if GIT_GLOBAL_VALUE_FLAGS.contains(&tok) {
+            if i + 1 >= args.len() {
+                return (Vec::new(), false); // dangling value
+            }
+            i += 2;
+            continue;
+        }
+        if GIT_GLOBAL_BOOL_FLAGS.contains(&tok) {
+            i += 1;
+            continue;
+        }
+        if let Some((head, _)) = tok.split_once('=')
+            && GIT_GLOBAL_VALUE_FLAGS.contains(&head)
+        {
+            i += 1;
+            continue;
+        }
+        // Unrecognised global flag: hand back the tail and fail closed.
+        return (args[i..].to_vec(), false);
+    }
+    (args[i..].to_vec(), true)
+}
+
+/// True when a config key's VALUE gets executed by a later git command
+/// (`core.pager`, `core.hooksPath`, `alias.*`, `*.sshCommand`, …).
+fn git_config_key_is_exec(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    GIT_EXEC_CONFIG_KEYS.contains(&k.as_str())
+        || GIT_EXEC_CONFIG_PREFIXES.iter().any(|p| k.starts_with(p))
+        || GIT_EXEC_CONFIG_SUFFIXES.iter().any(|s| k.ends_with(s))
+}
+
+/// `git config` is read-only ONLY for explicit read forms. `args` is the argv
+/// AFTER the `config` subcommand.
+fn git_config_is_read_only(args: &[String]) -> bool {
+    if args
+        .iter()
+        .any(|a| GIT_CONFIG_WRITE_FLAGS.contains(&a.as_str()))
+    {
+        return false;
+    }
+    let mut operands = 0usize;
+    let mut read_flag: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let tok = args[i].as_str();
+        if tok.starts_with('-') {
+            if GIT_CONFIG_READ_FLAGS.contains(&tok) {
+                read_flag = Some(tok);
+            }
+            if GIT_CONFIG_VALUE_FLAGS.contains(&tok) {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        operands += 1;
+        i += 1;
+    }
+    match read_flag {
+        Some("--list") | Some("-l") => operands == 0,
+        Some("--get-urlmatch") => operands <= 2,
+        Some(_) => operands <= 1,
+        // No explicit selector: 0 operands prints usage, 1 operand is a read,
+        // 2+ is `key value` — a WRITE.
+        None => operands <= 1,
+    }
+}
+
+/// True when this `git` invocation WRITES an exec-enabling config key.
+/// Takes the RAW git argv (global flags are normalised here).
+fn git_config_writes_exec_key(args: &[String]) -> bool {
+    let (norm, recognised) = normalize_git_argv(args);
+    if !recognised || norm.first().map(String::as_str) != Some("config") {
+        return false;
+    }
+    let rest = &norm[1..];
+    if git_config_is_read_only(rest) {
+        return false;
+    }
+    let mut i = 0;
+    while i < rest.len() {
+        let tok = rest[i].as_str();
+        if tok.starts_with('-') {
+            if GIT_CONFIG_VALUE_FLAGS.contains(&tok) {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        return git_config_key_is_exec(tok);
+    }
+    false
+}
+
 fn git_is_read_only(args: &[String]) -> bool {
-    // `git config` / `git stash` are read-only only without mutating sub-args
-    match args.first().map(String::as_str) {
-        Some("config") => args.len() <= 2 || args.iter().any(|a| a == "--list" || a == "--get"),
-        Some("stash") => args.get(1).map(String::as_str) == Some("list"),
+    let (norm, recognised) = normalize_git_argv(args);
+    if !recognised {
+        return false; // fail closed on argv shapes we don't understand
+    }
+    match norm.first().map(String::as_str) {
+        Some("config") => git_config_is_read_only(&norm[1..]) && !git_config_writes_exec_key(args),
+        Some("stash") => matches!(norm.get(1).map(String::as_str), Some("list") | Some("show")),
         Some(sub) => GIT_READ_ONLY.contains(&sub),
         None => true,
     }
 }
 
-/// Provably read-only (careful mode's allowlist question).
+/// Provably read-only (careful mode's allowlist question). Membership is a
+/// POSITIVE signal that must still survive the destructive check, so the
+/// invariant `is_read_only ⇒ !is_destructive` holds structurally.
 fn is_read_only(program: &str, args: &[String]) -> bool {
+    is_read_only_at(program, args, 0)
+}
+
+fn is_read_only_at(program: &str, args: &[String], depth: usize) -> bool {
+    if depth > MAX_WRAPPER_DEPTH {
+        return false;
+    }
     let bin = bin_name(program);
-    READ_ONLY_PROGRAMS.contains(&bin) || (bin == "git" && git_is_read_only(args))
+    // Wrappers inherit the classification of the argv they actually exec, so
+    // `env ls -la` stays allowlisted while `env rm -rf x` never can be.
+    if let Some(w) = resolve_wrapper(bin, args) {
+        return match w {
+            Wrapped::Argv(prog, rest) => is_read_only_at(&prog, &rest, depth + 1),
+            Wrapped::Opaque => false,
+        };
+    }
+    let positive = READ_ONLY_PROGRAMS.contains(&bin)
+        || (bin == "git" && git_is_read_only(args))
+        || (bin == "find" && !find_has_mutating_action(args));
+    positive && !is_destructive(program, args)
 }
 
 /// Does this look like it writes, creates, or deletes? (normal mode's
@@ -961,22 +1389,42 @@ fn is_read_only(program: &str, args: &[String]) -> bool {
 /// Heuristic by design: an unknown verb runs unprompted, a read named like
 /// a write prompts once.
 fn is_destructive(program: &str, args: &[String]) -> bool {
+    is_destructive_at(program, args, 0)
+}
+
+/// `is_destructive` with wrapper-recursion depth tracking.
+fn is_destructive_at(program: &str, args: &[String], depth: usize) -> bool {
+    if depth > MAX_WRAPPER_DEPTH {
+        return true; // absurd wrapper nesting: fail closed
+    }
     let bin = bin_name(program);
-    if READ_ONLY_PROGRAMS.contains(&bin) {
-        return false;
+    // 1. Exec wrappers: judge the argv that will ACTUALLY run, recursively.
+    if let Some(w) = resolve_wrapper(bin, args) {
+        return match w {
+            Wrapped::Argv(prog, rest) => is_destructive_at(&prog, &rest, depth + 1),
+            Wrapped::Opaque => true,
+        };
+    }
+    // 2. Interpreters / pagers / editors / build drivers can spawn anything.
+    if is_always_confirm(bin, args) {
+        return true;
     }
     if DESTRUCTIVE_PROGRAMS.contains(&bin) {
         return true;
     }
-    if matches!(bin, "sudo" | "doas") {
-        // judge the wrapped command, and treat a bare sudo as destructive
-        return match args.split_first() {
-            Some((cmd, rest)) => is_destructive(cmd, rest),
-            None => true,
-        };
-    }
     if bin == "git" {
+        if git_config_writes_exec_key(args) {
+            return true;
+        }
         return !git_is_read_only(args);
+    }
+    if bin == "find" {
+        return find_has_mutating_action(args);
+    }
+    // A provably read-only binary suppresses the fuzzy verb scan so a
+    // verb-shaped ARGUMENT (`grep delete .`) doesn't prompt.
+    if READ_ONLY_PROGRAMS.contains(&bin) {
+        return false;
     }
     args.iter().any(|a| {
         let token = a.trim_start_matches('-').to_ascii_lowercase();
@@ -1021,18 +1469,48 @@ fn current_git_branch(cwd: &Path) -> Option<String> {
 /// Guard entry point: returns a human reason when this `git` invocation would
 /// mutate the default branch (push to or commit on main/master). Only `push`
 /// and `commit` are inspected — and only those pay for the branch lookup.
+/// Tail of `args` starting at the first `push`/`commit` token — used to guard
+/// argv shapes the normaliser did not recognise (fail closed).
+fn git_mutating_tail(args: &[String]) -> Option<Vec<String>> {
+    let idx = args.iter().position(|a| a == "push" || a == "commit")?;
+    Some(args[idx..].to_vec())
+}
+
 fn git_default_branch_guard(args: &[String], cwd: &Path) -> Option<String> {
-    match args.first().map(String::as_str) {
-        Some("push") | Some("commit") => {
-            protected_git_mutation(args, current_git_branch(cwd).as_deref())
-        }
-        _ => None,
+    // Normalise git GLOBAL flags FIRST, so `git -C /repo push origin main`,
+    // `git -c k=v push` and `git --git-dir=… push` cannot skip the guard.
+    let (norm, recognised) = normalize_git_argv(args);
+    let mutating = if recognised {
+        matches!(
+            norm.first().map(String::as_str),
+            Some("push") | Some("commit")
+        )
+    } else {
+        // Fail CLOSED: a shape we can't normalise is still guarded when it
+        // mentions a mutating verb anywhere in the argv.
+        git_mutating_tail(args).is_some()
+    };
+    if !mutating {
+        return None;
     }
+    protected_git_mutation(args, current_git_branch(cwd).as_deref())
 }
 
 /// Pure default-branch detection (split out for testing — no IO). `args` is the
-/// git argv *after* the program; `current_branch` is the checked-out branch.
+/// git argv *after* the program (global flags included — they are normalised
+/// here); `current_branch` is the checked-out branch.
 fn protected_git_mutation(args: &[String], current_branch: Option<&str>) -> Option<String> {
+    let (norm, recognised) = normalize_git_argv(args);
+    let argv: Vec<String> = if recognised
+        && matches!(
+            norm.first().map(String::as_str),
+            Some("push") | Some("commit")
+        ) {
+        norm
+    } else {
+        git_mutating_tail(args)?
+    };
+    let args = &argv;
     let is_default = |b: &str| matches!(b, "main" | "master");
     let on_default = current_branch.map(is_default).unwrap_or(false);
     match args.first().map(String::as_str)? {
@@ -5864,6 +6342,540 @@ mod tests {
         // careful-mode allowlist still intact
         assert!(is_read_only("git", &["log".into()]));
         assert!(!is_read_only("git", &["push".into()]));
+    }
+
+    // ── gate matrix ───────────────────────────────────────────────────────
+    // Table-driven classifier harness: every documented bypass from the
+    // security review is a PERMANENT regression case here. Adding a row is the
+    // only sanctioned way to document a new gate expectation.
+
+    /// One row of the gate matrix.
+    struct GateCase {
+        /// Stable name — quoted in sprint/security exit evidence.
+        name: &'static str,
+        program: &'static str,
+        args: &'static [&'static str],
+        /// Must Normal (the DEFAULT mode) stop and confirm?
+        normal: bool,
+        /// Must Careful mode stop and confirm?
+        careful: bool,
+    }
+
+    const GATE_MATRIX: &[GateCase] = &[
+        // ── the six documented bypasses (F-03, F-05) ──
+        GateCase {
+            name: "env rm -rf",
+            program: "env",
+            args: &["rm", "-rf", "/tmp/x"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "find -delete",
+            program: "find",
+            args: &[".", "-name", "*.tmp", "-delete"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "find -exec",
+            program: "find",
+            args: &[".", "-exec", "rm", "{}", ";"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "less -> !sh",
+            program: "less",
+            args: &["/etc/passwd"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git -C ... push origin main",
+            program: "git",
+            args: &["-C", "/repo", "push", "origin", "main"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git -c k=v push",
+            program: "git",
+            args: &["-c", "core.pager=sh", "push"],
+            normal: true,
+            careful: true,
+        },
+        // ── wrapper family (F-03) ──
+        GateCase {
+            name: "env with assignment then rm",
+            program: "env",
+            args: &["FOO=1", "rm", "-rf", "/tmp/x"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "env -S shell string is opaque",
+            program: "env",
+            args: &["-S", "rm -rf /tmp/x"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "bare env is opaque",
+            program: "env",
+            args: &[],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "xargs rm",
+            program: "xargs",
+            args: &["-n1", "rm"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "nohup rm",
+            program: "nohup",
+            args: &["rm", "-rf", "/tmp/x"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "timeout duration then rm",
+            program: "timeout",
+            args: &["5", "rm", "-rf", "/tmp/x"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "watch rm",
+            program: "watch",
+            args: &["-n", "2", "rm", "-rf", "/tmp/x"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "setsid rm",
+            program: "setsid",
+            args: &["rm", "-rf", "/tmp/x"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "ssh host rm",
+            program: "ssh",
+            args: &["host", "rm", "-rf", "/tmp/x"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "nested wrappers env nohup timeout rm",
+            program: "env",
+            args: &["nohup", "timeout", "5", "rm", "-rf", "/tmp/x"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "wrapper around a read stays quiet",
+            program: "env",
+            args: &["ls", "-la"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "sudo ls stays quiet (regression)",
+            program: "sudo",
+            args: &["ls"],
+            normal: false,
+            careful: false,
+        },
+        // ── interpreters / pagers / editors / build drivers (F-03) ──
+        GateCase {
+            name: "bash -c",
+            program: "bash",
+            args: &["-c", "echo hi"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "python -c",
+            program: "python3",
+            args: &["-c", "print(1)"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "node -e",
+            program: "node",
+            args: &["-e", "1"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "awk program",
+            program: "awk",
+            args: &["{print}"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "more pager",
+            program: "more",
+            args: &["/etc/passwd"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "vim shell escape",
+            program: "vim",
+            args: &["/tmp/f"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "make runs a recipe",
+            program: "make",
+            args: &["all"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "make --dry-run stays quiet",
+            program: "make",
+            args: &["-n", "all"],
+            normal: false,
+            careful: true,
+        },
+        GateCase {
+            name: "cargo run",
+            program: "cargo",
+            args: &["run"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "npm run script",
+            program: "npm",
+            args: &["run", "build"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "cargo build stays quiet",
+            program: "cargo",
+            args: &["build"],
+            normal: false,
+            careful: true,
+        },
+        // ── git global-flag normalisation (F-05) ──
+        GateCase {
+            name: "git --git-dir push",
+            program: "git",
+            args: &["--git-dir=/repo/.git", "push", "origin", "main"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git -P push",
+            program: "git",
+            args: &["-P", "push", "origin", "main"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git --work-tree push",
+            program: "git",
+            args: &["--work-tree", "/repo", "push"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git -C read stays quiet",
+            program: "git",
+            args: &["-C", "/repo", "status"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "git unknown global flag fails closed",
+            program: "git",
+            args: &["--not-a-real-flag", "status"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git dangling -C value fails closed",
+            program: "git",
+            args: &["-C"],
+            normal: true,
+            careful: true,
+        },
+        // ── git config classification (F-08) ──
+        GateCase {
+            name: "git config core.pager write",
+            program: "git",
+            args: &["config", "core.pager", "sh"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git config core.hooksPath write",
+            program: "git",
+            args: &["config", "core.hooksPath", "/tmp/hooks"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git config alias write",
+            program: "git",
+            args: &["config", "alias.st", "!sh -c id"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git config credential.helper write",
+            program: "git",
+            args: &["config", "--global", "credential.helper", "/tmp/h"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git config unset core.pager",
+            program: "git",
+            args: &["config", "--unset", "core.pager"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git config plain write",
+            program: "git",
+            args: &["config", "user.name", "nobody"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git config --get stays quiet",
+            program: "git",
+            args: &["config", "--get", "user.name"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "git config --get-regexp stays quiet",
+            program: "git",
+            args: &["config", "--get-regexp", "^user\\."],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "git config --list stays quiet",
+            program: "git",
+            args: &["config", "--list"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "git stash push is gated",
+            program: "git",
+            args: &["stash"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git stash list stays quiet",
+            program: "git",
+            args: &["stash", "list"],
+            normal: false,
+            careful: false,
+        },
+        // ── reads must stay unprompted (no false-positive regression) ──
+        GateCase {
+            name: "ls read",
+            program: "ls",
+            args: &["-la"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "grep with a verb-shaped argument",
+            program: "grep",
+            args: &["-rn", "delete", "src"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "find without an action stays quiet",
+            program: "find",
+            args: &[".", "-name", "*.rs"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "git log read",
+            program: "git",
+            args: &["log", "--oneline"],
+            normal: false,
+            careful: false,
+        },
+    ];
+
+    fn owned(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn gate_matrix_normal_mode() {
+        use crate::session::Mode;
+        for c in GATE_MATRIX {
+            let got = exec_needs_confirm(Mode::Normal, c.program, &owned(c.args));
+            assert_eq!(
+                got, c.normal,
+                "[{}] normal mode: expected confirm={}, got {}",
+                c.name, c.normal, got
+            );
+        }
+    }
+
+    #[test]
+    fn gate_matrix_careful_mode() {
+        use crate::session::Mode;
+        for c in GATE_MATRIX {
+            let got = exec_needs_confirm(Mode::Careful, c.program, &owned(c.args));
+            assert_eq!(
+                got, c.careful,
+                "[{}] careful mode: expected confirm={}, got {}",
+                c.name, c.careful, got
+            );
+        }
+    }
+
+    #[test]
+    fn gate_matrix_read_only_never_destructive() {
+        // Structural invariant: the read-only allowlist is a POSITIVE signal
+        // that still falls through the destructive check, so it can never
+        // DISABLE the heuristic for a name on it.
+        for c in GATE_MATRIX {
+            let args = owned(c.args);
+            if is_read_only(c.program, &args) {
+                assert!(
+                    !is_destructive(c.program, &args),
+                    "[{}] is_read_only must imply !is_destructive",
+                    c.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_list_has_no_wrappers_or_pagers() {
+        // F-03: exec wrappers and shell-escaping pagers must never be on the
+        // read-only allowlist, and the two sets must stay disjoint.
+        for bad in ["env", "printenv", "find", "less", "more"] {
+            assert!(
+                !READ_ONLY_PROGRAMS.contains(&bad),
+                "{bad} must not be read-only"
+            );
+        }
+        for w in WRAPPER_PROGRAMS {
+            assert!(
+                !READ_ONLY_PROGRAMS.contains(w),
+                "wrapper {w} must not be read-only"
+            );
+        }
+        for p in ALWAYS_CONFIRM_PROGRAMS {
+            assert!(
+                !READ_ONLY_PROGRAMS.contains(p),
+                "always-confirm {p} must not be read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn git_argv_normalisation() {
+        let n = |a: &[&str]| {
+            let (v, ok) = normalize_git_argv(&owned(a));
+            (v, ok)
+        };
+        assert_eq!(n(&["push"]).0, vec!["push".to_string()]);
+        assert_eq!(
+            n(&["-C", "/repo", "push", "origin", "main"]).0,
+            owned(&["push", "origin", "main"])
+        );
+        assert_eq!(n(&["-c", "k=v", "push"]).0, owned(&["push"]));
+        assert_eq!(n(&["--git-dir=/r/.git", "push"]).0, owned(&["push"]));
+        assert_eq!(n(&["--git-dir", "/r/.git", "push"]).0, owned(&["push"]));
+        assert_eq!(n(&["--work-tree", "/r", "push"]).0, owned(&["push"]));
+        assert_eq!(n(&["--exec-path=/x", "-P", "push"]).0, owned(&["push"]));
+        assert_eq!(n(&["-P", "status"]).0, owned(&["status"]));
+        assert!(n(&["-C", "/repo", "status"]).1);
+        // fail closed
+        assert!(!n(&["--bogus-flag", "status"]).1);
+        assert!(!n(&["-C"]).1);
+    }
+
+    #[test]
+    fn default_branch_guard_sees_through_global_flags() {
+        // F-05: the only hard refuse in the system must not be skippable.
+        let g = |a: &[&str], branch: Option<&str>| protected_git_mutation(&owned(a), branch);
+        for argv in [
+            vec!["push", "origin", "main"],
+            vec!["-C", "/repo", "push", "origin", "main"],
+            vec!["-c", "k=v", "push", "origin", "main"],
+            vec!["--git-dir=/r/.git", "push", "origin", "main"],
+            vec!["--work-tree", "/r", "push", "origin", "main"],
+            vec!["-P", "push", "origin", "master"],
+            vec!["-C", "/r", "-c", "k=v", "-P", "push", "origin", "main"],
+        ] {
+            assert!(
+                g(&argv, Some("feature")).is_some(),
+                "{argv:?} must be refused"
+            );
+        }
+        // implicit push while ON the default branch, behind global flags
+        assert!(g(&["-C", "/repo", "push"], Some("main")).is_some());
+        assert!(g(&["-c", "k=v", "commit", "-m", "x"], Some("main")).is_some());
+        // unrecognised shape still guarded (fail closed)
+        assert!(g(&["--bogus", "push", "origin", "main"], Some("feature")).is_some());
+        // legitimate feature-branch work is untouched
+        assert!(g(&["-C", "/repo", "push", "origin", "feat/x"], Some("feat/x")).is_none());
+        assert!(g(&["push", "origin", "feat/x"], Some("feat/x")).is_none());
+        assert!(g(&["-C", "/repo", "status"], Some("main")).is_none());
+    }
+
+    #[test]
+    fn git_config_read_write_classification() {
+        // F-08: read-only ONLY for explicit read forms.
+        let ro = |a: &[&str]| git_is_read_only(&owned(a));
+        assert!(ro(&["config", "--get", "user.name"]));
+        assert!(ro(&["config", "--get-all", "user.name"]));
+        assert!(ro(&["config", "--get-regexp", "^user\\."]));
+        assert!(ro(&["config", "--list"]));
+        assert!(ro(&["config", "-l"]));
+        assert!(ro(&["config", "user.name"])); // single-operand read
+        assert!(ro(&["-C", "/repo", "config", "--list"]));
+        assert!(!ro(&["config", "user.name", "nobody"])); // key value = write
+        assert!(!ro(&["config", "--add", "user.name", "nobody"]));
+        assert!(!ro(&["config", "--unset", "user.name"]));
+        assert!(!ro(&["config", "--replace-all", "user.name", "x"]));
+        assert!(!ro(&["config", "--edit"]));
+        assert!(!ro(&["config", "--list", "extra.operand"]));
+        assert!(!ro(&["config", "-f", "/tmp/c", "user.name", "x"]));
+
+        // exec-enabling keys are destructive regardless of form
+        let exec = |a: &[&str]| git_config_writes_exec_key(&owned(a));
+        assert!(exec(&["config", "core.pager", "sh"]));
+        assert!(exec(&["config", "core.hooksPath", "/tmp/h"]));
+        assert!(exec(&["config", "core.editor", "sh"]));
+        assert!(exec(&["config", "credential.helper", "/tmp/h"]));
+        assert!(exec(&["config", "alias.st", "!sh"]));
+        assert!(exec(&["config", "remote.origin.sshCommand", "sh"]));
+        assert!(exec(&["config", "filter.x.clean", "sh"]));
+        assert!(exec(&["config", "--unset", "core.pager"]));
+        assert!(exec(&["-C", "/r", "config", "CORE.PAGER", "sh"])); // case-insensitive
+        assert!(!exec(&["config", "--get", "core.pager"])); // reading is fine
+        assert!(!exec(&["config", "user.name", "nobody"]));
+        assert!(!exec(&["status"]));
     }
 
     #[test]
