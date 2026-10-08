@@ -6729,6 +6729,16 @@ fn close_worker(id: Option<&str>, session: &mut Session) {
     // read-through cache can't grow without bound.
     crate::activity_summary::forget_cached(&run_id);
 
+    // Pull the worker out of the ESCALATION TRAY too. `:close` is a dismissal of
+    // the whole surface, and the pinned banner is part of that surface: leaving
+    // it behind pinned two animated footer rows for a coordinator the operator
+    // had just removed from `:workers` and the Shift-Tab rotation. Retirement
+    // can't cover this — `escalation::sweep` only retires a banner that reached
+    // a terminal state and outlived its dwell, which a still-RUNNING closed
+    // worker never does from this session's view, so the rows would have
+    // outlived the worker indefinitely. No-op when the worker never escalated.
+    let was_pinned = crate::escalation::unpin(&run_id);
+
     // Detach if we just closed the worker we were attached to.
     if attached.as_deref() == Some(run_id.as_str()) {
         *session.attached.lock().unwrap() = None;
@@ -6736,13 +6746,19 @@ fn close_worker(id: Option<&str>, session: &mut Session) {
     }
 
     let short = crate::batch::short_id(&run_id);
+    // Name the escalation tray only when a banner was really there — a plain
+    // `:dispatch` worker never escalated, so claiming we pulled it out of the
+    // tray would be a lie about a surface that was always empty for it.
+    let surfaces = if was_pinned {
+        ":workers, the Shift-Tab rotation, and the escalation tray"
+    } else {
+        ":workers and the Shift-Tab rotation"
+    };
     if matches!(status.as_str(), "done" | "failed") {
-        println!(
-            "\x1b[2m⇄ closed {short} — removed from :workers and the Shift-Tab rotation.\x1b[0m"
-        );
+        println!("\x1b[2m⇄ closed {short} — removed from {surfaces}.\x1b[0m");
     } else {
         println!(
-            "\x1b[2m⇄ closed {short} — removed from :workers and the Shift-Tab rotation; it keeps running in the background.\x1b[0m"
+            "\x1b[2m⇄ closed {short} — removed from {surfaces}; it keeps running in the background.\x1b[0m"
         );
     }
 }
