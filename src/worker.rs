@@ -2238,15 +2238,86 @@ fn ensure_dir_0700(dir: &std::path::Path) {
     }
 }
 
+/// Longest slug [`branch_slug`] emits before the `-{id}` suffix. Branch names are
+/// read in `git branch -r`, in PR lists and in `gh pr view --json headRefName`;
+/// past ~48 chars they stop being scannable, so the slug is cut on a `-` boundary
+/// (never mid-word) rather than hard-truncated.
+const BRANCH_SLUG_MAX: usize = 48;
+
+/// Slug a worker's task brief (or Atum card title) into the readable half of its
+/// branch name. Pure and total: `None` whenever the brief yields nothing usable
+/// (empty, or entirely punctuation / emoji / non-ASCII), which is the caller's
+/// signal to fall back to the opaque-but-always-valid `aish/{id}`.
+///
+/// Rules: lowercase; ASCII alphanumerics kept; every run of other characters
+/// collapsed to a single `-`; leading/trailing `-` trimmed; capped at
+/// [`BRANCH_SLUG_MAX`] on a `-` boundary. A leading conventional-commit type
+/// survives for free — `fix(ticker): bound the mid-turn erase` →
+/// `fix-ticker-bound-the-mid-turn-erase` — because the type is the first segment
+/// and the cap only ever cuts from the TAIL.
+///
+/// The output is deliberately a strict subset of git's ref grammar: only
+/// `[a-z0-9-]` can survive the collapse, so `..`, a trailing `.` or `.lock`,
+/// ASCII control characters, spaces and `~^:?*[\` are impossible by construction
+/// rather than by filtering (asserted in the tests regardless).
+fn branch_slug(task: &str) -> Option<String> {
+    let mut slug = String::with_capacity(task.len().min(BRANCH_SLUG_MAX * 2));
+    for ch in task.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() {
+        return None;
+    }
+    // All-ASCII by construction, so byte indexing == char indexing here.
+    if slug.len() <= BRANCH_SLUG_MAX {
+        return Some(slug.to_string());
+    }
+    match slug[..BRANCH_SLUG_MAX].rfind('-').filter(|&i| i > 0) {
+        Some(i) => Some(slug[..i].to_string()),
+        // A single word longer than the cap (one giant token, or a conventional
+        // type with an enormous scope): keep it WHOLE. Shearing it mid-word hurts
+        // readability and emitting nothing would needlessly cost the branch its
+        // meaning, so correctness wins over the cap in this one corner.
+        None => Some(slug.split('-').next().unwrap_or(slug).to_string()),
+    }
+}
+
 /// Build the branch name + worktree path for a worker. Pure (the caller supplies
-/// the already-resolved `root` and `repo_key`), so it's unit-testable. The
-/// worktree lives at `{root}/{repo_key}/{id}` — OUTSIDE the source repo, so it
-/// never pollutes the source `git status` — and the branch is `aish/{id}`. The
-/// worker id is globally unique (`w_########`, #86), so no session prefix is
-/// needed to disambiguate two sessions / two checkouts: they harmlessly share the
-/// `{repo_key}` parent dir with distinct leaves.
-fn worktree_layout(root: &std::path::Path, repo_key: &str, id: &str) -> (String, PathBuf) {
-    let branch = format!("aish/{id}");
+/// the already-resolved `root`, `repo_key` and dispatch brief), so it's
+/// unit-testable.
+///
+/// The worktree lives at `{root}/{repo_key}/{id}` — OUTSIDE the source repo, so
+/// it never pollutes the source `git status`. That path stays keyed on the worker
+/// id ALONE and is deliberately independent of `task`: worktree discovery, the
+/// age/orphan sweep, the ledger key ([`worktree_id_of`]) and `:jobs` all resolve a
+/// run by its leaf dir name, and every tree already on disk must keep resolving.
+///
+/// The BRANCH is the readable half: `aish/{slug-of-task}-{id}`, with the slug from
+/// [`branch_slug`] over the task brief (or an Atum card title when the dispatch
+/// carried one — `task` takes whichever the caller holds). `aish/w_lu79F23J` was
+/// opaque everywhere a branch is actually read, so the brief leads and the id
+/// trails. That id SUFFIX is what makes uniqueness non-negotiable: ids are
+/// globally unique (`w_########`, #86), so two workers dispatched with
+/// near-identical briefs can never collide, every branch traces back to exactly
+/// one run, and no session prefix is needed to disambiguate two sessions / two
+/// checkouts (they harmlessly share the `{repo_key}` parent dir with distinct
+/// leaves). When the brief slugs to nothing — absent, or all punctuation / emoji
+/// / non-ASCII — the branch falls back to exactly the old `aish/{id}`.
+fn worktree_layout(
+    root: &std::path::Path,
+    repo_key: &str,
+    id: &str,
+    task: Option<&str>,
+) -> (String, PathBuf) {
+    let branch = match task.and_then(branch_slug) {
+        Some(slug) => format!("aish/{slug}-{id}"),
+        None => format!("aish/{id}"),
+    };
     let path = root.join(repo_key).join(id);
     (branch, path)
 }
@@ -2452,10 +2523,16 @@ where
 /// repo) is invisible to it. Recording is best-effort: a ledger write failure
 /// must never cost the caller its isolation, so the error is reported and the
 /// worktree is still returned.
+///
+/// `task` is the dispatch brief (or Atum card title) the BRANCH name is derived
+/// from — see [`worktree_layout`]. It is threaded in as a parameter rather than
+/// read from a global so the layout stays pure and unit-testable; `None` keeps
+/// today's `aish/{id}` naming. It never affects the worktree PATH.
 fn create_worktree(
     src: &std::path::Path,
     id: &str,
     base: &str,
+    task: Option<&str>,
     store: Option<&crate::coordinator_store::CoordinatorStore>,
 ) -> Option<Worktree> {
     if !is_git_repo(src) {
@@ -2469,7 +2546,7 @@ fn create_worktree(
     // or sink a worker spawn.
     crate::worktree_gc::warn_if_disk_pressure();
     let key = repo_key(src);
-    let (branch, path) = worktree_layout(&root, &key, id);
+    let (branch, path) = worktree_layout(&root, &key, id, task);
     // Off the OS temp dir now (ISS-2046), so aish owns cleanup — create the root
     // and the per-repo parent `0700` before `git worktree add` materialises the leaf.
     ensure_dir_0700(&root);
@@ -2762,9 +2839,23 @@ pub fn sweep_worktrees(src: &std::path::Path) {
         if !should_sweep(dirty, ahead, orphaned, age, max_age) {
             continue;
         }
-        // Reclaim: drop git's registration (if any) + the `aish/<id>` branch, then
+        // Reclaim: drop git's registration (if any) + the worker's branch, then
         // the dir. `git worktree remove` deletes a REGISTERED leaf's dir; an orphan
         // it won't touch, so remove that ourselves.
+        //
+        // The branch is READ OFF the leaf first, not rebuilt from the leaf name:
+        // branch names now derive from the task brief (`aish/{slug}-{id}` — see
+        // `worktree_layout`), so the old `aish/{leaf}` guess would miss and LEAK
+        // the branch. Legacy trees (and an unreadable/detached HEAD) fall back to
+        // that guess, and the `aish/` filter keeps a trunk checkout from ever
+        // being handed to `branch -D`.
+        let leaf_branch = git_out(&leaf, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .filter(|b| b.starts_with("aish/"))
+            .or_else(|| {
+                leaf.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|name| format!("aish/{name}"))
+            });
         let _ = std::process::Command::new("git")
             .arg("-C")
             .arg(src)
@@ -2773,11 +2864,11 @@ pub fn sweep_worktrees(src: &std::path::Path) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        if let Some(name) = leaf.file_name().and_then(|s| s.to_str()) {
+        if let Some(branch) = leaf_branch {
             let _ = std::process::Command::new("git")
                 .arg("-C")
                 .arg(src)
-                .args(["branch", "-D", &format!("aish/{name}")])
+                .args(["branch", "-D", &branch])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -2789,7 +2880,8 @@ pub fn sweep_worktrees(src: &std::path::Path) {
 /// A worktree leaf that still holds work (uncommitted changes or commits ahead
 /// of its base) — a salvage candidate when its `coordinator_runs` row was lost
 /// to an early termination. `id` is the worker/run id (the leaf name), `branch`
-/// is `aish/<id>`, `path` the absolute worktree dir.
+/// the leaf's checked-out `aish/…` branch (read from git, since readable branch
+/// names no longer reconstruct from the id), `path` the absolute worktree dir.
 pub struct OrphanWork {
     pub id: String,
     pub branch: String,
@@ -2825,9 +2917,15 @@ pub fn work_bearing_worktrees(src: &std::path::Path) -> Vec<OrphanWork> {
             continue;
         }
         if let Some(name) = leaf.file_name().and_then(|s| s.to_str()) {
+            // Read the branch off the leaf — a readable branch (`aish/{slug}-{id}`)
+            // cannot be rebuilt from the leaf name. Legacy trees and an
+            // unreadable/detached HEAD fall back to the historical `aish/{name}`.
+            let branch = git_out(&leaf, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .filter(|b| b.starts_with("aish/"))
+                .unwrap_or_else(|| format!("aish/{name}"));
             out.push(OrphanWork {
                 id: name.to_string(),
-                branch: format!("aish/{name}"),
+                branch,
                 path: leaf.clone(),
             });
         }
@@ -3847,6 +3945,7 @@ async fn run_worker(
             &spec.cwd,
             &run_id,
             &spec.base,
+            Some(task.as_str()),
             spec.coordinator_store.as_ref(),
         )
     } else {
@@ -5890,8 +5989,9 @@ mod tests {
     #[test]
     fn worktree_layout_builds_branch_and_path() {
         let root = std::path::Path::new("/wt-root");
-        let (branch, path) = worktree_layout(root, "LightHeart-Ventures--aish", "w_a7k3m2pQ");
-        // Branch is just `aish/{id}` — the id is globally unique, no session prefix.
+        let (branch, path) = worktree_layout(root, "LightHeart-Ventures--aish", "w_a7k3m2pQ", None);
+        // No brief → the legacy `aish/{id}` branch, byte for byte. The id is
+        // globally unique, so no session prefix is needed.
         assert_eq!(branch, "aish/w_a7k3m2pQ");
         // Path = {root}/{repo-key}/{id}; the leaf is exactly the worker id.
         assert_eq!(
@@ -5900,12 +6000,197 @@ mod tests {
         );
         assert!(path.ends_with("w_a7k3m2pQ"), "got: {}", path.display());
         // Distinct ids never collide on path or branch.
-        let (b2, p2) = worktree_layout(root, "LightHeart-Ventures--aish", "w_ZZ00ay12");
+        let (b2, p2) = worktree_layout(root, "LightHeart-Ventures--aish", "w_ZZ00ay12", None);
         assert_ne!(branch, b2);
         assert_ne!(path, p2);
         // Distinct repo-keys get distinct parent dirs even with the same id.
-        let (_, other) = worktree_layout(root, "other--repo", "w_a7k3m2pQ");
+        let (_, other) = worktree_layout(root, "other--repo", "w_a7k3m2pQ", None);
         assert_ne!(path, other);
+    }
+
+    /// The readable-branch contract: the brief LEADS, the worker id TRAILS. A
+    /// generic `aish/w_lu79F23J` told a reviewer nothing in `git branch -r`, in a
+    /// PR list, or in `gh pr view --json headRefName`.
+    #[test]
+    fn worktree_layout_branch_reads_from_the_task_brief() {
+        let root = std::path::Path::new("/wt-root");
+        let (branch, _) = worktree_layout(
+            root,
+            "LightHeart-Ventures--aish",
+            "w_lu79F23J",
+            Some("fix(ticker): bound the mid-turn erase"),
+        );
+        assert_eq!(
+            branch,
+            "aish/fix-ticker-bound-the-mid-turn-erase-w_lu79F23J"
+        );
+        // Still inside the existing `aish/` namespace — `current_worktree_branch`
+        // (coordinator.rs) identifies a worker branch by exactly that prefix.
+        assert!(branch.starts_with("aish/"), "namespace preserved: {branch}");
+    }
+
+    /// Uniqueness is non-negotiable: the id suffix is the ONLY thing standing
+    /// between two similarly-briefed workers and a branch collision.
+    #[test]
+    fn identical_briefs_still_get_distinct_branches() {
+        let root = std::path::Path::new("/wt-root");
+        let brief = Some("fix(ticker): bound the mid-turn erase");
+        let (a, pa) = worktree_layout(root, "org--repo", "w_lu79F23J", brief);
+        let (b, pb) = worktree_layout(root, "org--repo", "w_QKJq3PdA", brief);
+        assert_eq!(a, "aish/fix-ticker-bound-the-mid-turn-erase-w_lu79F23J");
+        assert_eq!(b, "aish/fix-ticker-bound-the-mid-turn-erase-w_QKJq3PdA");
+        assert_ne!(a, b, "the id suffix is what guarantees uniqueness");
+        assert_ne!(pa, pb);
+    }
+
+    /// Only the BRANCH is brief-derived. The path must stay id-keyed or worktree
+    /// discovery, the age/orphan sweep, the ledger key and `:jobs` all stop
+    /// resolving — including for trees already on disk.
+    #[test]
+    fn worktree_path_stays_id_keyed_regardless_of_brief() {
+        let root = std::path::Path::new("/wt-root");
+        let expect = root.join("org--repo").join("w_a7k3m2pQ");
+        for brief in [
+            None,
+            Some("feat(worker): a perfectly readable brief"),
+            Some("\u{1F642} garbage \u{1F680}"),
+            Some(""),
+        ] {
+            let (_, path) = worktree_layout(root, "org--repo", "w_a7k3m2pQ", brief);
+            assert_eq!(path, expect, "path must not depend on the brief: {brief:?}");
+        }
+    }
+
+    #[test]
+    fn branch_slug_collapses_and_trims_separators() {
+        assert_eq!(
+            branch_slug("  Bound   the  mid-turn   erase!! ").as_deref(),
+            Some("bound-the-mid-turn-erase")
+        );
+        assert_eq!(
+            branch_slug("UPPER_snake_Case").as_deref(),
+            Some("upper-snake-case")
+        );
+        // Every run of non-alphanumerics collapses to exactly one `-`.
+        assert_eq!(branch_slug("a---b___c // d").as_deref(), Some("a-b-c-d"));
+        // Leading and trailing separators are trimmed, not emitted.
+        assert_eq!(branch_slug("...trim me...").as_deref(), Some("trim-me"));
+    }
+
+    #[test]
+    fn branch_slug_keeps_a_conventional_commit_prefix() {
+        for ty in [
+            "feat", "fix", "chore", "docs", "refactor", "perf", "test", "ci", "build",
+        ] {
+            let slug = branch_slug(&format!("{ty}(scope): do the thing")).expect("slug");
+            assert!(
+                slug.starts_with(&format!("{ty}-")),
+                "conventional type must lead: {slug}"
+            );
+        }
+        assert_eq!(
+            branch_slug("fix(ticker): bound the mid-turn erase").as_deref(),
+            Some("fix-ticker-bound-the-mid-turn-erase")
+        );
+    }
+
+    #[test]
+    fn branch_slug_caps_on_a_dash_boundary() {
+        let brief = "feat(worker): derive readable branch names from the task brief";
+        let slug = branch_slug(brief).expect("slug");
+        assert_eq!(slug, "feat-worker-derive-readable-branch-names-from");
+        assert!(
+            slug.len() <= BRANCH_SLUG_MAX,
+            "capped: {} chars",
+            slug.len()
+        );
+        assert!(
+            !slug.ends_with('-'),
+            "cut leaves no dangling separator: {slug}"
+        );
+        // Every surviving segment is a WHOLE word of the brief — the cut never
+        // shears a word in half, which is the whole point of the `-` boundary.
+        let words = "feat worker derive readable branch names from the task brief";
+        for seg in slug.split('-') {
+            assert!(
+                words.split(' ').any(|w| w == seg),
+                "segment {seg:?} was cut mid-word"
+            );
+        }
+        // One pathological word longer than the cap is kept whole rather than
+        // sheared or dropped (correctness over the cap in that corner).
+        let long = "x".repeat(80);
+        assert_eq!(branch_slug(&long).as_deref(), Some(long.as_str()));
+    }
+
+    #[test]
+    fn branch_slug_is_none_for_unusable_briefs() {
+        // Each of these must yield the `aish/{id}` fallback, not a bare `aish/-id`.
+        for brief in [
+            "",
+            "   ",
+            "!!! ??? ...",
+            "\u{1F642}\u{1F643}\u{1F680}",
+            "日本語のみ",
+        ] {
+            assert_eq!(branch_slug(brief), None, "unusable brief: {brief:?}");
+            let (branch, _) = worktree_layout(
+                std::path::Path::new("/wt-root"),
+                "org--repo",
+                "w_x1",
+                Some(brief),
+            );
+            assert_eq!(branch, "aish/w_x1", "fallback preserved for {brief:?}");
+        }
+    }
+
+    /// git's ref grammar is not negotiable either: a name it rejects means `git
+    /// worktree add -b` fails and the worker loses its isolation. The slug rules
+    /// make these impossible by construction — assert it anyway.
+    #[test]
+    fn derived_branches_respect_git_ref_grammar() {
+        let root = std::path::Path::new("/wt-root");
+        let briefs = [
+            "fix(ticker): bound the mid-turn erase",
+            "feat: add .. dots.and.a lock suffix.lock",
+            "chore~^:?*[\\ punctuation soup",
+            "trailing dot .",
+            "   leading and trailing   ",
+            "refactor//double//slashes//",
+            "@",
+            "a\u{7}control\u{1}chars\t and a space",
+            "emoji \u{1F680} mixed with words",
+            "",
+            "\u{1F642}\u{1F643}",
+        ];
+        for brief in briefs {
+            let (branch, _) = worktree_layout(root, "org--repo", "w_grammar1", Some(brief));
+            let name = branch
+                .strip_prefix("aish/")
+                .unwrap_or_else(|| panic!("branch must stay in the aish/ namespace: {branch}"));
+            assert!(!name.is_empty(), "branch needs a name: {branch}");
+            assert!(!branch.contains(".."), "no `..`: {branch}");
+            assert!(!branch.ends_with('.'), "no trailing `.`: {branch}");
+            assert!(!branch.ends_with(".lock"), "no `.lock` suffix: {branch}");
+            assert!(!branch.ends_with('/'), "no trailing `/`: {branch}");
+            assert!(!branch.contains("//"), "no doubled `/`: {branch}");
+            assert_ne!(name, "@", "never a lone `@`: {branch}");
+            for c in branch.chars() {
+                assert!(
+                    !c.is_ascii_control() && !c.is_whitespace(),
+                    "no control chars or whitespace: {branch:?}"
+                );
+                assert!(
+                    !"~^:?*[\\".contains(c),
+                    "git-forbidden char {c:?} in {branch}"
+                );
+            }
+            // The id always trails, so the branch stays traceable to its run.
+            assert!(
+                name.ends_with("w_grammar1"),
+                "id suffix keeps it unique + traceable: {branch}"
+            );
+        }
     }
 
     #[test]

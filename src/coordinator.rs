@@ -2357,7 +2357,9 @@ fn terminal_persist_backoff(attempt: u32) -> std::time::Duration {
 
 /// Best-effort current git branch of `dir`, recorded in the worker `meta.json`
 /// so retention never reclaims a dir whose worktree still holds kept work on an
-/// `aish/<id>` branch (AC7). `None` outside a repo, on a detached HEAD, or when
+/// `aish/…` branch (AC7) — read from git rather than rebuilt from the id, since
+/// worker branches are now brief-derived (`aish/{slug}-{id}`, see
+/// [`crate::worker`]). `None` outside a repo, on a detached HEAD, or when
 /// the branch isn’t an aish worktree branch (the trunk carries no kept work).
 fn current_worktree_branch(dir: &std::path::Path) -> Option<String> {
     let out = std::process::Command::new("git")
