@@ -74,22 +74,136 @@ pub enum ModalAction {
 pub enum Key {
     Up,
     Down,
+    /// PgUp / `Ctrl-b`-style jump — moves a whole viewport page up.
+    PageUp,
+    /// PgDn — moves a whole viewport page down.
+    PageDown,
+    /// `Home` / `g` — jump to the first row.
+    Home,
+    /// `End` / `G` — jump to the last row.
+    End,
     Enter,
     Delete,
     Dismiss,
 }
 
+/// Rows a PgUp/PgDn jump covers when the caller doesn't know the live viewport
+/// height (the default used by [`move_selection`]).
+pub const DEFAULT_PAGE: usize = 10;
+
 /// Move `sel` within `[0, len)` for a key, saturating at both ends (no wrap —
 /// matches the spec). Pure so the clamp logic is unit-tested. `len == 0` pins 0.
+/// Paging uses [`DEFAULT_PAGE`]; pass a live viewport height to
+/// [`move_selection_page`] to page by exactly one screenful.
 pub fn move_selection(sel: usize, len: usize, key: Key) -> usize {
+    move_selection_page(sel, len, key, DEFAULT_PAGE)
+}
+
+/// [`move_selection`] with an explicit `page` height for PgUp/PgDn, so the modal
+/// can page by the rows the viewport is actually showing. `page == 0` is treated
+/// as 1 (a page jump always moves at least one row). Pure → unit-tested.
+pub fn move_selection_page(sel: usize, len: usize, key: Key, page: usize) -> usize {
     if len == 0 {
         return 0;
     }
+    let last = len - 1;
+    let page = page.max(1);
     match key {
         Key::Up => sel.saturating_sub(1),
-        Key::Down => (sel + 1).min(len - 1),
-        _ => sel.min(len - 1),
+        Key::Down => (sel + 1).min(last),
+        Key::PageUp => sel.saturating_sub(page),
+        Key::PageDown => (sel + page).min(last),
+        Key::Home => 0,
+        Key::End => last,
+        _ => sel.min(last),
     }
+}
+
+/// Chrome rows the tray spends on non-row content: title + column header +
+/// key-hint footer. Subtracted from the available band to size the row viewport.
+pub const CHROME_ROWS: usize = 3;
+
+/// Max lines the SELECTED row's task cell may occupy (1 opening + up to 2
+/// continuation lines) before it is ellipsized. Unselected rows stay one line.
+pub const MAX_TASK_LINES: usize = 3;
+
+/// Pick the window of rows to paint: returns `(first, count)` such that `sel` is
+/// always inside `[first, first + count)` and `count <= avail`.
+///
+/// The window is **centered** on the selection (then clamped to the ends), which
+/// is stateless — no scroll offset to carry between redraws — and guarantees the
+/// selected row is on screen, which is the bug the old "keep the bottom N lines"
+/// crop had: paging past the fold scrolled the selection out of view, and the
+/// title/header were the first rows sacrificed. Pure → unit-tested.
+pub fn viewport(len: usize, sel: usize, avail: usize) -> (usize, usize) {
+    if len == 0 || avail == 0 {
+        return (0, 0);
+    }
+    if len <= avail {
+        return (0, len);
+    }
+    let sel = sel.min(len - 1);
+    let first = sel
+        .saturating_sub(avail / 2)
+        .min(len.saturating_sub(avail));
+    (first, avail)
+}
+
+/// Word-wrap `text` into at most `max_lines` lines of `width` display columns,
+/// hard-splitting any single word longer than the width and ellipsizing the last
+/// line when the text still overflows. Returns at least one line for non-empty
+/// input. Pure → unit-tested; used to let the selected row's task breathe over a
+/// few lines instead of being hard-clipped at the column edge.
+pub fn wrap_cell(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in text.split_whitespace() {
+        let ww = word.chars().count();
+        if ww > width {
+            // Hard-split an over-long token (a URL, a path) across lines.
+            if cur_w > 0 {
+                lines.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            for ch in word.chars() {
+                if cur_w == width {
+                    lines.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                }
+                cur.push(ch);
+                cur_w += 1;
+            }
+            continue;
+        }
+        let need = if cur_w == 0 { ww } else { cur_w + 1 + ww };
+        if need > width {
+            lines.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        if cur_w > 0 {
+            cur.push(' ');
+            cur_w += 1;
+        }
+        cur.push_str(word);
+        cur_w += ww;
+    }
+    if cur_w > 0 || lines.is_empty() {
+        lines.push(cur);
+    }
+    if lines.len() > max_lines {
+        let overflow_tail = lines[max_lines - 1].clone();
+        lines.truncate(max_lines);
+        lines[max_lines - 1] = clip(&overflow_tail, width);
+        // Mark truncation even when the kept tail happened to fit exactly.
+        if !lines[max_lines - 1].ends_with('…') {
+            lines[max_lines - 1] = clip(&format!("{overflow_tail} …"), width);
+        }
+    }
+    lines
 }
 
 /// Order a flat set of [`WorkerRow`]s into a stable pre-order **forest** and
@@ -158,7 +272,8 @@ pub fn build_worker_forest(rows: Vec<WorkerRow>) -> Vec<WorkerRow> {
 /// Feed one read-chunk of raw tty bytes through the CSI state machine, returning
 /// the carry-over `state` and every complete [`Key`] the chunk produced.
 ///
-/// State: `0` ground, `1` saw ESC, `2` saw `ESC [`, `3` saw `ESC [ 3`.
+/// State: `0` ground, `1` saw ESC, `2` saw `ESC [`, `3` saw `ESC [ 3`,
+/// `4` saw `ESC [ 5` (PgUp), `5` saw `ESC [ 6` (PgDn).
 ///
 /// A lone ESC that ends a chunk leaves `state == 1`; the read loop disambiguates
 /// it from a CSI prefix with a short poll timeout ([`pending_esc_dismiss`]).
@@ -186,8 +301,18 @@ pub fn parse_modal_keys(mut state: u8, bytes: &[u8]) -> (u8, Vec<Key>) {
                     match b {
                         b'A' => keys.push(Key::Up),
                         b'B' => keys.push(Key::Down),
+                        b'H' => keys.push(Key::Home), // CSI H — Home
+                        b'F' => keys.push(Key::End),  // CSI F — End
                         b'3' => {
                             state = 3;
+                            break;
+                        }
+                        b'5' => {
+                            state = 4;
+                            break;
+                        }
+                        b'6' => {
+                            state = 5;
                             break;
                         }
                         _ => {} // arrows C/D, back-tab Z, etc. — ignored.
@@ -203,6 +328,22 @@ pub fn parse_modal_keys(mut state: u8, bytes: &[u8]) -> (u8, Vec<Key>) {
                     state = 0;
                     break;
                 }
+                4 => {
+                    // Saw `ESC [ 5` — `~` completes PageUp.
+                    if b == b'~' {
+                        keys.push(Key::PageUp);
+                    }
+                    state = 0;
+                    break;
+                }
+                5 => {
+                    // Saw `ESC [ 6` — `~` completes PageDown.
+                    if b == b'~' {
+                        keys.push(Key::PageDown);
+                    }
+                    state = 0;
+                    break;
+                }
                 _ => {
                     // Ground.
                     match b {
@@ -212,6 +353,10 @@ pub fn parse_modal_keys(mut state: u8, bytes: &[u8]) -> (u8, Vec<Key>) {
                         b'd' => keys.push(Key::Delete),
                         b'j' => keys.push(Key::Down),
                         b'k' => keys.push(Key::Up),
+                        b'g' => keys.push(Key::Home),
+                        b'G' => keys.push(Key::End),
+                        0x02 => keys.push(Key::PageUp),   // Ctrl-b
+                        0x06 => keys.push(Key::PageDown), // Ctrl-f
                         b'q' => keys.push(Key::Dismiss),
                         _ => {}
                     }
@@ -406,12 +551,66 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
     // cell instead of wrapping the row.
     let task_w = crate::activity_summary::current_budget();
 
+    // Columns of chrome painted before the Task cell (gutter + type glyph + the
+    // three padded data columns and their 2-space separators). Continuation
+    // lines of a wrapped task indent to exactly here so they sit under the Task
+    // column instead of restarting at the left margin. Kept in sync with the
+    // `body` format string below.
+    let prefix_w = 2 + 2 + 2 + id_w + 2 + (st_w + 2) + 2 + rt_w + 2;
+
+    // Display budget for the task cell at a given nesting depth (the `  …└ `
+    // elbow eats from the cell, and we never shrink below a readable floor).
+    let task_budget = |depth: usize| -> usize {
+        if depth > 0 {
+            task_w.saturating_sub(2 * depth + 2).max(8)
+        } else {
+            task_w.max(8)
+        }
+    };
+
+    // Rows the tray may paint. With a footer scroll region live the band is the
+    // body area above the rule; the chrome rows and the selected row's extra
+    // wrap lines are reserved FIRST so the tray always fits instead of being
+    // bottom-cropped (which used to eat the title/header and could scroll the
+    // selection off screen). Unknown band (piped / legacy redraw) ⇒ show all.
+    let band = match (
+        crate::terminal::footer_active(),
+        crate::terminal::screen_rows(),
+    ) {
+        (true, Some(total)) => {
+            Some(total.saturating_sub(crate::terminal::FOOTER_ROWS).max(1) as usize)
+        }
+        _ => None,
+    };
+    let sel_extra = rows
+        .get(sel)
+        .map(|r| wrap_cell(&r.task, task_budget(r.depth), MAX_TASK_LINES).len())
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let avail_rows = band
+        .map(|b| b.saturating_sub(CHROME_ROWS + sel_extra).max(1))
+        .unwrap_or_else(|| rows.len());
+    let (first, count) = viewport(rows.len(), sel, avail_rows);
+    let hidden_above = first;
+    let hidden_below = rows.len().saturating_sub(first + count);
+
     let mut lines: Vec<String> = Vec::new();
-    // Title.
+    // Title — carries ▲/▼ counts when rows are scrolled out of the viewport so
+    // the operator knows the list continues past the window.
+    let mut scroll = String::new();
+    if hidden_above > 0 {
+        scroll.push_str(&format!(" · ▲{hidden_above}"));
+    }
+    if hidden_below > 0 {
+        scroll.push_str(&format!(" · ▼{hidden_below}"));
+    }
     lines.push(if color {
-        format!("\x1b[1m:workers\x1b[0m \x1b[2m({} live)\x1b[0m", rows.len())
+        format!(
+            "\x1b[1m:workers\x1b[0m \x1b[2m({} live{scroll})\x1b[0m",
+            rows.len()
+        )
     } else {
-        format!(":workers ({} live)", rows.len())
+        format!(":workers ({} live{scroll})", rows.len())
     });
     // Column header.
     let header = format!(
@@ -428,7 +627,7 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
         header
     });
 
-    for (i, r) in rows.iter().enumerate() {
+    for (i, r) in rows.iter().enumerate().skip(first).take(count) {
         let selected = i == sel;
         // Mark the active row with a `>` indicator in the gutter instead of
         // inverse-video highlighting the whole row. The two-column gutter keeps
@@ -441,13 +640,24 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
         };
         // Indent nested subworkers under their parent so the forest reads as a
         // tree; roots (depth 0) are flush. A `└ ` elbow marks each child.
-        let task = if r.depth > 0 {
-            let indent = "  ".repeat(r.depth);
-            let budget = task_w.saturating_sub(indent.chars().count() + 2);
-            format!("{indent}└ {}", clip(&r.task, budget))
+        let indent = if r.depth > 0 {
+            format!("{}└ ", "  ".repeat(r.depth))
         } else {
-            clip(&r.task, task_w)
+            String::new()
         };
+        let budget = task_budget(r.depth);
+        // The SELECTED row's task WRAPS over up to `MAX_TASK_LINES` lines so the
+        // operator can read the whole summary of the row they're on; every other
+        // row stays a single clipped line (dense list, readable focus).
+        let wrapped: Vec<String> = if selected {
+            wrap_cell(&r.task, budget, MAX_TASK_LINES)
+        } else {
+            vec![clip(&r.task, budget)]
+        };
+        let task = format!(
+            "{indent}{}",
+            wrapped.first().map(String::as_str).unwrap_or("")
+        );
         // Type glyph rides at the front (unpadded — every glyph is 2 cells, so
         // the data columns stay aligned with the blank 2-wide header cell).
         let body = format!(
@@ -460,13 +670,23 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
             task
         );
         lines.push(body);
+        // Continuation lines of a wrapped (selected) task, indented under the
+        // Task column so the cell reads as one block.
+        for cont in wrapped.iter().skip(1) {
+            lines.push(format!(
+                "{}{}{cont}",
+                " ".repeat(prefix_w),
+                " ".repeat(indent.chars().count())
+            ));
+        }
     }
 
     // Footer hint.
+    let hint = "  ↑/↓ move · PgUp/PgDn page · g/G top/end · Enter attach · Del/d close · Esc/q dismiss";
     lines.push(if color {
-        "\x1b[2m  ↑/↓ move · Enter attach · Del/d close · Esc/q dismiss\x1b[0m".to_string()
+        format!("\x1b[2m{hint}\x1b[0m")
     } else {
-        "  ↑/↓ move · Enter attach · Del/d close · Esc/q dismiss".to_string()
+        hint.to_string()
     });
 
     let n = lines.len();
@@ -575,7 +795,12 @@ pub fn run(rows: &[WorkerRow], initial_sel: usize) -> ModalAction {
             break ModalAction::Dismiss;
         };
         match key {
-            Key::Up | Key::Down => sel = move_selection(sel, rows.len(), key),
+            Key::Up
+            | Key::Down
+            | Key::PageUp
+            | Key::PageDown
+            | Key::Home
+            | Key::End => sel = move_selection(sel, rows.len(), key),
             Key::Enter => break ModalAction::Attach(rows[sel].id.clone()),
             Key::Delete => break ModalAction::Close(rows[sel].id.clone()),
             Key::Dismiss => break ModalAction::Dismiss,
@@ -783,5 +1008,112 @@ mod tests {
         // A row that lists itself as parent must not nest under itself.
         let out = build_worker_forest(vec![wr("s", Some("s"))]);
         assert_eq!(ids_depths(&out), vec![("s".into(), 0)]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Viewport scrolling + task wrapping (TUI item 4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn viewport_shows_everything_when_it_fits() {
+        assert_eq!(viewport(4, 0, 10), (0, 4));
+        assert_eq!(viewport(4, 3, 4), (0, 4));
+    }
+
+    #[test]
+    fn viewport_degenerate_inputs() {
+        assert_eq!(viewport(0, 0, 5), (0, 0));
+        assert_eq!(viewport(5, 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn viewport_keeps_selection_visible_at_both_ends() {
+        // 20 rows, 5-row window: selection is ALWAYS inside the returned window,
+        // which is the regression the old bottom-crop had.
+        for sel in 0..20 {
+            let (first, count) = viewport(20, sel, 5);
+            assert_eq!(count, 5, "sel={sel}");
+            assert!(sel >= first && sel < first + count, "sel={sel} window={first}..{}", first + count);
+            assert!(first + count <= 20);
+        }
+    }
+
+    #[test]
+    fn viewport_clamps_to_list_ends() {
+        assert_eq!(viewport(20, 0, 5), (0, 5)); // top
+        assert_eq!(viewport(20, 19, 5), (15, 5)); // bottom
+        assert_eq!(viewport(20, 10, 5), (8, 5)); // centered
+    }
+
+    #[test]
+    fn wrap_cell_wraps_on_word_boundaries() {
+        let out = wrap_cell("run a security audit across services", 12, 3);
+        assert!(out.iter().all(|l| l.chars().count() <= 12), "{out:?}");
+        assert_eq!(out[0], "run a");
+        assert!(out.len() > 1);
+    }
+
+    #[test]
+    fn wrap_cell_respects_max_lines_and_marks_truncation() {
+        let text = "alpha bravo charlie delta echo foxtrot golf hotel india juliet";
+        let out = wrap_cell(text, 10, 2);
+        assert_eq!(out.len(), 2);
+        assert!(out[1].ends_with('…'), "{out:?}");
+        assert!(out.iter().all(|l| l.chars().count() <= 10));
+    }
+
+    #[test]
+    fn wrap_cell_hard_splits_long_token() {
+        let out = wrap_cell("https://example.com/a/very/long/path", 10, 4);
+        assert!(out.len() > 1);
+        assert!(out.iter().all(|l| l.chars().count() <= 10), "{out:?}");
+    }
+
+    #[test]
+    fn wrap_cell_degenerate_inputs() {
+        assert!(wrap_cell("x", 0, 3).is_empty());
+        assert!(wrap_cell("x", 10, 0).is_empty());
+        assert_eq!(wrap_cell("", 10, 3), vec![String::new()]);
+    }
+
+    #[test]
+    fn page_keys_parse_from_csi() {
+        let (s, keys) = parse_modal_keys(0, b"\x1b[5~\x1b[6~");
+        assert_eq!(s, 0);
+        assert_eq!(keys, vec![Key::PageUp, Key::PageDown]);
+    }
+
+    #[test]
+    fn home_end_parse_from_csi_and_vim() {
+        let (_, keys) = parse_modal_keys(0, b"\x1b[H\x1b[F");
+        assert_eq!(keys, vec![Key::Home, Key::End]);
+        let (_, vim) = parse_modal_keys(0, b"gG");
+        assert_eq!(vim, vec![Key::Home, Key::End]);
+    }
+
+    #[test]
+    fn page_csi_fragmented_across_reads() {
+        let (s1, k1) = parse_modal_keys(0, b"\x1b[5");
+        assert!(k1.is_empty());
+        let (s2, k2) = parse_modal_keys(s1, b"~");
+        assert_eq!(s2, 0);
+        assert_eq!(k2, vec![Key::PageUp]);
+    }
+
+    #[test]
+    fn page_selection_jumps_by_page_and_clamps() {
+        assert_eq!(move_selection_page(0, 20, Key::PageDown, 5), 5);
+        assert_eq!(move_selection_page(18, 20, Key::PageDown, 5), 19);
+        assert_eq!(move_selection_page(3, 20, Key::PageUp, 5), 0);
+        assert_eq!(move_selection_page(12, 20, Key::PageUp, 5), 7);
+        // page 0 still advances one row
+        assert_eq!(move_selection_page(0, 20, Key::PageDown, 0), 1);
+    }
+
+    #[test]
+    fn home_end_selection_jumps_to_bounds() {
+        assert_eq!(move_selection(7, 20, Key::Home), 0);
+        assert_eq!(move_selection(7, 20, Key::End), 19);
+        assert_eq!(move_selection(7, 0, Key::End), 0);
     }
 }
