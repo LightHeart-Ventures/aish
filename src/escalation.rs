@@ -215,18 +215,22 @@ static BANNERS: Mutex<Vec<Banner>> = Mutex::new(Vec::new());
 /// REFRESHES that banner in place — same task hint, clocks reset, verdict
 /// cleared — so a retry can't stack a duplicate row for one coordinator.
 /// A pinned banner steals two body rows from the scrolling region. The STORE
-/// mutation is [`push_banner`]; this wrapper measures the growth around it and
-/// hands it to [`crate::terminal::absorb_banner_growth`], which scrolls the body
-/// out of the rows the footer is about to claim and walks the cursor back up
-/// with it. Without that, the cursor is left sitting INSIDE the new tray rows
-/// and the next body write — the animated `thinking…` row above all — paints
-/// over the banner, so "thinking" bleeds into the tray. Measured outside the
-/// `BANNERS` lock (both `row_count` calls take it themselves) so the terminal
-/// write never happens while the stack is held.
+/// mutation is [`push_banner`]; it runs inside
+/// [`crate::terminal::absorb_banner_growth_around`], which measures the row
+/// demand on both sides and scrolls the body out of the rows the footer is about
+/// to claim, walking the cursor back up with it. Without that, the cursor is
+/// left sitting INSIDE the new tray rows and the next body write — the animated
+/// `thinking…` row above all — paints over the banner, so "thinking" bleeds into
+/// the tray.
+///
+/// The measure → mutate → measure → scroll transition is atomic against footer
+/// paints (the terminal side holds its boundary lock across the closure), so a
+/// heartbeat repaint cannot install the shorter region mid-transition. Both
+/// `row_count` and `push_banner` take the `BANNERS` lock themselves and are
+/// called from OUTSIDE it here, so the terminal write never happens while this
+/// module's stack is held — and the lock order stays `FOOTER_PAINT` → `BANNERS`.
 pub fn pin(id: &str, task: &str) {
-    let before = row_count();
-    push_banner(id, task);
-    crate::terminal::absorb_banner_growth(before, row_count());
+    crate::terminal::absorb_banner_growth_around(row_count, || push_banner(id, task));
 }
 
 fn push_banner(id: &str, task: &str) {
