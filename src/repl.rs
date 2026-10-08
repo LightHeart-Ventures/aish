@@ -759,13 +759,18 @@ pub async fn run(
         };
         // TASK-282: surface the active goal + rollup % just before the cwd so it
         // rides along every prompt (empty when there's no active goal).
-        let goal_badge = session
-            .goal_badge()
-            .map(|b| format!("\x1b[35m{b}\x1b[0m "))
-            .unwrap_or_default();
-        let prompt = format!(
-            "{attach}{badge}{goal_badge}\x1b[36m{}\x1b[0m ❯ ",
-            short_cwd(&session)
+        //
+        // The prefix is WIDTH-BUDGETED (`fit_prompt_prefix`): on a narrow
+        // terminal an unbounded goal title + deep cwd used to eat the whole row
+        // and leave a sliver to type in. The fitter elides the goal badge first,
+        // then the cwd's leading segments, so there is always typing room.
+        let goal_badge = session.goal_badge();
+        let prompt = fit_prompt_prefix(
+            &attach,
+            &badge,
+            goal_badge.as_deref(),
+            &short_cwd(&session),
+            prompt_cols(),
         );
 
         // Consume an accepted-rewrite line first, then an active `:loop`
@@ -11140,6 +11145,222 @@ fn short_cwd(session: &Session) -> String {
     }
 }
 
+// ---- Prompt prefix width budget ---------------------------------------------
+//
+// The prompt prefix is `⇄attach ⟳N 🎯 Goal 60% ~/deep/path ❯ `. Three of those
+// four segments are UNBOUNDED (goal title, cwd depth, and — rarely — a long
+// attach id), so on an 80- or 60-column terminal the prefix could consume the
+// entire row and leave the operator a few columns to type in, with rustyline
+// soft-wrapping every keystroke. These helpers budget the prefix so a minimum
+// typing region always survives, eliding the LEAST load-bearing segment first.
+
+/// Columns we insist on leaving for the operator's own input.
+const PROMPT_MIN_TYPING_COLS: usize = 32;
+/// Never squeeze the prefix below this, even on an absurdly narrow terminal —
+/// below it the prefix carries no information at all.
+const PROMPT_MIN_PREFIX_COLS: usize = 12;
+/// A goal badge shorter than this says nothing useful; drop it instead.
+const PROMPT_MIN_GOAL_COLS: usize = 14;
+/// Visible width of the trailing `" ❯ "` separator (space + 1-col glyph + space).
+const PROMPT_SUFFIX_COLS: usize = 3;
+
+/// Terminal width for prompt fitting: a tty (stdout preferred — that's where the
+/// prompt renders — then stderr) via TIOCGWINSZ, else an explicit `$COLUMNS`,
+/// else `usize::MAX` so piped/captured runs and unit tests keep the legacy
+/// unbudgeted prefix byte-for-byte.
+fn prompt_cols() -> usize {
+    // SAFETY: isatty + a read-only TIOCGWINSZ ioctl on fd 1 / fd 2.
+    unsafe {
+        for fd in [1, 2] {
+            if libc::isatty(fd) == 1 {
+                let mut ws: libc::winsize = std::mem::zeroed();
+                if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+                    return ws.ws_col as usize;
+                }
+            }
+        }
+    }
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(usize::MAX)
+}
+
+/// Visible display width of `s` with ANSI CSI/SGR sequences discounted.
+///
+/// Measured with `UnicodeWidthStr::width` on the stripped string (not a per-char
+/// sum) so an emoji-presentation pair — a base codepoint followed by U+FE0F, e.g.
+/// `🎯` / `⇄` variants — counts at its true terminal width instead of being
+/// undercounted by one.
+fn prompt_vis_cols(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    let mut clean = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.next() == Some('[') {
+                for c2 in chars.by_ref() {
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        clean.push(c);
+    }
+    UnicodeWidthStr::width(clean.as_str())
+}
+
+/// Longest PREFIX of `s` whose visible width is `<= max` (whole chars only, so a
+/// wide glyph is dropped rather than split).
+fn take_head_cols(s: &str, max: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut w = 0usize;
+    for c in s.chars() {
+        let cw = if c == '\u{fe0f}' {
+            0
+        } else {
+            UnicodeWidthChar::width(c).unwrap_or(0)
+        };
+        if w + cw > max {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out
+}
+
+/// Longest SUFFIX of `s` whose visible width is `<= max`. Used to keep the
+/// *leaf* of a path — the part that actually tells you where you are.
+fn take_tail_cols(s: &str, max: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut rev: Vec<char> = Vec::new();
+    let mut w = 0usize;
+    for c in s.chars().rev() {
+        let cw = if c == '\u{fe0f}' {
+            0
+        } else {
+            UnicodeWidthChar::width(c).unwrap_or(0)
+        };
+        if w + cw > max {
+            break;
+        }
+        rev.push(c);
+        w += cw;
+    }
+    rev.iter().rev().collect()
+}
+
+/// Shrink a `🎯 <title> <pct>%` goal badge to `max` visible columns, chopping the
+/// TITLE and keeping both the sigil and the percentage (the two bits that stay
+/// meaningful at any width). `None` when even that can't fit — the caller then
+/// drops the badge entirely rather than render a stub.
+fn shrink_goal_badge(goal: &str, max: usize) -> Option<String> {
+    if max == 0 {
+        return None;
+    }
+    if prompt_vis_cols(goal) <= max {
+        return Some(goal.to_string());
+    }
+    // "🎯 Cross-session persistence 60%" → head="🎯 Cross-session persistence",
+    // pct="60%".
+    let (head, pct) = goal.rsplit_once(' ')?;
+    let title = head.strip_prefix("🎯 ").unwrap_or(head);
+    // "🎯 " (3) + title + "…" (1) + " " (1) + pct.
+    let overhead = 3 + 1 + 1 + prompt_vis_cols(pct);
+    // Fewer than 4 columns of title is noise.
+    if max < overhead + 4 {
+        return None;
+    }
+    let kept = take_head_cols(title.trim_end(), max - overhead);
+    if prompt_vis_cols(&kept) < 4 {
+        return None;
+    }
+    Some(format!("🎯 {}… {pct}", kept.trim_end()))
+}
+
+/// Assemble the prompt prefix, budgeted to leave [`PROMPT_MIN_TYPING_COLS`] of
+/// typing room on a `cols`-wide terminal.
+///
+/// Segment priority, highest first: the `⇄` attach indicator and `⟳N` worker
+/// pulse (both short, both tell you where your keystrokes GO), then the cwd,
+/// then the goal badge. So the goal badge is shrunk — and if still too big,
+/// dropped — before the cwd loses its leading segments (`…/worktrees/w_abc`).
+///
+/// `cols == usize::MAX` (piped / unknown width) returns the legacy unbudgeted
+/// prefix unchanged. Pure → unit-tested.
+fn fit_prompt_prefix(
+    attach: &str,
+    badge: &str,
+    goal: Option<&str>,
+    cwd: &str,
+    cols: usize,
+) -> String {
+    let render = |goal_txt: Option<&str>, cwd_txt: &str| -> String {
+        let g = goal_txt
+            .map(|g| format!("\x1b[35m{g}\x1b[0m "))
+            .unwrap_or_default();
+        // A fully-elided cwd renders as nothing at all (not a stray space) so
+        // the incompressible floor stays as tight as it can be.
+        if cwd_txt.is_empty() {
+            return format!("{attach}{badge}{g}❯ ");
+        }
+        format!("{attach}{badge}{g}\x1b[36m{cwd_txt}\x1b[0m ❯ ")
+    };
+    let full = render(goal, cwd);
+    if cols == usize::MAX || cols == 0 {
+        return full;
+    }
+    let budget = cols
+        .saturating_sub(PROMPT_MIN_TYPING_COLS)
+        .max(PROMPT_MIN_PREFIX_COLS);
+    if prompt_vis_cols(&full) <= budget {
+        return full;
+    }
+    // Fixed cost we can't shed: the attach + pulse badges and the " ❯ " suffix.
+    let fixed = prompt_vis_cols(attach) + prompt_vis_cols(badge) + PROMPT_SUFFIX_COLS;
+    let room = budget.saturating_sub(fixed);
+    let cwd_cols = prompt_vis_cols(cwd);
+
+    // 1. Goal badge: keep only what's left once the cwd has its full width, and
+    //    only if that's still a meaningful badge.
+    let goal_fit = goal.and_then(|g| {
+        let spare = room.saturating_sub(cwd_cols + 1); // +1 for the trailing space
+        if spare < PROMPT_MIN_GOAL_COLS {
+            None
+        } else {
+            shrink_goal_badge(g, spare)
+        }
+    });
+    let goal_cols = goal_fit
+        .as_deref()
+        .map(|g| prompt_vis_cols(g) + 1)
+        .unwrap_or(0);
+
+    // 2. Cwd: elide LEADING segments, keeping the leaf.
+    let cwd_room = room.saturating_sub(goal_cols);
+    let cwd_fit = if cwd_cols <= cwd_room {
+        cwd.to_string()
+    } else if cwd_room == 0 {
+        // Nothing left after the incompressible attach/pulse/❯ floor.
+        String::new()
+    } else if cwd_room == 1 {
+        "…".to_string()
+    } else {
+        let tail = take_tail_cols(cwd, cwd_room - 1);
+        // Prefer a clean segment boundary when one survives in the tail.
+        let tail = match tail.find('/') {
+            Some(i) if i + 1 < tail.len() => &tail[i..],
+            _ => tail.as_str(),
+        };
+        format!("…{tail}")
+    };
+    render(goal_fit.as_deref(), &cwd_fit)
+}
+
 fn dirs_history_path() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".aish_history")
 }
@@ -11149,6 +11370,150 @@ mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
     use std::collections::HashMap;
+
+    // ---- SPR-073: file-backed statusline segments (TASK-316) ---------------
+
+    // ---- Prompt prefix width budget ----------------------------------------
+
+    const PULSE: &str = "\x1b[37m⟳2\x1b[0m ";
+    const ATTACH: &str = "\x1b[1;33m⇄w_HK7Or \x1b[0m";
+
+    #[test]
+    fn unknown_width_keeps_the_legacy_prompt_byte_for_byte() {
+        // Piped / captured runs (and every pre-existing caller) must render the
+        // exact prefix we shipped before the budget existed.
+        let legacy = format!(
+            "{ATTACH}{PULSE}\x1b[35m🎯 Cross-session persistence 60%\x1b[0m \x1b[36m~/code/aish\x1b[0m ❯ "
+        );
+        assert_eq!(
+            fit_prompt_prefix(
+                ATTACH,
+                PULSE,
+                Some("🎯 Cross-session persistence 60%"),
+                "~/code/aish",
+                usize::MAX
+            ),
+            legacy
+        );
+        // cols == 0 (unreadable winsize) is treated the same way.
+        assert_eq!(
+            fit_prompt_prefix(
+                ATTACH,
+                PULSE,
+                Some("🎯 Cross-session persistence 60%"),
+                "~/code/aish",
+                0
+            ),
+            legacy
+        );
+    }
+
+    #[test]
+    fn wide_terminal_leaves_the_prefix_untouched() {
+        let got = fit_prompt_prefix(
+            ATTACH,
+            PULSE,
+            Some("🎯 Cross-session persistence 60%"),
+            "~/code/aish",
+            200,
+        );
+        assert!(got.contains("Cross-session persistence 60%"), "{got}");
+        assert!(got.contains("~/code/aish"), "{got}");
+    }
+
+    #[test]
+    fn narrow_terminal_always_leaves_typing_room() {
+        // The invariant that motivated the change: whatever the width, the
+        // prefix never eats the row the operator types on.
+        for cols in [40usize, 60, 72, 80, 100, 120] {
+            let got = fit_prompt_prefix(
+                ATTACH,
+                PULSE,
+                Some("🎯 Cross-session persistence of goal rollups 60%"),
+                "~/.aish/worktrees/LightHeart-Ventures--aish/w_HK7OrAuo",
+                cols,
+            );
+            let w = prompt_vis_cols(&got);
+            // attach + pulse + "❯ " are load-bearing and incompressible; the
+            // budget governs everything we can actually shed (goal, cwd).
+            let floor = prompt_vis_cols(ATTACH) + prompt_vis_cols(PULSE) + 2;
+            let budget = cols
+                .saturating_sub(PROMPT_MIN_TYPING_COLS)
+                .max(PROMPT_MIN_PREFIX_COLS)
+                .max(floor);
+            assert!(w <= budget, "cols={cols} width={w} budget={budget}: {got}");
+        }
+    }
+
+    #[test]
+    fn goal_badge_is_elided_before_the_cwd() {
+        // 80 cols with a deep worktree path: the cwd (where you are) survives,
+        // the goal badge (nice-to-have) is the first thing to go.
+        let got = fit_prompt_prefix(
+            "",
+            PULSE,
+            Some("🎯 Cross-session persistence of goal rollups 60%"),
+            "~/.aish/worktrees/LightHeart-Ventures--aish/w_HK7OrAuo",
+            80,
+        );
+        assert!(!got.contains("🎯"), "goal badge should be dropped: {got}");
+        assert!(got.contains("w_HK7OrAuo"), "cwd leaf must survive: {got}");
+    }
+
+    #[test]
+    fn roomy_budget_shrinks_the_goal_title_but_keeps_sigil_and_percent() {
+        let got = shrink_goal_badge("🎯 Cross-session persistence of goal rollups 60%", 24)
+            .expect("24 cols is enough for a shrunk badge");
+        assert!(got.starts_with("🎯 "), "{got}");
+        assert!(got.ends_with(" 60%"), "percent must survive: {got}");
+        assert!(got.contains('…'), "title should be elided: {got}");
+        assert!(prompt_vis_cols(&got) <= 24, "{got}");
+        // Too tight to say anything → caller drops the badge.
+        assert!(shrink_goal_badge("🎯 Cross-session persistence 60%", 10).is_none());
+    }
+
+    #[test]
+    fn deep_cwd_is_elided_from_the_left_on_a_segment_boundary() {
+        let got = fit_prompt_prefix(
+            "",
+            "",
+            None,
+            "~/.aish/worktrees/LightHeart-Ventures--aish/w_HK7OrAuo",
+            60,
+        );
+        assert!(got.contains('…'), "cwd should be elided: {got}");
+        assert!(got.contains("w_HK7OrAuo"), "leaf must survive: {got}");
+        // Elision lands on a '/' boundary rather than mid-segment.
+        assert!(got.contains("…/"), "{got}");
+    }
+
+    #[test]
+    fn absurdly_narrow_terminal_still_renders_a_usable_prompt() {
+        // 20 cols: below the typing floor, so the prefix clamps to
+        // PROMPT_MIN_PREFIX_COLS instead of collapsing to nothing.
+        let got = fit_prompt_prefix(ATTACH, PULSE, Some("🎯 Goal 10%"), "~/code/aish", 20);
+        assert!(got.ends_with("❯ "), "prompt glyph must survive: {got}");
+        assert!(!got.contains("🎯"), "goal badge dropped first: {got}");
+        assert!(!got.contains("code"), "cwd fully elided: {got}");
+        // Collapses to exactly the incompressible floor: attach + pulse + ❯.
+        assert_eq!(
+            prompt_vis_cols(&got),
+            prompt_vis_cols(ATTACH) + prompt_vis_cols(PULSE) + 2
+        );
+    }
+
+    #[test]
+    fn no_goal_and_short_cwd_is_passed_through_unchanged() {
+        let got = fit_prompt_prefix("", "", None, "~/code", 80);
+        assert_eq!(got, "\x1b[36m~/code\x1b[0m ❯ ");
+    }
+
+    #[test]
+    fn prompt_vis_cols_discounts_ansi_and_counts_wide_glyphs() {
+        assert_eq!(prompt_vis_cols("\x1b[36m~/code\x1b[0m"), 6);
+        // 🎯 is a 2-column glyph.
+        assert_eq!(prompt_vis_cols("🎯 x"), 4);
+    }
 
     // ---- SPR-073: file-backed statusline segments (TASK-316) ---------------
 
