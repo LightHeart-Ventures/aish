@@ -160,7 +160,8 @@ fn first_with_prefix<'a>(tags: &'a [String], prefix: &str) -> Option<&'a str> {
 
 /// Rust target triples whose release asset would run on this host, most-preferred
 /// first. Asset names embed the triple (e.g. `aish-x86_64-unknown-linux-gnu` or
-/// `aish-v0.3.0-x86_64-unknown-linux-gnu.tar.gz`), so we match on substring.
+/// `aish-v0.3.0-x86_64-unknown-linux-gnu.tar.gz`); matching is EXACT, not
+/// substring — see [`asset_name_matches`].
 /// An empty list means "unknown platform" → we won't claim any asset fits.
 fn target_triples() -> &'static [&'static str] {
     match (std::env::consts::ARCH, std::env::consts::OS) {
@@ -180,20 +181,73 @@ fn is_tarball(name: &str) -> bool {
     n.ends_with(".tar.gz") || n.ends_with(".tgz") || n.ends_with(".tar")
 }
 
+/// Extensions an asset name may carry after the triple. `""` is the raw
+/// per-platform binary (the current release format).
+const ASSET_EXTENSIONS: &[&str] = &["", ".tar.gz", ".tgz", ".tar"];
+
+/// Strip an optional leading `v<semver>-` segment (e.g. `v0.3.0-`). Returns the
+/// input unchanged when the first segment is not a version — triples never
+/// begin with `v` followed by digits, so this is unambiguous.
+fn strip_release_version_prefix(rest: &str) -> &str {
+    let Some(stripped) = rest.strip_prefix('v') else {
+        return rest;
+    };
+    let Some((seg, tail)) = stripped.split_once('-') else {
+        return rest;
+    };
+    if parse_semver(seg).is_some() {
+        tail
+    } else {
+        rest
+    }
+}
+
+/// EXACT asset-name match (TASK-948 / SEC-4.1 F-06, spec §5).
+///
+/// The old matcher used `name.contains(triple)`, which accepted any attacker
+/// chosen suffix: `aish-x86_64-unknown-linux-gnu-EVIL.tar.gz` matched, and
+/// first-in-list won. That hole is load-bearing now that the checksum sidecar
+/// is paired off the CHOSEN asset name — a hostile asset can simply publish its
+/// own matching `.sha256`, so digest verification would happily pass on the
+/// wrong artifact. We therefore strip a leading `aish-` plus an optional
+/// `v<semver>-`, then require the remainder to EQUAL the triple or the triple
+/// plus one known extension. Nothing else matches.
+fn asset_name_matches(name: &str, triple: &str) -> bool {
+    let Some(rest) = name.strip_prefix("aish-") else {
+        return false;
+    };
+    let rest = strip_release_version_prefix(rest);
+    let Some(tail) = rest.strip_prefix(triple) else {
+        return false;
+    };
+    let lower = tail.to_ascii_lowercase();
+    ASSET_EXTENSIONS.contains(&lower.as_str())
+}
+
 /// Pick the asset matching this platform from a release's asset list. Prefers
-/// triples in `target_triples()` order; returns the first asset whose name
-/// contains a matching triple. Checksum sidecars (`*.sha256`) are skipped so we
-/// never mistake `aish-<triple>.sha256` for the binary itself.
-fn match_asset(assets: &[GhAsset]) -> Option<&str> {
+/// triples in `target_triples()` order and matches EXACTLY (see
+/// [`asset_name_matches`]) — checksum sidecars and decorated look-alikes are
+/// both refused. `Ok(None)` means "no asset for this platform"; `Err` means the
+/// release is AMBIGUOUS (two assets claim the same triple), which we refuse to
+/// resolve by list order rather than guess which one is genuine.
+fn match_asset(assets: &[GhAsset]) -> Result<Option<&str>> {
     for triple in target_triples() {
-        if let Some(a) = assets
+        let hits: Vec<&str> = assets
             .iter()
-            .find(|a| a.name.contains(triple) && !a.name.ends_with(".sha256"))
-        {
-            return Some(&a.name);
+            .map(|a| a.name.as_str())
+            .filter(|n| asset_name_matches(n, triple))
+            .collect();
+        match hits.len() {
+            0 => continue,
+            1 => return Ok(Some(hits[0])),
+            _ => bail!(
+                "refusing to update: release publishes {} assets matching `{triple}` ({}) — ambiguous asset set, cannot tell which is genuine",
+                hits.len(),
+                hits.join(", ")
+            ),
         }
     }
-    None
+    Ok(None)
 }
 
 /// Parse a version string into `(major, minor, patch)`, ignoring a leading `v`
@@ -442,7 +496,7 @@ async fn resolve_channel_network(ch: Channel) -> Result<(Option<UpdateInfo>, Opt
         return Ok((None, None));
     };
     let version = release.tag_name.trim_start_matches('v').to_string();
-    let asset = match_asset(&release.assets).map(|s| s.to_string());
+    let asset = match_asset(&release.assets)?.map(|s| s.to_string());
     let cache = CachedCheck {
         last_check_ts: now_secs(),
         latest_tag: release.tag_name.clone(),
@@ -1638,7 +1692,7 @@ mod tests {
         ];
         // On any supported platform we either match one of these or (unknown
         // platform) match none — never panic, never a wrong-arch pick.
-        if let Some(name) = match_asset(&assets) {
+        if let Some(name) = match_asset(&assets).expect("unambiguous") {
             assert!(target_triples().iter().any(|t| name.contains(t)));
         } else {
             assert!(target_triples().is_empty());
@@ -1672,7 +1726,7 @@ mod tests {
                 name: "SHA256SUMS".into(),
             },
         ];
-        if let Some(name) = match_asset(&assets) {
+        if let Some(name) = match_asset(&assets).expect("unambiguous") {
             // Never pick a checksum sidecar, always a real per-platform binary.
             assert!(!name.ends_with(".sha256"));
             assert!(target_triples().iter().any(|t| name.contains(t)));
@@ -1687,7 +1741,57 @@ mod tests {
         let assets = vec![GhAsset {
             name: "aish-aarch64-apple-darwin.sha256".into(),
         }];
-        assert!(match_asset(&assets).is_none());
+        assert!(match_asset(&assets).expect("unambiguous").is_none());
+    }
+
+    #[test]
+    fn asset_match_is_exact_not_substring() {
+        // The sidecar is paired off the CHOSEN asset name, so a decorated
+        // look-alike that satisfied the old `contains()` matcher could publish
+        // its own matching `.sha256` and sail through digest verification.
+        let t = "x86_64-unknown-linux-gnu";
+        assert!(asset_name_matches("aish-x86_64-unknown-linux-gnu", t));
+        assert!(asset_name_matches(
+            "aish-v0.3.0-x86_64-unknown-linux-gnu",
+            t
+        ));
+        assert!(asset_name_matches(
+            "aish-v0.3.0-x86_64-unknown-linux-gnu.tar.gz",
+            t
+        ));
+        // Decorations, sidecars, and foreign prefixes are all refused.
+        assert!(!asset_name_matches(
+            "aish-x86_64-unknown-linux-gnu-EVIL.tar.gz",
+            t
+        ));
+        assert!(!asset_name_matches(
+            "aish-x86_64-unknown-linux-gnu.sha256",
+            t
+        ));
+        assert!(!asset_name_matches("aish-x86_64-unknown-linux-gnu.exe", t));
+        assert!(!asset_name_matches("evil-x86_64-unknown-linux-gnu", t));
+        assert!(!asset_name_matches("aish-x86_64-unknown-linux-musl", t));
+    }
+
+    #[test]
+    fn ambiguous_asset_set_aborts() {
+        // Two assets claiming the same triple: refuse rather than let list
+        // order decide which artifact gets re-exec'd over the running binary.
+        let Some(triple) = target_triples().first().copied() else {
+            return; // unknown platform — nothing to disambiguate
+        };
+        let assets = vec![
+            GhAsset {
+                name: format!("aish-{triple}"),
+            },
+            GhAsset {
+                name: format!("aish-v0.3.0-{triple}.tar.gz"),
+            },
+        ];
+        let err = match_asset(&assets).expect_err("ambiguous set must abort");
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"), "unexpected error: {msg}");
+        assert!(msg.contains(triple), "unexpected error: {msg}");
     }
 
     #[test]
@@ -1705,7 +1809,7 @@ mod tests {
         let assets = vec![GhAsset {
             name: "aish-v0.3.0-sparc64-unknown-haiku.tar.gz".into(),
         }];
-        assert!(match_asset(&assets).is_none());
+        assert!(match_asset(&assets).expect("unambiguous").is_none());
     }
 
     #[test]
