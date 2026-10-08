@@ -41,6 +41,14 @@ pub fn quiet_summary() -> bool {
 /// the in-place `\r`+erase redraw never jitters the label beside it.
 const QUIET_FRAMES: [&str; 2] = ["🔍", "🔎"];
 
+/// The ONE stable glyph used when the line is committed to scrollback instead of
+/// animated in place (see [`QuietSummary::start`]). A committed row must read as
+/// a single event: emitting frame 🔍 on one row and frame 🔎 on the next makes
+/// one turn look like two different things happened, which is exactly how the
+/// reported "🔍 … / 🔍 … / 🔎 … / 🔎 …" output read. Must be one of
+/// [`QUIET_FRAMES`] so the animated and committed paths stay visually identical.
+const QUIET_GLYPH: &str = QUIET_FRAMES[0];
+
 /// Label beside the animated emoji. Singular, present-tense: one turn, in
 /// flight.
 const QUIET_LABEL: &str = "Reviewing and summarizing result";
@@ -49,24 +57,59 @@ const QUIET_LABEL: &str = "Reviewing and summarizing result";
 /// braille spinners — a two-frame emoji flip at 80ms reads as a strobe.
 const QUIET_FRAME_MS: u64 = 350;
 
+/// The single dim row used when in-place animation is unsafe (live prompt) or
+/// pointless (piped stderr). Pure — unit-tested.
+fn quiet_static_line() -> String {
+    format!("\x1b[2m{QUIET_GLYPH} {QUIET_LABEL}\x1b[0m")
+}
+
 /// RAII guard for quiet-summary mode: [`QuietSummary::start`] arms the
-/// suppression flag and spawns the animated line; `Drop` aborts the animation,
-/// erases the line, restores the cursor, and disarms the flag — so an early
-/// return, a `?`, or a Ctrl-C abort can never leave the terminal
-/// cursor-hidden or the flag stuck on for later turns.
+/// suppression flag and then EITHER commits one prompt-preserving line (live
+/// prompt or piped stderr — no animation, nothing to tear down) or spawns the
+/// in-place animated line (raw tty). `Drop` disarms the flag either way, and
+/// when an animation was spawned it also aborts it, erases the line, and
+/// restores the cursor — so an early return, a `?`, or a Ctrl-C abort can never
+/// leave the terminal cursor-hidden or the flag stuck on for later turns. The
+/// committed line is deliberately NOT erased on drop: it is scrollback history,
+/// not a transient frame.
 pub struct QuietSummary(Option<tokio::task::JoinHandle<()>>);
 
 impl QuietSummary {
     /// Arm quiet rendering for the turn about to run.
     pub fn start() -> Self {
         QUIET_SUMMARY.store(true, AtomicOrdering::SeqCst);
-        if !stderr_is_tty() {
-            // Piped/headless: nothing to animate, but say it once so a log
-            // isn't silent for the whole turn.
-            eprintln!("\x1b[2m{} {QUIET_LABEL}\x1b[0m", QUIET_FRAMES[0]);
+        // Two cases where in-place animation must NOT be used:
+        //
+        // * piped/headless stderr — nothing to animate, but say it once so a log
+        //   isn't silent for the whole turn;
+        // * a LIVE interactive prompt (`external_printer_installed`) — an
+        //   in-place `\r\x1b[2K` frame assumes this task owns the current row.
+        //   It doesn't. The prompt is on that row, and every other mid-turn
+        //   writer (a `[goal]` row, a forwarded worker row, the compaction
+        //   notice) moves the cursor off it. Each such write makes the NEXT
+        //   frame redraw one row lower and permanently commits the previous
+        //   frame — the reported four-row
+        //   "🔍/🔍/🔎/🔎 Reviewing and summarizing result" output, where the
+        //   row count tracked the number of interleaved writers rather than
+        //   anything the operator cared about.
+        //
+        // `tools::external_printer_installed` is the predicate already defined
+        // for exactly this decision, and the worker "thinking…" animation
+        // already makes the same call: one prompt-preserving committed line
+        // beats a torn animation. Routing through `print_above_prompt` also
+        // serialises this row against those other writers, so it can neither
+        // trample the prompt nor be trampled.
+        if !stderr_is_tty() || crate::tools::external_printer_installed() {
+            let line = quiet_static_line();
+            if !crate::tools::print_above_prompt(format!("{line}\n")) {
+                eprintln!("{line}");
+            }
             return Self(None);
         }
-        eprint!("\x1b[?25l"); // hide the cursor for the duration; restored on drop
+        // Raw path (tty, no prompt printer installed): safe to animate in place.
+        // Open a FRESH row first — without this, frame 0 lands on whatever is on
+        // the current row and `\r\x1b[2K` erases it (the prompt).
+        eprint!("\n\x1b[?25l"); // own a row; hide the cursor — restored on drop
         Self(Some(tokio::spawn(async {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(QUIET_FRAME_MS));
             let mut i = 0usize;
@@ -1375,10 +1418,19 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
         return;
     };
     let dropped = commit_compaction(session, &plan);
-    eprintln!(
+    // Route through the serialised prompt-preserving printer, not a raw
+    // `eprintln!`. A raw write lands at the cursor, which both trampled the live
+    // prompt and tore any in-flight in-place animation — in the reported output
+    // this notice is the visible wedge that split the quiet-summary line into a
+    // 🔍 pair above it and a 🔎 pair below it. Falls back to stderr when no
+    // printer is installed (piped / headless / non-interactive).
+    let notice = format!(
         "\x1b[2maish: {} tripped — compacted {dropped} earlier message(s) to memory\x1b[0m",
         trigger.label()
     );
+    if !crate::tools::print_above_prompt(format!("{notice}\n")) {
+        eprintln!("{notice}");
+    }
 }
 
 /// Persist a planned compaction and apply it to the live session: offload the
@@ -2368,6 +2420,28 @@ mod tests {
             "need >= 2 frames to actually animate"
         );
         assert!(QUIET_FRAMES.iter().all(|f| !f.trim().is_empty()));
+    }
+
+    /// A row COMMITTED to scrollback must read as ONE event. The reported bug
+    /// showed four rows — `🔍 …`, `🔍 …`, `🔎 …`, `🔎 …` — for a single turn,
+    /// because animation frames were being committed instead of redrawn. Pin
+    /// that the committed row carries exactly one stable glyph and never the
+    /// alternate frame, so two rows can never again look like two events.
+    #[test]
+    fn quiet_static_line_is_one_stable_glyph() {
+        let line = quiet_static_line();
+        assert!(line.contains(QUIET_LABEL), "{line}");
+        assert_eq!(line.matches(QUIET_GLYPH).count(), 1, "{line}");
+        for alt in QUIET_FRAMES.iter().filter(|f| **f != QUIET_GLYPH) {
+            assert!(
+                !line.contains(alt),
+                "committed row must not mix frames: {line}"
+            );
+        }
+        // Animated and committed paths must look the same to the operator.
+        assert!(QUIET_FRAMES.contains(&QUIET_GLYPH));
+        // One row, no embedded newline — the caller supplies the terminator.
+        assert!(!line.contains('\n'), "{line}");
     }
 
     // ---- Phase 3.4: output-schema runtime-enforcement hook ----------------
