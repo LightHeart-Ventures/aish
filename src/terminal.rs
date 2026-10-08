@@ -470,12 +470,18 @@ pub fn clear_midturn_inline() {
 // A terminal *scroll* (mouse wheel, trackpad, PageUp) moves the viewport
 // without sending aish any input, so the shell never learns the footer scrolled
 // out of view — the classic "I scrolled and the footer disappeared" complaint.
-// The fix is a low-frequency heartbeat: while the REPL is parked at the prompt
-// (a blocking line read) and nothing has repainted the footer for
-// `HEARTBEAT_IDLE`, a background thread repaints it from the cached content. The
-// repaint is cursor-safe (DECSC/DECRC in `footer_seq` saves + restores the
-// caller's cursor, so the in-progress input line is untouched) and only fires in
-// the idle-at-prompt window, so it never races the engine's output writes.
+// The fix is a low-frequency heartbeat: whenever nothing has repainted the
+// footer for `HEARTBEAT_IDLE`, a background thread repaints it from the cached
+// content. The repaint is cursor-safe (DECSC/DECRC in `footer_seq` saves +
+// restores the caller's cursor, so an in-progress input line or a live spinner
+// row is untouched) and the whole sequence is written with a single buffered
+// `write!` + flush, so it can't interleave halfway with the main thread's
+// output.
+//
+// It deliberately runs BOTH at the prompt AND mid-turn (model thinking, tool
+// calls): a turn can last minutes, and that is exactly when a scroll or resize
+// used to leave the statusline missing until the turn ended. See
+// `heartbeat_should_paint` for the gate and the regression it fixes.
 // ---------------------------------------------------------------------------
 
 /// Idle gap after which the heartbeat repaints the footer. Chosen at 3s: long
@@ -483,9 +489,12 @@ pub fn clear_midturn_inline() {
 /// scrolled-away footer snaps back almost immediately.
 pub const HEARTBEAT_IDLE: Duration = Duration::from_secs(3);
 
-/// True only while the REPL is blocked in a line read (idle at the prompt). The
-/// heartbeat repaints ONLY in this window, so it can never interleave with the
-/// engine's output writes on the main thread. Toggled by [`set_reading_line`].
+/// True only while the REPL is blocked in a line read (idle at the prompt).
+/// Scopes the [`INPUT_DIRTY`] back-off to the prompt: while rustyline is
+/// rendering a line it owns the visible cursor, so the heartbeat must not
+/// repaint over a partially-typed command. Mid-turn (this is `false`) rustyline
+/// isn't rendering and the heartbeat keeps healing the footer. Toggled by
+/// [`set_reading_line`].
 static READING_LINE: AtomicBool = AtomicBool::new(false);
 
 /// Millis since the process heartbeat epoch of the last footer paint (via
@@ -519,11 +528,13 @@ fn size_changed_since_paint() -> bool {
     }
 }
 
-/// True while the in-progress input line is non-empty. The heartbeat NEVER
-/// repaints while this is set, so a partially-typed command can never be
-/// clobbered by a footer repaint racing rustyline's own line render (the
-/// "prompt eaten by the cursor" bug). Set from the highlighter on every redraw
-/// (via [`set_input_dirty`]) and cleared when a fresh read begins.
+/// True while the in-progress input line is non-empty. The heartbeat does not
+/// repaint while this is set AND the REPL is at the prompt ([`READING_LINE`]), so
+/// a partially-typed command can never be clobbered by a footer repaint racing
+/// rustyline's own line render (the "prompt eaten by the cursor" bug). Set from
+/// the highlighter on every redraw (via [`set_input_dirty`]) and cleared when a
+/// fresh read begins — mid-turn type-ahead lives in `MIDTURN_INPUT` instead,
+/// which the repaint itself draws.
 static INPUT_DIRTY: AtomicBool = AtomicBool::new(false);
 
 /// Record whether the input buffer currently holds text. The rustyline
@@ -560,11 +571,69 @@ pub fn set_reading_line(reading: bool) {
     }
 }
 
+/// Everything the heartbeat knows at one tick, sampled from the footer-state
+/// atomics. Split out so the repaint decision is a pure function the tests can
+/// drive exhaustively (the thread itself is untestable).
+#[derive(Debug, Clone, Copy)]
+struct HeartbeatState {
+    /// A footer scroll region is installed. Also false while a foreground TTY
+    /// child owns the terminal — `suspend_footer_region` clears `ACTIVE` — so
+    /// vim/sudo/less are never painted over.
+    region_active: bool,
+    /// A worker alt-screen (`:attach`) view owns the terminal.
+    attach_active: bool,
+    /// The REPL is parked in a blocking line read (idle at the prompt).
+    reading_line: bool,
+    /// The in-progress input buffer holds text.
+    input_dirty: bool,
+    /// Nothing has repainted the footer for [`HEARTBEAT_IDLE`].
+    idle_elapsed: bool,
+    /// The terminal was resized since the last footer paint.
+    size_changed: bool,
+    /// A pinned escalation banner is animating and needs frame advances.
+    animating: bool,
+}
+
+/// Decide whether this heartbeat tick should repaint the footer.
+///
+/// THE BUG THIS FIXES: the heartbeat used to require `reading_line` — it only
+/// self-healed the footer while the REPL was parked at the prompt. So for the
+/// entire duration of a turn (model thinking + tool calls), nothing repainted
+/// the statusline. Anything that scrolled it out of view or overwrote it during
+/// those seconds-to-minutes — a mouse-wheel/trackpad scroll (which sends aish no
+/// input at all), a window resize leaving DECSTBM stale, a full-screen program's
+/// leftovers — left the footer gone until the turn ENDED and the next prompt
+/// painted it. Hence "the statusline keeps disappearing while thinking".
+///
+/// The `reading_line` requirement was never about safety; the repaint is
+/// cursor-safe (DECSC/DECRC in `footer_seq`) and mid-turn the typed-ahead line
+/// lives in `MIDTURN_INPUT`, which the repaint itself draws. The one genuine
+/// hazard is rustyline rendering an in-progress line: that is `input_dirty`, and
+/// it only applies AT the prompt. So `input_dirty` is now scoped to
+/// `reading_line` instead of blocking unconditionally, and the heartbeat keeps
+/// healing the footer straight through a turn.
+fn heartbeat_should_paint(s: HeartbeatState) -> bool {
+    // No region to paint, or someone else owns the screen.
+    if !s.region_active || s.attach_active {
+        return false;
+    }
+    // Never repaint over a line the user is mid-editing: a non-empty buffer
+    // means rustyline owns the visible cursor and a racing repaint would eat the
+    // prompt. Mid-turn rustyline is NOT rendering, so the flag is stale there.
+    if s.reading_line && s.input_dirty {
+        return false;
+    }
+    // Idle-timed-out heals a scrolled-away footer; the resize and animation
+    // cases bypass the idle gate so the footer tracks a new canvas size within
+    // one tick and a pinned banner's emoji advances smoothly.
+    s.idle_elapsed || s.size_changed || s.animating
+}
+
 /// Spawn the footer heartbeat thread (idempotent — only the first call spawns).
 /// The thread wakes on a short cadence and repaints the cached footer whenever
-/// the REPL has been idle at the prompt for [`HEARTBEAT_IDLE`], self-healing a
-/// footer that scrolled out of view. No-op unless a footer region is installed;
-/// safe to call once at REPL startup.
+/// [`heartbeat_should_paint`] says so — self-healing a footer that scrolled out
+/// of view, at the prompt AND mid-turn. No-op unless a footer region is
+/// installed; safe to call once at REPL startup.
 pub fn spawn_footer_heartbeat() {
     if HEARTBEAT_SPAWNED.swap(true, Ordering::Relaxed) {
         return;
@@ -580,30 +649,21 @@ pub fn spawn_footer_heartbeat() {
             let idle_ms = HEARTBEAT_IDLE.as_millis() as u64;
             loop {
                 std::thread::sleep(tick);
-                // Only when a footer region is live, we're parked at the prompt,
-                // and no worker alt-screen view owns the terminal.
-                if !ACTIVE.load(Ordering::Relaxed)
-                    || !READING_LINE.load(Ordering::Relaxed)
-                    || ATTACH_ACTIVE.load(Ordering::Relaxed)
-                    // Never repaint over a line the user is mid-editing — a
-                    // non-empty buffer means rustyline owns the visible cursor
-                    // and a racing footer repaint would eat the prompt.
-                    || INPUT_DIRTY.load(Ordering::Relaxed)
-                {
-                    continue;
-                }
                 let idle = heartbeat_now_ms()
                     .saturating_sub(LAST_FOOTER_ACTIVITY_MS.load(Ordering::Relaxed));
-                // Repaint when idle-timed-out OR the terminal was resized since
-                // the last paint. The resize case bypasses the idle gate so the
-                // footer tracks the new canvas size within one tick rather than
-                // waiting out HEARTBEAT_IDLE — "update accordingly on resize".
-                // A live escalation banner also bypasses the idle gate: its
-                // emoji animates in place (like the thinking spinner) and only
-                // a repaint advances the frame.
-                if idle >= idle_ms || size_changed_since_paint() || crate::escalation::animating() {
+                if heartbeat_should_paint(HeartbeatState {
+                    region_active: ACTIVE.load(Ordering::Relaxed),
+                    attach_active: ATTACH_ACTIVE.load(Ordering::Relaxed),
+                    reading_line: READING_LINE.load(Ordering::Relaxed),
+                    input_dirty: INPUT_DIRTY.load(Ordering::Relaxed),
+                    idle_elapsed: idle >= idle_ms,
+                    size_changed: size_changed_since_paint(),
+                    animating: crate::escalation::animating(),
+                }) {
                     // Cursor-safe repaint (no body-home): DECSC/DECRC restores
-                    // the input cursor exactly where the user left it.
+                    // the caller's cursor exactly where it was — the in-progress
+                    // input line at the prompt, or the spinner/ticker row
+                    // mid-turn.
                     paint_cached_footer(false);
                 }
             }
@@ -1889,10 +1949,111 @@ mod tests {
         let idle =
             heartbeat_now_ms().saturating_sub(LAST_FOOTER_ACTIVITY_MS.load(Ordering::Relaxed));
         assert!(idle < HEARTBEAT_IDLE.as_millis() as u64);
-        // Leaving the read clears the window so the heartbeat stops repainting
-        // the moment a line is submitted / an engine turn begins.
+        // Leaving the read drops the at-prompt marker (the heartbeat keeps
+        // painting mid-turn — see heartbeat_paints_mid_turn).
         set_reading_line(false);
         assert!(!READING_LINE.load(Ordering::Relaxed));
+    }
+
+    /// Baseline heartbeat state: region live, nothing else going on, and the
+    /// idle timer already elapsed — i.e. "should paint".
+    fn beat() -> HeartbeatState {
+        HeartbeatState {
+            region_active: true,
+            attach_active: false,
+            reading_line: false,
+            input_dirty: false,
+            idle_elapsed: true,
+            size_changed: false,
+            animating: false,
+        }
+    }
+
+    #[test]
+    fn heartbeat_paints_mid_turn() {
+        // THE REGRESSION: mid-turn (reading_line == false) the heartbeat used to
+        // bail unconditionally, so a footer scrolled away during a long thinking
+        // phase stayed gone until the turn ended. It must now self-heal.
+        assert!(heartbeat_should_paint(HeartbeatState {
+            reading_line: false,
+            ..beat()
+        }));
+        // A resize or a live banner mid-turn also repaints, idle gate or not.
+        assert!(heartbeat_should_paint(HeartbeatState {
+            reading_line: false,
+            idle_elapsed: false,
+            size_changed: true,
+            ..beat()
+        }));
+        assert!(heartbeat_should_paint(HeartbeatState {
+            reading_line: false,
+            idle_elapsed: false,
+            animating: true,
+            ..beat()
+        }));
+        // Stale INPUT_DIRTY from the previous prompt must NOT suppress a
+        // mid-turn repaint — rustyline isn't rendering, so there's no line to
+        // clobber (mid-turn type-ahead rides in MIDTURN_INPUT, which the
+        // repaint itself draws).
+        assert!(heartbeat_should_paint(HeartbeatState {
+            reading_line: false,
+            input_dirty: true,
+            ..beat()
+        }));
+    }
+
+    #[test]
+    fn heartbeat_never_clobbers_an_in_progress_prompt_line() {
+        // At the prompt with text in the buffer, rustyline owns the cursor.
+        assert!(!heartbeat_should_paint(HeartbeatState {
+            reading_line: true,
+            input_dirty: true,
+            ..beat()
+        }));
+        // …not even for a resize or an animating banner.
+        assert!(!heartbeat_should_paint(HeartbeatState {
+            reading_line: true,
+            input_dirty: true,
+            idle_elapsed: false,
+            size_changed: true,
+            animating: true,
+            ..beat()
+        }));
+        // Empty buffer at the prompt: free to heal.
+        assert!(heartbeat_should_paint(HeartbeatState {
+            reading_line: true,
+            input_dirty: false,
+            ..beat()
+        }));
+    }
+
+    #[test]
+    fn heartbeat_yields_the_screen_to_other_owners() {
+        // No region installed — nothing to paint. `suspend_footer_region`
+        // clears ACTIVE, so this also covers a foreground TTY child (vim/sudo).
+        assert!(!heartbeat_should_paint(HeartbeatState {
+            region_active: false,
+            size_changed: true,
+            animating: true,
+            ..beat()
+        }));
+        // A worker alt-screen view owns the terminal.
+        assert!(!heartbeat_should_paint(HeartbeatState {
+            attach_active: true,
+            size_changed: true,
+            animating: true,
+            ..beat()
+        }));
+    }
+
+    #[test]
+    fn heartbeat_holds_still_when_nothing_changed() {
+        // Idle not elapsed, no resize, no animation ⇒ no repaint. Keeps the
+        // mid-turn relaxation from turning into a 2 Hz footer rewrite.
+        assert!(!heartbeat_should_paint(HeartbeatState {
+            idle_elapsed: false,
+            ..beat()
+        }));
     }
 
     #[test]
