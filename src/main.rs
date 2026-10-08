@@ -87,6 +87,7 @@ mod stream_render;
 mod style;
 mod suggest;
 mod terminal;
+mod ticker;
 mod tool_telemetry;
 mod tools;
 mod transcript_ring;
@@ -295,6 +296,8 @@ async fn main() -> Result<()> {
     timer.mark("args parsed");
     // Honor --no-color process-wide before anything styles output.
     style::set_no_color(args.no_color);
+    // Honor AISH_ACTIVITY_TICKER before any tool call can paint a window.
+    ticker::init_from_env();
 
     // `aish --update`: non-interactive self-upgrade. Check the latest release and,
     // if it's newer for this platform, download + swap the binary, then exit.

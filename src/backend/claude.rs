@@ -1158,21 +1158,13 @@ same oversized call.]",
         let uncached = g("input_tokens");
         let cache_read = g("cache_read_input_tokens");
         let cache_creation = g("cache_creation_input_tokens");
-        // Per-turn cache telemetry (TASK-320). hit rate = cached-read fraction of
-        // the total input prompt; a healthy multi-turn session trends toward the
-        // high 90s. Emitted dim so it sits quietly alongside the retry/status
-        // lines that already use eprintln + \x1b[2m.
-        let total_input = uncached + cache_read + cache_creation;
-        // Suppressed on a quiet-summary turn (auto-resume): that turn renders as
-        // a single animated line, and this dim telemetry would scroll over it.
-        if total_input > 0 && !crate::engine::quiet_summary() {
-            let hit_pct = (cache_read as f64 / total_input as f64) * 100.0;
-            eprintln!(
-                "\x1b[2m  cache: {cache_read} read + {cache_creation} write + {uncached} uncached \
-                 in ({hit_pct:.0}% hit) → {out} out\x1b[0m",
-                out = g("output_tokens"),
-            );
-        }
+        // Per-turn cache telemetry (TASK-320) used to be eprintln'd here, dim,
+        // once per API ROUND — so a six-round turn burned six permanent
+        // scrollback rows restating what the statusline already shows live
+        // (`cache: N% hit`, engine::statusline_stats). Removed as redundant: the
+        // numbers below still flow into `context::Usage`, which feeds the
+        // statusline, `:usage`, and the turn audit. Nothing is lost but the
+        // duplicate row.
         crate::context::Usage {
             input_tokens: uncached + cache_read + cache_creation,
             output_tokens: g("output_tokens"),

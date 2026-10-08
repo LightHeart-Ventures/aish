@@ -7678,8 +7678,13 @@ fn handle_config(backend: &Backend, session: &Session) {
         }
     );
     println!(
-        "  raw tool output {}",
-        if session.raw_tool_output { "on" } else { "off" }
+        "  raw tool output {} · activity ticker {}",
+        if session.raw_tool_output { "on" } else { "off" },
+        if crate::ticker::enabled() {
+            "on"
+        } else {
+            "off"
+        }
     );
     println!(
         "  env exports     {} · skills {} · mcp {}",
@@ -9046,6 +9051,38 @@ async fn handle_colon(
             }
             return true;
         }
+        // `:ticker [on|off]` — the bounded activity window. ON (default) paints
+        // mid-turn tool rows into a self-erasing K-row window; OFF restores the
+        // pre-ticker behavior where every row is permanent scrollback (what you
+        // want when you need to scroll back through what a long turn actually
+        // ran). Bare `:ticker` reports state.
+        Some("ticker") => {
+            match parts.next() {
+                Some("on") => crate::ticker::set_enabled(true),
+                Some("off") => crate::ticker::set_enabled(false),
+                None => {}
+                Some(other) => {
+                    println!(
+                        "\x1b[33m⊘\x1b[0m unknown: :ticker {other} — use `on`, `off`, or bare `:ticker`"
+                    );
+                    return false;
+                }
+            }
+            let state = if crate::ticker::enabled() {
+                "on"
+            } else {
+                "off"
+            };
+            // `enabled` is the operator's switch; `active` is whether it can
+            // actually do anything here (needs a TTY + a tall enough viewport).
+            // Report both so "I turned it on and nothing changed" is answerable.
+            let note = if crate::ticker::enabled() && !crate::ticker::active() {
+                " \x1b[2m(inactive: not a terminal, or viewport too short)\x1b[0m"
+            } else {
+                ""
+            };
+            println!("\x1b[2mactivity ticker {state}\x1b[0m{note}");
+        }
         Some("webhook") => match parts.next() {
             None | Some("status") => match &session.webhook {
                 Some(h) => {
@@ -9271,6 +9308,7 @@ async fn handle_colon(
                  a at a prompt                       always-allow this tool (see :allow)\n\
                  d at a read/write/delete prompt     allow that permission for the whole dir, recursively\n\
                  Ctrl-O                              expand/collapse tool output (verbatim results ⇄ line-count summary)\n\
+                 :ticker [on|off]                    bounded activity window — mid-turn tool rows scroll in place, then erase (off = permanent scrollback)\n\
                  Shift-Tab                           cycle attach across all coordinators incl. finished/failed, newest first (interactive → newest → … → oldest → back)\n\
                  :quit                               exit (also Ctrl-D or `exit`)"
             );
