@@ -4,6 +4,12 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.53.3] - 2026-10-08
+
+### Fixed
+- **Keywatch input improvements**: enhanced key event handling in `src/keywatch.rs` for more responsive mid-turn input capture
+- **Terminal footer layout**: refined terminal rendering in `src/terminal.rs` to anchor mid-turn input line above escalation banner, preventing status clobbering
+
 ## [0.52.1] - 2026-10-07
 
 Shipped as 0.52.1: the `v0.52.0` tag is unusable. The release for it was pre-published by hand instead of by the Release workflow, GitHub marked it immutable with zero assets, and the workflow's `Assert no published release already exists for this tag` gate then (correctly) refused to attach the `:update` binaries. Same failure mode as `v0.48.0`.

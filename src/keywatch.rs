@@ -50,7 +50,9 @@ use crate::midturn_input::{Action, KeyParser, LineBuf};
 /// Configuration for mid-turn **type-ahead** capture. When supplied to
 /// [`TurnKeyWatch::install`], the reader decodes the FULL key stream (not just
 /// Shift-Tab), folds it into a [`LineBuf`], echoes the in-progress line into the
-/// footer's message row (via [`crate::terminal::set_midturn_input`]), and sends
+/// footer's dedicated input row — the topmost footer row, directly under the
+/// text output and ABOVE any escalation/queued banner (via
+/// [`crate::terminal::set_midturn_input`]) — and sends
 /// each submitted (Enter-terminated, non-empty) line on `line_tx` for the REPL
 /// to run as the next command once the current turn finishes. Absent ⇒ the
 /// reader keeps its legacy Shift-Tab-only `scan_csi_z` behaviour, byte-for-byte.

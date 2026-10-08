@@ -9,6 +9,25 @@
 //! row  H        aish v0.23.0 · claude (sonnet)              2026-07-01 21:15   (statusline)
 //! ```
 //!
+//! Two OPTIONAL blocks grow the footer upward, each reserving its own rows so
+//! nothing ever overwrites anything else. Top-down, the full stack is:
+//!
+//! ```text
+//! rows 1..        scrolling REPL area
+//! row  (input)    ❯ git status                     ← mid-turn input (INPUT_ROWS)
+//! row  (banner)   🚀 escalated → w_a7k3m2 · …      ← escalation/queued banner
+//! row  (banner)      ↳ coordinating · 1m12s           (crate::escalation::ROWS)
+//! row  H-2        ──────────────────────────────    (solid rule)
+//! row  H-1        status message
+//! row  H          statusline
+//! ```
+//!
+//! The operator's mid-turn input line is ALWAYS the topmost footer row: the
+//! first row under the scrolling body — exactly where the idle prompt sits —
+//! and above the escalation/queued block. It no longer borrows the status-message
+//! row, so typing during a turn can't clobber the live coordinator status and
+//! the input line never hops between two places (see [`INPUT_ROWS`]).
+//!
 //! The footer is held fixed with a DECSTBM scroll region (`ESC[top;bottomr`):
 //! the region covers rows `1..=H-3`, so everything the shell prints scrolls
 //! *above* the footer while rows `H-2..=H` stay put. Each [`Terminal::draw_footer`]
@@ -39,32 +58,63 @@ pub const FOOTER_ROWS: u16 = 3;
 /// below 4 the caller falls back to inline printing.
 pub const MIN_FOOTER_ROWS: u16 = 5;
 
+/// Footer rows the mid-turn input line occupies while a turn is running. ONE
+/// row, reserved as the footer's TOPMOST row — i.e. immediately under the last
+/// body line and ABOVE the escalation/queued banner.
+///
+/// THE BUG THIS FIXES. The mid-turn type-ahead line used to be painted by
+/// overriding the footer's STATUS-MESSAGE row (row H-1, the SecondStatusLine),
+/// so typing during a turn (a) clobbered the live coordinator/attach status the
+/// operator was reading, and (b) made the input line hop between two places —
+/// the body prompt when idle, a row wedged inside the statusline frame mid-turn.
+/// Giving the input its own reserved row directly above the banner means the
+/// operator's line is ALWAYS in the same place relative to the footer: the last
+/// line of the text field, above the escalation/queued messages, and the
+/// statusline block below it is never written over.
+pub const INPUT_ROWS: u16 = 1;
+
+/// Which OPTIONAL footer blocks fit in a terminal of `rows` rows, given which
+/// ones want to be shown: `(banner, input)`.
+///
+/// Shared by [`footer_rows_for`] (what we RESERVE) and [`footer_seq`] (what we
+/// PAINT) so the two can never disagree about the footer's height. Each optional
+/// block is dropped when the window is too short to keep 2 scrolling rows above
+/// the taller footer ([`MIN_FOOTER_ROWS`] already budgets those 2 rows on top of
+/// [`FOOTER_ROWS`]): a cramped window keeps its output instead of being eaten by
+/// a notification. The banner is weighed first, so on a borderline-height
+/// terminal the input row — the thing the operator is actively using — is the
+/// one that still gets a chance to fit after the banner claimed its rows.
+fn footer_extras(rows: u16, want_banner: bool, want_input: bool) -> (bool, bool) {
+    let banner = want_banner && rows >= MIN_FOOTER_ROWS + crate::escalation::ROWS;
+    let used = if banner { crate::escalation::ROWS } else { 0 };
+    let input = want_input && rows >= MIN_FOOTER_ROWS + used + INPUT_ROWS;
+    (banner, input)
+}
+
 /// The footer's CURRENT height for a terminal of `rows` rows: [`FOOTER_ROWS`]
 /// normally, plus [`crate::escalation::ROWS`] while a background escalation is
 /// pinned (the escalation message + the worker's latest status, painted directly
 /// ABOVE the footer's horizontal rule, so the rule stays welded to the
-/// statusline block — see [`crate::escalation`]).
+/// statusline block — see [`crate::escalation`]), plus [`INPUT_ROWS`] while a
+/// mid-turn input line is live (painted above the banner — see [`INPUT_ROWS`]).
 ///
 /// Every row-arithmetic site — DECSTBM bottom margin, the body-home row, the
 /// resume choreography — routes through this so growing the footer can never
-/// desync the reserved region from what we actually paint. The banner is dropped
-/// (and the footer stays at its base height) when the terminal is too short to
-/// keep 2 scrolling rows above the taller footer: a cramped window keeps its
-/// output instead of being eaten by a notification.
+/// desync the reserved region from what we actually paint.
 pub fn footer_rows_for(rows: u16) -> u16 {
-    if crate::escalation::active() && rows >= MIN_FOOTER_ROWS + crate::escalation::ROWS {
-        FOOTER_ROWS + crate::escalation::ROWS
-    } else {
-        FOOTER_ROWS
-    }
+    let (banner, input) = footer_extras(rows, crate::escalation::active(), midturn_active());
+    FOOTER_ROWS
+        + if banner { crate::escalation::ROWS } else { 0 }
+        + if input { INPUT_ROWS } else { 0 }
 }
 
-/// The first (topmost) screen row the footer owns: the escalation banner's first
-/// row while one is pinned, otherwise the separator.
+/// The first (topmost) screen row the footer owns: the mid-turn input row while
+/// one is held, else the escalation banner's first row while one is pinned, else
+/// the separator.
 ///
-/// Teardown paths clear from this row to end-of-screen, so it MUST track the
-/// banner — clearing from the separator alone would strand the two banner rows
-/// on the terminal a child program (or the exiting shell) inherits.
+/// Teardown paths clear from this row to end-of-screen, so it MUST track every
+/// optional block — clearing from the separator alone would strand the banner or
+/// input rows on the terminal a child program (or the exiting shell) inherits.
 pub fn footer_top_row(rows: u16) -> u16 {
     rows.saturating_sub(footer_rows_for(rows).saturating_sub(1))
         .max(1)
@@ -101,55 +151,88 @@ static ALT_SCROLL_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 /// threading the strings back through.
 static LAST_FOOTER: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
 
-/// Mid-turn type-ahead override for the footer's status-message row (row H-1).
-/// When `Some`, the footer paints THIS string in the message row instead of the
-/// cached coordinator status message — so the operator sees the line they are
-/// typing WHILE a model turn runs (thinking / mid tool-call). Set/cleared by the
-/// keywatch reader thread via [`set_midturn_input`] / [`clear_midturn_input`].
+/// The live mid-turn input line (styled prompt + typed text). When `Some`, the
+/// footer reserves [`INPUT_ROWS`] extra rows and paints THIS string on its
+/// topmost row — directly under the last body line and above the
+/// escalation/queued banner — so the operator sees the line they are typing
+/// WHILE a model turn runs (thinking / mid tool-call) without the statusline
+/// block being written over. Set/cleared by the keywatch reader thread via
+/// [`set_midturn_input`] / [`clear_midturn_input`].
 static MIDTURN_INPUT: Mutex<Option<String>> = Mutex::new(None);
 
-/// The status-message row to actually paint: the mid-turn type-ahead line when
-/// one is active, otherwise the caller's cached coordinator status message. The
-/// raw status message is always what gets cached in `LAST_FOOTER`; the override
-/// is applied only at paint time so a resize/idle repaint reflects live typing.
-fn effective_status_msg(cached: &str) -> String {
-    match MIDTURN_INPUT.lock().unwrap().as_ref() {
-        Some(s) => s.clone(),
-        None => cached.to_string(),
-    }
+/// Whether a mid-turn input line is currently live (i.e. the footer owes it a
+/// reserved row). Read by [`footer_rows_for`], so it must never be called while
+/// the `MIDTURN_INPUT` lock is held.
+pub fn midturn_active() -> bool {
+    MIDTURN_INPUT.lock().unwrap().is_some()
 }
 
-/// Paint the operator's mid-turn prompt + type-ahead line into the footer's
-/// message row. `styled_prompt` is emitted verbatim (already colour-styled)
-/// before `text`. An empty `text` now means "nothing typed yet" and surfaces the
-/// BARE PROMPT sigil (so the operator can SEE there is a prompt to type into
-/// during thinking / tool-calls) rather than removing the override — the normal
-/// status message is restored only on turn teardown via [`clear_midturn_input`].
-/// No visible effect when no footer region is installed (short terminal /
-/// non-tty), but the override slot is still updated. Safe to call from the
-/// keywatch reader thread — it locks stdout + a mutex exactly like the idle
-/// heartbeat repaint.
+/// The live mid-turn input line to paint, if any. Read at PAINT time (not cached
+/// in `LAST_FOOTER`) so a resize / idle-heartbeat repaint always reflects the
+/// operator's current keystrokes.
+pub fn midturn_line() -> Option<String> {
+    MIDTURN_INPUT.lock().unwrap().clone()
+}
+
+/// Paint the operator's mid-turn prompt + type-ahead line onto the footer's
+/// DEDICATED input row — the footer's topmost row, immediately below the last
+/// body line and above the escalation/queued banner (see [`INPUT_ROWS`]).
+/// `styled_prompt` is emitted verbatim (already colour-styled) before `text`.
+///
+/// An empty `text` means "nothing typed yet" and surfaces the BARE PROMPT sigil
+/// (so the operator can SEE there is a prompt to type into during thinking /
+/// tool-calls) rather than releasing the row — the row is given back only on
+/// turn teardown via [`clear_midturn_input`]. Holding the row for the whole turn
+/// is the point: the input line must not move around under the operator's hands.
+///
+/// The FIRST call of a turn grows the footer by one row (and shrinks the DECSTBM
+/// scroll region to match — `footer_seq` re-asserts it every paint), exactly as
+/// a pinned escalation banner does. No visible effect when no footer region is
+/// installed (short terminal / non-tty), but the slot is still updated. Safe to
+/// call from the keywatch reader thread — it locks stdout + a mutex exactly like
+/// the idle heartbeat repaint.
 pub fn set_midturn_input(styled_prompt: &str, text: &str) {
     {
         let mut slot = MIDTURN_INPUT.lock().unwrap();
         // Always surface at least the bare prompt affordance during a turn; append
         // the live line as the operator types. `clear_midturn_input` (turn
-        // teardown) is what restores the cached status message.
+        // teardown) is what releases the reserved row again.
         *slot = Some(format!("{styled_prompt}{text}"));
     }
     paint_cached_footer(false);
 }
 
-/// Clear any mid-turn type-ahead override and repaint the normal footer. Called
-/// when a turn ends (guard teardown) and after each submitted line. Idempotent —
-/// returns early (no repaint) when nothing was overridden.
+/// Release the mid-turn input row and repaint the normal footer. Called when a
+/// turn ends (guard teardown) and after each submitted line. Idempotent —
+/// returns early (no repaint) when no input row was held.
+///
+/// The released row rejoins the scrolling body, so we erase it before the
+/// repaint: without that, the operator's last half-typed line would linger as
+/// the body's bottom row and then be scrolled up into scrollback as if it were
+/// output. The erase is wrapped in DECSC/DECRC so it cannot disturb the cursor
+/// the main thread is streaming output at.
 pub fn clear_midturn_input() {
+    // Resolve the row we are about to give back BEFORE dropping the slot (and
+    // before taking the lock — `footer_top_row` reads the same mutex).
+    let released_row = term_size()
+        .filter(|_| ACTIVE.load(Ordering::Relaxed))
+        .and_then(|(rows, _)| {
+            // Only when the input row actually FIT (a cramped window never got
+            // one) — and it is by construction the footer's topmost row.
+            let (_, input) = footer_extras(rows, crate::escalation::active(), true);
+            input.then(|| footer_top_row(rows))
+        });
     {
         let mut slot = MIDTURN_INPUT.lock().unwrap();
         if slot.is_none() {
             return;
         }
         *slot = None;
+    }
+    if let Some(row) = released_row {
+        let mut out = std::io::stdout();
+        let _ = write!(out, "\x1b7\x1b[{row};1H\x1b[2K\x1b8");
+        let _ = out.flush();
     }
     paint_cached_footer(false);
 }
@@ -465,9 +548,10 @@ fn paint_cached_footer(home_body: bool) {
     // Record the size we're painting at so the heartbeat can detect a later
     // resize and refresh the footer to the new canvas dimensions on sight.
     LAST_PAINTED_SIZE.store(pack_size(rows, cols), Ordering::Relaxed);
+    // The status-message row always shows the cached coordinator status: the
+    // mid-turn input line has its OWN reserved row (footer_seq reads it live),
+    // so typing can no longer clobber what the operator is reading here.
     let (msg, bar) = LAST_FOOTER.lock().map(|l| l.clone()).unwrap_or_default();
-    // Mid-turn type-ahead, when active, takes over the message row.
-    let msg = effective_status_msg(&msg);
     let utf8 = utf8_locale();
     let sep = separator_line(cols, utf8, crate::style::colors_enabled());
     // footer_seq re-asserts the scroll region internally (inside its DECSC/DECRC
@@ -572,17 +656,28 @@ pub fn footer_seq(
     status_msg: &str,
     statusline: &str,
 ) -> String {
-    // Snapshot the pinned escalation ONCE (dropping it when the window is too
-    // short) and hand it to the pure builder, so the rows we reserve and the
-    // rows we paint agree even if the banner retires mid-paint.
-    let banner = crate::escalation::rows(crate::style::colors_enabled())
-        .filter(|_| rows >= MIN_FOOTER_ROWS + crate::escalation::ROWS);
-    footer_seq_with(rows, cols, separator, status_msg, statusline, banner)
+    // Snapshot the pinned escalation AND the live mid-turn input line ONCE
+    // (dropping either when the window is too short) and hand them to the pure
+    // builder, so the rows we reserve (`footer_rows_for`) and the rows we paint
+    // agree even if the banner retires or a keystroke lands mid-paint.
+    let banner = crate::escalation::rows(crate::style::colors_enabled());
+    let input = midturn_line();
+    let (banner_ok, input_ok) = footer_extras(rows, banner.is_some(), input.is_some());
+    footer_seq_with(
+        rows,
+        cols,
+        separator,
+        status_msg,
+        statusline,
+        banner.filter(|_| banner_ok),
+        input.filter(|_| input_ok),
+    )
 }
 
-/// [`footer_seq`] with the escalation banner passed in instead of read from the
-/// process-global pin — the whole row plan is a pure function of `(rows, cols,
-/// banner)`, so the geometry is unit-testable without mutating shared state.
+/// [`footer_seq`] with the escalation banner and the mid-turn input line passed
+/// in instead of read from the process-global slots — the whole row plan is a
+/// pure function of `(rows, cols, banner, input)`, so the geometry is
+/// unit-testable without mutating shared state.
 pub fn footer_seq_with(
     rows: u16,
     cols: u16,
@@ -590,14 +685,24 @@ pub fn footer_seq_with(
     status_msg: &str,
     statusline: &str,
     banner: Option<(String, String)>,
+    input: Option<String>,
 ) -> String {
-    let height = if banner.is_some() {
-        FOOTER_ROWS + crate::escalation::ROWS
-    } else {
-        FOOTER_ROWS
-    };
-    // The footer occupies the bottom `height` rows: [escalation message, worker
-    // status,] separator, status message, statusline.
+    let height = FOOTER_ROWS
+        + if banner.is_some() {
+            crate::escalation::ROWS
+        } else {
+            0
+        }
+        + if input.is_some() { INPUT_ROWS } else { 0 };
+    // The footer occupies the bottom `height` rows, top-down:
+    //   [mid-turn input,] [escalation message, worker status,] separator,
+    //   status message, statusline.
+    //
+    // The mid-turn input line is the TOPMOST row — the first thing under the
+    // scrolling body and ABOVE the escalation/queued banner. That ordering is
+    // the whole contract: the operator's own line sits exactly where the idle
+    // prompt sat (immediately below the last output), it never moves mid-turn,
+    // and it never writes over the escalation/queued block or the statusline.
     //
     // The pinned escalation is anchored ABOVE the separator, not below it. The
     // horizontal rule is the LID of the statusline block — it marks where the
@@ -607,10 +712,12 @@ pub fn footer_seq_with(
     // running right now", and the rule stays welded to the two statusline rows
     // it opens whether or not a banner is pinned.
     let top_row = rows.saturating_sub(height.saturating_sub(1)).max(1);
+    let input_row = top_row;
+    let banner_top = top_row + if input.is_some() { INPUT_ROWS } else { 0 };
     let sep_row = if banner.is_some() {
-        top_row + crate::escalation::ROWS
+        banner_top + crate::escalation::ROWS
     } else {
-        top_row
+        banner_top
     };
     let msg_row = rows.saturating_sub(1);
     let bar_row = rows;
@@ -631,12 +738,21 @@ pub fn footer_seq_with(
     // so a banner that retires mid-paint can't desync region from paint.
     let region_bottom = rows.saturating_sub(height).max(1);
     s.push_str(&format!("\x1b[1;{region_bottom}r"));
+    // The operator's mid-turn line owns the footer's first row. Painted BEFORE
+    // the banner so the reserved block reads top-down exactly as it is listed in
+    // the row plan above.
+    if let Some(line) = input {
+        s.push_str(&format!(
+            "\x1b[{input_row};1H\x1b[2K{}",
+            clip_visible(&line, max)
+        ));
+    }
     // The pinned escalation sits ABOVE the separator — the (animated) escalation
     // message, then the worker's latest status, then the rule that opens the
     // statusline block.
     if let Some((escalation, worker)) = banner {
-        let esc_row = top_row;
-        let worker_row = top_row + 1;
+        let esc_row = banner_top;
+        let worker_row = banner_top + 1;
         s.push_str(&format!(
             "\x1b[{esc_row};1H\x1b[2K{}",
             clip_visible(&escalation, max)
@@ -810,11 +926,14 @@ impl Terminal {
         // footer_seq re-asserts the scroll region internally, INSIDE its
         // DECSC/DECRC save-restore, so the DECSTBM cursor-home side effect never
         // leaks out and strands the next prompt at the top of the screen.
+        // The status message is painted as-is; any live mid-turn input line is
+        // read by `footer_seq` and painted on its own reserved row above the
+        // escalation/queued banner, never over this one.
         buf.push_str(&footer_seq(
             self.rows,
             self.cols,
             &sep,
-            &effective_status_msg(status_msg),
+            status_msg,
             statusline,
         ));
         let mut out = std::io::stdout();
@@ -1562,7 +1681,7 @@ mod tests {
     #[test]
     fn footer_positions_three_rows_bottom_up() {
         // No banner → 3-row footer.
-        let seq = footer_seq_with(24, 10, "----------", "msg", "bar", None);
+        let seq = footer_seq_with(24, 10, "----------", "msg", "bar", None, None);
         assert!(seq.starts_with("\x1b7")); // DECSC
         assert!(seq.ends_with("\x1b8")); // DECRC
         // The scroll-region re-assert (DECSTBM) must be saved-then-emitted: it
@@ -1590,7 +1709,7 @@ mod tests {
         ));
 
         // 24-row window, 5-row footer: banner 20-21, rule 22, msg 23, bar 24.
-        let seq = footer_seq_with(24, 80, "----------", "msg", "bar", banner);
+        let seq = footer_seq_with(24, 80, "----------", "msg", "bar", banner, None);
         let esc = seq.find("\x1b[20;1H").expect("escalation row = H-4");
         let worker = seq.find("\x1b[21;1H").expect("worker status row = H-3");
         let rule = seq.find("\x1b[22;1H").expect("separator row = H-2");
@@ -1725,33 +1844,110 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         // Turn-start priming: set_midturn_input with EMPTY text must surface the
         // bare prompt affordance (so the operator SEES a prompt to type into
-        // during thinking / tool-calls), overriding the cached status message.
-        // Teardown (clear_midturn_input) must restore the cached status message.
+        // during thinking / tool-calls) and CLAIM the footer's input row rather
+        // than releasing it. Teardown (clear_midturn_input) gives the row back.
         // Locks in the ISS fix for "no visible prompt while the turn runs".
         let prompt = "\x1b[2m❯\x1b[0m ";
 
-        // Baseline: no override → cached status shows through.
+        // Baseline: no input line held → no reserved row.
         clear_midturn_input();
-        assert_eq!(effective_status_msg("coordinating…"), "coordinating…");
+        assert!(!midturn_active());
+        assert_eq!(midturn_line(), None);
+        assert_eq!(footer_rows_for(24), FOOTER_ROWS);
 
-        // Turn start, nothing typed yet → bare prompt is surfaced.
+        // Turn start, nothing typed yet → bare prompt is surfaced on its own row.
         set_midturn_input(prompt, "");
-        assert_eq!(effective_status_msg("coordinating…"), prompt);
+        assert!(midturn_active());
+        assert_eq!(midturn_line().as_deref(), Some(prompt));
+        assert_eq!(footer_rows_for(24), FOOTER_ROWS + INPUT_ROWS);
 
-        // Operator types → prompt + live line replaces the status row.
+        // Operator types → prompt + live line on the SAME reserved row.
         set_midturn_input(prompt, "ls -la");
-        assert_eq!(
-            effective_status_msg("coordinating…"),
-            format!("{prompt}ls -la")
-        );
+        assert_eq!(midturn_line(), Some(format!("{prompt}ls -la")));
+        assert_eq!(footer_rows_for(24), FOOTER_ROWS + INPUT_ROWS);
 
-        // Turn teardown → cached status message restored.
+        // Turn teardown → row released.
         clear_midturn_input();
-        assert_eq!(effective_status_msg("coordinating…"), "coordinating…");
+        assert!(!midturn_active());
+        assert_eq!(footer_rows_for(24), FOOTER_ROWS);
 
         // Idempotent: a second clear is a no-op (no panic, stays cleared).
         clear_midturn_input();
-        assert_eq!(effective_status_msg("idle"), "idle");
+        assert!(!midturn_active());
+    }
+
+    #[test]
+    fn midturn_input_owns_the_topmost_footer_row_above_the_banner() {
+        // THE regression this change exists for: the operator's mid-turn line
+        // must get its OWN row at the TOP of the footer — under the body, above
+        // the escalation/queued banner — and must NOT be painted into the
+        // status-message row (H-1), which stays the coordinator status.
+        let prompt = "\x1b[2m❯\x1b[0m ";
+        let input = Some(format!("{prompt}git status"));
+        let banner = Some((
+            "🚀 escalated → w_a7k3m2 · build and open pr".to_string(),
+            "   ↳ coordinating · 1m12s".to_string(),
+        ));
+
+        // 24 rows, 6-row footer: input 19, banner 20-21, rule 22, msg 23, bar 24.
+        let seq = footer_seq_with(24, 80, "----------", "msg", "bar", banner, input);
+        let inp = seq.find("\x1b[19;1H").expect("input row = H-5");
+        let esc = seq.find("\x1b[20;1H").expect("escalation row = H-4");
+        let worker = seq.find("\x1b[21;1H").expect("worker status row = H-3");
+        let rule = seq.find("\x1b[22;1H").expect("separator row = H-2");
+        let msg = seq.find("\x1b[23;1H").expect("status message row = H-1");
+        let bar = seq.find("\x1b[24;1H").expect("statusline row = H");
+        assert!(
+            inp < esc && esc < worker && worker < rule && rule < msg && msg < bar,
+            "footer must paint input → escalation → worker → rule → message → statusline"
+        );
+        assert!(
+            seq[inp..esc].contains("git status"),
+            "the topmost footer row must carry the operator's line, got {:?}",
+            &seq[inp..esc]
+        );
+        // The status-message row keeps the CACHED status — the old bug painted
+        // the typed line here and ate the coordinator/attach status.
+        assert!(
+            seq[msg..bar].contains("msg") && !seq[msg..bar].contains("git status"),
+            "status row must keep the cached status, got {:?}",
+            &seq[msg..bar]
+        );
+        // The reserved region grew to cover input + banner (24 - 6 = 18), so
+        // neither can be scrolled away by body output.
+        assert!(
+            seq.contains("\x1b[1;18r"),
+            "DECSTBM must reserve the input row too"
+        );
+    }
+
+    #[test]
+    fn midturn_input_row_sits_directly_under_the_body_without_a_banner() {
+        // No banner → 4-row footer: input 21, rule 22, msg 23, bar 24. The input
+        // line lands on the first row below the scrolling body, which is exactly
+        // where the IDLE prompt sits — that's the "always in the same spot"
+        // contract.
+        let seq = footer_seq_with(24, 80, "----------", "msg", "bar", None, Some("❯ ls".into()));
+        let inp = seq.find("\x1b[21;1H").expect("input row = H-3");
+        let rule = seq.find("\x1b[22;1H").expect("separator row = H-2");
+        assert!(inp < rule);
+        assert!(seq[inp..rule].contains("ls"));
+        assert!(seq.contains("\x1b[1;20r"), "region = 24 - 4 = 20");
+    }
+
+    #[test]
+    fn cramped_terminal_drops_the_input_row_before_eating_output() {
+        // MIN_FOOTER_ROWS (5) budgets 2 scrolling rows above a 3-row footer. A
+        // 5-row window has no slack, so the optional blocks are dropped rather
+        // than swallowing the operator's output.
+        assert_eq!(footer_extras(5, true, true), (false, false));
+        // 6 rows fits ONE extra row — the banner wants 2, so it loses and the
+        // input row (the thing being actively used) takes the slot.
+        assert_eq!(footer_extras(6, true, true), (false, true));
+        // 7 rows fits the banner's 2 rows but then nothing else.
+        assert_eq!(footer_extras(7, true, true), (true, false));
+        // 8 rows fits both.
+        assert_eq!(footer_extras(8, true, true), (true, true));
     }
 
     #[test]
@@ -1774,10 +1970,10 @@ mod tests {
             format!("\r\x1b[2K{prompt}ls -la")
         );
 
-        // The inline path never touches the footer's MIDTURN_INPUT slot, so the
-        // cached status message keeps showing through the footer effective view.
+        // The inline path never touches the footer's MIDTURN_INPUT slot, so no
+        // footer row is reserved for it.
         clear_midturn_input();
-        assert_eq!(effective_status_msg("coordinating…"), "coordinating…");
+        assert!(!midturn_active());
     }
 
     #[test]
